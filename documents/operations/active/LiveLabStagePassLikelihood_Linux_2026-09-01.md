@@ -42,14 +42,25 @@ CSV column.
 Of the Linux stage cells that look never-passed, **most are not code defects and not
 even Linux failures**:
 
-1. **`linux_stage_two_hop` is NOT never-passed — it is genuinely green today.** The
-   famous contamination (QH-07) masked this. After the 2026-07-27 alias removal, 26
-   of the ledger's 148 post-removal rows record `linux_stage_two_hop = pass`
-   (26 pass / 8 fail / 86 skip / 28 not_run), including both 2026-08-16 Run-44 rows
-   (`livelab-1786904758-2b205ca6d49c`, `livelab-1786908269-5510b726035e`) from the
-   first zero-failure full Linux suite. The never-passed residue is a *different*
-   stage id that shares the same roll-up column: the cross-OS wrapper
-   `live_two_hop_validation`, whose lifetime per-stage record is 0 passes.
+1. **`linux_stage_two_hop` is NOT never-passed — it is genuinely green today, and the
+   producer is the `--node` stage itself.** The famous contamination (QH-07) masked
+   this. After the 2026-07-27 alias removal, 26 of the ledger's 148 post-removal rows
+   record `linux_stage_two_hop = pass` (26 pass / 8 fail / 86 skip / 28 not_run),
+   including both 2026-08-16 Run-44 rows (`livelab-1786904758-2b205ca6d49c`,
+   `livelab-1786908269-5510b726035e`) from the first zero-failure full Linux suite.
+   Every one of those passes was written by `live_two_hop_validation` — the ONLY
+   two-hop stage the Rust engine can dispatch (`StageId::LiveTwoHopValidation`,
+   `stage/mod.rs:238`). Its per-stage record in `live_lab_node_stage_results.csv`
+   is **130 pass / 121 fail / 449 skip** node-rows on Linux (first pass 2026-08-14,
+   firewalld forward-chain root cause; last pass 2026-08-27, run
+   `livelab-1787835449-4b1d946795ad` @ `4b1d946795ad`). The "0 pass lifetime" figure
+   that circulates for this stage id is a count taken at commit `9cdd660f`
+   (2026-07-27) and quoted in the `live_lab_run_matrix.rs` doc-comment — stale since
+   2026-08-14. The other registry entry on the same column, `live_two_hop`
+   (`live_lab_stage_registry.rs:1943`), is a bash-dialect spec with no `StageId`
+   variant and therefore cannot have produced a single `--node` row. The residue
+   that IS never-passed is the same stage id on the other two OSes: macOS 32/32
+   skip, Windows 4/4 skip — it has never dispatched off Linux.
 2. **`mixed_topology` is topology-gated by design, not broken.** Both of its stage
    ids hard-require all three OSes live; a Linux-only run can never satisfy it.
 3. **The chaos suite is an opt-in selector that no recorded run has ever selected**
@@ -74,51 +85,53 @@ columns, but which the recorded runs never dispatched.
 
 ## Per-stage analysis
 
-### 1. `linux_stage_two_hop` — genuinely passing via `live_two_hop` (pass likelihood: HIGH; not in the never-passed bucket)
+### 1. `linux_stage_two_hop` — genuinely passing via `live_two_hop_validation` (pass likelihood: HIGH on Linux; not in the never-passed bucket)
 
 **Status + citation.** Ledger, post-removal rows only (148 rows after 2026-07-27):
 `pass 26 / fail 8 / skip 86 / not_run 28`. Lifetime pre-removal passes (35 of 94
 rows at commit `9cdd660f`) are the QH-07 contamination and are permanently
-disregarded.
+disregarded. Per-stage truth (`live_lab_node_stage_results.csv`, stage =
+`live_two_hop_validation`, platform = linux): **130 pass / 121 fail / 449 skip**
+node-rows; last pass 2026-08-27T12:12:28Z (run `livelab-1787835449-4b1d946795ad`,
+commit `4b1d946795ad`, clean tree, evidence
+`state/live-lab-bash-1787832726/logs/live_two_hop_validation.log`).
 
-**Why it is green.** Two distinct stage ids map to the logical column `two_hop`
-(`live_lab_stage_registry.rs`):
+**Which stage id writes the column.** Two registry entries map to the logical column
+`two_hop` (`live_lab_stage_registry.rs`), but only one is reachable on the engine of
+record:
 
-- `live_two_hop` (line ~1943): `logical = Some("two_hop")`, enable
-  `EnableRule::LinuxLiveSuite`, part of the standard Linux live suite block
-  (neighbours `live_relay`, `live_exit_handoff`, `live_lan_toggle`,
-  `live_role_switch_matrix`). This is the chained-exit proof every full Linux suite
-  run dispatches, and it is the producer of the 26 post-removal pass rows —
-  including both Run-44 (2026-08-16) rows where the whole Linux suite went green.
-- `live_two_hop_validation` (line ~921): `state_machine_only = true`,
-  `logical = Some("two_hop")`, `PlatformRule::AllPlatforms`; the comment at line
-  ~916 describes it as "Rust-native live two-hop: delegates to the proven
-  `live_linux_two_hop_test` binary (cross-OS via `--platform`)". This wrapper's own
-  lifetime per-stage record, counted in the QH-07 comment block
-  (`live_lab_run_matrix.rs:443-452`, data from `live_lab_node_stage_results.csv` at
-  commit `9cdd660f`), is **222 skip / 81 fail / 0 pass**.
+- `live_two_hop_validation` (line 921): `state_machine_only = true`,
+  `logical = Some("two_hop")`, `PlatformRule::AllPlatforms`; the comment at line 916
+  describes it as "Rust-native live two-hop: delegates to the proven
+  `live_linux_two_hop_test` binary (cross-OS via `--platform`)". It is the only
+  two-hop `StageId` (`LiveTwoHopValidation`, `stage/mod.rs:238`), so it is the
+  producer of every post-removal pass row.
+- `live_two_hop` (line 1943): `logical = Some("two_hop")`, `EnableRule::LinuxLiveSuite`,
+  no `state_machine_only`, and **no `StageId` variant** — a bash-dialect spec that
+  the `--node` plan builder cannot enter. It produced zero `--node` rows and never
+  will.
 
-**Classification.** `live_two_hop`: green, done. `live_two_hop_validation`:
-CONTAMINATION-adjacent WIRING/GATE residue — a cross-OS acceptance wrapper that
-inherits the roll-up column's good name while never having passed itself. The
-migration risk is exactly the one QH-07 warned about, now narrowed to a single
-stage id: a reader of the `two_hop` column cannot tell which producer wrote a pass.
-QH-07(b) (synonym table) and QH-07(c) (schema migration) remain the tracked fix.
+**The stale "0 pass" figure.** The QH-07 doc-comment in `live_lab_run_matrix.rs`
+(lines ~443-452) quotes `live_two_hop_validation` at "222 skip / 81 fail / 0 pass",
+counted at commit `9cdd660f` on 2026-07-27. The first `--node` two-hop pass landed
+2026-08-14 (firewalld's forward chain running after ours and rejecting; fix binds the
+tunnel to the default zone), and the stage has passed on every full Linux suite
+since. The comment is a historical count, not a live status — it should be refreshed
+(small docs/comment change, tracked with QH-07(b)/(c)) so no future reader repeats
+this misattribution.
 
-**Pass likelihood.** For Linux `two_hop` as a capability: **High** (already
-proven, repeatedly, post-removal). For `live_two_hop_validation` as a stage id:
-**Low today** — it is a cross-OS cell, and the macOS/Windows role cells are
-themselves ~0% proven on this engine per
-`CrossPlatformRoleParityRefresh_2026-07-23.md`. It greens automatically once a
-3-OS mesh run is achieved; no Linux-side work is owed.
+**Classification.** `live_two_hop_validation` on Linux: green, done. Off-Linux:
+WIRING/GATE residue — the same stage id is 32/32 skip on macOS and 4/4 skip on
+Windows (never dispatched), so the `two_hop` column's cross-OS face is unproven.
+QH-07(b) (synonym table) and QH-07(c) (schema migration) remain the tracked fix for
+the column-cannot-name-its-producer hazard.
 
-**Caveat, stated honestly.** The lab being down, the 26 post-removal passes are
-attributed to `live_two_hop` by scheduling logic (it is the only one of the two ids
-in the standard LinuxLiveSuite plan) rather than by reading each run's stage-log
-file names. Per `BashRetirementDispositions_2026-08-22.md:174`, a per-run pin-down
-would read each run's own stage artifacts; that remains possible on the next lab-up
-day and should confirm the attribution, but the scheduling argument plus Run-44's
-full-suite green makes the conclusion robust.
+**Pass likelihood.** Linux `two_hop` as a capability: **High** (already proven,
+repeatedly, post-removal). The same stage id on macOS/Windows: **Low today** — the
+macOS/Windows role cells are themselves ~0% proven on this engine per
+`CrossPlatformRoleParityRefresh_2026-07-23.md`, and macOS additionally sits behind
+the CP-1 L3 partition. It greens off-Linux as a by-product of the parity program;
+no Linux-side work is owed.
 
 ### 2. `linux_stage_mixed_topology` — topology-gated by design (pass likelihood: LOW)
 
@@ -269,10 +282,10 @@ opt-in.
 
 ## Ranked quickest-to-green
 
-1. **`two_hop` on Linux — already green.** No action; the only owed work is the
-   per-run attribution double-check on the next lab-up day (read stage-log names
-   in the Run-44 report artifacts) and finishing QH-07(b)/(c) so the column
-   unambiguously names its producer.
+1. **`two_hop` on Linux — already green.** Producer is `live_two_hop_validation`
+   (130 pass node-rows; no other two-hop `StageId` exists). No lab action; the only
+   owed work is refreshing the stale "0 pass" doc-comment in `live_lab_run_matrix.rs`
+   and finishing QH-07(b)/(c) so the column unambiguously names its producer.
 2. **Chaos suite — cheapest NEW evidence.** One selector flip on a scheduled run;
    all nine stages have implementations. First verdict of any kind in a single lab
    window. Expect first-contact failures; that is the suite succeeding.
@@ -282,11 +295,12 @@ opt-in.
 4. **`linux_relay_forwards_frame` — schedule the Disruptive stage once** when a
    lab window has slack. Opt-in by design; one run records the first verdict in
    the column.
-5. **`live_two_hop_validation` / `mixed_topology` — blocked on cross-OS parity,
-   correctly.** Both hard-require macOS+Windows live nodes. They are not Linux
-   work; they green as a by-product of the mac/win role cells reaching live
-   parity (`CrossPlatformRoleParityRefresh_2026-07-23.md`). Do not spend Linux
-   lab time on them.
+5. **`live_two_hop_validation` off-Linux / `mixed_topology` — blocked on cross-OS
+   parity, correctly.** `mixed_topology` hard-requires macOS+Windows live nodes and
+   the two-hop stage id has never dispatched off Linux. They are not Linux work;
+   they green as a by-product of the mac/win role cells reaching live parity
+   (`CrossPlatformRoleParityRefresh_2026-07-23.md`). Do not spend Linux lab time on
+   them.
 6. **The seven duplicate bare columns — schema migration (QH-07(b)/(c)), not lab
    work.** Any lab time spent "making them pass" is wasted; the properties are
    already proven in the `linux_stage_*_check` family.
@@ -294,9 +308,11 @@ opt-in.
 ## What this analysis does not claim
 
 - No stage is claimed to pass based on this document; the lab was down throughout.
-- The `live_two_hop` attribution for the 26 post-removal passes rests on plan
-  membership plus Run-44's full-suite green, not on per-run artifact reads; that
-  pin-down is a listed follow-up.
+- The attribution of the 26 post-removal passes to `live_two_hop_validation` rests
+  on two facts checked in the tree: it is the only two-hop `StageId`, and its
+  per-stage rows in `live_lab_node_stage_results.csv` carry 130 Linux passes with
+  evidence paths. A per-run read of each Run-44 stage artifact remains a cheap
+  confirmation on the next lab-up day.
 - The single `blind_exit_dataplane_check` failure is cited from its ledger row and
   report path only; its root cause is explicitly unresolved here.
 - Chaos-suite implementation quality is unassessed (no live evidence exists to
