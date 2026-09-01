@@ -3617,6 +3617,25 @@ and a local-only redirect target).
 the `entry` role's rule path that trips this, which is why it stayed hidden until a five-node
 topology could elect one.
 
+**Update 2026-08-31 (investigation doc).** Full investigation:
+`QH45EntryNftRuleInvestigation_2026-08-31.md` (same directory). Findings, all cited against
+HEAD `cc561939`: the rejected argv are the entry hop's two hairpin shapes —
+`forward iifname <tun> oifname <tun> counter accept` (emitter `phase10.rs:2889-2910`, builder
+`:1831-1839`) and `postrouting iifname <tun> oifname <tun> counter masquerade` (emitter
+`:3129-3153`, builder `:1854-1862`) — both legitimate for `entry` (flag-gated via
+`allow_tunnel_relay_forward` set at `phase10.rs:6488-6490`; hairpin-only, i.e. tunnel-in/
+tunnel-out, so a final exit never matches; `counter` is pure observability; the hairpin SNAT
+is load-bearing for the upstream exit's /32 cryptokey routing). Entry does **not** reuse
+exit-role egress NAT logic. **The allowlist fix is already landed** — steps 2–3 above are
+satisfied by `85d05864` (forward arm, `privileged_helper.rs:2374`) and `2afd4dad` (postrouting
+arm, `:2611`), both hairpin-only by validator pin, with negative tests
+`postrouting_counter_masquerade_is_allowed_only_as_a_hairpin` (`:4525`) and
+`forward_counter_accept_is_allowed_only_in_its_exact_narrow_shape` (`:4604`). What remains is
+live proof, not code: no `live_two_hop_validation` pass exists on the `--node` run matrix since
+2026-08-13 (every two_hop cell since is `not_run`/`skip`), so this entry stays OPEN until a
+five-node run proves the entry hop end to end — preferably an nftables-family entry first,
+then the firewalld-family cell (`linux_firewalld_zone.rs:18`) separately.
+
 ### QH-48 — the live suite is a linear dependency chain, so each run surfaces at most one defect
 
 **Severity: medium (throughput, not correctness).** Nothing here is wrong in a released binary; it
