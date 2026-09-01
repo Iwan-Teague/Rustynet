@@ -1632,9 +1632,9 @@ fn anchor_control_stream(
                 .map_err(|err| {
                     DaemonError::Io(format!("anchor TLS server connection failed: {err}"))
                 })?;
-            Ok(AnchorControlStream::Tls(Box::new(rustls::StreamOwned::new(
-                conn, stream,
-            ))))
+            Ok(AnchorControlStream::Tls(Box::new(
+                rustls::StreamOwned::new(conn, stream),
+            )))
         }
     }
 }
@@ -1650,10 +1650,7 @@ fn anchor_tls_identity_paths(config: &DaemonConfig) -> (PathBuf, PathBuf) {
         .parent()
         .map(|parent| parent.join("anchor-tls"))
         .unwrap_or_else(|| PathBuf::from("anchor-tls"));
-    (
-        root.join("anchor-cert.pem"),
-        root.join("anchor-key.pem"),
-    )
+    (root.join("anchor-cert.pem"), root.join("anchor-key.pem"))
 }
 
 /// Load (or first-boot generate) the anchor TLS identity and build the
@@ -1671,9 +1668,7 @@ fn load_anchor_tls_server_config(
         &key_path,
         "rustynet anchor control plane",
     )
-    .map_err(|err| {
-        DaemonError::InvalidConfig(format!("anchor TLS identity unavailable: {err}"))
-    })?;
+    .map_err(|err| DaemonError::InvalidConfig(format!("anchor TLS identity unavailable: {err}")))?;
     crate::anchor_tls::build_anchor_server_config(&identity).map_err(|err| {
         DaemonError::InvalidConfig(format!("anchor TLS server config unavailable: {err}"))
     })
@@ -2070,9 +2065,7 @@ fn poll_anchor_enrollment_once(
             let stream = match anchor_control_stream(stream, binding.tls.as_ref()) {
                 Ok(stream) => stream,
                 Err(err) => {
-                    log::warn!(
-                        "anchor_enrollment: TLS setup failed peer={peer_addr} reason={err}"
-                    );
+                    log::warn!("anchor_enrollment: TLS setup failed peer={peer_addr} reason={err}");
                     return Ok(true);
                 }
             };
@@ -18002,14 +17995,13 @@ mod tests {
 
     use super::{
         ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, AnchorControlStream, AnchorListenerBinding,
-        AutoTunnelBundle, AutoTunnelWatermark,
-        DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
-        DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
-        DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
-        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
-        MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
-        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
-        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
+        AutoTunnelBundle, AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
+        DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+        DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig,
+        DaemonError, DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext,
+        MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES,
+        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
+        MAX_RELAY_FLEET_BUNDLE_BYTES, MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole,
         SignedStateRefreshReason, StateFetcher, TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,

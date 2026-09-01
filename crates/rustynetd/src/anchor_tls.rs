@@ -18,7 +18,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use sha2::Digest;
@@ -63,17 +63,32 @@ impl std::fmt::Display for AnchorTlsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::KeyGeneration(what) => write!(f, "anchor TLS key generation failed: {what}"),
-            Self::CertGeneration(what) => write!(f, "anchor TLS certificate generation failed: {what}"),
-            Self::FileWrite { path, context, source } => {
+            Self::CertGeneration(what) => {
+                write!(f, "anchor TLS certificate generation failed: {what}")
+            }
+            Self::FileWrite {
+                path,
+                context,
+                source,
+            } => {
                 write!(f, "anchor TLS {}: {}: {source}", path.display(), context)
             }
-            Self::Io { path, context, source } => {
+            Self::Io {
+                path,
+                context,
+                source,
+            } => {
                 write!(f, "anchor TLS {}: {}: {source}", path.display(), context)
             }
-            Self::CertificateParse(what) => write!(f, "anchor TLS certificate parse failed: {what}"),
+            Self::CertificateParse(what) => {
+                write!(f, "anchor TLS certificate parse failed: {what}")
+            }
             Self::KeyRejected(what) => write!(f, "anchor TLS key rejected: {what}"),
             Self::ServerConfig(what) => write!(f, "anchor TLS server config failed: {what}"),
-            Self::PartialIdentity { cert_path, key_path } => write!(
+            Self::PartialIdentity {
+                cert_path,
+                key_path,
+            } => write!(
                 f,
                 "anchor TLS identity incomplete: certificate {} and key {} must both exist or both be absent; refusing to bind half an identity",
                 cert_path.display(),
@@ -401,10 +416,12 @@ mod tests {
         )
         .expect("identity generation must succeed");
         assert_eq!(identity.cert_fingerprint_sha256_hex().len(), 64);
-        assert!(identity
-            .cert_fingerprint_sha256_hex()
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+        assert!(
+            identity
+                .cert_fingerprint_sha256_hex()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
     }
 
     #[test]
