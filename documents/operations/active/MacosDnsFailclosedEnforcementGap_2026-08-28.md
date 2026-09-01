@@ -337,3 +337,15 @@ owner exception to run a privileged helper listener.
   the live SystemConfiguration half accepts Ok or a genuine drift error and
   fails loudly if the error text ever leaks the legend (i.e. a phantom service
   is being minted again).
+
+Update 2026-08-31 — role-split follow-up: the baseline `DnsFailclosed` failure
+of `macos-utm-1` when bootstrapped as the EXIT role (passes as anchor) is NOT a
+regression of this gap. The M1 enforcement above is intact; the failing node
+never reaches it because the daemon fails closed on a membership/role mismatch —
+the lab maps a macOS exit to the `blind_exit` daemon posture
+(`orchestrator/role.rs:159-160`) while its genesis membership carries the anchor
+capability (`rustynetd main.rs:4469-4479`; exit peer skipped by
+`adapter/macos_membership.rs:248-251`), which `validate_node_role_membership_alignment`
+(`daemon.rs:2302-2304`) hard-rejects, so `apply_dns_protection` never runs.
+Full evidence chain, verdict, and fix location:
+`MacosExitDnsFailclosedRoleSplitInvestigation_2026-08-31.md`.
