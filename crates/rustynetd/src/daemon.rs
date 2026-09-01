@@ -496,6 +496,22 @@ pub const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 1_000;
 /// traffic, it does not admit any.
 pub const HOST_FIREWALL_ADMISSION_ASSERT_INTERVAL_SECS: u64 = 30;
 
+/// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2): how often an
+/// otherwise-healthy macOS node re-asserts that the DNS fail-closed posture
+/// it applied is still in place.
+///
+/// The apply path asserts the posture once, at apply time. Drift that
+/// appears later — a service re-pinned to LAN DNS by an operator or another
+/// agent — is invisible to the apply path, so a healthy node needs its own
+/// slow cadence to notice. Like the QH-54 admission assert this bounds the
+/// exposure window of an availability/security drift at seconds of latency
+/// rather than a per-tick privileged round trip; a drift found here
+/// schedules exactly one re-apply (`dns_posture_reassert_pending`) instead
+/// of escalating, and a failed re-apply escalates through the standard
+/// apply-failure restriction ladder.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS: u64 = 30;
+
 /// QH-39: how often a healthy, quiescent node rewrites its session-state
 /// snapshot even when nothing changed.
 ///
@@ -4638,6 +4654,13 @@ struct DaemonRuntime {
     /// periodic posture check runs on its own slow cadence rather than on every
     /// one-second reconcile tick.
     last_host_firewall_admission_assert_unix: Option<u64>,
+    /// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2): unix time of the
+    /// last macOS DNS posture re-assert ATTEMPT (advanced on failure too, the
+    /// QH-54 pattern), so the posture check rides its own slow cadence rather
+    /// than the one-second reconcile tick. Only written on macOS; the
+    /// S1 re-assert itself is macOS-only.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    last_dns_posture_assert_unix: Option<u64>,
     /// QH-39: unix time of the last successful session-state persist, so a
     /// healthy quiescent node still refreshes the snapshot the mesh-status
     /// validators read for freshness.
@@ -4645,6 +4668,13 @@ struct DaemonRuntime {
     last_reconcile_error: Option<String>,
     last_applied_assignment: Option<AutoTunnelWatermark>,
     local_route_reconcile_pending: bool,
+    /// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2): set when the
+    /// periodic macOS DNS posture re-assert observed drift on an
+    /// otherwise-healthy node. Feeds `will_apply_generation`, so the next
+    /// reconcile pass performs exactly one DNS-protection re-apply (the
+    /// heal); a heal that fails escalates through the standard apply-failure
+    /// ladder, and a successful apply clears the latch.
+    dns_posture_reassert_pending: bool,
     /// QH-04: true from the moment a reconcile pass decides it will apply a
     /// new dataplane generation until that apply has been attempted.
     ///
@@ -5159,10 +5189,12 @@ impl DaemonRuntime {
             reconcile_failures: 0,
             last_reconcile_unix: None,
             last_host_firewall_admission_assert_unix: None,
+            last_dns_posture_assert_unix: None,
             last_state_persist_unix: None,
             last_reconcile_error: None,
             last_applied_assignment: None,
             local_route_reconcile_pending: false,
+            dns_posture_reassert_pending: false,
             pending_generation_apply: false,
             max_reconcile_failures: config.max_reconcile_failures.get(),
             remote_ops_expected_subject: config.remote_ops_expected_subject.clone(),
@@ -10330,7 +10362,11 @@ impl DaemonRuntime {
             || self.restriction_mode == RestrictionMode::Recoverable
             || assignment_changed
             || membership_changed
-            || self.local_route_reconcile_pending;
+            || self.local_route_reconcile_pending
+            // S1: a scheduled DNS posture heal re-applies the (unchanged)
+            // generation once. Like `local_route_reconcile_pending` this
+            // latch cannot change across the pre-apply traversal refreshes.
+            || self.dns_posture_reassert_pending;
         self.pending_generation_apply = will_apply_generation;
         self.maybe_preexpiry_refresh_traversal(now_unix);
         // Load fresh traversal hints here, after any pre-expiry download, so
@@ -10481,6 +10517,15 @@ impl DaemonRuntime {
             // QH-04: the apply has been attempted; from here the controller's
             // managed peer set is authoritative again.
             self.pending_generation_apply = false;
+            // S1: this apply was also the scheduled DNS posture heal (or an
+            // unrelated generation apply, in which case the latch is already
+            // clear). Either way the next pass must re-assert from scratch —
+            // the apply path asserts at apply time — instead of re-applying
+            // again. A heal that FAILED is handled by the ladder below (the
+            // node restricts / fails closed, which keeps the re-assert gated
+            // until the node is healthy again); no special failure handling
+            // is needed here.
+            self.dns_posture_reassert_pending = false;
             let cleanup_result = self.scrub_runtime_private_key_material();
 
             match (apply_result, cleanup_result) {
@@ -10596,6 +10641,12 @@ impl DaemonRuntime {
                     self.promote_to_permanent_if_over_limit();
                 }
             }
+        } else {
+            // S1: apply and assert are mutually exclusive within one pass.
+            // On a converged healthy pass (nothing applied), re-assert the
+            // macOS DNS runtime posture on its own slow cadence.
+            #[cfg(target_os = "macos")]
+            self.maybe_assert_dns_posture();
         }
 
         self.maybe_reassert_host_firewall_admission();
@@ -10649,6 +10700,60 @@ impl DaemonRuntime {
             self.last_reconcile_error = Some(message.clone());
             self.restrict_recoverable(message);
             self.promote_to_permanent_if_over_limit();
+        }
+    }
+
+    /// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2): periodic
+    /// re-assert of the macOS DNS runtime posture on an otherwise-healthy
+    /// node. Called only from the non-apply arm of the reconcile pass, so
+    /// apply and assert are mutually exclusive within one pass.
+    ///
+    /// Gates, in order:
+    /// 1. cadence — at most one attempt per
+    ///    [`DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS`]. The timestamp
+    ///    advances on every ATTEMPT, before the assert call and including a
+    ///    failed one (the QH-54 pattern), so a persistently failing assert
+    ///    re-fires no sooner than the cadence, never on every tick.
+    /// 2. health — skipped while the dataplane is fail-closed or any
+    ///    restriction is active: there the apply/restrict ladder owns the
+    ///    node, and a posture assert against a restricted node would only
+    ///    obscurate the ladder's own error.
+    /// 3. posture presence — skipped unless the system still reports the DNS
+    ///    posture installed (`dns_protected()`); a node whose posture was
+    ///    never applied (or was rolled back) has nothing to drift from, and
+    ///    protected-mode entry re-applies it anyway.
+    ///
+    /// Drift never escalates from here: it records the reason in
+    /// `last_reconcile_error` and schedules exactly one re-apply via
+    /// `dns_posture_reassert_pending`. The re-apply runs through the normal
+    /// apply branch, so a heal that FAILS escalates through the standard
+    /// apply-failure restriction ladder — no separate failure path exists.
+    #[cfg(target_os = "macos")]
+    fn maybe_assert_dns_posture(&mut self) {
+        let now_unix = unix_now();
+        if let Some(last) = self.last_dns_posture_assert_unix
+            && now_unix.saturating_sub(last) < DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS
+        {
+            return;
+        }
+        if self.controller.state() == DataplaneState::FailClosed
+            || self.restriction_mode != RestrictionMode::None
+        {
+            return;
+        }
+        if !self.controller.dns_protected() {
+            return;
+        }
+        self.last_dns_posture_assert_unix = Some(now_unix);
+        if let Err(err) = self.controller.assert_dns_protection() {
+            let message = format!("macOS DNS posture re-assert drifted: {err}");
+            if self.last_reconcile_error.as_deref() != Some(message.as_str()) {
+                log::warn!(
+                    "rustynetd reconcile: {message}; scheduling a single DNS protection re-apply"
+                );
+            }
+            self.last_reconcile_error = Some(message);
+            self.dns_posture_reassert_pending = true;
         }
     }
 
@@ -18002,6 +18107,474 @@ mod tests {
             "a failed re-assert has already fail-closed the controller; the \
              daemon must record it as a restriction rather than swallow it"
         );
+    }
+
+    // ─── S1: macOS DNS posture re-assert (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.4) ───
+    //
+    // `maybe_assert_dns_posture` is macOS-only and reads the wall clock via
+    // `unix_now()`; DaemonRuntime has no injectable clock. These tests drive
+    // the cadence at the stored-timestamp seam instead: planting
+    // `last_dns_posture_assert_unix` (None = never asserted;
+    // `unix_now() - INTERVAL` = cadence elapsed) is exactly what a fake clock
+    // would make the production code observe, without a production change to
+    // ease testing. Call-count observation rides the DryRunSystem's
+    // `operations` log — each `assert_dns_protection` / `apply_dns_protection`
+    // appends its own name. NOTE: the controller's apply path asserts the
+    // posture at apply time too (phase10.rs `apply_dataplane_generation`,
+    // `protected_dns` arm), so an APPLY pass legitimately records exactly one
+    // `assert_dns_protection` op; the deltas below are counted against that
+    // baseline. The tests are macOS-gated because the S1 re-assert (and the
+    // reconcile else-arm that drives it) is macOS-only — they run on the
+    // macOS CI leg, which is the platform the fix targets.
+
+    #[cfg(target_os = "macos")]
+    fn dns_posture_test_runtime(tag: &str) -> (DaemonRuntime, std::path::PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.45:40032".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay(tag, relay_addr, "relay-test");
+        {
+            use crate::phase10::DataplaneSystem;
+            runtime
+                .controller
+                .system_mut_for_test()
+                .apply_dns_protection()
+                .expect("dry-run apply_dns_protection must succeed");
+        }
+        (runtime, test_dir)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dns_posture_ops(runtime: &mut DaemonRuntime) -> Vec<String> {
+        match runtime.controller.system_mut_for_test() {
+            crate::phase10::RuntimeSystem::DryRun(system) => system.operations.clone(),
+            _ => panic!("S1 posture tests require the InMemory (DryRun) system"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dry_run_fail_on(runtime: &mut DaemonRuntime, operation: &str) {
+        match runtime.controller.system_mut_for_test() {
+            crate::phase10::RuntimeSystem::DryRun(system) => system.fail_on_from_now(operation),
+            _ => panic!("S1 posture tests require the InMemory (DryRun) system"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn count_op(ops: &[String], name: &str) -> usize {
+        ops.iter().filter(|op| op.as_str() == name).count()
+    }
+
+    /// §2.4 test 1: a node whose system does not report the DNS posture as
+    /// installed (`dns_protected() == false` — including every Linux/Windows
+    /// node, whose systems stay on the trait default) must never run the
+    /// re-assert: no `assert_dns_protection` call, no cadence latch, no drift
+    /// bookkeeping. This is the phantom-drift guard.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_posture_assert_skipped_when_not_dns_protected() {
+        let relay_addr: SocketAddr = "203.0.113.46:40033".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-s1-skip-not-protected",
+            relay_addr,
+            "relay-test",
+        );
+        // Deliberately NOT activating the posture: `dns_protected()` is false.
+        runtime.last_dns_posture_assert_unix = None;
+        let before = dns_posture_ops(&mut runtime);
+
+        runtime.maybe_assert_dns_posture();
+
+        let after = dns_posture_ops(&mut runtime);
+        assert_eq!(
+            count_op(&after, "assert_dns_protection"),
+            count_op(&before, "assert_dns_protection"),
+            "a node without an installed DNS posture must not run the re-assert"
+        );
+        assert!(
+            runtime.last_dns_posture_assert_unix.is_none(),
+            "a skipped gate must not arm the cadence timer"
+        );
+        assert!(!runtime.dns_posture_reassert_pending);
+        assert_eq!(runtime.reconcile_failures, 0);
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// §2.4 test 2: the re-assert rides its own 30 s cadence — no assert while
+    /// the timer is inside the window, exactly one attempt once it has
+    /// elapsed. NORMATIVE PIN: the cadence timestamp advances on the ATTEMPT,
+    /// before the assert call and including a FAILED one, so a persistently
+    /// failing assert re-fires no sooner than 30 s later, never every tick.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_posture_assert_skipped_before_cadence_elapsed() {
+        let (mut runtime, test_dir) = dns_posture_test_runtime("rustynetd-s1-cadence");
+
+        // Cadence NOT elapsed: a just-recorded attempt suppresses the assert.
+        runtime.last_dns_posture_assert_unix = Some(unix_now());
+        let before = dns_posture_ops(&mut runtime);
+        runtime.maybe_assert_dns_posture();
+        let after = dns_posture_ops(&mut runtime);
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "an in-cadence node must not attempt the posture assert"
+        );
+
+        // Cadence elapsed: exactly one attempt...
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+        dry_run_fail_on(&mut runtime, "assert_dns_protection");
+        let stamp_before = unix_now();
+        runtime.maybe_assert_dns_posture();
+        let after_failed = dns_posture_ops(&mut runtime);
+        assert_eq!(
+            after_failed.len(),
+            after.len() + 1,
+            "an elapsed cadence must produce exactly one assert attempt"
+        );
+        // ...and the attempt must advance the timer EVEN THOUGH it failed...
+        let stamped_at = runtime
+            .last_dns_posture_assert_unix
+            .expect("a failed attempt must still advance the cadence timestamp");
+        assert!(
+            stamped_at >= stamp_before,
+            "the cadence timestamp must advance to (at least) the attempt time: \
+             {stamped_at} < {stamp_before}"
+        );
+        // ...so an immediately following call re-fires nothing.
+        runtime.maybe_assert_dns_posture();
+        let after_immediate = dns_posture_ops(&mut runtime);
+        assert_eq!(
+            after_immediate.len(),
+            after_failed.len(),
+            "a persistently failing assert must re-fire no sooner than the \
+             cadence, never every tick"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// §2.4 test 3: the re-assert must stay silent while the node is
+    /// restricted (Recoverable or Permanent) or fail-closed — there the
+    /// apply/fail-close ladder owns the node, and a posture observation must
+    /// contribute NO noise to its failure accounting.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_posture_assert_skipped_while_restricted_or_fail_closed() {
+        let (mut runtime, test_dir) = dns_posture_test_runtime("rustynetd-s1-skip-restricted");
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+
+        for mode in [RestrictionMode::Recoverable, RestrictionMode::Permanent] {
+            runtime.restriction_mode = mode;
+            let before = dns_posture_ops(&mut runtime);
+            runtime.maybe_assert_dns_posture();
+            let after = dns_posture_ops(&mut runtime);
+            assert_eq!(
+                after.len(),
+                before.len(),
+                "a restricted node must not attempt the posture assert"
+            );
+            assert!(
+                !runtime.dns_posture_reassert_pending,
+                "a restricted node must not schedule a posture heal"
+            );
+            assert_eq!(
+                runtime.reconcile_failures, 0,
+                "a skipped posture assert must not enter the failure accounting"
+            );
+        }
+
+        // FailClosed: same gate, via the controller's real state transition.
+        runtime.restriction_mode = RestrictionMode::None;
+        runtime
+            .controller
+            .force_fail_closed("s1-test-fail-closed")
+            .expect("dry-run fail-close must succeed");
+        let before = dns_posture_ops(&mut runtime);
+        runtime.maybe_assert_dns_posture();
+        let after = dns_posture_ops(&mut runtime);
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "a fail-closed node must not attempt the posture assert"
+        );
+        assert!(!runtime.dns_posture_reassert_pending);
+        assert_eq!(runtime.reconcile_failures, 0);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// §2.4 test 4: drift on an otherwise-healthy pass schedules EXACTLY ONE
+    /// re-apply — the assert failure sets `dns_posture_reassert_pending`,
+    /// does NOT bump `reconcile_failures`, does NOT restrict — and the next
+    /// pass heals through the normal apply branch, whose success clears the
+    /// latch and the QH-04 in-flight flag.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_posture_drift_schedules_single_reapply() {
+        let (mut runtime, test_dir) = dns_posture_test_runtime("rustynetd-s1-drift-single-reapply");
+        // Pass 1 converges the fresh runtime: it applies the generation (with
+        // the posture), leaving a healthy node whose else-arm can re-assert.
+        runtime.reconcile();
+        assert_eq!(runtime.reconcile_failures, 0);
+        let baseline = dns_posture_ops(&mut runtime).len();
+
+        // Drift: the next posture re-assert observes the drift and fails.
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+        dry_run_fail_on(&mut runtime, "assert_dns_protection");
+        runtime.reconcile();
+
+        let drift_ops = dns_posture_ops(&mut runtime);
+        assert_eq!(
+            drift_ops.len(),
+            baseline + 1,
+            "the drift pass must only have attempted the assert, never applied"
+        );
+        assert_eq!(
+            count_op(&drift_ops[baseline..], "assert_dns_protection"),
+            1,
+            "the drift pass must attempt the assert exactly once"
+        );
+        assert!(
+            runtime.dns_posture_reassert_pending,
+            "drift must schedule exactly one re-apply"
+        );
+        assert_eq!(
+            runtime.reconcile_failures, 0,
+            "drift itself must not enter the reconcile-failure accounting"
+        );
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::None,
+            "drift must not restrict the node"
+        );
+        assert!(
+            runtime
+                .last_reconcile_error
+                .as_deref()
+                .is_some_and(|message| message.contains("drifted")),
+            "the drift must be recorded for the operator: {:?}",
+            runtime.last_reconcile_error
+        );
+
+        // Heal: the next pass applies exactly once through the apply branch.
+        dry_run_fail_on(&mut runtime, "no-dry-run-stage-matches-this");
+        runtime.reconcile();
+
+        let heal_ops = dns_posture_ops(&mut runtime);
+        let heal_delta = &heal_ops[drift_ops.len()..];
+        assert_eq!(
+            count_op(heal_delta, "apply_dns_protection"),
+            1,
+            "the scheduled heal must perform exactly one re-apply"
+        );
+        assert!(
+            !runtime.dns_posture_reassert_pending,
+            "a successful heal must clear the re-assert latch"
+        );
+        assert!(
+            !runtime.pending_generation_apply,
+            "a completed heal must clear the QH-04 in-flight apply flag"
+        );
+        assert_eq!(runtime.reconcile_failures, 0);
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// §2.4 test 5: a heal that FAILS escalates through the standard
+    /// apply-failure ladder — `reconcile_failures` increments,
+    /// `restrict_recoverable` fires, and five consecutive failures promote to
+    /// `RestrictionMode::Permanent`. No separate DNS-posture failure path
+    /// exists.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_posture_heal_failure_follows_reconcile_ladder() {
+        let (mut runtime, test_dir) = dns_posture_test_runtime("rustynetd-s1-heal-ladder");
+        runtime.max_reconcile_failures = 5;
+        runtime.reconcile(); // converge
+        assert_eq!(runtime.reconcile_failures, 0);
+
+        // Drift on a healthy pass schedules the heal...
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+        dry_run_fail_on(&mut runtime, "assert_dns_protection");
+        runtime.reconcile();
+        assert!(runtime.dns_posture_reassert_pending);
+
+        // ...and the scheduled heal fails: the ladder owns the aftermath.
+        dry_run_fail_on(&mut runtime, "apply_dns_protection");
+        runtime.reconcile();
+        assert_eq!(
+            runtime.reconcile_failures, 1,
+            "a failed heal is a reconcile failure"
+        );
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::Recoverable,
+            "the first failed heal must restrict the node (Recoverable)"
+        );
+        assert!(
+            !runtime.dns_posture_reassert_pending,
+            "the latch is consumed by the failed heal attempt; further \
+             escalation belongs to the ladder, not the latch"
+        );
+
+        // Four more consecutive failing heals: Recoverable until the fifth
+        // consecutive failure, which promotes to Permanent.
+        for expected in 2..=5 {
+            runtime.reconcile();
+            assert_eq!(runtime.reconcile_failures, expected);
+            if expected < 5 {
+                assert_eq!(
+                    runtime.restriction_mode,
+                    RestrictionMode::Recoverable,
+                    "failure {expected} below the threshold must stay Recoverable"
+                );
+            } else {
+                assert_eq!(
+                    runtime.restriction_mode,
+                    RestrictionMode::Permanent,
+                    "five consecutive apply failures must promote to Permanent"
+                );
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// §2.4 test 6: a flapping service (drift observed again after every
+    /// successful heal) produces repeated SINGLE-apply heals. Each drift pass
+    /// only observes (the assert/apply branches are mutually exclusive within
+    /// one pass) and each heal pass applies exactly once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_posture_drift_clears_after_successful_apply_even_if_next_assert_fails_again() {
+        let (mut runtime, test_dir) = dns_posture_test_runtime("rustynetd-s1-flapping-heals");
+        runtime.reconcile(); // converge
+
+        for cycle in 0..3 {
+            // Drift again: the flapping service re-pinned to LAN DNS.
+            dry_run_fail_on(&mut runtime, "assert_dns_protection");
+            runtime.last_dns_posture_assert_unix =
+                Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+            let before = dns_posture_ops(&mut runtime);
+            runtime.reconcile();
+            let drift_delta = &dns_posture_ops(&mut runtime)[before.len()..];
+            assert_eq!(
+                count_op(drift_delta, "apply_dns_protection"),
+                0,
+                "cycle {cycle}: the drift pass must only observe — never apply \
+                 in the same pass (assert/apply mutex)"
+            );
+            assert!(
+                runtime.dns_posture_reassert_pending,
+                "cycle {cycle}: drift must schedule the heal"
+            );
+
+            // The scheduled heal: exactly ONE apply, latch cleared.
+            dry_run_fail_on(&mut runtime, "no-dry-run-stage-matches-this");
+            let before = dns_posture_ops(&mut runtime);
+            runtime.reconcile();
+            let heal_delta = &dns_posture_ops(&mut runtime)[before.len()..];
+            assert_eq!(
+                count_op(heal_delta, "apply_dns_protection"),
+                1,
+                "cycle {cycle}: exactly one healing apply, never a double-apply"
+            );
+            assert!(
+                !runtime.dns_posture_reassert_pending,
+                "cycle {cycle}: a successful heal must clear the latch"
+            );
+            assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+            assert_eq!(runtime.reconcile_failures, 0);
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// §2.4 test 8: the QH-04 mid-pass fail-close — a signed-state refresh
+    /// that fails INSIDE the pass (between the first `will_apply_generation`
+    /// read and the apply-branch re-read) flips the controller to FailClosed.
+    /// The apply branch must still run (the re-read catches the flip) AND the
+    /// posture re-assert must NOT run (the `else` arm is unreachable), with no
+    /// observation noise entering the failure accounting.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dns_posture_assert_not_run_when_traversal_refresh_fails_closed_mid_pass() {
+        let (mut runtime, test_dir) = dns_posture_test_runtime("rustynetd-s1-midpass-failclosed");
+        runtime.reconcile(); // converge: applied, else-arm healthy
+        let baseline = dns_posture_ops(&mut runtime).len();
+
+        // Prime the mid-pass flip: a changed runtime-endpoint fingerprint
+        // triggers the endpoint-change signed-state refresh; removing the
+        // traversal bundle makes that refresh fail INSIDE the pass (its
+        // traversal-state-missing guard fires: peers are managed but hints
+        // are gone), which restricts and force-fail-closes the controller
+        // between the first `will_apply_generation` read and the branch
+        // re-read.
+        let _ = std::fs::remove_file(test_dir.join("traversal.bundle"));
+        runtime.traversal_last_endpoint_fingerprint = Some("stale-endpoint-fingerprint".to_owned());
+        runtime.traversal_last_endpoint_change_unix = None;
+        // Prime the re-assert to fire IF the pass wrongly reaches the else
+        // arm: healthy posture, cadence elapsed.
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+
+        runtime.reconcile();
+
+        let delta = &dns_posture_ops(&mut runtime)[baseline..];
+        // The traversal-authority guard sits at the TOP of the apply block, so
+        // its rejection message is reachable ONLY from inside the apply branch
+        // — its presence proves the QH-04 branch re-read caught the mid-pass
+        // FailClosed flip and routed the pass into the apply block. (Enforced
+        // traversal mode then refuses the hint-less apply — the correct next
+        // guard, not a skipped branch; a REGRESSED re-read would instead fall
+        // to the else arm, whose primed re-assert would leave a converged
+        // pass with NO such error and no apply-block trace.)
+        assert!(
+            runtime.last_reconcile_error.as_deref().is_some_and(
+                |message| message.contains("traversal authority rejected reconcile apply")
+            ),
+            "the apply block must have run after the mid-pass flip: {:?}",
+            runtime.last_reconcile_error
+        );
+        // And the else arm did NOT run: the posture re-assert is primed to
+        // fire on any healthy else-arm pass (posture installed, cadence
+        // elapsed), so a zero assert count proves the mutual exclusion held.
+        assert_eq!(
+            count_op(delta, "assert_dns_protection"),
+            0,
+            "the posture re-assert must NOT run on a fail-closed mid-pass turn"
+        );
+        assert!(
+            !runtime.dns_posture_reassert_pending,
+            "a fail-closed mid-pass flip must not schedule a posture heal"
+        );
+        assert!(
+            !runtime.pending_generation_apply,
+            "the in-flight QH-04 flag must be cleared once the apply block has been attempted"
+        );
+        assert_eq!(
+            runtime.reconcile_failures, 1,
+            "the only failure-accounting entry must be the apply block's own \
+             traversal-authority guard"
+        );
+        assert!(
+            !runtime
+                .last_reconcile_error
+                .as_deref()
+                .is_some_and(|message| message.contains("posture")),
+            "the posture re-assert must contribute no observation noise to the \
+             failure accounting: {:?}",
+            runtime.last_reconcile_error
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
     }
 
     #[test]

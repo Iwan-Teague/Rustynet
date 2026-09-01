@@ -674,6 +674,14 @@ pub trait DataplaneSystem {
     fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
         Ok(())
     }
+    /// Whether the system currently reports the DNS fail-closed posture as
+    /// installed. Default false: only a system with a real runtime
+    /// `dns_protected` flag overrides this. The daemon's S1 posture
+    /// re-assert (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2) gates on
+    /// it, so a system that cannot observe the posture must never claim it.
+    fn dns_protected(&self) -> bool {
+        false
+    }
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError>;
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError>;
     fn rollback_ipv6_egress(&mut self) -> Result<(), SystemError> {
@@ -794,6 +802,11 @@ pub struct DryRunSystem {
     fail_operation: Option<String>,
     generation: u64,
     relay_forwarding_enabled: bool,
+    /// Mirrors the real systems' runtime posture flag: set by
+    /// `apply_dns_protection`, cleared by `rollback_dns_protection`. The S1
+    /// daemon posture re-assert gates on `dns_protected()`, so the DryRun
+    /// system must track the same lifecycle the macOS system does.
+    dns_protected: bool,
 }
 
 impl DryRunSystem {
@@ -933,7 +946,9 @@ impl DataplaneSystem for DryRunSystem {
     }
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
-        self.step("apply_dns_protection")
+        self.step("apply_dns_protection")?;
+        self.dns_protected = true;
+        Ok(())
     }
 
     fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
@@ -941,7 +956,13 @@ impl DataplaneSystem for DryRunSystem {
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
-        self.step("rollback_dns_protection")
+        self.step("rollback_dns_protection")?;
+        self.dns_protected = false;
+        Ok(())
+    }
+
+    fn dns_protected(&self) -> bool {
+        self.dns_protected
     }
 
     fn hard_disable_ipv6_egress(&mut self) -> Result<(), SystemError> {
@@ -4554,6 +4575,15 @@ impl DataplaneSystem for MacosCommandSystem {
         Ok(crate::linux_conntrack_flush::ConntrackFlushOutcome::PlatformUnsupported)
     }
 
+    /// Read-only accessor over the real runtime posture flag (S1,
+    /// MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2): the daemon's periodic
+    /// DNS posture re-assert gates on this before calling
+    /// `assert_dns_protection`, so it never runs against a node whose DNS
+    /// posture was never applied (or was rolled back).
+    fn dns_protected(&self) -> bool {
+        self.dns_protected
+    }
+
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
         self.dns_protected = true;
         if let Err(err) = self.apply_pf_rules(false) {
@@ -4575,9 +4605,13 @@ impl DataplaneSystem for MacosCommandSystem {
         // system-configuration failure: the pf DNS-block rules above are
         // installed, and reverting dns_protected would make the next reconcile
         // re-render pf WITHOUT the DNS-block rules (killswitch_spec reads
-        // dns_protected), dropping protection entirely. Instead the failed
-        // apply propagates (protected-mode entry fails closed) and the
-        // reconcile loop's assert_dns_protection keeps surfacing the drift.
+        // dns_protected), dropping protection entirely. This apply path
+        // asserts the posture once, at apply time. Drift that appears LATER
+        // on an otherwise-healthy node is surfaced by the daemon's periodic
+        // DNS posture re-assert (S1, MacosDnsFailclosedS1S4FixDesign_2026-08-31
+        // §2.2, 30 s cadence), which schedules exactly one re-apply through
+        // `dns_posture_reassert_pending`; a re-apply that fails escalates
+        // through the standard apply-failure restriction ladder.
         let services = self
             .enumerate_networksetup_services()
             .map_err(SystemError::DnsApplyFailed)?;
@@ -6216,6 +6250,20 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    /// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2): only the systems
+    /// with a real runtime DNS posture flag report it. The macOS system owns
+    /// the flag this re-assert exists for; the DryRun test system mirrors the
+    /// same lifecycle so the daemon-level tests can drive drift and healing.
+    /// The Linux and Windows systems stay on the trait default (false): the
+    /// S1 posture re-assert is a macOS-runtime concern and must skip them.
+    fn dns_protected(&self) -> bool {
+        match self {
+            RuntimeSystem::Macos(system) => system.dns_protected(),
+            RuntimeSystem::DryRun(system) => system.dns_protected(),
+            RuntimeSystem::Linux(_) | RuntimeSystem::Windows(_) => false,
+        }
+    }
+
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.rollback_dns_protection(),
@@ -6433,6 +6481,21 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
     pub fn serving_exit_node_active(&self) -> bool {
         self.current_serve_exit_node
+    }
+
+    /// Whether the system currently reports the DNS fail-closed posture as
+    /// installed (S1, MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2). The
+    /// daemon's periodic DNS posture re-assert gates on this.
+    pub fn dns_protected(&self) -> bool {
+        self.system.dns_protected()
+    }
+
+    /// Forward the DNS posture assert to the system (S1,
+    /// MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2). The daemon's
+    /// periodic posture re-assert observes through this single audited
+    /// entry point, exactly like the apply path asserts at apply time.
+    pub fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
+        self.system.assert_dns_protection()
     }
 
     pub fn lan_access_enabled(&self) -> bool {
@@ -8638,6 +8701,58 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+
+    /// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.4 test 7): the
+    /// daemon's periodic DNS posture re-assert consumes exactly the error
+    /// `MacosCommandSystem::assert_dns_protection` produces, so that error
+    /// MUST name the drifted service AND the servers it now advertises — an
+    /// anonymous "drift detected" would leave the operator unable to tell
+    /// which service re-pinned to LAN DNS, or what it now resolves through.
+    ///
+    /// Source-pinned because producing the message behaviorally requires
+    /// enumerating the live host's networksetup services (the system-
+    /// configuration half of the assert runs against the real host, like the
+    /// legend test further below); what needs protecting here is the
+    /// operator-facing naming, not the enumeration.
+    #[test]
+    fn assert_dns_protection_drift_error_names_service_and_servers() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        let macos_impl = code
+            .find("impl DataplaneSystem for MacosCommandSystem")
+            .expect("MacosCommandSystem must implement DataplaneSystem");
+        let body = &code[macos_impl..];
+        let fn_at = body
+            .find("fn assert_dns_protection(&mut self) -> Result<(), SystemError> {")
+            .expect("MacosCommandSystem must assert the DNS posture");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+
+        assert!(
+            body.contains(
+                "macOS DNS protection drifted: service '{service}' advertises non-loopback DNS servers {servers:?}",
+            ),
+            "the drift error must name the drifted service AND the server list it \
+             now advertises — S1's daemon logic surfaces exactly this error to \
+             the operator"
+        );
+        assert!(
+            body.contains(
+                "macOS DNS protection drifted: service '{service}' no longer pins any DNS server (expected 127.0.0.1)",
+            ),
+            "the un-pinned-service drift error must name the service and the \
+             expected loopback pin"
+        );
+        assert!(
+            body.contains("is_loopback_dns_server_list(&servers)"),
+            "the drift naming must be driven by the shared loopback classifier, \
+             not an ad-hoc check"
+        );
+    }
 
     /// IPV-10: the blind_exit evaluator must be ON the daemon assert path.
     ///
