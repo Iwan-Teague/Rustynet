@@ -77,6 +77,7 @@ pub mod preflight;
 pub mod relay_forwards_frame_validation;
 pub mod relay_validation;
 pub mod role_switch_matrix;
+pub mod role_transition_ordering_eval;
 pub mod runtime_acls_validation;
 pub mod scenario;
 pub mod security_audit_validation;
