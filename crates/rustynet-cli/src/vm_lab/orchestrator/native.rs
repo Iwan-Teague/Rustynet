@@ -250,16 +250,31 @@ pub(crate) fn execute_rust_native_orchestration(
         config.blind_exit_platform.as_deref(),
     )?;
 
-    // MAC-D1: record whether THIS run elected the macOS anchor validator set
-    // (`--anchor-platform macos`), which dispatches deploy_macos_anchor_profile
-    // + validate_macos_anchor_bundle_pull +
+    // MAC-D1: record whether THIS run elected the macOS anchor validator set,
+    // which dispatches deploy_macos_anchor_profile +
+    // validate_macos_anchor_bundle_pull +
     // validate_macos_anchor_port_mapping_authority in this same invocation.
+    // Election is OR-shaped: either the raw `--anchor-platform macos` flag was
+    // passed, or this run's --node assignments already give the Anchor role to
+    // a macOS inventory entry (the MCP/ai_lab_run path, which synthesizes
+    // `--node <alias>:anchor` from its role selectors and never forwards the
+    // raw flag).
     // The actual election is tightened further down, AFTER the plan is built:
     // the flag only stays true when the three validator stages really are in
     // this run's plan, so `anchor_validation` grades delegated evidence only
     // when the delegation actually dispatches (MAC-D3). A resumed context
     // reloads `false`, the fail-closed direction.
-    ctx.macos_anchor_validators_elected = config.anchor_platform.as_deref() == Some("macos");
+    let anchor_platform_macos_elected = anchor_platform_macos_elected(
+        config.anchor_platform.as_deref(),
+        &ctx.assignments,
+        &|alias| {
+            inventory
+                .iter()
+                .find(|e| e.alias == alias)
+                .and_then(|e| e.platform)
+        },
+    );
+    ctx.macos_anchor_validators_elected = anchor_platform_macos_elected;
 
     // MAC-D3: the macOS anchor validator stages need the inventory path to
     // resolve SSH targets inside the legacy vm_lab helpers they call. Run-local
@@ -333,7 +348,7 @@ pub(crate) fn execute_rust_native_orchestration(
             // MAC-D3 fast path: keep the three macOS anchor validator stages
             // in the plan when a macOS anchor is elected, even under
             // skip_live_suite, so the delegation tightening below stays true.
-            config.anchor_platform.as_deref() == Some("macos"),
+            anchor_platform_macos_elected,
             enable_chaos_suite,
             enable_negative_control,
             enable_relay_forwarding_validation,
@@ -379,7 +394,7 @@ pub(crate) fn execute_rust_native_orchestration(
     // they were dropped (skip_live_suite / setup-only mode), the delegation
     // would never dispatch, so `anchor_validation` must grade the runtime as
     // a reported skip instead of delegated evidence. Never silently green.
-    ctx.macos_anchor_validators_elected = config.anchor_platform.as_deref() == Some("macos")
+    ctx.macos_anchor_validators_elected = anchor_platform_macos_elected
         && [
             orchestrator::stage::StageId::MacosAnchorProfileDeploy,
             orchestrator::stage::StageId::MacosAnchorBundlePullValidation,
@@ -1001,6 +1016,32 @@ fn augment_assignments_from_platform_selectors(
     Ok(())
 }
 
+/// MAC-D1 anchor-platform election — the single source of truth for every
+/// plan-structure consumer of a macOS anchor. A macOS anchor is elected when
+/// EITHER the raw `--anchor-platform macos` flag was passed OR this run's node
+/// assignments already place the Anchor role on a macOS inventory entry. The
+/// second disjunct is what makes the MCP/ai_lab_run path work: it synthesizes
+/// `--node <alias>:anchor` from its role selectors and never forwards the raw
+/// flag, so reading the flag alone starved the three MacosAnchor* validator
+/// stages of their plan-structure election (see
+/// AnchorPlatformSelectorPropagationInvestigation_2026-08-31.md §4).
+/// `platform_of_alias` resolves an assignment alias to its inventory platform
+/// (`None` when the alias is absent, which never counts as macOS).
+fn anchor_platform_macos_elected(
+    anchor_platform: Option<&str>,
+    assignments: &[orchestrator::role_assignment::NodeRoleAssignment],
+    platform_of_alias: &dyn Fn(&str) -> Option<VmGuestPlatform>,
+) -> bool {
+    use orchestrator::role::NodeRole;
+    if anchor_platform == Some("macos") {
+        return true;
+    }
+    assignments.iter().any(|assignment| {
+        assignment.role == NodeRole::Anchor
+            && platform_of_alias(&assignment.alias) == Some(VmGuestPlatform::Macos)
+    })
+}
+
 fn filter_rust_native_stages_for_mode(
     mut stages: Vec<Box<dyn orchestrator::stage::OrchestrationStage>>,
     setup_only: bool,
@@ -1176,4 +1217,64 @@ pub(crate) fn ensure_orchestration_network_profile_record(
         .map_err(|err| format!("serialize network profile record failed: {err}"))?;
     write_orchestration_artifact(&record_path, &serialized)?;
     Ok(record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use orchestrator::role::NodeRole;
+    use orchestrator::role_assignment::NodeRoleAssignment;
+
+    fn assignment(alias: &str, role: NodeRole) -> NodeRoleAssignment {
+        NodeRoleAssignment {
+            alias: alias.to_string(),
+            role,
+        }
+    }
+
+    #[test]
+    fn anchor_election_uses_macos_assignment_without_raw_flag() {
+        // Simulates the MCP/ai_lab_run path: the selector is synthesized into
+        // `--node macos-utm-1:anchor` and config.anchor_platform stays empty.
+        let assignments = vec![assignment("macos-utm-1", NodeRole::Anchor)];
+        let platform_of_alias =
+            |alias: &str| (alias == "macos-utm-1").then_some(VmGuestPlatform::Macos);
+        assert!(anchor_platform_macos_elected(
+            None,
+            &assignments,
+            &platform_of_alias
+        ));
+    }
+
+    #[test]
+    fn anchor_election_stays_false_without_macos_anchor_or_flag() {
+        // No anchor role at all.
+        let assignments = vec![assignment("linux-x86-exit-1", NodeRole::Exit)];
+        let platform_of_alias =
+            |alias: &str| (alias == "linux-x86-exit-1").then_some(VmGuestPlatform::Linux);
+        assert!(!anchor_platform_macos_elected(
+            None,
+            &assignments,
+            &platform_of_alias
+        ));
+        // Anchor role on a non-macOS node does not elect (platform gate).
+        let assignments = vec![assignment("linux-x86-exit-1", NodeRole::Anchor)];
+        assert!(!anchor_platform_macos_elected(
+            None,
+            &assignments,
+            &platform_of_alias
+        ));
+        // Unknown alias resolves to no platform, so it never elects.
+        assert!(!anchor_platform_macos_elected(
+            None,
+            &assignments,
+            &|_: &str| None
+        ));
+        // The raw flag alone still elects (backwards-compatible path).
+        assert!(anchor_platform_macos_elected(
+            Some("macos"),
+            &[],
+            &|_: &str| None
+        ));
+    }
 }
