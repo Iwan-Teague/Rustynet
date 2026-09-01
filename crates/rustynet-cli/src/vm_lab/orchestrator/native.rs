@@ -329,6 +329,10 @@ pub(crate) fn execute_rust_native_orchestration(
             source_mode,
             config.allow_dirty,
             skip_live_suite,
+            // MAC-D3 fast path: keep the three macOS anchor validator stages
+            // in the plan when a macOS anchor is elected, even under
+            // skip_live_suite, so the delegation tightening below stays true.
+            config.anchor_platform.as_deref() == Some("macos"),
             enable_chaos_suite,
             enable_negative_control,
             config.skip_soak,
@@ -910,6 +914,7 @@ fn build_rust_native_orchestration_stages(
     source_mode: orchestrator::stage::source_archive::ArchiveSourceMode,
     allow_dirty: bool,
     skip_live_suite: bool,
+    anchor_platform_macos: bool,
     enable_chaos_suite: bool,
     enable_negative_control: bool,
     skip_soak: bool,
@@ -922,6 +927,7 @@ fn build_rust_native_orchestration_stages(
         .with_source_mode(source_mode)
         .with_allow_dirty(allow_dirty)
         .with_skip_live_suite(skip_live_suite)
+        .with_anchor_platform_macos(anchor_platform_macos)
         .with_enable_chaos_suite(enable_chaos_suite)
         .with_enable_negative_control(enable_negative_control)
         .with_skip_soak(skip_soak)
@@ -1022,6 +1028,7 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
         false,
         false,
         false,
+        false,
         orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         1,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1040,6 +1047,7 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
         build_rust_native_orchestration_stages(
             None,
             orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+            false,
             false,
             false,
             false,
