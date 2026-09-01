@@ -26,6 +26,7 @@ pub mod key_custody;
 pub mod mesh_status;
 pub mod relay;
 pub mod runtime_acls;
+pub mod secrets_not_in_logs_eval;
 pub mod security_audit;
 pub mod service_hardening;
 
