@@ -193,6 +193,7 @@ phase checklists that finished (Phase 1, 2, 3, 5) have moved to
 
 Previously-unindexed active files, now listed for discoverability:
 
+- [RepoCodeWorkHunt_2026-09-01.md](./RepoCodeWorkHunt_2026-09-01.md) — docs-only production-code hunt (six categories, per-hit open-and-read verification): essentially clean; two P3 findings (llm-gateway scope=None-unrestricted design confirmation, whole-file `allow(dead_code)` on two macOS backend files) plus a cleared-with-evidence list so future hunts don't re-read the same ground
 - [NetworkFlapHandshakeCapture_2026-08-27.md](./NetworkFlapHandshakeCapture_2026-08-27.md) — QH-51 packet/state capture of the network-flap "handshake never returns" failure: NON-REPRODUCTION on current main (4/4 cycles recover in 8s, both Linux backends), mechanism packet-proven; closes QH-51
 - [AdversarialSecurityReview_2026-07-29.md](./AdversarialSecurityReview_2026-07-29.md) — adversarial security review
 - [AdversarialSecurityRemediation_2026-07-29.md](./AdversarialSecurityRemediation_2026-07-29.md) — remediation for the review above
