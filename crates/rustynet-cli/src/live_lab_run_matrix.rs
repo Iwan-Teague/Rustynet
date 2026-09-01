@@ -445,16 +445,30 @@ pub fn default_live_lab_run_matrix_path() -> PathBuf {
 /// the column, one of them `traffic_test_matrix` (mesh-ping) rather than a two-hop
 /// proof. The alias is removed as of 2026-07-27 (QH-07), at the production source of
 /// truth: the `logical` field on the `traffic_test_matrix` spec in
-/// `live_lab_stage_registry.rs`. The two ids that still map to `two_hop`,
-/// `live_two_hop_validation` and `live_two_hop`, are both genuine chained-exit proofs.
+/// `live_lab_stage_registry.rs`. After the removal, `live_two_hop_validation` is the
+/// ONLY two-hop stage id the Rust `--node` engine dispatches (`LiveTwoHopValidation`,
+/// `stage/mod.rs`); the other entry that still maps to the `two_hop` logical column,
+/// `live_two_hop` (`live_lab_stage_registry.rs:1943`), is a bash-dialect spec with no
+/// StageId variant and can never write a `--node` row.
 ///
 /// **The removal is FORWARD-ONLY: rows written before that commit are contaminated.**
-/// Counted at commit `9cdd660f`, this 94-row file holds **35 `linux_stage_two_hop =
-/// pass` rows** (against fail 27 / skip 23 / not_run 9) that are `traffic_test_matrix`
-/// results, at a time when `live_two_hop_validation` had never passed even once —
-/// its per-stage record is skip 222 / fail 81 / **pass 0**. Do not read a historical
-/// `two_hop` pass as evidence the chained
-/// exit path worked; go to `live_lab_node_stage_results.csv` for the per-stage truth,
+/// Counted at commit `9cdd660f`, the then-94-row file held **35 `linux_stage_two_hop =
+/// pass` rows** (against fail 27 / skip 23 / not_run 9) that were actually
+/// `traffic_test_matrix` results. Those pre-removal rows stay permanently
+/// contaminated; do not read a historical `two_hop` pass from before 2026-07-27 as
+/// evidence the chained exit path worked. In the cleaned ledger the column is
+/// trustworthy: across the 148 rows written after the removal,
+/// `linux_stage_two_hop` reads pass 26 / fail 8 / skip 86 / not_run 28.
+///
+/// The earlier "never passed" belief is itself retired — it was an artifact of the
+/// same contamination. Counted 2026-09-01 (quote-aware parse of
+/// `live_lab_node_stage_results.csv` and `live_lab_node_run_matrix.csv`),
+/// `live_two_hop_validation`'s per-stage record on Linux is **pass 130 / fail 121 /
+/// skip 449** node-rows: first `--node` pass 2026-08-14 (the earlier failures traced
+/// to firewalld's forward chain rejecting after ours; the fix binds the tunnel to the
+/// default zone), last pass 2026-08-27 (run `livelab-1787835449-4b1d946795ad`,
+/// commit `4b1d946795ad`). Off Linux the stage is never dispatched — macOS 32/32 and
+/// Windows 4/4 skip. Go to `live_lab_node_stage_results.csv` for the per-stage truth,
 /// or to the stage's own report (`live_two_hop_report.json`, whose `dataplane` block
 /// carries the actual measurements). Note also that a quote-aware CSV parse is required
 /// to read these columns at all — every row has commas inside quoted fields, so a naive
