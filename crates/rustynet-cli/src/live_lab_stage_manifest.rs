@@ -127,6 +127,8 @@ pub struct ManifestSelectors {
     #[serde(default)]
     pub negative_control_suite: bool,
     #[serde(default)]
+    pub relay_forwarding_validation: bool,
+    #[serde(default)]
     pub local_gate_suite: bool,
 }
 
@@ -147,6 +149,7 @@ impl From<&TargetSelectors> for ManifestSelectors {
             cross_network_suite: selectors.cross_network_suite,
             soak_suite: selectors.soak_suite,
             negative_control_suite: selectors.negative_control_suite,
+            relay_forwarding_validation: selectors.relay_forwarding_validation,
             local_gate_suite: selectors.local_gate_suite,
         }
     }
@@ -349,6 +352,7 @@ mod tests {
             soak_suite: true,
             local_gate_suite: true,
             negative_control_suite: true,
+            relay_forwarding_validation: true,
         }
     }
 

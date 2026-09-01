@@ -31,6 +31,7 @@
 //!    `ORCHESTRATOR_STAGES` doc table and the `EXPECTED` list in
 //!    `orchestrator_stages_doc_matches_the_rust_planbuilder` (cross-crate
 //!    string gate; keep it equal to `StageId::ALL` order).
+use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 use crate::vm_lab::orchestrator::stage::active_exit::ActiveExitStage;
 use crate::vm_lab::orchestrator::stage::admin_issue::AdminIssueStage;
 use crate::vm_lab::orchestrator::stage::anchor_validation::AnchorValidationStage;
@@ -92,6 +93,7 @@ use crate::vm_lab::orchestrator::stage::negative_control::{
     NegativeControlSignedBundleRejectionStage, NegativeControlWrongNodeSubstitutionStage,
 };
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
+use crate::vm_lab::orchestrator::stage::relay_forwards_frame_validation::RelayForwardsFrameValidationStage;
 use crate::vm_lab::orchestrator::stage::relay_validation::RelayValidationStage;
 use crate::vm_lab::orchestrator::stage::role_switch_matrix::RoleSwitchMatrixStage;
 use crate::vm_lab::orchestrator::stage::runtime_acls_validation::RuntimeAclsValidationStage;
@@ -103,7 +105,6 @@ use crate::vm_lab::orchestrator::stage::source_archive::{
 use crate::vm_lab::orchestrator::stage::traffic_test_matrix::TrafficTestMatrixStage;
 use crate::vm_lab::orchestrator::stage::validate_runtime::ValidateBaselineRuntimeStage;
 use crate::vm_lab::orchestrator::stage::verify_ssh::VerifySshReachabilityStage;
-use crate::vm_lab::orchestrator::stage::OrchestrationStage;
 
 /// Builds the ordered list of stages for a lab run.
 #[derive(Default)]
@@ -136,6 +137,12 @@ pub struct PlanBuilder {
     /// adjudication stages. Like chaos they stay outside the default plan so a
     /// normal live lab never injects the negative-control faults.
     enable_negative_control: bool,
+    /// `--enable-relay-forwarding-validation`: append the HP-3 opt-in
+    /// relay-frame-forwarding stage. It stays OUT of the default plan
+    /// (its own Disruptive suite) because the proof injects nft blocks on
+    /// two peer daemons and restarts them MID-RUN (QH-64); only an explicit
+    /// operator election carries that disruption.
+    enable_relay_forwarding_validation: bool,
     /// `--skip-soak`: drop the long-running extended soak composite.
     skip_soak: bool,
     /// `--skip-cross-network`: when false, run the Rust-owned cross-network
@@ -231,6 +238,15 @@ impl PlanBuilder {
         self
     }
 
+    /// Append the HP-3 opt-in relay-frame-forwarding stage to the plan.
+    pub fn with_enable_relay_forwarding_validation(
+        mut self,
+        enable_relay_forwarding_validation: bool,
+    ) -> Self {
+        self.enable_relay_forwarding_validation = enable_relay_forwarding_validation;
+        self
+    }
+
     pub fn with_skip_soak(mut self, skip_soak: bool) -> Self {
         self.skip_soak = skip_soak;
         self
@@ -264,6 +280,7 @@ impl PlanBuilder {
             anchor_platform_macos,
             enable_chaos_suite,
             enable_negative_control,
+            enable_relay_forwarding_validation,
             skip_soak,
             cross_network,
             max_parallel_node_workers,
@@ -297,6 +314,9 @@ impl PlanBuilder {
                 StageSuite::CrossNetwork => !skip_live_suite && cross_network.enable_suite,
                 StageSuite::Chaos => !skip_live_suite && enable_chaos_suite,
                 StageSuite::NegativeControl => !skip_live_suite && enable_negative_control,
+                // HP-3 disruptive opt-in: same guarantee as chaos — dropped by
+                // --skip-linux-live-suite AND absent unless explicitly elected.
+                StageSuite::Disruptive => !skip_live_suite && enable_relay_forwarding_validation,
             }
         };
 
@@ -377,6 +397,9 @@ impl PlanBuilder {
                     // Relay node so relay_validation has a live relay to prove.
                     StageId::DeployRelayService => Box::new(DeployRelayServiceStage),
                     StageId::RelayValidation => Box::new(RelayValidationStage),
+                    StageId::RelayForwardsFrameValidation => {
+                        Box::new(RelayForwardsFrameValidationStage)
+                    }
                     StageId::TrafficTestMatrix => Box::new(TrafficTestMatrixStage),
                     StageId::RoleSwitchMatrix => Box::new(RoleSwitchMatrixStage),
                     StageId::ExitHandoff => Box::new(ExitHandoffStage),
@@ -631,6 +654,111 @@ mod tests {
             stages.len(),
             77,
             "64 default + 9 chaos + 4 negative-control"
+        );
+    }
+
+    // HP-3: the relay-frame-forwarding proof is Disruptive by design (nft
+    // blocks + two peer daemon restarts MID-RUN, QH-64) — it must be
+    // absent from the default plan and appear ONLY on explicit election,
+    // exactly mirroring the chaos suite's opt-in guarantee.
+    #[test]
+    fn relay_forwarding_validation_absent_from_default_plan() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        // The default count MUST stay 64: a change here means the disruptive
+        // stage leaked into the default plan (a wiring bug, not a test bump).
+        let default_ids: Vec<StageId> = PlanBuilder::new().build().iter().map(|s| s.id()).collect();
+        assert_eq!(default_ids.len(), 64, "default plan must stay 64 stages");
+        assert!(
+            !default_ids.contains(&StageId::RelayForwardsFrameValidation),
+            "the disruptive relay-forwarding stage must NOT be in the default plan"
+        );
+    }
+
+    #[test]
+    fn relay_forwarding_validation_opt_in_appends_one_stage() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new()
+            .with_enable_relay_forwarding_validation(true)
+            .build();
+        let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            ids.len(),
+            65,
+            "relay-forwarding-enabled plan must contain 65 stages"
+        );
+        assert!(ids.contains(&StageId::RelayForwardsFrameValidation));
+        // Placed after relay_validation (its lifecycle gate) and still last
+        // before cleanup — the disruptive daemon restarts must disturb the
+        // fewest downstream stages.
+        let relay_pos = ids
+            .iter()
+            .position(|id| id == &StageId::RelayValidation)
+            .expect("relay_validation in plan");
+        let hp3_pos = ids
+            .iter()
+            .position(|id| id == &StageId::RelayForwardsFrameValidation)
+            .expect("relay_forwards_frame_validation in plan");
+        assert!(
+            hp3_pos > relay_pos,
+            "HP-3 stage must run after relay_validation"
+        );
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
+    }
+
+    #[test]
+    fn skip_live_suite_drops_relay_forwarding_validation_too() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let stages = PlanBuilder::new()
+            .with_enable_relay_forwarding_validation(true)
+            .with_skip_live_suite(true)
+            .build();
+        let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
+        assert!(
+            !ids.contains(&StageId::RelayForwardsFrameValidation),
+            "skip-live-suite must drop the opt-in relay-forwarding stage"
+        );
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
+    }
+
+    #[test]
+    fn relay_forwarding_validation_stacks_with_opt_in_suites() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let chaos_plus_hp3 = PlanBuilder::new()
+            .with_enable_chaos_suite(true)
+            .with_enable_relay_forwarding_validation(true)
+            .build();
+        assert_eq!(
+            chaos_plus_hp3.len(),
+            74,
+            "64 default + 9 chaos + 1 relay-forwarding"
+        );
+        let stacked = PlanBuilder::new()
+            .with_enable_chaos_suite(true)
+            .with_enable_negative_control(true)
+            .with_enable_relay_forwarding_validation(true)
+            .build();
+        let ids: Vec<StageId> = stacked.iter().map(|s| s.id()).collect();
+        assert_eq!(
+            stacked.len(),
+            78,
+            "64 default + 9 chaos + 4 negative-control + 1 relay-forwarding"
+        );
+        assert_eq!(ids.last(), Some(&StageId::Cleanup));
+    }
+
+    #[test]
+    fn relay_forwarding_validation_plan_has_no_duplicate_stages() {
+        use std::collections::HashSet;
+        let stages = PlanBuilder::new()
+            .with_enable_relay_forwarding_validation(true)
+            .with_enable_chaos_suite(true)
+            .build();
+        let ids: Vec<_> = stages.iter().map(|s| s.id()).collect();
+        let unique: HashSet<_> = ids.iter().collect();
+        assert_eq!(
+            ids.len(),
+            unique.len(),
+            "every stage id must be unique under the relay-forwarding flag"
         );
     }
 

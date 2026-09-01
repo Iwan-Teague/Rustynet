@@ -74,6 +74,7 @@ pub mod membership_init;
 pub mod mesh_status_validation;
 pub mod negative_control;
 pub mod preflight;
+pub mod relay_forwards_frame_validation;
 pub mod relay_validation;
 pub mod role_switch_matrix;
 pub mod runtime_acls_validation;
@@ -114,6 +115,14 @@ pub enum StageSuite {
     /// the default plan so a normal live lab never injects the negative-control
     /// faults. See `stage/negative_control.rs`.
     NegativeControl,
+    /// HP-3 relay-frame-forwarding opt-in validation. Opt-in via
+    /// `--enable-relay-forwarding-validation` (and dropped by
+    /// `--skip-linux-live-suite`), mirroring the chaos suite's opt-in
+    /// guarantee: it stays OUT of the default plan because it injects nft
+    /// blocks on two peer daemons and restarts them MID-RUN (QH-64), so a
+    /// normal live lab never carries that disruption. See
+    /// `stage/relay_forwards_frame_validation.rs`.
+    Disruptive,
     /// Final teardown. Always included; `always_run`-exempt from
     /// skip-cascade.
     Cleanup,
@@ -247,6 +256,14 @@ define_stage_catalog! {
     LiveMixedTopologyValidation => "live_mixed_topology_validation" @ Live / T3CrossOs,
     // HELLO-flood rate-limiter adversarial probe (DOS-1) — security tier.
     LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation" @ Live / T4Security,
+    // HP-3 relay-frame-forwarding opt-in proof: asserts the relay actually
+    // FORWARDS ciphertext between two peers (not just accepts registrations)
+    // by blocking direct peer↔peer nft paths and routing a counter-probe
+    // through the relay. Disruptive by design (nft blocks + two daemon
+    // restarts mid-run, QH-64) — hence its own Disruptive suite, last Live
+    // placement to minimize the post-restart tail, opt-in via
+    // --enable-relay-forwarding-validation. Role-capability proof: T1.
+    RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role,
     LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience,
     // Cross-NETWORK ≠ cross-OS: this suite exercises NAT/netns traversal
     // between simulated networks (spec §3 has no cross-network tier), so

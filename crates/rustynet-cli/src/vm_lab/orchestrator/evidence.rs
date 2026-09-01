@@ -162,6 +162,7 @@ pub(crate) fn orchestrate_manifest_selectors(
         soak_suite: !config.skip_soak,
         local_gate_suite: !config.skip_gates,
         negative_control_suite: config.enable_negative_control,
+        relay_forwarding_validation: config.enable_relay_forwarding_validation,
     }
 }
 
@@ -1482,7 +1483,10 @@ mod finalize_tests {
         // in every target that contains this test. The name is unique, so
         // the child runs exactly this one test.
         let output = std::process::Command::new(std::env::current_exe().expect("current_exe"))
-            .args(["stage_transitions_emit_exactly_one_stderr_line_each", "--nocapture"])
+            .args([
+                "stage_transitions_emit_exactly_one_stderr_line_each",
+                "--nocapture",
+            ])
             .env(CHILD_ENV, "1")
             .output()
             .expect("re-exec this test binary");

@@ -355,6 +355,7 @@ pub fn verify_recorded_plan_not_shrunk(report_dir: &Path) -> Result<(), String> 
         .with_anchor_platform_macos(selectors.anchor_platform == "macos")
         .with_enable_chaos_suite(selectors.chaos_suite)
         .with_enable_negative_control(selectors.negative_control_suite)
+        .with_enable_relay_forwarding_validation(selectors.relay_forwarding_validation)
         .with_skip_soak(!selectors.soak_suite)
         .with_cross_network_options(cross_network)
         .build();
@@ -817,6 +818,7 @@ mod tests {
             cross_network_suite: true,
             soak_suite: true,
             negative_control_suite: true,
+            relay_forwarding_validation: true,
             local_gate_suite: false,
             ..Default::default()
         }
@@ -830,6 +832,7 @@ mod tests {
         cross: bool,
         soak: bool,
         neg: bool,
+        hp3: bool,
     ) -> ResolvedPlan {
         let cross_network =
             crate::vm_lab::orchestrator::stage::cross_network::CrossNetworkOptions {
@@ -840,6 +843,7 @@ mod tests {
             .with_skip_live_suite(skip_live)
             .with_enable_chaos_suite(chaos)
             .with_enable_negative_control(neg)
+            .with_enable_relay_forwarding_validation(hp3)
             .with_skip_soak(!soak)
             .with_cross_network_options(cross_network)
             .build();
@@ -879,7 +883,7 @@ mod tests {
         let dir = tmp.path();
         write_manifest(dir, "full", true);
         // The recorded plan matches what the selectors demand (the full set).
-        let plan = build_real_plan(false, true, true, true, true);
+        let plan = build_real_plan(false, true, true, true, true, true);
         write_resolved_plan(dir, &plan).expect("write plan");
         verify_recorded_plan_not_shrunk(dir).expect("a faithful full-run plan verifies");
     }
@@ -892,7 +896,7 @@ mod tests {
         write_manifest(dir, "full", true);
         // ...but the recorded plan was built with the live suite skipped — a
         // shrink the manifest's own selectors do not permit.
-        let shrunk = build_real_plan(true, true, true, true, true);
+        let shrunk = build_real_plan(true, true, true, true, true, true);
         write_resolved_plan(dir, &shrunk).expect("write plan");
         let err = verify_recorded_plan_not_shrunk(dir)
             .expect_err("a plan smaller than its selectors demand must be rejected");

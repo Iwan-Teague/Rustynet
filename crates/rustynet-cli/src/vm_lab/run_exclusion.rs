@@ -416,6 +416,7 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         macos_promote_exit: _,
         enable_chaos_suite: _,
         enable_negative_control: _,
+        enable_relay_forwarding_validation: _,
         stage_timeout_secs: _,
         skip_linux_live_suite: _,
     } = config;
