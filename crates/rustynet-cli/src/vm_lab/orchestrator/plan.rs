@@ -123,6 +123,12 @@ pub struct PlanBuilder {
     /// only setup → baseline → cleanup. The fast inner loop (mesh-health check /
     /// mac-win cell iteration) that the MCP loop tooling already emits.
     skip_live_suite: bool,
+    /// `--anchor-platform macos`: keep the three MAC-D3 macOS anchor validator
+    /// stages in the plan even when `skip_live_suite` drops the rest of the
+    /// live suite, so a fast-path run that elects a macOS anchor still
+    /// dispatches them (and the downstream `macos_anchor_validators_elected`
+    /// tightening in native.rs stays true instead of grading a reported skip).
+    anchor_platform_macos: bool,
     /// `--enable-chaos-suite`: append the opt-in chaos stages. They remain
     /// outside the default plan so a normal live lab does not inject faults.
     enable_chaos_suite: bool,
@@ -206,6 +212,13 @@ impl PlanBuilder {
         self
     }
 
+    /// `--anchor-platform macos`: keep the three macOS anchor validator stages
+    /// in the plan even when the live suite is skipped (MAC-D3 fast path).
+    pub fn with_anchor_platform_macos(mut self, anchor_platform_macos: bool) -> Self {
+        self.anchor_platform_macos = anchor_platform_macos;
+        self
+    }
+
     /// Append the opt-in chaos stages to the plan.
     pub fn with_enable_chaos_suite(mut self, enable_chaos_suite: bool) -> Self {
         self.enable_chaos_suite = enable_chaos_suite;
@@ -248,6 +261,7 @@ impl PlanBuilder {
             source_mode,
             allow_dirty,
             skip_live_suite,
+            anchor_platform_macos,
             enable_chaos_suite,
             enable_negative_control,
             skip_soak,
@@ -261,8 +275,22 @@ impl PlanBuilder {
         // `--skip-linux-live-suite` keeps only setup → baseline → cleanup
         // (cleanup is always-run teardown and is never dropped, so this
         // run's own killswitch / exit-NAT residue is still removed).
-        let include = |suite: StageSuite| -> bool {
-            match suite {
+        // MAC-D3 exception: when a macOS anchor is elected on the fast path,
+        // the three macOS anchor validator stages are retained even though
+        // the rest of the live suite is dropped; they still skip-with-reason
+        // internally unless a macOS anchor node is assigned.
+        let include = |id: &StageId| -> bool {
+            if anchor_platform_macos
+                && matches!(
+                    id,
+                    StageId::MacosAnchorProfileDeploy
+                        | StageId::MacosAnchorBundlePullValidation
+                        | StageId::MacosAnchorPortMappingAuthorityValidation
+                )
+            {
+                return true;
+            }
+            match id.suite() {
                 StageSuite::Setup | StageSuite::Cleanup => true,
                 StageSuite::Live => !skip_live_suite,
                 StageSuite::Soak => !skip_live_suite && !skip_soak,
@@ -277,7 +305,7 @@ impl PlanBuilder {
         // plan membership can no longer silently drift from the catalog.
         StageId::ALL
             .iter()
-            .filter(|id| include(id.suite()))
+            .filter(|id| include(id))
             .map(|id| -> Box<dyn OrchestrationStage> {
                 match id {
                     StageId::Preflight => Box::new(PreflightStage),
@@ -480,10 +508,12 @@ mod tests {
     }
 
     // MAC-D3: the three macOS anchor validators must be part of the
-    // engine-of-record plan so a macOS anchor run dispatches them live, and
-    // they must drop out with the rest of the live suite when it is skipped
-    // (the anchor election tightening in native.rs then grades the delegated
-    // coverage as a reported skip instead of a silent pass).
+    // engine-of-record plan so a macOS anchor run dispatches them live. When
+    // the live suite is skipped they drop out — UNLESS the run also elected a
+    // macOS anchor, in which case they are retained so the fast path still
+    // dispatches them; every other live stage (e.g. LiveTwoHopValidation)
+    // still drops. Without the election flag the original drop behavior
+    // holds, so the native.rs tightening can keep grading a reported skip.
     #[test]
     fn macos_anchor_validator_stages_follow_the_live_suite_gate() {
         let ids = |builder: PlanBuilder| -> Vec<crate::vm_lab::orchestrator::stage::StageId> {
@@ -508,10 +538,28 @@ mod tests {
             let id = id.clone();
             assert!(
                 !without_live.contains(&id),
-                "skip_live_suite must drop {:?}; the elected flag then degrades to a reported skip",
+                "skip_live_suite must drop {:?} unless a macOS anchor is elected",
                 id
             );
         }
+        // Fast path: electing a macOS anchor keeps the three validators in the
+        // plan even with the live suite skipped, so the native.rs
+        // macos_anchor_validators_elected tightening stays true.
+        let fast_path = ids(PlanBuilder::new()
+            .with_skip_live_suite(true)
+            .with_anchor_platform_macos(true));
+        for id in &expected {
+            let id = id.clone();
+            assert!(
+                fast_path.contains(&id),
+                "skip_live_suite + anchor-platform macos must retain {:?} (MAC-D3 fast path)",
+                id
+            );
+        }
+        assert!(
+            !fast_path.contains(&crate::vm_lab::orchestrator::stage::StageId::LiveTwoHopValidation),
+            "the macOS anchor exception must not resurrect the rest of the live suite"
+        );
     }
 
     #[test]
