@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 
-use rustynet_control::role_audit::{verify_role_audit_chain, RoleAuditEntry};
+use rustynet_control::role_audit::{RoleAuditEntry, verify_role_audit_chain};
 use rustynet_control::role_presets::{
     Capability, RolePreset, ServiceKind, TransitionKind, TransitionPlan,
 };
@@ -358,7 +358,7 @@ fn hex_decode(input: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use rustynet_control::role_audit::{
-        append_role_audit_entry, read_role_audit_log, RoleTransitionEvent, RoleTransitionOutcome,
+        RoleTransitionEvent, RoleTransitionOutcome, append_role_audit_entry, read_role_audit_log,
     };
     use rustynet_control::role_presets::transition_plan;
     use std::path::{Path, PathBuf};
@@ -382,12 +382,14 @@ mod tests {
             OrderingRule::TeardownBeforeCapabilityRemoval,
             OrderingRule::BlindExitIrreversible,
         ] {
-            assert!(compare_ordering(
-                rule,
-                &observation(Some(100), None),
-                &observation(Some(200), None)
-            )
-            .is_ok());
+            assert!(
+                compare_ordering(
+                    rule,
+                    &observation(Some(100), None),
+                    &observation(Some(200), None)
+                )
+                .is_ok()
+            );
         }
     }
 
@@ -422,12 +424,14 @@ mod tests {
                 StateAnchor::FreshProcessIdentity,
                 StateAnchor::FirstEverObservation,
             ] {
-                assert!(compare_ordering(
-                    rule,
-                    &observation(Some(150), Some(anchor)),
-                    &observation(Some(150), None)
-                )
-                .is_ok());
+                assert!(
+                    compare_ordering(
+                        rule,
+                        &observation(Some(150), Some(anchor)),
+                        &observation(Some(150), None)
+                    )
+                    .is_ok()
+                );
                 let err = compare_ordering(
                     rule,
                     &observation(Some(150), None),
@@ -451,31 +455,39 @@ mod tests {
                 StateAnchor::FreshProcessIdentity,
                 StateAnchor::FirstEverObservation,
             ] {
-                assert!(compare_ordering(
-                    rule,
-                    &observation(None, Some(anchor)),
-                    &observation(Some(200), None)
-                )
-                .is_ok());
-                assert!(compare_ordering(
-                    rule,
-                    &observation(None, None),
-                    &observation(Some(200), None)
-                )
-                .is_err());
+                assert!(
+                    compare_ordering(
+                        rule,
+                        &observation(None, Some(anchor)),
+                        &observation(Some(200), None)
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    compare_ordering(
+                        rule,
+                        &observation(None, None),
+                        &observation(Some(200), None)
+                    )
+                    .is_err()
+                );
             }
-            assert!(compare_ordering(
-                rule,
-                &observation(Some(100), Some(StateAnchor::FirstEverObservation)),
-                &observation(None, None)
-            )
-            .is_ok());
-            assert!(compare_ordering(
-                rule,
-                &observation(Some(100), None),
-                &observation(None, None)
-            )
-            .is_err());
+            assert!(
+                compare_ordering(
+                    rule,
+                    &observation(Some(100), Some(StateAnchor::FirstEverObservation)),
+                    &observation(None, None)
+                )
+                .is_ok()
+            );
+            assert!(
+                compare_ordering(
+                    rule,
+                    &observation(Some(100), None),
+                    &observation(None, None)
+                )
+                .is_err()
+            );
         }
     }
 
@@ -734,11 +746,7 @@ mod tests {
             .enumerate()
             .map(|(i, c)| {
                 if i == 0 {
-                    if c == '0' {
-                        '1'
-                    } else {
-                        '0'
-                    }
+                    if c == '0' { '1' } else { '0' }
                 } else {
                     c
                 }
