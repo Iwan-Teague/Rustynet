@@ -126,18 +126,19 @@ pub fn inspect_registry_key_sddl(_key_path: &str) -> Result<String, String> {
 }
 
 /// W5 — Authenticode signer-certificate SHA-256 thumbprint
-/// extractor. On Windows the implementation calls
-/// `CryptQueryObject` to open the PE's signature blob, walks the
-/// CMS SignerInfo via `CryptMsgGetParam(CMSG_SIGNER_CERT_INFO_PARAM)`,
-/// derives the signer's certificate context from the SignedData,
-/// and reads `CertGetCertificateContextProperty(CERT_SHA256_HASH_PROP_ID)`.
-/// Returns the lowercase hex of the 32-byte SHA-256 hash.
+/// extractor. The Win32 surface (`CryptQueryObject` +
+/// `CryptMsgGetParam` + `CertGetCertificateContextProperty(
+/// CERT_SHA256_HASH_PROP_ID)`) has NOT yet been validated against
+/// a Windows runtime fixture, so BOTH bodies below are fail-closed
+/// placeholders: extraction is permanently Err today on every
+/// platform. Nothing calls WinVerifyTrust or the Crypt32 helpers
+/// from here yet, and no thumbprint is ever returned.
 ///
-/// Off-Windows the stub returns a clear platform blocker — callers
-/// that supply a thumbprint policy then get a fail-closed result
-/// via `evaluate_thumbprint_policy(None, &policy)`, which is the
-/// correct security posture (no policy bypass on unsupported
-/// platforms).
+/// Callers that supply a thumbprint policy then get a fail-closed
+/// result via `evaluate_thumbprint_policy(None, &policy)`, which
+/// is the correct security posture (no policy bypass while the
+/// extractor is unproven — never a false pass). The Windows-side
+/// validation drops in without changing call sites.
 #[cfg(not(windows))]
 pub fn extract_signer_thumbprint_sha256(_path: &Path) -> Result<String, String> {
     Err("Windows Authenticode thumbprint extraction is only available on Windows hosts".to_owned())
@@ -1250,10 +1251,14 @@ mod imp {
                 len += 1;
             }
             let slice = std::slice::from_raw_parts(ptr, len);
-            let value =
-                String::from_utf16(slice).map_err(|err| format!("UTF-16 decode failed: {err}"))?;
+            // `String::from_utf16` fully copies into an owned String (or
+            // errors) before returning, so the `slice` borrow has ended
+            // by the time `LocalFree` runs. Freeing here — before the
+            // error is returned — prevents leaking the Win32 buffer on
+            // the malformed-UTF-16 path.
+            let decoded = String::from_utf16(slice);
             LocalFree(ptr.cast::<c_void>());
-            Ok(value)
+            decoded.map_err(|err| format!("UTF-16 decode failed: {err}"))
         }
     }
 
