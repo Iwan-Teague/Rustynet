@@ -70,17 +70,28 @@ impl Watermark {
     /// True when a bundle carrying `self` must be REJECTED against the live
     /// (persisted) watermark, mirroring the daemon's anti-rollback semantics
     /// (daemon.rs:15486-15501, surfaced as `ReplayDetected` at 5902-5910):
-    /// - strictly older than persisted ⇒ rejected (rollback/replay);
-    /// - equal `generated_at_unix` with a DIFFERENT `payload_digest` ⇒
-    ///   rejected (same generation, divergent content);
-    /// - equal with the same digest ⇒ the current bundle, not a replay;
-    /// - newer ⇒ not a replay by this layer.
+    /// The daemon orders watermarks by `generated_at_unix`, then by `nonce`
+    /// (`traversal_watermark_ordering`, daemon.rs:16523-16531):
+    /// - orders `Less` than persisted ⇒ rejected (rollback/replay);
+    /// - orders `Equal` (same generation AND same nonce) with a DIFFERENT
+    ///   `payload_digest` ⇒ rejected (same snapshot identity, divergent
+    ///   content);
+    /// - `Equal` with the same digest ⇒ the current bundle, not a replay;
+    /// - orders `Greater` ⇒ not a replay by this layer.
     pub fn is_replay_of(&self, live: &Watermark) -> bool {
-        match self.generated_at_unix.cmp(&live.generated_at_unix) {
+        match self.ordering_against(live) {
             Ordering::Less => true,
             Ordering::Equal => self.payload_digest != live.payload_digest,
             Ordering::Greater => false,
         }
+    }
+
+    /// The daemon's watermark ordering (`traversal_watermark_ordering`,
+    /// daemon.rs:16523-16531): generation first, nonce as the tiebreak.
+    pub fn ordering_against(&self, other: &Watermark) -> Ordering {
+        self.generated_at_unix
+            .cmp(&other.generated_at_unix)
+            .then(self.nonce.cmp(&other.nonce))
     }
 }
 
@@ -962,9 +973,11 @@ mod tests {
             "Less-than-persisted must be rejected as a replay"
         );
 
+        // `Equal` in the daemon's ordering means the same generation AND the
+        // same nonce (daemon.rs:16523-16531); only then does the digest decide.
         let equal_other_digest = Watermark {
             generated_at_unix: 2000,
-            nonce: "nonce-eq".to_owned(),
+            nonce: "nonce-live".to_owned(),
             payload_digest: "digest-other".to_owned(),
         };
         assert!(
@@ -974,12 +987,42 @@ mod tests {
 
         let equal_same_digest = Watermark {
             generated_at_unix: 2000,
-            nonce: "nonce-eq".to_owned(),
+            nonce: "nonce-live".to_owned(),
             payload_digest: "digest-live".to_owned(),
         };
         assert!(
             !equal_same_digest.is_replay_of(&live),
             "Equal-with-same-digest is the current bundle, not a replay"
+        );
+
+        // Same generation, different nonce: the nonce tiebreak decides, exactly
+        // as the daemon orders it — a lesser nonce is a rollback, a greater one
+        // is not a replay at this layer (even with the same digest).
+        let same_generation_lesser_nonce = Watermark {
+            generated_at_unix: 2000,
+            nonce: "nonce-a".to_owned(),
+            payload_digest: "digest-live".to_owned(),
+        };
+        assert_eq!(
+            same_generation_lesser_nonce.ordering_against(&live),
+            Ordering::Less
+        );
+        assert!(
+            same_generation_lesser_nonce.is_replay_of(&live),
+            "same generation with a lesser nonce orders Less and is rejected"
+        );
+        let same_generation_greater_nonce = Watermark {
+            generated_at_unix: 2000,
+            nonce: "nonce-z".to_owned(),
+            payload_digest: "digest-other".to_owned(),
+        };
+        assert_eq!(
+            same_generation_greater_nonce.ordering_against(&live),
+            Ordering::Greater
+        );
+        assert!(
+            !same_generation_greater_nonce.is_replay_of(&live),
+            "same generation with a greater nonce orders Greater and is not a replay"
         );
 
         let newer = Watermark {
