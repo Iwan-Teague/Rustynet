@@ -1,6 +1,12 @@
 # Live-Lab Stage Design: Role-Transition Side-Effect Ordering Validation (GAP-1)
 
-**Status: DESIGN ONLY — no code changed.** Implementation is owner-approved in principle but is pending (a) this design's adversarial review and (b) live-lab availability for proving. The lab VMs are currently down, so every live assertion in this document is *specified but unproven*; the offline unit tests in §4 are runnable today without any VM.
+**Status: DESIGN ONLY — no code changed.** The adversarial review is **COMPLETE** (verdict: READY-WITH-AMENDMENTS, `LiveLabTransitionOrderingStageAdversarialReview_2026-09-01.md`); this document has been amended in place per its findings and is implementation-ready. Implementation remains **owner-gated and lab-pending** (the lab VMs were down on the design/review dates), so every live assertion is *specified but unproven*; the offline unit tests in §4 are runnable today without any VM.
+
+> **Adversarial-review amendments folded (2026-09-01)** — per `GapStageDesignsAmendmentFoldChecklist_2026-09-01.md` §GAP-1 (review §9 numbering):
+> - **A1 — rename blast-radius checklist:** every name-keyed reader of `role_switch_matrix` / `live_role_switch_matrix` enumerated (§3.5) to move in the same change as the rename; anchor-capability disambiguation added to §1.1.
+> - **A2 — audit-assertion scope pinned to the public-CLI drive path:** all four transition kinds driven via the public CLI per node; assertion (c) scoped to CLI-driven transitions; pre-registered wiring fact (zero `append_role_audit_entry` call sites in `rustynetd`; sole executor `execute_role_plan`) recorded in §2.5 with an offline source-scanning test pinning it (§4 test 7).
+> - **A3 — state-based fallback anchor:** every fallback ordering acceptance must anchor liveness to an effect the transition itself performed (fresh process identity, or first-ever observation against a pre-transition absent-service snapshot); unanchored acceptance is a failure (§2 preamble).
+> - **A4 — sampling-window honesty:** §2.1(b) gains a trailing stability check (two spaced probes with process-identity equality) and states its semantics as bounded-window liveness evidence, not continuous availability (§2.1).
 
 **Grounding provenance.** This design implements GAP-1 from `LiveLabCoverageGapHuntIndependent_2026-08-31.md` (§2, lines 36–42), which **CONFIRMED** the gap as HIGH severity. The gap-hunt's GAP-2 (failed-deploy negative-residue stage) was **REFUTED** in the same pass and is explicitly out of scope here; nothing in this document proposes building it.
 
@@ -41,6 +47,8 @@ The orchestrator already has three transition-adjacent stages, each proving **on
 
 The gap hunt's sweep for §10.7 ordering terms found only comments (`deploy_relay.rs:276`, `macos_anchor_profile_deploy.rs:5`) — the ordering rules exist in prose and in the transition planner, but nothing observes them live.
 
+**Scope disambiguation (review A1):** this stage asserts `serves_relay` bundle-emission ordering — the signed membership bundle advertising the relay capability. It does not concern the *anchor* bundle-pull path, where an anchor node pulls (rather than is pushed) membership state: the two mechanisms both move signed state but play no role in this design's ordering assertions. The stage name and its evidence must never be read as covering anchor capability advertisement.
+
 ### 1.4 Scope
 
 In scope: a new (or renamed/extended) `--node` orchestrator stage that drives the four transition kinds listed in §2 and asserts ordering, advertisement-before-verification, audit growth, and residue-free demotion. Out of scope: GAP-2 (REFUTED), the Windows/macOS role-parity cells (own track), and any change to `rustynet-control` transition semantics — this stage *observes* the decree, it does not re-implement it.
@@ -49,12 +57,12 @@ In scope: a new (or renamed/extended) `--node` orchestrator stage that drives th
 
 ## 2. What the Stage Asserts, Per Transition Kind
 
-The stage drives each transition on the live mesh through the same public control path an operator uses, then asserts four invariant families (a)–(d). "Observable ordering" in the `--node` orchestrator means: evidence artifacts carry wall-clock timestamps captured at each step (side-effect completion, signed-bundle/revocation emission, audit append), and the stage compares them. Where a timestamp alone is ambiguous (same-second events), the stage falls back to state-at-observation: e.g. "the signed bundle containing capability X was already distributed when service Y was first observed live" is a strictly ordered pair regardless of clock granularity. Every assertion names its evidence artifact in the run's report directory; a missing artifact is a failure, never a pass.
+The stage drives each transition on the live mesh **through the public CLI, per node** (review A2: the drive mechanism is pinned to the same public control path §2.4(a) already uses, matching what an operator runs), and asserts four invariant families (a)–(d). "Observable ordering" in the `--node` orchestrator means: evidence artifacts carry wall-clock timestamps captured at each step (side-effect completion, signed-bundle/revocation emission, audit append), and the stage compares them. Where a timestamp alone is ambiguous (same-second events), the stage falls back to state-at-observation — e.g. "the signed bundle containing capability X was already distributed when service Y was first observed live" is a strictly ordered pair regardless of clock granularity — **under the fallback anchor rule (review A3):** a fallback acceptance is valid only when the liveness/absence observation is anchored to an effect the transition itself performed — either (i) a post-transition deploy/restart acknowledgment with a **fresh process identity** (fresh PID / boot-id / start-time relative to a pre-transition capture), or (ii) a **first-ever observation** of the service's state against a pre-transition snapshot that recorded the opposite state (e.g. service absent in the pre-transition snapshot, present for the first time post-transition). Every fallback acceptance records its anchor in the evidence artifact; an **unanchored fallback acceptance is a failure, never a pass**. Every assertion names its evidence artifact in the run's report directory; a missing artifact is a failure, never a pass.
 
 ### 2.1 client → relay (adding `serves_relay`)
 
 - **(a) Ordering.** Relay service deployed AND verified live (health observed from the driving node) strictly before the signed bundle advertising `serves_relay` for that node is emitted, and therefore before it can reach any peer. Timestamp of first successful relay liveness probe < timestamp of bundle emission record.
-- **(b) Advertisement gate.** At no observation point does a distributed signed bundle advertise `serves_relay` for the node while the relay service fails a liveness check. The stage samples: after bundle distribution, immediately probe the relay; failure fails the stage.
+- **(b) Advertisement gate (bounded-window, review A4).** At no observation point does a distributed signed bundle advertise `serves_relay` for the node while the relay service fails a liveness check. The stage samples: after bundle distribution, immediately probe the relay; failure fails the stage. Because point-in-time liveness cannot rule out a deploy-then-crash between samples, the gate closes with a **trailing stability check**: two liveness probes spaced by a fixed settle interval (the interval is recorded in the evidence artifact) with **process-identity equality across them** (same PID/boot-id/start-time — the crash-and-restart case changes identity and fails the check). **Semantics are stated honestly:** this is *bounded-window liveness evidence*, not continuous availability; the residual crash-after-window risk is documented as **out of the stage's claim**.
 - **(c) Audit.** The node's role audit log grows by an append-only entry for the transition, with the expected event kind (a preset transition to `relay` that is `SignedMembership` per `TransitionKind`, `crates/rustynet-control/src/role_presets.rs:496`,706-713) and outcome `succeeded` per `RoleTransitionOutcome` (`crates/rustynet-control/src/role_audit.rs:42`). Chain integrity is re-verified with `verify_role_audit_chain` (`role_audit.rs:413`).
 - **(d)** Not applicable to this direction.
 
@@ -74,14 +82,21 @@ The stage drives each transition on the live mesh through the same public contro
 
 ### 2.4 blind_exit irreversibility
 
-- **(a) Blocked-before-side-effect.** Any attempt to transition *away from* `blind_exit` is rejected by the transition matrix before any side effect executes: `transition_plan` returns `Blocked("blind_exit is immutable; factory reset + fresh key provisioning required to change role")` (`role_presets.rs:624-638`). The stage drives the attempt via the public CLI and asserts (i) the CLI fails closed, (ii) role state is unchanged, (iii) no service/undeploy side effects ran (observable via unchanged service inventory), and (iv) an audit entry with outcome `blocked` was appended (`RoleTransitionOutcome::Blocked`, `role_audit.rs:42`).
+- **(a) Blocked-before-side-effect.** Any attempt to transition *away from* `blind_exit` is rejected by the transition matrix before any side effect executes: `transition_plan` returns `Blocked("blind_exit is immutable; factory reset + fresh key provisioning required to change role")` (`role_presets.rs:624-638`). The stage drives the attempt **via the public CLI per node** (§2.5 pinned drive path) and asserts (i) the CLI fails closed, (ii) role state is unchanged, (iii) no service/undeploy side effects ran (observable via unchanged service inventory), and (iv) an audit entry with outcome `blocked` was appended (`RoleTransitionOutcome::Blocked`, `role_audit.rs:42`).
 - **(b) Entering.** Becoming `blind_exit` yields kind `Irreversible("becoming blind_exit wipes node identity and re-enrolls fresh; this cannot be undone without another factory reset")` (`role_presets.rs:706-709`). The live stage does NOT repeatedly wipe the mesh node; see §5 (open question on cost) — the assertion set for entering is planned as: identity wipe + fresh enrollment observable, prior identity absent from membership, audit entry kind `Irreversible`. On the current lab this is exercised only when a blind_exit re-enrollment is already scheduled, not gratuitously.
 - **(c)** Audit as above — for the blocked attempt this is the critical observation: §6.D control 6 (`SecurityMinimumBar.md:522`) requires *every* transition (successful/failed/aborted) to emit an entry.
 - **(d)** Not applicable (blind_exit forbids NAT by construction; `blind_exit_dataplane_validation.rs` already proves no-NAT posture).
 
-### 2.5 Honest wiring note (assertion (c))
+### 2.5 Audit-assertion scope (rewritten per review A2 — the wiring fact is pinned, not deferred)
 
-This design pass did **not** trace the production call sites that append audit entries during a real transition. What exists and is verified: the tamper-evident log machinery — `append_role_audit_entry` (`role_audit.rs:241`, atomic single-write append, 0o640 on create, hash-chained to the previous entry), `read_role_audit_log` (`:299`, fail-closed byte cap), `verify_role_audit_chain` (`:413`) — and the `TransitionPlan` that prescribes `service_deploys`/`service_undeploys` ordering (`role_presets.rs:555,560`). Whether *every* production transition path currently calls the appender is exactly what assertion (c) will expose when run live: if entries do not appear, the stage fails, and that failure is the finding. The design deliberately treats (c) as an observability forcing function rather than assuming the wiring is complete.
+All four transition kinds are driven **via the public CLI, per node** (§2 preamble), and **assertion (c) is scoped to these CLI-driven transitions**. The review verified the production wiring this scope depends on, and the design pre-registers that verified fact instead of treating audit wiring as an open question:
+
+- **There are zero `append_role_audit_entry` call sites in `rustynetd` today.** Daemon-side bundle application emits no audit entries.
+- The **sole production executor** that appends role-audit entries is the CLI-side `execute_role_plan` (`crates/rustynet-cli/src/main.rs:19546`), calling the appender at `main.rs:19633` / `:19636`.
+- Consequence: an audit entry exists **if and only if** the transition was driven through the CLI path — which is exactly why the drive mechanism is pinned above. Scoping (c) to CLI-driven transitions makes the assertion testable today rather than unprovable.
+- **Offline guard:** a **source-scanning unit test** (§4 test 7) pins this wiring fact — it fails if a `rustynetd` call site for `append_role_audit_entry` appears, so a future daemon-side emitter flips the stage's expectation **deliberately** (the test forces whoever adds the emitter to update the stage's expected-rejection model in the same change).
+
+What the tamper-evident machinery provides (unchanged): `append_role_audit_entry` (`role_audit.rs:241`, atomic single-write append, 0o640 on create, hash-chained to the previous entry), `read_role_audit_log` (`:299`, fail-closed byte cap), `verify_role_audit_chain` (`:413`), and the `TransitionPlan` that prescribes `service_deploys`/`service_undeploys` ordering (`role_presets.rs:555,560`). The stage reads the node's audit log over the existing adapter/SSH plane and verifies the chain off-node (§3.3).
 
 ---
 
@@ -112,6 +127,25 @@ Registration goes in the `define_stage_catalog` macro in `crates/rustynet-cli/sr
 
 Per the fail-LOUD live-stage spec: a live result is the stage status; a dry-run never counts as a pass. Concretely: platform/runtime gates write named reported-skips notes and yield `Skipped` — never `Passed` — when nothing executed ("no node executed this validation; N node(s) reported a runtime skip"); a topology with no eligible node skips loudly (the `blind_exit_dataplane_validation.rs` empty-assignment rule: evidence must not promise a check that never ran); every assertion names its evidence artifact, and a missing artifact is a failure.
 
+### 3.5 Rename blast-radius checklist (review A1 — every reader moves in ONE change)
+
+The rename (§3.1) retires `role_switch_matrix` / `live_role_switch_matrix`. A stage name is read by far more tooling than the stage registry; the implementation change MUST update **all** of the following name-keyed readers in the **same change**, or evidence integrity silently degrades (old rows read as coverage of the new stage, or new runs invisible to tooling):
+
+| Reader | Location |
+|---|---|
+| Stage spec `name` + `logical` fields | `crates/rustynet-cli/src/live_lab_stage_registry.rs:996,1956` |
+| Failure digest stage-name keying | `crates/rustynet-cli/src/ops_live_lab_failure_digest.rs:335` |
+| Evidence verifier name matching | `crates/rustynet-cli/src/live_lab_evidence_verifier.rs:448,1395-1407` |
+| Lab-monitor TUI coverage column construction | `crates/rustynet-lab-monitor/src/data/run_matrix.rs:984` (standalone crate — gate with `./scripts/ci/lab_monitor_gates.sh`) |
+| MCP lab-state binary stage tables | `crates/rustynet-mcp/src/bin/lab_state.rs:68,89,110,7357` |
+| MCP repo-context binary stage references | `crates/rustynet-mcp/src/bin/repo_context.rs:2115` |
+| MCP ai-agent binary stage references | `crates/rustynet-mcp/src/bin/ai_agent.rs:6121,10839` |
+| e2e wrappers + their bin target | `scripts/e2e/live_*_role_switch_matrix_test.sh` family |
+| Live ledger column family | `documents/operations/live_lab_node_run_matrix.csv` (historical rows stay attributed to the retired name — never re-read as coverage of the new stage; see §5 open question 1) |
+| Prompt-doc stage references | `rustynet_live_lab_loop_prompt.md:1256` |
+
+The one-time old-name→new-name ledger note (§5 open question 1's recommendation) is part of this same change: record it in the parity Refresh doc at implementation time.
+
 ---
 
 ## 4. Offline Validator Unit Tests (runnable now, no VMs)
@@ -124,6 +158,7 @@ The lab VMs are currently down, so live-proving is pending lab availability. The
 4. **Empty-assignment fail-loud.** The `exit_demotion_residue_validation.rs` context-literal pattern: empty assignments → `Skipped` with the naming message, not `Passed`; no adapter for an eligible alias → `Failed` "no adapter for …".
 5. **Outcome aggregation.** `outcome_for` semantics: any failure → `Failed`; skips only → `Skipped` naming the count; clean → `Passed` (mirrors the `exit_nat_lifecycle_validation.rs` test set).
 6. **Blind-exit blocked assertion logic.** Given a synthetic "attempt rejected" CLI result plus unchanged-state evidence, the assertion accepts; a rejected attempt with mutated state evidence is rejected (that combination means the block happened after a side effect — precisely the hazard).
+7. **Audit-wiring source scan (review A2).** A source-scanning test that asserts `append_role_audit_entry` has **zero call sites under `crates/rustynetd/src/`** and that the sole production executor remains `execute_role_plan` (`crates/rustynet-cli/src/main.rs:19546`, appender `:19633`/`:19636`). Fails the moment a daemon-side emitter appears, so §2.5's expected model is flipped deliberately, never silently.
 
 Live-proving of §2 (a)–(d) on the real mesh is **pending lab availability** and is the explicit acceptance gate; until a `--node` run records this stage as passed in `live_lab_node_run_matrix.csv` at a pinned commit, GAP-1 remains open regardless of offline test results.
 
@@ -140,7 +175,7 @@ Live-proving of §2 (a)–(d) on the real mesh is **pending lab availability** a
 5. **Scope of "relay verified live".** Minimum viable liveness for the relay service (TCP accept? a control-plane ping? frame round-trip?) should be fixed during implementation and kept consistent with what `rustynet-relay` can self-report.
 6. **Cross-OS staging.** Linux first (the done reference per the parity mandate), then macOS/Windows cells — confirm the ordering assertions do not depend on Linux-only observability (e.g. `nft` presence) without a per-platform gate like the existing `*_runtime_implemented` gates.
 
-### Adversarial-review checklist (the design gets a separate adversarial review before ANY implementation, same as the S4/S1 precedent)
+### Adversarial-review checklist (review COMPLETED 2026-09-01 — verdict READY-WITH-AMENDMENTS; amendments A1–A4 folded into this document, see the header note)
 
 - [ ] Refute the claim that no existing stage covers ordering (re-sweep the stage tree for anything reading bundle-emission timestamps).
 - [ ] Refute the extend-in-place decision: does folding liveness + ordering into one stage mask a liveness regression behind an ordering failure (or vice versa)?
