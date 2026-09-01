@@ -2015,11 +2015,14 @@ pub const STAGES: &[StageSpec] = &[
     // Rust-engine live LAN-toggle test: three cycles (off→on→off)
     // proving LAN-access toggle with enforcement evidence and
     // blind-exit rejection. Cross-OS (Linux/macOS/Windows via --platform).
+    // Feeds the `cross_os_lan_toggle` schema column, matching the
+    // bash-dialect `live_lan_toggle` arm.
     StageSpec {
         name: "live_lan_toggle_validation",
         state_machine_only: true,
         group: StageGroup::Live,
         logical: Some("lan_toggle"),
+        cross_os: Some("cross_os_lan_toggle"),
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
@@ -3066,6 +3069,24 @@ mod tests {
                 "`{column}` is owed a real reachability validator, not a push: {feeders:?}"
             );
         }
+    }
+
+    /// The `--node` LAN-toggle stage must feed the `cross_os_lan_toggle`
+    /// schema column, matching the bash-dialect `live_lan_toggle` arm pinned
+    /// in `oracle_cross_os_column`. Asserted on the spec side (QH-07
+    /// rationale): the production mapping is registry-derived, so the spec
+    /// is the source of truth and an oracle-only edit would prove nothing.
+    #[test]
+    fn live_lan_toggle_validation_feeds_cross_os_lan_toggle() {
+        let spec = find_stage("live_lan_toggle_validation")
+            .unwrap_or_else(|| panic!("live_lan_toggle_validation missing from registry"));
+        assert_eq!(
+            spec.cross_os,
+            Some("cross_os_lan_toggle"),
+            "`live_lan_toggle_validation` must feed `cross_os_lan_toggle`; if this \
+             mapping moves, update `oracle_cross_os_column` beside its bash arm \
+             in the same change"
+        );
     }
 
     /// A1 anti-drift gate for the class the spec §3 records: the earlier
