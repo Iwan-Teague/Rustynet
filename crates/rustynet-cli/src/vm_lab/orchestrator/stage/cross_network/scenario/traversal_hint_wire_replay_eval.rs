@@ -170,18 +170,13 @@ pub fn validate_replay_fixture(fixture: &ReplayFixture) -> Result<CorrelationId,
     if !fixture.nonce_consumed_by_receiver {
         return Err(FixtureRefusal::NonceNotConsumedByReceiver);
     }
-    if fixture
-        .envelope_watermark
-        .is_replay_of(&fixture.live_watermark)
-    {
-        // The daemon WOULD reject this envelope as a replay — which is the
-        // experiment's intent. But strictly-older is required of the fixture
-        // *precondition*: equal-same-digest and newer are not replays, and
-        // equal-different-digest is a divergence sample, not an OLD bundle.
-        // Only the strict preconditions below are refusals; a fixture whose
-        // envelope is not strictly older is refused outright (A3: "envelope
-        // watermark asserted older than live").
-    }
+    // `Watermark::is_replay_of` tells us whether the daemon WOULD reject the
+    // envelope — the experiment's intent — but the fixture precondition is
+    // stricter than "would be rejected": equal-same-digest is the current
+    // bundle and newer is future-dated (neither is a replay), and
+    // equal-different-digest is a divergence sample, not an OLD bundle. So
+    // the guard requires a strictly older generation outright (A3: "envelope
+    // watermark asserted older than live").
     let strictly_older =
         fixture.envelope_watermark.generated_at_unix < fixture.live_watermark.generated_at_unix;
     if !strictly_older {
