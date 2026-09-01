@@ -349,6 +349,10 @@ pub fn verify_recorded_plan_not_shrunk(report_dir: &Path) -> Result<(), String> 
     };
     let expected_stages = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
         .with_skip_live_suite(selectors.skip_linux_live_suite)
+        // MAC-D3: the reconstruction must reproduce the exact membership the
+        // runner built — a fast-path run that elected a macOS anchor recorded
+        // the three validator stages even with the live suite skipped.
+        .with_anchor_platform_macos(selectors.anchor_platform == "macos")
         .with_enable_chaos_suite(selectors.chaos_suite)
         .with_enable_negative_control(selectors.negative_control_suite)
         .with_skip_soak(!selectors.soak_suite)
