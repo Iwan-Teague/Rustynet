@@ -208,11 +208,14 @@ pub fn check_sequence(expected: &[ObservedStep], observed: &[ObservedStep]) -> R
             .position(|candidate| candidate == step)
         {
             Some(0) => cursor += 1,
-            Some(offset) => {
+            Some(_offset) => {
+                // The offending step is the one sitting at the cursor — the
+                // expected step exists later in the observed sequence, so
+                // whatever preceded it is what ran out of order.
                 return Err(format!(
                     "observed step '{}' is out of order: expected '{}' next (first \
                      out-of-order step)",
-                    observed[cursor + offset].label(),
+                    observed[cursor].label(),
                     step.label()
                 ));
             }
