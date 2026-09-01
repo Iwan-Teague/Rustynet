@@ -1,6 +1,7 @@
 # Security-audit catalog references paths that no longer exist (RSA-0049 class)
 
-**Status:** OPEN — not started. Raised 2026-07-28, verified against `b285685e`.
+**Status:** RESOLVED 2026-09-01 (see [Resolution](#resolution-2026-09-01) below).
+Raised 2026-07-28, verified against `b285685e`.
 
 ## What is wrong
 
@@ -112,3 +113,44 @@ Confirmed against `b285685e` on 2026-07-28:
   `documents/operations/done/`.
 - 11 repo-path strings referenced by the catalog, 2 missing.
 - No existing test asserts that catalog-referenced paths exist.
+
+## Resolution 2026-09-01
+
+1. **`:279` dataplane.rs — deleted.** The stale entry was removed from the
+   `server_ip_bypass` `affected_files`; `crates/rustynetd/src/phase10.rs` already
+   covered the live path, as predicted.
+2. **`:693` backlog path — repointed to the archived doc.** The check now reads
+   `documents/operations/done/SecurityHardeningBacklog_2026-03-09.md`, which is
+   where the marker string ("constant-time auth/token checks", its line 141)
+   actually lives. The active
+   `documents/operations/active/SecurityHardeningBacklog_2026-06-01.md` does not
+   contain the marker, and the comparative-coverage document
+   (`RustynetComparativeVpnExploitCoverage_2026-03-14.md`, lines 202/361/651)
+   records the original verification as having run against the archived copy —
+   so the archived doc is the faithful target.
+3. **rg-exit-code question answered — no silent-pass hazard.** The consumer,
+   `run_comparative_commands` in
+   `crates/rustynet-cli/src/ops_security_audit_workflows.rs` (the `rc`/`status`
+   assignment), sets `status = rc == 0 ? "pass" : "fail"` from
+   `output.status.code().unwrap_or(1)`. A missing file makes `rg` exit 2, which
+   is reported as `fail` with the stderr captured in the report output — the
+   harness never treats a non-zero exit as "pattern absent". The stale path was
+   therefore a stale reference (a report that names something it cannot
+   inspect), not a silently-passing check.
+4. **Class-closing test added.**
+   `security_audit_catalog::tests::catalog_repo_path_references_exist_on_disk`
+   (in `crates/rustynet-cli/src/security_audit_catalog.rs`) asserts every
+   catalog string matching `^(crates|scripts|documents|third_party|\.github)/` —
+   across both `LIVE_VALIDATION_SPECS[].affected_files` and
+   `COMPARATIVE_COMMAND_SPECS[].argv` — exists under the repo root
+   (`CARGO_MANIFEST_DIR` two levels up). Mutation-verified: injecting
+   `crates/rustynetd/src/nonexistent_mutation.rs` failed the test with the exact
+   offending reference named; reverting restored green.
+
+Verification on this fix (all exit codes read directly): test
+`1 passed; 0 failed` against `--bin rustynet-cli`; `rustfmt --check` clean on the
+edited file; `cargo clippy -p rustynet-cli --all-targets --all-features -- -D
+warnings` clean. Note: repo-wide `cargo fmt --all -- --check` currently reports
+pre-existing drift in unrelated files (`vm_lab/orchestrator/adapter/
+windows_install.rs`, `rustynetd/src/anchor_tls.rs`, `rustynetd/src/daemon.rs`)
+introduced outside this change and deliberately left untouched here.

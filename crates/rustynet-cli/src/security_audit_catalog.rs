@@ -276,7 +276,6 @@ pub const LIVE_VALIDATION_SPECS: &[ValidationSpec] = &[
         ],
         affected_files: &[
             "crates/rustynetd/src/phase10.rs",
-            "crates/rustynetd/src/dataplane.rs",
             "crates/rustynet-backend-wireguard/src/lib.rs",
         ],
         check_metadata: SERVER_IP_BYPASS_CHECKS,
@@ -690,7 +689,7 @@ pub const COMPARATIVE_COMMAND_SPECS: &[ComparativeCommandSpec] = &[
             "rg",
             "-n",
             "constant-time auth/token checks",
-            "documents/operations/SecurityHardeningBacklog_2026-03-09.md",
+            "documents/operations/done/SecurityHardeningBacklog_2026-03-09.md",
         ],
     },
 ];
@@ -1024,4 +1023,71 @@ pub fn comparative_status_order(status: &str) -> usize {
         .iter()
         .find(|(candidate, _)| *candidate == status)
         .map_or(usize::MAX, |(_, order)| *order)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Repo-root-relative prefixes that are allowed to appear as filesystem
+    /// references in the catalog. Anything matching one of these must exist on
+    /// disk, so a moved or deleted file cannot linger as a stale reference.
+    const REPO_PATH_PREFIXES: [&str; 5] = [
+        "crates/",
+        "scripts/",
+        "documents/",
+        "third_party/",
+        ".github/",
+    ];
+
+    fn repo_path_candidates(value: &str) -> Option<&str> {
+        REPO_PATH_PREFIXES
+            .iter()
+            .find_map(|prefix| value.strip_prefix(prefix).map(|_| value))
+    }
+
+    fn repo_root() -> std::path::PathBuf {
+        // crates/rustynet-cli -> repo root is two levels up.
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .canonicalize()
+            .expect("repo root resolves")
+    }
+
+    /// Closes the RSA-0049 defect class: every repo path the catalog names —
+    /// whether in a ValidationSpec `affected_files` list or inside a
+    /// ComparativeCommandSpec `argv` — must exist on disk. Fails with the
+    /// offending reference so the fix is a one-line lookup.
+    #[test]
+    fn catalog_repo_path_references_exist_on_disk() {
+        let root = repo_root();
+        let mut stale: Vec<String> = Vec::new();
+
+        for spec in LIVE_VALIDATION_SPECS {
+            for path in spec.affected_files {
+                if let Some(candidate) = repo_path_candidates(path)
+                    && !root.join(candidate).exists()
+                {
+                    stale.push(format!("{} affected_files: {path}", spec.key));
+                }
+            }
+        }
+
+        for spec in COMPARATIVE_COMMAND_SPECS {
+            for arg in spec.argv {
+                if let Some(candidate) = repo_path_candidates(arg)
+                    && !root.join(candidate).exists()
+                {
+                    stale.push(format!("{} argv: {arg}", spec.key));
+                }
+            }
+        }
+
+        assert!(
+            stale.is_empty(),
+            "catalog names repo paths that do not exist on disk: {stale:#?}"
+        );
+    }
 }
