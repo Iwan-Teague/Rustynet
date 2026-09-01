@@ -29,6 +29,7 @@ pub mod runtime_acls;
 pub mod secrets_not_in_logs_eval;
 pub mod security_audit;
 pub mod service_hardening;
+pub mod signed_state_rollback_eval;
 
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
