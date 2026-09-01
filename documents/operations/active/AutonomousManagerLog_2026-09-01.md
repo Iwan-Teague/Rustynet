@@ -55,3 +55,7 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - DECIDE: GAP-1 rename-RETIRE DEFERRED — the design's rename+extend needs the live CLI-driven transition driver (lab); renaming today would put an ordering name on a liveness-only body (the GAP-7 hazard in reverse) and could not be live-proven. Revisit when the lab is up (§4C loop). The offline core is merged and ready to wire.
 - LAUNCH edit-1788306278374-51744-0 full (docs): LiveLabMacosExitServingAdapterDesign_2026-09-02.md — resolves the exit-vs-blind_exit role tension, adapter surface, S2 end-to-end egress assertion, killswitch-precedence fold-in, offline core plan, live-proof recipe, open questions (goes to Phase B next).
 - JOB edit-1788305993287-47879-0 (candidate 1, Windows live identity collector) RUNNING (~299k tokens).
+- PUSH origin main = 3eecd5f6 (drift fix e2ff2c82 + log). Watch next CI run for green fmt.
+- LAUNCH edit-1788306459791-52627-0 full: Phase C candidate 5 — `cross_os: Some("cross_os_lan_toggle")` on the --node live_lan_toggle_validation spec + oracle mapping + fail-closed "skip never writes pass" test.
+- LAUNCH edit-1788306579981-54602-0 full: WIN-F-2 delete dead inspect_handle_sddl (rustynet-windows-native; cross-check on x86_64-pc-windows-gnu).
+- TICK 2 END: in flight = C1 (-47879-0), C2 design (-51744-0), C5 (-52627-0), WIN-F-2 (edit-1788306579981-54602-0). Wakeup 01:05.
