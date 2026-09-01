@@ -927,6 +927,7 @@ mod tests {
             macos_promote_exit: false,
             enable_chaos_suite: false,
             enable_negative_control: false,
+            enable_relay_forwarding_validation: false,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,

@@ -1273,6 +1273,11 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// suite (the `--node`-native adjudication half of the G1 trust bar). Like
     /// `enable_chaos_suite`, out of the default plan.
     pub enable_negative_control: bool,
+    /// `--enable-relay-forwarding-validation`: opt-in HP-3 relay-frame-
+    /// forwarding proof. OUT of the default plan: the probe injects nft
+    /// blocks on two peer daemons and restarts them MID-RUN (QH-64), so only
+    /// an explicit operator election carries that disruption.
+    pub enable_relay_forwarding_validation: bool,
     /// Per-stage watchdog timeout in seconds, forwarded to the bash
     /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
     /// `0` (the default) disables the watchdog and preserves the historical
@@ -13746,7 +13751,7 @@ const RELAY_FORWARD_TEST_MARKER_LEN: usize = 8;
 /// Carries mesh IPs too, since the traffic itself must cross the mesh
 /// tunnel, not the underlay LAN the SSH control plane uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RelayForwardTestTopology {
+pub(crate) struct RelayForwardTestTopology {
     relay_alias: String,
     sender_alias: String,
     sender_mesh_ip: String,
@@ -13758,7 +13763,7 @@ struct RelayForwardTestTopology {
 /// through it with no direct path between them. Fails closed with a clear
 /// reason (not a silent skip) if the topology lacks what this proof needs —
 /// the standard 5-node lab (exit/client/relay/aux/extra) always has them.
-fn select_relay_forward_test_topology(
+pub(crate) fn select_relay_forward_test_topology(
     inventory: &[VmInventoryEntry],
 ) -> Result<RelayForwardTestTopology, String> {
     let is_linux = |e: &&VmInventoryEntry| {
@@ -14068,7 +14073,7 @@ fn relay_forward_test_status_reports_relay_peer(status_line: &str) -> bool {
 /// wire traffic never contained the plaintext marker. Always attempts
 /// cleanup (remove the firewall block, restart the daemons back to normal)
 /// regardless of pass/fail, so a failed run never leaves the lab stuck.
-fn exercise_linux_relay_forwards_frame(
+pub(crate) fn exercise_linux_relay_forwards_frame(
     linux_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
@@ -31429,7 +31434,7 @@ fn ensure_role_targets_share_network(targets: &[Option<RoleTarget>]) -> Result<S
 
 /// Load inventory entries only. Thin wrapper over [`load_inventory_with_hosts`]
 /// for the many call sites that never need the host records.
-fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
+pub(crate) fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, String> {
     load_inventory_with_hosts(path).map(|(entries, _hosts)| entries)
 }
 
@@ -50506,6 +50511,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             macos_promote_exit: false,
             enable_chaos_suite: false,
             enable_negative_control: false,
+            enable_relay_forwarding_validation: false,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,

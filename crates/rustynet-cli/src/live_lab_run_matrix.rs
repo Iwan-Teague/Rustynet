@@ -4088,22 +4088,16 @@ mod tests {
             Some("4567")
         );
         assert_eq!(
-            values
-                .get("source_archive_source_mode")
-                .map(String::as_str),
+            values.get("source_archive_source_mode").map(String::as_str),
             Some("working-tree")
         );
         assert_eq!(values.get("allow_dirty").map(String::as_str), Some("true"));
         assert_eq!(
-            values
-                .get("source_archive_git_commit")
-                .map(String::as_str),
+            values.get("source_archive_git_commit").map(String::as_str),
             Some("deadbee")
         );
         assert_eq!(
-            values
-                .get("source_archive_git_dirty")
-                .map(String::as_str),
+            values.get("source_archive_git_dirty").map(String::as_str),
             Some("true")
         );
         let _ = fs::remove_dir_all(root);
@@ -4868,6 +4862,9 @@ mod registry_equivalence_tests {
             "validate_linux_enrollment_replay" => Some("linux_enrollment_replay"),
             "validate_linux_hello_limiter_flood" => Some("linux_hello_limiter_flood"),
             "validate_linux_relay_forwards_frame" => Some("linux_relay_forwards_frame"),
+            // HP-3: the --node engine's disruptive opt-in stage folds into the
+            // same evidence column as the bash-era validator.
+            "relay_forwards_frame_validation" => Some("linux_relay_forwards_frame"),
             "validate_windows_membership_revoke_applies" => {
                 Some("windows_membership_revoke_applies")
             }

@@ -193,6 +193,7 @@ independent contract and recomputes each required assertion.
 | `EvidenceVerdict` + `from_assessment()`/`bound()`/`run_level()` + `authorize_release()` | `stage/scenario/verdict.rs` | The durable `evidence_verdict.v1.json`; a `ReleaseAuthorization` (the `run_passed=true` gate) exists only for a Passed verdict bound to this run+plan digest |
 | `evaluate_wired_scenarios()` + `wired_scenarios()` | `stage/scenario/finalize.rs` | The finalizer bridge (first non-test caller of `evaluate`): evaluates EVERY wired control's emitted scenario, demotes the run if any fails even when structurally green, aggregates the contract + artifact map |
 | Negative-control T5 stages + `signed_bundle` emission/recomputers | `stage/negative_control.rs` | The four T5 deliberate-inversion controls; the two LOCAL ones (signed-bundle forgery, wrong-node substitution) emit `scenario.v1` + a time-stable verifier transcript their recomputers re-classify (never re-run the verifier — fixtures embed absolute timestamps) |
+| HP-3 relay-frame-forwarding proof | `stage/relay_forwards_frame_validation.rs` | OPT-IN disruptive stage (`StageSuite::Disruptive`, `--enable-relay-forwarding-validation`): reuses the `vm_lab` relay-forward helper chain (topology election, script builders, nft peer blocks, counter-delta + ciphertext-only assertions, cleanup) to prove the relay forwards a frame between two peers; absent from the default plan |
 
 ### VM-lab host-script renderer (`rustynet-cli/src/vm_lab/script_template.rs`)
 

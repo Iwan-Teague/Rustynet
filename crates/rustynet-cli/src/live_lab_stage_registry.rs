@@ -36,6 +36,9 @@ pub enum StageGroup {
     Chaos,
     /// T5 negative-control / adjudication suite (opt-in).
     NegativeControl,
+    /// HP-3 relay-frame-forwarding proof (opt-in, disruptive: nft blocks +
+    /// two peer daemon restarts MID-RUN, QH-64).
+    Disruptive,
     Job,
 }
 
@@ -48,6 +51,7 @@ impl StageGroup {
             StageGroup::Live => "live",
             StageGroup::Chaos => "chaos",
             StageGroup::NegativeControl => "negative_control",
+            StageGroup::Disruptive => "disruptive",
             StageGroup::Job => "job",
         }
     }
@@ -287,6 +291,9 @@ pub enum EnableRule {
     /// Opt-in T5 negative-control / adjudication suite
     /// (`--enable-negative-control`).
     NegativeControlSuite,
+    /// Opt-in HP-3 relay-frame-forwarding proof
+    /// (`--enable-relay-forwarding-validation`).
+    RelayForwardingValidation,
 }
 
 /// The run selectors that resolve [`EnableRule`]s into an actual plan.
@@ -309,6 +316,7 @@ pub struct TargetSelectors {
     pub soak_suite: bool,
     pub local_gate_suite: bool,
     pub negative_control_suite: bool,
+    pub relay_forwarding_validation: bool,
 }
 
 impl TargetSelectors {
@@ -329,6 +337,7 @@ impl TargetSelectors {
             EnableRule::ChaosSuite => self.chaos_suite,
             EnableRule::CrossNetworkSuite => self.cross_network_suite,
             EnableRule::NegativeControlSuite => self.negative_control_suite,
+            EnableRule::RelayForwardingValidation => self.relay_forwarding_validation,
             // extended_soak only ever dispatches as part of the Linux
             // live-validation suite (`execute_ops_vm_lab_run_live_lab`); when
             // that suite is skipped the soak sub-stage never runs either, so
@@ -359,6 +368,9 @@ impl TargetSelectors {
             EnableRule::ChaosSuite => "chaos suite not selected",
             EnableRule::CrossNetworkSuite => "cross-network suite not selected",
             EnableRule::NegativeControlSuite => "negative-control suite not selected",
+            EnableRule::RelayForwardingValidation => {
+                "relay-forwarding validation not elected (--enable-relay-forwarding-validation)"
+            }
             // extended_soak only dispatches inside the Linux live suite; when
             // that suite is skipped, say so even though soak_suite itself may
             // be selected — matches the AND in `resolves()` above.
@@ -2187,6 +2199,15 @@ pub const STAGES: &[StageSpec] = &[
         conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
+    // ── HP-3 disruptive relay-forwarding proof (opt-in) ─────────────────
+    StageSpec {
+        name: "relay_forwards_frame_validation",
+        group: StageGroup::Disruptive,
+        logical: Some("relay_forward_test"),
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::RelayForwardingValidation,
+        ..DEFAULT_SPEC
+    },
     // ── cross-network + job-level ───────────────────────────────────────
     // Topology-level substrate lifecycle (spec §0.5, 2026-08-27). Setup runs
     // in the Setup suite BEFORE collect_pubkeys (endpoint seam) and is a
@@ -3097,7 +3118,7 @@ mod tests {
             // +3 on 2026-08-29 (MAC-D3): the macOS anchor validator set
             // (deploy_macos_anchor_profile + bundle_pull + port_mapping)
             // joined T1Role as first-class --node stages.
-            ("t1_role", 21),
+            ("t1_role", 22),
             ("t2_resilience", 13),
             ("t3_cross_os", 1),
             ("t4_security", 16),

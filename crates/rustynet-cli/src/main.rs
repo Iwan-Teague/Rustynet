@@ -4458,6 +4458,8 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 validate_linux_daemon_state: parser.has_flag("--validate-linux-daemon-state"),
                 enable_chaos_suite: parser.has_flag("--enable-chaos-suite"),
                 enable_negative_control: parser.has_flag("--enable-negative-control"),
+                enable_relay_forwarding_validation: parser
+                    .has_flag("--enable-relay-forwarding-validation"),
                 node_assignments: {
                     let raw = collect_repeated_option_values(&args[1..], "--node");
                     let mut out = Vec::with_capacity(raw.len());
