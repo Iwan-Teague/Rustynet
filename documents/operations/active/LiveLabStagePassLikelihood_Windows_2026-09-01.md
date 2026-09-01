@@ -73,14 +73,16 @@ five times.
 
 **Likelihood once remediated: MEDIUM. No live evidence today.**
 
-The failing step is `Ensure-WingetConfigurationDependencies`:
-`scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1:1130` runs
-`winget configure --file` (throw on failure at :1132), a hard dependency on
-the opt-in WinGet Configuration feature that the script's own `Require-Winget`
-gate (:548-571) never enables or checks. The code half is **landed**:
-W-FIX-1 adds `Enable-WingetConfigurationFeature`, which runs
-`winget configure --enable` idempotently before any configure, with a
-content-pin test
+The failing step is `Ensure-WingetConfigurationDependencies`
+(`scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1:1248`), which runs
+`winget configure --file` at :1256 (throw on failure at :1258) — a hard
+dependency on the opt-in WinGet Configuration feature that the script's own
+`Require-Winget` gate (:616-639) never enables or checks. (Line numbers are
+the current tree; the 08-28 verdict cited the pre-W-FIX-1 positions
+:1130/:1132/:548-571.) The code half is **landed**: W-FIX-1 adds
+`Enable-WingetConfigurationFeature` (:1209-1247), called at :1255 immediately
+before the configure, which runs `winget configure --enable` idempotently,
+with a content-pin test
 (`bootstrap_script_enables_winget_configuration_feature_before_configuring`)
 in `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs`;
 W-FIX-2 landed the CLIXML/raw-stderr decode in `adapter/ssh.rs`
@@ -102,7 +104,7 @@ The guest half is the reason bootstrap cannot simply be re-run today:
 One scope note that prevents misreading history: `winget configure` is a
 **cold-guest path only**. Build-RustyNet guards it behind a toolchain-presence
 check, and a `--node` run only invokes `-Phase build-release`
-(`windows_install.rs:484`); the bash era never hit this branch at all (its 66
+(`windows_install.rs:575`); the bash era never hit this branch at all (its 66
 bootstrap passes rode pre-baked guest toolchains). This is why the bash
 archive is not merely a different engine — it exercised a different code
 path.
@@ -268,7 +270,7 @@ defect surfaced.
 - Ledger: `documents/operations/live_lab_node_run_matrix.csv` (242 rows; quote-aware parse; column counts in §2).
 - Root-cause verdict + fix plan: `WindowsNodeBootstrapTriageVerdict_2026-08-28.md` (§0 run decomposition, §4 failure #5, §6 guest health, §7 fixes, §9.1-§9.3 landed-fix citations).
 - Status of record: `CrossPlatformRoleParityRefresh_2026-07-23.md` (Windows role rows; CP-3; blind_exit exclusion; CP-1 caveat; Harvest-form caveat).
-- Code citations: `live_lab_stage_registry.rs` :753-916, :1081, :1383-1675; `live_lab_run_matrix.rs` :1881-1966, :2247-2258; `node_adapter.rs` :516-524, :685-697; `windows_install.rs` (content-pin test; :484); `adapter/windows.rs` :158-160, :288-311; `scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1` :548-571, :1130-1132.
+- Code citations: `live_lab_stage_registry.rs` :753-916, :1081, :1383-1675; `live_lab_run_matrix.rs` :1881-1966, :2247-2258; `node_adapter.rs` :516-524, :685-697; `windows_install.rs` (content-pin test :1765; build-release invocation :575); `adapter/windows.rs` :158-160, :288-311; `scripts/bootstrap/windows/Bootstrap-RustyNetWindows.ps1` :616-639, :1209-1247, :1248-1258.
 - Explicitly **not** evidence: `live_lab_run_matrix.csv` (bash archive, frozen W5.7; its green Windows rows rode pre-baked toolchains and a deleted engine).
 
 No live pass is claimed in this document. The lab is down; the first
