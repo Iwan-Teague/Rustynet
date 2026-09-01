@@ -28,9 +28,38 @@
 //! therefore derived from `scutil --dns` and from nothing else, and
 //! fails closed when `scutil` cannot be read.
 //!
+//! Those two sources alone were not enough to make green mean closed
+//! (macOS DNS fail-closed adversarial review, finding S6): a host whose
+//! pf DNS block rules were flushed, or whose enabled network services
+//! quietly re-acquired DHCP-provided resolvers, could still report
+//! `overall_ok: true`. The verifier therefore reads TWO additional
+//! independent observations, both fail-closed, and ANDs them into the
+//! verdict:
+//!
+//! * pf DNS block floor — `pfctl -s Anchors` plus `pfctl -a <anchor>
+//!   -s rules` over every rustynet-owned anchor; at least one must
+//!   carry BOTH labeled DNS block rules
+//!   (`rustynet-dns-block-lan-udp` / `rustynet-dns-block-lan-tcp`).
+//!   Unreadable `pfctl` output or zero rustynet-owned anchors fails
+//!   closed.
+//! * per-service loopback DNS pin — `networksetup
+//!   -listallnetworkservices` plus `networksetup -getdnsservers
+//!   <service>` over every ENABLED hardware network service; each must
+//!   report loopback-only DNS. Unreadable `networksetup` output fails
+//!   closed.
+//!
 //! Wired through the CLI as `rustynetd macos-dns-failclosed-check`. The
 //! orchestrator's `MacosDaemonProbe` dispatches `DnsFailclosed` here.
 
+use crate::macos_dns_sc_protect::{
+    NETWORKSETUP_BINARY_PATH, NetworksetupDnsServers, is_loopback_dns_server_list,
+    networksetup_getdns_args, networksetup_listall_args, parse_networksetup_getdns_output,
+    parse_networksetup_service_list,
+};
+use crate::macos_exit_dns_failclosed::{DNS_BLOCK_LAN_TCP_RULE, DNS_BLOCK_LAN_UDP_RULE};
+use crate::macos_exit_killswitch_precedence::{
+    MACOS_RUSTYNET_ANCHOR_PREFIX, validate_pf_anchor_name,
+};
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
@@ -40,6 +69,18 @@ pub const REVIEWED_RESOLV_CONF_PATH: &str = "/etc/resolv.conf";
 /// tool. Absolute so no `PATH` entry can substitute a different binary.
 pub const REVIEWED_SCUTIL_PATH: &str = "/usr/sbin/scutil";
 
+/// Absolute path to `pfctl`, the pf rule-set query tool. Absolute so no
+/// `PATH` entry can substitute a different binary.
+pub const REVIEWED_PFCTL_PATH: &str = "/sbin/pfctl";
+
+/// Anchor-name prefixes a pf anchor must carry for this verifier to
+/// treat its rules as rustynet-owned: the generation-scoped killswitch
+/// anchors (`com.apple/rustynet_g<N>`) and the rustynet blind-exit
+/// anchor family (`com.rustynet/...`). Rules under any other anchor are
+/// not ours to assert on.
+pub const MACOS_RUSTYNET_OWNED_ANCHOR_PREFIXES: [&str; 2] =
+    [MACOS_RUSTYNET_ANCHOR_PREFIX, "com.rustynet/"];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacosDnsFailclosedSnapshot {
     pub resolv_conf_path: String,
@@ -47,6 +88,41 @@ pub struct MacosDnsFailclosedSnapshot {
     pub nameservers: Vec<String>,
     pub search_domains: Vec<String>,
     pub loopback_resolver_advertised: bool,
+    /// pf DNS block floor: `pfctl` anchor/rule reads succeeded. `false`
+    /// means the floor is unverifiable and fails closed.
+    pub pfctl_readable: bool,
+    /// pf DNS block floor: at least one rustynet-owned anchor carries
+    /// BOTH labeled DNS block rules. Implies `pfctl_readable`.
+    pub pf_block_rules_present: bool,
+    /// pf DNS block floor: rustynet-owned anchors whose rules were read.
+    pub pf_anchors_scanned: Vec<String>,
+    /// Per-service loopback DNS pin: `networksetup` reads succeeded.
+    /// `false` means the pin is unverifiable and fails closed.
+    pub networksetup_readable: bool,
+    /// Per-service loopback DNS pin: enabled services reporting
+    /// loopback-only DNS.
+    pub pinned_services: Vec<String>,
+    /// Per-service loopback DNS pin: enabled services NOT reporting
+    /// loopback-only DNS (including services with no configured
+    /// servers — those inherit DHCP resolvers and can leak).
+    pub unpinned_services: Vec<String>,
+}
+
+/// Raw pf DNS block floor observation (S6 layer 3), as collected from
+/// `pfctl`. `None`-equivalent (read failure) is represented by the
+/// `Option` at the builder boundary, not by a variant here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PfDnsBlockFloorObservation {
+    pub anchors_scanned: Vec<String>,
+    pub block_rules_present: bool,
+}
+
+/// Raw per-service loopback DNS pin observation (S6 layer 4), as
+/// collected from `networksetup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworksetupDnsPinObservation {
+    pub pinned_services: Vec<String>,
+    pub unpinned_services: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +180,27 @@ pub fn evaluate_macos_dns_failclosed_snapshot(
         ));
     }
     reasons.extend(evaluate_macos_dns_failclosed(&snapshot.nameservers));
+    // S6 layer 3: the pf DNS block floor. An unreadable `pfctl` sets
+    // `pf_block_rules_present=false`, so one reason covers both shapes.
+    if !snapshot.pf_block_rules_present {
+        reasons.push(format!(
+            "pf DNS block floor not verified: no rustynet-owned pf anchor (prefixes {}) observed carrying both labeled DNS block rules ({DNS_BLOCK_LAN_UDP_RULE} / {DNS_BLOCK_LAN_TCP_RULE}); anchors scanned: {:?}; pfctl unreadable or rules absent; DNS fail-closed posture cannot be verified",
+            MACOS_RUSTYNET_OWNED_ANCHOR_PREFIXES.join(", "),
+            snapshot.pf_anchors_scanned
+        ));
+    }
+    // S6 layer 4: the per-service loopback DNS pin.
+    if !snapshot.networksetup_readable {
+        reasons.push(
+            "networksetup service enumeration unreadable; per-service loopback DNS pin cannot be verified; DNS fail-closed posture cannot be verified"
+                .to_owned(),
+        );
+    }
+    for service in &snapshot.unpinned_services {
+        reasons.push(format!(
+            "network service {service:?} does not report loopback-only DNS via networksetup -getdnsservers; DNS fail-closed posture cannot be verified"
+        ));
+    }
     reasons
 }
 
@@ -191,40 +288,131 @@ pub fn loopback_resolver_advertised_from_scutil(primary_nameservers: &[String]) 
         })
 }
 
-/// Pure snapshot builder over the two raw observations. `None` means
-/// "could not be read", which fails closed in both cases: an unreadable
-/// `resolv.conf` sets `resolv_conf_present=false`, and unreadable
-/// `scutil` output sets `loopback_resolver_advertised=false`.
+/// True when an anchor name reported by `pfctl -s Anchors` names a
+/// rustynet-owned anchor: one of `MACOS_RUSTYNET_OWNED_ANCHOR_PREFIXES`
+/// AND a structurally valid pf anchor name
+/// (`validate_pf_anchor_name`). Anything else is not ours to assert on.
+pub fn is_rustynet_owned_pf_anchor(name: &str) -> bool {
+    if !MACOS_RUSTYNET_OWNED_ANCHOR_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        return false;
+    }
+    validate_pf_anchor_name(name).is_ok()
+}
+
+/// Parse `pfctl -s Anchors` output into the rustynet-owned anchor
+/// names. Non-owned or structurally invalid lines are skipped; blank
+/// lines are skipped.
+pub fn parse_pf_anchor_names(pfctl_anchors_output: &str) -> Vec<String> {
+    let mut anchors = Vec::new();
+    for line in pfctl_anchors_output.lines() {
+        let name = line.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if is_rustynet_owned_pf_anchor(name) {
+            anchors.push(name.to_owned());
+        }
+    }
+    anchors
+}
+
+/// True when a `pfctl -a <anchor> -s rules` dump contains BOTH labeled
+/// DNS block rules, each as a real block rule: the quoted label token,
+/// a `block` action, and a :53 port form. `pfctl` normalizes the port
+/// to `port = 53`; the service-name forms (`port domain`) are accepted
+/// the same way.
+pub fn anchor_rules_contain_both_dns_block_labels(rules: &str) -> bool {
+    fn line_is_labeled_block_rule(line: &str, label: &str) -> bool {
+        let lowered = line.to_lowercase();
+        lowered.contains(&format!("label \"{label}\""))
+            && lowered.starts_with("block")
+            && (lowered.contains("port 53")
+                || lowered.contains("port = 53")
+                || lowered.contains("port domain")
+                || lowered.contains("port = domain"))
+    }
+    rules
+        .lines()
+        .any(|line| line_is_labeled_block_rule(line, DNS_BLOCK_LAN_UDP_RULE))
+        && rules
+            .lines()
+            .any(|line| line_is_labeled_block_rule(line, DNS_BLOCK_LAN_TCP_RULE))
+}
+
+/// Pure snapshot builder over all four raw observations. `None` means
+/// "could not be read", which fails closed in every case: an unreadable
+/// `resolv.conf` sets `resolv_conf_present=false`, unreadable `scutil`
+/// output sets `loopback_resolver_advertised=false`, an unreadable pf
+/// floor sets `pf_block_rules_present=false` (with
+/// `pfctl_readable=false`), and an unreadable `networksetup` sets
+/// `networksetup_readable=false`.
 ///
 /// Production and tests share this function, so the drift branches are
 /// reachable by the same path the daemon takes.
-pub fn build_macos_dns_failclosed_snapshot(
+pub fn build_macos_dns_failclosed_snapshot_with_host_layers(
     resolv_conf_body: Option<&str>,
     scutil_dns_body: Option<&str>,
+    pf_observation: Option<&PfDnsBlockFloorObservation>,
+    networksetup_observation: Option<&NetworksetupDnsPinObservation>,
 ) -> MacosDnsFailclosedSnapshot {
     let resolv_conf_path = REVIEWED_RESOLV_CONF_PATH.to_owned();
     let loopback_resolver_advertised = scutil_dns_body.is_some_and(|body| {
         loopback_resolver_advertised_from_scutil(&parse_scutil_primary_resolver_nameservers(body))
     });
-    match resolv_conf_body {
+    let (resolv_conf_present, nameservers, search_domains) = match resolv_conf_body {
         Some(body) => {
             let (nameservers, search_domains) = parse_resolv_conf(body);
-            MacosDnsFailclosedSnapshot {
-                resolv_conf_path,
-                resolv_conf_present: true,
-                nameservers,
-                search_domains,
-                loopback_resolver_advertised,
-            }
+            (true, nameservers, search_domains)
         }
-        None => MacosDnsFailclosedSnapshot {
-            resolv_conf_path,
-            resolv_conf_present: false,
-            nameservers: Vec::new(),
-            search_domains: Vec::new(),
-            loopback_resolver_advertised,
-        },
-    }
+        None => (false, Vec::new(), Vec::new()),
+    };
+    let mut snapshot = MacosDnsFailclosedSnapshot {
+        resolv_conf_path,
+        resolv_conf_present,
+        nameservers,
+        search_domains,
+        loopback_resolver_advertised,
+        pfctl_readable: false,
+        pf_block_rules_present: false,
+        pf_anchors_scanned: Vec::new(),
+        networksetup_readable: false,
+        pinned_services: Vec::new(),
+        unpinned_services: Vec::new(),
+    };
+    snapshot.pfctl_readable = pf_observation.is_some();
+    snapshot.pf_block_rules_present = pf_observation.is_some_and(|o| o.block_rules_present);
+    snapshot.pf_anchors_scanned = pf_observation
+        .map(|o| o.anchors_scanned.clone())
+        .unwrap_or_default();
+    snapshot.networksetup_readable = networksetup_observation.is_some();
+    snapshot.pinned_services = networksetup_observation
+        .map(|o| o.pinned_services.clone())
+        .unwrap_or_default();
+    snapshot.unpinned_services = networksetup_observation
+        .map(|o| o.unpinned_services.clone())
+        .unwrap_or_default();
+    snapshot
+}
+
+/// Pure snapshot builder over the two raw resolver observations. The
+/// host-level layers (pf DNS block floor, per-service loopback DNS pin)
+/// are not observable here and FAIL CLOSED (`pfctl_readable=false`,
+/// `networksetup_readable=false`); production snapshots are built with
+/// `build_macos_dns_failclosed_snapshot_with_host_layers`, which the
+/// collector feeds with live `pfctl`/`networksetup` observations.
+pub fn build_macos_dns_failclosed_snapshot(
+    resolv_conf_body: Option<&str>,
+    scutil_dns_body: Option<&str>,
+) -> MacosDnsFailclosedSnapshot {
+    build_macos_dns_failclosed_snapshot_with_host_layers(
+        resolv_conf_body,
+        scutil_dns_body,
+        None,
+        None,
+    )
 }
 
 /// Read `scutil --dns`. `None` on any failure (missing binary, non-zero
@@ -242,10 +430,101 @@ pub fn read_scutil_dns() -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Read-only query through the reviewed fixed `pfctl` binary. `None` on
+/// any failure (missing binary, non-zero exit) so the caller fails
+/// closed rather than assuming the floor holds.
+fn read_pfctl(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(REVIEWED_PFCTL_PATH)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Read-only query through the reviewed fixed `networksetup` binary.
+/// `None` on any failure (missing binary, non-zero exit) so the caller
+/// fails closed rather than assuming the pin holds.
+fn read_networksetup(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(NETWORKSETUP_BINARY_PATH)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Observe the pf DNS block floor (S6 layer 3): enumerate anchors via
+/// `pfctl -s Anchors`, then read every rustynet-owned anchor's rules via
+/// `pfctl -a <anchor> -s rules`, reporting whether SOME anchor carries
+/// BOTH labeled DNS block rules. `None` on any read failure — including
+/// a single rustynet-owned anchor whose rules cannot be read — so the
+/// caller fails closed. Zero rustynet-owned anchors is a readable-but-
+/// absent floor (`block_rules_present=false`), also a failure
+/// downstream.
+pub fn read_pf_dns_block_floor() -> Option<PfDnsBlockFloorObservation> {
+    let anchors_output = read_pfctl(&["-s", "Anchors"])?;
+    let mut anchors_scanned = Vec::new();
+    let mut block_rules_present = false;
+    for anchor in parse_pf_anchor_names(&anchors_output) {
+        let rules = read_pfctl(&["-a", &anchor, "-s", "rules"])?;
+        if anchor_rules_contain_both_dns_block_labels(&rules) {
+            block_rules_present = true;
+        }
+        anchors_scanned.push(anchor);
+    }
+    Some(PfDnsBlockFloorObservation {
+        anchors_scanned,
+        block_rules_present,
+    })
+}
+
+/// Observe the per-service loopback DNS pin (S6 layer 4): enumerate the
+/// ENABLED hardware network services via `networksetup
+/// -listallnetworkservices`, then read each service's DNS servers via
+/// `networksetup -getdnsservers <service>`. A service with NO servers
+/// configured is UNPINNED — it inherits resolver state from DHCP and
+/// can leak. `None` on any read or parse failure so the caller fails
+/// closed.
+pub fn read_networksetup_dns_pin() -> Option<NetworksetupDnsPinObservation> {
+    let list_output = read_networksetup(&networksetup_listall_args())?;
+    let services = parse_networksetup_service_list(&list_output).ok()?;
+    let mut pinned_services = Vec::new();
+    let mut unpinned_services = Vec::new();
+    for service in &services {
+        let args = networksetup_getdns_args(service).ok()?;
+        let dns_output = read_networksetup(&args)?;
+        let servers = match parse_networksetup_getdns_output(&dns_output).ok()? {
+            NetworksetupDnsServers::None => Vec::new(),
+            NetworksetupDnsServers::Servers(servers) => servers,
+        };
+        if is_loopback_dns_server_list(&servers) {
+            pinned_services.push(service.clone());
+        } else {
+            unpinned_services.push(service.clone());
+        }
+    }
+    Some(NetworksetupDnsPinObservation {
+        pinned_services,
+        unpinned_services,
+    })
+}
+
 pub fn collect_macos_dns_failclosed_snapshot() -> MacosDnsFailclosedSnapshot {
     let resolv_conf_body = std::fs::read_to_string(REVIEWED_RESOLV_CONF_PATH).ok();
     let scutil_dns_body = read_scutil_dns();
-    build_macos_dns_failclosed_snapshot(resolv_conf_body.as_deref(), scutil_dns_body.as_deref())
+    let pf_observation = read_pf_dns_block_floor();
+    let networksetup_observation = read_networksetup_dns_pin();
+    build_macos_dns_failclosed_snapshot_with_host_layers(
+        resolv_conf_body.as_deref(),
+        scutil_dns_body.as_deref(),
+        pf_observation.as_ref(),
+        networksetup_observation.as_ref(),
+    )
 }
 
 pub fn build_macos_dns_failclosed_report(
@@ -264,6 +543,43 @@ pub fn build_macos_dns_failclosed_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fully compliant snapshot: loopback resolver state AND all host
+    /// layers observed healthy. Tests mutate single fields from here so
+    /// each test isolates one drift branch.
+    fn compliant_snapshot() -> MacosDnsFailclosedSnapshot {
+        MacosDnsFailclosedSnapshot {
+            resolv_conf_path: REVIEWED_RESOLV_CONF_PATH.to_owned(),
+            resolv_conf_present: true,
+            nameservers: vec!["127.0.0.1".to_owned()],
+            search_domains: Vec::new(),
+            loopback_resolver_advertised: true,
+            pfctl_readable: true,
+            pf_block_rules_present: true,
+            pf_anchors_scanned: vec!["com.apple/rustynet_g1".to_owned()],
+            networksetup_readable: true,
+            pinned_services: vec!["Wi-Fi".to_owned()],
+            unpinned_services: Vec::new(),
+        }
+    }
+
+    /// A compliant pf DNS block floor observation, as `read_pf_dns_block_floor`
+    /// would produce on an enforced host.
+    fn compliant_pf_observation() -> PfDnsBlockFloorObservation {
+        PfDnsBlockFloorObservation {
+            anchors_scanned: vec!["com.apple/rustynet_g1".to_owned()],
+            block_rules_present: true,
+        }
+    }
+
+    /// A compliant per-service DNS pin observation, as
+    /// `read_networksetup_dns_pin` would produce on an enforced host.
+    fn compliant_networksetup_observation() -> NetworksetupDnsPinObservation {
+        NetworksetupDnsPinObservation {
+            pinned_services: vec!["Wi-Fi".to_owned()],
+            unpinned_services: Vec::new(),
+        }
+    }
 
     #[test]
     fn evaluator_accepts_loopback_only() {
@@ -308,13 +624,7 @@ mod tests {
 
     #[test]
     fn report_serde_round_trips() {
-        let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_owned(),
-            resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_owned()],
-            search_domains: vec![],
-            loopback_resolver_advertised: true,
-        };
+        let snapshot = compliant_snapshot();
         let report = build_macos_dns_failclosed_report(snapshot);
         let json = serde_json::to_string(&report).expect("serialize");
         let parsed: MacosDnsFailclosedReport = serde_json::from_str(&json).expect("deserialize");
@@ -323,27 +633,17 @@ mod tests {
 
     #[test]
     fn build_report_loopback_only_is_ok() {
-        let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_owned(),
-            resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_owned()],
-            search_domains: vec![],
-            loopback_resolver_advertised: true,
-        };
-        let report = build_macos_dns_failclosed_report(snapshot);
+        let report = build_macos_dns_failclosed_report(compliant_snapshot());
         assert!(report.overall_ok);
         assert!(report.drift_reasons.is_empty());
     }
 
     #[test]
     fn build_report_missing_resolv_conf_is_drift() {
-        let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_owned(),
-            resolv_conf_present: false,
-            nameservers: vec![],
-            search_domains: vec![],
-            loopback_resolver_advertised: false,
-        };
+        let mut snapshot = compliant_snapshot();
+        snapshot.resolv_conf_present = false;
+        snapshot.nameservers = Vec::new();
+        snapshot.loopback_resolver_advertised = false;
         let report = build_macos_dns_failclosed_report(snapshot);
         assert!(!report.overall_ok);
         assert!(
@@ -358,13 +658,8 @@ mod tests {
 
     #[test]
     fn build_report_empty_nameserver_list_fails_closed() {
-        let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_owned(),
-            resolv_conf_present: true,
-            nameservers: vec![],
-            search_domains: vec![],
-            loopback_resolver_advertised: true,
-        };
+        let mut snapshot = compliant_snapshot();
+        snapshot.nameservers = Vec::new();
         let report = build_macos_dns_failclosed_report(snapshot);
         assert!(!report.overall_ok);
         assert!(
@@ -379,13 +674,8 @@ mod tests {
 
     #[test]
     fn build_report_rejects_missing_loopback_resolver_advertisement() {
-        let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_owned(),
-            resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_owned()],
-            search_domains: vec![],
-            loopback_resolver_advertised: false,
-        };
+        let mut snapshot = compliant_snapshot();
+        snapshot.loopback_resolver_advertised = false;
         let report = build_macos_dns_failclosed_report(snapshot);
         assert!(!report.overall_ok);
         assert!(
@@ -461,9 +751,11 @@ mod tests {
 
     #[test]
     fn snapshot_builder_observes_a_loopback_resolver_as_advertised() {
-        let snapshot = build_macos_dns_failclosed_snapshot(
+        let snapshot = build_macos_dns_failclosed_snapshot_with_host_layers(
             Some(LOOPBACK_RESOLV_CONF),
             Some(&scutil_output("127.0.0.1")),
+            Some(&compliant_pf_observation()),
+            Some(&compliant_networksetup_observation()),
         );
         assert!(snapshot.resolv_conf_present);
         assert!(
@@ -566,14 +858,7 @@ mod tests {
 
     #[test]
     fn report_schema_version_pinned_at_one() {
-        let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_owned(),
-            resolv_conf_present: true,
-            nameservers: vec!["127.0.0.1".to_owned()],
-            search_domains: Vec::new(),
-            loopback_resolver_advertised: true,
-        };
-        let report = build_macos_dns_failclosed_report(snapshot);
+        let report = build_macos_dns_failclosed_report(compliant_snapshot());
         assert_eq!(report.schema_version, 1);
         let body = serde_json::to_string(&report).expect("serialize");
         assert!(
@@ -682,13 +967,9 @@ mod tests {
     fn build_report_aggregates_multiple_nameserver_drift_reasons() {
         // Two off-loopback nameservers must surface as two reasons,
         // not collapse to one. Pin the no-dedup contract.
-        let snapshot = MacosDnsFailclosedSnapshot {
-            resolv_conf_path: "/etc/resolv.conf".to_owned(),
-            resolv_conf_present: true,
-            nameservers: vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()],
-            search_domains: Vec::new(),
-            loopback_resolver_advertised: false,
-        };
+        let mut snapshot = compliant_snapshot();
+        snapshot.nameservers = vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()];
+        snapshot.loopback_resolver_advertised = false;
         let report = build_macos_dns_failclosed_report(snapshot);
         assert!(!report.overall_ok);
         let off_loopback: Vec<&String> = report
@@ -702,5 +983,204 @@ mod tests {
             "expected 2 reasons (no dedup), got: {:?}",
             report.drift_reasons
         );
+    }
+
+    // ----- S6: the pf DNS block floor and the per-service DNS pin ------
+
+    #[test]
+    fn pf_anchor_parser_selects_only_rustynet_owned_anchors() {
+        let output = "com.apple/rustynet_g2\n\
+                      com.apple/Anchor\n\
+                      com.rustynet/blind_exit\n\
+                      com.apple/rustynet_g10/sub\n\
+                      rustynet_g1\n\
+                      ../escape\n\
+                      com.apple/rustynet_g/../evil\n\
+                      \n\
+                      com.apple/other\n";
+        let parsed = parse_pf_anchor_names(output);
+        assert_eq!(
+            parsed,
+            vec![
+                "com.apple/rustynet_g2",
+                "com.rustynet/blind_exit",
+                "com.apple/rustynet_g10/sub",
+            ],
+            "only prefix-matched, structurally valid anchor names are ours"
+        );
+    }
+
+    #[test]
+    fn anchor_rules_require_both_labeled_block_rules() {
+        let udp = "block drop out quick inet proto udp from any to ! 127.0.0.0/8 port = 53 label \"rustynet-dns-block-lan-udp\"";
+        let tcp = "block drop out quick inet proto tcp from any to ! 127.0.0.0/8 port = 53 label \"rustynet-dns-block-lan-tcp\"";
+        assert!(anchor_rules_contain_both_dns_block_labels(&format!(
+            "{udp}\n{tcp}\n"
+        )));
+        // pfctl's service-name port form must be accepted too.
+        let tcp_domain = tcp.replace("port = 53", "port domain");
+        assert!(anchor_rules_contain_both_dns_block_labels(&format!(
+            "{udp}\n{tcp_domain}\n"
+        )));
+        // Only one label present: the floor is NOT verified.
+        assert!(
+            !anchor_rules_contain_both_dns_block_labels(&format!("{udp}\n")),
+            "a single labeled rule must not satisfy the both-labels floor"
+        );
+        // Both labels but the TCP one is a pass rule, not a block rule.
+        let tcp_pass = tcp.replace("block drop", "pass out");
+        assert!(
+            !anchor_rules_contain_both_dns_block_labels(&format!("{udp}\n{tcp_pass}\n")),
+            "a labeled pass rule must not satisfy the block-rule floor"
+        );
+        // Labels mentioned in a comment-ish context (not a block rule line).
+        assert!(
+            !anchor_rules_contain_both_dns_block_labels(
+                "# label \"rustynet-dns-block-lan-udp\" label \"rustynet-dns-block-lan-tcp\"\n"
+            ),
+            "labels outside block rules must not satisfy the floor"
+        );
+    }
+
+    #[test]
+    fn all_four_layers_ok_report_is_green() {
+        let snapshot = build_macos_dns_failclosed_snapshot_with_host_layers(
+            Some(LOOPBACK_RESOLV_CONF),
+            Some(&scutil_output("127.0.0.1")),
+            Some(&compliant_pf_observation()),
+            Some(&compliant_networksetup_observation()),
+        );
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(
+            report.overall_ok,
+            "all four layers compliant must be green: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn missing_pf_block_rules_fails_the_report() {
+        let pf = PfDnsBlockFloorObservation {
+            anchors_scanned: vec!["com.apple/rustynet_g1".to_owned()],
+            block_rules_present: false,
+        };
+        let snapshot = build_macos_dns_failclosed_snapshot_with_host_layers(
+            Some(LOOPBACK_RESOLV_CONF),
+            Some(&scutil_output("127.0.0.1")),
+            Some(&pf),
+            Some(&compliant_networksetup_observation()),
+        );
+        assert!(snapshot.pfctl_readable, "pfctl read succeeded here");
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(
+            !report.overall_ok,
+            "a flushed pf anchor must fail the check even with clean resolv.conf"
+        );
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("pf DNS block floor not verified")),
+            "the pf floor branch must be the reason: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn unpinned_networksetup_service_fails_the_report() {
+        let pin = NetworksetupDnsPinObservation {
+            pinned_services: Vec::new(),
+            unpinned_services: vec!["Wi-Fi".to_owned()],
+        };
+        let snapshot = build_macos_dns_failclosed_snapshot_with_host_layers(
+            Some(LOOPBACK_RESOLV_CONF),
+            Some(&scutil_output("127.0.0.1")),
+            Some(&compliant_pf_observation()),
+            Some(&pin),
+        );
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(
+            !report.overall_ok,
+            "a service reporting non-loopback DNS must fail the check"
+        );
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("Wi-Fi") && r.contains("loopback-only DNS")),
+            "the unpinned-service branch must be the reason: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn pfctl_unreadable_fails_closed() {
+        let snapshot = build_macos_dns_failclosed_snapshot_with_host_layers(
+            Some(LOOPBACK_RESOLV_CONF),
+            Some(&scutil_output("127.0.0.1")),
+            None,
+            Some(&compliant_networksetup_observation()),
+        );
+        assert!(
+            !snapshot.pfctl_readable,
+            "unreadable pfctl must be observable as such"
+        );
+        assert!(
+            !snapshot.pf_block_rules_present,
+            "unreadable pfctl must never read as a verified floor"
+        );
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(
+            !report.overall_ok,
+            "unreadable pfctl must fail closed, never pass"
+        );
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("pf DNS block floor not verified")),
+            "the pf floor branch must cover the unreadable case: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn networksetup_unreadable_fails_closed() {
+        let snapshot = build_macos_dns_failclosed_snapshot_with_host_layers(
+            Some(LOOPBACK_RESOLV_CONF),
+            Some(&scutil_output("127.0.0.1")),
+            Some(&compliant_pf_observation()),
+            None,
+        );
+        assert!(
+            !snapshot.networksetup_readable,
+            "unreadable networksetup must be observable as such"
+        );
+        let report = build_macos_dns_failclosed_report(snapshot);
+        assert!(
+            !report.overall_ok,
+            "unreadable networksetup must fail closed, never pass"
+        );
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|r| r.contains("networksetup service enumeration unreadable")),
+            "the networksetup branch must be the reason: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn two_observation_builder_fails_closed_on_host_layers_by_default() {
+        // The two-source builder cannot observe the pf floor or the DNS
+        // pin, so both must read as UNVERIFIED (never as pass).
+        let snapshot = build_macos_dns_failclosed_snapshot(Some(LOOPBACK_RESOLV_CONF), None);
+        assert!(!snapshot.pfctl_readable);
+        assert!(!snapshot.pf_block_rules_present);
+        assert!(!snapshot.networksetup_readable);
+        assert!(snapshot.pinned_services.is_empty());
+        assert!(snapshot.unpinned_services.is_empty());
+        assert!(!build_macos_dns_failclosed_report(snapshot).overall_ok);
     }
 }
