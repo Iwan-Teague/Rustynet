@@ -61,6 +61,10 @@ pub mod remote_exit_dns;
 pub mod remote_exit_soak;
 pub mod traversal_adversarial;
 
+// exercised by tests now; live traversal-hint replay stage wiring + the A8
+// host capability land when the lab is up (GAP-4 §2.6/§5)
+pub mod traversal_hint_wire_replay_eval;
+
 // All eight scenarios are ported. The orchestrator calls each as a function,
 // no `[[bin]]` shim or `.sh` remains for any of them, and `run_script_stage`'s
 // `cargo run --bin` fan is deleted rather than merely unused.
