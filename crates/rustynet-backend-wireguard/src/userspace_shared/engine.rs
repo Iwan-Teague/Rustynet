@@ -2470,6 +2470,21 @@ mod tests {
         packet
     }
 
+    /// Advance the clock boringtun's timers read. With the forwarded
+    /// `boringtun-mock-instant` feature (always on under the workspace gate)
+    /// that is the mock clock, which a sleep can never move; otherwise it is
+    /// wall time.
+    fn advance_engine_clock(by: std::time::Duration) {
+        #[cfg(feature = "boringtun-mock-instant")]
+        {
+            boringtun::mock_instant::MockClock::advance(by);
+        }
+        #[cfg(not(feature = "boringtun-mock-instant"))]
+        {
+            std::thread::sleep(by);
+        }
+    }
+
     /// Pops a single ciphertext event, returning its payload.
     fn pop_ciphertext(sink: &mut RecordingSink, label: &str) -> Vec<u8> {
         match sink.events.pop() {
@@ -2601,11 +2616,14 @@ mod tests {
         // must accept it (Done: an empty inner payload is a keepalive, not a
         // tunnel write). Any stale byte after the 32-byte slice would have
         // been observable in the length or in the counterpart's MAC check.
-        // The keepalive is due once a full second of silence has elapsed on the
-        // engine's own clock. Wall-clock sleeps are not that clock: tick until
-        // the keepalive appears, bounded so a genuinely missing keepalive still
-        // fails loudly instead of hanging.
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // The keepalive is due once a full second of silence has elapsed on
+        // boringtun's clock. Under the workspace gate that clock is the
+        // `mock-instant` mock (boringtun is an implicit workspace member, so
+        // `--workspace --all-features` switches it on) and a wall-clock sleep
+        // never advances it; `advance_engine_clock` moves whichever clock is
+        // live. Tick until the keepalive appears, bounded so a genuinely
+        // missing keepalive still fails loudly instead of hanging.
+        advance_engine_clock(std::time::Duration::from_millis(1100));
         let mut observed = Vec::new();
         for _ in 0..50 {
             observed = engine
@@ -2614,7 +2632,7 @@ mod tests {
             if !sink.events.is_empty() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            advance_engine_clock(std::time::Duration::from_millis(100));
         }
         // A live session makes `authenticated_handshake_unix` report the
         // established handshake on every tick — that is not a NEW handshake;

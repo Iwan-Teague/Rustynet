@@ -8,7 +8,7 @@
 pub mod noise;
 
 #[cfg(feature = "mock-instant")]
-pub(crate) mod mock_instant;
+pub mod mock_instant;
 
 #[cfg(not(feature = "mock-instant"))]
 pub(crate) mod sleepyinstant;
