@@ -46,9 +46,17 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 /// helper dies on launchd's 5 s ceiling while the daemon is still dialing).
 /// The `pkill -TERM -f …privileged-helper` fallback sits AFTER the helper
 /// bootout: KeepAlive would respawn a SIGTERMed helper whose job is still
-/// bootstrapped. The wait predicate is per-service (`pgrep -x rustynetd` /
-/// `rustynet-relay`), so it observes the daemon PROCESS exiting, which is the
-/// stronger form of "the job reports no pid".
+/// bootstrapped. The daemon-exit wait predicate is JOB-scoped
+/// (`launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q
+/// 'pid = '`), not process-scoped: the helper runs `/usr/local/bin/rustynetd`
+/// too, so a `pgrep -x rustynetd` poll conflates the helper's pid with the
+/// daemon's and can spin through its whole budget without ever observing
+/// daemon exit (post-merge review §2). The `pgrep -x` / `pkill -x` lines that
+/// remain are TERM/KILL backstops aimed by NAME and carry the same
+/// conflation — a TERM to `-x rustynetd` can take the helper down as
+/// collateral — which is why every KILL backstop is ordered strictly BEFORE
+/// the helper bootout (review §3): the helper dies LAST, after the daemon job
+/// is confirmed exited.
 ///
 /// Only the daemon label is disabled, deliberately: it is the ONLY label the
 /// bootstrap re-enables (`Install-RustyNetMacosService.sh` runs
@@ -68,21 +76,21 @@ const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.r
      sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.exit.plist 2>/dev/null || true; \
      sudo -n pkill -TERM -x rustynetd 2>/dev/null || true; \
      sudo -n pkill -TERM -x rustynet-relay 2>/dev/null || true; \
-     for _ in $(seq 1 60); do \
-         if pgrep -x rustynetd >/dev/null 2>&1 || pgrep -x rustynet-relay >/dev/null 2>&1; then \
+     for _ in $(seq 1 20); do \
+         if sudo -n launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then \
              sleep 0.5; \
          else \
              break; \
          fi; \
      done; \
+     sudo -n pkill -KILL -x rustynetd 2>/dev/null || true; \
+     sudo -n pkill -KILL -x rustynet-relay 2>/dev/null || true; \
+     sudo -n launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
      sudo -n launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true; \
      sudo -n pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper' 2>/dev/null || true; \
-     sudo -n launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
-     sudo -n pkill -KILL -x rustynetd 2>/dev/null || true; \
      sudo -n pkill -KILL -f '/usr/local/bin/rustynetd.*privileged-helper' 2>/dev/null || true; \
-     sudo -n pkill -KILL -x rustynet-relay 2>/dev/null || true; \
      for _ in $(seq 1 20); do \
-         if pgrep -x rustynetd >/dev/null 2>&1 || pgrep -x rustynet-relay >/dev/null 2>&1; then \
+         if sudo -n launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then \
              sleep 0.5; \
          else \
              break; \
@@ -958,17 +966,23 @@ mod tests {
             );
         }
         assert!(cmd.contains("launchctl bootout system/com.rustynet.anchor"));
-        assert!(
-            cmd.contains(
-                "launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist"
-            )
-        );
+        assert!(cmd
+            .contains("launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist"));
         assert!(cmd.contains("pkill -TERM -x rustynetd"));
         assert!(cmd.contains("pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper'"));
         assert!(cmd.contains("pkill -KILL -x rustynetd"));
         assert!(cmd.contains("pkill -KILL -f '/usr/local/bin/rustynetd.*privileged-helper'"));
-        assert!(cmd.contains("pgrep -x rustynetd"));
         assert!(cmd.contains("pkill -TERM -x rustynet-relay"));
+        assert!(cmd.contains("pkill -KILL -x rustynet-relay"));
+        // The daemon-exit polls are JOB-scoped (review §2): the helper runs
+        // /usr/local/bin/rustynetd too, so a pgrep -x rustynetd poll cannot
+        // tell the daemon from the helper.
+        assert!(cmd.contains("launchctl print system/com.rustynet.daemon"));
+        assert!(cmd.contains("grep -q 'pid = '"));
+        assert!(
+            !cmd.contains("pgrep"),
+            "the daemon-exit wait is job-scoped, not pgrep-polled"
+        );
     }
 
     /// M2 ordering pin (tests-first #8, plan
@@ -985,7 +999,7 @@ mod tests {
     fn macos_launchd_stop_command_has_no_early_helper_bootout() {
         let cmd = MACOS_LAUNCHD_STOP_COMMAND;
         let wait_at = cmd
-            .find("for _ in $(seq 1 60)")
+            .find("for _ in $(seq 1 20)")
             .expect("daemon-exit wait present");
         let before_wait = &cmd[..wait_at];
         assert!(
@@ -1018,6 +1032,74 @@ mod tests {
         );
     }
 
+    /// Post-merge review §3 ordering pin: the KILL backstops aimed at the
+    /// daemon's process name (`pkill -KILL -x rustynetd` /
+    /// `rustynet-relay`) may kill the helper as collateral (same binary
+    /// path), so they must run BEFORE the helper bootout — the helper dies
+    /// LAST, and its KILL fallback after its bootout.
+    #[test]
+    fn macos_launchd_stop_command_kills_the_daemon_before_booting_the_helper_out() {
+        let cmd = MACOS_LAUNCHD_STOP_COMMAND;
+        let kill_daemon_at = cmd
+            .rfind("pkill -KILL -x rustynetd")
+            .expect("the KILL daemon backstop must exist");
+        let kill_relay_at = cmd
+            .rfind("pkill -KILL -x rustynet-relay")
+            .expect("the KILL relay backstop must exist");
+        let bootout_at = cmd
+            .find("launchctl bootout system/com.rustynet.privileged-helper")
+            .expect("the helper bootout must exist");
+        assert!(
+            kill_daemon_at < bootout_at,
+            "pkill -KILL -x rustynetd must precede the helper bootout: the KILL is \
+             name-aimed and the helper runs the same binary, so a late KILL would \
+             take the freshly-verified helper down (review §3)"
+        );
+        assert!(
+            kill_relay_at < bootout_at,
+            "pkill -KILL -x rustynet-relay must precede the helper bootout (review §3)"
+        );
+        let kill_helper_at = cmd
+            .find("pkill -KILL -f '/usr/local/bin/rustynetd.*privileged-helper'")
+            .expect("the KILL helper fallback must exist");
+        assert!(
+            kill_helper_at > bootout_at,
+            "the helper KILL fallback stays after the helper bootout — the helper dies last"
+        );
+    }
+
+    /// Post-merge review §2 predicate pin: both daemon-exit polls are
+    /// job-scoped (`launchctl print system/com.rustynet.daemon | grep -q
+    /// 'pid = '` — absence of the pid line ⇒ exited), bounded at 20 × 0.5 s.
+    #[test]
+    fn macos_launchd_stop_command_waits_on_the_daemon_job_not_the_process_name() {
+        let cmd = MACOS_LAUNCHD_STOP_COMMAND;
+        let polls = cmd
+            .matches("launchctl print system/com.rustynet.daemon")
+            .count();
+        assert_eq!(
+            polls, 2,
+            "both the post-TERM and post-KILL waits are job-scoped"
+        );
+        for segment in cmd.split("for _ in $(seq 1 20); do ").skip(1) {
+            let poll = segment
+                .split("done")
+                .next()
+                .expect("wait loop body present");
+            assert!(
+                poll.contains("launchctl print system/com.rustynet.daemon")
+                    && poll.contains("grep -q 'pid = '"),
+                "every daemon-exit wait polls the launchd job's pid line, not pgrep"
+            );
+        }
+        assert_eq!(
+            cmd.matches("seq 1 20").count(),
+            2,
+            "each wait is bounded at 20 polls; 20 × 0.5 s = 10 s, above launchd's 5 s \
+             SIGKILL ceiling"
+        );
+    }
+
     #[test]
     fn parse_macos_node_clean_probe_accepts_fully_clean_node() {
         assert!(parse_macos_node_clean_probe("pf=- daemon=down iface=-\n").is_ok());
@@ -1044,10 +1126,9 @@ mod tests {
     fn parse_macos_node_clean_probe_reports_running_daemon() {
         let err = parse_macos_node_clean_probe("pf=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(
-            err.to_string()
-                .contains("rustynetd or rustynet-relay still running")
-        );
+        assert!(err
+            .to_string()
+            .contains("rustynetd or rustynet-relay still running"));
     }
 
     #[test]
