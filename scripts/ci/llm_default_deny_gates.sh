@@ -54,9 +54,30 @@ run_required_test -p rustynet-policy service_allow_is_scoped_to_peer_and_service
 # Model/quota/rate scoping (restrictions on a grant, never a grant).
 run_required_test -p rustynet-policy llm_access_scope_permits_model_truth_table
 run_required_test -p rustynet-policy llm_scope_policy_scope_for_prefers_most_specific_selector
+run_required_test -p rustynet-policy llm_access_scope_unrestricted_marker_and_narrowing_detection
 run_required_test -p rustynet-llm-gateway enforce::tests::model_outside_allow_list_refused
 run_required_test -p rustynet-llm-gateway enforce::tests::rate_limit_trips_on_third_request_and_resets_after_minute
 run_required_test -p rustynet-llm-gateway enforce::tests::token_quota_severs_stream_and_window_resets
+
+# Deny-on-absent scoping (OG-1 Option B): absence never means
+# unrestricted; `unrestricted` is the explicit full-access marker.
+if rg -q 'leaves grants unrestricted|keeps the full grant|means "unrestricted grant"' \
+    crates/rustynet-policy/src/lib.rs crates/rustynet-llm-gateway/src/ crates/rustynetd/src/service_access_state.rs; then
+  echo "GATE DEFECT: fail-open absent-scope doc survived the deny-on-absent flip" >&2
+  exit 1
+fi
+run_required_test -p rustynet-llm-gateway enforce::tests::missing_scope_denies_every_model
+run_required_test -p rustynet-llm-gateway enforce::tests::missing_scope_severs_stream_on_first_token
+run_required_test -p rustynet-llm-gateway enforce::tests::missing_scope_hides_every_model
+run_required_test -p rustynet-llm-gateway enforce::tests::explicit_unrestricted_admits_any_model_without_quota
+# Loader/admitted_peer/stream tests live in the bin target
+# (src/main.rs, behind the `daemon` feature), unlike the lib tests
+# above — target the bin explicitly and with features on.
+run_required_test -p rustynet-llm-gateway --bin rustynet-llm-gateway --all-features unrestricted_with_any_limit_key_is_a_loader_error
+run_required_test -p rustynet-llm-gateway --bin rustynet-llm-gateway --all-features bare_selector_line_denies
+run_required_test -p rustynet-llm-gateway --bin rustynet-llm-gateway --all-features grant_present_scope_absent_refused_end_to_end
+run_required_test -p rustynet-llm-gateway --bin rustynet-llm-gateway --all-features serve_connection_refuses_granted_peer_without_scope_line
+run_required_test -p rustynet-llm-gateway --bin rustynet-llm-gateway --all-features midstream_scope_narrowing_severs_stream
 
 # E4 — token can never exceed CURRENT signed policy.
 run_required_test -p rustynet-llm-gateway session::tests::e4_pin_valid_in_ttl_token_dies_under_current_deny
