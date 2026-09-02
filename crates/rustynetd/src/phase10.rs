@@ -401,6 +401,22 @@ pub struct ApplyOptions {
     /// key their blind-vs-regular exit dataplane on this flag; Windows
     /// blind_exit is out of scope by design (Linux/macOS only).
     pub blind_exit: bool,
+    /// M2 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3):
+    /// when set — BOOTSTRAP-time applies only — the `ScopedResolverOnly`
+    /// posture sub-apply is SKIPPED here and left to the daemon's
+    /// first-reconcile heal (the `dns_posture_reassert_pending` latch), whose
+    /// pass runs while the daemon's DNS serve loop is already live. The
+    /// scoped posture's only mutation is the single `/etc/resolver/rustynet`
+    /// file and the probe precedes it, so deferring costs at most one
+    /// reconcile tick of Magic-DNS availability and opens no leak window.
+    /// `FullyProtected` is NEVER deferred by this flag: the review's §3.1
+    /// finding is that deferring the full posture would leave a tunnel-up
+    /// node resolving general DNS with no pf floor and no pins — a real leak
+    /// window under Requirements.md:186 / SecurityMinimumBar §8 — so that
+    /// posture stays in-bootstrap (serviced by M1's hoisted-bind probe
+    /// servicer). Default `false`: reconcile-time applies never defer (the
+    /// serve loop is live by then).
+    pub defer_scoped_dns_posture: bool,
 }
 
 impl Default for ApplyOptions {
@@ -411,6 +427,7 @@ impl Default for ApplyOptions {
             exit_mode: ExitMode::Off,
             serve_exit_node: false,
             blind_exit: false,
+            defer_scoped_dns_posture: false,
         }
     }
 }
@@ -7344,9 +7361,23 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             // posture. Exit-serving / full-tunnel nodes get the full
             // fail-closed sequence; plain mesh clients get scoped-only.
             let posture = macos_dns_posture(options.exit_mode, options.serve_exit_node);
-            self.system.apply_dns_protection_for_posture(posture)?;
-            applied_stages.push(StageMarker::DnsApplied);
-            self.system.assert_dns_protection()?;
+            if options.defer_scoped_dns_posture && posture == DnsPosture::ScopedResolverOnly {
+                // M2 posture-split deferral (bootstrap-time only): the scoped
+                // sub-apply moves to the daemon's first-reconcile heal latch.
+                // The DNS arm emits NO ops here — no probe, no scoped-file
+                // write, no assert — and records nothing as applied, so this
+                // generation's DNS posture remains exactly `Untouched` (the
+                // zero-leak state) until the serve loop is live and the heal
+                // pass applies it for real.
+                log::info!(
+                    "bootstrap deferred the {scoped} DNS posture; the first reconcile pass owns it",
+                    scoped = DnsPosture::ScopedResolverOnly.as_str()
+                );
+            } else {
+                self.system.apply_dns_protection_for_posture(posture)?;
+                applied_stages.push(StageMarker::DnsApplied);
+                self.system.assert_dns_protection()?;
+            }
         }
 
         if !options.ipv6_parity_supported {
@@ -11232,6 +11263,112 @@ mod tests {
                 .operations
                 .contains(&"block_all_egress".to_owned()),
             "fail-closed must block all egress; ops={:?}",
+            controller.system.operations
+        );
+    }
+
+    /// M2 posture-split deferral: a bootstrap apply (`defer_scoped_dns_posture`)
+    /// for a plain client (exit Off, not serving) — the `ScopedResolverOnly`
+    /// posture — must emit NO DNS ops at all: no apply, no probe, no assert.
+    /// The DNS posture of this generation stays `Untouched` (zero-leak); the
+    /// daemon's first-reconcile heal latch owns the real apply.
+    #[test]
+    fn bootstrap_deferred_scoped_posture_emits_no_dns_ops() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "10.0.0.0/8".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::Off,
+                    serve_exit_node: false,
+                    protected_dns: true,
+                    defer_scoped_dns_posture: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("a deferred scoped apply must succeed without touching DNS");
+
+        assert!(
+            !controller
+                .system
+                .operations
+                .contains(&"apply_dns_protection".to_owned()),
+            "bootstrap must not apply the scoped DNS posture; ops={:?}",
+            controller.system.operations
+        );
+        assert!(
+            !controller
+                .system
+                .operations
+                .contains(&"assert_dns_protection".to_owned()),
+            "bootstrap must not assert the skipped scoped DNS posture; ops={:?}",
+            controller.system.operations
+        );
+        assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
+    }
+
+    /// M2 negative control: the SAME bootstrap deferral flag must NOT defer
+    /// the `FullyProtected` posture (exit-serving node) — that posture is
+    /// leak-relevant (pf floor, pins, resolv.conf) and stays in-bootstrap,
+    /// serviced by the hoisted-bind probe servicer.
+    #[test]
+    fn bootstrap_defer_flag_never_defers_fully_protected_posture() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "0.0.0.0/0".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::ExitNodeDefault,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::FullTunnel,
+                    serve_exit_node: true,
+                    protected_dns: true,
+                    defer_scoped_dns_posture: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("a protected-DNS apply must proceed despite the scoped defer flag");
+
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"apply_dns_protection".to_owned()),
+            "FullyProtected must stay in-bootstrap; ops={:?}",
+            controller.system.operations
+        );
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"assert_dns_protection".to_owned()),
+            "FullyProtected must be asserted at apply time; ops={:?}",
             controller.system.operations
         );
     }
