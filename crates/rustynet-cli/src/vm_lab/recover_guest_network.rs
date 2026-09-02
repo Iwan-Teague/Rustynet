@@ -265,15 +265,17 @@ pub(crate) fn parse_ipv4_for_interface(ip_addr_output: &str, interface: &str) ->
 /// the only module that can render one (QH-01). The YAML body goes into a quoted
 /// heredoc, so its control is `Binding::HeredocBody` — "no line equal to the
 /// terminator" — not a quoting rule.
-fn netplan_repair_script(interface: &str) -> Result<String, String> {
+fn netplan_repair_script(interface: &str) -> Result<script_template::RenderedScript, String> {
     script_template::render_netplan_repair_script(&corrected_netplan_yaml(interface))
 }
 
-fn network_manager_repair_script(interface: &str) -> Result<String, String> {
+fn network_manager_repair_script(
+    interface: &str,
+) -> Result<script_template::RenderedScript, String> {
     script_template::render_network_manager_repair_script(interface)
 }
 
-fn networkd_repair_script(interface: &str) -> Result<String, String> {
+fn networkd_repair_script(interface: &str) -> Result<script_template::RenderedScript, String> {
     script_template::render_networkd_repair_script(interface)
 }
 
@@ -513,7 +515,7 @@ fn apply_guest_repair(
             );
         }
     };
-    run_ssh_script_with_sudo(identity, ssh_target, &script)
+    run_ssh_script_with_sudo(identity, ssh_target, script.as_str())
 }
 
 fn poll_recovered_ipv4(
@@ -717,9 +719,10 @@ network:
         assert!(!corrected.contains("set-name:"));
         // The generated repair script embeds the corrected config, name-matched.
         let script = netplan_repair_script("enp0s1").expect("a valid interface must render");
+        let script = script.as_str();
         assert!(script.contains("netplan apply"));
         assert!(script.contains("dhcp4: true"));
-        assert!(!netplan_yaml_pins_mac(&script));
+        assert!(!netplan_yaml_pins_mac(script));
         // The heredoc terminator must still start at column 0 after the body.
         assert!(script.contains("dhcp6: true\nRN_NETPLAN_EOF\n"));
     }
