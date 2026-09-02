@@ -143,6 +143,28 @@ impl PowerShellScript {
         Ok(Self(ps_quote(value)?))
     }
 
+    /// Build the standard validator-call script from an already-validated
+    /// argv: `$out = & '<binary>' '<arg>' ... 2>&1; Write-Output $out`. Every
+    /// element is `ps_quote`d; an empty argv is an error, not an empty script.
+    pub(crate) fn from_call_argv(
+        label: &str,
+        argv: &[crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg],
+    ) -> Result<Self, AdapterError> {
+        if argv.is_empty() {
+            return Err(AdapterError::Protocol {
+                message: format!("{label}: validated argv must not be empty"),
+            });
+        }
+        let mut rendered = String::from("$out = &");
+        for arg in argv {
+            let quoted = ps_quote(arg.value())?;
+            rendered.push(' ');
+            rendered.push_str(&quoted);
+        }
+        rendered.push_str(" 2>&1; Write-Output $out");
+        Ok(Self(rendered))
+    }
+
     // Deliberately NO whole-script constructor from a plain `String`: it
     // would accept any `format!` result (voiding the type boundary), and
     // `ps_quote` turns a script body into a single-quoted literal, which is

@@ -282,6 +282,26 @@ pub(crate) fn windows_path(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// A daemon-CLI subcommand or flag token: non-empty, restricted to
+/// `[A-Za-z0-9._=-]+`. Flags start with `-` and `key=value` flags carry `=`;
+/// whitespace and shell metacharacters are rejected outright.
+pub(crate) fn cli_token(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Err(ValidationError::new("CLI token", "must not be empty"));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '=' | '-'))
+    {
+        return Err(ValidationError::new(
+            "CLI token",
+            "contains characters not safe for shell embedding (allowed: \
+             alphanumeric, '.', '_', '=', '-'; a leading '-' marks a flag)",
+        ));
+    }
+    Ok(())
+}
+
 /// An IP-address-shaped argument: a charset allowlist safe for shell
 /// embedding. Hoisted from `linux_traffic.rs` / `windows_traffic.rs` (the two
 /// identical copies). Note this class intentionally accepts CIDR notation;
@@ -339,10 +359,12 @@ pub(crate) enum ValidatedArg {
     InterfaceName(String),
     BundleFilename(String),
     Port(String),
+    CliToken(String),
+    WindowsPath(String),
 }
 
 impl ValidatedArg {
-    fn value(&self) -> &str {
+    pub(crate) fn value(&self) -> &str {
         match self {
             Self::Ip(v)
             | Self::NodeId(v)
@@ -353,7 +375,9 @@ impl ValidatedArg {
             | Self::ConnectionUser(v)
             | Self::InterfaceName(v)
             | Self::BundleFilename(v)
-            | Self::Port(v) => v,
+            | Self::Port(v)
+            | Self::CliToken(v)
+            | Self::WindowsPath(v) => v,
         }
     }
 
@@ -412,6 +436,16 @@ impl ValidatedArg {
         port(value)?;
         Ok(Self::Port(value.to_owned()))
     }
+
+    pub(crate) fn cli_token(value: &str) -> Result<Self, ValidationError> {
+        cli_token(value)?;
+        Ok(Self::CliToken(value.to_owned()))
+    }
+
+    pub(crate) fn windows_path(value: &str) -> Result<Self, ValidationError> {
+        windows_path(value)?;
+        Ok(Self::WindowsPath(value.to_owned()))
+    }
 }
 
 impl fmt::Debug for ValidatedArg {
@@ -429,6 +463,8 @@ impl fmt::Debug for ValidatedArg {
             Self::InterfaceName(_) => "InterfaceName",
             Self::BundleFilename(_) => "BundleFilename",
             Self::Port(_) => "Port",
+            Self::CliToken(_) => "CliToken",
+            Self::WindowsPath(_) => "WindowsPath",
         };
         write!(f, "ValidatedArg::{variant}(len={})", self.value().len())
     }
@@ -702,6 +738,18 @@ mod tests {
     }
 
     #[test]
+    fn cli_token_rejects_metacharacters_and_accepts_subcommands_and_flags() {
+        assert!(cli_token("--no-fail-on-drift").is_ok());
+        assert!(cli_token("linux-key-custody-check").is_ok());
+        assert!(cli_token("sudo").is_ok());
+        assert!(cli_token("key=value").is_ok());
+        assert!(cli_token("x; id").is_err());
+        assert!(cli_token("$(id)").is_err());
+        assert!(cli_token("a b").is_err());
+        assert!(cli_token("").is_err());
+    }
+
+    #[test]
     fn hoisted_wrappers_still_error_as_adapter_protocol_failures() {
         assert!(validate_ip_arg("10.0.0.5;id").is_err());
         assert!(validate_ip_arg("10.0.0.5").is_ok());
@@ -724,5 +772,9 @@ mod tests {
         assert!(ValidatedArg::bundle_filename("a/b").is_err());
         assert!(ValidatedArg::port("99999").is_err());
         assert!(ValidatedArg::port("4242").is_ok());
+        assert!(ValidatedArg::cli_token("x; id").is_err());
+        assert!(ValidatedArg::cli_token("--no-fail-on-drift").is_ok());
+        assert!(ValidatedArg::windows_path("bad\0path").is_err());
+        assert!(ValidatedArg::windows_path("C:\\ok").is_ok());
     }
 }
