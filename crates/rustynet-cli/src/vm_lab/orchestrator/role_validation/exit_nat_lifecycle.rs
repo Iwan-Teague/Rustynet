@@ -1,22 +1,92 @@
 #![allow(dead_code)]
 //! Cross-OS exit NAT lifecycle validation for the standard orchestrator.
 //!
-//! Runs `rustynetd linux-exit-nat-lifecycle-snapshot` twice — once during
-//! active exit service (captures NAT table + forwarding state), then again
-//! after daemon stop — merges the two-phase artifact with the official
-//! [`merge_linux_exit_nat_lifecycle_artifact`] merger, and evaluates it
-//! with the same typed evaluator the bash live-suite applies
-//! (`evaluate_linux_exit_nat_lifecycle_artifact`).
+//! Runs the platform's `rustynetd *-exit-nat-lifecycle-snapshot` subcommand
+//! twice — once during active exit service, then again after daemon stop —
+//! merges the two-phase artifact with the platform's official merger, and
+//! evaluates it with the same typed evaluator the live suites apply
+//! (`evaluate_linux_exit_nat_lifecycle_artifact` /
+//! `evaluate_macos_exit_nat_lifecycle_artifact`).
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::orchestrator::role_validation::discover_single_generated_nft_table;
 
 pub fn exit_nat_lifecycle_runtime_implemented(platform: VmGuestPlatform) -> bool {
-    matches!(platform, VmGuestPlatform::Linux)
+    matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
 }
 
-const DEFAULT_MESH_CIDR: &str = "100.64.0.0/10";
+/// The lab mesh CIDR every snapshot is taken against. Defined once in the
+/// macOS exit adapter's module and re-used here, so the adapter's assertions
+/// and this stage's two-phase proof can never disagree about the expected
+/// prefix.
+const DEFAULT_MESH_CIDR: &str =
+    crate::vm_lab::orchestrator::adapter::macos_exit_traffic::MACOS_EXIT_EXPECTED_MESH_CIDR;
+
+/// Run the macOS two-phase exit NAT lifecycle validation: snapshot during
+/// active exit → stop daemon → snapshot after stop → merge → evaluate.
+/// Mirrors [`validate_linux_exit_nat_lifecycle`] but speaks pf: the daemon's
+/// own `macos-exit-nat-lifecycle-snapshot` subcommand is the only state
+/// reader (design §0 decision 2 — the CLI never re-derives pf parsing), and
+/// the merged artifact is evaluated by the unquarantined
+/// `evaluate_macos_exit_nat_lifecycle_artifact`. Fail-closed on dispatch,
+/// parse, merge, or evaluation failure.
+pub fn validate_macos_exit_nat_lifecycle(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    alias: &str,
+) -> Result<(), String> {
+    let during = capture_macos_nat_lifecycle_snapshot(shell, daemon_path, "during-run")?;
+    stop_macos_daemon(shell)?;
+    let after = capture_macos_nat_lifecycle_snapshot(shell, daemon_path, "after-stop")?;
+
+    let merged = rustynetd::macos_exit_nat_lifecycle::merge_macos_exit_nat_lifecycle_artifact(
+        &during, &after,
+    );
+    crate::vm_lab::evaluate_macos_exit_nat_lifecycle_artifact(alias, &merged.to_string())?;
+    Ok(())
+}
+
+fn capture_macos_nat_lifecycle_snapshot(
+    shell: &dyn RemoteShellHost,
+    daemon_path: &str,
+    phase: &str,
+) -> Result<rustynetd::macos_exit_nat_lifecycle::MacosExitNatLifecycleSnapshot, String> {
+    let out = shell
+        .run_argv(
+            &[
+                daemon_path,
+                "macos-exit-nat-lifecycle-snapshot",
+                "--mesh-cidr",
+                DEFAULT_MESH_CIDR,
+            ],
+            &[],
+            &[],
+        )
+        .map_err(|err| format!("dispatch of {phase} exit NAT lifecycle snapshot failed: {err}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout)
+        .map_err(|err| format!("parse {phase} exit NAT lifecycle snapshot failed: {err}"))
+}
+
+/// Stop the launchd daemon for the after-stop phase. Tolerant of a
+/// already-stopped daemon (mirrors `macos_install::stop_daemon`): a daemon
+/// that never actually stopped is caught by the after-stop snapshot itself —
+/// the evaluator rejects a leftover anchor or unrestored forwarding.
+fn stop_macos_daemon(shell: &dyn RemoteShellHost) -> Result<(), String> {
+    let _ = shell.run_argv(
+        &[
+            "sudo",
+            "-n",
+            "launchctl",
+            "bootout",
+            "system/com.rustynet.daemon",
+        ],
+        &[],
+        &[],
+    );
+    Ok(())
+}
 
 /// Run the full two-phase exit NAT lifecycle validation: snapshot during
 /// active exit → stop daemon → snapshot after stop → merge → evaluate.
@@ -90,11 +160,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_implemented_linux_only() {
+    fn runtime_implemented_linux_and_macos_not_windows() {
         assert!(exit_nat_lifecycle_runtime_implemented(
             VmGuestPlatform::Linux
         ));
-        assert!(!exit_nat_lifecycle_runtime_implemented(
+        assert!(exit_nat_lifecycle_runtime_implemented(
             VmGuestPlatform::Macos
         ));
         assert!(!exit_nat_lifecycle_runtime_implemented(
@@ -105,6 +175,127 @@ mod tests {
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
     const TEST_DAEMON: &str = "/usr/local/bin/rustynetd";
+
+    // ----- macOS two-phase lifecycle (MockShellHost, no SSH) ----------------
+
+    fn macos_snapshot_argv() -> [&'static str; 4] {
+        [
+            TEST_DAEMON,
+            "macos-exit-nat-lifecycle-snapshot",
+            "--mesh-cidr",
+            "100.64.0.0/10",
+        ]
+    }
+
+    fn macos_stop_argv() -> [&'static str; 5] {
+        [
+            "sudo",
+            "-n",
+            "launchctl",
+            "bootout",
+            "system/com.rustynet.daemon",
+        ]
+    }
+
+    fn macos_active_pfctl() -> &'static str {
+        "nat on en0 inet from 100.64.0.0/10 to any -> (en0) round-robin\n"
+    }
+
+    fn macos_during_snapshot() -> serde_json::Value {
+        serde_json::to_value(
+            rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+                1700000000,
+                "100.64.0.0/10",
+                "com.rustynet/nat",
+                macos_active_pfctl(),
+                "1\n",
+            ),
+        )
+        .unwrap()
+    }
+
+    fn macos_after_snapshot() -> serde_json::Value {
+        serde_json::to_value(
+            rustynetd::macos_exit_nat_lifecycle::build_macos_exit_nat_lifecycle_snapshot(
+                1700000001,
+                "100.64.0.0/10",
+                "com.rustynet/nat",
+                "",
+                "0\n",
+            ),
+        )
+        .unwrap()
+    }
+
+    fn program_macos_clean_lifecycle(mock: &MockShellHost) {
+        mock.program_run_response(
+            &macos_snapshot_argv(),
+            exit_ok(&macos_during_snapshot().to_string()),
+        );
+        mock.program_run_response(&macos_stop_argv(), exit_ok(""));
+        mock.program_run_response(
+            &macos_snapshot_argv(),
+            exit_ok(&macos_after_snapshot().to_string()),
+        );
+    }
+
+    #[test]
+    fn validate_macos_accepts_clean_teardown() {
+        let mock = MockShellHost::new();
+        program_macos_clean_lifecycle(&mock);
+        validate_macos_exit_nat_lifecycle(&mock, TEST_DAEMON, "mac-1")
+            .expect("clean macOS exit NAT lifecycle teardown must validate");
+    }
+
+    #[test]
+    fn validate_macos_fails_closed_on_snapshot_dispatch_error() {
+        let mock = MockShellHost::new();
+        let err = validate_macos_exit_nat_lifecycle(&mock, TEST_DAEMON, "mac-1")
+            .expect_err("a dispatch error must fail the stage");
+        assert!(
+            err.contains("during-run exit NAT lifecycle snapshot failed")
+                || err.contains("unsupported argv"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_macos_fails_closed_on_leftover_anchor_after_stop() {
+        let mock = MockShellHost::new();
+        mock.program_run_response(
+            &macos_snapshot_argv(),
+            exit_ok(&macos_during_snapshot().to_string()),
+        );
+        mock.program_run_response(&macos_stop_argv(), exit_ok(""));
+        // Anchor still present after stop — a leftover anchor is a rejection.
+        mock.program_run_response(
+            &macos_snapshot_argv(),
+            exit_ok(&macos_during_snapshot().to_string()),
+        );
+        let err = validate_macos_exit_nat_lifecycle(&mock, TEST_DAEMON, "mac-1")
+            .expect_err("leftover pf anchor after stop must fail closed");
+        assert!(
+            err.contains("left pf anchor present after daemon stop"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_macos_fails_closed_on_after_stop_snapshot_error() {
+        let mock = MockShellHost::new();
+        mock.program_run_response(
+            &macos_snapshot_argv(),
+            exit_ok(&macos_during_snapshot().to_string()),
+        );
+        mock.program_run_response(&macos_stop_argv(), exit_ok(""));
+        let err = validate_macos_exit_nat_lifecycle(&mock, TEST_DAEMON, "mac-1")
+            .expect_err("a second-snapshot failure must fail the stage");
+        assert!(
+            err.contains("after-stop exit NAT lifecycle snapshot failed")
+                || err.contains("unsupported argv"),
+            "unexpected error: {err}"
+        );
+    }
 
     fn exit_ok(stdout: &str) -> RemoteExitStatus {
         RemoteExitStatus {
