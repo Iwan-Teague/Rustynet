@@ -3143,7 +3143,9 @@ mod tests {
             // +3 on 2026-08-29 (MAC-D3): the macOS anchor validator set
             // (deploy_macos_anchor_profile + bundle_pull + port_mapping)
             // joined T1Role as first-class --node stages.
-            ("t1_role", 22),
+            // +1 on 2026-09-02 (C6): validate_macos_role_transition ported
+            // from the legacy vm_lab hub into a first-class --node stage.
+            ("t1_role", 23),
             ("t2_resilience", 13),
             ("t3_cross_os", 1),
             ("t4_security", 16),
