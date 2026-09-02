@@ -2200,10 +2200,14 @@ pub const STAGES: &[StageSpec] = &[
         ..DEFAULT_SPEC
     },
     // ── HP-3 disruptive relay-forwarding proof (opt-in) ─────────────────
+    // Folds into the same evidence column as the bash-dialect
+    // `validate_linux_relay_forwards_frame` (`linux_relay_forwards_frame`);
+    // there is no `{os}_stage_relay_forward_test` schema column, so a
+    // `logical` mapping here would be silently dropped by `set_status`.
     StageSpec {
         name: "relay_forwards_frame_validation",
         group: StageGroup::Disruptive,
-        logical: Some("relay_forward_test"),
+        special: Some("linux_relay_forwards_frame"),
         platform_rule: PlatformRule::AllPlatforms,
         enable: EnableRule::RelayForwardingValidation,
         ..DEFAULT_SPEC
