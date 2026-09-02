@@ -283,30 +283,116 @@ impl ContextualPolicySet {
 /// authorised peer may do — they are never an authorisation source:
 /// the gateway must first obtain `Decision::Allow` from
 /// [`ContextualPolicySet::evaluate_with_membership`] for
-/// `TrafficContext::LlmService`, then apply the scope. A peer with
-/// no scope entry keeps the full grant (the grant itself is the
-/// authorisation; scoping is an optional admin restriction).
+/// `TrafficContext::LlmService`, then apply the scope.
+///
+/// Deny-on-absent (default-deny): a granted peer with **no** scope
+/// entry — an absent scopes file, no line matching the peer, or a
+/// bare selector line with no keys ([`LlmAccessScope::default`]) —
+/// is denied every model. Absence never means unrestricted. The only
+/// way to express full access is the explicit [`LlmAccessScope::unrestricted`]
+/// marker on the peer's scope line; it cannot be combined with any
+/// limit key, and the gateway's loader hard-errors on that
+/// contradiction instead of degrading.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LlmAccessScope {
-    /// Models the peer may invoke. `None` = the grant is
-    /// unrestricted (any model the node offers). `Some(list)` =
-    /// only the named models; an empty list denies every model.
+    /// Models the peer may invoke. With `unrestricted == false`,
+    /// `None` denies every model (no explicit model grant — never
+    /// "any model"); `Some(list)` permits only the named models, and
+    /// an empty list denies every model. With
+    /// [`LlmAccessScope::unrestricted`], every model is permitted and
+    /// this field must stay `None`.
     pub allowed_models: Option<Vec<String>>,
-    /// Token budget per accounting window. `None` = no token quota.
+    /// Token budget per accounting window. `None` imposes no token
+    /// quota (scopes never invent a default quota; the deny posture
+    /// comes from the model list, not from a fabricated limit). Must
+    /// stay `None` on an [`LlmAccessScope::unrestricted`] scope.
     pub max_tokens_per_window: Option<u64>,
-    /// Request-rate ceiling per minute. `None` = no rate ceiling.
+    /// Request-rate ceiling per minute. `None` imposes no rate
+    /// ceiling. Must stay `None` on an
+    /// [`LlmAccessScope::unrestricted`] scope.
     pub max_requests_per_minute: Option<u32>,
+    /// Explicit full-access marker. `false` (the `Default`) is the
+    /// deny posture: `permits_model` answers from
+    /// `allowed_models` alone, where `None` denies. `true` is the
+    /// only path to "any model, no quota, no rate ceiling" and is
+    /// mutually exclusive with every limit field by construction —
+    /// see [`LlmAccessScope::unrestricted`].
+    pub unrestricted: bool,
 }
 
 impl LlmAccessScope {
+    /// The explicit full-access scope: every model permitted, no
+    /// quota, no rate ceiling. The ONLY way to reproduce
+    /// "unrestricted" under deny-on-absent semantics — it must be
+    /// written explicitly into the peer's scope line; absence of a
+    /// scope never resolves to this.
+    pub fn unrestricted() -> Self {
+        Self {
+            allowed_models: None,
+            max_tokens_per_window: None,
+            max_requests_per_minute: None,
+            unrestricted: true,
+        }
+    }
+
     /// Whether this scope permits invoking `model`. Purely a
     /// restriction check — callers must already hold an Allow
-    /// decision for the peer.
+    /// decision for the peer. Fail-closed: an unknown model, or a
+    /// scoped scope with no model list, denies.
     pub fn permits_model(&self, model: &str) -> bool {
+        if self.unrestricted {
+            return true;
+        }
         match &self.allowed_models {
-            None => true,
+            // Deny-on-absent: a scope without an explicit model list
+            // grants nothing (it is `Default`, the deny posture).
+            None => false,
             Some(models) => models.iter().any(|m| m == model),
         }
+    }
+
+    /// Whether this scope is at least as permissive as `baseline`
+    /// for every capability `baseline` grants: it permits every
+    /// model `baseline` permits and never sets a lower limit.
+    ///
+    /// Used for mid-stream scope-currency checks: an in-flight
+    /// request admitted under `baseline` must be severed the moment
+    /// the freshly loaded scope is NOT a superset of it (narrowed or
+    /// removed). An `unrestricted` baseline is only matched by an
+    /// `unrestricted` current scope — losing the marker mid-stream is
+    /// a narrowing and severs the stream.
+    pub fn is_at_least_as_permissive_as(&self, baseline: &LlmAccessScope) -> bool {
+        if baseline.unrestricted {
+            return self.unrestricted;
+        }
+        if self.unrestricted {
+            // Widening relative to a scoped baseline; never narrower.
+            return true;
+        }
+        let models_ok = match &baseline.allowed_models {
+            // A deny-all baseline permits nothing; anything matches.
+            None => true,
+            Some(list) => match &self.allowed_models {
+                Some(mine) => list.iter().all(|m| mine.contains(m)),
+                None => false,
+            },
+        };
+        // A limit of `None` imposes no ceiling, so a current scope that
+        // dropped a limit is wider, never narrower; only a lower `Some`
+        // narrows. (The in-flight request keeps its admission-time
+        // accounting regardless, so a dropped limit never widens it.)
+        let quota_ok = match (baseline.max_tokens_per_window, self.max_tokens_per_window) {
+            (None, _) | (Some(_), None) => true,
+            (Some(baseline_limit), Some(limit)) => limit >= baseline_limit,
+        };
+        let rate_ok = match (
+            baseline.max_requests_per_minute,
+            self.max_requests_per_minute,
+        ) {
+            (None, _) | (Some(_), None) => true,
+            (Some(baseline_limit), Some(limit)) => limit >= baseline_limit,
+        };
+        models_ok && quota_ok && rate_ok
     }
 }
 
@@ -341,12 +427,16 @@ impl LlmScopePolicy {
     /// parse them; it returns the scope for the first supplied selector that has
     /// an entry, so the caller's ordering IS the precedence (POL-12).
     ///
-    /// Returns `None` when no entry applies, which leaves the grant
-    /// unrestricted. That fail-open direction is deliberate here — a scope is an
-    /// optional admin restriction layered on top of an Allow decision the caller
-    /// already holds, not the authorization itself — but it is also why the
-    /// ordering obligation above matters: a mis-ordered call does not error, it
-    /// silently resolves a broader scope.
+    /// Returns `None` when no entry applies. Deny-on-absent: the
+    /// consumer MUST treat a `None` resolution as "no access" (deny
+    /// every model) — absence never means unrestricted, and the only
+    /// full-access value is an explicit
+    /// [`LlmAccessScope::unrestricted`] entry. The ordering
+    /// obligation above still matters: a mis-ordered call does not
+    /// error, it silently resolves whichever selector the caller
+    /// listed first — under deny-on-absent the realistic
+    /// mis-resolution is a wrong *narrow* scope (confusing denies),
+    /// never a silent widening.
     pub fn scope_for<'a>(&'a self, peer_selectors: &[String]) -> Option<&'a LlmAccessScope> {
         for selector in peer_selectors {
             if let Some((_, scope)) = self
@@ -2699,14 +2789,23 @@ mod tests {
         assert!(TrafficContext::LlmService.is_service_context());
     }
 
-    /// D13.b: scope model-restriction truth table — `None` permits
-    /// any model, `Some(list)` permits only the listed models, and
+    /// D13.b: scope model-restriction truth table — deny-on-absent.
+    /// `Default` (a bare selector line) denies every model; the
+    /// explicit `unrestricted` marker permits any model;
+    /// `Some(list)` permits only the listed models, and
     /// `Some(empty)` permits none.
     #[test]
     fn llm_access_scope_permits_model_truth_table() {
-        let unrestricted = LlmAccessScope::default();
-        assert!(unrestricted.allowed_models.is_none());
-        assert!(unrestricted.permits_model("any-model"));
+        let deny_all = LlmAccessScope::default();
+        assert!(!deny_all.unrestricted);
+        assert!(
+            !deny_all.permits_model("any-model"),
+            "deny-on-absent: a scope with no model list and no marker denies"
+        );
+
+        let marker = LlmAccessScope::unrestricted();
+        assert!(marker.permits_model("any-model"));
+        assert!(marker.permits_model("another-model"));
 
         let listed = LlmAccessScope {
             allowed_models: Some(vec!["small-model".to_owned(), "code-model".to_owned()]),
@@ -2724,6 +2823,66 @@ mod tests {
             !none_allowed.permits_model("small-model"),
             "an explicit empty model list must deny every model"
         );
+    }
+
+    /// Deny-on-absent: the explicit `unrestricted` marker is the only
+    /// full-access scope, and the mid-stream narrowing check treats
+    /// losing the marker, dropping a model, or lowering a limit as a
+    /// narrowing (sever), while an equal-or-wider scope is not one.
+    #[test]
+    fn llm_access_scope_unrestricted_marker_and_narrowing_detection() {
+        let marker = LlmAccessScope::unrestricted();
+        assert!(marker.is_at_least_as_permissive_as(&marker));
+        // Losing the marker is a narrowing, whatever replaces it.
+        assert!(
+            !LlmAccessScope::default().is_at_least_as_permissive_as(&marker),
+            "replacing `unrestricted` with any scoped scope must count as a narrowing"
+        );
+        let scoped = LlmAccessScope {
+            allowed_models: Some(vec!["small-model".to_owned()]),
+            max_tokens_per_window: Some(100),
+            max_requests_per_minute: Some(5),
+            unrestricted: false,
+        };
+        // Equal scope is not a narrowing.
+        assert!(scoped.is_at_least_as_permissive_as(&scoped));
+        // Widening is not a narrowing.
+        let wider = LlmAccessScope {
+            allowed_models: Some(vec!["small-model".to_owned(), "big-model".to_owned()]),
+            max_tokens_per_window: Some(200),
+            max_requests_per_minute: Some(10),
+            unrestricted: false,
+        };
+        assert!(wider.is_at_least_as_permissive_as(&scoped));
+        // Dropping a model, lowering a quota, or lowering the rate
+        // each narrow on their own axis.
+        let fewer_models = LlmAccessScope {
+            allowed_models: Some(vec![]),
+            ..scoped.clone()
+        };
+        assert!(!fewer_models.is_at_least_as_permissive_as(&scoped));
+        let lower_quota = LlmAccessScope {
+            max_tokens_per_window: Some(99),
+            ..scoped.clone()
+        };
+        assert!(!lower_quota.is_at_least_as_permissive_as(&scoped));
+        let lower_rate = LlmAccessScope {
+            max_requests_per_minute: Some(4),
+            ..scoped.clone()
+        };
+        assert!(!lower_rate.is_at_least_as_permissive_as(&scoped));
+        // Dropping a limit altogether removes a ceiling: wider, not
+        // narrower, on that axis.
+        let no_limits = LlmAccessScope {
+            max_tokens_per_window: None,
+            max_requests_per_minute: None,
+            ..scoped.clone()
+        };
+        assert!(no_limits.is_at_least_as_permissive_as(&scoped));
+        // A deny-all baseline is trivially matched by anything
+        // equally scoped (no model grant to lose).
+        let deny_all = LlmAccessScope::default();
+        assert!(deny_all.is_at_least_as_permissive_as(&deny_all));
     }
 
     /// D13.b: scope lookup follows the peer's selector specificity —
@@ -2761,7 +2920,7 @@ mod tests {
         assert_eq!(
             policy.scope_for(&unmatched_selectors),
             None,
-            "no entry means the grant stays unrestricted"
+            "no entry resolves to None, which the gateway denies (deny-on-absent)"
         );
     }
 

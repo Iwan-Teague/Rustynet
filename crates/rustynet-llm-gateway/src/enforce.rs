@@ -1,10 +1,16 @@
 //! Per-peer model / quota / rate enforcement (LLM design §7).
 //!
-//! Scopes come from the owner-signed policy
-//! (`rustynet_policy::LlmAccessScope`) and only ever *narrow* an
+//! Scopes (`rustynet_policy::LlmAccessScope`) only ever *narrow* an
 //! existing `Decision::Allow` — enforcement here never grants
-//! anything. All state is deterministic: callers supply `now_unix`,
-//! so behaviour is fully unit-testable and replayable.
+//! anything. Deny-on-absent: a peer with **no** scope entry (an
+//! absent scopes file, no line for the peer's node id, or a bare
+//! selector line) is denied every model, has every stream severed,
+//! and sees no models — absence never means unrestricted. The only
+//! full-access value is the explicit `unrestricted` marker on the
+//! peer's scope line; the gateway loader refuses to load it
+//! combined with any limit key. All state is deterministic: callers
+//! supply `now_unix`, so behaviour is fully unit-testable and
+//! replayable.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -22,6 +28,10 @@ pub enum EnforceError {
     TokenQuotaExhausted { used: u64, limit: u64 },
     /// Peer exceeded its request-rate ceiling.
     RateLimited { requests_in_minute: u32, limit: u32 },
+    /// Deny-on-absent: the peer holds a grant but has no scope
+    /// entry, and absence never means unrestricted. Every model is
+    /// denied and any in-flight stream is severed.
+    ScopeAbsent,
 }
 
 impl fmt::Display for EnforceError {
@@ -39,6 +49,10 @@ impl fmt::Display for EnforceError {
             } => write!(
                 f,
                 "rate limited: {requests_in_minute}/{limit} requests in minute"
+            ),
+            EnforceError::ScopeAbsent => write!(
+                f,
+                "peer has no LLM scope entry; access denied (default-deny: an admin scope line is required)"
             ),
         }
     }
@@ -80,10 +94,18 @@ impl EnforcementState {
         now_unix: u64,
     ) -> Result<(), EnforceError> {
         let Some(scope) = scope else {
-            // No scope entry: the grant is unrestricted (the grant
-            // itself was the authorisation; scoping is optional).
-            return Ok(());
+            // Deny-on-absent: no scope entry denies every model. The
+            // grant admits the peer to the service; only an explicit
+            // scope line (limits, or the `unrestricted` marker) says
+            // what it may consume.
+            return Err(EnforceError::ScopeAbsent);
         };
+        if scope.unrestricted {
+            // The explicit full-access marker: any model, no quota,
+            // no rate ceiling. This is the ONLY path to today's
+            // former absent-scope behaviour.
+            return Ok(());
+        }
         if !scope.permits_model(model) {
             return Err(EnforceError::ModelNotAllowed {
                 model: model.to_owned(),
@@ -135,8 +157,16 @@ impl EnforcementState {
             counters.tokens_in_window = 0;
         }
         counters.tokens_in_window = counters.tokens_in_window.saturating_add(token_count);
-        if let Some(scope) = scope
-            && let Some(limit) = scope.max_tokens_per_window
+        let Some(scope) = scope else {
+            // Deny-on-absent: a peer whose scope entry disappeared
+            // mid-stream loses the stream at the next token event.
+            return Err(EnforceError::ScopeAbsent);
+        };
+        if scope.unrestricted {
+            // Explicit full-access marker: no token quota.
+            return Ok(());
+        }
+        if let Some(limit) = scope.max_tokens_per_window
             && counters.tokens_in_window > limit
         {
             return Err(EnforceError::TokenQuotaExhausted {
@@ -167,9 +197,12 @@ impl EnforcementState {
         scope: Option<&LlmAccessScope>,
         node_models: &'a [String],
     ) -> Vec<&'a String> {
+        // Deny-on-absent: no scope entry hides every model. A bare
+        // (Default) scope also hides every model: no explicit model
+        // list grants nothing.
         node_models
             .iter()
-            .filter(|model| scope.map(|s| s.permits_model(model)).unwrap_or(true))
+            .filter(|model| scope.is_some_and(|s| s.permits_model(model)))
             .collect()
     }
 }
@@ -191,22 +224,49 @@ mod tests {
                 .map(|models| models.into_iter().map(str::to_owned).collect()),
             max_tokens_per_window,
             max_requests_per_minute,
+            unrestricted: false,
         }
     }
 
     #[test]
-    fn no_scope_admits_any_model_without_quota_or_rate() {
+    fn missing_scope_denies_every_model() {
         let mut state = EnforcementState::new();
-        // Far more requests than any plausible rate limit, any model.
+        // Deny-on-absent: a granted peer with no scope entry is
+        // denied EVERY model — absence never means unrestricted.
+        for i in 0..1000 {
+            let err = state
+                .admit_request(PEER, None, &format!("model-{i}"), NOW)
+                .expect_err("no scope ⇒ every model denied");
+            assert_eq!(err, EnforceError::ScopeAbsent);
+        }
+    }
+
+    #[test]
+    fn missing_scope_severs_stream_on_first_token() {
+        let mut state = EnforcementState::new();
+        // Deny-on-absent: token accounting without a scope severs the
+        // stream at the first token event instead of streaming
+        // unbounded.
+        let err = state
+            .record_tokens(PEER, None, 1, NOW)
+            .expect_err("no scope ⇒ stream severed on the first token");
+        assert_eq!(err, EnforceError::ScopeAbsent);
+    }
+
+    #[test]
+    fn explicit_unrestricted_admits_any_model_without_quota() {
+        let mut state = EnforcementState::new();
+        let marker = LlmAccessScope::unrestricted();
+        // The explicit marker is the only path to full access: any
+        // model, no rate ceiling, no token quota.
         for i in 0..1000 {
             state
-                .admit_request(PEER, None, &format!("model-{i}"), NOW)
-                .expect("no scope ⇒ unrestricted grant");
+                .admit_request(PEER, Some(&marker), &format!("model-{i}"), NOW)
+                .expect("explicit unrestricted ⇒ any model");
         }
-        // Token recording never severs without a scope either.
         state
-            .record_tokens(PEER, None, u32::MAX as u64, NOW)
-            .expect("no scope ⇒ no token quota");
+            .record_tokens(PEER, Some(&marker), u32::MAX as u64, NOW)
+            .expect("explicit unrestricted ⇒ no token quota severs nothing");
     }
 
     #[test]
@@ -230,7 +290,7 @@ mod tests {
     #[test]
     fn rate_limit_trips_on_third_request_and_resets_after_minute() {
         let mut state = EnforcementState::new();
-        let scope = scope(None, None, Some(2));
+        let scope = scope(Some(vec!["a"]), None, Some(2));
         state
             .admit_request(PEER, Some(&scope), "a", NOW)
             .expect("first request admits");
@@ -256,7 +316,7 @@ mod tests {
     #[test]
     fn token_quota_severs_stream_and_window_resets() {
         let mut state = EnforcementState::new();
-        let scope = scope(None, Some(10), None);
+        let scope = scope(Some(vec!["a"]), Some(10), None);
         state
             .record_tokens(PEER, Some(&scope), 6, NOW)
             .expect("under quota");
@@ -291,12 +351,18 @@ mod tests {
         let scope = scope(Some(vec!["a", "c"]), None, None);
         let visible = EnforcementState::visible_models(Some(&scope), &node_models);
         assert_eq!(visible, vec![&"a".to_owned(), &"c".to_owned()]);
-        // No scope ⇒ everything visible.
-        let all = EnforcementState::visible_models(None, &node_models);
-        assert_eq!(all.len(), 3);
+        // No scope ⇒ nothing visible (deny-on-absent).
+        let none = EnforcementState::visible_models(None, &node_models);
+        assert!(none.is_empty());
         // Empty allow-list ⇒ nothing visible (deny posture).
         let empty = scope_empty();
         assert!(EnforcementState::visible_models(Some(&empty), &node_models).is_empty());
+        // The explicit marker ⇒ everything visible.
+        let marker = LlmAccessScope::unrestricted();
+        assert_eq!(
+            EnforcementState::visible_models(Some(&marker), &node_models).len(),
+            3
+        );
     }
 
     fn scope_empty() -> LlmAccessScope {
@@ -304,7 +370,16 @@ mod tests {
             allowed_models: Some(Vec::new()),
             max_tokens_per_window: None,
             max_requests_per_minute: None,
+            unrestricted: false,
         }
+    }
+
+    #[test]
+    fn missing_scope_hides_every_model() {
+        // Deny-on-absent: `list-models` shows a granted peer without
+        // a scope entry nothing at all.
+        let node_models = vec!["a".to_owned(), "b".to_owned()];
+        assert!(EnforcementState::visible_models(None, &node_models).is_empty());
     }
 
     #[test]
@@ -323,12 +398,13 @@ mod tests {
     fn tokens_used_in_window_accounting() {
         let mut state = EnforcementState::new();
         assert_eq!(state.tokens_used_in_window(PEER), 0);
+        let marker = LlmAccessScope::unrestricted();
         state
-            .record_tokens(PEER, None, 3, NOW)
-            .expect("no quota without scope");
+            .record_tokens(PEER, Some(&marker), 3, NOW)
+            .expect("explicit unrestricted ⇒ no quota severs nothing");
         state
-            .record_tokens(PEER, None, 4, NOW + 1)
-            .expect("no quota without scope");
+            .record_tokens(PEER, Some(&marker), 4, NOW + 1)
+            .expect("explicit unrestricted ⇒ no quota severs nothing");
         assert_eq!(state.tokens_used_in_window(PEER), 7);
         // Accounting is per-peer.
         assert_eq!(state.tokens_used_in_window("node:laptop-2"), 0);
