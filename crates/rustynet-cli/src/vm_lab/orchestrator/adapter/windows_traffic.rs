@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    WINDOWS_RELAY_SERVICE_NAME, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
-    ps_quote, run_remote_ps, run_remote_ps_check,
+    WINDOWS_RELAY_SERVICE_NAME, WINDOWS_RUSTYNET_PATH, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR,
+    WINDOWS_STATE_ROOT, ps_quote, run_remote_ps, run_remote_ps_check,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -56,24 +56,16 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
     Ok(hex)
 }
 
-/// Read the local `node_id` from `rustynetd.env` (`RUSTYNETD_DAEMON_ARGS_JSON`).
+/// Read the local `node_id` from `rustynetd.env`
+/// (`RUSTYNETD_DAEMON_ARGS_JSON`).
 ///
-/// The Windows trust CLI installed at `C:\Program Files\RustyNet\rustynet.exe`
-/// is not the daemon-control CLI and does not accept a `status` sub-command.
-/// Invoking it for status fails with a usage error.  The node-id is written
-/// into the reviewed env-file by the orchestrator during bootstrap, so we read
-/// it from there instead.
+/// The node-id is written into the reviewed env-file by the orchestrator
+/// during bootstrap. This reader remains the bootstrap-time identity source;
+/// it must NOT be used to satisfy the §4.7 live-identity challenge — that
+/// challenge requires the daemon's own status response (see
+/// [`query_live_identity`], which asks the installed trust CLI for it).
 pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
-    let env_path = format!(r"{WINDOWS_STATE_ROOT}\config\rustynetd.env");
-    let script = format!(
-        "$envPath = {env_path_q}; \
-         $content = Get-Content -LiteralPath $envPath -Raw -ErrorAction SilentlyContinue; \
-         if ([string]::IsNullOrEmpty($content)) {{ throw ('rustynetd.env not found or empty at ' + $envPath) }}; \
-         $m = [regex]::Match($content, '\"--node-id\",\"([^\"]+)\"'); \
-         if (-not $m.Success) {{ throw 'node-id not found in RUSTYNETD_DAEMON_ARGS_JSON in rustynetd.env' }}; \
-         $m.Groups[1].Value.Trim()",
-        env_path_q = ps_quote(&env_path)?
-    );
+    let script = collect_node_id_script()?;
     let output = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
     let node_id = output.trim().to_owned();
     if node_id.is_empty() {
@@ -84,16 +76,59 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     Ok(node_id)
 }
 
-/// Gather a node-identity for the §4.7 challenge. The Windows control CLI has
-/// NO `status` subcommand (see [`collect_node_id`]), so no live daemon
-/// self-report is available; the only identity source is the config env-file.
-/// The result is tagged `ConfigFile` so the adjudicator correctly treats it as
-/// a non-live assertion — §4.7 is not satisfiable on Windows until a live
-/// status surface exists, and the challenge must say so honestly rather than
-/// let a config-file read pass as a live proof.
+/// Build the PowerShell script [`collect_node_id`] runs. Extracted so tests
+/// can pin the script shape (env-file only, no trust-CLI invocation) without
+/// an SSH round-trip.
+fn collect_node_id_script() -> Result<String, AdapterError> {
+    let env_path = format!(r"{WINDOWS_STATE_ROOT}\config\rustynetd.env");
+    Ok(format!(
+        "$envPath = {env_path_q}; \
+         $content = Get-Content -LiteralPath $envPath -Raw -ErrorAction SilentlyContinue; \
+         if ([string]::IsNullOrEmpty($content)) {{ throw ('rustynetd.env not found or empty at ' + $envPath) }}; \
+         $m = [regex]::Match($content, '\"--node-id\",\"([^\"]+)\"'); \
+         if (-not $m.Success) {{ throw 'node-id not found in RUSTYNETD_DAEMON_ARGS_JSON in rustynetd.env' }}; \
+         $m.Groups[1].Value.Trim()",
+        env_path_q = ps_quote(&env_path)?
+    ))
+}
+
+/// Gather a node-identity for the §4.7 challenge from the daemon's LIVE
+/// status surface. The installed trust CLI's `status` verb forwards an
+/// `IpcCommand::Status` request over the local daemon-control pipe and
+/// prints the daemon's verbatim response, whose first line carries
+/// `node_id=<id> node_role=<role> state=<state>`. The node-id is parsed from
+/// that live self-report and tagged `LiveDaemonSocket`.
+///
+/// There is no fallback to the config env-file: if the remote invocation
+/// fails, or the response carries no `node_id=`, this returns `Err` and the
+/// challenge fails closed. [`collect_node_id`] stays as the bootstrap-time
+/// env-file reader and must never stand in for a live proof.
 pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, AdapterError> {
-    let node_id = collect_node_id(conn)?;
-    Ok(IdentityEvidence::config_file(node_id))
+    let script = live_identity_status_script()?;
+    let status = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
+    live_identity_from_status(&status)
+}
+
+/// Build the PowerShell script [`query_live_identity`] runs: invoke the
+/// trust CLI's `status` verb (no shell, no untrusted interpolation — the
+/// only dynamic part is the reviewed install path).
+fn live_identity_status_script() -> Result<String, AdapterError> {
+    Ok(format!("& {} status", ps_quote(WINDOWS_RUSTYNET_PATH)?))
+}
+
+/// Parse the daemon's status response into live identity evidence,
+/// mirroring `linux_traffic::query_live_identity`. Missing `node_id=` is a
+/// fail-closed error, never a downgrade to a config-file assertion.
+fn live_identity_from_status(status: &str) -> Result<IdentityEvidence, AdapterError> {
+    match ssh::parse_status_node_id(status) {
+        Some(node_id) => Ok(IdentityEvidence::live(node_id)),
+        None => Err(AdapterError::Protocol {
+            message: format!(
+                "live identity challenge: node_id not in rustynet status output: {}",
+                status.chars().take(200).collect::<String>()
+            ),
+        }),
+    }
 }
 
 /// Ping `peer_mesh_ip` 3 times via `Test-Connection`. Returns `Reachable` on success.
@@ -1709,42 +1744,80 @@ mod tests {
         assert!(result.unwrap_err().contains("32-byte"));
     }
 
-    /// Verify that the `collect_node_id` `PowerShell` script reads from rustynetd.env
-    /// and does NOT invoke rustynet.exe status (which is the trust CLI on Windows
-    /// and does not support the status sub-command).
+    /// The bootstrap-time `collect_node_id` reader must stay scoped to the
+    /// reviewed rustynetd.env file: its script reads the env-file and must
+    /// not invoke the trust CLI (the live challenge has its own dedicated
+    /// script — see `live_identity_script_invokes_trust_cli_status`).
     #[test]
-    fn collect_node_id_reads_env_file_not_trust_cli() {
-        use std::io::Write;
-        use tempfile::NamedTempFile;
-        // Build a NodeConnection so we can call ps_quote via the internal impl;
-        // the actual SSH call is not exercised here — we inspect the script text.
-        let mut f = NamedTempFile::new().unwrap();
-        writeln!(f, "# placeholder").unwrap();
-        let conn = crate::vm_lab::orchestrator::connection::NodeConnection::ssh(
-            "10.0.0.1",
-            22,
-            Some("Administrator".to_owned()),
-            std::path::PathBuf::from("/id_rsa"),
-            f.path().to_path_buf(),
-            None,
-        )
-        .unwrap();
-        // We cannot call collect_node_id without an SSH server, but we can verify
-        // that the ps_quote helper doesn't insert rustynet.exe references.
-        // The key contract: the function must reference rustynetd.env and must NOT
-        // reference rustynet.exe.  Verify via the public interface by inspecting
-        // what the ps_quote helper would produce for the reviewed path.
-        let env_path = format!(r"{}\config\rustynetd.env", super::WINDOWS_STATE_ROOT);
-        let quoted = ps_quote(&env_path).expect("ps_quote must not reject reviewed path");
+    fn collect_node_id_script_targets_env_file_not_trust_cli() {
+        let script = super::collect_node_id_script().expect("env-file path must pass ps_quote");
         assert!(
-            quoted.contains("rustynetd.env"),
-            "env-file path must survive ps_quote: {quoted}"
+            script.contains("rustynetd.env"),
+            "bootstrap reader must read rustynetd.env: {script}"
         );
-        // Smoke-check that the connection type is SSH (function would use it).
+        assert!(
+            script.contains("Get-Content"),
+            "bootstrap reader must read the env-file contents: {script}"
+        );
+        assert!(
+            !script.contains("rustynet.exe"),
+            "bootstrap reader must not invoke the trust CLI: {script}"
+        );
+        assert!(
+            !script.contains(" status"),
+            "bootstrap reader must not run a status sub-command: {script}"
+        );
+    }
+
+    /// The §4.7 live-identity script must invoke the trust CLI's `status`
+    /// verb (the daemon's live self-report over the daemon-control pipe) and
+    /// must not fall back to reading rustynetd.env.
+    #[test]
+    fn live_identity_script_invokes_trust_cli_status() {
+        let script = super::live_identity_status_script().expect("install path must pass ps_quote");
+        assert!(
+            script.contains("rustynet.exe"),
+            "live identity must go through the trust CLI: {script}"
+        );
+        assert!(
+            script.ends_with(" status"),
+            "live identity must run the status verb: {script}"
+        );
+        assert!(
+            !script.contains("rustynetd.env"),
+            "live identity must not read the config env-file: {script}"
+        );
+    }
+
+    /// A daemon status fixture line parses into live identity evidence via
+    /// the same `parse_status_node_id` seam Linux/macOS use.
+    #[test]
+    fn live_identity_from_status_parses_fixture_to_live_evidence() {
+        use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityProvenance;
+
+        let status = "node_id=win-1 node_role=client state=Running mesh_ip=100.64.0.9";
+        let evidence =
+            super::live_identity_from_status(status).expect("fixture must parse to live evidence");
+        assert_eq!(evidence.node_id, "win-1");
         assert!(matches!(
-            conn,
-            crate::vm_lab::orchestrator::connection::NodeConnection::Ssh { .. }
+            evidence.provenance,
+            IdentityProvenance::LiveDaemonSocket
         ));
-        drop(conn);
+    }
+
+    /// A status response without `node_id=` fails closed: an Err (never a
+    /// ConfigFile assertion), so the challenge cannot pass on a partial
+    /// daemon response.
+    #[test]
+    fn live_identity_from_status_without_node_id_fails_closed() {
+        let err = super::live_identity_from_status("node_role=client state=Running")
+            .expect_err("missing node_id must fail closed");
+        match err {
+            AdapterError::Protocol { message } => assert!(
+                message.contains("node_id not in rustynet status output"),
+                "error must name the missing live node_id: {message}"
+            ),
+            other => panic!("expected Protocol error, got: {other:?}"),
+        }
     }
 }

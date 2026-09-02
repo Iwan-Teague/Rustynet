@@ -518,10 +518,11 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     //
     // Fail-closed across every outcome: a missing expected id
     // (`Unverifiable`), a live mismatch (`NodeIdMismatch`), or an
-    // un-assertable non-live identity (`NotLiveAssertion` — today only Windows,
-    // whose control CLI has no `status` subcommand, a KNOWN deferred §4.7 gap
-    // per the acceptance spec) all reject the validator rather than let it earn
-    // a green it has not proven.
+    // un-assertable non-live identity (`NotLiveAssertion` — reserved for any
+    // platform that still lacks a live status surface; Windows no longer
+    // qualifies, since its trust CLI's `status` sub-command forwards the
+    // daemon's own status response over the daemon-control pipe) all reject
+    // the validator rather than let it earn a green it has not proven.
     enforce_identity_challenge(
         adapter.collect_live_identity(),
         expected_node_id,
