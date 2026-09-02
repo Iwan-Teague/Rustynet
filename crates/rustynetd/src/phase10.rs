@@ -15551,7 +15551,11 @@ mod tests {
             Vec::new(),
         )
         .expect("linux command system should initialize")
-        .with_wg_listen_port(51820);
+        .with_wg_listen_port(51820)
+        // apply_dns_protection refuses to take loopback DNS ownership without a
+        // configured resolver port (fail-closed); the capture helper only records
+        // argv, so any non-zero port exercises the emitted rule tokens.
+        .with_dns_resolver_port(53535);
         DataplaneSystem::set_relay_forwarding(&mut system, true);
 
         DataplaneSystem::apply_firewall_killswitch(&mut system)
@@ -16899,6 +16903,10 @@ mod tests {
         );
     }
 
+    // The scripted networksetup binary is resolved by absolute Unix path; on
+    // Windows that path is not absolute and the prerequisite check refuses it
+    // before the assertion under test is reached.
+    #[cfg(unix)]
     #[test]
     fn macos_assert_dns_protection_requires_active_dns_rules() {
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
