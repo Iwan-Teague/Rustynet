@@ -172,7 +172,12 @@ pub(crate) fn remediation_allowed(verdict: &ClockVerdict) -> bool {
     matches!(verdict, ClockVerdict::HourOffset { .. })
 }
 
-pub struct PreflightStage;
+pub struct PreflightStage {
+    /// `--enable-clock-remediation`: arms the ONE-SHOT self-heal below. OFF
+    /// (the default) keeps every failure text byte-identical to the
+    /// pre-flag behaviour (review A-6).
+    pub clock_remediation_enabled: bool,
+}
 
 impl OrchestrationStage for PreflightStage {
     fn id(&self) -> StageId {
@@ -363,7 +368,10 @@ mod tests {
     fn preflight_passes_with_exit_node_and_writable_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = make_ctx_with_exit(tmp.path());
-        let outcome = PreflightStage.execute(&mut ctx);
+        let outcome = PreflightStage {
+            clock_remediation_enabled: false,
+        }
+        .execute(&mut ctx);
         assert!(
             matches!(outcome, StageOutcome::Passed | StageOutcome::Failed(_)),
             "must produce a terminal outcome: {outcome:?}"
@@ -398,7 +406,10 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
         };
-        let outcome = PreflightStage.execute(&mut ctx);
+        let outcome = PreflightStage {
+            clock_remediation_enabled: false,
+        }
+        .execute(&mut ctx);
         assert!(
             matches!(outcome, StageOutcome::Failed(_)),
             "must fail with no exit node: {outcome:?}"

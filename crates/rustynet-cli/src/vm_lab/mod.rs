@@ -1281,6 +1281,14 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// topology rewrite.
     pub macos_promote_exit: bool,
     pub enable_chaos_suite: bool,
+    /// `--enable-clock-remediation`: opt-in ONE-SHOT clock-skew self-heal in
+    /// the preflight stage. OFF by default: with the flag absent the preflight
+    /// skew failure is byte-identical to today's behaviour (review A-6). When
+    /// ON, an HourOffset-classified drift gets one bounded remediation attempt
+    /// (fresh host timestamp, validated argv) followed by a re-measure through
+    /// the same skew gate; any residual skew still fails the stage (fail
+    /// closed).
+    pub enable_clock_remediation: bool,
     /// `--enable-negative-control`: opt-in T5 negative-control / adjudication
     /// suite (the `--node`-native adjudication half of the G1 trust bar). Like
     /// `enable_chaos_suite`, out of the default plan.
@@ -50818,6 +50826,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             reboot_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
+            enable_clock_remediation: false,
             enable_negative_control: false,
             enable_relay_forwarding_validation: false,
             stage_timeout_secs: 0,

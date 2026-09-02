@@ -45,6 +45,7 @@ pub(crate) fn execute_rust_native_orchestration(
     let dry_run = config.dry_run;
     let skip_live_suite = config.skip_linux_live_suite;
     let enable_chaos_suite = config.enable_chaos_suite;
+    let enable_clock_remediation = config.enable_clock_remediation;
     let enable_negative_control = config.enable_negative_control;
     let enable_relay_forwarding_validation = config.enable_relay_forwarding_validation;
     let enable_cross_network_suite = !config.skip_cross_network;
@@ -377,6 +378,7 @@ pub(crate) fn execute_rust_native_orchestration(
             // skip_live_suite, so the tightening below stays true.
             reboot_platform_macos_elected,
             enable_chaos_suite,
+            enable_clock_remediation,
             enable_negative_control,
             enable_relay_forwarding_validation,
             config.skip_soak,
@@ -980,6 +982,7 @@ fn build_rust_native_orchestration_stages(
     role_switch_platform_macos: bool,
     reboot_platform_macos: bool,
     enable_chaos_suite: bool,
+    enable_clock_remediation: bool,
     enable_negative_control: bool,
     enable_relay_forwarding_validation: bool,
     skip_soak: bool,
@@ -996,6 +999,7 @@ fn build_rust_native_orchestration_stages(
         .with_role_switch_platform_macos(role_switch_platform_macos)
         .with_reboot_platform_macos(reboot_platform_macos)
         .with_enable_chaos_suite(enable_chaos_suite)
+        .with_enable_clock_remediation(enable_clock_remediation)
         .with_enable_negative_control(enable_negative_control)
         .with_enable_relay_forwarding_validation(enable_relay_forwarding_validation)
         .with_skip_soak(skip_soak)
@@ -1143,6 +1147,7 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
         false,
         false,
         false,
+        false,
         orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         1,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1161,6 +1166,7 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
         build_rust_native_orchestration_stages(
             None,
             orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+            false,
             false,
             false,
             false,
