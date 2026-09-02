@@ -1,6 +1,6 @@
 # macOS Enforce-Refresh Parity Plan — 2026-09-02
 
-Status: ACTIVE (planning; Phase A+B doc-only). Scope: documents only — no code in this change.
+Status: ACTIVE — reviewed; Gap B re-scoped to diagnose-first per the 2026-09-02 review (verdict ACCEPT-WITH-AMENDMENTS, findings F-1..F-6 folded). Scope: documents only — no code in this change.
 Evidence base: live-lab run `labrun-1788332375714-1644-0` (macOS client `macos-utm-1`, Linux exit `debian-headless-4`, Linux client `debian-headless-2`), plus source reads at base commit `f6b8fdab` (this worktree, clean).
 
 ## 0) Failure signature
@@ -16,7 +16,7 @@ Both gaps are real; neither alone is the whole story.
 - Linux adapter `enforce_daemon` (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/linux_install.rs:152`): `build_enforce_script` (fn at :231) ends at `rustynet ops e2e-enforce-host --role {role_str} --node-id '{node_id}' --src-dir ... --ssh-allow-cidrs ...` (script lines :248-253). Nothing is chained after the restart.
 - macOS adapter `enforce_daemon` (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs:752-834`): scp's `Install-RustyNetMacosService.sh` (:801-811), runs `build_auto_tunnel_enforce_install_script` (:817-824; script ends :730-734 with `--fail-closed-ssh-allow*`), runs over 60 s (:825), then only `wait_for_macos_daemon_socket` (:832). No `state refresh` anywhere. Its own doc comment (:738-751) admits: "production daemons rely on periodic refresh timers that do not exist in the lab".
 - `execute_ops_e2e_enforce_host` itself (`crates/rustynet-cli/src/ops_e2e.rs:771` non-Windows; `:1086` Windows) refreshes trust evidence PRE-restart only and waits for the socket post-restart (`wait_for_macos_daemon_socket`, :1063-1075, called at :968). It never issues `state refresh` on ANY platform.
-- Therefore Linux's pass is NOT enforce-path design: it is the systemd trust-refresh timer, external to enforce. `scripts/systemd/rustynetd-trust-refresh.timer` (`OnBootSec=45s`, `OnUnitActiveSec=60s`) → `rustynetd-trust-refresh.service` `ExecStartPost=/usr/local/bin/rustynet ops state-refresh-if-socket-present` (`crates/rustynet-cli/src/main.rs`, `execute_ops_state_refresh_if_socket_present` ~:9767: skip if daemon socket absent, else IPC `state refresh`). In the harvest the timer's refresh landed 0.1 s after bootstrap — a race Linux happened to win. macOS has no launchd counterpart (guest LaunchDaemons are `com.rustynet.anchor`, `.daemon`, `.exit`, `.privileged-helper`; the macOS bootstrap installs no refresh timer), so the refresh never comes and the macOS client's signed state stays stale → `DnsFailclosed`.
+- Linux posture at startup is re-established by the bootstrap apply itself (review F-1/F-4): the Linux pass does not depend on the timer for posture; the timer provides signed-state freshness and makes the pass deterministic, which is exactly what Gap A's enforce-path refresh would hard-wire for both platforms. Gap A remains justified for determinism/parity, not for posture correctness. The timer facts stand: `scripts/systemd/rustynetd-trust-refresh.timer` (`OnBootSec=45s`, `OnUnitActiveSec=60s`) → `rustynetd-trust-refresh.service` `ExecStartPost=/usr/local/bin/rustynet ops state-refresh-if-socket-present` (`crates/rustynet-cli/src/main.rs`, `execute_ops_state_refresh_if_socket_present` :9768: skip if daemon socket absent, else IPC `state refresh`); in the harvest its refresh landed 0.1 s after bootstrap. macOS has no launchd counterpart (guest LaunchDaemons are `com.rustynet.anchor`, `.daemon`, `.exit`, `.privileged-helper`; the macOS bootstrap installs no refresh timer), so no external refresh arrives after restart.
 
 ### 1.2 Gap B — undiagnosed macOS startup-posture failure (re-scoped per review F-1)
 
@@ -56,7 +56,7 @@ Goal: both platforms' `enforce_daemon` issue a post-restart `state refresh`, mak
 
 - Seam (verified): per QH-01 Step 4d, new remote commands go through `RemoteCommand::from_args` (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/validated_args.rs` — the single constructor; `validated_args.rs:656` pins that only `ssh.rs` may construct `RemoteCommand` directly, and `:614-638` extends the QH-01 scanner pin to `.as_str()` sinks so a `format!` bypass cannot hide). Arguments are typed via `ValidatedArg` constructors (`ValidatedArg::node_id`/`::path`/`::utun`, validated_args.rs:420-450) and each token is single-quote-wrapped by `from_args` (:290-315). The readiness probe to chain after is the existing `wait_for_macos_daemon_socket` (adapter call `macos_install.rs:832`; impl `ops_e2e.rs:1063-1075`, 45 s fail-closed poll).
 - Order to pin by unit test: restart → socket wait (`wait_for_macos_daemon_socket`) → `state refresh` → a non-zero refresh result FAILS enforce.
-- macOS precedent for the refresh-after-restart seam already exists: the mac role-transition path (`adapter/mod.rs:14753`, script `sudo $RN state refresh` at :14835-14837) and the live test binaries' post-restart refresh helpers (`live_linux_two_hop_test.rs:1841`, `live_linux_lan_toggle_test.rs:1957`, `live_linux_exit_handoff_test.rs:1564`).
+- macOS precedent for the refresh-after-restart seam already exists: the mac role-transition path (`vm_lab/mod.rs:14753`, script `sudo $RN state refresh` at `vm_lab/mod.rs:14835-14837`) and the live test binaries' post-restart refresh helpers (`live_linux_two_hop_test.rs:1841`, `live_linux_lan_toggle_test.rs:1957`, `live_linux_exit_handoff_test.rs:1564`).
 - Existing worker `execute_ops_e2e_worker_refresh_signed_state` (`ops_e2e.rs:7471-7487`; wired `main.rs:1472/5616/9315-9319`) shows the target command shape; the adapters currently never call it.
 
 ### 3.2 Product layer (primary fix — diagnose-first, re-scoped per review F-2)
@@ -86,9 +86,10 @@ Security floor for any direct apply of persisted state (review F-2):
 
 ## 5) Unknown — needs a live probe
 
-- Whether the persisted state on disk after a protected-mode refresh carries everything `apply_dataplane_generation`'s `protected_dns` arm needs at startup without network I/O (or whether a refresh is genuinely required for posture, which would re-weight 3.1 vs 3.2).
-- Linux startup ordering: exact point where nft killswitch + resolv restore happen relative to first packet, to size the Linux-side window the timer currently masks.
-- Whether `state-refresh-if-socket-present` would race the product startup re-apply (both firing shortly after restart) and whether that is harmless.
+- **unknown-0 (review F-5 — the first diagnostic step):** which log variant the harvest actually showed — plain `runtime bootstrap complete` vs `(restricted: {err})`. Pull the raw daemon log line and confirm whether `bootstrap_error` was set (daemon.rs:11816-11819); `bootstrap()` returns normally in both cases. This decides between F-1 candidates (a) and (b)/(c).
+- Whether the persisted state on disk after a protected-mode refresh carries everything `apply_dataplane_generation`'s `protected_dns` arm needs at startup without network I/O — ANSWERED by review F-1: bootstrap already applies the generation from `load_verified_trust` + `load_verified_membership` with no network I/O required (fetch `Skipped` falls through to disk load).
+- Linux startup ordering: exact point where nft killswitch + resolv restore happen relative to first packet — the bootstrap apply (`:8878`) establishes them; the timer is redundancy, not a window-mask.
+- Whether `state-refresh-if-socket-present` racing the bootstrap apply shortly after restart is harmless — review analysis: the refresh is an idempotent re-apply of already-verified state and skips without a socket; treated harmless.
 
 ## 6) Deliverable checklist
 
@@ -98,3 +99,14 @@ Security floor for any direct apply of persisted state (review F-2):
 - [x] Risks/collisions enumerated (§4).
 - [x] Unknown-needs-live-probe list (§5).
 - [x] Index entry in `documents/operations/active/README.md`.
+
+## 7) Review fold record
+
+Folded from `MacosEnforceRefreshParityPlanAdversarialReview_2026-09-02.md` (verdict ACCEPT-WITH-AMENDMENTS; Gap A and §3.1 verified sound and kept, apart from F-3):
+
+- **F-1 (CRITICAL)** — §1.2 replaced with the corrected statement: `bootstrap()` (daemon.rs:8623, called at :11812) applies the full dataplane generation at every startup on both platforms (daemon.rs:8878-8889 with `protected_dns: true` → `apply_dns_protection` phase10.rs:6852-6853); the "no startup re-apply / fail-open window" claim and the Linux "same fail-open window" sentence retracted. §2 consequences rewritten to diagnose-first (candidates a/b/c); Linux timer reclassified as redundancy (§2.3, §1.1). §5 unknowns annotated answered.
+- **F-2 (HIGH)** — §3.2 re-scoped: Phase 1 diagnose (pin restricted-vs-plain log variant, instrument apply outcome, check the QH-39 verifier probe) → Phase 2 repair in place; second startup apply admitted only if Phase 1 proves structural insufficiency. Security floor written in: `validate_trust` (phase10.rs:6543) mandatory, PreExpiry/replay/`RUSTYNET_*_MAX_AGE_SECS` gates binding, expiry timers never reset, scope limited to the local deny-direction posture (DNS block, loopback pin, killswitch) with peers/routes left to the signed-state refresh. §4 risk bullets reworded to reference any Phase 2 apply.
+- **F-3 (MEDIUM)** — §3.1 precedent anchor corrected: `adapter/mod.rs:14753` / `:14835-14837` → `vm_lab/mod.rs:14753` / `vm_lab/mod.rs:14835-14837`.
+- **F-4 (MEDIUM)** — §1.1 Linux analysis reworded: the Linux pass does not depend on the timer for posture; the timer provides signed-state freshness/determinism, which Gap A's enforce-path refresh would hard-wire for both platforms. Gap A stays justified for determinism/parity.
+- **F-5 (LOW)** — §5 unknown-0 added: pin which log variant the harvest showed (plain vs `(restricted: {err})`; daemon.rs:11816-11819).
+- **F-6 (LOW)** — line-range nits: `maybe_assert_dns_posture` is daemon.rs:10810 (cfg) + :10811-10837 (fn), not :10811-10847; `execute_ops_state_refresh_if_socket_present` is main.rs:9768, not ~:9767.
