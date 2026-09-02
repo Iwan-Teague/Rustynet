@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -254,8 +255,14 @@ pub fn install_daemon_from_workdir(
     }
 
     // Probe: exit 0 if workdir exists, non-zero otherwise.
-    let workdir_present =
-        ssh::run_remote(conn, &format!("test -d '{workdir}'"), SHORT_TIMEOUT).is_ok();
+    // QH-01 Step 4c: argv-shaped probe rendered through the validated seam.
+    let workdir_args = vec![
+        ValidatedArg::cli_token("test")?,
+        ValidatedArg::cli_token("-d")?,
+        ValidatedArg::path(workdir)?,
+    ];
+    let workdir_script = ssh::RemoteCommand::from_args("macos workdir probe", &workdir_args)?;
+    let workdir_present = ssh::run_remote(conn, workdir_script.as_str(), SHORT_TIMEOUT).is_ok();
 
     let build_cmd = if let Some(source) = source {
         // A freshly-carried source archive ALWAYS wins, even when a remote
@@ -762,11 +769,17 @@ pub fn deploy_relay_service(
     //    with sudo. The path is a compile-time constant; nothing untrusted is
     //    interpolated.
     let assignment_pub = format!("{MACOS_STATE_ROOT}/trust/assignment.pub");
-    let assignment_hex = ssh::run_remote(
-        conn,
-        &format!("sudo -n cat '{assignment_pub}'"),
-        short_timeout,
-    )?;
+    // QH-01 Step 4c: argv-shaped read rendered through the validated seam
+    // (the path is const-derived from MACOS_STATE_ROOT).
+    let assignment_args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("cat")?,
+        ValidatedArg::path(&assignment_pub)?,
+    ];
+    let assignment_script =
+        ssh::RemoteCommand::from_args("macos assignment pubkey read", &assignment_args)?;
+    let assignment_hex = ssh::run_remote(conn, assignment_script.as_str(), short_timeout)?;
 
     // 2. Decode hex -> raw 32 bytes (fail-closed); the relay --verifier-key
     //    loader requires exactly 32 raw bytes.
@@ -2684,5 +2697,46 @@ mod tests {
             WINDOWS_BOOTSTRAP_WRAPPER.contains("ServiceReadyTimeoutSecs"),
             "rn_bootstrap_windows.ps1 must accept a configurable timeout"
         );
+    }
+
+    #[test]
+    fn workdir_probe_and_assignment_read_render_argv_through_the_validated_seam() {
+        let workdir_args = vec![
+            ValidatedArg::cli_token("test").expect("token"),
+            ValidatedArg::cli_token("-d").expect("token"),
+            ValidatedArg::path("/Users/lab/Rustynet").expect("path"),
+        ];
+        let workdir_script =
+            ssh::RemoteCommand::from_args("macos workdir probe", &workdir_args).expect("render");
+        assert_eq!(workdir_script.as_str(), "'test' '-d' '/Users/lab/Rustynet'");
+
+        let assignment_pub = format!("{MACOS_STATE_ROOT}/trust/assignment.pub");
+        let assignment_args = vec![
+            ValidatedArg::cli_token("sudo").expect("token"),
+            ValidatedArg::cli_token("-n").expect("token"),
+            ValidatedArg::cli_token("cat").expect("token"),
+            ValidatedArg::path(&assignment_pub).expect("path"),
+        ];
+        let assignment_script =
+            ssh::RemoteCommand::from_args("macos assignment pubkey read", &assignment_args)
+                .expect("render");
+        assert_eq!(
+            assignment_script.as_str(),
+            format!("'sudo' '-n' 'cat' '{assignment_pub}'")
+        );
+    }
+
+    #[test]
+    fn workdir_probe_rejects_an_out_of_shape_workdir_at_the_seam() {
+        // The path class is a SHAPE check (absolute, no traversal segment, no
+        // control characters); shell metacharacters inside a path are inert
+        // because every token is single-quoted at render. What the class must
+        // refuse before any command exists: a relative path, a traversal
+        // segment, and a control character.
+        assert!(ValidatedArg::path("Users/lab").is_err());
+        assert!(ValidatedArg::path("/Users/../etc").is_err());
+        assert!(ValidatedArg::path("/Users/lab\nrm -rf /").is_err());
+        let quoted = ValidatedArg::path("/Users/lab; rm -rf /").expect("shape-valid path");
+        assert_eq!(quoted.quoted(), "'/Users/lab; rm -rf /'");
     }
 }

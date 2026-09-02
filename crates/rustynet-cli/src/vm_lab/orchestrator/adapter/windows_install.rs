@@ -5,6 +5,7 @@ use base64::prelude::*;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
@@ -1292,11 +1293,18 @@ pub(crate) fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterE
     let short_timeout = Duration::from_secs(30);
 
     let assignment_pub_path = format!(r"{WINDOWS_STATE_ROOT}\trust\assignment.pub");
-    let read_script = format!(
-        "Get-Content -LiteralPath {} -Raw",
-        ps_quote(&assignment_pub_path)?,
-    );
-    let assignment_hex = run_remote_ps(conn, &read_script, short_timeout)?
+    // QH-01 Step 4c: single-cmdlet read rendered through the validated seam
+    // (the path is windows-path-validated and ps-quoted before any command
+    // string exists).
+    let read_argv = [
+        ValidatedArg::cli_token("Get-Content")?,
+        ValidatedArg::cli_token("-LiteralPath")?,
+        ValidatedArg::windows_path(&assignment_pub_path)?,
+        ValidatedArg::cli_token("-Raw")?,
+    ];
+    let read_script =
+        PowerShellScript::from_call_argv("windows read assignment pubkey", &read_argv)?;
+    let assignment_hex = run_remote_ps(conn, read_script.as_str(), short_timeout)?
         .trim()
         .to_owned();
     if assignment_hex.is_empty() {
@@ -2421,5 +2429,53 @@ mod powershell_script_seam_tests {
         let rendered = format!("{script:?}");
         assert!(!rendered.contains("secret-body"), "{rendered}");
         assert!(rendered.contains("len="), "{rendered}");
+    }
+
+    #[test]
+    fn assignment_pubkey_read_renders_argv_through_the_validated_seam() {
+        let assignment_pub_path = format!(r"{WINDOWS_STATE_ROOT}\trust\assignment.pub");
+        let read_argv = [
+            ValidatedArg::cli_token("Get-Content").expect("token"),
+            ValidatedArg::cli_token("-LiteralPath").expect("token"),
+            ValidatedArg::windows_path(&assignment_pub_path).expect("path"),
+            ValidatedArg::cli_token("-Raw").expect("token"),
+        ];
+        let script = PowerShellScript::from_call_argv("windows read assignment pubkey", &read_argv)
+            .expect("render");
+        assert_eq!(
+            script.as_str(),
+            format!(
+                "$out = & 'Get-Content' '-LiteralPath' '{assignment_pub_path}' \
+                 '-Raw' 2>&1; Write-Output $out"
+            )
+        );
+    }
+
+    #[test]
+    fn assignment_pubkey_read_rejects_a_control_character_path_at_the_seam() {
+        // windows_path rejects NUL/CR/LF outright (the characters that could
+        // escape PS single-quote contexts); ps_quote contains everything else.
+        let err = ValidatedArg::windows_path("C:\\bad\\path\nline").expect_err("must reject");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn from_call_argv_contains_a_single_quote_injection_attempt() {
+        // A single quote inside a validated value cannot break out: ps_quote
+        // doubles it, so the rendered script stays one quoted argument.
+        let script = PowerShellScript::from_call_argv(
+            "windows containment probe",
+            &[
+                ValidatedArg::cli_token("Get-Content").expect("token"),
+                ValidatedArg::cli_token("-LiteralPath").expect("token"),
+                ValidatedArg::windows_path("C:\\bad'; Write-Host pwned").expect("path"),
+                ValidatedArg::cli_token("-Raw").expect("token"),
+            ],
+        )
+        .expect("render");
+        assert!(
+            script.as_str().contains("'C:\\bad''; Write-Host pwned'"),
+            "the doubled quote must keep the value a single argument: {script:?}"
+        );
     }
 }
