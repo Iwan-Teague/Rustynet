@@ -520,6 +520,15 @@ impl fmt::Debug for ValidatedArg {
 /// baseline dropped from the earlier all-calls count (158) to the raw-only
 /// count below; seam-routed additions such as the S2b helper-liveness
 /// commands no longer move it.
+///
+/// 2026-09-02 (post-merge review §5): the seam exclusion is ANCHORED to a
+/// plain-binding receiver — a window line excuses the call only where
+/// `.as_str()` is applied to a bare lowercase identifier/field path
+/// (`command.as_str()`, `self.script.as_str()`), never to a call result
+/// (`format!(…).as_str()`), so an inline interpolation counts RAW again
+/// while a validated `RemoteCommand`/`RenderedScript` local passed on one
+/// line stays excused. Re-measured on this tree: the count is unchanged
+/// at 130; the MUST-ONLY-GO-DOWN contract holds.
 #[cfg(test)]
 pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 130;
 
@@ -607,15 +616,56 @@ mod tests {
         files
     }
 
-    /// Count occurrences of `run_remote[a-z_]*(` in non-fn-definition lines.
+    /// True when `line` applies `.as_str()` to a PLAIN binding: the receiver
+    /// is a non-empty lowercase identifier/field path (`command`,
+    /// `self.script`) and is not itself the result of a call, index, literal
+    /// or generic (`format!(…)`, `x[0]`, `"…"`, `T::<..>`). This is the
+    /// anchored seam excuse (post-merge review §5): a validated local handed
+    /// to the sink is excused whether rustfmt wrapped it onto its own line or
+    /// left it inline; an interpolation hidden behind `.as_str()` is not.
+    fn has_plain_binding_as_str_receiver(line: &str) -> bool {
+        let needle = ".as_str()";
+        let mut search_from = 0usize;
+        while let Some(rel) = line[search_from..].find(needle) {
+            let at = search_from + rel;
+            let head = &line[..at];
+            let receiver_start = head
+                .rfind(|c: char| {
+                    !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+                })
+                .map_or(0, |idx| idx + 1);
+            let receiver = &head[receiver_start..];
+            let preceded_by = head[..receiver_start].chars().next_back();
+            let receiver_is_plain = !receiver.is_empty()
+                && !receiver.starts_with('.')
+                && receiver
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+            let preceded_ok = !matches!(
+                preceded_by,
+                Some(')') | Some(']') | Some('"') | Some('\'') | Some('>')
+            ) && !preceded_by.is_some_and(|c| c.is_ascii_alphanumeric());
+            if receiver_is_plain && preceded_ok {
+                return true;
+            }
+            search_from = at + needle.len();
+        }
+        false
+    }
+
     /// Count occurrences of `run_remote[a-z_]*(` in non-fn-definition lines,
     /// EXCLUDING seam-lowered calls: a call whose argument list (this line
     /// and the next three, which covers the rustfmt-wrapped form) hands the
-    /// sink a `RemoteCommand`/`PowerShellScript` through `.as_str()` was
-    /// validated at construction and is not a raw interpolation site. Only
-    /// the remaining calls — raw `&str`/`format!` arguments — are the
-    /// injection surface Step 4 is retiring, so only they count against the
-    /// baseline.
+    /// sink a `RemoteCommand`/`PowerShellScript` through a BARE
+    /// `<binding>.as_str()` line — the receiver a plain lowercase identifier
+    /// — was validated at construction and is not a raw interpolation site.
+    /// The anchor matters (post-merge review §5): the earlier loose
+    /// `.contains(".as_str()")` window also excused calls that interpolate
+    /// inline, e.g. `ssh::run_remote(conn, format!("…").as_str(), t)`, which
+    /// is exactly the raw shell-interpolation surface this baseline exists
+    /// to shrink. Only the remaining calls — raw `&str`/`format!` arguments
+    /// that survive to the sink — count against the baseline.
     fn count_raw_sink_call_sites(source: &str) -> usize {
         let lines: Vec<&str> = source.lines().collect();
         let mut count = 0usize;
@@ -635,7 +685,7 @@ mod tests {
                     let window_end = (i + 4).min(lines.len());
                     let seam_lowered = lines[i..window_end]
                         .iter()
-                        .any(|candidate| candidate.contains(".as_str()"));
+                        .any(|candidate| has_plain_binding_as_str_receiver(candidate));
                     if !seam_lowered {
                         count += 1;
                     }
@@ -733,6 +783,45 @@ mod tests {
         let stripped = strip_test_regions(source);
         assert!(!stripped.contains("run_remote_x"));
         assert_eq!(count_raw_sink_call_sites(&stripped), 1);
+    }
+
+    /// Anchored exclusion (post-merge review §5): the seam excuse applies to
+    /// a PLAIN binding receiver in either the rustfmt-wrapped or the one-line
+    /// form; only a call/index/literal receiver — the shape an inline
+    /// interpolation takes — counts RAW.
+    #[test]
+    fn anchored_exclusion_excuses_a_plain_binding_receiver_in_either_form() {
+        let wrapped = "    ssh::run_remote(\n        conn,\n        command.as_str(),\n        SHORT_TIMEOUT,\n    )\n";
+        assert_eq!(count_raw_sink_call_sites(wrapped), 0);
+        let single_line = "    ssh::run_remote(conn, command.as_str(), SHORT_TIMEOUT)\n";
+        assert_eq!(count_raw_sink_call_sites(single_line), 0);
+        let field_path = "    ssh::run_remote(conn, self.script.as_str(), SHORT_TIMEOUT)\n";
+        assert_eq!(count_raw_sink_call_sites(field_path), 0);
+        // A call result, an index, a literal or a turbofish is NOT a plain binding.
+        assert!(!has_plain_binding_as_str_receiver(
+            "x(format!(\"a {b}\").as_str())"
+        ));
+        assert!(!has_plain_binding_as_str_receiver("x(parts[0].as_str())"));
+        assert!(!has_plain_binding_as_str_receiver("x(\"lit\".as_str())"));
+        assert!(!has_plain_binding_as_str_receiver(
+            "x(Vec::<u8>::new().as_str())"
+        ));
+        assert!(has_plain_binding_as_str_receiver(
+            "        command.as_str(),"
+        ));
+    }
+
+    /// Anchored exclusion (post-merge review §5): an INLINE
+    /// `format!(…).as_str()` argument is NOT a seam lower — the interpolated
+    /// string reaches the sink raw — so it must count RAW even though the
+    /// line contains `.as_str()`. This is the hole the old loose
+    /// `contains(".as_str()")` window test left open.
+    #[test]
+    fn inline_format_as_str_argument_counts_raw_not_seam_lowered() {
+        let inline = "    ssh::run_remote(conn, format!(\"x {y}\").as_str(), t)\n";
+        assert_eq!(count_raw_sink_call_sites(inline), 1);
+        let raw_string = "    ssh::run_remote(conn, &format!(\"cmd {node}\"), t)\n";
+        assert_eq!(count_raw_sink_call_sites(raw_string), 1);
     }
 
     // ── Per-class validators: one rejection + one acceptance each ───────────

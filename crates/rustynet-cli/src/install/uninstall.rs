@@ -178,7 +178,7 @@ fn remove_unix_binaries() {
 /// helper bootout exactly as the old bare-`sleep 1` did, so uninstall can
 /// never hang.
 fn wait_for_macos_daemon_exit() {
-    for _ in 0..20 {
+    for _ in 0..MACOS_DAEMON_EXIT_WAIT_POLLS {
         let exited = command("launchctl")
             .args(["print", "system/com.rustynet.daemon"])
             .output()
@@ -192,9 +192,17 @@ fn wait_for_macos_daemon_exit() {
         if exited {
             return;
         }
-        std::thread::sleep(Duration::from_millis(500));
+        std::thread::sleep(Duration::from_millis(MACOS_DAEMON_EXIT_WAIT_POLL_MILLIS));
     }
 }
+
+/// The uninstall daemon-exit wait's budget, pinned by test
+/// ([`MACOS_DAEMON_EXIT_WAIT_POLLS`] ×
+/// [`MACOS_DAEMON_EXIT_WAIT_POLL_MILLIS`]): 20 polls × 500 ms = 10 s, which
+/// must stay at or above launchd's 5 s SIGTERM→SIGKILL ceiling so a
+/// SIGTERMed daemon is fully dead before the helper job is booted out.
+const MACOS_DAEMON_EXIT_WAIT_POLLS: usize = 20;
+const MACOS_DAEMON_EXIT_WAIT_POLL_MILLIS: u64 = 500;
 
 /// True when `launchctl print` says the daemon job has exited: the job is
 /// absent (non-zero print exit) or present but reports no `pid = ` line.
@@ -230,5 +238,31 @@ mod tests {
             true,
             "\tstate = not running\n"
         ));
+    }
+    /// The daemon-exit wait budget is pinned SYMBOLICALLY (post-merge review
+    /// §Tests e): 20 polls × 500 ms = 10 s, at or above launchd's 5 s
+    /// SIGTERM→SIGKILL ceiling with margin. The pin is a COMPILE-TIME
+    /// assertion, so the constants cannot quietly shrink below what the
+    /// daemon needs to finish its rollback before the helper job is booted
+    /// out — shrinking them fails this test's build outright.
+    #[test]
+    fn macos_daemon_exit_wait_budget_cannot_shrink_below_the_launchd_ceiling() {
+        const BUDGET_MILLIS: u64 =
+            MACOS_DAEMON_EXIT_WAIT_POLLS as u64 * MACOS_DAEMON_EXIT_WAIT_POLL_MILLIS;
+        const _: () = assert!(
+            BUDGET_MILLIS >= 10_000,
+            "the uninstall daemon-exit wait must stay at 10 s (20 × 500 ms): launchd \
+             SIGKILLs a SIGTERMed job after 5 s, and the daemon's rollback dials the \
+             helper socket that the following bootout takes down"
+        );
+        const _: () = assert!(
+            MACOS_DAEMON_EXIT_WAIT_POLLS >= 2,
+            "a single poll is not a wait; the bounded poll loop must have headroom"
+        );
+        assert_eq!(
+            std::time::Duration::from_millis(BUDGET_MILLIS),
+            std::time::Duration::from_secs(10),
+            "documented budget: 10 s"
+        );
     }
 }
