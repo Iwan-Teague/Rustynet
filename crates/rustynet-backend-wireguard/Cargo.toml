@@ -23,6 +23,12 @@ rustynet-windows-native = { path = "../rustynet-windows-native" }
 
 [features]
 test-harness = []
+# boringtun is a path dependency inside the workspace directory, so the
+# workspace gate (`--workspace --all-features`) activates its `mock-instant`
+# feature and every boringtun timer runs on a frozen mock clock. Forwarding
+# the feature here lets the engine's timer tests advance that clock
+# explicitly instead of sleeping, so they are deterministic under the gate.
+boringtun-mock-instant = ["boringtun/mock-instant"]
 
 [dev-dependencies]
 tempfile = "3"
