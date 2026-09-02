@@ -108,6 +108,15 @@
 //! bypass: it has nothing to render and no way to build a template.
 //! `no_script_template_is_declared_outside_this_module` is the backstop for a
 //! template smuggled in as a plain `&str` const elsewhere in the tree.
+//!
+//! The boundary is now held on the output side too (QH-01 Step 4d-i): every
+//! `render_*` function returns a [`RenderedScript`], a newtype whose field is
+//! private to this module and which has no `From<String>`, so a caller cannot
+//! fabricate "rendered" bytes without rendering — and the adapter sink
+//! constructors (`RemoteCommand::from_rendered`,
+//! `PowerShellScript::from_rendered`) accept only this type.
+
+use std::fmt;
 
 use super::{powershell_quote, shell_quote};
 
@@ -117,6 +126,38 @@ use super::{powershell_quote, shell_quote};
 /// can only be written in *this* module, which is what confines rendering to
 /// [`render_script_template`].
 struct ScriptTemplate(&'static str);
+
+/// The typed output of the renderer (QH-01 Step 4d-i): a fully rendered
+/// remote-host script whose bytes came from an audited template.
+///
+/// [`ScriptTemplate`] confines what can go *into* the renderer; this type
+/// confines what comes *out*. The field is private, there is no
+/// `From<String>` and no `Display`, and `Debug` prints the length only, so a
+/// `RenderedScript` in hand is proof the bytes were produced by
+/// [`render_script_template`] (and therefore by the named `render_*`
+/// functions) — the only constructors in the crate. Sinks and tests read the
+/// bytes through [`RenderedScript::as_str`]; nothing else may observe or
+/// rebuild the payload. `rendered_script_is_constructed_only_inside_this_file`
+/// (in the adapter seam's source-scan pins) is the backstop.
+pub(crate) struct RenderedScript(String);
+
+impl RenderedScript {
+    /// Read-only accessor for sinks and tests. Do not use it to
+    /// re-interpolate the payload into another command string — post-
+    /// processing rendered script text is exactly the bypass this boundary
+    /// exists to make impossible.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RenderedScript {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted: a rendered script may embed host names, paths, and other
+        // environment data; only its length may reach logs.
+        write!(f, "RenderedScript(len={})", self.0.len())
+    }
+}
 
 /// How the renderer spells one substituted value.
 ///
@@ -281,7 +322,7 @@ fn ensure_heredoc_body(token: &str, value: &str, terminator: &str) -> Result<(),
 fn render_script_template(
     template: ScriptTemplate,
     bindings: &[(&'static str, Binding<'_>)],
-) -> Result<String, String> {
+) -> Result<RenderedScript, String> {
     let body = template.0;
     let mut rendered: Vec<String> = Vec::with_capacity(bindings.len());
     for (token, binding) in bindings {
@@ -330,7 +371,7 @@ fn render_script_template(
             ));
         }
     }
-    Ok(out)
+    Ok(RenderedScript(out))
 }
 
 // --- the script templates: private to this module ---------------------------
@@ -1741,7 +1782,7 @@ pub(crate) fn render_host_fetch_image_script(
     url: &str,
     sha256: &str,
     expect_model: &str,
-) -> Result<String, String> {
+) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_FETCH_IMAGE_SCRIPT,
         &[
@@ -1759,7 +1800,7 @@ pub(crate) fn render_host_fetch_image_script(
 pub(crate) fn render_host_guest_console_script(
     domain: &str,
     seconds: u32,
-) -> Result<String, String> {
+) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_GUEST_CONSOLE_SCRIPT,
         &[
@@ -1771,7 +1812,7 @@ pub(crate) fn render_host_guest_console_script(
 
 /// Render the guest toolchain installer. The channel is a `rustup` argument and
 /// a bare word inside `--default-toolchain __CHANNEL__`, so it is `Bare`.
-pub(crate) fn render_guest_toolchain_script(channel: &str) -> Result<String, String> {
+pub(crate) fn render_guest_toolchain_script(channel: &str) -> Result<RenderedScript, String> {
     render_script_template(
         GUEST_TOOLCHAIN_SCRIPT,
         &[("__CHANNEL__", Binding::Bare(channel))],
@@ -1781,7 +1822,10 @@ pub(crate) fn render_guest_toolchain_script(channel: &str) -> Result<String, Str
 /// Render the stuck-guest recovery script. `targets` is a space-joined domain
 /// list and is legitimately empty ("every domain on the host"), so it is a
 /// `Literal`; `force` is a rendered `0`/`1` and is `Bare`.
-pub(crate) fn render_host_recover_vms_script(force: bool, targets: &str) -> Result<String, String> {
+pub(crate) fn render_host_recover_vms_script(
+    force: bool,
+    targets: &str,
+) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_RECOVER_VMS_SCRIPT,
         &[
@@ -1792,7 +1836,7 @@ pub(crate) fn render_host_recover_vms_script(force: bool, targets: &str) -> Resu
 }
 
 /// Render the pool disk-usage report.
-pub(crate) fn render_host_disk_status_script(pool: &str) -> Result<String, String> {
+pub(crate) fn render_host_disk_status_script(pool: &str) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_DISK_STATUS_SCRIPT,
         &[("__POOL__", Binding::Literal(pool))],
@@ -1803,7 +1847,9 @@ pub(crate) fn render_host_disk_status_script(pool: &str) -> Result<String, Strin
 /// `guest_subnet_prefix`, which admits only digits and dots, and it is
 /// substituted into a `sed` expression as well as a variable — `Bare` is the
 /// binding that matches that shape.
-pub(crate) fn render_host_renumber_net_script(target_prefix: &str) -> Result<String, String> {
+pub(crate) fn render_host_renumber_net_script(
+    target_prefix: &str,
+) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_RENUMBER_NET_SCRIPT,
         &[("__TARGET_PREFIX__", Binding::Bare(target_prefix))],
@@ -1816,7 +1862,7 @@ pub(crate) fn render_host_fetch_artifact_script(
     repo_dir: &str,
     path: &str,
     cap: u64,
-) -> Result<String, String> {
+) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_FETCH_ARTIFACT_SCRIPT,
         &[
@@ -1828,7 +1874,7 @@ pub(crate) fn render_host_fetch_artifact_script(
 }
 
 /// Render the stop-in-flight-run script.
-pub(crate) fn render_host_stop_script(repo_dir: &str) -> Result<String, String> {
+pub(crate) fn render_host_stop_script(repo_dir: &str) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_STOP_SCRIPT,
         &[("__REPO_DIR__", Binding::Literal(repo_dir))],
@@ -1836,7 +1882,7 @@ pub(crate) fn render_host_stop_script(repo_dir: &str) -> Result<String, String> 
 }
 
 /// Render the read-only "is a run in flight?" probe. See [`HOST_RUN_STATUS_SCRIPT`].
-pub(crate) fn render_host_run_status_script(repo_dir: &str) -> Result<String, String> {
+pub(crate) fn render_host_run_status_script(repo_dir: &str) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_RUN_STATUS_SCRIPT,
         &[("__REPO_DIR__", Binding::Literal(repo_dir))],
@@ -1925,7 +1971,7 @@ pub(crate) fn render_host_launch_script(
     orch_identity: &HostSshPath<'_>,
     orch_known_hosts: &HostSshPath<'_>,
     orchestrator_args: &[String],
-) -> Result<String, String> {
+) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_LAUNCH_SCRIPT,
         &[
@@ -1969,7 +2015,7 @@ pub(crate) fn render_host_provision_guest_script(
     ram_mb: u64,
     vcpus: u32,
     authorized_key: &HostSshPath<'_>,
-) -> Result<String, String> {
+) -> Result<RenderedScript, String> {
     render_script_template(
         HOST_PROVISION_GUEST_SCRIPT,
         &[
@@ -1990,7 +2036,7 @@ pub(crate) fn render_host_provision_guest_script(
 /// control and a metacharacter rule would be wrong (YAML needs `:` and
 /// newlines). `HeredocBody` enforces the rule that actually applies: the body
 /// must end in a newline and must not contain a line equal to the terminator.
-pub(crate) fn render_netplan_repair_script(netplan_yaml: &str) -> Result<String, String> {
+pub(crate) fn render_netplan_repair_script(netplan_yaml: &str) -> Result<RenderedScript, String> {
     render_script_template(
         NETPLAN_REPAIR_SCRIPT,
         &[(
@@ -2004,7 +2050,9 @@ pub(crate) fn render_netplan_repair_script(netplan_yaml: &str) -> Result<String,
 }
 
 /// Render the NetworkManager repair script. The interface name is a bare word.
-pub(crate) fn render_network_manager_repair_script(interface: &str) -> Result<String, String> {
+pub(crate) fn render_network_manager_repair_script(
+    interface: &str,
+) -> Result<RenderedScript, String> {
     render_script_template(
         NETWORK_MANAGER_REPAIR_SCRIPT,
         &[("__RN_IFACE__", Binding::Bare(interface))],
@@ -2014,7 +2062,7 @@ pub(crate) fn render_network_manager_repair_script(interface: &str) -> Result<St
 /// Render the systemd-networkd repair script. The interface name lands in a
 /// `.network` unit key (`Name=__RN_IFACE__`) as well as an argv word, so `Bare`
 /// is the binding that matches both.
-pub(crate) fn render_networkd_repair_script(interface: &str) -> Result<String, String> {
+pub(crate) fn render_networkd_repair_script(interface: &str) -> Result<RenderedScript, String> {
     render_script_template(
         NETWORKD_REPAIR_SCRIPT,
         &[("__RN_IFACE__", Binding::Bare(interface))],
@@ -2029,7 +2077,7 @@ pub(crate) fn render_windows_exit_evidence_capture_script(
     artifact_root: &str,
     daemon_path: &str,
     killswitch_probe_marker: &str,
-) -> Result<String, String> {
+) -> Result<RenderedScript, String> {
     render_script_template(
         WINDOWS_EXIT_EVIDENCE_CAPTURE_SCRIPT,
         &[
@@ -2354,6 +2402,7 @@ mod tests {
                 .collect();
             let rendered = render_script_template(row.template, bindings.as_slice())
                 .unwrap_or_else(|err| panic!("{} must render: {err}", row.name));
+            let rendered = rendered.as_str();
             for (token, _) in row.bindings {
                 assert!(
                     !rendered.contains(token),
@@ -2501,6 +2550,7 @@ echo "PROVISION-RESULT: created domain $NAME (state=$st, overlay=$OVERLAY, seed=
             &HostSshPath::Default(DefaultHostSshPath::GUEST_AUTHORIZED_KEY),
         )
         .expect("renders");
+        let rendered = rendered.as_str();
         assert_eq!(rendered, EXPECTED);
     }
 
@@ -2585,6 +2635,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &["--node".to_owned(), "linux-x86-client-1:client".to_owned()],
         )
         .expect("renders");
+        let rendered = rendered.as_str();
         assert_eq!(rendered, EXPECTED);
     }
 
@@ -2621,6 +2672,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &HostSshPath::Override("/home/u/.ssh/id_ed25519.pub"),
         )
         .expect("a placeholder-shaped name is data, not an error");
+        let script = script.as_str();
         assert!(script.contains("NAME='__AUTH_KEY__'"), "script:\n{script}");
         assert_eq!(
             script.matches("PUBKEY_SRC=").count(),
@@ -2645,12 +2697,13 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &HostSshPath::Override("/home/u/k.pub"),
         )
         .expect("renders");
+        let script = script.as_str();
         assert_eq!(
-            shell_split(line_starting_with(&script, "NAME=")).expect("parses"),
+            shell_split(line_starting_with(script, "NAME=")).expect("parses"),
             vec!["NAME=__AUTH_KEY__".to_owned()]
         );
         assert_eq!(
-            shell_split(line_starting_with(&script, "PUBKEY_SRC=")).expect("parses"),
+            shell_split(line_starting_with(script, "PUBKEY_SRC=")).expect("parses"),
             vec!["PUBKEY_SRC=/home/u/k.pub".to_owned()]
         );
     }
@@ -2671,12 +2724,13 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &HostSshPath::Default(DefaultHostSshPath::GUEST_AUTHORIZED_KEY),
         )
         .expect("the renderer escapes rather than refuses");
+        let script = script.as_str();
         assert_eq!(
-            shell_split(line_starting_with(&script, "POOL=")).expect("parses"),
+            shell_split(line_starting_with(script, "POOL=")).expect("parses"),
             vec!["POOL=/var/lib/libvirt/images';touch /tmp/pwned;'".to_owned()]
         );
         assert_eq!(
-            shell_split(line_starting_with(&script, "IMAGE=")).expect("parses"),
+            shell_split(line_starting_with(script, "IMAGE=")).expect("parses"),
             vec!["IMAGE=d.qcow2';id;'".to_owned()]
         );
     }
@@ -2707,6 +2761,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &[("__ONE__", Binding::Literal("1"))],
         )
         .expect("an unbound token in prose must not fail the render");
+        let rendered = rendered.as_str();
         assert_eq!(rendered, "A='1' # see the __PLACEHOLDERS__ note\n");
     }
 
@@ -2751,6 +2806,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &[],
         )
         .expect("renders");
+        let ok = ok.as_str();
         assert_eq!(ok.matches("RUNNER_EOF").count(), 2, "open + close only");
     }
 
@@ -2762,6 +2818,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &[("__SHA__", Binding::Literal(""))],
         )
         .expect("empty must be legal");
+        let rendered = rendered.as_str();
         assert_eq!(rendered, "SHA=''\n");
     }
 
@@ -2777,6 +2834,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
     fn the_guest_toolchain_installs_and_verifies_dig_for_the_dns_failclosed_stage() {
         let script = render_guest_toolchain_script("1.88.0")
             .expect("the toolchain script should render for a valid channel");
+        let script = script.as_str();
 
         // Slice the apt-get install command, NOT the whole script. A bare
         // `script.contains("dnsutils")` is satisfied by the COMMENT above the
@@ -2820,6 +2878,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
     fn the_guest_toolchain_installs_with_each_detected_distros_package_manager() {
         let script = render_guest_toolchain_script("1.88.0")
             .expect("the toolchain script should render for a valid channel");
+        let script = script.as_str();
 
         // Detection: $ID first, then $ID_LIKE — the same order rustynet-sysinfo's
         // pkg_family_for uses — and a loud refusal when neither matches.
@@ -2971,6 +3030,23 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
         assert!(render_netplan_repair_script("network: 2").is_err());
     }
 
+    /// QH-01 Step 4d-i: the output newtype redacts. `RenderedScript` has no
+    /// `Display` and its `Debug` prints the length only, so a rendered script
+    /// (host names, repo paths, values) cannot reach a log through `{:?}`.
+    #[test]
+    fn rendered_script_debug_prints_only_the_length() {
+        let rendered = render_host_stop_script("/home/u/Rustynet").expect("renders");
+        let text = format!("{rendered:?}");
+        assert_eq!(
+            text,
+            format!("RenderedScript(len={})", rendered.as_str().len())
+        );
+        assert!(
+            !text.contains("Rustynet"),
+            "the payload must not appear in Debug: {text}"
+        );
+    }
+
     /// S1: `script -qec` re-parses its argument as a command string in a nested
     /// shell, so `shell_quote`ing the `DOM=` assignment is not the control here.
     ///
@@ -2982,6 +3058,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
     #[test]
     fn guest_console_nested_command_string_is_single_quoted() {
         let script = render_host_guest_console_script("alpha", 30).expect("renders");
+        let script = script.as_str();
 
         assert!(
             script.contains(
@@ -3021,6 +3098,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &[],
         )
         .expect("renders");
+        let script = script.as_str();
         assert!(script.contains("--ssh-identity-file \"$HOME/.ssh/id_ed25519\""));
         assert!(script.contains("--known-hosts-file \"$HOME/.ssh/known_hosts\""));
     }
@@ -3039,6 +3117,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &[],
         )
         .expect("renders");
+        let script = script.as_str();
         assert!(script.contains("--ssh-identity-file '/home/u/.ssh/lab_key'"));
         assert!(script.contains("--known-hosts-file '/home/u/.ssh/lab_known_hosts'"));
         // Even a quote-bearing override cannot escape its word.
@@ -3051,7 +3130,8 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
             &[],
         )
         .expect("renders");
-        let runner = line_starting_with(&escaped, "exec cargo run");
+        let escaped = escaped.as_str();
+        let runner = line_starting_with(escaped, "exec cargo run");
         let words = shell_split(runner).expect("parses");
         assert!(
             words.contains(&"/home/u/k';id;'".to_owned()),

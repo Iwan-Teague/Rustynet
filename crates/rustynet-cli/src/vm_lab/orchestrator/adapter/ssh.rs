@@ -441,11 +441,21 @@ fn base_scp_command(
 pub(crate) struct RemoteCommand(String);
 
 impl RemoteCommand {
-    // Deliberately NO constructor from a plain `String`: the renderer's
-    // `render_*` functions return `String` today, so a "from rendered
-    // template" constructor would accept any `format!` result and void the
-    // compile-time proof this type exists for. Step 4d adds the typed
-    // renderer-output constructor together with the sink signature flip.
+    // Deliberately NO `From<String>`: the only ways in are a `script_template`
+    // render output (typed, via `from_rendered`) or a validator-checked value,
+    // so holding a `RemoteCommand` is proof the injection boundary was crossed
+    // deliberately.
+
+    /// The typed renderer-output constructor (QH-01 Step 4d-i): a command
+    /// rendered by `script_template::render_*` crosses this boundary by type,
+    /// not by convention. The name makes the input type explicit — there is
+    /// deliberately no `From<String>`, so a `format!` result cannot reach the
+    /// sink through this path. (This is the plan's `from_template`; the
+    /// Step 4d-ii sink signature flip is what makes every other path
+    /// uncompilable.)
+    pub(crate) fn from_rendered(rendered: crate::vm_lab::script_template::RenderedScript) -> Self {
+        Self(rendered.as_str().to_owned())
+    }
 
     /// Wrap a single value after quote-safety validation and shell quoting.
     /// `label` names the argument for the error message.
@@ -1348,6 +1358,36 @@ mod powershell_clixml_rendering_tests {
 #[cfg(test)]
 mod remote_command_seam_tests {
     use super::*;
+
+    /// QH-01 Step 4d-i: `from_rendered` carries the renderer's bytes through
+    /// unchanged — byte-for-byte what the plain-`String` render path produced
+    /// before the output boundary existed, pinned here against a fixed
+    /// binding set so a future renderer change is a visible, deliberate act.
+    #[test]
+    fn from_rendered_carries_the_renderer_output_byte_identically() {
+        let rendered =
+            crate::vm_lab::script_template::render_network_manager_repair_script("enp0s1")
+                .expect("the benign interface must render");
+        let cmd = RemoteCommand::from_rendered(rendered);
+        let expected = "\
+set -eu
+iface=enp0s1
+con=\"$(nmcli -t -f NAME,DEVICE con show 2>/dev/null | awk -F: -v i=\"$iface\" '$2==i{print $1; exit}')\"
+if [ -n \"${con:-}\" ]; then
+  nmcli con mod \"$con\" 802-3-ethernet.mac-address \"\" 2>/dev/null || true
+  nmcli con mod \"$con\" ipv4.method auto ipv6.method auto || true
+  nmcli con up \"$con\"
+else
+  nmcli con add type ethernet ifname \"$iface\" con-name \"rustynet-recover-$iface\" ipv4.method auto ipv6.method auto
+  nmcli con up \"rustynet-recover-$iface\"
+fi
+";
+        assert_eq!(cmd.as_str(), expected);
+        // And the Debug contract: length only, never the payload.
+        let text = format!("{cmd:?}");
+        assert_eq!(text, format!("RemoteCommand(len={})", expected.len()));
+        assert!(!text.contains("nmcli"), "payload must not appear: {text}");
+    }
 
     #[test]
     fn from_validated_single_rejects_a_single_quoted_value_before_quoting() {

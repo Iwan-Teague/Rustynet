@@ -4173,6 +4173,10 @@ pub fn execute_ops_vm_lab_renumber_guest_network(
     let script = script_template::render_host_renumber_net_script(prefix.as_str())?;
 
     if config.dry_run {
+        // The dry-run report only *displays* the rendered script (QH-01 Step
+        // 4d-i remainder: this site reads the bytes for the operator report;
+        // it never re-interpolates them into another command).
+        let script = script.as_str();
         if config.json {
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "host_id": host.host_id,
@@ -4483,6 +4487,9 @@ pub fn execute_ops_vm_lab_launch_on_host(
     )?;
 
     if config.dry_run {
+        // Same display-only read as the renumber dry-run above (QH-01 Step
+        // 4d-i remainder).
+        let script = script.as_str();
         if config.json {
             return Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "host_id": host.host_id,
@@ -18723,11 +18730,19 @@ fn parse_windows_exit_evidence_inventory(raw_json: &str) -> Result<HashSet<Strin
     Ok(found)
 }
 
-fn build_windows_exit_evidence_capture_script() -> Result<String, String> {
-    script_template::render_windows_exit_evidence_capture_script(
-        WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT,
-        WINDOWS_RUSTYNETD_EXE_PATH,
-        WINDOWS_EXIT_KILLSWITCH_PROBE_MARKER,
+/// The Windows Exit evidence capture, rendered through the audited
+/// `script_template` boundary and typed as a `PowerShellScript` (QH-01 Step
+/// 4d-i) so its bytes are provably a renderer product, not a `format!`.
+fn build_windows_exit_evidence_capture_script()
+-> Result<orchestrator::adapter::windows_install::PowerShellScript, String> {
+    Ok(
+        orchestrator::adapter::windows_install::PowerShellScript::from_rendered(
+            script_template::render_windows_exit_evidence_capture_script(
+                WINDOWS_EXIT_EVIDENCE_REMOTE_ROOT,
+                WINDOWS_RUSTYNETD_EXE_PATH,
+                WINDOWS_EXIT_KILLSWITCH_PROBE_MARKER,
+            )?,
+        ),
     )
 }
 
@@ -38825,6 +38840,7 @@ mod tests {
     fn guest_toolchain_script_keeps_the_hard_won_fixes() {
         let script = script_template::render_guest_toolchain_script("1.88.0")
             .expect("the pinned channel must render");
+        let script = script.as_str();
         // 127: rustup's shims are invisible to the non-login shell the orchestrator uses
         assert!(
             script.contains("/usr/local/bin/$shim"),
@@ -50333,6 +50349,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     fn build_windows_exit_evidence_capture_script_is_allowlisted_and_marker_gated() {
         let script =
             super::build_windows_exit_evidence_capture_script().expect("capture script builds");
+        let script = script.as_str();
         assert!(script.contains("Set-StrictMode -Version Latest"));
         assert!(script.contains(r"C:\ProgramData\RustyNet\vm-lab\windows_exit"));
         assert!(script.contains("scm_context_nat_lifecycle.json"));
@@ -51286,6 +51303,7 @@ mod fetch_image_sha256_tests {
             "Samsung SSD 870 EVO 500GB",
         )
         .expect("benign values must render");
+        let script = script.as_str();
         let verify = script
             .find("sha256sum \"$STAGE/$NAME\"")
             .expect("stage verify");
@@ -51316,6 +51334,7 @@ mod fetch_image_sha256_tests {
             "",
         )
         .expect("empty sha256/model are legitimate, not an error");
+        let script = script.as_str();
         assert!(script.contains("SHA256=''"));
         assert!(script.contains("EXPECT_MODEL=''"));
     }
@@ -51663,6 +51682,8 @@ mod launch_on_host_tests {
             &args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>(),
         )
         .expect("benign launcher values must render")
+        .as_str()
+        .to_owned()
     }
 
     /// BUG-BOX-4: the --node orchestrator requires --known-hosts-file, so the
@@ -51822,6 +51843,7 @@ mod launch_on_host_tests {
             &["--node".to_owned(), "a'; touch /tmp/pwned; '".to_owned()],
         )
         .expect("the renderer quotes rather than refuses");
+        let script = script.as_str();
         assert!(
             script.contains(r"'--node' 'a'\''; touch /tmp/pwned; '\'''"),
             "each arg must be POSIX-escaped into a single word; script was:\n{script}"
@@ -51844,6 +51866,8 @@ mod host_run_status_probe_tests {
         // regression in the render chain would leave these green (QH-02).
         script_template::render_host_run_status_script(repo_dir)
             .expect("a benign repo_dir must render")
+            .as_str()
+            .to_owned()
     }
 
     /// The status path used to ask `pgrep -af 'vm-lab-orchestrate-live-lab'`. Its
@@ -52067,6 +52091,8 @@ mod stop_host_run_tests {
     fn render() -> String {
         script_template::render_host_stop_script("/home/u/Rustynet")
             .expect("a benign repo_dir must render")
+            .as_str()
+            .to_owned()
     }
 
     #[test]
@@ -52259,6 +52285,8 @@ mod fetch_host_artifact_tests {
     fn render(path: &str, cap: u64) -> String {
         script_template::render_host_fetch_artifact_script("/home/u/Rustynet", path, cap)
             .expect("benign path/cap must render")
+            .as_str()
+            .to_owned()
     }
 
     #[test]
@@ -52318,6 +52346,7 @@ mod renumber_guest_network_tests {
     fn the_script_is_idempotent_and_sudoless() {
         let s = script_template::render_host_renumber_net_script("192.168.121.")
             .expect("a dotted-quad prefix must render");
+        let s = s.as_str();
         // No-op when already on target — the guest restart must be gated on a change.
         assert!(s.contains("already on ${TARGET_PREFIX}0/24 — no change"));
         // Every virsh call is on qemu:///system with no sudo.
@@ -52344,6 +52373,8 @@ mod provision_guest_create_tests {
             auth_key,
         )
         .expect("benign provision values must render")
+        .as_str()
+        .to_owned()
     }
 
     fn render_default() -> String {
@@ -52570,6 +52601,7 @@ mod host_disk_status_tests {
         // Through the production renderer, not a local substitution copy (QH-02).
         let s = script_template::render_host_disk_status_script("/var/lib/libvirt/images")
             .expect("a benign pool must render");
+        let s = s.as_str();
         assert!(s.contains("POOL='/var/lib/libvirt/images'"));
         // Fenced between sentinels the executor splits on.
         assert!(s.contains("DISK-BEGIN"));
@@ -52587,6 +52619,8 @@ mod recover_host_vms_tests {
     fn render(force: bool, targets: &str) -> String {
         script_template::render_host_recover_vms_script(force, targets)
             .expect("benign force/targets must render")
+            .as_str()
+            .to_owned()
     }
 
     #[test]
@@ -52712,6 +52746,8 @@ exit 0
     fn render_recover(force: bool, targets: &str) -> String {
         script_template::render_host_recover_vms_script(force, targets)
             .expect("benign force/targets must render")
+            .as_str()
+            .to_owned()
     }
 
     // --- HOST_RECOVER_VMS_SCRIPT: success is exit 0 AND RECOVER-END. ---
@@ -52828,7 +52864,8 @@ exit 0
             pool.to_str().expect("utf-8 temp path"),
         )
         .expect("a benign pool must render");
-        let (ok, stdout, stderr) = run_script(&script, &dir, &[]);
+        let script = script.as_str();
+        let (ok, stdout, stderr) = run_script(script, &dir, &[]);
         assert!(
             ok,
             "an existing pool must report successfully\nstderr: {stderr}"
@@ -52852,7 +52889,8 @@ exit 0
             pool.to_str().expect("utf-8 temp path"),
         )
         .expect("a benign pool path must render");
-        let (ok, stdout, stderr) = run_script(&script, &dir, &[]);
+        let script = script.as_str();
+        let (ok, stdout, stderr) = run_script(script, &dir, &[]);
         assert!(!ok, "a missing pool must exit non-zero");
         assert!(
             !stdout.contains("DISK-END"),
