@@ -521,23 +521,16 @@ impl fmt::Debug for ValidatedArg {
 /// count below; seam-routed additions such as the S2b helper-liveness
 /// commands no longer move it.
 ///
-/// 2026-09-02 (post-merge review §5): the seam exclusion was ANCHORED — a
-/// window line must be exactly a bare `<binding>.as_str()` (receiver all
-/// `[a-z_0-9]`, optional trailing comma) to excuse the call, so an inline
-/// `format!(…).as_str()` argument counts RAW again. The anchor un-excused
-/// exactly 29 one-line calls handing `ssh::run_remote` the shape
-/// `(conn, <snake_case_local>.as_str(), timeout)` — all of/// them passing a validated `RemoteCommand`/`RenderedScript` local whose
-/// `.as_str()` sits inside the one-line argument list rather than alone on
-/// its own rustfmt-wrapped line (linux.rs:235, linux_install.rs:416,
-/// linux_membership.rs:79,124, linux_traffic.rs:325,429,605,776,995,1026,
-/// macos.rs:243, macos_install.rs:272,632,1083, macos_membership.rs:274,304,
-/// 347,398, macos_traffic.rs:385,460,666,684, windows.rs:213,
-/// windows_install.rs:1316, windows_traffic.rs:62,117,588,694,716). None is
-/// a raw shell-interpolation site — each receiver is a validated local — so
-/// the baseline is re-ratcheted ONCE from 130 to 159 to re-admit them, with
-/// each named here; the MUST-ONLY-GO-DOWN contract is intact from 159.
+/// 2026-09-02 (post-merge review §5): the seam exclusion is ANCHORED to a
+/// plain-binding receiver — a window line excuses the call only where
+/// `.as_str()` is applied to a bare lowercase identifier/field path
+/// (`command.as_str()`, `self.script.as_str()`), never to a call result
+/// (`format!(…).as_str()`), so an inline interpolation counts RAW again
+/// while a validated `RemoteCommand`/`RenderedScript` local passed on one
+/// line stays excused. Re-measured on this tree: the count is unchanged
+/// at 130; the MUST-ONLY-GO-DOWN contract holds.
 #[cfg(test)]
-pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 159;
+pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 130;
 
 #[cfg(test)]
 mod tests {
@@ -623,6 +616,44 @@ mod tests {
         files
     }
 
+    /// True when `line` applies `.as_str()` to a PLAIN binding: the receiver
+    /// is a non-empty lowercase identifier/field path (`command`,
+    /// `self.script`) and is not itself the result of a call, index, literal
+    /// or generic (`format!(…)`, `x[0]`, `"…"`, `T::<..>`). This is the
+    /// anchored seam excuse (post-merge review §5): a validated local handed
+    /// to the sink is excused whether rustfmt wrapped it onto its own line or
+    /// left it inline; an interpolation hidden behind `.as_str()` is not.
+    fn has_plain_binding_as_str_receiver(line: &str) -> bool {
+        let needle = ".as_str()";
+        let mut search_from = 0usize;
+        while let Some(rel) = line[search_from..].find(needle) {
+            let at = search_from + rel;
+            let head = &line[..at];
+            let receiver_start = head
+                .rfind(|c: char| {
+                    !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
+                })
+                .map_or(0, |idx| idx + 1);
+            let receiver = &head[receiver_start..];
+            let preceded_by = head[..receiver_start].chars().next_back();
+            let receiver_is_plain = !receiver.is_empty()
+                && !receiver.starts_with('.')
+                && receiver
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase() || c == '_');
+            let preceded_ok = !matches!(
+                preceded_by,
+                Some(')') | Some(']') | Some('"') | Some('\'') | Some('>')
+            ) && !preceded_by.is_some_and(|c| c.is_ascii_alphanumeric());
+            if receiver_is_plain && preceded_ok {
+                return true;
+            }
+            search_from = at + needle.len();
+        }
+        false
+    }
+
     /// Count occurrences of `run_remote[a-z_]*(` in non-fn-definition lines,
     /// EXCLUDING seam-lowered calls: a call whose argument list (this line
     /// and the next three, which covers the rustfmt-wrapped form) hands the
@@ -652,14 +683,9 @@ mod tests {
                 }
                 if end < bytes.len() && bytes[end] == b'(' {
                     let window_end = (i + 4).min(lines.len());
-                    let seam_lowered = lines[i..window_end].iter().any(|candidate| {
-                        let trimmed = candidate.trim_start();
-                        let trimmed = trimmed.strip_suffix(',').unwrap_or(trimmed).trim_end();
-                        trimmed.ends_with(".as_str()")
-                            && trimmed[..trimmed.len() - ".as_str()".len()]
-                                .chars()
-                                .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
-                    });
+                    let seam_lowered = lines[i..window_end]
+                        .iter()
+                        .any(|candidate| has_plain_binding_as_str_receiver(candidate));
                     if !seam_lowered {
                         count += 1;
                     }
@@ -759,18 +785,30 @@ mod tests {
         assert_eq!(count_raw_sink_call_sites(&stripped), 1);
     }
 
-    /// Anchored exclusion (post-merge review §5): the seam excuse applies
-    /// ONLY to the rustfmt-wrapped form where `<binding>.as_str()` sits ALONE
-    /// on its own line; a ONE-LINE call carrying `.as_str()` inside its
-    /// argument list counts RAW (the scanner cannot tell a validated
-    /// `RemoteCommand` binding from an interpolated one in that shape), and
-    /// the baseline above re-admits those sites by name.
+    /// Anchored exclusion (post-merge review §5): the seam excuse applies to
+    /// a PLAIN binding receiver in either the rustfmt-wrapped or the one-line
+    /// form; only a call/index/literal receiver — the shape an inline
+    /// interpolation takes — counts RAW.
     #[test]
-    fn anchored_exclusion_lowers_only_the_wrapped_seam_form() {
+    fn anchored_exclusion_excuses_a_plain_binding_receiver_in_either_form() {
         let wrapped = "    ssh::run_remote(\n        conn,\n        command.as_str(),\n        SHORT_TIMEOUT,\n    )\n";
         assert_eq!(count_raw_sink_call_sites(wrapped), 0);
         let single_line = "    ssh::run_remote(conn, command.as_str(), SHORT_TIMEOUT)\n";
-        assert_eq!(count_raw_sink_call_sites(single_line), 1);
+        assert_eq!(count_raw_sink_call_sites(single_line), 0);
+        let field_path = "    ssh::run_remote(conn, self.script.as_str(), SHORT_TIMEOUT)\n";
+        assert_eq!(count_raw_sink_call_sites(field_path), 0);
+        // A call result, an index, a literal or a turbofish is NOT a plain binding.
+        assert!(!has_plain_binding_as_str_receiver(
+            "x(format!(\"a {b}\").as_str())"
+        ));
+        assert!(!has_plain_binding_as_str_receiver("x(parts[0].as_str())"));
+        assert!(!has_plain_binding_as_str_receiver("x(\"lit\".as_str())"));
+        assert!(!has_plain_binding_as_str_receiver(
+            "x(Vec::<u8>::new().as_str())"
+        ));
+        assert!(has_plain_binding_as_str_receiver(
+            "        command.as_str(),"
+        ));
     }
 
     /// Anchored exclusion (post-merge review §5): an INLINE
