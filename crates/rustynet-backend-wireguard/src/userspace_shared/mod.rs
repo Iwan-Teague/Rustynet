@@ -3634,7 +3634,7 @@ mod tests {
         let required = [
             Required {
                 path: "crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs",
-                field_anchor: "self.recorded_peer_ciphertext_ingress",
+                field_anchor: "recorded_peer_ciphertext_ingress.push",
             },
             Required {
                 path: "crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs",
