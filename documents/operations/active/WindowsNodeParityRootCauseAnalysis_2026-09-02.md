@@ -33,10 +33,10 @@ Per `(stage, status)` over those rows:
 
 | status | stages |
 |---|---|
-| `fail` (4) | `preflight` ×2, `bootstrap_hosts` ×3 |
+| `fail` (5) | `preflight` ×2, `bootstrap_hosts` ×3 |
 | `not_proven` (2) | `cleanup` ×2 |
-| `pass` (10) | `preflight` ×1, `prepare_source_archive` ×3, `verify_ssh_reachability` ×3, `cleanup_hosts` ×3 — setup plumbing only; **no validation or role stage has ever run live on a Windows node** |
-| `skip` (169) | every collect/distribute/validate/live/cross-network stage — all downstream of the bootstrap wall |
+| `pass` (15) | `preflight` ×3, `prepare_source_archive` ×3, `verify_ssh_reachability` ×3, `cleanup_hosts` ×3, `cleanup` ×3 — setup plumbing only; **no validation or role stage has ever run live on a Windows node** |
+| `skip` (163) | every collect/distribute/validate/live/cross-network stage — all downstream of the bootstrap wall |
 
 The five runs, oldest first (columns: run id, start, commit, alias, role, report dir):
 
@@ -246,7 +246,7 @@ Ordering principle: what unblocks the most downstream Windows cells first. Every
 stage (`collect_pubkeys` onward) is downstream of one green `bootstrap_hosts`; F4 additionally gates
 the run before any stage at all.
 
-### R1 — Land the first `windows_stage_bootstrap=pass` (unblocks: all 169 skipped cells) — **effort M, operator + ops**
+### R1 — Land the first `windows_stage_bootstrap=pass` (unblocks: all 163 skipped cells) — **effort M, operator + ops**
 
 The code half of the wall is already fixed (F2/F3/F5/F6 above; W-FIX-1 landed). What remains is the
 guest/ops half, exactly the verdict doc's W-FIX-4/W-FIX-5, restated here with the current failure
