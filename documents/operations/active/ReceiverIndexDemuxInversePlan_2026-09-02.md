@@ -569,3 +569,5 @@ pending" to "amended, ready to implement".
   `allocate_tunnel_index` output, datagram-supplied `receiver_idx` values are
   lookup probes that can never become keys, and map size is bounded by
   invariant (a) to `peer_states.len()`.
+
+Status: implemented on branch ai-edit/edit-1788328125627-36698-0 (2026-09-02).
