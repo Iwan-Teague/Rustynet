@@ -521,7 +521,7 @@ impl fmt::Debug for ValidatedArg {
 /// count below; seam-routed additions such as the S2b helper-liveness
 /// commands no longer move it.
 #[cfg(test)]
-pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 140;
+pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 130;
 
 #[cfg(test)]
 mod tests {
@@ -658,6 +658,58 @@ mod tests {
                  build one — route new values through ValidatedArg instead"
             );
         }
+    }
+
+    /// QH-01 Step 4d-i: the renderer's OUTPUT newtype is constructed only
+    /// inside `vm_lab/script_template.rs` (`render_script_template` is its
+    /// only constructor). This extends the `RemoteCommand(` pin above to the
+    /// whole crate source tree: any `RenderedScript(` outside that file is a
+    /// hand-built "rendered" script, i.e. exactly the bypass the private
+    /// field exists to make impossible. The type system already enforces this
+    /// within the crate (private field, no `From<String>`); this scan is the
+    /// same backstop the template side keeps for `ScriptTemplate(`
+    /// declarations, and it skips `#[cfg(test)]` regions (review A7).
+    #[test]
+    fn rendered_script_is_constructed_only_inside_script_template() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![src.clone()];
+        let mut offenders: Vec<String> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).expect("src directory must be readable");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_owned();
+                if name == "script_template.rs" {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).expect("crate source must be readable");
+                let stripped = strip_test_regions(&source);
+                if stripped.contains("RenderedScript(") {
+                    let display = path.strip_prefix(&src).unwrap_or(path.as_path()).display();
+                    offenders.push(format!(
+                        "{display}: constructs RenderedScript outside \
+                         vm_lab/script_template.rs — render through script_template::render_* \
+                         instead of assembling the bytes by hand"
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "renderer output must be constructed only by the renderer:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 
     #[test]

@@ -169,8 +169,17 @@ impl PowerShellScript {
     // Deliberately NO whole-script constructor from a plain `String`: it
     // would accept any `format!` result (voiding the type boundary), and
     // `ps_quote` turns a script body into a single-quoted literal, which is
-    // not how the `-EncodedCommand` sinks consume a script. Step 4d adds the
-    // typed renderer-output constructor with the sink signature flip.
+    // not how the `-EncodedCommand` sinks consume a script. The typed
+    // renderer-output constructor below is the one whole-script way in.
+
+    /// The typed renderer-output constructor (QH-01 Step 4d-i): a script
+    /// rendered by `script_template::render_*` (the one PowerShell template
+    /// on the renderer's path uses `Binding::PowerShellLiteral`) crosses this
+    /// boundary by type, not by convention. The name makes the input type
+    /// explicit — there is deliberately no `From<String>`.
+    pub(crate) fn from_rendered(rendered: crate::vm_lab::script_template::RenderedScript) -> Self {
+        Self(rendered.as_str().to_owned())
+    }
 
     /// Sink-only accessor for the remote-PS sink family in THIS module.
     pub(crate) fn as_str(&self) -> &str {
@@ -2400,6 +2409,38 @@ mod tests {
 #[cfg(test)]
 mod powershell_script_seam_tests {
     use super::*;
+
+    /// QH-01 Step 4d-i: `from_rendered` carries the renderer's bytes through
+    /// unchanged. The one PowerShell template on the renderer's path is the
+    /// Windows Exit evidence capture (`Binding::PowerShellLiteral`), so it is
+    /// the representative output: byte-identical to the plain-`String` render,
+    /// with the ps-quoted values and the StrictMode prefix pinned exactly.
+    #[test]
+    fn from_rendered_carries_the_renderer_output_byte_identically() {
+        let rendered = crate::vm_lab::script_template::render_windows_exit_evidence_capture_script(
+            r"C:\ProgramData\RustyNet\vm-lab\windows_exit",
+            r"C:\ProgramData\RustyNet\bin\rustynetd.exe",
+            "rn-win-exit-killswitch-probe",
+        )
+        .expect("const-valued capture script must render");
+        let bytes = rendered.as_str().to_owned();
+        let script = PowerShellScript::from_rendered(rendered);
+        assert_eq!(script.as_str(), bytes);
+        assert!(script.as_str().contains("Set-StrictMode -Version Latest"));
+        assert!(
+            script
+                .as_str()
+                .contains(r"'C:\ProgramData\RustyNet\vm-lab\windows_exit'"),
+            "the artifact root must arrive ps-quoted, exactly as the renderer emitted it"
+        );
+        // And the Debug contract: length only, never the payload.
+        let text = format!("{script:?}");
+        assert_eq!(text, format!("PowerShellScript(len={})", bytes.len()));
+        assert!(
+            !text.contains("rustynetd"),
+            "payload must not appear: {text}"
+        );
+    }
 
     #[test]
     fn from_single_value_quotes_a_plain_value() {
