@@ -407,3 +407,22 @@ unquarantine (`…87816-0`): editing `vm_lab/mod.rs`. R2 clock-skew plan: the ti
 `edit-1788367835553-94044-0` (1 commit already). Owner mentioned a patchy internet link; that
 fits the hang signature (a dropped SSE stream that OpenCode never times out) — the stall rule plus
 commit-per-milestone is the mitigation.
+
+## Tick 19 — 2026-09-02 ~18:20–18:35Z
+
+**Windows clock-skew hardening plan MERGED** (`WindowsClockSkewHardeningPlan_2026-09-02.md`).
+Verified at the gate: `MAX_LAB_CLOCK_SKEW_SECS = 90` and `CLOCK_PROBE_ATTEMPTS` at the cited
+preflight.rs lines; SecurityMinimumBar.md:136 (clock-skew tolerance on signed state) and
+Requirements.md:182 (strict clock-skew policy) say what is quoted; the ledger row for
+`livelab-1785005557-b7667cce46db` carries exactly `guest clock skew is 3602s (maximum 90s;
+host=1785005541, guest=1785001939)` — and the plan correctly notices the same error is recorded
+against `linux-x86-client-1` too (topology-scoped stage), flagged as a possible reporting defect.
+Fixed two README index entries that had become nested bullets. PHASE B review launched next.
+
+**CI.** `9c907071` (docs-only) went red on the macOS leg at "Bootstrap CI tools": `failed to
+clone advisory db from https://github.com/RustSec/advisory-db.git` — a runner network flake, not
+the change; re-ran the failed job (`gh run rerun --failed`). `0bd3f8ac` still in progress.
+
+**Fleet.** S2b/M2 fixes (`…86936-0`): 5 commits, now updating the helper-ordering plan doc — near
+done, spend 1.10M. C2 unquarantine (`…87816-0`): 4 commits, editing `active_exit.rs`, spend 1.18M.
+Enforce-refresh plan review (`…4519-0`): 1 commit, 2 sub-agents. All turns fresh (<1 min old).
