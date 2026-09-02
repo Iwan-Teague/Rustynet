@@ -539,28 +539,41 @@ fn verify_cert_and_key_are_paired(
 
     let mut client = rustls::StreamOwned::new(client_conn, client_sock);
     let mut server = rustls::StreamOwned::new(server_conn, server_sock);
-    const MAX_PROBE_STEPS: usize = 200;
-    for _ in 0..MAX_PROBE_STEPS {
+    // Bounded by wall clock, not by a spin count: loopback delivery is not
+    // synchronous on every kernel (macOS queues lo0 input to a network
+    // thread), so a pure step cap could expire under load before the
+    // peer's bytes were even readable and refuse a perfectly paired
+    // identity. A legitimate handshake completes in milliseconds; the
+    // budget is generous so only a genuine failure (which rustls reports
+    // as an error long before then) or a wedged loopback ends it.
+    const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+    const PROBE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+    let deadline = std::time::Instant::now() + PROBE_BUDGET;
+    while std::time::Instant::now() < deadline {
         if !client.conn.is_handshaking() && !server.conn.is_handshaking() {
             return Ok(());
         }
         // Drive each side; a non-blocking socket surfaces "waiting on the
         // peer" as WouldBlock, which is progress-neutral, not a failure.
+        let mut progressed = false;
         for outcome in [
             client.conn.complete_io(&mut client.sock),
             server.conn.complete_io(&mut server.sock),
         ] {
             match outcome {
-                Ok(_) => {}
+                Ok(_) => progressed = true,
                 Err(err)
                     if err.kind() == std::io::ErrorKind::WouldBlock
                         || err.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(pairing_failure(err.to_string())),
             }
         }
+        if !progressed {
+            std::thread::sleep(PROBE_POLL_INTERVAL);
+        }
     }
     Err(pairing_failure(format!(
-        "handshake did not complete within {MAX_PROBE_STEPS} steps"
+        "handshake did not complete within {PROBE_BUDGET:?}"
     )))
 }
 
@@ -889,26 +902,64 @@ mod tests {
     }
 
     #[test]
-    fn tls12_client_hello_cannot_be_processed_by_compiled_stack() {
-        // AT-9: TLS 1.3-only is enforced twice — the workspace builds rustls
-        // WITHOUT the `tls12` cargo feature AND `build_anchor_server_config`
-        // pins `with_protocol_versions(&[&TLS13])`. A live TLS 1.2-only
-        // ClientHello cannot be driven without enabling the `tls12` feature
-        // (which would un-compile the structural guarantee this test is here
-        // to prove), so this test asserts the structural half instead:
-        // `rustls::ALL_VERSIONS` includes TLS 1.2 exactly when the
-        // feature is compiled in, so this stack must list TLS 1.3 only —
-        // no TLS 1.2-only ClientHello has any version to negotiate.
-        assert_eq!(
-            rustls::ALL_VERSIONS.len(),
-            1,
-            "the `tls12` cargo feature must stay compiled out: \
-             only TLS 1.3 may exist in this stack"
-        );
-        let rendered = format!("{:?}", rustls::ALL_VERSIONS);
+    fn tls12_only_client_hello_is_refused_as_incompatible() {
+        // AT-9: `build_anchor_server_config` pins TLS 1.3 only. This is
+        // proven at the wire, not structurally: `rustls::ALL_VERSIONS` is a
+        // property of the compiled crate, and the workspace gate unifies the
+        // `tls12` feature through `ureq`, so a structural assertion would
+        // hold under `-p rustynetd` and fail under `--workspace`. Instead a
+        // well-formed TLS 1.2-only ClientHello (legacy version 0x0303 and no
+        // `supported_versions` extension) is offered to the real server
+        // config; whether or not TLS 1.2 is compiled in, the server must
+        // refuse it as a PEER INCOMPATIBILITY — never negotiate it, and never
+        // report a decode error (which would mean the hello was malformed
+        // and the test vacuous).
+        let dir = TempTlsDir::new("tls12only");
+        let identity = load_or_generate_anchor_tls_identity(
+            &dir.cert_path(),
+            &dir.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect("generation must succeed");
+        let config = build_anchor_server_config(&identity).expect("server config");
+        let mut conn =
+            rustls::ServerConnection::new(std::sync::Arc::new(config)).expect("server connection");
+
+        // ClientHello body: legacy_version, random, session_id, cipher
+        // suites (two TLS 1.2 ECDHE-ECDSA suites), compression, then the
+        // extensions rustls insists on before it decides the version:
+        // supported_groups (secp256r1) and signature_algorithms
+        // (ecdsa_secp256r1_sha256). Deliberately no supported_versions.
+        let mut body: Vec<u8> = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x5a; 32]);
+        body.push(0x00);
+        body.extend_from_slice(&[0x00, 0x04, 0xc0, 0x2b, 0xc0, 0x2c]);
+        body.extend_from_slice(&[0x01, 0x00]);
+        let extensions: Vec<u8> = vec![
+            0x00, 0x0a, 0x00, 0x04, 0x00, 0x02, 0x00, 0x17, // supported_groups
+            0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03, // signature_algorithms
+        ];
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+        let mut handshake = vec![0x01];
+        let body_len = body.len() as u32;
+        handshake.extend_from_slice(&body_len.to_be_bytes()[1..]);
+        handshake.extend_from_slice(&body);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        let mut cursor = std::io::Cursor::new(record);
+        let err = conn
+            .complete_io(&mut cursor)
+            .expect_err("a TLS 1.2-only ClientHello must be refused");
+        let rustls_err = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+            .unwrap_or_else(|| panic!("expected a rustls error, got: {err}"));
         assert!(
-            rendered.contains("TLSv1_3") && !rendered.contains("TLSv1_2"),
-            "unexpected compiled version set: {rendered}"
+            matches!(rustls_err, rustls::Error::PeerIncompatible(_)),
+            "TLS 1.2-only hello must be refused as peer-incompatible (not decoded, not negotiated): {rustls_err:?}"
         );
     }
 
