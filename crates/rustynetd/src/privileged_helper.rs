@@ -6112,6 +6112,33 @@ mod tests {
         assert!(validate_pfctl_args(&["-a", "com.rustynet/other", "-s", "nat"]).is_err());
     }
 
+    /// Tests-first item 5 of MacosDnsBackupRebootSurvivalPlan_2026-09-02:
+    /// every backup entry shape the startup guard can restore (`None` →
+    /// `Empty`; `Some(list)` → exact list) produces argv THIS module's
+    /// validator admits, so moving the backup document to its durable path
+    /// cannot silently desynchronize the backup→helper contract.
+    #[test]
+    fn restore_argv_contract_with_helper_validator() {
+        let entries = vec![
+            crate::macos_dns_sc_protect::NetworksetupDnsBackupEntry {
+                service: "Wi-Fi".to_owned(),
+                servers: Some(vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()]),
+            },
+            crate::macos_dns_sc_protect::NetworksetupDnsBackupEntry {
+                service: "Ethernet".to_owned(),
+                servers: None,
+            },
+        ];
+        for entry in &entries {
+            let argv = crate::macos_dns_sc_protect::startup_restore_argv_for_entry(entry)
+                .expect("backup entry must yield a valid restore argv");
+            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            validate_networksetup_args(&argv_refs).unwrap_or_else(|err| {
+                panic!("restore argv {argv_refs:?} must be helper-admitted: {err}")
+            });
+        }
+    }
+
     #[test]
     fn validate_networksetup_args_permits_only_the_m1_surface() {
         // The M1 surface: enumerate, read per service, pin loopback, restore

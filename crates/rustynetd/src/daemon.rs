@@ -11593,7 +11593,16 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
             config.fail_closed_ssh_allow_cidrs.clone(),
         )
         .map(|system| {
-            system.with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
+            system
+                .with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
+                // The DNS fail-closed backup document lives beside THIS
+                // daemon's state file (durable, reboot-surviving;
+                // MacosDnsBackupRebootSurvivalPlan_2026-09-02 Option A), so
+                // apply/rollback/startup-restore all use the same derived
+                // path.
+                .with_dns_backup_path(crate::macos_dns_sc_protect::networksetup_dns_backup_path(
+                    std::path::Path::new(&config.state_path),
+                ))
         })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         Ok(RuntimeSystem::Macos(system))
@@ -11770,7 +11779,15 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     // removal is impossible, and proceeding would strand resolution either way.
     #[cfg(target_os = "macos")]
     {
+        // The durable DNS fail-closed backup is derived from THIS daemon's
+        // state path (a sibling file, QH-40 marker_path pattern), so
+        // `--state` installs consult the backup beside their own state file.
+        // This guard runs BEFORE `run_preflight_checks` creates the state
+        // directory: a missing parent reads as "backup missing" (fail
+        // closed, strand message), never as an error — see invariant 6 of
+        // MacosDnsBackupRebootSurvivalPlan_2026-09-02.
         crate::macos_dns_sc_protect::run_startup_dns_recovery(
+            &config.state_path,
             config.privileged_helper_socket_path.as_deref(),
             std::time::Duration::from_millis(config.privileged_helper_timeout_ms.get()),
         )
