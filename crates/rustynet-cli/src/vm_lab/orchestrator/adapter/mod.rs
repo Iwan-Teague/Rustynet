@@ -7,6 +7,7 @@ pub mod linux_install;
 pub mod linux_membership;
 pub mod linux_traffic;
 pub mod macos;
+pub mod macos_exit_traffic;
 pub mod macos_install;
 pub mod macos_membership;
 pub mod macos_traffic;
