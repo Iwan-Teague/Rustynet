@@ -1,6 +1,10 @@
 # macOS Client Resolver Not Serving — Diagnosis (2026-09-02)
 
-**Status:** DIAGNOSIS, docs-only. No code changed.
+**Status:** DIAGNOSIS, docs-only. No code changed. **§3 AMENDED 2026-09-03** (below):
+the adversarial review (`MacosClientResolverNotServingDiagnosisReview_2026-09-02.md`,
+verdict ACCEPT-WITH-AMENDMENTS) corrected the fix direction to the posture split,
+which has since been IMPLEMENTED (M1 hoisted bind + in-bootstrap probe servicing;
+M2 scoped-posture first-reconcile deferral; M3 scoped-failure decoupling).
 **Context:** The macOS DNS three-state posture fix (`345fe219`, merged) is correct and
 fail-closed; its live proof (`cc25ceac` records the harvest) exposed this deeper defect.
 **Symptom:** on `macos-utm-1` (plain mesh client, `ExitMode::Off`), the daemon log shows
@@ -136,6 +140,49 @@ correct.**
   full-apply-failure restriction is the correct strict behavior.
 
 ## 3. Recommended fix direction
+
+### 3.0 AMENDMENT (2026-09-03) — the review's posture-split correction, IMPLEMENTED
+
+The review (§3/§F3) found the primary fix as written below **not shippable**:
+deferring the DNS sub-apply out of bootstrap for ALL postures opens a real
+DNS leak window for `FullyProtected` nodes — for them the sub-apply is the
+ONLY thing installing the pf DNS-block floor, the loopback pins, the
+resolv.conf rewrite, and the scoped file, so a bootstrap→first-reconcile
+deferral leaves a tunnel-up node resolving general DNS with no protection for
+at least one reconcile tick (a leak window under Requirements.md:186 /
+SecurityMinimumBar §8, not a delay). The adopted, now-implemented fix is the
+review's **posture-split deferral**:
+
+- **`ScopedResolverOnly`** (plain client — the defect's actual victim):
+  the sub-apply is DEFERRED out of bootstrap to the first reconcile pass,
+  reusing the `dns_posture_reassert_pending` latch so the S1 ladder owns it
+  (diagnosis option (1) below, adopted verbatim for this posture only).
+  Deferral is safe here: the only mutation is the single scoped file and the
+  probe precedes it, so the worst case is `Untouched` — the zero-leak state —
+  and the cost is one tick of Magic-DNS availability.
+- **`FullyProtected`** (exit / full-tunnel): the sub-apply STAYS in
+  bootstrap. `run_daemon` now HOISTS the `dns_socket` bind above
+  `runtime.bootstrap()` and installs a probe servicer owning that same
+  socket; the probe's wait window drains it synchronously through
+  `build_dns_response` — the identical responder the main loop drains — under
+  the probe's existing 2 s bound. No second DNS implementation, no fallback
+  branch; failure still rolls back fail-closed and climbs today's ladder.
+- **Q2 decoupling implemented as F4:** a `ScopedResolverOnly` DNS-apply
+  failure takes its OWN degraded branch (`last_reconcile_error` + re-armed
+  latch + a surfaced `dns_scoped_apply_degraded` status field) and does NOT
+  increment `reconcile_failures`, restrict, or reach Permanent;
+  `FullyProtected` failures keep the full ladder byte-for-byte. The
+  decoupling is keyed on the posture DECIDED FROM THE GENERATION, never on
+  observed state, so it cannot mask a real leak.
+
+Two sentences below are accordingly SUPERSEDED: §1.2's "no intra-apply
+bounded-retry can fix it" is true only under the OLD bind ordering — with the
+hoisted bind plus in-apply drain, the probe's existing 2 s timeout becomes the
+bounded retry — and §3 option (2)'s "buys nothing over (1) security-wise" is
+wrong for `FullyProtected`, where it buys exactly the in-bootstrap protected
+DNS posture that matters.
+
+### 3.1 Original recommendation (2026-09-02; option (1) superseded by §3.0 for all postures)
 
 **Primary (ordering — required either way): the DNS-posture sub-apply must run only
 once the daemon's DNS serve path is live.** Concretely, one of:
