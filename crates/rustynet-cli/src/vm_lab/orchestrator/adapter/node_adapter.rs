@@ -2,6 +2,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::vm_lab::DaemonProbeOp;
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
@@ -11,8 +13,6 @@ use crate::vm_lab::orchestrator::error::{
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
-use crate::vm_lab::DaemonProbeOp;
-use crate::vm_lab::VmGuestPlatform;
 
 /// Extract the daemon's own failure reason from a tail of its `rustynetd.log`,
 /// so a stage failure can report the *cause* (e.g. a fail-closed membership
@@ -650,7 +650,7 @@ mod tests {
 
     // ── §4.7 identity-challenge gate (the wiring in run_typed_role_validator) ──
 
-    use super::{enforce_identity_challenge, RoleValidatorKind};
+    use super::{RoleValidatorKind, enforce_identity_challenge};
     use crate::vm_lab::orchestrator::error::AdapterError;
     use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
 
@@ -727,12 +727,14 @@ mod tests {
     fn challenge_gate_admits_matching_live_identity() {
         // The positive control: a live self-report matching the expected id
         // passes the gate, so the validator's own check proceeds.
-        assert!(enforce_identity_challenge(
-            Ok(IdentityEvidence::live("real-node")),
-            Some("real-node"),
-            RoleValidatorKind::ServiceHardening,
-            "deb-1",
-        )
-        .is_ok());
+        assert!(
+            enforce_identity_challenge(
+                Ok(IdentityEvidence::live("real-node")),
+                Some("real-node"),
+                RoleValidatorKind::ServiceHardening,
+                "deb-1",
+            )
+            .is_ok()
+        );
     }
 }

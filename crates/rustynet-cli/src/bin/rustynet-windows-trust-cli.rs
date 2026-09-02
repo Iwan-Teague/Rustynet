@@ -31,19 +31,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{Signer, SigningKey};
-use rand::{rngs::OsRng, TryRngCore};
+use rand::{TryRngCore, rngs::OsRng};
 use rustynet_cli::role_cli;
 use rustynet_control::role_audit::{RoleTransitionEvent, RoleTransitionOutcome};
 use rustynet_control::role_presets::composition_for;
 use rustynet_crypto::{
-    read_encrypted_key_file, write_encrypted_key_file, KeyCustodyPermissionPolicy,
+    KeyCustodyPermissionPolicy, read_encrypted_key_file, write_encrypted_key_file,
 };
 use rustynetd::exit_codes::ExitCode;
 use rustynetd::ipc::{IpcCommand, IpcResponse};
 use rustynetd::key_material::read_passphrase_file_explicit;
 use rustynetd::windows_ipc::{
-    call_windows_daemon_control_raw, validate_windows_pipe_path, WindowsLocalIpcRole,
-    DEFAULT_WINDOWS_DAEMON_PIPE_PATH,
+    DEFAULT_WINDOWS_DAEMON_PIPE_PATH, WindowsLocalIpcRole, call_windows_daemon_control_raw,
+    validate_windows_pipe_path,
 };
 use zeroize::{Zeroize, Zeroizing};
 
