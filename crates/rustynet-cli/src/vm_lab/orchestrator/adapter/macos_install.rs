@@ -2,7 +2,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
@@ -11,6 +10,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+use crate::vm_lab::VmGuestPlatform;
 
 pub const MACOS_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 pub const MACOS_RUSTYNET_PATH: &str = "/usr/local/bin/rustynet";
@@ -507,17 +507,64 @@ pub fn stop_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
+/// Tri-state result of the S2b helper-job probe (post-merge review §1,
+/// MacosHelperShutdownOrderingS2bM2Review_2026-09-02): `launchctl print` exits
+/// 0 for a *loaded* job whose process has exited (KeepAlive respawn pending,
+/// throttled, or crashed-with-retry), so a bare `is_ok()` conflates
+/// "alive" with "present". A loaded-but-dead job's socket is gone or stale
+/// (launchd removes per-job sockets at job exit), so the daemon's shutdown
+/// rollback would dial a dead socket exactly as if the job were absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperJobPresence {
+    /// `launchctl print system/com.rustynet.privileged-helper` failed: the
+    /// job is not bootstrapped at all.
+    Absent,
+    /// The job is bootstrapped but reports no `pid = ` line: loaded, dead.
+    PresentDead,
+    /// The job is bootstrapped and reports a live `pid = ` line.
+    PresentAlive,
+}
+
+/// Why the pre-restart liveness step entered the restore path (post-merge
+/// review §1): rendered into the restart's log line so the run's stage log
+/// distinguishes the present-but-dead demotion from a plain absent job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperRestoreReason {
+    /// The launchd job was not bootstrapped at all.
+    JobAbsent,
+    /// The job was bootstrapped but had no live `pid = ` line, or its live
+    /// pid's socket was absent: present-but-dead, restored like an absent job
+    /// (after a best-effort bootout of the stale job slot).
+    PresentButDead,
+}
+
+impl std::fmt::Display for HelperRestoreReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::JobAbsent => write!(f, "job absent"),
+            Self::PresentButDead => write!(
+                f,
+                "job present but dead (no live pid or helper socket gone)"
+            ),
+        }
+    }
+}
+
 /// What the pre-restart privileged-helper liveness step found and did
 /// (S2b of MacosHelperShutdownOrderingImplementationPlan_2026-09-02). Rendered
 /// into the restart's log line so the run's stage log records it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelperLivenessStep {
-    /// `launchctl print system/com.rustynet.privileged-helper` succeeded: the
-    /// job is bootstrapped, so the probe-gated step is a no-op.
+    /// The job is bootstrapped with a live `pid = ` line AND its socket is
+    /// present: the probe-gated step is a no-op.
     HelperPresent,
-    /// The job was absent; it was re-bootstrapped from its installed plist and
-    /// the socket appeared after `socket_probes` poll(s) of the bounded wait.
-    HelperRestored { socket_probes: usize },
+    /// The helper was not live (absent, or present-but-dead per review §1);
+    /// it was re-bootstrapped from its installed plist and the socket appeared
+    /// after `socket_probes` poll(s) of the bounded wait.
+    HelperRestored {
+        socket_probes: usize,
+        reason: HelperRestoreReason,
+    },
 }
 
 impl std::fmt::Display for HelperLivenessStep {
@@ -526,32 +573,50 @@ impl std::fmt::Display for HelperLivenessStep {
             Self::HelperPresent => {
                 write!(f, "job present (probe-gated no-op)")
             }
-            Self::HelperRestored { socket_probes } => write!(
+            Self::HelperRestored {
+                socket_probes,
+                reason,
+            } => write!(
                 f,
-                "job absent; re-bootstrapped from {MACOS_PRIVILEGED_HELPER_PLIST} \
-                 and socket appeared after {socket_probes} poll(s)"
+                "{reason}; booted out any stale job, re-bootstrapped from \
+                 {MACOS_PRIVILEGED_HELPER_PLIST} and socket appeared after \
+                 {socket_probes} poll(s)"
             ),
         }
     }
 }
 
-/// Order-enforcing driver behind [`restart_daemon`] (S2b): the daemon
-/// stop/start steps run ONLY after the helper-liveness step succeeds — a
-/// failed liveness probe restore propagates its error and the daemon restart
-/// commands are never issued. The remote effects are closures so the ordering
-/// guarantee (no daemon restart past a failed helper restore) is testable
-/// without SSH.
+/// Order-enforcing driver behind [`restart_daemon`] (S2b, review §1): the
+/// daemon stop/start steps run ONLY after the helper-liveness step succeeds —
+/// a failed liveness restore propagates its error and the daemon restart
+/// commands are never issued. The `HelperPresent` no-op branch requires a
+/// live job AND a present socket: a job that is loaded but has no live pid
+/// (`PresentDead`), or a live pid whose socket is gone, is demoted to the
+/// restore path instead of sailing through (review §1's exact hole). The
+/// remote effects are closures so the ordering guarantee (no daemon restart
+/// past a failed helper restore) is testable without SSH.
 fn drive_restart_with_helper_liveness(
-    probe_helper_job: &mut dyn FnMut() -> bool,
+    probe_helper_job: &mut dyn FnMut() -> HelperJobPresence,
+    socket_present: &mut dyn FnMut() -> bool,
     restore_helper: &mut dyn FnMut() -> Result<usize, AdapterError>,
     stop_daemon: &mut dyn FnMut() -> Result<(), AdapterError>,
     start_daemon: &mut dyn FnMut() -> Result<(), AdapterError>,
 ) -> Result<HelperLivenessStep, AdapterError> {
-    let step = if probe_helper_job() {
-        HelperLivenessStep::HelperPresent
-    } else {
-        let socket_probes = restore_helper()?;
-        HelperLivenessStep::HelperRestored { socket_probes }
+    let step = match probe_helper_job() {
+        HelperJobPresence::PresentAlive if socket_present() => HelperLivenessStep::HelperPresent,
+        presence => {
+            let reason = match presence {
+                HelperJobPresence::Absent => HelperRestoreReason::JobAbsent,
+                HelperJobPresence::PresentDead | HelperJobPresence::PresentAlive => {
+                    HelperRestoreReason::PresentButDead
+                }
+            };
+            let socket_probes = restore_helper()?;
+            HelperLivenessStep::HelperRestored {
+                socket_probes,
+                reason,
+            }
+        }
     };
     stop_daemon()?;
     start_daemon()?;
