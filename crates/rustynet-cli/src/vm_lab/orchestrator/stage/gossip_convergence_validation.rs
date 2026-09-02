@@ -62,9 +62,11 @@ impl OrchestrationStage for GossipConvergenceValidationStage {
                 continue;
             }
             let expected_node_id = ctx.node_ids.get(alias.as_str()).map(String::as_str);
-            if let Err(e) =
-                adapter.run_role_validator(RoleValidatorKind::GossipConvergence, expected_node_id)
-            {
+            if let Err(e) = adapter.run_role_validator(
+                RoleValidatorKind::GossipConvergence,
+                expected_node_id,
+                None,
+            ) {
                 failures.push(format!("{alias}: {e}"));
             }
         }
