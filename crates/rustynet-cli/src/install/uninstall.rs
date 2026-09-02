@@ -10,6 +10,17 @@
 use super::common::command;
 use rustynet_sysinfo::OsFamily;
 use std::path::Path;
+use std::time::Duration;
+
+/// The macOS launchd bootout order (M2,
+/// MacosHelperShutdownOrderingImplementationPlan_2026-09-02): the daemon
+/// STRICTLY before the privileged helper, with the bounded daemon-exit wait
+/// between the two — the daemon's shutdown rollback dials the helper socket,
+/// so the helper must outlive the daemon.
+const MACOS_UNINSTALL_BOOTOUT_ORDER: [&str; 2] = [
+    "system/com.rustynet.daemon",
+    "system/com.rustynet.privileged-helper",
+];
 
 pub(super) fn run(family: OsFamily) -> Result<String, String> {
     match family {
@@ -68,11 +79,13 @@ fn uninstall_linux() -> Result<(), String> {
 }
 
 fn uninstall_macos() -> Result<(), String> {
-    for label in [
-        "system/com.rustynet.daemon",
-        "system/com.rustynet.privileged-helper",
-    ] {
+    for (index, label) in MACOS_UNINSTALL_BOOTOUT_ORDER.iter().enumerate() {
         let _ = command("launchctl").args(["bootout", label]).status();
+        if index == 0 {
+            // M2: the helper is booted out only after the daemon job has
+            // actually exited (bounded wait below) — never back-to-back.
+            wait_for_macos_daemon_exit();
+        }
     }
     // Clear any persistent `launchctl disable` override so a later reinstall's
     // gated (disabled) service isn't confused with a stale one.
@@ -154,5 +167,68 @@ fn uninstall_windows() -> Result<(), String> {
 fn remove_unix_binaries() {
     for name in super::acquire::SHIPPING {
         let _ = std::fs::remove_file(format!("/usr/local/bin/{name}"));
+    }
+}
+
+/// Bounded wait (20 × 0.5 s = 10 s ≥ launchd's 5 s SIGTERM→SIGKILL ceiling
+/// plus margin) for the daemon job to report exit, before the helper is booted
+/// out (plan M2 / design §2 Option A poll): `launchctl bootout` returns at
+/// SIGTERM delivery, not at job exit, and the daemon's shutdown rollback dials
+/// the privileged-helper socket. Best-effort: expiry falls through to the
+/// helper bootout exactly as the old bare-`sleep 1` did, so uninstall can
+/// never hang.
+fn wait_for_macos_daemon_exit() {
+    for _ in 0..20 {
+        let exited = command("launchctl")
+            .args(["print", "system/com.rustynet.daemon"])
+            .output()
+            .map(|out| {
+                macos_daemon_job_reported_exit(
+                    out.status.success(),
+                    &String::from_utf8_lossy(&out.stdout),
+                )
+            })
+            .unwrap_or(true);
+        if exited {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// True when `launchctl print` says the daemon job has exited: the job is
+/// absent (non-zero print exit) or present but reports no `pid = ` line.
+fn macos_daemon_job_reported_exit(print_ok: bool, print_stdout: &str) -> bool {
+    !print_ok || !print_stdout.contains("pid = ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_uninstall_boots_out_daemon_before_helper() {
+        assert_eq!(
+            MACOS_UNINSTALL_BOOTOUT_ORDER[0], "system/com.rustynet.daemon",
+            "the daemon must be booted out first"
+        );
+        assert_eq!(
+            MACOS_UNINSTALL_BOOTOUT_ORDER[1], "system/com.rustynet.privileged-helper",
+            "the helper must be booted out second, after the daemon-exit wait \
+             (uninstall_macos inserts wait_for_macos_daemon_exit between the two)"
+        );
+    }
+
+    #[test]
+    fn macos_daemon_job_reported_exit_matrix() {
+        // Job present and still running a process: keep waiting.
+        assert!(!macos_daemon_job_reported_exit(true, "\tpid = 512\n"));
+        // Job absent (launchctl print exits non-zero): exited.
+        assert!(macos_daemon_job_reported_exit(false, ""));
+        // Job present but no pid line (loaded, not running): exited.
+        assert!(macos_daemon_job_reported_exit(
+            true,
+            "\tstate = not running\n"
+        ));
     }
 }

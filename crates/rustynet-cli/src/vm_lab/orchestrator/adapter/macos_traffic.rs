@@ -37,6 +37,19 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 /// `systemctl disable --now "$unit"`, which clears the boot-time symlink and is
 /// why no Linux guest has ever shown this failure.
 ///
+/// Ordering (M2, MacosHelperShutdownOrderingImplementationPlan_2026-09-02):
+/// the privileged helper is booted out ONLY after the bounded daemon-exit wait
+/// completes, and it is the constant's single helper stop. The early
+/// back-to-back helper bootout that used to sit beside the daemon bootout is
+/// deleted, because the daemon's shutdown rollback dials the helper socket
+/// (`launchctl bootout` returns at SIGTERM delivery, not at job exit; the
+/// helper dies on launchd's 5 s ceiling while the daemon is still dialing).
+/// The `pkill -TERM -f …privileged-helper` fallback sits AFTER the helper
+/// bootout: KeepAlive would respawn a SIGTERMed helper whose job is still
+/// bootstrapped. The wait predicate is per-service (`pgrep -x rustynetd` /
+/// `rustynet-relay`), so it observes the daemon PROCESS exiting, which is the
+/// stronger form of "the job reports no pid".
+///
 /// Only the daemon label is disabled, deliberately: it is the ONLY label the
 /// bootstrap re-enables (`Install-RustyNetMacosService.sh` runs
 /// `launchctl enable system/com.rustynet.daemon`, idempotent by its own note).
@@ -47,8 +60,6 @@ const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
      sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.daemon.plist 2>/dev/null || true; \
      sudo -n launchctl disable system/com.rustynet.daemon 2>/dev/null || true; \
-     sudo -n launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true; \
-     sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.privileged-helper.plist 2>/dev/null || true; \
      sudo -n launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
      sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist 2>/dev/null || true; \
      sudo -n launchctl bootout system/com.rustynet.relay 2>/dev/null || true; \
@@ -56,7 +67,6 @@ const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.r
      sudo -n launchctl bootout system/com.rustynet.exit 2>/dev/null || true; \
      sudo -n launchctl bootout system /Library/LaunchDaemons/com.rustynet.exit.plist 2>/dev/null || true; \
      sudo -n pkill -TERM -x rustynetd 2>/dev/null || true; \
-     sudo -n pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper' 2>/dev/null || true; \
      sudo -n pkill -TERM -x rustynet-relay 2>/dev/null || true; \
      for _ in $(seq 1 60); do \
          if pgrep -x rustynetd >/dev/null 2>&1 || pgrep -x rustynet-relay >/dev/null 2>&1; then \
@@ -66,6 +76,7 @@ const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.r
          fi; \
      done; \
      sudo -n launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true; \
+     sudo -n pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper' 2>/dev/null || true; \
      sudo -n launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
      sudo -n pkill -KILL -x rustynetd 2>/dev/null || true; \
      sudo -n pkill -KILL -f '/usr/local/bin/rustynetd.*privileged-helper' 2>/dev/null || true; \
@@ -958,6 +969,53 @@ mod tests {
         assert!(cmd.contains("pkill -KILL -f '/usr/local/bin/rustynetd.*privileged-helper'"));
         assert!(cmd.contains("pgrep -x rustynetd"));
         assert!(cmd.contains("pkill -TERM -x rustynet-relay"));
+    }
+
+    /// M2 ordering pin (tests-first #8, plan
+    /// MacosHelperShutdownOrderingImplementationPlan_2026-09-02): NO helper
+    /// bootout and NO helper pkill may appear before the bounded daemon-exit
+    /// wait. The daemon's shutdown rollback dials the helper socket, so a
+    /// helper stop delivered before the daemon has exited deterministically
+    /// loses the rollback (launchd SIGKILLs the helper 5 s after SIGTERM
+    /// while the daemon is still dialing). The post-wait bootout must be the
+    /// ONLY helper bootout, and the TERM fallback pkill must sit AFTER it
+    /// (KeepAlive would respawn a SIGTERMed helper whose job is still
+    /// bootstrapped).
+    #[test]
+    fn macos_launchd_stop_command_has_no_early_helper_bootout() {
+        let cmd = MACOS_LAUNCHD_STOP_COMMAND;
+        let wait_at = cmd
+            .find("for _ in $(seq 1 60)")
+            .expect("daemon-exit wait present");
+        let before_wait = &cmd[..wait_at];
+        assert!(
+            !before_wait.contains("privileged-helper"),
+            "no helper bootout or helper pkill may precede the daemon-exit wait; found \
+             an early helper stop, which is the M2 completion-order defect"
+        );
+        let post_wait = &cmd[wait_at..];
+        let bootout_at = cmd
+            .find("launchctl bootout system/com.rustynet.privileged-helper")
+            .expect("the post-wait helper bootout must exist");
+        assert!(
+            bootout_at >= wait_at
+                && post_wait.contains("launchctl bootout system/com.rustynet.privileged-helper"),
+            "the post-wait bootout must be the single helper stop"
+        );
+        assert_eq!(
+            cmd.matches("launchctl bootout system/com.rustynet.privileged-helper")
+                .count(),
+            1,
+            "exactly one helper bootout may exist, and only after the daemon-exit wait"
+        );
+        let term_helper_at = cmd
+            .find("pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper'")
+            .expect("the TERM helper fallback pkill must exist");
+        assert!(
+            term_helper_at > bootout_at,
+            "the TERM helper pkill must come after the helper bootout: KeepAlive would \
+             respawn a SIGTERMed helper whose job is still bootstrapped"
+        );
     }
 
     #[test]
