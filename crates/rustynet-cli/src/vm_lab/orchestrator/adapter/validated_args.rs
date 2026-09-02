@@ -483,7 +483,7 @@ impl fmt::Debug for ValidatedArg {
 /// `RemoteCommand`; an increase reintroduces raw string interpolation at a
 /// sink and fails this test.
 #[cfg(test)]
-pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 160;
+pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 158;
 
 #[cfg(test)]
 mod tests {
