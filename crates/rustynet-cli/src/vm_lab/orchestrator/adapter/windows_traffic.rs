@@ -986,21 +986,11 @@ pub fn issue_bundles_to_dir(
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Validate that an IP address argument contains no shell-dangerous characters.
-fn validate_ip_arg(ip: &str) -> Result<(), AdapterError> {
-    if ip
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ':' | '/'))
-    {
-        Ok(())
-    } else {
-        Err(AdapterError::Protocol {
-            message: format!(
-                "IP argument '{ip}' contains characters not safe for shell embedding \
-                 (allowed: alphanumeric, '.', ':', '/')"
-            ),
-        })
-    }
-}
+///
+/// Shared source of truth: the charset rule lives in the QH-01 seam module
+/// (`validated_args.rs`); the formerly duplicated copy in
+/// `linux_traffic.rs` resolves to the same function.
+pub(crate) use super::validated_args::validate_ip_arg;
 
 fn decode_wireguard_pubkey_to_hex(value: &str) -> Result<String, String> {
     let decoded = base64_decode_simple(value.as_bytes())
