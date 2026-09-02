@@ -720,6 +720,132 @@ impl NatConntrackFlushReason {
     }
 }
 
+/// The DNS fail-closed posture a macOS node must hold
+/// (MacosClientDnsFailclosedDiagnosis_2026-09-02 §5/§6, as amended by the
+/// review A1). The prior binary model — protect everything or touch nothing —
+/// could not express a plain mesh client, which needs scoped `*.rustynet`
+/// resolution (Requirements §3.5) but must not pin the machine's general DNS
+/// at a loopback listener nothing general traffic relies on.
+///
+/// The invariant this type encodes: DNS is EITHER fully protected OR
+/// mesh-scoped-only OR untouched. A half-applied general pin without a live
+/// loopback primary and a pf floor is never a valid posture.
+// Dead-code allowance is scoped to the M1 landing; the M2 apply-site wiring
+// consumes `Untouched` and `as_str` and removes the allowance.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DnsPosture {
+    /// Full fail-closed protection: live loopback resolver as the machine's
+    /// primary, every general DNS path pinned to it, a pf DNS-block floor
+    /// under the pins, and the scoped `*.rustynet` resolver. Guards
+    /// `dns_protected` (killswitch floor emission, S1 re-assert).
+    FullyProtected,
+    /// Plain mesh client: only the scoped `/etc/resolver/rustynet` file,
+    /// routing `*.rustynet` to the daemon's loopback listener. NO general
+    /// pins, NO pf floor, NO primary rewrite — the machine's own DNS is
+    /// untouched, so mesh-name queries cannot leak to the LAN resolver.
+    ScopedResolverOnly,
+    /// No DNS control installed at all. Constructed only where
+    /// `protected_dns=false` opts the node out; never returned by
+    /// [`macos_dns_posture`], which must always pick a protective posture.
+    Untouched,
+}
+
+impl DnsPosture {
+    // Dead-code allowance is scoped to the M1 landing; the M2 apply-site wiring
+    // consumes this method and removes the allowance.
+    #[allow(dead_code)]
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DnsPosture::FullyProtected => "fully_protected",
+            DnsPosture::ScopedResolverOnly => "scoped_resolver_only",
+            DnsPosture::Untouched => "untouched",
+        }
+    }
+}
+
+/// Which DNS posture applies to a node with the given exit posture.
+///
+/// A node serving as an exit (or running full-tunnel exit mode) handles ALL
+/// of the machine's traffic and gets [`DnsPosture::FullyProtected`]; a plain
+/// mesh client gets [`DnsPosture::ScopedResolverOnly`]. Never returns
+/// [`DnsPosture::Untouched`]: the untouched variant is reserved for the
+/// `protected_dns=false` opt-out, decided at the apply site, not here.
+// Dead-code allowance is scoped to the M1 landing; the M2 apply-site call
+// consumes this function and removes the allowance.
+#[allow(dead_code)]
+pub(crate) fn macos_dns_posture(exit_mode: ExitMode, serve_exit_node: bool) -> DnsPosture {
+    if exit_mode == ExitMode::FullTunnel || serve_exit_node {
+        DnsPosture::FullyProtected
+    } else {
+        DnsPosture::ScopedResolverOnly
+    }
+}
+
+#[cfg(test)]
+mod dns_posture_tests {
+    use super::{DnsPosture, ExitMode, macos_dns_posture};
+
+    #[test]
+    fn full_tunnel_exit_mode_yields_fully_protected() {
+        assert_eq!(
+            macos_dns_posture(ExitMode::FullTunnel, false),
+            DnsPosture::FullyProtected
+        );
+    }
+
+    #[test]
+    fn serving_exit_node_yields_fully_protected() {
+        assert_eq!(
+            macos_dns_posture(ExitMode::Off, true),
+            DnsPosture::FullyProtected
+        );
+    }
+
+    #[test]
+    fn both_exit_markers_yield_fully_protected() {
+        assert_eq!(
+            macos_dns_posture(ExitMode::FullTunnel, true),
+            DnsPosture::FullyProtected
+        );
+    }
+
+    #[test]
+    fn plain_mesh_client_yields_scoped_resolver_only() {
+        assert_eq!(
+            macos_dns_posture(ExitMode::Off, false),
+            DnsPosture::ScopedResolverOnly
+        );
+    }
+
+    #[test]
+    fn posture_decision_never_returns_untouched() {
+        // Untouched is reserved for the protected_dns=false opt-out at the
+        // apply site; the decision function must never select it.
+        for (exit_mode, serve_exit_node) in [
+            (ExitMode::Off, false),
+            (ExitMode::Off, true),
+            (ExitMode::FullTunnel, false),
+            (ExitMode::FullTunnel, true),
+        ] {
+            assert_ne!(
+                macos_dns_posture(exit_mode, serve_exit_node),
+                DnsPosture::Untouched
+            );
+        }
+    }
+
+    #[test]
+    fn posture_wire_names_are_stable() {
+        assert_eq!(DnsPosture::FullyProtected.as_str(), "fully_protected");
+        assert_eq!(
+            DnsPosture::ScopedResolverOnly.as_str(),
+            "scoped_resolver_only"
+        );
+        assert_eq!(DnsPosture::Untouched.as_str(), "untouched");
+    }
+}
+
 /// The masquerade-relevant shape of a generation.
 ///
 /// Two generations with EQUAL postures translate traffic identically, so a
