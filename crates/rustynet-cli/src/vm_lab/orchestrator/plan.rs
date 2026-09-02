@@ -86,6 +86,7 @@ use crate::vm_lab::orchestrator::stage::live_two_hop_validation::LiveTwoHopValid
 use crate::vm_lab::orchestrator::stage::macos_anchor_bundle_pull_validation::MacosAnchorBundlePullValidationStage;
 use crate::vm_lab::orchestrator::stage::macos_anchor_port_mapping_authority_validation::MacosAnchorPortMappingAuthorityValidationStage;
 use crate::vm_lab::orchestrator::stage::macos_anchor_profile_deploy::MacosAnchorProfileDeployStage;
+use crate::vm_lab::orchestrator::stage::macos_role_transition_validation::MacosRoleTransitionValidationStage;
 use crate::vm_lab::orchestrator::stage::membership_init::MembershipInitStage;
 use crate::vm_lab::orchestrator::stage::mesh_status_validation::MeshStatusValidationStage;
 use crate::vm_lab::orchestrator::stage::negative_control::{
@@ -130,6 +131,13 @@ pub struct PlanBuilder {
     /// dispatches them (and the downstream `macos_anchor_validators_elected`
     /// tightening in native.rs stays true instead of grading a reported skip).
     anchor_platform_macos: bool,
+    /// `--role-switch-platform macos`: keep the C6 macOS live role-transition
+    /// validator in the plan even when `skip_live_suite` drops the rest of
+    /// the live suite, so a fast-path run that elects macOS for role
+    /// transition still dispatches it (and the downstream
+    /// `macos_role_transition_elected` tightening in native.rs stays true
+    /// instead of grading a reported skip).
+    role_switch_platform_macos: bool,
     /// `--enable-chaos-suite`: append the opt-in chaos stages. They remain
     /// outside the default plan so a normal live lab does not inject faults.
     enable_chaos_suite: bool,
@@ -226,6 +234,13 @@ impl PlanBuilder {
         self
     }
 
+    /// `--role-switch-platform macos`: keep the C6 macOS live role-transition
+    /// validator in the plan even when the live suite is skipped (fast path).
+    pub fn with_role_switch_platform_macos(mut self, role_switch_platform_macos: bool) -> Self {
+        self.role_switch_platform_macos = role_switch_platform_macos;
+        self
+    }
+
     /// Append the opt-in chaos stages to the plan.
     pub fn with_enable_chaos_suite(mut self, enable_chaos_suite: bool) -> Self {
         self.enable_chaos_suite = enable_chaos_suite;
@@ -278,6 +293,7 @@ impl PlanBuilder {
             allow_dirty,
             skip_live_suite,
             anchor_platform_macos,
+            role_switch_platform_macos,
             enable_chaos_suite,
             enable_negative_control,
             enable_relay_forwarding_validation,
@@ -305,6 +321,9 @@ impl PlanBuilder {
                         | StageId::MacosAnchorPortMappingAuthorityValidation
                 )
             {
+                return true;
+            }
+            if role_switch_platform_macos && matches!(id, StageId::MacosRoleTransitionValidation) {
                 return true;
             }
             match id.suite() {
@@ -428,6 +447,14 @@ impl PlanBuilder {
                     StageId::MacosAnchorPortMappingAuthorityValidation => {
                         Box::new(MacosAnchorPortMappingAuthorityValidationStage)
                     }
+                    // C6: the macOS live role-transition validator is a
+                    // first-class engine-of-record stage now — it dispatches
+                    // live whenever macOS role transition is elected and the
+                    // live suite is enabled, and skips-with-reason otherwise
+                    // (never silently).
+                    StageId::MacosRoleTransitionValidation => {
+                        Box::new(MacosRoleTransitionValidationStage)
+                    }
                     StageId::LiveTwoHopValidation => Box::new(LiveTwoHopValidationStage),
                     StageId::LiveManagedDnsValidation => Box::new(LiveManagedDnsValidationStage),
                     StageId::LiveNetworkFlapValidation => Box::new(LiveNetworkFlapValidationStage),
@@ -525,9 +552,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_returns_64_stages() {
+    fn build_returns_65_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 64, "plan must contain exactly 64 stages");
+        assert_eq!(stages.len(), 65, "plan must contain exactly 65 stages");
     }
 
     // MAC-D3: the three macOS anchor validators must be part of the
@@ -582,12 +609,46 @@ mod tests {
         );
     }
 
+    // C6: the macOS live role-transition validator follows the same live-suite
+    // gate discipline as the MAC-D3 anchor validators — present in the full
+    // plan, dropped by --skip-linux-live-suite, and retained on the fast path
+    // only when macOS role transition is elected.
+    #[test]
+    fn macos_role_transition_stage_follows_the_live_suite_gate() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let ids = |builder: PlanBuilder| -> Vec<StageId> {
+            builder.build().iter().map(|stage| stage.id()).collect()
+        };
+        let id = StageId::MacosRoleTransitionValidation;
+        let full = ids(PlanBuilder::new());
+        assert!(
+            full.contains(&id),
+            "full plan must dispatch {id:?} for the macOS role-transition cell (C6)"
+        );
+        let without_live = ids(PlanBuilder::new().with_skip_live_suite(true));
+        assert!(
+            !without_live.contains(&id),
+            "skip_live_suite must drop {id:?} unless macOS role transition is elected"
+        );
+        let fast_path = ids(PlanBuilder::new()
+            .with_skip_live_suite(true)
+            .with_role_switch_platform_macos(true));
+        assert!(
+            fast_path.contains(&id),
+            "skip_live_suite + role-switch-platform macos must retain {id:?} (C6 fast path)"
+        );
+        assert!(
+            !fast_path.contains(&StageId::LiveTwoHopValidation),
+            "the macOS role-transition exception must not resurrect the rest of the live suite"
+        );
+    }
+
     #[test]
     fn chaos_suite_opt_in_appends_9_fault_stages() {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        assert_eq!(ids.len(), 73, "chaos-enabled plan must contain 73 stages");
+        assert_eq!(ids.len(), 74, "chaos-enabled plan must contain 74 stages");
         for chaos_id in PlanBuilder::chaos_suite_stages() {
             assert!(
                 ids.contains(&chaos_id),
@@ -610,10 +671,10 @@ mod tests {
             .with_enable_negative_control(true)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        // Opt-in and out of the default plan (like chaos): default 64 + 4.
+        // Opt-in and out of the default plan (like chaos): default 65 + 4.
         assert_eq!(
             ids.len(),
-            68,
+            69,
             "negative-control-enabled plan must contain 65 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
@@ -642,15 +703,15 @@ mod tests {
     }
 
     #[test]
-    fn negative_control_and_chaos_stack_to_72_stages() {
+    fn negative_control_and_chaos_stack_to_78_stages() {
         let stages = PlanBuilder::new()
             .with_enable_chaos_suite(true)
             .with_enable_negative_control(true)
             .build();
         assert_eq!(
             stages.len(),
-            77,
-            "64 default + 9 chaos + 4 negative-control"
+            78,
+            "65 default + 9 chaos + 4 negative-control"
         );
     }
 
@@ -661,10 +722,10 @@ mod tests {
     #[test]
     fn relay_forwarding_validation_absent_from_default_plan() {
         use crate::vm_lab::orchestrator::stage::StageId;
-        // The default count MUST stay 64: a change here means the disruptive
+        // The default count MUST stay 65: a change here means the disruptive
         // stage leaked into the default plan (a wiring bug, not a test bump).
         let default_ids: Vec<StageId> = PlanBuilder::new().build().iter().map(|s| s.id()).collect();
-        assert_eq!(default_ids.len(), 64, "default plan must stay 64 stages");
+        assert_eq!(default_ids.len(), 65, "default plan must stay 65 stages");
         assert!(
             !default_ids.contains(&StageId::RelayForwardsFrameValidation),
             "the disruptive relay-forwarding stage must NOT be in the default plan"
@@ -680,8 +741,8 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            65,
-            "relay-forwarding-enabled plan must contain 65 stages"
+            66,
+            "relay-forwarding-enabled plan must contain 66 stages"
         );
         assert!(ids.contains(&StageId::RelayForwardsFrameValidation));
         // Placed after relay_validation (its lifecycle gate) and still last
@@ -726,8 +787,8 @@ mod tests {
             .build();
         assert_eq!(
             chaos_plus_hp3.len(),
-            74,
-            "64 default + 9 chaos + 1 relay-forwarding"
+            75,
+            "65 default + 9 chaos + 1 relay-forwarding"
         );
         let stacked = PlanBuilder::new()
             .with_enable_chaos_suite(true)
@@ -737,8 +798,8 @@ mod tests {
         let ids: Vec<StageId> = stacked.iter().map(|s| s.id()).collect();
         assert_eq!(
             stacked.len(),
-            78,
-            "64 default + 9 chaos + 4 negative-control + 1 relay-forwarding"
+            79,
+            "65 default + 9 chaos + 4 negative-control + 1 relay-forwarding"
         );
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
@@ -781,10 +842,10 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 64 total - 33 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
+        // 65 total - 34 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
         assert_eq!(
             ids.len(),
-            64 - PlanBuilder::live_suite_stages().len()
+            65 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -826,7 +887,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            64 - PlanBuilder::live_suite_stages().len()
+            65 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -888,6 +949,7 @@ mod tests {
                 StageId::MacosAnchorProfileDeploy,
                 StageId::MacosAnchorBundlePullValidation,
                 StageId::MacosAnchorPortMappingAuthorityValidation,
+                StageId::MacosRoleTransitionValidation,
                 StageId::LiveTwoHopValidation,
                 StageId::LiveManagedDnsValidation,
                 StageId::LiveNetworkFlapValidation,
@@ -922,7 +984,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_soak(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        assert_eq!(ids.len(), 63);
+        assert_eq!(ids.len(), 64);
         assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
         assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
         assert!(ids.contains(&StageId::CrossNetworkPreflight));
@@ -942,7 +1004,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            64 - PlanBuilder::cross_network_suite_stages().len()
+            65 - PlanBuilder::cross_network_suite_stages().len()
         );
         for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(
