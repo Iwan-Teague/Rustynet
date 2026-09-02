@@ -473,3 +473,31 @@ assert `git status --short` is empty and `rev-list origin/main..HEAD` is what yo
 A-1/2/3/5/7 baked in). Gap A enforce-path refresh (`edit-1788371870504-83558-0`, macOS + Linux
 enforce issue `state refresh` after the socket wait, seam-only, order pinned, non-zero fails).
 CI: `9c907071` re-run green; docs commits in progress.
+
+### Tick 20 addendum — ~19:40–20:25Z (network recovered)
+
+**Post-network-drop recovery, all verified.** The host network dropped mid-tick (owner
+check-in). Damage + repair:
+- main was intact throughout (clean, staleness 0). Local sanity gate on `3f0be0c1` finished green
+  after the drop: clippy clean, 2939 workspace tests. CI green through `3f0be0c1` (the last code
+  merge); the two red runs (`14e7e048`, `a1ec88ee`) are docs-only commits failing ONLY the Windows
+  leg mid-download — flakes; re-ran.
+- The rank-1 harvest (`labrun-1788372032590`) reached `bootstrap_hosts` then failed with
+  `debian-headless-4 ... exit 255: Compiling subtle` — the SSH channel died when the host network
+  dropped; the ~74 min wall clock is the SSH command blocking on the dead channel. Environmental.
+  Remedy recorded against the real stub `livelab-1788376565-a1ec88ee2cef::bootstrap_hosts` (a first
+  attempt used a guessed stub id and errored — the real id came from tailing the triage jsonl).
+- Both GLM jobs were killed by the drop (serve → 0). R2 classifier core had a COMPLETE checkpoint
+  on its branch; Gap A had written nothing.
+
+**R2 classifier core MERGED** (`4a4d4512`): `ClockVerdict` + `classify_clock_skew` +
+`remediation_allowed` in preflight.rs with the review amendments (inclusive hour band A-7, generic
+drift never remediated A-1, no unreachable Unparseable A-2, pinned sign convention A-3, the 7240
+test A-5). Gate green (clippy + whole cli; 7 clock_verdict tests). The checkpoint carried the
+delegated-edit marker; amended to a proper Iwan-Teague commit before merging so the QH-26 gate
+stays clean.
+
+**Gap A relaunched** (`edit-1788376800179-509-0`, base 9a5d6e44) — macOS + Linux enforce paths
+issue a post-restart `state refresh` via the seam. The macOS DnsFailclosed DIAGNOSIS (now the
+primary open thread after the tick-20 root-cause correction) still needs one clean harvest run; the
+2 s guest sampler stands ready on macos-utm-1.
