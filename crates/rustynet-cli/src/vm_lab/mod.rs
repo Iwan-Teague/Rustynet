@@ -15097,7 +15097,8 @@ pub fn exercise_macos_reboot_recovery_live(
     // startup-recovery line is recorded as evidence of WHICH path restored
     // the posture — present after a hard reset that left the backup behind,
     // absent after a clean shutdown that retired it — not as a second gate.
-    let failclosed_summary = evaluate_macos_dns_failclosed_report(macos_alias, &failclosed_json)?;
+    let failclosed_summary =
+        evaluate_macos_dns_failclosed_report(macos_alias, &failclosed_json, "fully_protected")?;
 
     let summary = format!(
         "macOS reboot-with-protection proven on {macos_alias}: node_id={node_id}; {}; boottime {pre_boottime} -> {post_boottime}; startup_recovery_line={}; residue_marker=absent; failclosed-check: {failclosed_summary}",
@@ -21415,7 +21416,7 @@ fn evaluate_macos_exit_dns_failclosed_artifact_dir(
 
     let dns_check = fs::read_to_string(artifact_dir.join("macos_dns_failclosed_check.json"))
         .map_err(|err| format!("read macos_dns_failclosed_check.json failed: {err}"))?;
-    evaluate_macos_dns_failclosed_report(macos_alias, dns_check.as_str())?;
+    evaluate_macos_dns_failclosed_report(macos_alias, dns_check.as_str(), "fully_protected")?;
 
     Ok(format!(
         "macOS exit DNS leak proof verified on {macos_alias}: off-tunnel probe driven, UDP/TCP egress pcaps empty, no probe response, and tunnel positive control passed"
@@ -21604,18 +21605,31 @@ pub(crate) fn evaluate_macos_exit_killswitch_precedence_artifact(
 fn evaluate_macos_dns_failclosed_report(
     macos_alias: &str,
     raw_json: &str,
+    expected_posture: &str,
 ) -> Result<String, String> {
     let report: Value = serde_json::from_str(raw_json)
         .map_err(|err| format!("parse macos-dns-failclosed-check JSON output failed: {err}"))?;
-    require_json_u64(&report, "schema_version")?
-        .eq(&1)
-        .then_some(())
-        .ok_or_else(|| {
-            format!(
-                "macos-dns-failclosed-check returned unsupported schema_version={}",
-                require_json_u64(&report, "schema_version").unwrap_or_default()
-            )
-        })?;
+    // Schema 1 predates the posture field and is only ever emitted by a
+    // pre-three-state daemon, whose only contract was fully-protected; a
+    // missing posture field therefore defaults to fully_protected. Schema 2
+    // always carries the evaluated posture and it MUST match the posture the
+    // caller threaded from the node's planned role — a report evaluated for
+    // the wrong posture must never read as a pass.
+    let schema_version = require_json_u64(&report, "schema_version")?;
+    if schema_version != 1 && schema_version != 2 {
+        return Err(format!(
+            "macos-dns-failclosed-check returned unsupported schema_version={schema_version}"
+        ));
+    }
+    let report_posture = report
+        .get("posture")
+        .and_then(Value::as_str)
+        .unwrap_or("fully_protected");
+    if report_posture != expected_posture {
+        return Err(format!(
+            "macos-dns-failclosed-check evaluated posture {report_posture:?} but the node under test must hold {expected_posture:?}; the role-to-posture plan and the check disagree"
+        ));
+    }
     let overall_ok = require_json_bool(&report, "overall_ok")?;
     let drift_reasons = require_json_array(&report, "drift_reasons")?;
     if !overall_ok {
@@ -21641,7 +21655,9 @@ fn evaluate_macos_dns_failclosed_report(
             "report set overall_ok=true but drift_reasons is non-empty: {joined}"
         ));
     }
-    Ok(format!("macOS DNS fail-closed verified on {macos_alias}"))
+    Ok(format!(
+        "macOS DNS fail-closed verified on {macos_alias} (posture {report_posture:?})"
+    ))
 }
 
 fn require_forwarding_enabled_macos(value: &Value, field: &str) -> Result<(), String> {
@@ -47917,6 +47933,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let summary = super::evaluate_macos_dns_failclosed_report(
             "macos-utm-1",
             payload.to_string().as_str(),
+            "fully_protected",
         )
         .expect("reviewed macOS DNS failclosed payload must validate");
         assert!(
@@ -47935,6 +47952,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let err = super::evaluate_macos_dns_failclosed_report(
             "macos-utm-1",
             payload.to_string().as_str(),
+            "fully_protected",
         )
         .expect_err("inconsistent overall_ok=false with empty drift_reasons must fail");
         assert!(
@@ -47953,6 +47971,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let err = super::evaluate_macos_dns_failclosed_report(
             "macos-utm-1",
             payload.to_string().as_str(),
+            "fully_protected",
         )
         .expect_err("overall_ok=true with drift_reasons must fail");
         assert!(err.contains("bogus drift"), "unexpected error: {err}");
