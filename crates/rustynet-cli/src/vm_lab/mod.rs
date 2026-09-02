@@ -20370,8 +20370,10 @@ fn evaluate_windows_exit_killswitch_precedence_artifact(
 /// net.inet.ip.forwarding=1` while the daemon is running. Both the pf
 /// anchor and the forwarding sysctl MUST revert when the daemon stops;
 /// any leftover anchor or `ip.forwarding=1` after stop fails closed.
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
-fn evaluate_macos_exit_nat_lifecycle_artifact(
+/// Reachable from both the legacy macOS exit-evidence validation stage above
+/// and the Rust `--node` engine's exit-NAT-lifecycle role validation
+/// (`role_validation::exit_nat_lifecycle::validate_macos_exit_nat_lifecycle`).
+pub(crate) fn evaluate_macos_exit_nat_lifecycle_artifact(
     macos_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
@@ -21561,8 +21563,11 @@ fn linux_exit_dns_failclosed_artifact_set_complete(artifact_dir: &Path) -> Resul
 /// reason string. The tamper itself (e.g. flushing pf or unloading the
 /// `com.rustynet.daemon` plist mid-run) is producer-side; the
 /// validator only enforces the audit-shape contract.
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
-fn evaluate_macos_exit_killswitch_precedence_artifact(
+/// Reachable from both the legacy macOS exit-evidence validation stage above
+/// and the macOS exit adapter's pre-activation baseline position
+/// (`adapter::macos_exit_traffic::run_killswitch_precedence_baseline`, design
+/// §5/A2).
+pub(crate) fn evaluate_macos_exit_killswitch_precedence_artifact(
     macos_alias: &str,
     raw_json: &str,
 ) -> Result<String, String> {
