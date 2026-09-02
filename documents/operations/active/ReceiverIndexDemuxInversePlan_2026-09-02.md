@@ -84,7 +84,8 @@ destructure the engine for a split borrow:
         } = self;
 ```
 
-(`engine.rs:640-648`) and pick the peer:
+(the comment starts at `engine.rs:640`; the destructuring proper is
+`engine.rs:645-652`) and pick the peer:
 
 ```rust
         let node_id: &NodeId = match &receiver_index_match {
@@ -128,7 +129,7 @@ index (boringtun stores `index << 8`), and inbound packets echo it back in
    the "Replaced" rebuild: the peer's **old** `tunnel_index` is orphaned and a fresh
    one takes over. Note this is the *reconfigure/rebuild* site, not a rekey: see
    1.4.
-2. **`remove_peer`** — `engine.rs:555-566` removes the state (`engine.rs:557`) and
+2. **`remove_peer`** — `engine.rs:555-568` removes the state (`engine.rs:557`) and
    unlinks the endpoint from `removed_state.endpoint`. This is the single teardown
    choke point; the daemon-side revocation/removal path reaches it via
    `Backend::remove_peer` (`crates/rustynetd/src/phase10.rs:7400`, and the
@@ -179,11 +180,14 @@ section** — there are exactly two (1.3 sites 1 and 2); both must go through th
 helper pair, and no other code may touch `receiver_index`.
 Enforcement: private helpers `fn set_tunnel_index(&mut self, node_id: &NodeId, index: u32)`
 and `fn clear_tunnel_index(&mut self, index: u32)` are the only writers; both are
-called from inside `configure_peer` (after the fallible steps, immediately beside the
-existing `peer_states.insert` / `unlink_endpoint`/`link_endpoint` block,
-`engine.rs:405-421`) and `remove_peer` (beside `unlink_endpoint`,
-`engine.rs:557-563). Privacy (`fn`, not `pub(crate)`) plus the (a) checker makes a
-forgotten site a loud test failure rather than a silent drift.
+called from inside `configure_peer`/`remove_peer`'s mutating block in the A1
+order (the fallible `set_tunnel_index` first, so its collision refusal precedes
+every other mutation; then `clear_tunnel_index`, `peer_states.insert`
+(`engine.rs:408-417`), and the `unlink_endpoint`/`link_endpoint` relink
+(`engine.rs:418-421`); `remove_peer` calls `clear_tunnel_index` beside
+`unlink_endpoint`, `engine.rs:558-565`, `unlink_endpoint` at `engine.rs:563`).
+Privacy (`fn`, not `pub(crate)`) plus the (a) checker makes a forgotten site a
+loud test failure rather than a silent drift.
 Verification: unit tests named below, plus the (a) fuzz test, which would catch any
 future mutation site added without a helper call.
 
@@ -194,13 +198,42 @@ unknown index and falls through to the endpoint fallback exactly as
 endpoint fallback at `engine.rs:652-658`; a miss on *both* returns `Ok(None)` =
 drop, `engine.rs:655-657`). The map never contains a retired index (invariants
 (a)/(b): cleared at rebuild/remove), so "stale index" and "unknown index" are the
-same lookup outcome. The existing `expect("matched peer state should exist")`
-(`engine.rs:666`) is retained as the belt-and-braces proof that a map hit implies
-live state; if it could ever fire, that is invariant-(a) breakage, and the fail-closed
-posture is to treat it as a bug, not to add a fallback branch.
+same lookup outcome. The dispatch resolves the peer with a guarded get, not a
+panic:
+
+```rust
+let node_id: &NodeId = match mapped {
+    Some(node_id) if peer_states.contains_key(node_id) => node_id,
+    Some(_) => {
+        debug_assert!(false, "receiver_index named a peer with no live state (invariant (a) broken)");
+        Self::endpoint_index_lookup(endpoint_index, remote_addr)
+            .ok_or(())? // → `return Ok(None)`, datagram dropped
+    }
+    None => Self::endpoint_index_lookup(endpoint_index, remote_addr)
+        .ok_or(())?,
+};
+```
+
+(Borrows are disjoint: the matched id borrows `receiver_index`, the guard reads
+`peer_states` shared, the later `get_mut` takes `peer_states` mutable.) A map hit
+whose state is missing is treated exactly like a miss — endpoint fallback, else
+drop — plus a `debug_assert!` so the invariant break is loud in debug/CI. The
+final drop **increments a counter** (a `receiver_index_divergence_drops`
+observability counter), so the drop-and-count is visible to operators. Rationale:
+CLAUDE.md §10.2 forbids panics in attacker-reachable production paths; a worker
+panic here is recovered only by a full engine rebuild
+(`userspace_shared/mod.rs:162-175`, `:196-199`, `:276-286`), dropping every
+peer's session. Drop preserves the fail-closed property (no misattribution:
+endpoint-fallback attribution is still authenticated inside `Tunn.decapsulate`,
+`engine.rs:667-670`). The pre-existing `expect` at `engine.rs:666` is replaced by
+this guard on the same line's responsibility, so the change removes a panic from
+the inbound path rather than adding one.
 Verification: `stale_receiver_index_after_rebuild_is_not_attributed` (§5, T1) —
 after a Replaced rebuild, a datagram carrying the *old* index resolves to `None`
-(endpoint fallback aside) and never to the rebuilt peer.
+(endpoint fallback aside) and never to the rebuilt peer — plus
+`receiver_index_dispatch_never_panics_on_divergence` (§5, T4): a dispatch hitting
+a divergent entry must return `Ok(None)` (or the endpoint-fallback outcome) and
+never panic, in a release-profile test build (`debug_assert` compiled out).
 
 **(d) Two peers can never share a `tunnel_index`.**
 Today: guaranteed structurally — the monotonic counter (`engine.rs:318`, `:783-790`)
@@ -210,17 +243,19 @@ had one ever existed, silently. The plan does not rely on the scan's silent
 tie-break: `set_tunnel_index` refuses a key collision with a *different* `NodeId`
 with a hard error (`BackendError::internal`), and `debug_assert`s it.
 Enforcement: the collision check inside `set_tunnel_index`.
-Verification: `duplicate_tunnel_index_collision_is_refused` (§5, T3) — drives
-`set_tunnel_index` twice with different node ids for one index and asserts the
-error and that neither map entry changed; a comment at the counter
+Verification: `duplicate_tunnel_index_collision_refusal_is_a_clean_no_op` (§5,
+T3, strengthened per A1) — drives the collision (test-only direct helper call)
+and asserts the error and that **both** maps are byte-identical to before the
+attempt; a comment at the counter
 (`allocate_tunnel_index`, `engine.rs:783`) records that the refusal is
 defence-in-depth, not the primary guard.
 
 **(e) Removal/revocation clears the index entry before the peer state is dropped
 (teardown-before-revoke ordering).**
-Enforcement: `remove_peer` (`engine.rs:555-566`) calls
+Enforcement: `remove_peer` (`engine.rs:555-568`) calls
 `clear_tunnel_index(removed_state.tunnel_index)` inside the same `Some(removed_state)`
-arm that already calls `unlink_endpoint` (`engine.rs:557-563`), i.e. the index entry
+arm that already calls `unlink_endpoint` (`engine.rs:558-565`, `unlink_endpoint` at
+`engine.rs:563`), i.e. the index entry
 is gone in the same critical section that retires the state, before the function
 returns and the state is dropped. Ordering is observable to no one between the two
 statements (single-threaded worker, no early-return between them), which is the same
@@ -242,7 +277,7 @@ daemon revocation tests that drive `Backend::remove_peer`
 **Can the caller take a borrow, given the `:604` "unavoidably owned" comment? Yes.**
 The ownership was an artifact of the *implementation*, not a borrow-checker law: the
 scan needed `&self.peer_states` *before* the split-borrow destructuring at
-`engine.rs:640-648` takes `peer_states` mutably, so the result had to be an owned
+`engine.rs:645-652` takes `peer_states` mutably, so the result had to be an owned
 `NodeId` to survive that transition. Once the lookup is a read of a **different,
 disjoint field**, it can be performed *inside* the split borrow exactly the way the
 endpoint fallback already is (`endpoint_index_lookup`,
@@ -266,6 +301,13 @@ borrow already eliminates; the P3 fair-drain item may still choose interning for
 *its* `FlowKey` (`HotPathCloneAudit_2026-09-01.md` §P3) — that decision is
 independent and out of scope here (§8).
 
+The map's keys are only ever `allocate_tunnel_index` output — locally generated,
+monotonic, never attacker-chosen; datagram-supplied `receiver_idx` values are
+lookup probes only and can never become keys (`set_tunnel_index` is private,
+called only from `configure_peer`, which only the control plane reaches). Map
+size is bounded by invariant (a) to `peer_states.len()`, so an attacker can
+neither grow the table nor degrade std SipHash's probe cost by key choice.
+
 ### 3.2 Single maintenance helper pair
 
 ```rust
@@ -274,16 +316,30 @@ fn clear_tunnel_index(&mut self, index: u32) { /* remove; no-op on absent (idemp
 ```
 
 Call sites — and only these (invariant (b)):
-- `configure_peer` rebuild path: `set_tunnel_index(&peer.node_id, tunnel_index)`
-  immediately after `peer_states.insert` (`engine.rs:408-417`). When the disposition
-  is `Replaced`, the orphaned old index is cleared first via
-  `clear_tunnel_index(previous.tunnel_index)` (captured from
-  `self.peer_states.get(&peer.node_id)` where `previous_endpoint` is already read,
-  `engine.rs:402-404`) — monotonic allocation means old ≠ new, so ordering inside
-  the block is not load-bearing, but clear-then-set keeps the (a) checker trivially
-  satisfied at the hook between the two writes.
+- `configure_peer` rebuild path. Mutating block order (after
+  `allocate_tunnel_index` at `engine.rs:372` and `Tunn::new` at
+  `engine.rs:373-395` succeed):
+  1. `set_tunnel_index(&peer.node_id, tunnel_index)` — its collision check
+     runs before it inserts, so on refusal it returns
+     `BackendError::internal` with **no mutation performed**;
+  2. on `Replaced`, `clear_tunnel_index(previous.tunnel_index)` (captured
+     beside `previous_endpoint` at `engine.rs:399-402`);
+  3. `peer_states.insert(...)` (`engine.rs:408-417`);
+  4. `unlink_endpoint`/`link_endpoint` (`engine.rs:418-421`).
+
+  Rationale: `set_tunnel_index` is the only fallible step after
+  allocation, so it must precede every other mutation — restoring §4 row
+  7's "no partial write" guarantee. A collision refusal now fails closed
+  for both peers: the existing peer's state and map entry are untouched
+  and no state exists for the incoming peer. The transient states between
+  steps 1-3 (map entry present without state, or both old and new index
+  present) are unobservable: the engine is single-owner
+  (`engine.rs:126`) and no read path runs mid-statement. The §3.3 checker
+  is invoked at `configure_peer`/`remove_peer` **function boundaries
+  only**, never between these steps.
 - `remove_peer`: `clear_tunnel_index(removed_state.tunnel_index)` beside
-  `unlink_endpoint` (`engine.rs:557-563`) — invariant (e).
+  `unlink_endpoint` (`engine.rs:558-565`, `unlink_endpoint` at
+  `engine.rs:563`) — invariant (e).
 
 `update_peer_endpoint` (`engine.rs:425-437`) deliberately gets no call: it does not
 mutate `tunnel_index` (1.3 site 3).
@@ -294,7 +350,9 @@ mutate `tunnel_index` (1.3 site 3).
 asserts the bijection of invariant (a) (same size; every `(index, node_id)` pair in
 the map is present in `peer_states` and vice versa). Invoked from the (a) fuzz test
 after every mutation, and cheap enough to also call at the end of
-`configure_peer`/`remove_peer` in debug builds. Release builds compile it out;
+`configure_peer`/`remove_peer` in debug builds — at function boundaries only,
+never between the A1 mutation steps (a mid-reconfigure invocation would fire on
+the legitimate transient orderings). Release builds compile it out;
 the fail-closed behaviour never depends on it — it exists to make drift loud.
 
 ## 4) Fail-closed analysis
@@ -307,10 +365,10 @@ row the outcome is **drop (or correct attribution), never misattribution**:
 | 1 | Attacker speaks a retired index (post-rebuild or post-removal) | Cleared by `set`/`clear` (inv. b/e); lookup misses | Falls to endpoint fallback; if that also misses, `Ok(None)` ⇒ drop (`engine.rs:652-657`) — identical to today's scan-miss |
 | 2 | Attacker speaks a *live* foreign index | Map hit attributes the datagram to that live peer — but this is exactly today's behaviour (scan would find the same peer; WireGuard's own `peers_by_idx` demux has the same property) and is subsequently authenticated by the tunnel's session keys inside `Tunn::decapsulate` (`engine.rs:667-674`), so a wrong-key datagram is rejected by crypto, not by demux | Unchanged from today; no new exposure |
 | 3 | Forgotten update at a future mutation site | (a) fuzz test fails in CI; debug checker asserts | Loud test failure, not production drift |
-| 4 | Map/`peer_states` divergence somehow escapes checks and the `expect` at `engine.rs:666` fires | Panic in the worker thread — the runtime already treats worker death as recoverable (`is_runtime_worker_unavailable` string-match contract, `DataplanePerfBacklog_2026-06-12.md` §3) | Loud failure (denial of the demux path), which is fail-closed; never silent misattribution |
+| 4 | Map/`peer_states` divergence somehow escapes the checks and a map hit names a node with no live state | Treated exactly like a miss (§2 (c) guarded get): `debug_assert!` fires in debug/CI; release dispatch falls back to the endpoint index and, if that misses, drops the datagram and **increments a divergence counter** | Drop (or an authenticated endpoint-fallback attribution), never misattribution, and never a worker panic — a panic here would be recovered only by a full engine rebuild from the key file (`userspace_shared/mod.rs:162-175`, `:196-199`, `:276-286`), dropping every peer's session |
 | 5 | `u32` index-space exhaustion | Pre-existing: `allocate_tunnel_index` errors (`engine.rs:785-788`) | Unchanged; peer configure fails, no index written |
 | 6 | Collision (two peers, one index) | Structurally impossible (monotonic counter); `set_tunnel_index` additionally refuses with `BackendError::internal` (inv. d) | Configure error, no index written |
-| 7 | `configure_peer` fails partway (bad allowed-IP parse, allocation error) | Fallible steps all complete *before* the first mutation (`engine.rs:339-346` parse; `engine.rs:372` allocate), and the insert + index writes are infallible after that point | No partial write; index and state never diverge |
+| 7 | `configure_peer` fails partway (bad allowed-IP parse, allocation error, collision refusal) | Fallible steps all complete *before* the first mutation (`engine.rs:336-340` parse; `engine.rs:372` allocate), and `set_tunnel_index` — the only fallible step after allocation — precedes every other mutation in the A1 order (§3.2), so the remaining insert + index writes are infallible | No partial write; index and state never diverge; a refusal leaves both maps byte-identical |
 
 The trust-binding property this preserves: an inbound ciphertext datagram is
 attributed to a peer iff its `tunnel_index` is that peer's **currently live** index —
@@ -319,31 +377,60 @@ proven (a) to mirror `peer_states`.
 
 ## 5) Migration steps
 
-Tests are written FIRST, against the new seam, and fail before the change (the first
-three exercise fail-closed behaviour):
+Tests are written FIRST, against the new seam, and fail before the change. The
+**authoritative fail-closed test list** below is folded verbatim from the
+adversarial review ("Fail-closed tests the implementation MUST write first") and
+supersedes any earlier test sketch in this plan — T3 is strengthened per A1 and
+T4 is added per A3:
 
-- **T1** `stale_receiver_index_after_rebuild_is_not_attributed` — configure peer;
-  capture index; re-`configure_peer` with changed key material (Replaced path);
-  datagram carrying the old index ⇒ lookup `None` (or endpoint-fallback outcome),
-  never the peer; new index ⇒ the peer. *(S)*
-- **T2** `removed_peer_receiver_index_entry_is_gone` — configure; `remove_peer`;
-  old index ⇒ `None`; `receiver_index.len() == peer_states.len()`. *(S)*
-- **T3** `duplicate_tunnel_index_collision_is_refused` — second `set_tunnel_index`
-  with a different `NodeId` for a live index ⇒ `BackendError::internal`, map
-  unchanged. *(S)*
+1. **T1 `stale_receiver_index_after_rebuild_is_not_attributed`** (plan §5, as
+   written, plus the §7.1 extension): configure → capture index →
+   re-`configure_peer` with changed key material (`Replaced`) → old index
+   resolves `None` (endpoint fallback aside), never the peer; new index
+   resolves the peer; then `update_peer_endpoint` (roam) → the *same* index
+   still resolves the peer (endpoint-moved-then-old-index case).
+2. **T2 `removed_peer_receiver_index_entry_is_gone`** (plan §5, as written):
+   after `remove_peer`, retired index ⇒ `None`;
+   `receiver_index.len() == peer_states.len()`.
+3. **T3 `duplicate_tunnel_index_collision_refusal_is_a_clean_no_op`**
+   (strengthens the earlier T3 sketch per A1): drive the collision (test-only
+   direct helper call) and assert — error returned; `peer_states`
+   **byte-identical** to before the attempt; `receiver_index` **byte-identical**
+   to before; the existing (non-colliding) peer still resolves. The earlier
+   "map unchanged" claim is necessary but not sufficient: without A1's ordering
+   the *state* map would have mutated, and this test is what proves the
+   amendment.
+4. **T4 `receiver_index_dispatch_never_panics_on_divergence`** (new, per A3):
+   test-only construction of a divergent state (map entry naming a node with
+   no `peer_states` entry — reachable via the test-harness seam), then a
+   dispatch of a datagram carrying that index must return `Ok(None)` (or the
+   endpoint-fallback outcome) and **not panic**, in a release-profile test
+   build (`debug_assert` compiled out).
+5. **T5 `receiver_index_agrees_with_peer_states_under_random_mutations`**
+   (the S3 fuzz): the fuzz mirror of `engine.rs:1883`, driving
+   configure/rebuild/remove/roam over N names against the linear-scan
+   reference closure, checker invoked after every mutation.
+
+T1-T3 gate S1. Migration steps:
 - **S1** — add the `receiver_index` field, helper pair, collision refusal; wire the
   two call sites (`configure_peer`, `remove_peer`). Tests T1-T3 green. *(S)*
 - **S2** — add `receiver_index_lookup` free function + consistency checker; extend
-  the `let Self { .. }` destructuring (`engine.rs:640-648`); switch the dispatch
+  the `let Self { .. }` destructuring (`engine.rs:645-652`); switch the dispatch
   match (`engine.rs:651-659`) to consult the map first and delete
   `find_node_id_by_receiver_index` (the audit's finding is only closed if the scan
   is *removed*, per the one-hardened-path rule — no dead legacy branch kept).
   Update the `#[cfg(test)]` recorded-ingress block (`engine.rs:614-633`) to the
   same free function. Existing test
   `inbound_dispatch_uses_receiver_index_independent_of_source_address`
-  (`engine.rs:1222-1299`) keeps passing unmodified — it asserts behaviour, not the
-  lookup mechanism (it reads `tunnel_index` off `peer_states` and builds raw
-  packets, `engine.rs:1250-1299`). *(M)*
+  (`engine.rs:1222-1299`) keeps its assertions but NOT its text unmodified:
+  it calls `find_node_id_by_receiver_index` directly three times
+  (`engine.rs:1283-1297`), so S2 must repoint those calls at the new
+  `pub(crate)` probe seam (same `cfg(any(test, feature = "test-harness"))`
+  carve-out `find_node_id_by_endpoint` already has, `engine.rs:834-840`)
+  in the same step as the deletion. The assertion content (foreign source
+  → index routing, unknown index → `None`, handshake init → `None`) is
+  unchanged. No other caller exists (crate-wide grep: the only references
+  are the definition, the `engine.rs:609` call site, and the test). *(M)*
 - **S3** — add the randomized fuzz test
   `receiver_index_agrees_with_peer_states_under_random_mutations` (mirror of
   `engine.rs:1883`), reusing its configure/rebuild/remove mutation driver and a
@@ -397,6 +484,8 @@ medium step (touching the hot dispatch) and is gated by T1-T3 being green first.
    require invariant (a). The fail-closed posture (§4 row 4) accepts a loud panic
    over silent misattribution — is that acceptable, or should the refuter demand a
    drop-on-divergence instead? (House rules lean fail-closed-and-loud; confirm.)
+   *(Answered by the review: drop-on-divergence — see A3, folded into §2 (c) and
+   §4 row 4; the panic is gone from the inbound path.)*
 3. **HashDoS / key control.** Index keys are attacker-influenced (they arrive in
    datagrams) but the map only ever contains locally allocated counter values, so
    lookup probes arbitrary keys but never inserts them — SipHash on `u32` is fine.
@@ -438,3 +527,45 @@ against this section.
 - Any change to `NodeId`'s representation (`Arc<str>` interning) — rejected for this
   scope (§3.1); revisitable only if a future finding shows a remaining clone at a
   path a field borrow cannot reach.
+
+## 9) Review disposition
+
+Adversarial review verdict: **READY-WITH-AMENDMENTS**
+(`ReceiverIndexDemuxInversePlanAdversarialReview_2026-09-02.md`). All five
+amendments folded on 2026-09-02; the plan's verdict moves from "refute pass
+pending" to "amended, ready to implement".
+
+- **A1: folded** — §3.2's `configure_peer` call-site bullet replaced with the
+  review's exact mutating-block order: the fallible `set_tunnel_index` runs
+  first (collision refusal = pure no-op rejection, `BackendError::internal`
+  before any mutation), then `clear_tunnel_index` on `Replaced`, then
+  `peer_states.insert`, then the endpoint relink; the §3.3 checker is invoked
+  at function boundaries only. §2 (b) enforcement and §4 rows 6/7 updated to
+  match; the §5 authoritative test list's strengthened T3 proves the ordering.
+- **A2: folded** — §5 S2's false "keeps passing unmodified" claim replaced with
+  the review's text: the dispatch test calls `find_node_id_by_receiver_index`
+  directly three times (`engine.rs:1283-1297`), so S2 must repoint those calls
+  at the new `pub(crate)` probe seam (`engine.rs:834-840` pattern) in the same
+  step as the deletion.
+- **A3: folded** — §2 (c) and §4 row 4 no longer retain the
+  `expect("matched peer state should exist")` panic (`engine.rs:666`): the
+  dispatch resolves the peer with the review's guarded get (debug-assert +
+  endpoint fallback, else drop-and-count via a
+  `receiver_index_divergence_drops` counter). A map hit whose state is missing
+  is treated exactly like a miss; no panic exists in the inbound path
+  (CLAUDE.md §10.2). §5 T4 added to prove dispatch never panics on divergence.
+- **A4: folded** — anchor drift corrected: §4 row 7's parse anchor
+  `engine.rs:339-346` → `engine.rs:336-340`; §1.2 and §3.1's split-borrow
+  citation now distinguish the comment (`engine.rs:640`) from the
+  destructuring proper (`engine.rs:645-652`); §1.3's `remove_peer` range
+  corrected to `engine.rs:555-568` with `unlink_endpoint` at `engine.rs:563`
+  (also applied to the arm citations in §2 (e) and §3.2, verified `558-565`).
+  **Exception:** the review's `1765` → `1764` correction for
+  `update_peer_endpoint_moves_peer_between_reverse_index_entries` was verified
+  against this tree and **not applied** — the test's `fn` line is at
+  `engine.rs:1765` (the `#[test]` attribute is at 1764), so the plan's existing
+  `1765` citation is correct here.
+- **A5: folded** — §3.1 now states the HashDoS bound: keys are only ever
+  `allocate_tunnel_index` output, datagram-supplied `receiver_idx` values are
+  lookup probes that can never become keys, and map size is bounded by
+  invariant (a) to `peer_states.len()`.
