@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -403,7 +404,16 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
 
 fn run_systemctl(conn: &NodeConnection, action: &str) -> Result<(), AdapterError> {
     let timeout = Duration::from_secs(60);
-    ssh::run_remote(conn, &format!("sudo systemctl {action} rustynetd"), timeout)?;
+    // QH-01 Step 4c: argv-shaped command rendered through the validated seam
+    // (systemctl action ∈ {start, stop, restart} from internal callers).
+    let args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("systemctl")?,
+        ValidatedArg::cli_token(action)?,
+        ValidatedArg::service(LINUX_SERVICE_NAME)?,
+    ];
+    let script = ssh::RemoteCommand::from_args("linux systemd {action}", &args)?;
+    ssh::run_remote(conn, script.as_str(), timeout)?;
     Ok(())
 }
 
@@ -773,5 +783,24 @@ mod tests {
         assert!(LINUX_DAEMON_READY_PROBE.contains(LINUX_DAEMON_SOCKET));
         assert!(LINUX_DAEMON_READY_PROBE.contains("/usr/local/bin/rustynet status"));
         assert!(LINUX_DAEMON_READY_PROBE.contains("daemon-not-ready; exit 1"));
+    }
+
+    #[test]
+    fn run_systemctl_renders_argv_through_the_validated_seam() {
+        let args = vec![
+            ValidatedArg::cli_token("sudo").expect("token"),
+            ValidatedArg::cli_token("systemctl").expect("token"),
+            ValidatedArg::cli_token("restart").expect("token"),
+            ValidatedArg::service(LINUX_SERVICE_NAME).expect("service"),
+        ];
+        let script =
+            ssh::RemoteCommand::from_args("linux systemd {action}", &args).expect("render");
+        assert_eq!(script.as_str(), "'sudo' 'systemctl' 'restart' 'rustynetd'");
+    }
+
+    #[test]
+    fn run_systemctl_rejects_a_metacharacter_action_at_the_seam() {
+        let err = ValidatedArg::cli_token("start; reboot").expect_err("must reject");
+        assert!(err.to_string().contains("not safe for shell embedding"));
     }
 }

@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, GossipIdentity, MembershipOwnerKey, MembershipSnapshot,
@@ -57,50 +58,70 @@ pub fn init_membership_snapshot(
         .iter()
         .find(|p| p.role == NodeRole::Exit)
         .map_or("", |p| p.node_id.as_str());
-    let exit_node_id_arg = shell_safe_arg(exit_node_id)?;
-    ssh::run_remote(
-        conn,
-        &format!(
-            "sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='{exit_node_id_arg}' \
-             /usr/local/bin/rustynet ops init-membership"
-        ),
-        MEDIUM_TIMEOUT,
-    )?;
+    // The node id validates through the `node_id` class first; the
+    // `KEY=value` env assignment then renders as a single `cli_token` (the
+    // `=` is in that alphabet, the id inside the value is already proven
+    // clean). It must stay an ASSIGNMENT token: a bare id after `env` would
+    // be executed as the program.
+    ValidatedArg::node_id(exit_node_id)?;
+    let node_id_env = ValidatedArg::cli_token(&format!("RUSTYNET_NODE_ID={exit_node_id}"))?;
+    let init_args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin")?,
+        node_id_env,
+        ValidatedArg::path("/usr/local/bin/rustynet")?,
+        ValidatedArg::cli_token("ops")?,
+        ValidatedArg::cli_token("init-membership")?,
+    ];
+    let init_script = ssh::RemoteCommand::from_args("init-membership", &init_args)?;
+    ssh::run_remote(conn, init_script.as_str(), MEDIUM_TIMEOUT)?;
 
     // 2. Add each non-exit peer via e2e-membership-add.
     //    Privileged: writes membership.snapshot, reads owner key.
     //    owner_approver_id convention: "{exit_node_id}-owner" (matches ops_e2e.rs).
     //    There is no `rustynet ops owner-approver-id` command; derive from the exit peer.
-    let owner_approver_id_arg = shell_safe_arg(&format!("{exit_node_id}-owner"))?;
+    let owner_approver_id_arg = ValidatedArg::node_id(&format!("{exit_node_id}-owner"))?;
     for peer in peers {
         if peer.role == NodeRole::Exit {
             continue;
         }
-        let node_id_arg = shell_safe_arg(&peer.node_id)?;
+        let node_id_arg = ValidatedArg::node_id(&peer.node_id)?;
         // Membership publishes the GOSSIP key. `hex_32_safe_arg` is kept on both
-        // branches: the value crosses SSH into a root shell, so the shape guard
-        // must not be lost just because the source changed.
+        // branches: the value crosses SSH into a root shell, so the stricter
+        // 64-hex shape guard must not be lost just because the source changed.
+        // It is layered on top of the seam's `cli_token` class (the hex
+        // alphabet is a subset), not replaced by it.
         let (pubkey_flag, pubkey_arg) = match &peer.gossip_identity {
-            GossipIdentity::Published(gossip_hex) => {
-                ("--client-gossip-pubkey-hex", hex_32_safe_arg(gossip_hex)?)
-            }
+            GossipIdentity::Published(gossip_hex) => (
+                "--client-gossip-pubkey-hex",
+                ValidatedArg::cli_token(hex_32_safe_arg(gossip_hex)?.as_str())?,
+            ),
             GossipIdentity::DeferredPlatform => (
                 "--client-pubkey-hex-unaligned-wireguard",
-                hex_32_safe_arg(&peer.public_key_hex)?,
+                ValidatedArg::cli_token(hex_32_safe_arg(&peer.public_key_hex)?.as_str())?,
             ),
         };
-        let capabilities_arg = shell_safe_arg(&role_capability_csv(&peer.capabilities))?;
-        ssh::run_remote(
-            conn,
-            &format!(
-                "sudo -n /usr/local/bin/rustynet ops e2e-membership-add \
-                 --client-node-id '{node_id_arg}' \
-                 {pubkey_flag} '{pubkey_arg}' \
-                 --capabilities '{capabilities_arg}' \
-                 --owner-approver-id '{owner_approver_id_arg}'"
-            ),
-            MEDIUM_TIMEOUT,
-        )?;
+        let capabilities_arg =
+            ValidatedArg::capability_csv(&role_capability_csv(&peer.capabilities))?;
+        let add_args = vec![
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::path("/usr/local/bin/rustynet")?,
+            ValidatedArg::cli_token("ops")?,
+            ValidatedArg::cli_token("e2e-membership-add")?,
+            ValidatedArg::cli_token("--client-node-id")?,
+            node_id_arg,
+            ValidatedArg::cli_token(pubkey_flag)?,
+            pubkey_arg,
+            ValidatedArg::cli_token("--capabilities")?,
+            capabilities_arg,
+            ValidatedArg::cli_token("--owner-approver-id")?,
+            owner_approver_id_arg.clone(),
+        ];
+        let add_script = ssh::RemoteCommand::from_args("e2e-membership-add", &add_args)?;
+        ssh::run_remote(conn, add_script.as_str(), MEDIUM_TIMEOUT)?;
     }
 
     // 3. Read back the snapshot bytes. /var/lib/rustynet/ is mode 700 root-owned.
@@ -244,22 +265,8 @@ fn membership_log_header() -> String {
 }
 
 /// Reject shell-dangerous characters to prevent injection via alias strings.
-fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ','))
-    {
-        Ok(value.to_owned())
-    } else {
-        Err(AdapterError::Protocol {
-            message: format!(
-                "value '{value}' contains characters not safe for shell argument embedding \
-                 (allowed: alphanumeric, hyphen, underscore, dot, comma)"
-            ),
-        })
-    }
-}
-
+/// (The per-value shape guard is layered on top of the QH-01 seam classes:
+/// node ids and capability CSVs validate through `ValidatedArg`.)
 fn hex_32_safe_arg(value: &str) -> Result<String, AdapterError> {
     if NodeMembershipPeer::is_valid_public_key_hex(value) {
         Ok(value.to_owned())
@@ -320,21 +327,72 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shell_safe_arg_accepts_valid() {
-        assert_eq!(shell_safe_arg("node-exit-1").unwrap(), "node-exit-1");
-        assert_eq!(shell_safe_arg("abc.def_ghi").unwrap(), "abc.def_ghi");
-        // capability CSVs contain commas (e.g. "client,entry_relay")
+    fn membership_add_renders_argv_through_the_validated_seam() {
+        let node_id_arg = ValidatedArg::node_id("client-1").expect("node id");
+        let pubkey_arg =
+            ValidatedArg::cli_token(hex_32_safe_arg(&"a".repeat(64)).expect("hex").as_str())
+                .expect("token");
+        let capabilities_arg =
+            ValidatedArg::capability_csv("client,entry_relay").expect("capabilities");
+        let owner_approver_id_arg = ValidatedArg::node_id("exit-1-owner").expect("owner");
+        let add_args = vec![
+            ValidatedArg::cli_token("sudo").expect("token"),
+            ValidatedArg::cli_token("-n").expect("token"),
+            ValidatedArg::path("/usr/local/bin/rustynet").expect("path"),
+            ValidatedArg::cli_token("ops").expect("token"),
+            ValidatedArg::cli_token("e2e-membership-add").expect("token"),
+            ValidatedArg::cli_token("--client-node-id").expect("token"),
+            node_id_arg,
+            ValidatedArg::cli_token("--client-gossip-pubkey-hex").expect("token"),
+            pubkey_arg,
+            ValidatedArg::cli_token("--capabilities").expect("token"),
+            capabilities_arg,
+            ValidatedArg::cli_token("--owner-approver-id").expect("token"),
+            owner_approver_id_arg,
+        ];
+        let script =
+            ssh::RemoteCommand::from_args("e2e-membership-add", &add_args).expect("render");
         assert_eq!(
-            shell_safe_arg("client,entry_relay").unwrap(),
-            "client,entry_relay"
+            script.as_str(),
+            "'sudo' '-n' '/usr/local/bin/rustynet' 'ops' 'e2e-membership-add' \
+             '--client-node-id' 'client-1' '--client-gossip-pubkey-hex' \
+             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+             '--capabilities' 'client,entry_relay' '--owner-approver-id' 'exit-1-owner'"
         );
     }
 
     #[test]
-    fn shell_safe_arg_rejects_special_chars() {
-        assert!(shell_safe_arg("node; rm -rf /").is_err());
-        assert!(shell_safe_arg("node$(whoami)").is_err());
-        assert!(shell_safe_arg("node`id`").is_err());
+    fn membership_init_renders_the_node_id_as_an_env_assignment() {
+        // Regression pin: `env` treats the first non-assignment token as the
+        // program, so the exit node id must render as `RUSTYNET_NODE_ID=<id>`,
+        // never as a bare token.
+        ValidatedArg::node_id("exit-1").expect("node id");
+        let node_id_env =
+            ValidatedArg::cli_token("RUSTYNET_NODE_ID=exit-1").expect("env assignment token");
+        let init_args = vec![
+            ValidatedArg::cli_token("sudo").expect("token"),
+            ValidatedArg::cli_token("-n").expect("token"),
+            ValidatedArg::cli_token("env").expect("token"),
+            ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin").expect("token"),
+            node_id_env,
+            ValidatedArg::path("/usr/local/bin/rustynet").expect("path"),
+            ValidatedArg::cli_token("ops").expect("token"),
+            ValidatedArg::cli_token("init-membership").expect("token"),
+        ];
+        let script = ssh::RemoteCommand::from_args("init-membership", &init_args).expect("render");
+        assert_eq!(
+            script.as_str(),
+            "'sudo' '-n' 'env' 'RUSTYNET_NODE_ROLE=admin' 'RUSTYNET_NODE_ID=exit-1' \
+             '/usr/local/bin/rustynet' 'ops' 'init-membership'"
+        );
+    }
+
+    #[test]
+    fn membership_add_rejects_a_metacharacter_node_id_at_the_seam() {
+        let err = ValidatedArg::node_id("client-1; rm -rf /").expect_err("must reject");
+        let msg = err.to_string();
+        assert!(msg.contains("node id"), "must name the class: {msg}");
+        assert!(msg.contains(';'), "must name the offending char: {msg}");
     }
 
     #[test]

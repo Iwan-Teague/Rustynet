@@ -135,8 +135,9 @@ Folded from `Qh01TemplateInjectionEliminationPlanAdversarialReview_2026-09-02.md
 - A8: folded — §8 Q5 answered with the explicit non-live-evidence policy and parity-ledger dependency record.
 - Step 4a landed — the three validator argv-join sink sites (linux.rs, macos.rs, windows.rs build_validator_script) now build their commands through the validated seam (`ValidatedArg::cli_token` + `RemoteCommand::from_args` / `PowerShellScript::from_call_argv`).
 - Step 4b landed — the argv-shaped traffic-adapter sites (linux_traffic: exit route-advertise, diag rm, issue mkdir + sudo-env issue; macos_traffic: mesh ping with stderr merged, diag rm, issue mkdir + env-sudo issue; windows_traffic: Get-Content pubkey, live-identity `& path status`, diag Remove-Item, both Stop-Service sites) now render through the validated seam via `RemoteCommand::from_args` / `from_args_with_stderr_merged` / `PowerShellScript::from_call_argv`; each migrated site has a rendering test and each adapter a rejection test. The seam's `cli_token` alphabet gained `/` so `KEY=/absolute/path` env-assignment tokens stay one safe token.
+- Step 4c landed — the argv-shaped install/membership adapter sites (linux_install: `run_systemctl`; linux_membership: init-membership + e2e-membership-add; macos_install: workdir probe + assignment-pubkey read; macos_membership: init-membership + peer-add + both staging `mkdir -p` sites; windows_install: assignment-pubkey `Get-Content -Raw`) now render through the validated seam the same way; each migrated site has a rendering test and each migrated adapter a rejection test. The seam gained a `capability_csv` class (charset `[A-Za-z0-9._,-]+`, hoisted from linux/macos_membership's identical local `shell_safe_arg` guards, now removed); `hex_32_safe_arg` stays as the stricter per-site 64-hex guard layered under `cli_token`. Constant-literal sink scripts (no `format!`/concatenation) remain out of inventory by the Step 4b precedent. The raw sink-call-site pin is unchanged at 158 (migrations keep the existing sink call, so the structural count only moves at Step 4d's sink-signature flip).
 
-## 10) Step 4b remainder (input to Step 4d)
+## 10) Step 4b/4c remainder (input to Step 4d)
 
 Sites whose script argument is built by `format!`/concatenation but are SHELL-shaped (pipes, `&&`/`||`, `;`, non-trailing redirections, `if`/`for`/`try` blocks, multi-statement PowerShell, command substitution). These cannot migrate to the argv seam without changing remote behavior; Step 4d's typed renderer-output constructor is the planned shape.
 
@@ -166,3 +167,48 @@ Sites whose script argument is built by `format!`/concatenation but are SHELL-sh
 | windows_traffic.rs issue run_script (~:942) | rustynet path, subcmd, env, dir | `$env:` assignment, `;`, `if throw` | PS multi-statement renderer |
 | windows_traffic.rs issue list_script (~:954) | issue dir | pipeline `\|` | PS pipeline renderer |
 | windows_traffic.rs issue cleanup_script (~:975) | env, dir | two statements joined by `;` | PS multi-statement renderer |
+| linux_install.rs bootstrap verify_script (~:127) | binary/key/env paths (compile-time consts) | `&&`, `$(stat -f …)` substitution | Multi-statement renderer |
+| linux_install.rs install build/enforce branch (~:213, ~:276-295) | workdir (path), archive/report path consts | `&&`, `cd`, `tar`, `echo >>` env append | Multi-statement renderer |
+| linux_install.rs relay install_cmd (~:338) | src_dir (operator workdir / `$HOME`-derived), const binary | `sh -c` subshell, `env` indirection, `&&`, `cd` | Env-assignment + subshell renderer |
+| linux_install.rs uninstall (~:386) | state/run dirs (consts) | `;`, `\|\|`, `&&` chain | Multi-command renderer |
+| linux_membership.rs snapshot readback (~:111) | snapshot path (const) | `&&`, `cat \| base64` pipe | Two-command + pipe renderer |
+| linux_membership.rs distribute_signed_bundle (~:168) | tmp/dst/log paths, mode/owner consts | `&&` chain, `printf \| tee` pipe, `(…)` group | Multi-command + pipe renderer |
+| linux_membership.rs distribute_verifier_key (~:197) | dst/tmp paths, sha256 (validated) | `&&` chain, `$(sha256sum \| awk)` substitution | Multi-command + substitution renderer |
+| macos_install.rs verify_script (~:152) | binary/key/env paths (consts) | `&&`, `$(stat -f …)` substitution | Multi-statement renderer |
+| macos_install.rs build_cmd workdir branch (~:295) | workdir (path), archive consts | `&&`, `cd`, `tar`, `echo >>` | Multi-statement renderer |
+| macos_install.rs start_daemon (~:416) | plist path (const) | `\|\|` fallback across launchctl verbs | Multi-command renderer |
+| macos_install.rs enforce install script (~:645) | node id/network id/utun/cidrs (validated), STUN gateway detection | `;`, `if/then`, `$(route \| awk)` substitution | Multi-statement renderer (env flags via argv once 4d) |
+| macos_install.rs uninstall (~:660) | binary/plist/state paths (consts) | `&&` chain | Multi-command renderer |
+| macos_install.rs relay verifier install (~:790) | state-root path (const) | `sh -c` subshell, `&&` chain | Subshell renderer |
+| macos_install.rs relay install_cmd (~:825) | src_dir (workdir/`$HOME`-derived) | `env` indirection, `sh -c`, `&&`, `cd` | Env-assignment + subshell renderer |
+| macos_install.rs relay dep check (~:923) | guest registry path (derived) | `;`-joined `test … \|\| echo` batch | Multi-command renderer |
+| macos_membership.rs owner_key_read_script (~:47) | pubkey path (const) | `if/then/else/fi`, `;`, `$(cat 2>&1 \| head)` | Branching renderer (marker protocol) |
+| macos_membership.rs snapshot readback (~:282) | snapshot path (const) | `if`, `cat \| base64` pipe, stderr diagnostic | Branching + pipe renderer |
+| macos_membership.rs distribute_signed_bundle (~:168 install) | tmp/dst/log paths, mode/owner consts | `&&` chain, `\|\|`, `printf \| tee` pipe | Multi-command + pipe renderer |
+| macos_membership.rs distribute_verifier_key (~:228 install) | tmp/dst paths, sha256 (validated) | `&&` chain, `$(shasum \| awk)` substitution | Multi-command + substitution renderer |
+| windows_install.rs ensure staging dir (~:297) | staging dir (const) | `\| Out-Null` pipeline | Single-cmdlet renderer (drop the pipe) |
+| windows_install.rs vendor extract (~:344) | workdir, vendor archive (paths) | multi-statement, `$vars`, backtick strings, `Join-Path` | PS multi-statement renderer |
+| windows_install.rs build release script (~:377) | workdir/bootstrap/config/report paths | `Set-StrictMode` prefix, `Set-Location`, `&` invocation | PS multi-statement renderer |
+| windows_install.rs service install script (~:388) | install root, service/node/role ids (validated) | `Set-StrictMode` prefix, `&` invocation | PS multi-statement renderer |
+| windows_install.rs verify rustynetd.exe (~:419) | binary path (const) | `if (-not (Test-Path)) { throw }` | PS control-flow renderer |
+| windows_install.rs enforce patch script (~:519) | env path (const-derived) | multi-statement, pipeline, `if` blocks | PS multi-statement renderer |
+| windows_install.rs tunnel-ip readiness (~:542) | adapter name (validated) | multi-statement fragment composition | PS multi-statement renderer |
+| windows_install.rs start daemon probe (~:563) | service name (const) | loops, `$LASTEXITCODE` branches, `throw` | PS control-flow renderer |
+| windows_install.rs uninstall ensure dir (~:594) | staging dir (const) | `\| Out-Null` pipeline | Single-cmdlet renderer |
+| windows_install.rs uninstall script (~:617) | uninstaller/service/install/state paths | `Set-StrictMode` prefix, `&` invocation | PS multi-statement renderer |
+| windows_install.rs trust dir (~:935) | trust dir (const) | `\| Out-Null` pipeline | Single-cmdlet renderer |
+| windows_install.rs e2e bootstrap script (~:1082) | many DPAPI/key paths, RNG material | multi-statement, `try/finally`, scriptblock invocation | PS multi-statement renderer |
+| windows_install.rs run_service_action (~:1140) | service name (const) | `Set-StrictMode` prefix before cmdlet | PS prefix-aware renderer |
+| windows_install.rs relay mkroot+harden (~:1324) | relay root (const) | `\| Out-Null` + ACL harden statements | PS multi-statement renderer |
+| windows_install.rs relay install verifier (~:1347) | tmp/dst paths (const-derived) | `Set-StrictMode` prefix, `Move-Item`, harden call | PS multi-statement renderer |
+| windows_install.rs relay replay store (~:1362) | store path (const) | `if (-not (Test-Path))`, pipe | PS control-flow renderer |
+| windows_install.rs relay install env (~:1390) | tmp/env paths (const-derived) | `Set-StrictMode` prefix, `Move-Item`, harden call | PS multi-statement renderer |
+| windows_install.rs relay create service (~:1397) | service/binary/env paths (consts) | `if/else`, `sc.exe create/config`, `throw` | PS control-flow renderer |
+| windows_install.rs relay start probe (~:1406) | service name (const) | loops, `$LASTEXITCODE` branches, `throw` | PS control-flow renderer |
+| windows_membership.rs owner key read (~:37) | pubkey path (const) | `$var`, `if/throw`, multi-statement | PS control-flow renderer |
+| windows_membership.rs add-peer w/ helper (~:117) | node/owner ids, hex, capabilities (validated) | `if` + function definition, scriptblock | PS function-provision renderer |
+| windows_membership.rs snapshot readback (~:127) | snapshot path (const) | preference prefix statements + `[Convert]::ToBase64String` | PS prefix-aware renderer |
+| windows_membership.rs ensure dirs (~:154) | staging/dst parent (consts) | `foreach`, `if`, `\| Out-Null` | PS loop renderer |
+| windows_membership.rs install script (~:183) | tmp/dst/log paths | `Set-StrictMode` prefix, conditional `Set-Content` | PS multi-statement renderer |
+| windows_membership.rs verifier ensure dir (~:211) | dst parent (const) | `if`, `\| Out-Null` | PS control-flow renderer |
+| windows_membership.rs verifier install (~:228) | tmp/dst paths, sha256 (validated) | `Set-StrictMode` prefix, `Get-FileHash`, `if/throw` | PS multi-statement renderer |
