@@ -15492,6 +15492,13 @@ mod tests {
         .expect("linux command system should initialize");
         DataplaneSystem::set_relay_forwarding(&mut system, true);
 
+        // The killswitch egress-allow rule is only emitted while a firewall
+        // table exists (`apply_nat_forwarding` keys it off `firewall_table`),
+        // exactly as a live apply orders the stages: killswitch first, NAT
+        // afterwards. Without this the third expectation below can never be
+        // met, and the test would be asserting an ordering no node uses.
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the capture helper");
         DataplaneSystem::apply_nat_forwarding(
             &mut system,
             false,
