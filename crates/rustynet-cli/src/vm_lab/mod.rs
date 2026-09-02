@@ -11,7 +11,7 @@ pub mod overnight;
 pub mod recover_guest_network;
 pub mod run_exclusion;
 pub mod run_history;
-mod script_template;
+pub(crate) mod script_template;
 pub mod topology;
 
 pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};
@@ -3148,7 +3148,7 @@ fn pinned_toolchain_channel() -> Result<String, String> {
 /// Spelled as a type rather than a `bool` because both answers are load-bearing:
 /// three bindings are *legitimately* empty and the script branches on that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AllowEmpty {
+pub(crate) enum AllowEmpty {
     Yes,
     No,
 }
@@ -3173,7 +3173,7 @@ enum AllowEmpty {
 /// (unpinned) and `__TARGETS__` (every domain) are legitimately empty and render
 /// as `''`. Proven by `single_quoted_value_guard_refuses_by_attack_class` and
 /// `an_absent_pool_disk_model_is_not_an_error`.
-fn ensure_single_quoted_script_value(
+pub(crate) fn ensure_single_quoted_script_value(
     label: &str,
     value: &str,
     allow_empty: AllowEmpty,
@@ -35040,7 +35040,7 @@ fn ensure_local_directory_path(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     let mut out = String::from("'");
     for ch in value.chars() {
         if ch == '\'' {
@@ -35053,7 +35053,7 @@ fn shell_quote(value: &str) -> String {
     out
 }
 
-fn powershell_quote(value: &str) -> Result<String, String> {
+pub(crate) fn powershell_quote(value: &str) -> Result<String, String> {
     ensure_no_control_chars("PowerShell literal", value)?;
     Ok(format!("'{}'", value.replace('\'', "''")))
 }

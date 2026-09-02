@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -7,8 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::AdapterError;
+use crate::vm_lab::{AllowEmpty, ensure_single_quoted_script_value, shell_quote};
 
 const POLL_INTERVAL_MILLIS: u64 = 100;
 
@@ -423,6 +426,70 @@ fn base_scp_command(
         cmd.arg("-o").arg(format!("User={u}"));
     }
     cmd
+}
+
+// ── QH-01: validated remote-command newtypes ─────────────────────────────────
+
+/// A remote command that is safe to hand to the SSH sink family.
+///
+/// The field is private and there is deliberately no `From<String>`: the only
+/// ways in are a `script_template` render output or a validator-checked value,
+/// so holding a `RemoteCommand` is proof the injection boundary was crossed
+/// deliberately. There is no `Display`; `Debug` prints the length only, never
+/// the payload. `as_str` exists solely so the sink functions in this module
+/// can lower the value into `cmd.arg(...)` — it must not leak further.
+pub(crate) struct RemoteCommand(String);
+
+impl RemoteCommand {
+    // Deliberately NO constructor from a plain `String`: the renderer's
+    // `render_*` functions return `String` today, so a "from rendered
+    // template" constructor would accept any `format!` result and void the
+    // compile-time proof this type exists for. Step 4d adds the typed
+    // renderer-output constructor together with the sink signature flip.
+
+    /// Wrap a single value after quote-safety validation and shell quoting.
+    /// `label` names the argument for the error message.
+    pub(crate) fn from_validated_single(label: &str, value: &str) -> Result<Self, AdapterError> {
+        ensure_single_quoted_script_value(label, value, AllowEmpty::No).map_err(|reason| {
+            AdapterError::Protocol {
+                message: format!("{label}: {reason}"),
+            }
+        })?;
+        Ok(Self(shell_quote(value)))
+    }
+
+    /// Build a command from validated arguments: each is shell-quoted and the
+    /// results are space-joined. Validation already happened at
+    /// [`ValidatedArg`] construction, so a value that would break out of
+    /// quoting is rejected before any command string exists.
+    pub(crate) fn from_args(label: &str, args: &[ValidatedArg]) -> Result<Self, AdapterError> {
+        if args.is_empty() {
+            return Err(AdapterError::Protocol {
+                message: format!("{label}: no validated arguments supplied"),
+            });
+        }
+        let joined = args
+            .iter()
+            .map(ValidatedArg::quoted)
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(Self(joined))
+    }
+
+    /// Sink-only accessor: the run_remote sink family in THIS module lowers
+    /// this into `cmd.arg(...)`. Do not use it to re-interpolate the payload
+    /// into another string.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RemoteCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Redacted: a remote command may embed hostnames and user data; only
+        // its length may reach logs.
+        write!(f, "RemoteCommand(len={})", self.0.len())
+    }
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -1256,5 +1323,61 @@ mod powershell_clixml_rendering_tests {
             detail.contains("Configuration is not enabled."),
             "stdout-carried CLIXML must decode too; got: {detail}"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_command_seam_tests {
+    use super::*;
+
+    #[test]
+    fn from_validated_single_rejects_a_single_quoted_value_before_quoting() {
+        let err = RemoteCommand::from_validated_single("target", "no'together")
+            .expect_err("single quote must be refused");
+        assert!(err.to_string().contains("target"));
+    }
+
+    #[test]
+    fn from_validated_single_quotes_an_accepted_value() {
+        let cmd = RemoteCommand::from_validated_single("target", "10.0.0.5")
+            .expect("plain value must validate");
+        assert_eq!(cmd.as_str(), "'10.0.0.5'");
+    }
+
+    #[test]
+    fn from_args_never_produces_a_command_when_an_argument_is_rejected() {
+        // The metacharacter-bearing value cannot become a ValidatedArg, so no
+        // RemoteCommand is ever constructed — the rejection happens before any
+        // command string exists.
+        let rejected = ValidatedArg::ip("10.0.0.5; rm -rf /");
+        assert!(rejected.is_err(), "metacharacters must fail the ip class");
+        let err = rejected.expect_err("rejection expected").to_string();
+        assert!(!err.contains("rm -rf"), "error must not echo the payload");
+    }
+
+    #[test]
+    fn from_args_space_joins_shell_quoted_validated_values() {
+        let args = [
+            ValidatedArg::node_id("edge-1").expect("valid node id"),
+            ValidatedArg::ip("10.0.0.5").expect("valid ip"),
+            ValidatedArg::port("4242").expect("valid port"),
+        ];
+        let cmd = RemoteCommand::from_args("demo", &args).expect("all validated");
+        assert_eq!(cmd.as_str(), "'edge-1' '10.0.0.5' '4242'");
+    }
+
+    #[test]
+    fn from_args_refuses_an_empty_argument_list() {
+        let err = RemoteCommand::from_args("demo", &[]).expect_err("empty is a bug");
+        assert!(err.to_string().contains("demo"));
+    }
+
+    #[test]
+    fn remote_command_debug_prints_length_only() {
+        let cmd = RemoteCommand::from_validated_single("target", "secret-thing")
+            .expect("plain value must validate");
+        let rendered = format!("{cmd:?}");
+        assert!(!rendered.contains("secret-thing"), "{rendered}");
+        assert!(rendered.contains("len=14"), "{rendered}");
     }
 }
