@@ -575,3 +575,28 @@ half.
 **Launched** the grounded diagnosis+design job (`edit-1788380923059-44890-0`, docs) →
 `MacosClientDnsFailclosedDiagnosis_2026-09-02.md` with the full per-condition pass/fail map, the
 spec decision, and the strictest-secure fix. F2 plan still running. Fleet at 2.
+
+## Tick 24 — 2026-09-02 ~21:48–22:10Z
+
+**macOS client DnsFailclosed diagnosis MERGED** (`f01dc4fb`,
+MacosClientDnsFailclosedDiagnosis_2026-09-02.md). The design confirms my tick-23 root cause and
+adds a precedence-cited spec decision: Requirements.md:90/:186 key DNS/routing protection on "when
+VPN mode requires protected DNS", and a plain mesh client (ExitMode::Off) is not a protected-routing
+mode, so it must be left UNTOUCHED rather than half-pinned to a rustynet-domain-scoped loopback
+resolver. Chosen fix R1 (fail-closed apply ordering: never pin unless the resolver is up+answering
+and the pf floor is verified live, else restore M1 backup untouched), R2 (no floor-less re-render),
+R3 (client untouched + residue cleanup), R4 (role-scoped verifier without weakening the exit
+contract), with an offline-testable pure DnsPosture decision fn (only FullyProtected/Untouched, no
+Half). I verified the substance (the resolver binds 127.0.0.1:53535 scoped to the `rustynet` domain,
+confirming the half-posture); the doc's specific line anchors drifted (its :9554/:3852 miss), noted
+in the merge message for the review to re-anchor.
+
+**Launched the PHASE B review** (`edit-1788382258128-60267-0`) with the make-or-break concern the
+diagnosis under-weighs: since the rustynet resolver is SCOPED to the mesh domain, leaving a client
+"fully untouched" (general DNS on the LAN resolver) may LEAK `*.rustynet` mesh-name queries to the
+LAN resolver, violating SecurityMinimumBar control 8 for mesh names. The correct posture may be a
+THIRD state — split-horizon (mesh names → loopback scoped resolver; general names → normal DNS) —
+not binary fully-protected-or-untouched. The review must resolve this before any code, re-anchor
+every citation, and confirm R4 is not a verifier weakening.
+
+Fleet: DNS review (60267) + R2 self-heal (45558) running.
