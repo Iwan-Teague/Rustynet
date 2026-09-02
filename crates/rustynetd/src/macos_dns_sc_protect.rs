@@ -767,8 +767,7 @@ pub fn startup_recovery_manual_restore_message(services: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is still loopback but no RustyNet DNS protection is running and the backup document is missing or unreadable ({}). Host DNS resolution will stay broken until the manual fix is applied:\n{per_service}\nThen restart rustynetd.",
-        NETWORKSETUP_DNS_BACKUP_PATH
+        "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is still loopback but no RustyNet DNS protection is running and the backup document is missing or unreadable ({NETWORKSETUP_DNS_BACKUP_PATH}). Host DNS resolution will stay broken until the manual fix is applied:\n{per_service}\nThen restart rustynetd."
     )
 }
 
@@ -828,8 +827,7 @@ pub fn run_startup_dns_recovery(
                 // still loud, still actionable — name the fix shape and the
                 // backup path.
                 return Err(format!(
-                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback, no RustyNet DNS protection is running, and the backup at {} is missing or unreadable. List services with `networksetup -listallnetworkservices` and restore each with:\n  sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}\nThen restart rustynetd.",
-                    NETWORKSETUP_DNS_BACKUP_PATH
+                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback, no RustyNet DNS protection is running, and the backup at {NETWORKSETUP_DNS_BACKUP_PATH} is missing or unreadable. List services with `networksetup -listallnetworkservices` and restore each with:\n  sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}\nThen restart rustynetd."
                 ));
             }
             Err(startup_recovery_manual_restore_message(&services))
@@ -837,8 +835,7 @@ pub fn run_startup_dns_recovery(
         StartupRecoveryDecision::RestoreFromBackup => {
             let Some(socket) = helper_socket_path else {
                 return Err(format!(
-                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback and a backup exists at {}, but no privileged helper socket is configured, so the automatic restore cannot run. Restore manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}` per service, then restart rustynetd.",
-                    NETWORKSETUP_DNS_BACKUP_PATH
+                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback and a backup exists at {NETWORKSETUP_DNS_BACKUP_PATH}, but no privileged helper socket is configured, so the automatic restore cannot run. Restore manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}` per service, then restart rustynetd."
                 ));
             };
             let backup = match backup {
@@ -847,8 +844,7 @@ pub fn run_startup_dns_recovery(
                 // readable), but fail closed anyway instead of panicking.
                 _ => {
                     return Err(format!(
-                        "the networksetup DNS backup at {} became unreadable during startup recovery; restore manually",
-                        NETWORKSETUP_DNS_BACKUP_PATH
+                        "the networksetup DNS backup at {NETWORKSETUP_DNS_BACKUP_PATH} became unreadable during startup recovery; restore manually"
                     ));
                 }
             };
@@ -914,9 +910,7 @@ pub fn run_startup_dns_recovery(
                         NETWORKSETUP_DNS_BACKUP_PATH,
                     ))?;
                     log::warn!(
-                        "RustyNet DNS fail-closed startup guard: post-restore DNS observation unavailable ({}); loopback residue in services absent from the backup at {} may persist until the first apply. The backup restore itself completed.",
-                        reason,
-                        NETWORKSETUP_DNS_BACKUP_PATH
+                        "RustyNet DNS fail-closed startup guard: post-restore DNS observation unavailable ({reason}); loopback residue in services absent from the backup at {NETWORKSETUP_DNS_BACKUP_PATH} may persist until the first apply. The backup restore itself completed."
                     );
                     log::info!(
                         "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)"
