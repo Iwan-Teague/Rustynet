@@ -212,8 +212,8 @@ Residual uncertainty is recorded rather than papered over: run logs prove *which
 | S/M0 constants | pending |
 | S1 helper lease | pending (blocked on sign-off) |
 | S2 daemon lease lifecycle | pending (blocked on sign-off) |
-| S2b helper-liveness restore (A1 fallback) | pending |
+| S2b helper-liveness restore (A1 fallback) | implemented on branch (2026-09-02) — lab-adapter side only; live proof pending |
 | S3 connect retry | pending |
 | M1 installer rendering | pending |
-| M2 site ordering repair | pending |
+| M2 site ordering repair | implemented on branch (2026-09-02) — `MACOS_LAUNCHD_STOP_COMMAND`, `uninstall.rs`, both installer stop regions; live proof pending |
 | Live proof (§5) | pending |

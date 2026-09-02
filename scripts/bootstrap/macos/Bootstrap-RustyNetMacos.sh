@@ -757,7 +757,17 @@ clear_residual_state() {
   # systemd Requires=rustynetd-privileged-helper.service teardown order.
   if launchctl print system/com.rustynet.daemon &>/dev/null 2>&1; then
     launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
-    sleep 1
+    # Wait (bounded, <= 10 s: launchd's 5 s SIGTERM->SIGKILL ceiling + margin)
+    # for the daemon job to report no pid before stopping the helper. `bootout`
+    # returns at SIGTERM delivery, not at job exit, and the daemon's shutdown
+    # rollback dials the privileged-helper socket — the helper must outlive the
+    # daemon (plan M2, MacosHelperShutdownOrderingImplementationPlan_2026-09-02).
+    for _attempt in $(seq 1 20); do
+      if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then
+        break
+      fi
+      sleep 0.5
+    done
   fi
   if launchctl print system/com.rustynet.privileged-helper &>/dev/null 2>&1; then
     launchctl bootout system/com.rustynet.privileged-helper 2>/dev/null || true
