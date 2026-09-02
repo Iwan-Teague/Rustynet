@@ -38,9 +38,9 @@ use crate::key_rotation::{
 #[cfg(target_os = "macos")]
 use crate::phase10::MacosCommandSystem;
 use crate::phase10::{
-    ApplyOptions, DataplaneState, DataplaneSystem, ManagementCidr, PathMode, Phase10Controller,
-    RouteGrantRequest, RuntimeSystem, TraversalProbeDecision, TraversalProbeEvaluation,
-    TraversalProbeReason, TrustEvidence, TrustPolicy,
+    ApplyOptions, DataplaneState, DataplaneSystem, DnsPosture, ManagementCidr, PathMode,
+    Phase10Controller, RouteGrantRequest, RuntimeSystem, TraversalProbeDecision,
+    TraversalProbeEvaluation, TraversalProbeReason, TrustEvidence, TrustPolicy, macos_dns_posture,
 };
 #[cfg(target_os = "linux")]
 use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
@@ -8857,6 +8857,26 @@ impl DaemonRuntime {
             self.force_fail_closed_or_restrict("bootstrap_exit_overlay_exception_violated");
             return;
         }
+        // M2 posture-split (MacosClientResolverNotServingDiagnosisReview
+        // §3.3): at BOOTSTRAP, a plain client's `ScopedResolverOnly` DNS
+        // sub-apply is deferred to the first reconcile pass (the serve loop is
+        // not live yet); `FullyProtected` stays in-bootstrap, serviced by M1's
+        // hoisted-bind probe servicer. macOS only: Linux/Windows DNS paths
+        // have no loopback probe and keep their existing in-bootstrap apply.
+        let bootstrap_exit_mode = if self.node_role.is_blind_exit() {
+            ExitMode::Off
+        } else if self.auto_tunnel_enforce {
+            if auto_exit.is_some() {
+                ExitMode::FullTunnel
+            } else {
+                ExitMode::Off
+            }
+        } else {
+            self.desired_exit_mode()
+        };
+        let defer_scoped_dns = cfg!(target_os = "macos")
+            && macos_dns_posture(bootstrap_exit_mode, serve_exit_node)
+                == DnsPosture::ScopedResolverOnly;
         let apply_result = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
@@ -8872,22 +8892,21 @@ impl DaemonRuntime {
                 ipv6_parity_supported: false,
                 serve_exit_node,
                 blind_exit: self.node_role.is_blind_exit(),
-                exit_mode: if self.node_role.is_blind_exit() {
-                    ExitMode::Off
-                } else if self.auto_tunnel_enforce {
-                    if auto_exit.is_some() {
-                        ExitMode::FullTunnel
-                    } else {
-                        ExitMode::Off
-                    }
-                } else {
-                    self.desired_exit_mode()
-                },
+                exit_mode: bootstrap_exit_mode,
+                defer_scoped_dns_posture: defer_scoped_dns,
             },
         );
         let cleanup_result = self.scrub_runtime_private_key_material();
         match (apply_result, cleanup_result) {
-            (Ok(()), Ok(())) => {}
+            (Ok(()), Ok(())) => {
+                if defer_scoped_dns {
+                    // M2: the scoped DNS posture was deliberately skipped
+                    // during bootstrap; schedule the first-reconcile heal
+                    // through the existing S1 latch so its pass applies the
+                    // posture while the serve loop is live.
+                    self.dns_posture_reassert_pending = true;
+                }
+            }
             (Err(err), Ok(())) => {
                 self.restrict_recoverable(format!("dataplane bootstrap apply failed: {err}"));
                 self.force_fail_closed_or_restrict("bootstrap_apply_failed");
@@ -10562,6 +10581,10 @@ impl DaemonRuntime {
                     ipv6_parity_supported: false,
                     serve_exit_node,
                     blind_exit: self.node_role.is_blind_exit(),
+                    // M2: reconcile-time applies NEVER defer — the serve
+                    // loop is live by then, so the posture applies (and its
+                    // probe is answered) right here.
+                    defer_scoped_dns_posture: false,
                     exit_mode: if self.node_role.is_blind_exit() {
                         ExitMode::Off
                     } else if self.auto_tunnel_enforce {
@@ -18400,6 +18423,83 @@ mod tests {
             via_snapshot.is_some(),
             "the always-answer property must hold through the snapshot core"
         );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// M2 posture-split deferral (MacosClientResolverNotServingDiagnosisReview
+    /// §3.3): a plain client's BOOTSTRAP must not apply the ScopedResolverOnly
+    /// DNS posture — no `apply_dns_protection` op, because the serve loop
+    /// cannot be live yet — and must latch the heal; the FIRST reconcile pass
+    /// then applies it for real and clears the latch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_defers_scoped_dns_posture_to_first_reconcile() {
+        let test_dir = secure_test_dir("rustynetd-m2-scoped-defer");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::None,
+            "a healthy plain client must bootstrap unrestricted"
+        );
+        assert!(
+            runtime.dns_posture_reassert_pending,
+            "bootstrap must latch the scoped DNS posture heal for the first reconcile pass"
+        );
+        let bootstrap_ops = match runtime.controller.system_mut_for_test() {
+            crate::phase10::RuntimeSystem::DryRun(system) => system.operations.clone(),
+            _ => panic!("M2 test requires the InMemory (DryRun) system"),
+        };
+        assert!(
+            !bootstrap_ops.contains(&"apply_dns_protection".to_owned()),
+            "bootstrap must not apply the scoped DNS posture; ops={bootstrap_ops:?}"
+        );
+
+        // First reconcile pass: the latch fires the real scoped apply, now
+        // that the serve loop is (would be) live.
+        runtime.reconcile();
+        assert!(
+            !runtime.dns_posture_reassert_pending,
+            "a successful heal must clear the re-assert latch"
+        );
+        let heal_ops = match runtime.controller.system_mut_for_test() {
+            crate::phase10::RuntimeSystem::DryRun(system) => system.operations.clone(),
+            _ => panic!("M2 test requires the InMemory (DryRun) system"),
+        };
+        assert!(
+            heal_ops.contains(&"apply_dns_protection".to_owned()),
+            "the first reconcile pass must apply the scoped DNS posture; ops={heal_ops:?}"
+        );
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
