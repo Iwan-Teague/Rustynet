@@ -5,9 +5,10 @@ use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    WINDOWS_RELAY_SERVICE_NAME, WINDOWS_RUSTYNET_PATH, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR,
-    WINDOWS_STATE_ROOT, ps_quote, run_remote_ps, run_remote_ps_check,
+    PowerShellScript, WINDOWS_RELAY_SERVICE_NAME, WINDOWS_RUSTYNET_PATH, WINDOWS_SERVICE_NAME,
+    WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT, ps_quote, run_remote_ps, run_remote_ps_check,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -46,11 +47,19 @@ fn empty_artifact_archive_ps_literal() -> String {
 /// Returns the base64-encoded key decoded to hex (32-byte key → 64-char hex).
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
     let key_path = format!(r"{WINDOWS_STATE_ROOT}\keys\wireguard.pub");
-    let script = format!(
-        "Get-Content -LiteralPath {} -Encoding utf8 -Raw",
-        ps_quote(&key_path)?
-    );
-    let raw = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
+    // QH-01 Step 4b: the single-cmdlet script is rendered through the validated
+    // seam, so the path is windows-path-validated and ps-quoted before any
+    // command string exists.
+    let argv = [
+        ValidatedArg::cli_token("Get-Content")?,
+        ValidatedArg::cli_token("-LiteralPath")?,
+        ValidatedArg::windows_path(&key_path)?,
+        ValidatedArg::cli_token("-Encoding")?,
+        ValidatedArg::cli_token("utf8")?,
+        ValidatedArg::cli_token("-Raw")?,
+    ];
+    let script = PowerShellScript::from_call_argv("windows read wireguard public key", &argv)?;
+    let raw = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
     let hex = decode_wireguard_pubkey_to_hex(raw.trim())
         .map_err(|err| AdapterError::Protocol { message: err })?;
     Ok(hex)
@@ -105,15 +114,21 @@ fn collect_node_id_script() -> Result<String, AdapterError> {
 /// env-file reader and must never stand in for a live proof.
 pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, AdapterError> {
     let script = live_identity_status_script()?;
-    let status = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
+    let status = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
     live_identity_from_status(&status)
 }
 
 /// Build the PowerShell script [`query_live_identity`] runs: invoke the
 /// trust CLI's `status` verb (no shell, no untrusted interpolation — the
 /// only dynamic part is the reviewed install path).
-fn live_identity_status_script() -> Result<String, AdapterError> {
-    Ok(format!("& {} status", ps_quote(WINDOWS_RUSTYNET_PATH)?))
+fn live_identity_status_script() -> Result<PowerShellScript, AdapterError> {
+    // QH-01 Step 4b: the single interpolated value (the reviewed install path)
+    // is validated as a windows path and ps-quoted by the seam renderer.
+    let argv = [
+        ValidatedArg::windows_path(WINDOWS_RUSTYNET_PATH)?,
+        ValidatedArg::cli_token("status")?,
+    ];
+    PowerShellScript::from_call_argv("windows live identity status", &argv)
 }
 
 /// Parse the daemon's status response into live identity evidence,
@@ -557,12 +572,20 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
     }
     ssh::scp_from(conn, &remote_tmp_ps, dst, Duration::from_secs(120))?;
 
-    // Remove temp archive from remote (best-effort).
-    let cleanup_script = format!(
-        "Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue",
-        ps_quote(&remote_tmp)?
-    );
-    let _ = run_remote_ps(conn, &cleanup_script, SHORT_TIMEOUT);
+    // Remove temp archive from remote (best-effort). QH-01 Step 4b: built
+    // through the validated seam so the path is validated and ps-quoted
+    // before any command string exists.
+    let cleanup_argv = [
+        ValidatedArg::cli_token("Remove-Item")?,
+        ValidatedArg::cli_token("-LiteralPath")?,
+        ValidatedArg::windows_path(&remote_tmp)?,
+        ValidatedArg::cli_token("-Force")?,
+        ValidatedArg::cli_token("-ErrorAction")?,
+        ValidatedArg::cli_token("SilentlyContinue")?,
+    ];
+    let cleanup_ps =
+        PowerShellScript::from_call_argv("windows remove diagnostic archive", &cleanup_argv)?;
+    let _ = run_remote_ps(conn, cleanup_ps.as_str(), SHORT_TIMEOUT);
 
     // Verify no key material in the collected archive.
     verify_no_key_material_zip(dst)?;
@@ -655,12 +678,20 @@ fn build_runtime_state_cleanup_script() -> Result<String, AdapterError> {
 
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
-    // Stop the daemon service first (best-effort).
-    let stop_script = format!(
-        "Stop-Service -Name {} -Force -ErrorAction SilentlyContinue",
-        ps_quote(WINDOWS_SERVICE_NAME)?
-    );
-    let _ = run_remote_ps(conn, &stop_script, SHORT_TIMEOUT);
+    // Stop the daemon service first (best-effort). QH-01 Step 4b: the service
+    // name is service-name-validated and ps-quoted by the seam renderer.
+    let stop_script = PowerShellScript::from_call_argv(
+        "windows stop service",
+        &[
+            ValidatedArg::cli_token("Stop-Service")?,
+            ValidatedArg::cli_token("-Name")?,
+            ValidatedArg::service(WINDOWS_SERVICE_NAME)?,
+            ValidatedArg::cli_token("-Force")?,
+            ValidatedArg::cli_token("-ErrorAction")?,
+            ValidatedArg::cli_token("SilentlyContinue")?,
+        ],
+    )?;
+    let _ = run_remote_ps(conn, stop_script.as_str(), SHORT_TIMEOUT);
 
     // Stop the relay sibling service too (best-effort; absent on a node that
     // was never elected Relay). Without this, a still-running RustyNetRelay
@@ -669,11 +700,20 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // the file ... because it is being used by another process." — live-lab
     // evidence: this reached a real re-run of the guest and failed
     // bootstrap_hosts on the very next attempt after a relay was deployed.
-    let stop_relay_script = format!(
-        "Stop-Service -Name {} -Force -ErrorAction SilentlyContinue",
-        ps_quote(WINDOWS_RELAY_SERVICE_NAME)?
-    );
-    let _ = run_remote_ps(conn, &stop_relay_script, SHORT_TIMEOUT);
+    // QH-01 Step 4b: rendered through the validated seam (same shape as the
+    // daemon service stop above).
+    let stop_relay_script = PowerShellScript::from_call_argv(
+        "windows stop relay service",
+        &[
+            ValidatedArg::cli_token("Stop-Service")?,
+            ValidatedArg::cli_token("-Name")?,
+            ValidatedArg::service(WINDOWS_RELAY_SERVICE_NAME)?,
+            ValidatedArg::cli_token("-Force")?,
+            ValidatedArg::cli_token("-ErrorAction")?,
+            ValidatedArg::cli_token("SilentlyContinue")?,
+        ],
+    )?;
+    let _ = run_remote_ps(conn, stop_relay_script.as_str(), SHORT_TIMEOUT);
 
     // Best-effort reset of leftover RustyNet dataplane artifacts (killswitch
     // firewall rules + default-deny outbound policy, the DNS fail-closed NRPT
@@ -1765,17 +1805,18 @@ mod tests {
     #[test]
     fn live_identity_script_invokes_trust_cli_status() {
         let script = super::live_identity_status_script().expect("install path must pass ps_quote");
+        let rendered = script.as_str();
         assert!(
-            script.contains("rustynet.exe"),
-            "live identity must go through the trust CLI: {script}"
+            rendered.contains("rustynet.exe"),
+            "live identity must go through the trust CLI: {rendered}"
         );
         assert!(
-            script.ends_with(" status"),
-            "live identity must run the status verb: {script}"
+            rendered.contains("'status'"),
+            "live identity must run the status verb: {rendered}"
         );
         assert!(
-            !script.contains("rustynetd.env"),
-            "live identity must not read the config env-file: {script}"
+            !rendered.contains("rustynetd.env"),
+            "live identity must not read the config env-file: {rendered}"
         );
     }
 
@@ -1809,5 +1850,58 @@ mod tests {
             ),
             other => panic!("expected Protocol error, got: {other:?}"),
         }
+    }
+
+    // ── QH-01 Step 4b: seam-rendered argv-shaped sites ────────────────────────
+
+    #[test]
+    fn wireguard_public_key_script_renders_get_content_argv() {
+        let argv = [
+            ValidatedArg::cli_token("Get-Content").expect("token"),
+            ValidatedArg::cli_token("-LiteralPath").expect("token"),
+            ValidatedArg::windows_path(r"C:\ProgramData\RustyNet\keys\wireguard.pub")
+                .expect("path"),
+            ValidatedArg::cli_token("-Encoding").expect("token"),
+            ValidatedArg::cli_token("utf8").expect("token"),
+            ValidatedArg::cli_token("-Raw").expect("token"),
+        ];
+        let script = PowerShellScript::from_call_argv("windows read wireguard public key", &argv)
+            .expect("ok");
+        assert_eq!(
+            script.as_str(),
+            "$out = & 'Get-Content' '-LiteralPath' 'C:\\ProgramData\\RustyNet\\keys\\wireguard.pub' \
+             '-Encoding' 'utf8' '-Raw' 2>&1; Write-Output $out"
+        );
+    }
+
+    #[test]
+    fn stop_service_script_renders_the_service_name_argv() {
+        let script = PowerShellScript::from_call_argv(
+            "windows stop service",
+            &[
+                ValidatedArg::cli_token("Stop-Service").expect("token"),
+                ValidatedArg::cli_token("-Name").expect("token"),
+                ValidatedArg::service("RustyNet").expect("service"),
+                ValidatedArg::cli_token("-Force").expect("token"),
+                ValidatedArg::cli_token("-ErrorAction").expect("token"),
+                ValidatedArg::cli_token("SilentlyContinue").expect("token"),
+            ],
+        )
+        .expect("ok");
+        assert_eq!(
+            script.as_str(),
+            "$out = & 'Stop-Service' '-Name' 'RustyNet' '-Force' '-ErrorAction' \
+             'SilentlyContinue' 2>&1; Write-Output $out"
+        );
+    }
+
+    #[test]
+    fn windows_traffic_rejection_refuses_a_metacharacter_token_before_any_script_exists() {
+        let err = ValidatedArg::cli_token("RustyNet'; Remove-Item C:\\ -Recurse")
+            .expect_err("metacharacter must be rejected at construction");
+        assert!(
+            err.to_string().contains("CLI token"),
+            "unexpected error: {err}"
+        );
     }
 }

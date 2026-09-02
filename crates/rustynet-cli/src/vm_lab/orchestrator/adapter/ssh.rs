@@ -476,6 +476,25 @@ impl RemoteCommand {
         Ok(Self(joined))
     }
 
+    /// Build a command from validated arguments exactly like [`Self::from_args`],
+    /// then append the fixed trailer ` 2>&1` so the remote shell merges the
+    /// command's stderr into its stdout stream.
+    ///
+    /// This is the ONLY shell operator Step 4b may introduce, and it is a fixed
+    /// literal: no interpolated value ever reaches the operator position, and
+    /// every argument is validated + shell-quoted before the trailer is glued
+    /// on. Sites whose scripts need any other operator (`|`, `&&`, `;`,
+    /// non-trailing redirections) are shell-shaped and stay out of scope until
+    /// the typed renderer-output constructor lands in Step 4d.
+    pub(crate) fn from_args_with_stderr_merged(
+        label: &str,
+        args: &[ValidatedArg],
+    ) -> Result<Self, AdapterError> {
+        let mut joined = Self::from_args(label, args)?.0;
+        joined.push_str(" 2>&1");
+        Ok(Self(joined))
+    }
+
     /// Sink-only accessor: the run_remote sink family in THIS module lowers
     /// this into `cmd.arg(...)`. Do not use it to re-interpolate the payload
     /// into another string.
@@ -1369,6 +1388,30 @@ mod remote_command_seam_tests {
     #[test]
     fn from_args_refuses_an_empty_argument_list() {
         let err = RemoteCommand::from_args("demo", &[]).expect_err("empty is a bug");
+        assert!(err.to_string().contains("demo"));
+    }
+
+    #[test]
+    fn from_args_with_stderr_merged_appends_exactly_the_fixed_trailer() {
+        // `2>&1` is the ONLY shell operator Step 4b may introduce, and it is a
+        // fixed literal appended once — never interpolated, never repeated.
+        let args = [
+            ValidatedArg::cli_token("ping").expect("token"),
+            ValidatedArg::ip("10.0.0.5").expect("ip"),
+        ];
+        let merged = RemoteCommand::from_args_with_stderr_merged("demo", &args).expect("ok");
+        assert_eq!(merged.as_str(), "'ping' '10.0.0.5' 2>&1");
+        let plain = RemoteCommand::from_args("demo", &args).expect("ok");
+        assert_eq!(
+            merged.as_str(),
+            format!("{} 2>&1", plain.as_str()),
+            "the trailer is exactly the from_args rendering plus one fixed ` 2>&1`"
+        );
+    }
+
+    #[test]
+    fn from_args_with_stderr_merged_refuses_an_empty_argument_list() {
+        let err = RemoteCommand::from_args_with_stderr_merged("demo", &[]).expect_err("empty");
         assert!(err.to_string().contains("demo"));
     }
 

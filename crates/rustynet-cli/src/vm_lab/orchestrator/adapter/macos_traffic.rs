@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::macos_install::{MACOS_KEYS_DIR, MACOS_STATE_ROOT};
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
 use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
@@ -348,8 +349,21 @@ pub fn ping_mesh_peer(
     peer_mesh_ip: &str,
 ) -> Result<TrafficTestResult, AdapterError> {
     validate_ip_arg(peer_mesh_ip)?;
-    let script = format!("ping -c 3 -W 1000 '{peer_mesh_ip}' 2>&1");
-    match ssh::run_remote(conn, &script, Duration::from_secs(30)) {
+    // QH-01 Step 4b: argv-shaped script built through the validated seam. The
+    // retained `validate_ip_arg` call keeps the stricter IP semantics
+    // (unspecified/multicast/broadcast rejection) that `ValidatedArg::ip`'s
+    // charset rule alone does not provide; the trailing ` 2>&1` is the fixed
+    // trailer `RemoteCommand::from_args_with_stderr_merged` appends.
+    let args = [
+        ValidatedArg::cli_token("ping")?,
+        ValidatedArg::cli_token("-c")?,
+        ValidatedArg::cli_token("3")?,
+        ValidatedArg::cli_token("-W")?,
+        ValidatedArg::cli_token("1000")?,
+        ValidatedArg::ip(peer_mesh_ip)?,
+    ];
+    let script = ssh::RemoteCommand::from_args_with_stderr_merged("macos ping mesh peer", &args)?;
+    match ssh::run_remote(conn, script.as_str(), Duration::from_secs(30)) {
         Ok(_stdout) => Ok(TrafficTestResult::Reachable),
         Err(AdapterError::Command { stderr, .. }) => Ok(TrafficTestResult::Error(format!(
             "ping to {peer_mesh_ip} failed: {}",
@@ -415,8 +429,16 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
     }
     ssh::scp_from(conn, remote_tmp, dst, Duration::from_secs(120))?;
 
-    // Remove temp archive from remote (best-effort).
-    let _ = ssh::run_remote(conn, &format!("rm -f '{remote_tmp}'"), SHORT_TIMEOUT);
+    // Remove temp archive from remote (best-effort). QH-01 Step 4b: built
+    // through the validated seam so the path is validated and shell-quoted
+    // before any command string exists.
+    let rm_args = [
+        ValidatedArg::cli_token("rm")?,
+        ValidatedArg::cli_token("-f")?,
+        ValidatedArg::path(remote_tmp)?,
+    ];
+    let rm_cmd = ssh::RemoteCommand::from_args("macos remove diagnostic archive", &rm_args)?;
+    let _ = ssh::run_remote(conn, rm_cmd.as_str(), SHORT_TIMEOUT);
 
     verify_no_key_material_tarball(dst)?;
 
@@ -601,22 +623,33 @@ pub fn issue_bundles_to_dir(
     ssh::scp_to(conn, &env_tmp, &remote_env, MEDIUM_TIMEOUT)?;
     let _ = std::fs::remove_file(&env_tmp);
 
-    ssh::run_remote(
-        conn,
-        &format!("mkdir -p '{remote_issue_dir}'"),
-        SHORT_TIMEOUT,
-    )?;
+    // QH-01 Step 4b: argv-shaped script built through the validated seam; the
+    // issue dir is path-validated and shell-quoted before any command exists.
+    let mkdir_args = [
+        ValidatedArg::cli_token("mkdir")?,
+        ValidatedArg::cli_token("-p")?,
+        ValidatedArg::path(&remote_issue_dir)?,
+    ];
+    let mkdir_cmd = ssh::RemoteCommand::from_args("macos create issue dir", &mkdir_args)?;
+    ssh::run_remote(conn, mkdir_cmd.as_str(), SHORT_TIMEOUT)?;
 
-    let safe_rustynet = rustynet_path.replace('\'', "'\"'\"'");
-    ssh::run_remote(
-        conn,
-        &format!(
-            "env RUSTYNET_NODE_ROLE=admin sudo \
-             '{safe_rustynet}' ops {issue_subcmd} \
-             --env-file '{remote_env}' --issue-dir '{remote_issue_dir}'"
-        ),
-        MEDIUM_TIMEOUT,
-    )?;
+    // QH-01 Step 4b: the previous `safe_rustynet` manual quote-escape is
+    // replaced by `ValidatedArg::path` + `RemoteCommand::from_args`, which
+    // validates then shell-quotes every argument.
+    let issue_args = [
+        ValidatedArg::cli_token("env")?,
+        ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin")?,
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::path(rustynet_path)?,
+        ValidatedArg::cli_token("ops")?,
+        ValidatedArg::cli_token(issue_subcmd)?,
+        ValidatedArg::cli_token("--env-file")?,
+        ValidatedArg::path(&remote_env)?,
+        ValidatedArg::cli_token("--issue-dir")?,
+        ValidatedArg::path(&remote_issue_dir)?,
+    ];
+    let issue_cmd = ssh::RemoteCommand::from_args("macos issue bundles", &issue_args)?;
+    ssh::run_remote(conn, issue_cmd.as_str(), MEDIUM_TIMEOUT)?;
 
     // rustynet creates the issue dir as root:root 0700; make it and its
     // files readable by the SSH user so the listing and scp_from below work.
@@ -987,6 +1020,72 @@ mod tests {
         let result = decode_wireguard_pubkey_to_hex(encoded);
         assert!(result.is_err(), "must reject non-32-byte key");
         assert!(result.unwrap_err().contains("32-byte"));
+    }
+
+    // ── QH-01 Step 4b: seam-rendered argv-shaped sites ────────────────────────
+
+    #[test]
+    fn ping_mesh_peer_renders_the_ping_argv_with_stderr_merged() {
+        let ip_arg = ValidatedArg::ip("100.64.0.7").expect("representative mesh ip");
+        let args = [
+            ValidatedArg::cli_token("ping").expect("token"),
+            ValidatedArg::cli_token("-c").expect("token"),
+            ValidatedArg::cli_token("3").expect("token"),
+            ValidatedArg::cli_token("-W").expect("token"),
+            ValidatedArg::cli_token("1000").expect("token"),
+            ip_arg,
+        ];
+        let cmd = ssh::RemoteCommand::from_args_with_stderr_merged("macos ping mesh peer", &args)
+            .expect("all validated");
+        assert_eq!(
+            cmd.as_str(),
+            "'ping' '-c' '3' '-W' '1000' '100.64.0.7' 2>&1"
+        );
+    }
+
+    #[test]
+    fn diagnostic_archive_cleanup_renders_rm_f_with_a_validated_path() {
+        let args = [
+            ValidatedArg::cli_token("rm").expect("token"),
+            ValidatedArg::cli_token("-f").expect("token"),
+            ValidatedArg::path("/tmp/rn_diag_artifacts.tar.gz").expect("path"),
+        ];
+        let cmd =
+            ssh::RemoteCommand::from_args("macos remove diagnostic archive", &args).expect("ok");
+        assert_eq!(cmd.as_str(), "'rm' '-f' '/tmp/rn_diag_artifacts.tar.gz'");
+    }
+
+    #[test]
+    fn issue_bundles_renders_the_env_sudo_invocation_argv() {
+        let args = [
+            ValidatedArg::cli_token("env").expect("token"),
+            ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin").expect("token"),
+            ValidatedArg::cli_token("sudo").expect("token"),
+            ValidatedArg::path("/usr/local/bin/rustynet").expect("path"),
+            ValidatedArg::cli_token("ops").expect("token"),
+            ValidatedArg::cli_token("e2e-issue-assignment-bundles-from-env").expect("token"),
+            ValidatedArg::cli_token("--env-file").expect("token"),
+            ValidatedArg::path("/tmp/rn_issue_env_4242.env").expect("path"),
+            ValidatedArg::cli_token("--issue-dir").expect("token"),
+            ValidatedArg::path("/tmp/rn_issue_4242").expect("path"),
+        ];
+        let cmd = ssh::RemoteCommand::from_args("macos issue bundles", &args).expect("ok");
+        assert_eq!(
+            cmd.as_str(),
+            "'env' 'RUSTYNET_NODE_ROLE=admin' 'sudo' '/usr/local/bin/rustynet' 'ops' \
+             'e2e-issue-assignment-bundles-from-env' '--env-file' '/tmp/rn_issue_env_4242.env' \
+             '--issue-dir' '/tmp/rn_issue_4242'"
+        );
+    }
+
+    #[test]
+    fn macos_traffic_rejection_refuses_a_metacharacter_token_before_any_command_exists() {
+        let err = ValidatedArg::cli_token("e2e-issue-assignment-bundles-from-env; id")
+            .expect_err("metacharacter must be rejected at construction");
+        assert!(
+            err.to_string().contains("CLI token"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
