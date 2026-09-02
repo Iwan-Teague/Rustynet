@@ -2,12 +2,14 @@
 //! `LiveLabMacosExitServingAdapterDesign_2026-09-02.md` §0 decision 2/3, §3,
 //! §4; adversarial review §2–§4 amendments A3/A6 folded).
 //!
-//! Everything here is pure parsing/evaluation over captured text — no I/O, no
-//! SSH, no pf mutation. The live `NodeAdapter` wiring in `adapter/macos.rs`,
-//! the `active_exit_runtime_implemented` predicate flip, and the role.rs remap
-//! are deliberately NOT in this module: they are lab-gated changes (design §6)
-//! and land separately. Until then most of these helpers are intentionally
-//! unreferenced outside their tests.
+//! The pure parsing/evaluation helpers below are the shared core; the live
+//! `NodeAdapter` wiring (SSH dispatch through the validated-argument seam,
+//! the A2 pre-activation precedence-baseline driver) now lives in the second
+//! half of this module and is called from `adapter/macos.rs`. The
+//! `active_exit_runtime_implemented` predicate flip and the role.rs remap
+//! remain lab-gated (design §6) and are deliberately NOT here — until they
+//! land, the S2 egress-evidence family stays intentionally unreferenced
+//! outside its tests.
 //!
 //! Two evidence surfaces, both defined by this design (§3, §4):
 //! 1. the daemon's own `macos-exit-nat-lifecycle-snapshot` JSON (schema v1,
@@ -270,7 +272,7 @@ pub fn parse_macos_pf_state_translation_line(
 /// True when `addr` is inside the mesh CGNAT range `100.64.0.0/10` — IPv4
 /// with first octet 100 and second octet 64–127. Mirrors the Linux/Windows
 /// adapters' mesh-source classification; non-IPv4 (or any IPv6) is false.
-fn is_mesh_cgnat_addr(addr: IpAddr) -> bool {
+pub(crate) fn is_mesh_cgnat_addr(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -543,6 +545,357 @@ pub fn evaluate_macos_exit_egress_evidence(
          observation nor a two-phase fallback record is present"
             .to_owned(),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Live NodeAdapter wiring (design §3/§5; review amendment A2)
+// ---------------------------------------------------------------------------
+
+use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
+use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
+use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
+use crate::vm_lab::orchestrator::connection::NodeConnection;
+use crate::vm_lab::orchestrator::error::AdapterError;
+
+/// The lab mesh CIDR every macOS exit snapshot is taken against and the
+/// prefix the daemon's NAT rule must carry for a serving assertion to pass.
+/// The exit-NAT-lifecycle role validation imports this constant, so the
+/// adapter and the stage can never disagree about the expected prefix.
+pub(crate) const MACOS_EXIT_EXPECTED_MESH_CIDR: &str = "100.64.0.0/10";
+
+/// Guest-side path the daemon's own `macos-exit-killswitch-precedence-check`
+/// writes its schema-v1 artifact to. A compile-time constant, validated at
+/// the seam like every other argv element — no runtime value ever reaches a
+/// command line unvalidated.
+pub(crate) const MACOS_EXIT_KILLSWITCH_PRECEDENCE_ARTIFACT_PATH: &str =
+    "/usr/local/var/rustynet/macos_exit_killswitch_precedence.json";
+
+/// The mutating precedence experiment writes + restores the anchor; bound it
+/// generously but finitely like every other adapter command.
+const EXIT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Convergence retry budget for the mesh-client NAT-session assertion
+/// (design §3: bounded retry — 10 attempts, 1.5 s apart).
+const NAT_SESSION_ATTEMPTS: usize = 10;
+const NAT_SESSION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Build `sudo -n <daemon> <subcommand> [extra…]` from validated argv
+/// elements: the daemon path as a POSIX path, everything else per its class.
+/// This is the ONLY command-construction path in this module — a `format!`-
+/// built shell string with runtime values can never reach the sink.
+fn daemon_command(
+    label: &str,
+    subcommand: &str,
+    extra: &[ValidatedArg],
+) -> Result<ssh::RemoteCommand, AdapterError> {
+    let mut args = vec![
+        ValidatedArg::cli_token("sudo").map_err(AdapterError::from)?,
+        ValidatedArg::cli_token("-n").map_err(AdapterError::from)?,
+        ValidatedArg::path(MACOS_RUSTYNETD_PATH).map_err(AdapterError::from)?,
+        ValidatedArg::cli_token(subcommand).map_err(AdapterError::from)?,
+    ];
+    args.extend(extra.iter().cloned());
+    ssh::RemoteCommand::from_args(label, &args)
+}
+
+/// Capture one `macos-exit-nat-lifecycle-snapshot` JSON document from the
+/// guest — the daemon's own verifier output, captured verbatim. The CLI never
+/// re-derives pf parsing (design §0 decision 2).
+pub(crate) fn capture_exit_snapshot(conn: &NodeConnection) -> Result<String, AdapterError> {
+    let script = daemon_command(
+        "macos exit nat lifecycle snapshot",
+        "macos-exit-nat-lifecycle-snapshot",
+        &[ValidatedArg::cidr(MACOS_EXIT_EXPECTED_MESH_CIDR)
+            .map_err(AdapterError::from)?],
+    )?;
+    ssh::run_remote(conn, script.as_str(), EXIT_COMMAND_TIMEOUT)
+}
+
+/// Assert (never actuate) the exit-serving posture through the daemon's own
+/// snapshot: anchor present, forwarding enabled, prefix equal to the run's
+/// mesh CIDR. A missing, unparseable, or drifting snapshot is a named
+/// protocol error — never a skip, never a pass.
+pub(crate) fn assert_exit_snapshot_serving(
+    conn: &NodeConnection,
+    phase: &str,
+) -> Result<(), AdapterError> {
+    let raw = capture_exit_snapshot(conn)?;
+    assess_exit_snapshot(&raw, MACOS_EXIT_EXPECTED_MESH_CIDR)
+        .map_err(|reason| AdapterError::Protocol {
+            message: format!("macos exit {phase}: {reason}"),
+        })?;
+    Ok(())
+}
+
+/// The pre-activation baseline position (design §5/A2): run the daemon's own
+/// MUTATING killswitch-precedence experiment (snapshot the active anchor →
+/// flush it → prove the assertion fails → restore the exact rules), evaluate
+/// its artifact with the hub evaluator, then CLOSE the window with a
+/// post-baseline lifecycle snapshot proving the restore. Legal ONLY through
+/// [`MacosExitActivationSequence::precedence_baseline`], which refuses once
+/// activation has been attempted.
+pub(crate) fn run_killswitch_precedence_baseline(
+    conn: &NodeConnection,
+    alias: &str,
+) -> Result<(), AdapterError> {
+    let check_script = daemon_command(
+        "macos exit killswitch precedence check",
+        "macos-exit-killswitch-precedence-check",
+        &[
+            ValidatedArg::cli_token("--output").map_err(AdapterError::from)?,
+            ValidatedArg::path(MACOS_EXIT_KILLSWITCH_PRECEDENCE_ARTIFACT_PATH)
+                .map_err(AdapterError::from)?,
+        ],
+    )?;
+    ssh::run_remote(conn, check_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
+
+    // Read the artifact back and evaluate it: a missing, stale, unparseable,
+    // or foreign-schema artifact is an error here — never a skip.
+    let read_script = ssh::RemoteCommand::from_args(
+        "read macos exit killswitch precedence artifact",
+        &[
+            ValidatedArg::cli_token("cat").map_err(AdapterError::from)?,
+            ValidatedArg::path(MACOS_EXIT_KILLSWITCH_PRECEDENCE_ARTIFACT_PATH)
+                .map_err(AdapterError::from)?,
+        ],
+    )?;
+    let raw_artifact = ssh::run_remote(conn, read_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
+    crate::vm_lab::evaluate_macos_exit_killswitch_precedence_artifact(alias, &raw_artifact)
+        .map_err(|reason| AdapterError::Protocol {
+            message: format!("macos exit killswitch precedence baseline: {reason}"),
+        })?;
+
+    // A2: the experiment window is closed by a post-check snapshot proving
+    // the daemon restored the exact anchor it flushed.
+    assert_exit_snapshot_serving(conn, "killswitch-precedence restore")
+}
+
+/// Ordering driver for the macOS exit-serving sequence (design §5/A2): the
+/// mutating killswitch-precedence experiment is legal ONLY from the
+/// pre-activation baseline position. The remote effects are closures so the
+/// ordering guarantee is testable offline without SSH — the same pattern as
+/// `drive_restart_with_helper_liveness` in `macos_install.rs`.
+pub(crate) struct MacosExitActivationSequence {
+    activation_attempted: bool,
+}
+
+impl MacosExitActivationSequence {
+    pub(crate) fn new() -> Self {
+        Self {
+            activation_attempted: false,
+        }
+    }
+
+    /// Issue the precedence baseline. Refused with a named error once the
+    /// sequence has reached activation: the check NEVER runs against a live
+    /// exit-serving posture.
+    pub(crate) fn precedence_baseline(
+        &mut self,
+        step: &mut dyn FnMut() -> Result<(), AdapterError>,
+    ) -> Result<(), AdapterError> {
+        if self.activation_attempted {
+            return Err(AdapterError::Protocol {
+                message: "macos-exit-killswitch-precedence-check refused: the exit-serving \
+                          sequence is already activated; the precedence experiment never runs \
+                          against a live exit-serving posture (design §5/A2)"
+                    .to_owned(),
+            });
+        }
+        step()
+    }
+
+    /// Activate. From the moment activation is attempted — success OR failure
+    /// — the mutating precedence experiment is permanently out of position
+    /// (fail-closed: after a failed activation the posture is unknown, so no
+    /// further mutation is issued).
+    pub(crate) fn activate(
+        &mut self,
+        step: &mut dyn FnMut() -> Result<(), AdapterError>,
+    ) -> Result<(), AdapterError> {
+        self.activation_attempted = true;
+        step()
+    }
+}
+
+/// The macOS adapter's `activate_exit_serving`, A2-ordered: precedence
+/// baseline (its own post-check restore snapshot) THEN the activation assert.
+/// Assert-not-actuate: the daemon holds the enforce-time NAT; the adapter
+/// verifies it through the daemon's own snapshot and never mutates the
+/// product firewall from the CLI (design §0 decision 2).
+pub(crate) fn activate_exit_serving(
+    conn: &NodeConnection,
+    alias: &str,
+) -> Result<(), AdapterError> {
+    let mut sequence = MacosExitActivationSequence::new();
+    sequence.precedence_baseline(&mut || run_killswitch_precedence_baseline(conn, alias))?;
+    sequence.activate(&mut || assert_exit_snapshot_serving(conn, "activation"))
+}
+
+/// The macOS adapter's `assert_exit_actively_serving`: the same daemon
+/// snapshot with the same three-part verdict, without the baseline sequence.
+pub(crate) fn assert_exit_actively_serving(conn: &NodeConnection) -> Result<(), AdapterError> {
+    assert_exit_snapshot_serving(conn, "active-serving assertion")
+}
+
+/// Resolve the exit's egress IP address on the guest: the default-route
+/// interface, then that interface's address. Both steps are argv-only, and
+/// the runtime-derived interface name is validated at the seam before it may
+/// join a command line — the identity correlation itself always runs in Rust.
+fn resolve_exit_egress_addr(conn: &NodeConnection) -> Result<IpAddr, AdapterError> {
+    let route_script = ssh::RemoteCommand::from_args(
+        "resolve default route interface",
+        &[
+            ValidatedArg::cli_token("route").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("-n").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("get").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("default").map_err(AdapterError::from)?,
+        ],
+    )?;
+    let route_out = ssh::run_remote(conn, route_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
+    let iface = route_out
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("interface:"))
+        .map(str::trim)
+        .ok_or_else(|| AdapterError::Protocol {
+            message:
+                "macos exit egress: `route -n get default` reported no `interface:` line"
+                    .to_owned(),
+        })?;
+    let iface_arg = ValidatedArg::cli_token(iface).map_err(AdapterError::from)?;
+    let addr_script = ssh::RemoteCommand::from_args(
+        "resolve egress interface address",
+        &[
+            ValidatedArg::cli_token("ipconfig").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("getifaddr").map_err(AdapterError::from)?,
+            iface_arg,
+        ],
+    )?;
+    let addr_out = ssh::run_remote(conn, addr_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
+    addr_out.trim().parse::<IpAddr>().map_err(|_| {
+        AdapterError::Protocol {
+            message: format!(
+                "macos exit egress: interface {iface} reported unparseable address {addr_out:?}"
+            ),
+        }
+    })
+}
+
+/// Parse every translatable line of a global `pfctl -s state` capture. Lines
+/// describing other protocols or state classes do not parse as client-NAT
+/// translations and are skipped (counted for the failure message, design A3:
+/// the GLOBAL state view is the surface, so foreign lines are expected);
+/// non-empty captures that correlate nothing fail at selection time.
+fn parse_pf_state_translations(pf_state_output: &str) -> (Vec<PfStateTranslation>, usize) {
+    let mut records = Vec::new();
+    let mut skipped = 0usize;
+    for line in pf_state_output.lines() {
+        match parse_macos_pf_state_translation_line(line) {
+            Ok(record) => records.push(record),
+            Err(_) => {
+                if !line.trim().is_empty() {
+                    skipped += 1;
+                }
+            }
+        }
+    }
+    (records, skipped)
+}
+
+/// Weaker range-mode selection for the no-known-client-address case: the
+/// first mesh-sourced (`100.64.0.0/10`) translation whose translated side is
+/// the exit's egress address. The resulting claim stays the honest weaker one
+/// (a mesh-sourced session was translated — not THE probed client's).
+pub(crate) fn select_macos_client_nat_state_by_range(
+    states: &[PfStateTranslation],
+    exit_egress_addr: IpAddr,
+) -> Result<PfStateTranslation, String> {
+    states
+        .iter()
+        .find(|s| is_mesh_cgnat_addr(s.original_source) && s.translated_source == exit_egress_addr)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "pf_state_no_mesh_correlating_record: no pf state record translates a \
+                 100.64.0.0/10 source to {exit_egress_addr}"
+            )
+        })
+}
+
+/// The macOS adapter's `assert_mesh_client_nat_session` (design §3): the
+/// daemon snapshot proves the anchor/prefix half, the read-only global
+/// `pfctl -s state` capture proves the translation half, and the client
+/// identity correlation runs in RUST — never as a guest-side command
+/// argument. Retries for convergence within a bounded budget.
+pub(crate) fn assert_mesh_client_nat_session(
+    conn: &NodeConnection,
+    expected_client_mesh_addr: Option<&str>,
+) -> Result<MeshClientNatSession, AdapterError> {
+    let client_mesh_addr = expected_client_mesh_addr
+        .map(|raw| {
+            raw.trim().parse::<IpAddr>().map_err(|_| AdapterError::Protocol {
+                message: format!(
+                    "macos exit nat-session: unparseable expected client mesh address {raw:?}"
+                ),
+            })
+        })
+        .transpose()?;
+    let exit_egress_addr = resolve_exit_egress_addr(conn)?;
+
+    let pf_state_script = ssh::RemoteCommand::from_args(
+        "capture global pf state",
+        &[
+            ValidatedArg::cli_token("sudo").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("-n").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("pfctl").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("-s").map_err(AdapterError::from)?,
+            ValidatedArg::cli_token("state").map_err(AdapterError::from)?,
+        ],
+    )?;
+
+    let mut last_reason = String::from("no attempt completed");
+    for attempt in 1..=NAT_SESSION_ATTEMPTS {
+        // Anchor/prefix half — a posture failure is retried for convergence
+        // like the translation half (the daemon may still be applying).
+        if let Err(e) = assert_exit_snapshot_serving(conn, "nat-session anchor check") {
+            last_reason = e.to_string();
+        } else {
+            // Translation half.
+            let state_out =
+                ssh::run_remote(conn, pf_state_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
+            let (records, skipped) = parse_pf_state_translations(&state_out);
+            let selection = match client_mesh_addr {
+                Some(client) => select_macos_client_nat_state(&records, client, exit_egress_addr),
+                None => select_macos_client_nat_state_by_range(&records, exit_egress_addr),
+            };
+            match selection {
+                Ok(record) => {
+                    return Ok(MeshClientNatSession {
+                        client_source: record.original_source.to_string(),
+                        translated_side: record.translated_source.to_string(),
+                        observed_via: "pf",
+                    });
+                }
+                Err(mut reason) => {
+                    if skipped > 0 {
+                        reason.push_str(&format!(
+                            " ({skipped} non-translation state line(s) skipped)"
+                        ));
+                    }
+                    last_reason = reason;
+                }
+            }
+        }
+        if attempt < NAT_SESSION_ATTEMPTS {
+            std::thread::sleep(NAT_SESSION_BACKOFF);
+        }
+    }
+    Err(AdapterError::Protocol {
+        message: format!(
+            "macos exit nat-session: no correlating pf state after {NAT_SESSION_ATTEMPTS} \
+             attempts: {last_reason}"
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -956,5 +1309,132 @@ mod tests {
         let err = evaluate_macos_exit_egress_evidence(&json, "run-1", CLIENT, EXIT_EGRESS)
             .expect_err("mismatched declared exit address must reject");
         assert!(err.contains("exit_addr_mismatch"), "{err}");
+    }
+}
+
+// ─── Live-wiring ordering + selection tests (design §5/A2, §7) ─────────────
+
+#[cfg(test)]
+mod live_wiring_tests {
+    use super::*;
+
+    const EXIT_EGRESS: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 64, 10));
+
+    fn translation(original: &str, translated: &str) -> PfStateTranslation {
+        let line = format!(
+            "ALL udp {translated}:51820 ({original}:51820) -> 1.1.1.1:53  MULTIPLE:MULTIPLE"
+        );
+        parse_macos_pf_state_translation_line(&line)
+            .unwrap_or_else(|e| panic!("fixture line should parse: {e}"))
+    }
+
+    // ----- A2 ordering driver ----------------------------------------------
+
+    #[test]
+    fn precedence_baseline_runs_before_activation() {
+        let mut calls: Vec<&'static str> = Vec::new();
+        let mut sequence = MacosExitActivationSequence::new();
+        sequence
+            .precedence_baseline(&mut || {
+                calls.push("precedence");
+                Ok(())
+            })
+            .expect("baseline before activation must run");
+        sequence
+            .activate(&mut || {
+                calls.push("activate");
+                Ok(())
+            })
+            .expect("activation must run");
+        assert_eq!(calls, vec!["precedence", "activate"]);
+    }
+
+    #[test]
+    fn precedence_check_cannot_be_issued_after_activation() {
+        // THE A2 pin: once the sequence reached activation, the mutating
+        // precedence experiment is refused — it never runs against a live
+        // exit-serving posture.
+        let mut sequence = MacosExitActivationSequence::new();
+        sequence
+            .activate(&mut || Ok(()))
+            .expect("activation must run");
+        let mut issued = false;
+        let err = sequence
+            .precedence_baseline(&mut || {
+                issued = true;
+                Ok(())
+            })
+            .expect_err("precedence after activation must be refused");
+        assert!(!issued, "the step closure must never run");
+        assert!(err.to_string().contains("already activated"), "{err}");
+        assert!(err.to_string().contains("never runs"), "{err}");
+    }
+
+    #[test]
+    fn activation_failure_still_disables_precedence() {
+        // Fail-closed: after a FAILED activation the posture is unknown, so
+        // the mutating experiment is refused too.
+        let mut sequence = MacosExitActivationSequence::new();
+        let err = sequence
+            .activate(&mut || {
+                Err(AdapterError::Protocol {
+                    message: "anchor absent".to_owned(),
+                })
+            })
+            .expect_err("activation failure must propagate");
+        assert!(err.to_string().contains("anchor absent"), "{err}");
+        let mut issued = false;
+        let err = sequence
+            .precedence_baseline(&mut || {
+                issued = true;
+                Ok(())
+            })
+            .expect_err("precedence after failed activation must be refused");
+        assert!(!issued, "the step closure must never run");
+        assert!(err.to_string().contains("already activated"), "{err}");
+    }
+
+    // ----- range-mode selection (no known client address) -------------------
+
+    #[test]
+    fn select_by_range_correlates_mesh_source_to_exit_egress() {
+        let records = vec![
+            translation("192.168.1.5", "192.168.64.10"), // non-mesh source
+            translation("100.64.0.9", "192.168.64.99"),  // wrong translated side
+            translation("100.64.0.7", "192.168.64.10"),  // the match
+        ];
+        let picked = select_macos_client_nat_state_by_range(&records, EXIT_EGRESS)
+            .expect("mesh-sourced translation must be found");
+        assert_eq!(picked.original_source.to_string(), "100.64.0.7");
+        assert_eq!(picked.translated_source, EXIT_EGRESS);
+    }
+
+    #[test]
+    fn select_by_range_rejects_non_mesh_and_untranslated_captures() {
+        let non_mesh = vec![translation("192.168.1.5", "192.168.64.10")];
+        let err = select_macos_client_nat_state_by_range(&non_mesh, EXIT_EGRESS)
+            .expect_err("a non-mesh source must not satisfy the range claim");
+        assert!(err.contains("pf_state_no_mesh_correlating_record"), "{err}");
+
+        let empty: Vec<PfStateTranslation> = Vec::new();
+        let err = select_macos_client_nat_state_by_range(&empty, EXIT_EGRESS)
+            .expect_err("an empty capture must fail closed");
+        assert!(err.contains("pf_state_no_mesh_correlating_record"), "{err}");
+    }
+
+    // ----- pf state capture parsing -----------------------------------------
+
+    #[test]
+    fn parse_pf_state_translations_skips_non_translation_lines_and_counts_them() {
+        let capture = "\
+self tcp 192.168.64.10:51400 (100.64.0.9:51400) -> 1.1.1.1:443       TIME_WAIT:TIME_WAIT
+ALL udp 192.168.64.10:51820 (100.64.0.7:51820) -> 1.1.1.1:53  MULTIPLE:MULTIPLE
+
+tcp 10.0.0.2:49152 -> 10.0.0.1:22       ESTABLISHED:ESTABLISHED
+";
+        let (records, skipped) = parse_pf_state_translations(capture);
+        assert_eq!(records.len(), 2, "both self-prefixed translations parse");
+        assert_eq!(skipped, 1, "the foreign tcp line is counted, not fatal");
+        assert_eq!(records[1].original_source.to_string(), "100.64.0.7");
     }
 }
