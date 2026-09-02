@@ -552,8 +552,7 @@ mod tests {
             let id = id.clone();
             assert!(
                 full.contains(&id),
-                "full plan must dispatch {:?} for the macOS anchor cell (MAC-D3)",
-                id
+                "full plan must dispatch {id:?} for the macOS anchor cell (MAC-D3)"
             );
         }
         let without_live = ids(PlanBuilder::new().with_skip_live_suite(true));
@@ -561,8 +560,7 @@ mod tests {
             let id = id.clone();
             assert!(
                 !without_live.contains(&id),
-                "skip_live_suite must drop {:?} unless a macOS anchor is elected",
-                id
+                "skip_live_suite must drop {id:?} unless a macOS anchor is elected"
             );
         }
         // Fast path: electing a macOS anchor keeps the three validators in the
@@ -575,8 +573,7 @@ mod tests {
             let id = id.clone();
             assert!(
                 fast_path.contains(&id),
-                "skip_live_suite + anchor-platform macos must retain {:?} (MAC-D3 fast path)",
-                id
+                "skip_live_suite + anchor-platform macos must retain {id:?} (MAC-D3 fast path)"
             );
         }
         assert!(
