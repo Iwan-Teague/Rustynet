@@ -688,3 +688,16 @@ ScopedResolverOnly). **Merged the F2 freshness-plan review** (`22c4ff26`, ACCEPT
 Option A print-verbatim confirmed strictest). Fleet briefly at 0 by design while gating the
 release-blocker — new launches held to avoid a main.rs/mod.rs collision with the merging DNS fix;
 refill from the merged HEAD next tick (F2 impl, QH-01 4d-ii). main 22c4ff26, clean.
+
+### Tick 28 continuation — DNS fix MERGED + live-proof harvest launched (~23:35Z)
+
+The two-crate gate came back fully green (fmt clean; clippy clean on rustynetd + rustynet-cli;
+all rustynetd tests; rustynet-cli 3402 tests). **Merged the macOS DNS three-state posture fix**
+(`345fe219`) — the release-blocking DnsFailclosed defect is now fixed on main. Rebuilt the vm-lab
+CLI from the merged tree, truncated the guest sampler, and **launched the live-proof rank-1 harvest**
+(`labrun-1788387277223-11683-0`) — running detached, past the clean-tree gate into bootstrap. The
+macOS validate_baseline_runtime/DnsFailclosed stage (client = ScopedResolverOnly) hits ~13 min in;
+next tick reads the stage report + ledger row + `scutil --dns` on the guest. If it passes, that is
+the FIRST macOS role proven green on the `--node` engine — log it prominently and commit the ledger
+rows. **Refilled the fleet: launched the F2 freshness implementation** (`edit-1788387264479-11491-0`,
+Option A print-verbatim per the plan+review, gates both crates). main 345fe219, clean.
