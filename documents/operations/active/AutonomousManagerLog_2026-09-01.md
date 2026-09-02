@@ -644,3 +644,19 @@ confirm it is removed at final review.
 Fleet intentionally lean at 1 (the charter sanctions 1-2 for this release-blocking security fix; it
 runs autonomously and I am reserving review bandwidth for its full diff). CI green through the
 recent merges. main 4e8f17f3, clean.
+
+## Tick 27 — 2026-09-02 ~22:48–23:00Z
+
+DNS three-state fix (`edit-1788383472503-67869-0`) has M1+M2 committed (`97d6442f` "Apply macOS DNS
+protection by posture: scoped-only for plain clients (M2)") and is at **1.85M/2M tokens** — it will
+HALT on budget within a turn. M1+M2 is the core apply restructure; M3 (no floor-less re-render), M4
+(startup residue), M5 (posture-scoped verifier — REQUIRED for the harvest to accept ScopedResolverOnly)
+and M6 (fold) remain. When it halts with a checkpoint I will gate what landed, then relaunch
+base_ref=the branch to finish M3-M6; M2 alone is NOT mergeable (the verifier still expects the full
+posture until M5). No partial merge.
+
+**Launched the F2 freshness-plan review** (`edit-1788385756157-88436-0`, docs) to keep the fleet ≥1
+through the DNS-fix halt — collision-free (F2 owns macos_exit_killswitch_precedence, not the DNS
+fix's macos_dns_failclosed/phase10-DNS). It checks whether Option A (print-verbatim) is truly
+strictest-secure and closes the stale-file window without a new stdout-interleaving risk. Fleet at 2.
+CI green through the recent merges. main b44a8ff6, clean.
