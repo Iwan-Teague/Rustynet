@@ -50,15 +50,20 @@ impl OrchestrationStage for MacosRoleTransitionValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // Election first: a run that did not elect macOS for role transition
+        // (every Linux-only run included) records a reported skip, exactly as
+        // the legacy hub gate did. Only an ELECTED run then fails closed when
+        // the topology cannot supply exactly one macOS target.
+        if !ctx.macos_role_transition_elected {
+            return StageOutcome::Skipped(
+                "skipped: macOS is not elected for role transition (role_switch_platform != macos)"
+                    .to_owned(),
+            );
+        }
         let alias = match macos_role_transition_alias(ctx) {
             Ok(alias) => alias,
             Err(err) => return StageOutcome::Failed(err),
         };
-        if !ctx.macos_role_transition_elected {
-            return StageOutcome::Skipped(format!(
-                "skipped: {alias} is not elected for role transition (role_switch_platform != macos)"
-            ));
-        }
         let inventory_path = match ctx.inventory_path.as_deref() {
             Some(path) => path.to_owned(),
             None => {
@@ -139,17 +144,30 @@ mod tests {
     }
 
     #[test]
-    fn fails_closed_when_no_macos_node_exists() {
+    fn skips_with_reason_when_macos_is_not_elected() {
+        // Every run that did not elect macOS for role transition — a
+        // Linux-only run included — must record a reported skip, never a
+        // failure: the stage is in the default plan.
         let mut ctx = empty_ctx();
         assert!(
             !ctx.macos_role_transition_elected,
             "a fresh context must default to not-elected (fail closed)"
         );
-        let stage = MacosRoleTransitionValidationStage;
-        let outcome = stage.execute(&mut ctx);
+        let outcome = MacosRoleTransitionValidationStage.execute(&mut ctx);
+        assert!(
+            matches!(&outcome, StageOutcome::Skipped(reason) if reason.contains("not elected")),
+            "a non-elected run must skip with a reason: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn fails_closed_when_elected_but_no_macos_node_exists() {
+        let mut ctx = empty_ctx();
+        ctx.macos_role_transition_elected = true;
+        let outcome = MacosRoleTransitionValidationStage.execute(&mut ctx);
         assert!(
             matches!(&outcome, StageOutcome::Failed(message) if message.contains("no macOS node")),
-            "without a macOS node the stage fails closed rather than skipping silently: {outcome:?}"
+            "an elected run without a macOS node fails closed rather than skipping silently: {outcome:?}"
         );
     }
 
