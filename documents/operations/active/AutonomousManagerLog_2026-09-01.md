@@ -383,3 +383,27 @@ tick; the enforce-refresh plan relaunch is next. The R2 clock-skew plan job
 (`edit-1788366061714-71947-0`) is progressing slowly (new turns appearing) and was kept.
 
 **Also launched:** Windows R2 clock-skew hardening plan (`edit-1788366061714-71947-0`, docs).
+
+## Tick 18 — 2026-09-02 ~17:58–18:15Z
+
+**Enforce-refresh parity plan MERGED** (`9c907071`, `MacosEnforceRefreshParityPlan_2026-09-02.md`).
+Verified at the gate: Requirements.md:90/:146/:186/:197 and SecurityMinimumBar.md:240-243/:283
+say what the plan quotes; `maybe_assert_dns_posture` does skip unless `controller.dns_protected()`;
+the startup block runs `run_startup_dns_recovery` then `runtime.bootstrap()` with no apply. Its
+ratified decision matches mine: the product-side startup re-apply of the persisted protected
+posture is the PRIMARY fix on both platforms (the Linux trust-refresh timer is reclassified as a
+fail-open window that merely masks the gap), the enforce-path `state refresh` is the lab-side
+proof enabler. Two stale "unknown" bullets (already resolved in §2/§3.1) removed at the gate. One
+anchor is off — the plan cites the `protected_dns` arm at `phase10.rs:6535`; the symbol is at
+:391/:409/:6852 — left for the review to correct with the rest of its anchor table.
+**PHASE B review launched** → `edit-1788368507314-4519-0`, with the pointed question of whether a
+startup re-apply of an EXPIRED persisted generation would itself violate fail-closed, and whether
+the strictest-secure scope is to re-apply only the LOCAL protective posture (DNS pin + DNS block +
+killswitch) at startup and leave peers/routes to the refresh.
+
+**Fleet health.** S2b/M2 fixes (`…86936-0`): 2 commits + `macos_traffic.rs` in progress. C2
+unquarantine (`…87816-0`): editing `vm_lab/mod.rs`. R2 clock-skew plan: the tick-17 launch
+(`…71947-0`) hung in a reasoning turn for 25 min (spend frozen) — killed and relaunched as
+`edit-1788367835553-94044-0` (1 commit already). Owner mentioned a patchy internet link; that
+fits the hang signature (a dropped SSE stream that OpenCode never times out) — the stall rule plus
+commit-per-milestone is the mitigation.
