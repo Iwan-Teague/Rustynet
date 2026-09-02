@@ -220,3 +220,8 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - MERGED: S2b/M2 (the merge conflicted with Step 4c in macos_install.rs's test module — both test blocks kept verbatim; macos_install + validated_args tests and clippy 1.88 re-run on the merged tree).
 - INCIDENT (self-inflicted, fixed): the S2b merge conflicted with Step 4c in macos_install.rs's test module; my concatenation resolution dropped one closing brace and the chain committed + pushed 687d67d5 before the compile result was read — rustynet-cli did not compile on main for two commits (687d67d5..1bb6b2a7). Fixed at d2695632 (74 macos_install tests + clippy 1.88 green, commit gated on the results this time). Lesson recorded: every merge-conflict resolution must be compile-gated before commit, and commits must be `&&`-chained on the gate result.
 - MERGED: AT-2 client-pinning design (finding: no production client reaches a --allow-lan anchor today; the pin's signed-field trust bootstrap is an owner decision — deferred).
+
+## Tick 14 — 2026-09-02 08:10
+
+- Whole rustynet-cli suite on the merged main: 2908 passed, 0 failed (post-incident confirmation). vm-lab CLI rebuilt from the fixed main.
+- LAB: rank-1 macOS-client full suite RELAUNCHED as the live proof for S2b/M2 + the durable DNS backup (see the job id in the loop journal / state/deepseek-mcp-jobs).
