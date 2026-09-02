@@ -194,3 +194,9 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - LAB: Ubuntu guest booted (ubuntu-utm-1 → 192.168.65.9; inventory refreshed 091f5e09). Three-node run launched with entry_vm=ubuntu-utm-1 so two_hop/relay/anchor cells can dispatch.
 - MERGED: QH-01 Step 4b (13 argv-shaped traffic sites; pin ratcheted 160→158 at the gate).
 - LAUNCH (code): QH-01 Step 4c — install/membership adapters, argv-shaped sites (edit-1788328738505-43825-0). Four GLM jobs in flight (helper fold+Q-1, P2 inverse map, DNS-backup durable path, Step 4c). Three-node lab run labrun-1788328399035-39708-0 in bootstrap_hosts (Ubuntu builds).
+
+## Tick 13 — 2026-09-02 07:06
+
+- MERGED: helper-ordering plan fold + Q-1 evidence (answer (b): the failing restart was enforce_baseline_runtime's daemon-only restart_daemon; MACOS_LAUNCHD_STOP_COMMAND never ran in that run; helper liveness at that instant is undetermined from the logs). DECISION: the production lease (S1/S2) stays behind the design's recorded owner sign-off gate — I am NOT overriding a repo-recorded owner gate on a privileged-helper behaviour change; the lab-side S2b (verify/restore helper liveness before the daemon restart) + M2 teardown-site ordering hygiene proceed now as the fix for the driving incident. Deferred decision logged for the owner.
+- CI: 823671be red on `vm_lab::tests::rust_native_cli_stage_ids_match_plan_builder` (64→65 after C6) — fixing the count pin directly.
+- LAB: three-node run labrun-1788328399035-39708-0 at 30 pass / 0 fail; two_hop still skipped ("needs a second client: no node carries the extra or aux role") and relay/anchor need assigned roles — the ai_lab_run tool exposes entry_vm only, so the next two-hop attempt launches the orchestrator directly from Bash with --extra-vm (a fourth Linux guest, Fedora, booting now).
