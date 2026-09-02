@@ -346,6 +346,7 @@ mod tests {
             admin_platform: "windows".to_owned(),
             blind_exit_platform: "macos".to_owned(),
             role_switch_platform: "macos".to_owned(),
+            reboot_platform: "macos".to_owned(),
             skip_linux_live_suite: false,
             chaos_suite: true,
             cross_network_suite: true,

@@ -278,6 +278,9 @@ pub enum EnableRule {
     /// Live role-transition (LocalOnly admin<->client flip) elected on the
     /// given platform.
     RoleSwitchPlatform(&'static str),
+    /// Live reboot-recovery (macOS reboot-with-protection proof) elected on
+    /// the given platform.
+    RebootPlatform(&'static str),
     /// Part of the Linux live-validation suite (`!skip_linux_live_suite`).
     LinuxLiveSuite,
     /// The extended soak stage (`!skip_soak` / bash RUN_SOAK).
@@ -310,6 +313,7 @@ pub struct TargetSelectors {
     pub admin_platform: String,
     pub blind_exit_platform: String,
     pub role_switch_platform: String,
+    pub reboot_platform: String,
     pub skip_linux_live_suite: bool,
     pub chaos_suite: bool,
     pub cross_network_suite: bool,
@@ -333,6 +337,7 @@ impl TargetSelectors {
             EnableRule::AdminPlatform(platform) => self.admin_platform == platform,
             EnableRule::BlindExitPlatform(platform) => self.blind_exit_platform == platform,
             EnableRule::RoleSwitchPlatform(platform) => self.role_switch_platform == platform,
+            EnableRule::RebootPlatform(platform) => self.reboot_platform == platform,
             EnableRule::LinuxLiveSuite => !self.skip_linux_live_suite,
             EnableRule::ChaosSuite => self.chaos_suite,
             EnableRule::CrossNetworkSuite => self.cross_network_suite,
@@ -364,6 +369,7 @@ impl TargetSelectors {
             EnableRule::AdminPlatform(_) => "admin not elected on this platform",
             EnableRule::BlindExitPlatform(_) => "blind_exit not elected on this platform",
             EnableRule::RoleSwitchPlatform(_) => "role transition not elected on this platform",
+            EnableRule::RebootPlatform(_) => "reboot recovery not elected on this platform",
             EnableRule::LinuxLiveSuite => "linux live suite skipped for this run",
             EnableRule::ChaosSuite => "chaos suite not selected",
             EnableRule::CrossNetworkSuite => "cross-network suite not selected",
@@ -1235,6 +1241,17 @@ pub const STAGES: &[StageSpec] = &[
         direct_platform: Some(("macos", "role_transition")),
         enable: EnableRule::RoleSwitchPlatform("macos"),
         budget_secs: 180,
+        ..DEFAULT_SPEC
+    },
+    StageSpec {
+        name: "validate_macos_reboot_recovery",
+        stream: PlatformStream::Macos,
+        direct_platform: Some(("macos", "reboot_recovery")),
+        enable: EnableRule::RebootPlatform("macos"),
+        // Review F4: the helper's own worst case is ~120 s pre-capture + 30 s
+        // dispatch + 8 x (90 s + 20 s) return probing + 2 x 120 s post
+        // captures; 180 s would cut a legitimate reboot proof short.
+        budget_secs: 1200,
         ..DEFAULT_SPEC
     },
     StageSpec {
@@ -3146,7 +3163,10 @@ mod tests {
             // +1 on 2026-09-02 (C6): validate_macos_role_transition ported
             // from the legacy vm_lab hub into a first-class --node stage.
             ("t1_role", 23),
-            ("t2_resilience", 13),
+            // +1 on 2026-09-02 (C7): validate_macos_reboot_recovery joins
+            // T2Resilience as the macOS reboot-with-protection live stage
+            // (MacosDnsBackupRebootSurvivalPlan_2026-09-02.md).
+            ("t2_resilience", 14),
             ("t3_cross_os", 1),
             ("t4_security", 16),
             // A3a: the four T5 negative-control / adjudication stages

@@ -4480,6 +4480,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 admin_platform: parser.value("--admin-platform"),
                 blind_exit_platform: parser.value("--blind-exit-platform"),
                 role_switch_platform: parser.value("--role-switch-platform"),
+                reboot_platform: parser.value("--reboot-platform"),
                 macos_promote_exit: parser.has_flag("--macos-promote-exit"),
                 stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
                 skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
