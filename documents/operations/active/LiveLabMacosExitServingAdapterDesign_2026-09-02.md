@@ -356,6 +356,26 @@ predicate flip is the only part that must wait for the lab:
 - Sink-side capture format is defined in this design and versioned (`schema_version: 1`)
   so the evaluator can reject foreign payloads the same way the lifecycle artifact does.
 
+**STATUS (2026-09-02, adapter wiring landed — offline proof complete):** the A2
+unquarantine is DONE (`evaluate_macos_exit_nat_lifecycle_artifact` /
+`evaluate_macos_exit_killswitch_precedence_artifact` are `pub(crate)` with no
+`allow(dead_code)`; the negative tests re-activate and pass). The live wiring is in
+`adapter/macos_exit_traffic.rs` (second half) + `adapter/macos.rs`: all commands are
+built via `RemoteCommand::from_args` over `ValidatedArg` (no `format!`-built shell),
+the CLI asserts the daemon's own `macos-exit-nat-lifecycle-snapshot` output through
+`assess_exit_snapshot` (never re-derives pf parsing) and never mutates the product
+firewall; the §5/A2 ordering is encoded in `MacosExitActivationSequence` with the pin
+test `precedence_check_cannot_be_issued_after_activation` (also after a FAILED
+activation); the precedence artifact is read back and evaluated with a post-baseline
+snapshot proving the restore; `assert_mesh_client_nat_session` correlates the pf
+state translation in Rust (identity when known, `select_macos_client_nat_state_by_range`
+otherwise) under a bounded 10×1.5 s retry. `validate_macos_exit_nat_lifecycle`
+(two-phase merge → hub lifecycle evaluator) is dispatched by
+`stage/exit_nat_lifecycle_validation.rs` per platform, and the shared mesh CIDR is
+`macos_exit_traffic::MACOS_EXIT_EXPECTED_MESH_CIDR`. `active_exit` gained
+`macos_two_phase_stage_reports_skip_while_predicate_false`. The egress-evidence
+family stays quarantined (`cfg_attr(not(test), allow(dead_code))`) until §6.
+
 ## 8. Live proof and sequencing
 
 **Dependencies (ordered, not parallel):**
@@ -391,6 +411,15 @@ report artifacts (stage `status` + the §4/§5 data blocks), never from the colu
 `SecurityMinimumBar.md:529-532`: forwarding + NAT down before the capability leaves
 local state; the two-phase after-stop snapshot is the artifact that proves the residue
 is gone.
+
+**STATUS (2026-09-02):** step 3's offline half is landed (§7 status) — the adapter,
+the lifecycle stage dispatch, and both hub-evaluator call sites exist on the engine
+of record with the `active_exit_runtime_implemented` macOS pin still FALSE. Remaining,
+in this section's order: CP-1 operator re-attach, the macOS DNS fail-closed owner
+decision, then the live `--node` macOS exit run per the run recipe; only a passing
+row (pass/fail taken from the stage's own report artifacts) unlocks the §6 flip
+commit (predicate + inverted pin), which must land committed+clean before the
+verifying run it is attributed to.
 
 ## 9. Evidence artifacts produced by the cell
 

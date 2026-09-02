@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+use crate::vm_lab::LINUX_RUSTYNETD_PATH;
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
@@ -8,8 +10,6 @@ use crate::vm_lab::orchestrator::role_validation::exit_nat_lifecycle::{
     validate_macos_exit_nat_lifecycle,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
-use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::LINUX_RUSTYNETD_PATH;
 
 const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
 

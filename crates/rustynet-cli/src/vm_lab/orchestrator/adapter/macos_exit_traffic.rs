@@ -606,8 +606,7 @@ pub(crate) fn capture_exit_snapshot(conn: &NodeConnection) -> Result<String, Ada
     let script = daemon_command(
         "macos exit nat lifecycle snapshot",
         "macos-exit-nat-lifecycle-snapshot",
-        &[ValidatedArg::cidr(MACOS_EXIT_EXPECTED_MESH_CIDR)
-            .map_err(AdapterError::from)?],
+        &[ValidatedArg::cidr(MACOS_EXIT_EXPECTED_MESH_CIDR).map_err(AdapterError::from)?],
     )?;
     ssh::run_remote(conn, script.as_str(), EXIT_COMMAND_TIMEOUT)
 }
@@ -621,10 +620,11 @@ pub(crate) fn assert_exit_snapshot_serving(
     phase: &str,
 ) -> Result<(), AdapterError> {
     let raw = capture_exit_snapshot(conn)?;
-    assess_exit_snapshot(&raw, MACOS_EXIT_EXPECTED_MESH_CIDR)
-        .map_err(|reason| AdapterError::Protocol {
+    assess_exit_snapshot(&raw, MACOS_EXIT_EXPECTED_MESH_CIDR).map_err(|reason| {
+        AdapterError::Protocol {
             message: format!("macos exit {phase}: {reason}"),
-        })?;
+        }
+    })?;
     Ok(())
 }
 
@@ -758,9 +758,8 @@ fn resolve_exit_egress_addr(conn: &NodeConnection) -> Result<IpAddr, AdapterErro
         .find_map(|line| line.trim().strip_prefix("interface:"))
         .map(str::trim)
         .ok_or_else(|| AdapterError::Protocol {
-            message:
-                "macos exit egress: `route -n get default` reported no `interface:` line"
-                    .to_owned(),
+            message: "macos exit egress: `route -n get default` reported no `interface:` line"
+                .to_owned(),
         })?;
     let iface_arg = ValidatedArg::cli_token(iface).map_err(AdapterError::from)?;
     let addr_script = ssh::RemoteCommand::from_args(
@@ -772,13 +771,14 @@ fn resolve_exit_egress_addr(conn: &NodeConnection) -> Result<IpAddr, AdapterErro
         ],
     )?;
     let addr_out = ssh::run_remote(conn, addr_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
-    addr_out.trim().parse::<IpAddr>().map_err(|_| {
-        AdapterError::Protocol {
+    addr_out
+        .trim()
+        .parse::<IpAddr>()
+        .map_err(|_| AdapterError::Protocol {
             message: format!(
                 "macos exit egress: interface {iface} reported unparseable address {addr_out:?}"
             ),
-        }
-    })
+        })
 }
 
 /// Parse every translatable line of a global `pfctl -s state` capture. Lines
@@ -831,15 +831,16 @@ pub(crate) fn assert_mesh_client_nat_session(
     conn: &NodeConnection,
     expected_client_mesh_addr: Option<&str>,
 ) -> Result<MeshClientNatSession, AdapterError> {
-    let client_mesh_addr = expected_client_mesh_addr
-        .map(|raw| {
-            raw.trim().parse::<IpAddr>().map_err(|_| AdapterError::Protocol {
+    let client_mesh_addr =
+        expected_client_mesh_addr
+            .map(|raw| {
+                raw.trim().parse::<IpAddr>().map_err(|_| AdapterError::Protocol {
                 message: format!(
                     "macos exit nat-session: unparseable expected client mesh address {raw:?}"
                 ),
             })
-        })
-        .transpose()?;
+            })
+            .transpose()?;
     let exit_egress_addr = resolve_exit_egress_addr(conn)?;
 
     let pf_state_script = ssh::RemoteCommand::from_args(
@@ -861,8 +862,7 @@ pub(crate) fn assert_mesh_client_nat_session(
             last_reason = e.to_string();
         } else {
             // Translation half.
-            let state_out =
-                ssh::run_remote(conn, pf_state_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
+            let state_out = ssh::run_remote(conn, pf_state_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
             let (records, skipped) = parse_pf_state_translations(&state_out);
             let selection = match client_mesh_addr {
                 Some(client) => select_macos_client_nat_state(&records, client, exit_egress_addr),
