@@ -689,24 +689,10 @@ fn utun_name_for_node_id(node_id: &str) -> String {
 }
 
 /// Validate that a utun name is safe for use as an interface name.
-fn validate_utun_name(name: &str) -> Result<(), AdapterError> {
-    let suffix = name
-        .strip_prefix("utun")
-        .ok_or_else(|| AdapterError::Protocol {
-            message: format!("utun name {name:?} must start with utun"),
-        })?;
-    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-        return Err(AdapterError::Protocol {
-            message: format!("utun name {name:?} must be utun followed by digits"),
-        });
-    }
-    if name.len() > 15 {
-        return Err(AdapterError::Protocol {
-            message: format!("utun name {name:?} exceeds 15-char IFNAMSIZ"),
-        });
-    }
-    Ok(())
-}
+///
+/// Shared source of truth: the rule lives in the QH-01 seam module
+/// (`validated_args.rs`) so every adapter validates the class identically.
+pub(crate) use super::validated_args::validate_utun_name;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

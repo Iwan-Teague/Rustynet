@@ -208,7 +208,7 @@ fn is_virtual_interface(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-fn is_safe_interface_name(name: &str) -> bool {
+pub(crate) fn is_safe_interface_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 32
         && name

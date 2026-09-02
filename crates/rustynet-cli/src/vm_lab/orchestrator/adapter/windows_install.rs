@@ -115,6 +115,52 @@ pub fn ps_quote(value: &str) -> Result<String, AdapterError> {
     Ok(format!("'{}'", value.replace('\'', "''")))
 }
 
+// ── QH-01: validated PowerShell script newtype ───────────────────────────────
+
+/// A PowerShell payload that is safe to hand to the remote-PS sink family.
+///
+/// Like `RemoteCommand` on the POSIX side, the field is private and there is
+/// no `From<String>`: construction always runs `ps_quote` (and, for
+/// interpolated values, an interior allowlist). `Debug` prints the length
+/// only. `as_str` exists solely for the PS sinks in this module.
+pub(crate) struct PowerShellScript(String);
+
+impl PowerShellScript {
+    /// Wrap a single interpolated VALUE: reject subexpression `$(...)`,
+    /// backticks, and quote characters outright (interior allowlist — a value
+    /// must never carry executable PS syntax), then single-quote via
+    /// `ps_quote`.
+    pub(crate) fn from_single_value(label: &str, value: &str) -> Result<Self, AdapterError> {
+        const FORBIDDEN: [char; 3] = ['`', '"', '\''];
+        if value.contains("$(") || value.chars().any(|ch| FORBIDDEN.contains(&ch)) {
+            return Err(AdapterError::Protocol {
+                message: format!(
+                    "{label}: interpolated PowerShell value contains forbidden \
+                     syntax (substitution, backtick, or quote characters)"
+                ),
+            });
+        }
+        Ok(Self(ps_quote(value)?))
+    }
+
+    /// Wrap a whole script body authored in-repo (not operator input). Still
+    /// routed through `ps_quote`'s control-character refusal.
+    pub(crate) fn from_script_body(script: String) -> Result<Self, AdapterError> {
+        Ok(Self(ps_quote(&script)?))
+    }
+
+    /// Sink-only accessor for the remote-PS sink family in THIS module.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for PowerShellScript {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PowerShellScript(len={})", self.0.len())
+    }
+}
+
 // ── Remote PS execution ───────────────────────────────────────────────────────
 
 /// Run a `PowerShell` script over SSH. The script is base64-encoded so it
@@ -1074,24 +1120,10 @@ fn run_service_action(conn: &NodeConnection, action_cmdlet: &str) -> Result<(), 
 }
 
 /// Validate a Windows path argument: reject NUL/CR/LF that could escape PS quoting.
-fn validate_windows_path(path: &str) -> Result<(), AdapterError> {
-    if path
-        .chars()
-        .any(|ch| ch == '\0' || ch == '\r' || ch == '\n')
-    {
-        return Err(AdapterError::Protocol {
-            message: format!(
-                "Windows path argument '{path}' contains control characters not safe for shell embedding"
-            ),
-        });
-    }
-    if path.is_empty() {
-        return Err(AdapterError::Protocol {
-            message: "Windows path argument must not be empty".to_owned(),
-        });
-    }
-    Ok(())
-}
+///
+/// Shared source of truth: the rule lives in the QH-01 seam module
+/// (`validated_args.rs`) so every adapter validates the class identically.
+pub(crate) use super::validated_args::validate_windows_path;
 
 fn write_temp_file(
     prefix: &str,
@@ -2332,5 +2364,46 @@ mod tests {
             BOOTSTRAP_SCRIPT.contains("Ensure-CargoBuildJobsForWindowsLab"),
             "the Ensure function itself must remain present"
         );
+    }
+}
+
+#[cfg(test)]
+mod powershell_script_seam_tests {
+    use super::*;
+
+    #[test]
+    fn from_single_value_quotes_a_plain_value() {
+        let script = PowerShellScript::from_single_value("svc", "rustynet-relay").expect("plain");
+        assert_eq!(script.as_str(), "'rustynet-relay'");
+    }
+
+    #[test]
+    fn from_single_value_rejects_subexpression_substitution() {
+        let err = PowerShellScript::from_single_value("svc", "a$(b)")
+            .expect_err("substitution must be refused");
+        assert!(err.to_string().contains("svc"));
+        assert!(!err.to_string().contains("a$(b)"));
+    }
+
+    #[test]
+    fn from_single_value_rejects_backticks_and_quotes() {
+        assert!(PowerShellScript::from_single_value("svc", "a`nb").is_err());
+        assert!(PowerShellScript::from_single_value("svc", "a\"b").is_err());
+        assert!(PowerShellScript::from_single_value("svc", "a'b").is_err());
+    }
+
+    #[test]
+    fn from_script_body_rejects_control_characters_like_ps_quote() {
+        assert!(PowerShellScript::from_script_body("ok".to_owned()).is_ok());
+        assert!(PowerShellScript::from_script_body("a\nb".to_owned()).is_err());
+    }
+
+    #[test]
+    fn powershell_script_debug_prints_length_only() {
+        let script =
+            PowerShellScript::from_script_body("secret-body".to_owned()).expect("plain body");
+        let rendered = format!("{script:?}");
+        assert!(!rendered.contains("secret-body"), "{rendered}");
+        assert!(rendered.contains("len="), "{rendered}");
     }
 }
