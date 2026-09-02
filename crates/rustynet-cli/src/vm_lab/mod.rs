@@ -21582,6 +21582,13 @@ pub(crate) fn evaluate_macos_exit_killswitch_precedence_artifact(
 ) -> Result<String, String> {
     let report: Value = serde_json::from_str(raw_json)
         .map_err(|err| format!("parse macos exit killswitch precedence artifact failed: {err}"))?;
+    // Fail closed on a foreign shape before any field access: an empty
+    // payload already errors at parse, but a valid non-object document
+    // (array, string, number) must be rejected by name rather than surprise
+    // the field readers.
+    if !report.is_object() {
+        return Err("macos exit killswitch precedence artifact is not a JSON object".to_owned());
+    }
     require_json_u64(&report, "schema_version")?
         .eq(&1)
         .then_some(())

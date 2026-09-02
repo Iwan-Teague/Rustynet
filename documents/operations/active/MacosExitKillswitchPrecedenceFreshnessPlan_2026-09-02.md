@@ -1,9 +1,29 @@
 # macOS Exit Killswitch-Precedence Artifact Freshness Plan (2026-09-02)
 
-**Status:** PLANNING (docs-only; no code changed in this document's creation).
-Closes follow-up **F2 (Low-Med — evidence freshness)** from
-[`MacosExitServingAdapterWiringPostMergeReview_2026-09-02.md`](./MacosExitServingAdapterWiringPostMergeReview_2026-09-02.md:215)
-(":215-228). The finding: the macOS exit killswitch-precedence artifact has no
+**Status:** IMPLEMENTED (Option A, with the adversarial review's amendments
+applied — see
+[`MacosExitKillswitchPrecedenceFreshnessPlanReview_2026-09-02.md`](./MacosExitKillswitchPrecedenceFreshnessPlanReview_2026-09-02.md);
+R1-R4 and the §5 note applied, R3 accepted in its preferred form, R7 accepted).
+Daemon half: `e52d1cae` (the check subcommand prints the encoded report
+verbatim on stdout, confirmation on stderr, `--output` now optional —
+stdout-only mode leaves no artifact file). Adapter half: `b5de5a3c` (the
+baseline captures the check's stdout, `extract_precedence_report_stdout`
+is the fail-closed boundary, the fixed-path constant and the `cat` read are
+deleted, no `--output` is passed, hub evaluator rejects non-object payloads
+by name). Offline tests: daemon `precedence_check_stdout_is_report_json` +
+`precedence_check_without_output_confirms_stdout_only_mode`; adapter
+`precedence_stdout_capture_accepts_fresh_verbatim_json`,
+`..._rejects_empty_stdout`, `..._rejects_confirmation_line_only`,
+`..._rejects_leading_or_trailing_text_around_json`,
+`..._rejects_truncated_json` (R7), and
+`killswitch_precedence_baseline_sequence_has_no_artifact_path_read` (no
+`--output`, no read step, no module reference to the deleted fixed path —
+the leftover-file-ignored pin). Live proof still owed by the macOS exit
+cell per §6 (CP-1-gated).
+
+Closes follow-up **F2 (Low-Med — evidence freshness)** of
+[`MacosExitServingAdapterWiringPostMergeReview_2026-09-02.md`](./MacosExitServingAdapterWiringPostMergeReview_2026-09-02.md).
+The original finding: the macOS exit killswitch-precedence artifact has no
 freshness binding, so a leftover valid-shape file at the fixed path could be
 read as a fresh pass if the daemon ever exited 0 without rewriting it.
 
@@ -196,8 +216,11 @@ nonce-match in `evaluate_macos_exit_killswitch_precedence_artifact`
   artifact*. A fresh-timestamped file is still not proven to be from
   this run's experiment unless the nonce is threaded end-to-end, at
   which point the nonce alone would suffice and the timestamp adds a
-  clock-skew failure mode (`CrossNetworkLiveLabPrerequisitesChecklist.md:57`
-  already flags guest-clock sensitivity) for no added strength.
+  clock-skew failure mode (the freshness-window pattern the repo
+  already states lives in `SecurityMinimumBar.md:134-136`) for no
+  added strength. (Review R4: the previously cited
+  `CrossNetworkLiveLabPrerequisitesChecklist.md` does not exist and
+  has been dropped.)
 - More code: schema field + producer change + validated-arg plumbing +
   evaluator logic + schema-version bump decision (v2 vs optional-field
   parse — the optional-field shape weakens the fail-closed property the
@@ -272,10 +295,32 @@ one-hardened-path rule, AGENTS.md §3).
   *Product crate.* Daemon-verifier surface only; no enforcement path
   touched.
 - **`rustynet-cli`** (`crates/rustynet-cli`): `macos_exit_traffic.rs`
-  (capture + extract + drop `cat`) and, if the legacy call sites are
-  migrated, `vm_lab/mod.rs:12068`/`:12279`. *Lab tooling behind the
-  `vm-lab` feature (RNQ-17).*
-- Both crates change → per the operating contract this needs
+  (capture + extract + drop `cat`). *Lab tooling behind the `vm-lab`
+  feature (RNQ-17).*
+- **Legacy stage call sites — CORRECTED per review R2 (the plan's
+  original claim here was wrong).** The fixed path's only consumer was
+  the adapter's `cat`. The legacy Stage 9
+  (`validate_macos_exit_killswitch_precedence`, `mod.rs:12244-12313`)
+  reads a different input: the per-run captured copy under
+  `report_dir/macos_exit_evidence` (`mod.rs:11893`, `:12272`, collected
+  via `:13050`), gated on mesh-join and capture success — it does not
+  carry the fixed-path stale-file defect and was NOT migrated by this
+  fix. Dropping the adapter's `cat` therefore closed the stale-file leg
+  completely on its own. The legacy stage's absent→Skip posture is
+  recorded here as out of F2 scope.
+- **In-flight macOS DNS three-state fix note (review §3):**
+  `macos_dns_failclosed.rs:60-62` imports
+  `MACOS_RUSTYNET_ANCHOR_PREFIX` and `validate_pf_anchor_name` from
+  `macos_exit_killswitch_precedence.rs`. This fix renamed neither; keep
+  it that way while the DNS fix is in flight. The files are disjoint,
+  so the two changes may land in either order.
+- **R3 applied (preferred form):** the adapter's check invocation drops
+  `--output` entirely, so no file is created at the fixed path on the
+  lab path — the stale-artifact side channel is eliminated rather than
+  merely unread. The daemon keeps `--output` as an optional
+  operator/forensics mode (the legacy per-run capture script still
+  passes it, now against its per-run report directory).
+- Both crates changed → per the operating contract this needs
   **plan → review → impl** (this document is the plan; an adversarial
   refute pass on it, then the implementation commit) rather than a
   single-drive edit.
@@ -286,12 +331,7 @@ one-hardened-path rule, AGENTS.md §3).
   file. Follow-up **F1** of that review (`:206-214`) also edits
   `macos_exit_traffic.rs:23` (deleting/narrowing the module-level
   `allow(dead_code)`) — disjoint lines, but land serially to keep the
-  blame clean. The legacy stage call sites (`mod.rs:12068`, `:12279`;
-  review `:253-254`) read the same fixed path today and carry the same
-  emergent binding: migrating them to stdout capture is in-scope for
-  this fix (same defect, same repair) and is the only way the "stale
-  file" leg fully closes; if deferred, the deferral must be recorded
-  here, not silently.
+  blame clean.
 
 ## 6) Live-lab proof stage and unknowns
 
