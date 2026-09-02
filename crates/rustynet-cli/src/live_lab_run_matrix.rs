@@ -3415,6 +3415,120 @@ mod tests {
         );
     }
 
+    /// The `--node` LAN-toggle stage feeds the `cross_os_lan_toggle` column
+    /// through the registry-derived mapping in `populate_cross_os_values`,
+    /// matching the bash-dialect `live_lan_toggle` arm in
+    /// `oracle_cross_os_column`. Pinned here on the write path so a registry
+    /// or oracle drift is caught at the point the CSV value is produced.
+    #[test]
+    fn live_lan_toggle_validation_populates_cross_os_lan_toggle() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let mut values = BTreeMap::new();
+        let targets = vec![
+            TargetEvidence {
+                label: "exit".to_owned(),
+                target: "exit".to_owned(),
+                alias: "exit-1".to_owned(),
+                platform: "linux".to_owned(),
+                node_id: "n1".to_owned(),
+                bootstrap_role: "exit".to_owned(),
+            },
+            TargetEvidence {
+                label: "client".to_owned(),
+                target: "client".to_owned(),
+                alias: "client-1".to_owned(),
+                platform: "macos".to_owned(),
+                node_id: "n2".to_owned(),
+                bootstrap_role: "client".to_owned(),
+            },
+        ];
+        populate_cross_os_values(
+            &mut values,
+            &schema,
+            "live_lan_toggle_validation",
+            "pass",
+            &targets,
+        );
+        assert_eq!(
+            values.get("cross_os_lan_toggle").map(String::as_str),
+            Some("pass")
+        );
+    }
+
+    /// Fail-closed evidence contract for the same column: a stage that did
+    /// not genuinely execute a cross-platform pass must never read `pass`.
+    /// A skip writes `skip` (QH-37: skip outranks pass in the merge), a
+    /// never-ran stage leaves the column at its `not_run` default (absent
+    /// from the values map), and a single-platform run — which cannot prove
+    /// a cross-OS cell — leaves the column untouched even on a real pass.
+    #[test]
+    fn lan_toggle_stage_that_did_not_execute_never_reads_pass_in_cross_os_lan_toggle() {
+        let schema: BTreeSet<String> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .map(|c| (*c).to_owned())
+            .collect();
+        let targets = vec![
+            TargetEvidence {
+                label: "exit".to_owned(),
+                target: "exit".to_owned(),
+                alias: "exit-1".to_owned(),
+                platform: "linux".to_owned(),
+                node_id: "n1".to_owned(),
+                bootstrap_role: "exit".to_owned(),
+            },
+            TargetEvidence {
+                label: "client".to_owned(),
+                target: "client".to_owned(),
+                alias: "client-1".to_owned(),
+                platform: "macos".to_owned(),
+                node_id: "n2".to_owned(),
+                bootstrap_role: "client".to_owned(),
+            },
+        ];
+
+        // Skipped stage, multi-platform run: the column must read `skip`.
+        let mut values = BTreeMap::new();
+        populate_cross_os_values(
+            &mut values,
+            &schema,
+            "live_lan_toggle_validation",
+            "skip",
+            &targets,
+        );
+        assert_eq!(
+            values.get("cross_os_lan_toggle").map(String::as_str),
+            Some("skip")
+        );
+
+        // Never-ran stage: nothing writes the column, so it stays at the
+        // schema default (`not_run`) rather than inheriting any verdict.
+        let values: BTreeMap<String, String> = BTreeMap::new();
+        assert!(
+            !values.contains_key("cross_os_lan_toggle"),
+            "a never-ran stage must leave `cross_os_lan_toggle` at not_run"
+        );
+
+        // Single-platform run: the early return in `populate_cross_os_values`
+        // must keep the column untouched — a Linux-only pass is not a
+        // cross-OS pass, even though the stage itself passed.
+        let linux_only = vec![targets[0].clone()];
+        let mut values = BTreeMap::new();
+        populate_cross_os_values(
+            &mut values,
+            &schema,
+            "live_lan_toggle_validation",
+            "pass",
+            &linux_only,
+        );
+        assert!(
+            !values.contains_key("cross_os_lan_toggle"),
+            "a single-platform pass must not fabricate a cross-OS pass"
+        );
+    }
+
     #[test]
     fn role_transition_stages_populate_their_own_dedicated_csv_columns() {
         // Regression: validate_macos_role_transition / validate_windows_role_transition
@@ -4836,7 +4950,7 @@ mod registry_equivalence_tests {
             | "relay_validation"
             | "validate_windows_relay_service_lifecycle"
             | "validate_macos_relay_service_lifecycle" => Some("cross_os_relay_path"),
-            "live_lan_toggle" => Some("cross_os_lan_toggle"),
+            "live_lan_toggle" | "live_lan_toggle_validation" => Some("cross_os_lan_toggle"),
             "live_role_switch_matrix" | "role_switch_matrix" => Some("cross_os_role_switch"),
             "live_managed_dns"
             | "validate_windows_dns_failclosed"

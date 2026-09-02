@@ -247,8 +247,9 @@ define_stage_catalog! {
     // anchor's enrollment-SERVING capability is live_anchor's T1 scope.
     LiveEnrollmentRestartValidation => "live_enrollment_restart_validation" @ Live / T2Resilience,
     // Asserts the killswitch + blind-exit posture HOLD through LAN-access
-    // toggling — the map's "killswitch" T4 family member. The bash-dialect
-    // mac/win cross_os_lan_toggle aggregate is a different (cross-OS) cell.
+    // toggling — the map's "killswitch" T4 family member. Its registry spec
+    // feeds the `cross_os_lan_toggle` schema column, the same cell the
+    // bash-dialect `live_lan_toggle` wrapper historically fed.
     LiveLanToggleValidation => "live_lan_toggle_validation" @ Live / T4Security,
     // Requires Linux+macOS+Windows ALL present (skips otherwise) and proves
     // one signed membership view + fresh WireGuard handshakes across the
