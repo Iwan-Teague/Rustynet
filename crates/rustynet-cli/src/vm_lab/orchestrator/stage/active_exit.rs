@@ -76,14 +76,14 @@ impl OrchestrationStage for ActiveExitStage {
             }
         };
 
-        // macOS Exit maps to the blind_exit role, whose pf NAT is applied at
-        // enforce-time (not via route-advertise) and whose pf anchor is
-        // hard-locked across cleanup — it does not fit this
-        // activate→assert→nat-session shape, so the macOS adapter has no
-        // exit-serving override and would hit the trait fail-closed default.
-        // Report-skip it (named, never a silent pass) so the run goes Partial
-        // instead of a misleading hard-fail; gated on
-        // active_exit_runtime_implemented pending the macOS exit-serving adapter.
+        // The macOS exit adapter now IMPLEMENTS the exit-serving methods
+        // (assert-not-actuate over the daemon's own lifecycle verifier, with
+        // the A2 pre-activation killswitch-precedence baseline), but the
+        // runtime predicate stays false until a live --node run proves the
+        // macOS exit cell end to end (design §6: no "implemented but
+        // unproven" posture). Until the flip, report-skip it (named, never a
+        // silent pass) so the run goes Partial instead of executing an
+        // unproven sequence.
         let exit_platform = exit_adapter.platform();
         if !active_exit_runtime_implemented(exit_platform) {
             write_reported_skip_note(ctx, &exit_alias, exit_platform);
@@ -174,13 +174,14 @@ impl OrchestrationStage for ActiveExitStage {
     }
 }
 
-/// True where the active-exit-serving dataplane is implemented: Linux (nftables
-/// MASQUERADE driven over the daemon control socket) and Windows (WinNAT, whose
-/// adapter overrides the exit-serving methods). macOS is NOT implemented here —
-/// its blind_exit pf NAT is applied at enforce-time, not via route-advertise —
-/// so a macOS Exit is reported-skipped rather than hard-failing the trait
-/// default. Gated on this, NOT `is_supported_for_platform`, so promotion follows
-/// a live macOS exit-serving run rather than preceding it.
+/// True where the active-exit-serving dataplane is PROVEN: Linux (nftables
+/// MASQUERADE driven over the daemon control socket) and Windows (WinNAT,
+/// whose adapter overrides the exit-serving methods). The macOS adapter now
+/// implements the exit methods (assert-not-actuate over the daemon's pf
+/// lifecycle verifier, with the A2 pre-activation precedence baseline), but
+/// stays FALSE here until a live --node run passes the macOS exit cell with
+/// its artifacts — promotion follows live evidence, never precedes it
+/// (design §6). Gated on this, NOT `is_supported_for_platform`.
 fn active_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Windows)
 }
@@ -195,10 +196,10 @@ fn reported_skip_json_bytes(alias: &str, platform: VmGuestPlatform) -> Vec<u8> {
         "stage": "active_exit",
         "reported_skipped_active_exit": [{ "alias": alias, "platform": format!("{platform:?}") }],
         "reason": "active exit-serving is implemented for Linux (nftables MASQUERADE) and Windows \
-                   (WinNAT); a macOS Exit maps to the blind_exit role whose pf NAT is applied at \
-                   enforce-time (not via route-advertise), so it is reported-skipped here (named, \
-                   never a silent pass) pending the macOS exit-serving adapter — gated on \
-                   active_exit_runtime_implemented, not is_supported_for_platform",
+                   (WinNAT); the macOS adapter now asserts the daemon's own pf lifecycle verifier \
+                   but the macOS cell has no live --node run proof yet, so it is reported-skipped \
+                   here (named, never a silent pass) — gated on active_exit_runtime_implemented \
+                   until that run passes (design §6: no implemented-but-unproven posture)",
     });
     serde_json::to_vec_pretty(&body).unwrap_or_default()
 }
@@ -311,6 +312,92 @@ mod tests {
         assert!(active_exit_runtime_implemented(VmGuestPlatform::Linux));
         assert!(active_exit_runtime_implemented(VmGuestPlatform::Windows));
         assert!(!active_exit_runtime_implemented(VmGuestPlatform::Macos));
+    }
+
+    /// The §6 pin while the macOS exit cell is unproven: with the predicate
+    /// false, the two-phase stage report-SKIPS a macOS exit (named, with the
+    /// reported-skip artifact) instead of executing the adapter's exit
+    /// sequence or hard-failing on it.
+    #[test]
+    fn macos_two_phase_stage_reports_skip_while_predicate_false() {
+        use crate::vm_lab::orchestrator::adapter::macos::MacosNodeAdapter;
+        use crate::vm_lab::orchestrator::connection::NodeConnection;
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        use std::io::Write as _;
+        use tempfile::NamedTempFile;
+
+        let mut identity = NamedTempFile::new().unwrap();
+        writeln!(identity, "# placeholder").unwrap();
+        let conn = NodeConnection::ssh(
+            "10.0.0.1",
+            22,
+            Some("admin".to_owned()),
+            std::path::PathBuf::from("/id_rsa"),
+            identity.path().to_path_buf(),
+            None,
+        )
+        .unwrap();
+        let macos_adapter: Box<
+            dyn crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter,
+        > = Box::new(MacosNodeAdapter::new("macos-utm-1", conn, None));
+        assert_eq!(macos_adapter.platform(), VmGuestPlatform::Macos);
+
+        let report_dir = std::env::temp_dir().join(format!(
+            "active_exit_skip_proof_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&report_dir).unwrap();
+
+        let mut ctx = OrchestrationContext {
+            assignments: vec![NodeRoleAssignment {
+                alias: "macos-utm-1".to_owned(),
+                role: NodeRole::Exit,
+            }],
+            adapters: HashMap::from([("macos-utm-1".to_owned(), macos_adapter)]),
+            source_archive: None,
+            report_dir: report_dir.clone(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+        };
+
+        match ActiveExitStage.execute(&mut ctx) {
+            StageOutcome::Skipped(reason) => {
+                assert!(
+                    reason.contains("Macos"),
+                    "skip must name the platform: {reason}"
+                );
+            }
+            other => panic!("predicate-false macOS exit must report-skip, got {other:?}"),
+        }
+        let note = std::fs::read_to_string(report_dir.join(REPORTED_SKIP_FILENAME))
+            .expect("reported-skip note must be written");
+        assert!(
+            note.contains("macos-utm-1"),
+            "note must name the alias: {note}"
+        );
+        assert!(
+            note.contains("Macos"),
+            "note must name the platform: {note}"
+        );
+        let _ = std::fs::remove_dir_all(&report_dir);
     }
 
     #[test]
