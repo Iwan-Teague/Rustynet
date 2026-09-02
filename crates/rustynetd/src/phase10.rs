@@ -3854,7 +3854,14 @@ impl MacosCommandSystem {
         MacosKillswitchSpec {
             interface_name: self.interface_name.clone(),
             egress_interface: self.egress_interface.clone(),
-            dns_protected: self.dns_protected,
+            // M3 (MacosClientDnsFailclosedDiagnosis_2026-09-02 R2): the
+            // DNS-block floor must accompany EVERY live loopback pin, not
+            // just the ones this daemon's full posture installed. Any pf
+            // re-render (bypass routes, killswitch, pre-NAT) while a general
+            // pin persists — including residue a failed apply could not roll
+            // back — would otherwise drop the floor under the pins: the
+            // exact floor-less half state the plain-client failure was.
+            dns_protected: self.dns_protected || self.has_live_loopback_dns_pins(),
             allow_egress_interface: self.allow_egress_interface,
             fail_closed_ssh_allow: self.fail_closed_ssh_allow,
             fail_closed_ssh_allow_cidrs: self.fail_closed_ssh_allow_cidrs.clone(),
@@ -3862,6 +3869,35 @@ impl MacosCommandSystem {
             managed_peer_egress_endpoints: self.managed_peer_egress_endpoints.clone(),
             ipv6_blocked: self.ipv6_blocked,
         }
+    }
+
+    /// Does any enabled network service currently advertise a general DNS pin
+    /// at the loopback resolver? Fail-closed: an unreadable system
+    /// configuration counts as pins-present (the caller keeps the pf floor
+    /// over a state it cannot verify). `dns_protected` short-circuits true —
+    /// the full posture implies the pins by definition, and skipping the
+    /// enumeration keeps every re-render cheap.
+    fn has_live_loopback_dns_pins(&self) -> bool {
+        if self.dns_protected {
+            return true;
+        }
+        let Ok(services) = self.enumerate_networksetup_services() else {
+            return true;
+        };
+        for service in &services {
+            match self.read_networksetup_service_dns(service) {
+                Ok(Some(servers)) => {
+                    if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
+                        return true;
+                    }
+                }
+                Ok(None) => {}
+                // A service we cannot read is a service that MAY be pinned:
+                // keep the floor.
+                Err(_) => return true,
+            }
+        }
+        false
     }
 
     fn render_pf_rules(&self, strict_fail_closed: bool) -> Result<String, SystemError> {
@@ -17366,6 +17402,18 @@ mod tests {
             system.anchor_name.as_deref(),
             Some(DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_killswitch_spec_latches_dns_floor_while_fully_protected() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_protected = true;
+        // The full posture implies live loopback pins: the spec must keep the
+        // DNS-block floor without re-enumerating the system configuration
+        // (short-circuit, deterministic on every host).
+        assert!(system.killswitch_spec().dns_protected);
     }
 
     #[cfg(target_os = "macos")]
