@@ -165,7 +165,8 @@ ownership.
 
 `crates/rustynetd/src/linux_dns_protect.rs:248`:
 `RESOLV_CONF_FAILCLOSED_BACKUP_PATH = "/run/rustynet/resolv.conf.failclosed.bak"` (Linux branch;
-`/tmp` fallback at `:250-253`). On Linux `/run` is typically a `RuntimeDirectory=` tmpfs cleared
+the same const also has a **macOS branch** at `:250-251` — `/private/var/run/rustynet/resolv.conf.failclosed.bak`,
+see §6 — and a `/tmp` fallback at `:253`). On Linux `/run` is typically a `RuntimeDirectory=` tmpfs cleared
 at boot, so **the same volatility defect class applies on Linux**: a reboot while
 resolv.conf/systemd-resolved protection is active can strand host DNS with the backup gone. The
 startup-refusal behaviour differs by platform plumbing (Linux does not have this exact SC guard),
@@ -205,8 +206,11 @@ Move the backup document to the durable state root, derived the QH-40 way: a sib
 
 Cost: the constant stops being a bare path and becomes a derivation from the state path (a
 function plus a const suffix); every site that names `NETWORKSETUP_DNS_BACKUP_PATH`
-(`macos_dns_sc_protect.rs:770`, `:816`, `:830`, `:838`, `:847`, `:869-:913` messages;
-`phase10.rs:4629`, `:4660-4661`) must take the derived path; test pins move
+(`macos_dns_sc_protect.rs:770`, `:816`, `:830`, `:838`, `:847`, `:884`, `:909`, `:869-:913`
+messages — `:884`/`:909` are the two post-restore `remove_networksetup_dns_backup` calls, which
+must move with everything else or a successful startup restore leaves the volatile file behind
+while the durable one is gone, a phantom residue document; `phase10.rs:4629`, `:4660-4661`) must
+take the derived path; test pins move
 (`macos_dns_sc_protect.rs:1243` neighbourhood, `manual_restore_message_names_the_fix_per_service`
 at `:1267` which asserts the substring `networksetup-dns.failclosed.bak` — the filename survives,
 only the directory changes).
@@ -256,8 +260,21 @@ assumptions, reuses a proven in-tree pattern, and needs no helper allowlist chan
 | 1 | Backup survives reboot | Path derived from the durable state root (`sibling-of-state-file` derivation, `shutdown_residue.rs:182-187` pattern) — not under `/var/run` | Unit: derived path is under the state dir and changes with `--state-root`; live: macOS `live_reboot_recovery` with protection active (§4) |
 | 2 | Backup written BEFORE the first SC mutation | Existing ordering in `phase10.rs::apply_dns_protection` (`:4657-4664` comment + write-before-loop) — preserved verbatim, only the path changes | Existing ordering coverage; add: a failed `networksetup` set mid-apply leaves the *durable* backup readable (rollback can use it) |
 | 3 | Backup readable only by root/daemon | `write_networksetup_dns_backup` keeps `0o600` (`macos_dns_sc_protect.rs:427-433`); durable dir is daemon-owned by construction | Unit: mode assertion after write (follows existing style); file lands beside state file → inherits dir ownership |
-| 4 | Startup restore uses the durable path | `run_startup_dns_recovery` reads the derived path (`:816` — constant swap); messages name the new path (`:770`, `:830`, `:838`) | Update `startup_guard_restores_from_readable_backup_only` neighbourhood (`:1243`) and `manual_restore_message_names_the_fix_per_service` (`:1267`) to the derived path |
-| 5 | The old volatile path is NOT read as a fallback | Startup and apply read ONLY the derived path. **Threat model:** `/var/run` is root-owned, so planting a file there requires root — an attacker with root has already won. The trust decision is therefore *not* primarily about attacker-planting; it is about *stale-content* ambiguity (a boot-cleared dir repopulated by an old image, snapshot restore, or another RustyNet install could present a document that vouches for the wrong pre-protection state). Fail-closed answer: no fallback read; old path ignored entirely | Unit: a backup written to the old volatile path is ignored by `run_startup_dns_recovery` (documented in §4 tests-first list) |
+| 4 | Startup restore uses the durable path | `run_startup_dns_recovery` reads the derived path (`:816` — constant swap); messages name the new path (`:770`, `:816`, `:830`, `:838`, `:847`, `:884`, `:909`, `:869-:913` — the `:884`/`:909` post-restore `remove_networksetup_dns_backup` calls included) | Update `startup_guard_restores_from_readable_backup_only` neighbourhood (`:1243`) and `manual_restore_message_names_the_fix_per_service` (`:1267`) to the derived path |
+| 5 | The old volatile path is NOT read as a fallback | Startup and apply read ONLY the derived path; no fallback branch exists (the reader takes one path argument). Fail-closed answer: no fallback read; old path ignored entirely | Unit: a backup written to the old volatile path is ignored by `run_startup_dns_recovery` (§4 tests-first list, item 3) |
+| 6 | The durable backup's parent directory exists before the startup guard reads it, or the guard treats "parent missing" the same as "backup missing" | The startup DNS guard (`daemon.rs:11773` → `run_startup_dns_recovery`) runs BEFORE `run_preflight_checks` (call `daemon.rs:11781` → def `:13534`, `create_dir_all(state_path.parent())` at `:13536`), so the guard cannot rely on preflight having created the state dir. Safe today, and must stay safe: reboot case — the durable dir already exists; fresh-install case — a missing dir reads as missing backup (`Ok(None)`) → strand message (correct); apply-time writes are covered by the writer's own `create_dir_all` (`macos_dns_sc_protect.rs:410-412`) plus preflight having run by then. The implementation must keep one of the two guards explicit: parent created before the guard reads, or parent-missing ≡ backup-missing | Unit: a derived-path read with the state dir absent behaves as missing backup (strand path), never as a write-side surprise or a fallback read |
+
+Under Option A the backup's directory is daemon-writable by design, so the old `/var/run`
+reasoning ("planting requires root") no longer holds and must not be relied on. The honest
+model: the backup's author gains exactly the `networksetup -setdnsservers <svc> <IP-list>` power
+the daemon already holds through the helper allowlist (`privileged_helper.rs:2936-2955` admits
+the same argv from the daemon at any time), so a planted backup is **not** a privilege
+escalation. The residual risk is *stale or foreign content* — a document vouching for the wrong
+pre-protection baseline across reboot, snapshot restore, or a second install — which the
+no-fallback-read rule and the M1 capture guard (prior entries win only for services whose
+current DNS is loopback, `phase10.rs:4624-4648`) answer. Helper-side validation of restored DNS
+*values* beyond IP syntax is deliberately not added; it would restrict only the daemon, which
+retains unrestricted legitimate use of the same argv.
 
 Invariant 5's trust reasoning is stated here so the refute pass can attack it explicitly rather
 than discovering it implicitly: the danger of a fallback is not privilege escalation, it is
@@ -269,37 +286,68 @@ before mutation" bar (AGENTS.md §4) even if every directory ACL holds.
 1. **Path change.** Add `NETWORKSETUP_DNS_BACKUP_SUFFIX` (name TBD in review) and derive
    `networksetup_dns_backup_path(state_path) -> PathBuf` in `macos_dns_sc_protect.rs`,
    mirroring `shutdown_residue::marker_path`. Replace every `NETWORKSETUP_DNS_BACKUP_PATH`
-   use site (`:770`, `:816`, `:830`, `:838`, `:847`, `:869-:913`; `phase10.rs:4629`,
-   `:4660-4661`). The bare-path const is deleted, not deprecated (§3 "no runtime fallback"
+   use site (`:770`, `:816`, `:830`, `:838`, `:847`, `:884`, `:909`, `:869-:913`;
+   `phase10.rs:4629`,
+   `:4660-4661`) — the two post-restore `remove_networksetup_dns_backup` calls at `:884`/`:909`
+   must move with everything else, or a successful startup restore leaves the volatile file
+   behind while the durable one is gone (a phantom residue document). The bare-path const is
+   deleted, not deprecated (§3 "no runtime fallback"
    — a dangling const invites a fallback read).
 2. **Helper allowlist:** no change (§1.5 — the helper never sees the backup document).
-3. **Tests-first list (fail-closed first):**
-   1. Missing durable backup + loopback residue + no protection → still
-      `FailLoudManualRestoreRequired` (the old `:1261` truth table, path-agnostic — must not
-      regress).
-   2. Present-but-unreadable durable backup counts as residue, not absence (reader semantics
-      `:441-478` unchanged).
-   3. A backup written to the **old** volatile path is ignored by startup recovery (invariant 5
-      negative test).
-   4. Derived-path unit tests: path is under the state root; `--state-root` override moves it
-      (the installer's `--state-root` flag, `Install-RustyNetMacosService.sh:11`, `:116`, must
-      stay honoured — the daemon's state-path plumbing is already parameterized, so derive from
-      the same value).
-   5. Message pins updated: `manual_restore_message_names_the_fix_per_service` (`:1267`).
-4. **Live-lab proof:** a macOS run whose stage set includes the macOS reboot cell with DNS
-   protection active across the reboot must pass: reboot `macos-utm-1` under protection → daemon
-   starts → guard observes residue + durable backup → automatic restore from backup →
-   post-restore DNS observation clean (the `:913` "backup restore itself completed" path). The
-   failure transcript in §1.1 must be unreproducible. Verify the appended
+3. **Tests-first list (fail-closed first) — the following is copied verbatim from the
+   adversarial review §V ("Fail-closed tests the implementation MUST write first") and is the
+   authoritative list; the earlier draft items above it are subsumed by it:**
+
+   1. **Truth table preserved (path-agnostic):** `decide_startup_recovery(true, false, false) == FailLoudManualRestoreRequired`, `…(true, false, true) == RestoreFromBackup`, `…(true, true, _) == NoAction`, `…(false, _, _) == NoAction` — the existing `startup_guard_restores_from_readable_backup_only` (`:1243`) must pass unmodified against the derived-path plumbing.
+   2. **Present-but-unreadable durable backup is residue, not absence:** corrupt/truncated/foreign-schema document at the derived path → `read_networksetup_dns_backup` hard-`Err` → strand refusal, backup retained (reader semantics `:439-478` unchanged).
+   3. **No volatile fallback:** a valid backup planted at the old `/private/var/run` path is ignored by `run_startup_dns_recovery`; recovery decisions consult only the derived path (negative test pinning invariant 5).
+   4. **Derivation:** `networksetup_dns_backup_path(state_path)` is a sibling of the state file (`with_file_name`), moves with a `--state-root` override, and has the degenerate-path fallback `marker_path` has (`shutdown_residue.rs:182-192`); every `NETWORKSETUP_DNS_BACKUP_PATH` use site listed in A1 takes the derived value (a compile-time grep gate or a test that the const is gone — the bare const is deleted, not deprecated).
+   5. **Restore writes argv the helper admits:** for every backup entry shape (`None` → `Empty`; `Some(list)` → exact list), `startup_restore_argv_for_entry` output passes `validate_networksetup_args` (`privileged_helper.rs:2936`) — pins the backup→helper contract before any path moves.
+   6. **Unverified restore retains the backup (A5):** observation-unavailable after restore → backup still on disk + loud warn (this test pins the amended behavior, and fails until A5 is implemented).
+   7. **Cleanup compatibility (A4):** the macOS cleanup command list includes the derived backup path (or `assert_node_clean` includes an SC-DNS probe) — a stage-level test on `macos_traffic::cleanup_runtime_state`'s command set.
+   8. **Message pins:** `manual_restore_message_names_the_fix_per_service` (`:1267`) updated to the derived path; the `:830` no-socket, `:868` restore-failed, and `:875` retained-backup messages all interpolate the derived path (grep-gate: no remaining `NETWORKSETUP_DNS_BACKUP_PATH` identifier).
+   9. **Apply ordering preserved:** a mocked write failure before the first `networksetup` set aborts with the prior backup intact and zero mutation argvs issued (invariant 2, now against the derived path).
+4. **Live-lab proof (blocked on new stage work):** `live_reboot_recovery` is Linux-only today
+   (`PlatformRule::LinuxOnly` via `DEFAULT_SPEC`, `live_lab_stage_registry.rs:485-506` —
+   `platform_rule: PlatformRule::LinuxOnly` at `:495`; `enable: EnableRule::LinuxLiveSuite`,
+   `:2049-2052`) and its binary (`live_linux_reboot_recovery_test.rs`) contains no macOS
+   DNS-protection code — **there is no macOS reboot cell to include in a stage set**. The
+   deliverable therefore includes: (a) a macOS reboot-with-protection-active stage (registry
+   entry + implementation that applies protection, reboots `macos-utm-1`, and asserts the daemon
+   started, restored from the durable backup, and post-restore observation is clean), or (b) an
+   explicit fallback acceptance: the standalone test binary run focused on `macos-utm-1` with
+   its transcript archived as the report artifact. Until one exists, this plan cannot reach its
+   Definition of Done and no matrix row may claim it. The acceptance outcome itself is: reboot
+   `macos-utm-1` under protection → daemon starts → guard observes residue + durable backup →
+   automatic restore from backup → post-restore DNS observation clean via the **verified**
+   branch (`survivors.is_empty()`, `macos_dns_sc_protect.rs:882-890`). The `:905-917` degrade
+   path — observation unavailable → backup retired + `Ok` (warn at `:913`) — is a fail-open
+   seam: an unverified restore must **retain** the backup (retiring it converts an unverifiable
+   recovery into a guaranteed no-backup strand at next start). The implementation must change
+   that path to retain-and-warn, with a test pinning it (tests-first item 6). The failure
+   transcript in §1.1 must be unreproducible. Verify the appended
    `live_lab_node_run_matrix.csv` row (`documents/operations/live_lab_node_run_matrix.csv`) and
    take the pass claim from the stage's own report artifact, not the column alone.
+5. **cleanup_hosts and uninstall must not strand the bootstrap.** The macOS cleanup's explicit
+   rm list (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_traffic.rs:466-483`)
+   stops the daemon mid-protection (no teardown), leaves SC loopback residue in place, and does
+   not remove the durable backup — so the next run's daemon startup auto-restores (or, on
+   service-set drift, refuses to start and fails `bootstrap_hosts`). Add the derived backup path
+   to the cleanup rm list (alongside the already-missed
+   `rustynetd.state.shutdown-residue.json`), or extend `assert_node_clean` (`:498`) with an
+   SC-DNS-clean probe; the same removal belongs in the uninstall path. Record which in this plan
+   before implementation.
 
 ## 5) Risks and open questions (for the adversarial review)
 
 1. **Does the state root exist before first apply?** The volatile write created its own parent
    (`create_dir_all`, `:410-412`). The durable dir is created by the daemon at startup for the
    state file — confirm the ordering (state-file dir creation precedes any DNS apply) and that
-   the writer's `create_dir_all` remains harmless there.
+   the writer's `create_dir_all` remains harmless there. **Resolved by the review (§B.4
+   "Guard-vs-state-dir ordering"):** the startup guard (`daemon.rs:11773`) runs *before*
+   `run_preflight_checks` (call `:11781` → def `:13534`, `create_dir_all` at `:13536`), which is
+   safe in the safe direction — folded as §3 invariant 6 (parent must exist before the guard
+   reads, or the guard treats parent-missing the same as backup-missing).
 2. **Windows branch of the const.** The `else` branch (`/tmp/...`) exists for non-mac/non-linux
    test hosts. Derivation must keep a deterministic test-host answer (state-path sibling on every
    branch) or tests pinning the tmp path break. What is the Windows story — is DNS protection
@@ -326,10 +374,30 @@ before mutation" bar (AGENTS.md §4) even if every directory ACL holds.
 
 ## 6) Out of scope
 
-* Linux `/run` backup volatility fix (`linux_dns_protect.rs:248`) — recorded as the follow-up;
-  same derivation pattern applies.
+* The **macOS branch** of `RESOLV_CONF_FAILCLOSED_BACKUP_PATH` (`linux_dns_protect.rs:250-251`,
+  `/private/var/run/...`) — written best-effort by the same apply (`phase10.rs:4674-4695`, the
+  `DnsFailclosedFile` `RESOLV_APPLY` call at `:4691-4692`) and never read by the startup guard;
+  macOS regenerates `resolv.conf` from restored SC state, and the durable
+  `/etc/resolver/rustynet` artifact (`phase10.rs:4698-4712`, `*.rustynet`-scoped; restored
+  best-effort at teardown, `:4779`) persists un-restored across reboot. This plan accepts those
+  bounds explicitly and records them; the Linux `/run` branch (`linux_dns_protect.rs:248`)
+  remains the follow-up fix, same derivation pattern — so a reader does not conclude the plan
+  relocated *all* macOS volatile DNS artifacts when it relocates one of three.
 * Option C's authorship-proof primitive (signed residue binding) — future design, strictly
   after this plan.
 * Changes to the privileged helper's allowlist or the `DnsFailclosedFile` builtin.
 * Any change to `decide_startup_recovery`'s truth table — Option A deliberately preserves it.
 * The Windows DNS protection mechanism.
+
+## 7) Review disposition
+
+Adversarial review: `MacosDnsBackupRebootSurvivalPlanAdversarialReview_2026-09-02.md` (§V, READY-WITH-AMENDMENTS). All six amendments folded in place:
+
+- A1: folded — completed the `NETWORKSETUP_DNS_BACKUP_PATH` use-site list with the two post-restore `remove_networksetup_dns_backup` calls (`:884`/`:909`) in §2 (Option A cost), §3 invariant 4, and §4 step 1; without them a successful startup restore leaves the volatile file behind while the durable one is gone.
+- A2: folded — §3 invariant 5's threat model restated for the durable path: the backup's directory is daemon-writable by design, a planted backup is not a privilege escalation (the daemon already holds the same `networksetup -setdnsservers` argv power via `privileged_helper.rs:2936-2955`), and the residual risk is stale/foreign content, answered by the no-fallback-read rule and the M1 capture guard (`phase10.rs:4624-4648`).
+- A3: folded — §4 step 4 rewritten: `live_reboot_recovery` is Linux-only (`PlatformRule::LinuxOnly` via `DEFAULT_SPEC`; `EnableRule::LinuxLiveSuite`), its binary contains no macOS DNS-protection code, so no macOS reboot cell exists to include; building the macOS reboot-with-protection stage (or naming the focused standalone-proof fallback) is now part of the deliverable, and no matrix row may claim done until it exists.
+- A4: folded — new §4 step 5: `cleanup_hosts` (and uninstall) must remove the derived backup path (alongside the already-missed `rustynetd.state.shutdown-residue.json`) or `assert_node_clean` grows an SC-DNS-clean probe; the choice must be recorded in this plan before implementation.
+- A5: folded — §4 step 4 acceptance now requires the verified restore branch (`survivors.is_empty()`, `macos_dns_sc_protect.rs:882-890`); the `:905-917` observation-unavailable path (backup retired + `Ok`) is named a fail-open seam and must become retain-and-warn, pinned by tests-first item 6.
+- A6: folded — §6 reframed from "Linux twin" to "macOS branch + Linux twin": the macOS branch of `RESOLV_CONF_FAILCLOSED_BACKUP_PATH` (`linux_dns_protect.rs:250-251`) and the durable `/etc/resolver/rustynet` artifact (`phase10.rs:4698-4712`) are recorded with their explicitly accepted bounds; only the Linux `/run` branch remains the follow-up.
+
+The review's guard-vs-state-dir ordering finding (§B.4) is folded as §3 invariant 6 and resolves former §5 open question 1; its fail-closed tests list is folded verbatim as the authoritative §4 step 3 list.
