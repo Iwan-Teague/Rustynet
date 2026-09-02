@@ -156,3 +156,6 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - LAB: guests show on ARP (.4/.10/.18 and 192.168.65.101); waiting for sshd.
 - MERGED: QH-26 marker gate (87aa7b6d; hand fix 8ddaea6f inlined format args for clippy 1.88 in bin + tests). Runs green on the merged main. AGENTS/CLAUDE mirror byte-identical.
 - LAB: probe_and_recover found no live IP for the booted guests (discovery listed only Windows11), so nothing was recovered; the three still time out on 22 while answering ARP → next: utmctl guest-agent path for the Debians, wait/ARP for the macOS guest.
+- LAB: the booted guests moved to 192.168.65.0/24 (debian-headless-2 → .4, debian-headless-4 → .5); inventory refreshed via the sanctioned discover command (5963afd2). macOS guest (192.168.65.101) stays ARP-incomplete after 35 min — rank-1 harvest deferred.
+- LAB RUN livelab-1788323082-5963afd2f993 (Linux full suite, 2 nodes): FAIL at `prepare_source_archive` — every guest reports "git worktree must be clean for this live-lab iteration"; 3 pass / 1 fail / 59 skipped. Ledger row appended (overall_result=fail, first_failed_stage=prepare_source_archive). Diagnosing the guests' dirty checkouts before re-running.
+- LAUNCH (docs): receiver-index demux inverse-map plan (clone-audit P2) edit-1788323087644-3597-0.
