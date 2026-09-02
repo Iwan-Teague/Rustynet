@@ -18,8 +18,11 @@
 //!   boundary (host-derived, so treated as untrusted; mirrors
 //!   `is_owned_nft_table_token` discipline),
 //! - parsing of `-listallnetworkservices` and `-getdnsservers` output,
-//! - the session-scoped backup document (which service had which servers
-//!   before enforcement) and its save/load round-trip,
+//! - the durable backup document (which service had which servers
+//!   before enforcement; a sibling of the daemon state file, derived by
+//!   [`networksetup_dns_backup_path`] so it survives reboot — see
+//!   `MacosDnsBackupRebootSurvivalPlan_2026-09-02`) and its save/load
+//!   round-trip,
 //! - the startup-recovery decision function that bounds M1's known crash
 //!   risk (SC DNS persists across reboot; a crash without teardown would
 //!   otherwise strand host DNS on the dead loopback port), widened by S4
@@ -293,18 +296,39 @@ pub fn is_loopback_dns_server_list(servers: &[String]) -> bool {
         })
 }
 
-/// Session-scoped backup path for the per-service DNS documents M1 captures
-/// before enforcement. Same pattern as
-/// `RESOLV_CONF_FAILCLOSED_BACKUP_PATH` in `linux_dns_protect.rs`: under the
-/// runtime dir on the supported targets, /tmp elsewhere (unit tests run on
-/// the non-macos branch on this host's CI).
-pub const NETWORKSETUP_DNS_BACKUP_PATH: &str = if cfg!(target_os = "macos") {
-    "/private/var/run/rustynet/networksetup-dns.failclosed.bak"
-} else if cfg!(target_os = "linux") {
-    "/run/rustynet/networksetup-dns.failclosed.bak"
-} else {
-    "/tmp/rustynet-networksetup-dns.failclosed.bak"
-};
+/// Suffix appended to the daemon state file name to derive the durable DNS
+/// fail-closed backup path (the QH-40 `shutdown_residue::marker_path`
+/// pattern; see [`networksetup_dns_backup_path`]).
+///
+/// MacosDnsBackupRebootSurvivalPlan_2026-09-02 (Option A): the backup moved
+/// from the volatile `/private/var/run/rustynet` runtime dir (macOS clears it
+/// at boot) to a DURABLE sibling of the daemon state file, so a reboot while
+/// DNS protection is active no longer strands the host with the backup gone.
+/// There is deliberately NO bare-path constant and NO fallback read of the
+/// old volatile location: the reader takes exactly one path, derived from the
+/// daemon's actual state path, or nothing.
+pub const NETWORKSETUP_DNS_BACKUP_SUFFIX: &str = ".networksetup-dns.failclosed.bak";
+
+/// Derive the durable backup path from the daemon state path, mirroring
+/// `shutdown_residue::marker_path` (`crates/rustynetd/src/shutdown_residue.rs`).
+///
+/// The backup is a sibling of the state file so it inherits the state
+/// directory's ownership and permissions and lives on the same durable volume
+/// (`/usr/local/var/rustynet` on macOS, the installer's `STATE_ROOT`): it
+/// survives reboot, which is the whole point — the startup-recovery guard
+/// (`run_startup_dns_recovery`, called from `daemon.rs` BEFORE preflight has
+/// created anything) reads exactly this derived path and never any volatile
+/// fallback. A state path with no file name (`/`, `..`) falls back to a fixed
+/// name inside that directory rather than silently producing a path that
+/// would collide with the directory itself.
+pub fn networksetup_dns_backup_path(state_path: &std::path::Path) -> std::path::PathBuf {
+    match state_path.file_name().and_then(|name| name.to_str()) {
+        Some(name) if !name.is_empty() => {
+            state_path.with_file_name(format!("{name}{NETWORKSETUP_DNS_BACKUP_SUFFIX}"))
+        }
+        _ => state_path.join(format!("rustynetd{NETWORKSETUP_DNS_BACKUP_SUFFIX}")),
+    }
+}
 
 /// One service's pre-enforcement DNS configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,8 +526,8 @@ pub enum StartupRecoveryDecision {
 ///   `residue_evidence_from_observation`; the signature and truth table are
 ///   unchanged, only the meaning of this first argument widened),
 /// - `dns_protection_running`: RustyNet DNS protection is currently applied,
-/// - `backup_readable`: a valid backup document exists at
-///   `NETWORKSETUP_DNS_BACKUP_PATH`.
+/// - `backup_readable`: a valid backup document exists at the derived durable
+///   path (`networksetup_dns_backup_path(state_path)`).
 ///
 /// The loopback posture itself is M1's durable residue marker: it persists
 /// across reboot (unlike pf anchors, which launchd's boot-time `pfctl -F`
@@ -643,8 +667,10 @@ fn fail_loud_service_list(
 /// The exact per-entry argv the startup restore loop issues (pure so the
 /// widened guard's restore behavior is pinned by unit test): a recorded
 /// server list restores exactly, a recorded no-servers state restores with
-/// `Empty`.
-fn startup_restore_argv_for_entry(
+/// `Empty`. `pub(crate)` so the backup→helper argv contract is pinned
+/// against `privileged_helper::validate_networksetup_args` in that module's
+/// tests.
+pub(crate) fn startup_restore_argv_for_entry(
     entry: &NetworksetupDnsBackupEntry,
 ) -> Result<Vec<String>, String> {
     match &entry.servers {
@@ -759,15 +785,20 @@ pub fn observe_service_dns_postures_with(
 
 /// The operator-actionable message for the backup-lost strand. Names the
 /// exact manual fix per affected service (`networksetup -setdnsservers <svc>
-/// Empty`) so an operator is never left guessing.
-pub fn startup_recovery_manual_restore_message(services: &[String]) -> String {
+/// Empty`) so an operator is never left guessing. `backup_path` is the
+/// derived durable path the guard actually consults.
+pub fn startup_recovery_manual_restore_message(
+    services: &[String],
+    backup_path: &std::path::Path,
+) -> String {
     let per_service = services
         .iter()
         .map(|s| format!("  sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers {s:?} {NETWORKSETUP_EMPTY_DNS_KEYWORD}"))
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is still loopback but no RustyNet DNS protection is running and the backup document is missing or unreadable ({NETWORKSETUP_DNS_BACKUP_PATH}). Host DNS resolution will stay broken until the manual fix is applied:\n{per_service}\nThen restart rustynetd."
+        "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is still loopback but no RustyNet DNS protection is running and the backup document is missing or unreadable ({}). Host DNS resolution will stay broken until the manual fix is applied:\n{per_service}\nThen restart rustynetd.",
+        backup_path.display()
     )
 }
 
@@ -789,14 +820,22 @@ pub fn startup_recovery_manual_restore_message(services: &[String]) -> String {
 /// confirmed-residue + unrecoverable; S1's runtime posture assert closes the
 /// degraded window within one cadence).
 ///
+/// `state_path` is the daemon's state file path: the durable backup is
+/// derived from it (`networksetup_dns_backup_path`) and is the ONLY backup
+/// location the guard consults — there is no fallback read of the old
+/// volatile `/private/var/run` location (fail closed: a missing or stale
+/// document is reported as such, never silently replaced by a second copy).
+///
 /// `helper_socket_path` is the daemon's privileged-helper socket (when one is
 /// configured); restoring and observing require it, because
 /// `networksetup -setdnsservers` / `-getdnsservers` are privileged
 /// operations.
 pub fn run_startup_dns_recovery(
+    state_path: &std::path::Path,
     helper_socket_path: Option<&std::path::Path>,
     helper_timeout: std::time::Duration,
 ) -> Result<(), String> {
+    let backup_path = networksetup_dns_backup_path(state_path);
     if !cfg!(target_os = "macos") {
         return Ok(());
     }
@@ -812,8 +851,29 @@ pub fn run_startup_dns_recovery(
     if let ServiceDnsObservation::ObservationUnavailable(reason) = &observation {
         log::warn!("{}", observation_unavailable_warning(reason));
     }
-    let residue_evidence = residue_evidence_from_observation(sc_dns_is_loopback, &observation);
-    let backup = read_networksetup_dns_backup(std::path::Path::new(NETWORKSETUP_DNS_BACKUP_PATH));
+    run_startup_dns_recovery_with(
+        &backup_path,
+        sc_dns_is_loopback,
+        &observation,
+        helper_socket_path,
+        helper_timeout,
+    )
+}
+
+/// The decision+act core of [`run_startup_dns_recovery`], with the scutil
+/// and helper observations injected so the guard's file-backed behavior is
+/// unit-testable (the production wrapper supplies the real observations).
+/// `backup_path` is the derived durable backup path and the only path this
+/// function reads or removes.
+pub(crate) fn run_startup_dns_recovery_with(
+    backup_path: &std::path::Path,
+    sc_dns_is_loopback: bool,
+    observation: &ServiceDnsObservation,
+    helper_socket_path: Option<&std::path::Path>,
+    helper_timeout: std::time::Duration,
+) -> Result<(), String> {
+    let residue_evidence = residue_evidence_from_observation(sc_dns_is_loopback, observation);
+    let backup = read_networksetup_dns_backup(backup_path);
     let backup_readable = matches!(backup, Ok(Some(_)));
     match decide_startup_recovery(residue_evidence, false, backup_readable) {
         StartupRecoveryDecision::NoAction => Ok(()),
@@ -821,21 +881,26 @@ pub fn run_startup_dns_recovery(
             // S4: name the OBSERVED loopback-pinned services (with the
             // backup's recorded entries as fallback), so the loud refusal is
             // actionable even when the backup is missing or corrupt.
-            let services = fail_loud_service_list(&observation, &backup);
+            let services = fail_loud_service_list(observation, &backup);
             if services.is_empty() {
                 // Neither observation nor backup yielded a concrete name:
                 // still loud, still actionable — name the fix shape and the
                 // backup path.
                 return Err(format!(
-                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback, no RustyNet DNS protection is running, and the backup at {NETWORKSETUP_DNS_BACKUP_PATH} is missing or unreadable. List services with `networksetup -listallnetworkservices` and restore each with:\n  sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}\nThen restart rustynetd."
+                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback, no RustyNet DNS protection is running, and the backup at {} is missing or unreadable. List services with `networksetup -listallnetworkservices` and restore each with:\n  sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}\nThen restart rustynetd.",
+                    backup_path.display()
                 ));
             }
-            Err(startup_recovery_manual_restore_message(&services))
+            Err(startup_recovery_manual_restore_message(
+                &services,
+                backup_path,
+            ))
         }
         StartupRecoveryDecision::RestoreFromBackup => {
             let Some(socket) = helper_socket_path else {
                 return Err(format!(
-                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback and a backup exists at {NETWORKSETUP_DNS_BACKUP_PATH}, but no privileged helper socket is configured, so the automatic restore cannot run. Restore manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}` per service, then restart rustynetd."
+                    "RustyNet DNS fail-closed residue detected at startup: System Configuration DNS is loopback and a backup exists at {}, but no privileged helper socket is configured, so the automatic restore cannot run. Restore manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}` per service, then restart rustynetd.",
+                    backup_path.display()
                 ));
             };
             let backup = match backup {
@@ -844,7 +909,8 @@ pub fn run_startup_dns_recovery(
                 // readable), but fail closed anyway instead of panicking.
                 _ => {
                     return Err(format!(
-                        "the networksetup DNS backup at {NETWORKSETUP_DNS_BACKUP_PATH} became unreadable during startup recovery; restore manually"
+                        "the networksetup DNS backup at {} became unreadable during startup recovery; restore manually",
+                        backup_path.display()
                     ));
                 }
             };
@@ -866,58 +932,77 @@ pub fn run_startup_dns_recovery(
                         output.status,
                         output.stderr,
                         entry.service,
-                        NETWORKSETUP_DNS_BACKUP_PATH
+                        backup_path.display()
                     ));
                 }
             }
             // S4-A2: verify the restore actually cleared residue before
-            // deleting the backup. The backup only covers the services it
-            // recorded; a service observed loopback-pinned but absent from
-            // the backup would otherwise survive silently once the backup is
-            // removed.
+            // deleting the backup (the disposition lives in
+            // `verify_and_retire_backup` — including the fail-closed
+            // treatment of an unverifiable post-restore observation).
             let post = observe_service_dns_postures(helper_socket_path, helper_timeout);
-            match &post {
-                ServiceDnsObservation::Observed(_) => {
-                    let survivors = surviving_loopback_services(&post);
-                    if survivors.is_empty() {
-                        // Residue confirmed cleared: retire the backup.
-                        remove_networksetup_dns_backup(std::path::Path::new(
-                            NETWORKSETUP_DNS_BACKUP_PATH,
-                        ))?;
-                        log::info!(
-                            "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)"
-                        );
-                        Ok(())
-                    } else {
-                        // Restore did NOT clear residue (an observed-loopback
-                        // service is absent from the backup): fail loud,
-                        // retain the backup, name the manual fix.
-                        Err(format!(
-                            "RustyNet DNS fail-closed startup recovery: the automatic backup restore completed, but these services remain loopback-pinned and are not covered by the backup at {}: {}. Backup RETAINED at {}. Restore each manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}`, then restart rustynetd.",
-                            NETWORKSETUP_DNS_BACKUP_PATH,
-                            surviving_loopback_services(&post).join(", "),
-                            NETWORKSETUP_DNS_BACKUP_PATH,
-                        ))
-                    }
-                }
-                ServiceDnsObservation::ObservationUnavailable(reason) => {
-                    // Degrade-not-strand: the backup restore itself
-                    // succeeded, so the host is not stranded — but the
-                    // post-restore verification could not run, so this is
-                    // never silent. Retire the backup (it did its job for the
-                    // services it covered) and name the blind spot.
-                    remove_networksetup_dns_backup(std::path::Path::new(
-                        NETWORKSETUP_DNS_BACKUP_PATH,
-                    ))?;
-                    log::warn!(
-                        "RustyNet DNS fail-closed startup guard: post-restore DNS observation unavailable ({reason}); loopback residue in services absent from the backup at {NETWORKSETUP_DNS_BACKUP_PATH} may persist until the first apply. The backup restore itself completed."
-                    );
-                    log::info!(
-                        "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)"
-                    );
-                    Ok(())
-                }
+            verify_and_retire_backup(backup_path, &post)
+        }
+    }
+}
+
+/// Post-restore disposition (the tail of the startup guard's
+/// `RestoreFromBackup` arm): retire the backup ONLY on a verified clean
+/// restore; retain it on every unverifiable or failed outcome.
+///
+/// - `Observed` + no loopback survivors: residue confirmed cleared — the
+///   backup is retired and startup proceeds.
+/// - `Observed` + survivors: an observed-loopback service is absent from the
+///   backup, so the restore did NOT clear residue — fail loud, RETAIN the
+///   backup, name the manual fix.
+/// - `ObservationUnavailable` (A5,
+///   MacosDnsBackupRebootSurvivalPlanAdversarialReview_2026-09-02): the
+///   restore argvs were accepted by the helper, but the post-restore
+///   observation could not run, so the restore is UNVERIFIED. The backup is
+///   RETAINED and startup is REFUSED: retiring it here would convert an
+///   unverifiable recovery into a guaranteed no-backup strand at next start,
+///   and proceeding would claim a recovery the host has not demonstrated.
+///   The retained backup means the next start re-runs this guard, re-restores
+///   from it, and re-verifies once the helper is observable — or the operator
+///   applies the named manual fix. (Former behavior — retire the backup and
+///   return `Ok` — was a fail-open seam and was removed; the refusal
+///   semantics are otherwise unchanged.)
+fn verify_and_retire_backup(
+    backup_path: &std::path::Path,
+    post: &ServiceDnsObservation,
+) -> Result<(), String> {
+    match post {
+        ServiceDnsObservation::Observed(_) => {
+            let survivors = surviving_loopback_services(post);
+            if survivors.is_empty() {
+                // Residue confirmed cleared: retire the backup.
+                remove_networksetup_dns_backup(backup_path)?;
+                log::info!(
+                    "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)"
+                );
+                Ok(())
+            } else {
+                // Restore did NOT clear residue (an observed-loopback
+                // service is absent from the backup): fail loud,
+                // retain the backup, name the manual fix.
+                Err(format!(
+                    "RustyNet DNS fail-closed startup recovery: the automatic backup restore completed, but these services remain loopback-pinned and are not covered by the backup at {}: {}. Backup RETAINED at {}. Restore each manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}`, then restart rustynetd.",
+                    backup_path.display(),
+                    surviving_loopback_services(post).join(", "),
+                    backup_path.display(),
+                ))
             }
+        }
+        ServiceDnsObservation::ObservationUnavailable(reason) => {
+            // Fail closed (A5): UNVERIFIED restore ⇒ backup RETAINED and
+            // startup refused. Never retire the only recovery document on an
+            // unverified outcome, and never report success for a recovery
+            // the guard could not observe.
+            Err(format!(
+                "RustyNet DNS fail-closed startup guard: post-restore DNS observation unavailable ({reason}); the automatic restore from the backup at {} could not be VERIFIED, so the backup is RETAINED at {} and startup is refused. Restart rustynetd with the privileged helper observable to re-restore and re-verify, or restore manually with `sudo {NETWORKSETUP_BINARY_PATH} -setdnsservers \"<service>\" {NETWORKSETUP_EMPTY_DNS_KEYWORD}` per service, then restart rustynetd.",
+                backup_path.display(),
+                backup_path.display(),
+            ))
         }
     }
 }
@@ -1265,12 +1350,369 @@ Thunderbolt Bridge
 
     #[test]
     fn manual_restore_message_names_the_fix_per_service() {
-        let message =
-            startup_recovery_manual_restore_message(&["Wi-Fi".to_owned(), "Ethernet".to_owned()]);
-        assert!(message.contains("networksetup-dns.failclosed.bak"));
+        let backup_path =
+            networksetup_dns_backup_path(std::path::Path::new(crate::daemon::default_state_path()));
+        let message = startup_recovery_manual_restore_message(
+            &["Wi-Fi".to_owned(), "Ethernet".to_owned()],
+            &backup_path,
+        );
+        // The durable sibling path (the file NAME survives the directory
+        // change from the old volatile location).
+        assert!(message.contains("rustynetd.state.networksetup-dns.failclosed.bak"));
         assert!(message.contains("-setdnsservers \"Wi-Fi\" Empty"));
         assert!(message.contains("-setdnsservers \"Ethernet\" Empty"));
         assert!(message.contains("/usr/sbin/networksetup"));
+    }
+
+    // ---- Durable backup path (MacosDnsBackupRebootSurvivalPlan_2026-09-02,
+    //      Option A; authoritative tests-first list §4 step 3) ----
+
+    /// A temp state file layout: `<dir>/rustynetd.state` (existing parent) or
+    /// a not-yet-created parent, per test.
+    fn temp_state_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rn-dns-bak-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp state dir should create");
+        dir
+    }
+
+    fn sample_backup() -> NetworksetupDnsBackup {
+        build_networksetup_dns_backup(vec![NetworksetupDnsBackupEntry {
+            service: "Wi-Fi".to_owned(),
+            servers: Some(vec!["8.8.8.8".to_owned()]),
+        }])
+        .expect("valid backup")
+    }
+
+    #[test]
+    fn derived_backup_path_is_durable_sibling_of_state_path() {
+        // Default install: sibling of the daemon state file with the exact
+        // suffix, on the durable volume — never under the old volatile
+        // /private/var/run runtime dir.
+        let derived =
+            networksetup_dns_backup_path(std::path::Path::new(crate::daemon::DEFAULT_STATE_PATH));
+        assert_eq!(
+            derived,
+            std::path::PathBuf::from("/usr/local/var/rustynet/rustynetd.state")
+                .with_file_name("rustynetd.state.networksetup-dns.failclosed.bak")
+        );
+        assert_eq!(
+            derived.file_name().and_then(|n| n.to_str()),
+            Some("rustynetd.state.networksetup-dns.failclosed.bak")
+        );
+        let derived_str = derived.to_str().expect("utf-8 path");
+        assert!(!derived_str.contains("/private/var/run"));
+        assert!(!derived_str.contains("/run/"));
+        assert!(!derived_str.contains("/tmp/"));
+        assert!(derived_str.ends_with(NETWORKSETUP_DNS_BACKUP_SUFFIX));
+        assert!(derived_str.starts_with("/usr/local/var/rustynet/"));
+
+        // A --state-root override moves the derivation with it: the path is
+        // always derived from the daemon's ACTUAL state path, never
+        // hardcoded.
+        let custom =
+            networksetup_dns_backup_path(std::path::Path::new("/var/tmp/lab/node1/rn.state"));
+        assert_eq!(
+            custom,
+            std::path::PathBuf::from("/var/tmp/lab/node1/rn.state.networksetup-dns.failclosed.bak")
+        );
+
+        // Degenerate paths (no file name) fall back to a fixed sibling name
+        // instead of colliding with the directory itself — the same fallback
+        // `shutdown_residue::marker_path` has.
+        let degenerate = networksetup_dns_backup_path(std::path::Path::new("/"));
+        assert_eq!(
+            degenerate,
+            std::path::PathBuf::from("/rustynetd.networksetup-dns.failclosed.bak")
+        );
+        let dots = networksetup_dns_backup_path(std::path::Path::new(".."));
+        assert_eq!(
+            dots,
+            std::path::Path::new("..").join("rustynetd.networksetup-dns.failclosed.bak")
+        );
+    }
+
+    #[test]
+    fn missing_durable_backup_with_loopback_residue_still_refuses() {
+        // Invariant 1/5/6 composite at the pure layer: the guard reads ONLY
+        // the derived path; nothing exists there (the volatile old path is
+        // never consulted, and no const for it exists anymore), so a
+        // loopback-residue host with no durable backup refuses startup
+        // loudly — the same decision the reboot-strand produced, but now the
+        // durable backup usually EXISTS.
+        let dir = temp_state_dir("missing-refuses");
+        let state_path = dir.join("rustynetd.state");
+        let backup_path = networksetup_dns_backup_path(&state_path);
+        assert_eq!(
+            read_networksetup_dns_backup(&backup_path),
+            Ok(None),
+            "a missing durable backup reads as absence, not error"
+        );
+        assert_eq!(
+            decide_startup_recovery(true, false, false),
+            StartupRecoveryDecision::FailLoudManualRestoreRequired
+        );
+        // And the core guard refuses with the derived path named.
+        let observation = ServiceDnsObservation::Observed(vec![(
+            "Wi-Fi".to_owned(),
+            ServiceDnsPosture::LoopbackOnly,
+        )]);
+        let err = run_startup_dns_recovery_with(
+            &backup_path,
+            true,
+            &observation,
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("residue with no durable backup must refuse");
+        assert!(err.contains("backup document is missing or unreadable"));
+        assert!(err.contains(&backup_path.display().to_string()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parent_missing_reads_as_backup_missing_never_as_error_or_crash() {
+        // Invariant 6: the startup guard runs BEFORE preflight creates the
+        // state directory, so the derived path's parent may not exist yet on
+        // a fresh install. That MUST read as "backup missing" (Ok(None) →
+        // strand refusal path), never as an I/O error masquerading as a
+        // corrupt backup or as a silent pass.
+        let dir = temp_state_dir("parent-missing");
+        let state_path = dir.join("not-created-yet").join("rustynetd.state");
+        let backup_path = networksetup_dns_backup_path(&state_path);
+        assert!(!backup_path.parent().map(|p| p.exists()).unwrap_or(false));
+        assert_eq!(read_networksetup_dns_backup(&backup_path), Ok(None));
+        assert_eq!(
+            decide_startup_recovery(true, false, false),
+            StartupRecoveryDecision::FailLoudManualRestoreRequired
+        );
+        assert_eq!(
+            decide_startup_recovery(false, false, false),
+            StartupRecoveryDecision::NoAction
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn present_but_unreadable_durable_backup_is_residue_and_is_retained() {
+        // Corrupt/truncated/foreign-schema document at the derived path is a
+        // hard error (residue, not absence) → strand refusal, and the
+        // document is RETAINED (the reader never deletes).
+        let dir = temp_state_dir("unreadable");
+        let backup_path = networksetup_dns_backup_path(&dir.join("rustynetd.state"));
+        std::fs::write(&backup_path, b"{ not a backup document").expect("corrupt doc writes");
+        let read = read_networksetup_dns_backup(&backup_path);
+        assert!(
+            read.is_err(),
+            "a present-but-broken document is a hard error"
+        );
+        assert_eq!(
+            decide_startup_recovery(true, false, false),
+            StartupRecoveryDecision::FailLoudManualRestoreRequired
+        );
+        assert!(
+            backup_path.exists(),
+            "the unreadable backup is never deleted"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_at_old_volatile_style_path_is_ignored() {
+        // Invariant 5 (no volatile fallback): a VALID backup planted at the
+        // OLD-style location (the old basename in a runtime-style dir,
+        // distinct from the derived sibling) is ignored — the guard consults
+        // only the derived path, so a loopback-residue host without the
+        // durable sibling refuses rather than silently restoring from the
+        // stale copy.
+        let dir = temp_state_state_dir_with_legacy_backup();
+        let backup_path = networksetup_dns_backup_path(&dir.join("rustynetd.state"));
+        assert!(read_networksetup_dns_backup(&backup_path).is_ok_and(|b| b.is_none()));
+        let observation = ServiceDnsObservation::Observed(vec![(
+            "Wi-Fi".to_owned(),
+            ServiceDnsPosture::LoopbackOnly,
+        )]);
+        let err = run_startup_dns_recovery_with(
+            &backup_path,
+            true,
+            &observation,
+            None,
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("no durable backup ⇒ refuse, even with a legacy-named file present");
+        assert!(err.contains("missing or unreadable"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn temp_state_state_dir_with_legacy_backup() -> std::path::PathBuf {
+        let dir = temp_state_dir("legacy-ignored");
+        // The OLD basename (pre-Option-A) under a runtime-style subdir of the
+        // temp dir — a stand-in for the old volatile location, which tests
+        // cannot write to directly (root-owned /private/var/run).
+        let legacy_dir = dir.join("var-run-rustynet");
+        std::fs::create_dir_all(&legacy_dir).expect("legacy dir should create");
+        std::fs::write(
+            legacy_dir.join("networksetup-dns.failclosed.bak"),
+            serde_json::to_vec(&sample_backup()).expect("backup serializes"),
+        )
+        .expect("legacy backup writes");
+        dir
+    }
+
+    #[test]
+    fn unverified_restore_retains_backup_and_refuses_startup() {
+        // A5: after a restore whose post-restore observation is UNAVAILABLE,
+        // the backup is RETAINED (never retired) and the guard refuses
+        // startup until the restore is verified. Retiring it would convert
+        // an unverifiable recovery into a guaranteed no-backup strand at
+        // next start.
+        let dir = temp_state_dir("unverified-retain");
+        let backup_path = networksetup_dns_backup_path(&dir.join("rustynetd.state"));
+        write_networksetup_dns_backup(&backup_path, &sample_backup())
+            .expect("backup writes beside the state file");
+        let err = verify_and_retire_backup(
+            &backup_path,
+            &ServiceDnsObservation::ObservationUnavailable(
+                "privileged helper connect failed".to_owned(),
+            ),
+        )
+        .expect_err("an unverified restore must not report success");
+        assert!(
+            err.contains("RETAINED"),
+            "the refusal names the retention: {err}"
+        );
+        assert!(err.contains(&backup_path.display().to_string()));
+        assert!(
+            backup_path.exists(),
+            "the backup document survives an unverifiable restore"
+        );
+        // The document is still readable: the next start can restore from it.
+        assert_eq!(
+            read_networksetup_dns_backup(&backup_path).expect("retained backup reads"),
+            Some(sample_backup())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verified_clean_restore_still_retires_backup() {
+        // The disposition's other arms are unchanged: an OBSERVED clean
+        // restore retires the backup (and only that outcome does).
+        let dir = temp_state_dir("verified-retire");
+        let backup_path = networksetup_dns_backup_path(&dir.join("rustynetd.state"));
+        write_networksetup_dns_backup(&backup_path, &sample_backup())
+            .expect("backup writes beside the state file");
+        let observed = ServiceDnsObservation::Observed(vec![
+            ("Wi-Fi".to_owned(), ServiceDnsPosture::NonLoopback),
+            ("Ethernet".to_owned(), ServiceDnsPosture::None),
+        ]);
+        verify_and_retire_backup(&backup_path, &observed)
+            .expect("a verified clean restore retires the backup");
+        assert!(!backup_path.exists(), "retired on verified clean only");
+
+        // Observed SURVIVORS keep the backup and fail loud.
+        write_networksetup_dns_backup(&backup_path, &sample_backup()).expect("backup rewrites");
+        let survivors = ServiceDnsObservation::Observed(vec![(
+            "Stray".to_owned(),
+            ServiceDnsPosture::LoopbackOnly,
+        )]);
+        let err = verify_and_retire_backup(&backup_path, &survivors)
+            .expect_err("survivors must fail loud");
+        assert!(err.contains("RETAINED"));
+        assert!(backup_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_write_failure_aborts_and_keeps_prior_backup_intact() {
+        // Invariant 2 (apply ordering, writer half): the backup write is the
+        // gate BEFORE the first `networksetup` mutation — phase10.rs
+        // `apply_dns_protection` returns `DnsApplyFailed` on any write error
+        // before the per-service set loop (pinned structurally by
+        // `macos_apply_writes_backup_before_first_mutation_argv` in
+        // phase10's tests). Here: a mocked write failure (the document made
+        // read-only) aborts the write AND leaves the prior backup readable
+        // and unchanged, so rollback/startup restore can still use it.
+        let dir = temp_state_dir("write-fails");
+        let backup_path = networksetup_dns_backup_path(&dir.join("rustynetd.state"));
+        let prior = build_networksetup_dns_backup(vec![NetworksetupDnsBackupEntry {
+            service: "Ethernet".to_owned(),
+            servers: Some(vec!["1.1.1.1".to_owned()]),
+        }])
+        .expect("prior backup builds");
+        write_networksetup_dns_backup(&backup_path, &prior).expect("prior backup writes");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o400))
+                .expect("chmod 0400 should succeed for the file owner");
+        }
+        let replacement = sample_backup();
+        let result = write_networksetup_dns_backup(&backup_path, &replacement);
+        #[cfg(unix)]
+        {
+            assert!(
+                result.is_err(),
+                "writing over a 0400 document must fail closed"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = result;
+        }
+        // Prior document intact: same bytes, still readable, still valid.
+        let restored = read_networksetup_dns_backup(&backup_path);
+        #[cfg(unix)]
+        assert_eq!(
+            restored.expect("prior backup must stay readable"),
+            Some(prior),
+            "a failed write must leave the prior backup untouched"
+        );
+        #[cfg(not(unix))]
+        {
+            let _ = restored;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_argv_passes_helper_validation_for_every_entry_shape() {
+        // Tests-first item 5: every backup entry shape (`None` → `Empty`,
+        // `Some(list)` → exact list) yields argv the privileged helper's
+        // validator admits. Pinned here against the same argv shapes; the
+        // authoritative validator itself is exercised by
+        // `restore_argv_contract_with_helper_validator` in
+        // `privileged_helper.rs`'s tests.
+        let entries = vec![
+            NetworksetupDnsBackupEntry {
+                service: "Wi-Fi".to_owned(),
+                servers: Some(vec!["8.8.8.8".to_owned(), "1.1.1.1".to_owned()]),
+            },
+            NetworksetupDnsBackupEntry {
+                service: "Ethernet".to_owned(),
+                servers: None,
+            },
+        ];
+        for entry in &entries {
+            let argv = startup_restore_argv_for_entry(entry).expect("entry yields valid argv");
+            assert_eq!(argv[0], "-setdnsservers");
+            assert!(argv.iter().all(|arg| !arg.is_empty()));
+            if entry.servers.is_none() {
+                assert_eq!(argv[2], NETWORKSETUP_EMPTY_DNS_KEYWORD);
+            }
+        }
     }
 
     // ---- S4: startup guard sees partial per-service SC loopback residue ----
@@ -1407,7 +1849,12 @@ Thunderbolt Bridge
             services,
             vec!["Ethernet".to_owned(), "Thunderbolt Bridge".to_owned()]
         );
-        let message = startup_recovery_manual_restore_message(&services);
+        let message = startup_recovery_manual_restore_message(
+            &services,
+            &networksetup_dns_backup_path(
+                std::path::Path::new(crate::daemon::default_state_path()),
+            ),
+        );
         assert!(message.contains("-setdnsservers \"Ethernet\" Empty"));
         assert!(message.contains("-setdnsservers \"Thunderbolt Bridge\" Empty"));
 
