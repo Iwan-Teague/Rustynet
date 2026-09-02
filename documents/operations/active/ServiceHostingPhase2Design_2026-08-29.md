@@ -28,7 +28,7 @@ indicative (they drift); the symbol names are the stable reference.
 | Service view from signed membership | `crates/rustynetd/src/service_exposure.rs` — `service_hosting_view_from_membership` | Absent/inactive node serves nothing (test L756). Tunnel-only bind: `validate_tunnel_only_bind` (tests L657–710). |
 | Tunnel→identity resolution | `crates/rustynetd/src/service_exposure.rs` L225/234 — `VerifiedPeerIdentity { node_id, overlay_addr }` + `resolve_peer_identity(source, overlay_addr_to_node)` | Map is built by the daemon from signed state only; **unknown source ⇒ `UnknownPeerAddress` fail-closed**. |
 | Policy engine with service contexts | `crates/rustynet-policy` — `ContextualPolicySet::evaluate_with_membership`, `TrafficContext::{NasService,LlmService}` | Engine default is `Decision::Deny`; rules with an empty `contexts` list never match service contexts (context hardening landed in D13.b). |
-| LLM scopes | `crates/rustynet-policy/src/lib.rs` L290/L332 — `LlmAccessScope`, `LlmScopePolicy` | Scopes only ever *narrow* an existing Allow; they are never an authorisation source. `None` = unrestricted (documented, deliberate — see §5 OG-1). |
+| LLM scopes | `crates/rustynet-policy/src/lib.rs` — `LlmAccessScope`, `LlmScopePolicy` | Scopes only ever *narrow* an existing Allow; they are never an authorisation source. **Deny-on-absent (OG-1 resolved, Option B):** no scope entry ⇒ every model denied; `unrestricted` marker = full access. |
 | E2 access evaluation | `crates/rustynetd/src/service_exposure.rs` L257 — `evaluate_service_access(policy, membership, …)` | One enforcement point for every new session; empty/missing policy ⇒ deny. |
 | Materialised access state | `crates/rustynetd/src/service_access_state.rs` — `grants.v1` (L43, one authorised peer node-id per line), `peers.v1` (L44), `scopes.v1` (L45); `derive_service_access_snapshot`, `write_service_access_state`, `refresh_grants_and_scopes`, removal + `force_deny_all` (L208) | Written **from** verified signed state at the four signed-state commit points (`daemon.rs` `materialize_service_access_state` L5327 → L5795/L8635/L9696/L10355). Write failure degrades to deny-all; removal tears `grants.v1` first (teardown-before-revoke). The files are **materialised artifacts, not signed documents** — their authority is the signed snapshot they were rendered from. |
 | Sibling-binary per-frame re-check | `crates/rustynet-nas/src/main.rs` ~L269/299 | No/empty access files ⇒ deny-all; grants re-read per frame so revocation lands mid-session. Same pattern in `crates/rustynet-llm-gateway` per frame **and** per token event. |
@@ -188,8 +188,8 @@ Shared foundation task `P2-M1` must land first; both milestones depend on it.
    - Enforcement point: controller-drive module + `crates/rustynet-llm-gateway` session/token path.
    - Acceptance: stream to a non-granted peer ⇒ nothing (deny before first token); mid-stream
      revocation ⇒ stream severed; scope with `allowed_models: Some([])` ⇒ every model denied even
-     though the grant stands (scope narrows, grant authorises); no scope entry ⇒ full grant (see
-     §5 OG-1 before changing this).
+     though the grant stands (scope narrows, grant authorises); no scope entry ⇒ deny every model
+     (OG-1 resolved as Option B: deny-on-absent, explicit `unrestricted` marker = full access).
    - Verification: unit tests for mid-stream severance + scope narrowing; extend
      `scripts/ci/llm_default_deny_gates.sh`.
 2. **Exit coexistence under live controller.** LLM service traffic stays intra-mesh while client

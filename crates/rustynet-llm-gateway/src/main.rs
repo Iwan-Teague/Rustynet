@@ -223,9 +223,11 @@ type AccessState = (
 /// malformed limit value or an unrecognized key, is an error — never
 /// silently degraded to "no restrictions". Only genuine absence
 /// (`NotFound`) means "no entries", which keeps every state in the
-/// deny direction: missing grants deny admission, and a missing
-/// scopes file leaves grants unrestricted by documented design
-/// (scopes restrict, they never grant).
+/// deny direction: missing grants deny admission, and a granted
+/// peer without a scope line is refused (deny-on-absent — absence
+/// never means unrestricted). The only full-access value is an
+/// explicit `unrestricted` key on the peer's scope line; combining
+/// it with any limit key is a contradiction that refuses the peer.
 fn load_access_state(access_dir: &Path) -> Result<AccessState, String> {
     fn read_optional(path: &Path) -> Result<Option<String>, String> {
         match std::fs::read_to_string(path) {
@@ -297,6 +299,11 @@ fn load_access_state(access_dir: &Path) -> Result<AccessState, String> {
                             scopes_path.display()
                         )
                     })?);
+                } else if part == "unrestricted" {
+                    // The explicit full-access marker: the only way
+                    // to grant "any model, no quota, no rate ceiling"
+                    // under deny-on-absent semantics.
+                    scope.unrestricted = true;
                 } else {
                     // An unrecognized key is a typo'd restriction
                     // (e.g. `qouta=`): honouring the rest of the line
@@ -308,6 +315,19 @@ fn load_access_state(access_dir: &Path) -> Result<AccessState, String> {
                     ));
                 }
             }
+            if scope.unrestricted
+                && (scope.allowed_models.is_some()
+                    || scope.max_tokens_per_window.is_some()
+                    || scope.max_requests_per_minute.is_some())
+            {
+                // `unrestricted` combined with any limit key is a
+                // contradiction: honouring one half would silently
+                // discard the admin's other intent. Refuse the peer.
+                return Err(format!(
+                    "{}: selector {selector:?} combines `unrestricted` with limit keys; refused",
+                    scopes_path.display()
+                ));
+            }
             scopes.insert(selector.to_owned(), scope);
         }
     }
@@ -317,10 +337,7 @@ fn load_access_state(access_dir: &Path) -> Result<AccessState, String> {
 /// Per-frame admission: tunnel-source identity + current grant.
 /// Deny-all when the daemon has not materialised any signed state,
 /// or when that state exists but cannot be read/validated.
-fn admitted_peer(
-    access_dir: &Path,
-    source: IpAddr,
-) -> Result<(String, Option<LlmAccessScope>), String> {
+fn admitted_peer(access_dir: &Path, source: IpAddr) -> Result<(String, LlmAccessScope), String> {
     let (grants, peers, scopes) = load_access_state(access_dir).map_err(|err| {
         eprintln!("[rustynet-llm-gateway] {err}; refusing peer (fail-closed)");
         "gateway access state unusable; refused (default-deny)".to_owned()
@@ -333,7 +350,15 @@ fn admitted_peer(
             "your admin hasn't enabled LLM access for this device (peer {node_id}; default-deny)"
         ));
     }
-    let scope = scopes.get(node_id).cloned();
+    // Deny-on-absent: a granted peer without a scope line is
+    // refused — absence never means unrestricted. The scope entry
+    // (explicit limits, or the explicit `unrestricted` marker) is
+    // what says what the grant may consume.
+    let scope = scopes.get(node_id).cloned().ok_or_else(|| {
+        format!(
+            "your admin hasn't scoped LLM access for this device (peer {node_id}; default-deny: no scope line)"
+        )
+    })?;
     Ok((node_id.clone(), scope))
 }
 
@@ -389,7 +414,7 @@ fn serve_connection(
 
         match request {
             Request::Hello { .. } => {
-                let models = visible_models(engine, scope.as_ref())?;
+                let models = visible_models(engine, Some(&scope))?;
                 let used = enforcement
                     .lock()
                     .map_err(|_| "enforcement state poisoned".to_owned())?
@@ -404,7 +429,7 @@ fn serve_connection(
                 )?;
             }
             Request::ListModels => {
-                let models = visible_models(engine, scope.as_ref())?;
+                let models = visible_models(engine, Some(&scope))?;
                 write_frame(
                     &mut stream,
                     &protocol::encode_event(&Event::Models { models }),
@@ -418,7 +443,7 @@ fn serve_connection(
                     access_dir,
                     source,
                     &peer_node_id,
-                    scope.as_ref(),
+                    Some(&scope),
                     &model,
                     &prompt,
                 )?;
@@ -502,11 +527,37 @@ fn stream_completion(
         // Mid-stream severance: a peer revoked while a generation is
         // in flight loses the stream at the next event boundary —
         // authorisation is re-checked between fragments (E2/E3/E4).
-        if let Err(reason) = admitted_peer(access_dir, source) {
+        let (_, fresh_scope) = match admitted_peer(access_dir, source) {
+            Ok(fresh) => fresh,
+            Err(reason) => {
+                return write_frame(
+                    stream,
+                    &protocol::encode_event(&Event::Error {
+                        message: format!("stream severed: {reason}"),
+                    }),
+                );
+            }
+        };
+        // Scope currency (T7): the freshly read scope is adopted for
+        // the narrowing check, not discarded. A scope that narrowed
+        // or disappeared mid-stream severs the generation at this
+        // event boundary, mirroring grant severance above. An
+        // equal-or-wider fresh scope does NOT retroactively widen
+        // the in-flight request: token accounting below keeps the
+        // frame-admission scope.
+        let scope_narrowed = match scope {
+            // A frame admitted without a scope is invalid under
+            // deny-on-absent; sever rather than continue.
+            None => true,
+            Some(admitted) => !fresh_scope.is_at_least_as_permissive_as(admitted),
+        };
+        if scope_narrowed {
             return write_frame(
                 stream,
                 &protocol::encode_event(&Event::Error {
-                    message: format!("stream severed: {reason}"),
+                    message:
+                        "stream severed: peer scope narrowed or removed mid-stream; re-issue the request"
+                            .to_owned(),
                 }),
             );
         }
@@ -590,13 +641,19 @@ fn write_frame(stream: &mut impl Write, body: &[u8]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACCESS_GRANTS_FILE, ACCESS_PEERS_FILE, ACCESS_SCOPES_FILE, FRAME_COALESCE_MAX,
-        admitted_peer, read_frame, write_frame,
+        ACCESS_GRANTS_FILE, ACCESS_PEERS_FILE, ACCESS_SCOPES_FILE, Event, FRAME_COALESCE_MAX,
+        MockEngine, Request, admitted_peer, read_frame, serve_connection, stream_completion,
+        write_frame,
     };
+    use rustynet_llm_gateway::enforce::EnforcementState;
+    use rustynet_llm_gateway::engine::{CompletionEvent, EngineError, InferenceEngine};
     use rustynet_policy::LlmAccessScope;
     use std::io::Write;
     use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    use super::protocol;
 
     /// Fail-open regression harness: a granted peer whose scope state
     /// cannot be parsed must be refused, never silently widened to an
@@ -691,7 +748,6 @@ mod tests {
         );
         let (node_id, scope) = admitted_peer(&dir, PEER_IP).expect("valid scope admits");
         assert_eq!(node_id, PEER_NODE);
-        let scope: LlmAccessScope = scope.expect("scope entry present");
         assert_eq!(
             scope.allowed_models.as_deref(),
             Some(["tiny".to_owned()].as_slice())
@@ -703,15 +759,269 @@ mod tests {
     }
 
     #[test]
-    fn absent_scopes_file_keeps_documented_unrestricted_grant() {
-        let dir = temp_access_dir("absent-scopes");
+    fn grant_present_scope_absent_refused_end_to_end() {
+        let dir = temp_access_dir("grant-no-scope");
         grant_test_peer(&dir);
-        // Absence (NotFound) is the documented "admin set no scope"
-        // state and stays admissible; only unreadable/invalid state
-        // denies.
-        let (node_id, scope) = admitted_peer(&dir, PEER_IP).expect("grant without scopes admits");
-        assert_eq!(node_id, PEER_NODE);
-        assert!(scope.is_none());
+        // Deny-on-absent, end to end through the frame-admission
+        // seam: a grant line with no matching scope line refuses the
+        // peer — absence (no scopes file, no line for the node id)
+        // never means unrestricted.
+        let err = admitted_peer(&dir, PEER_IP).expect_err("grant without scope line must deny");
+        assert!(err.contains(PEER_NODE), "refusal must name the peer: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bare_selector_line_denies() {
+        let dir = temp_access_dir("bare-selector");
+        grant_test_peer(&dir);
+        // A scope line with selector but no keys parses to
+        // `LlmAccessScope::default()` — the deny posture. Under the
+        // old semantics this silently meant unrestricted.
+        write_access_file(
+            &dir,
+            ACCESS_SCOPES_FILE,
+            &format!(
+                "{PEER_NODE}
+"
+            ),
+        );
+        let (_, scope) = admitted_peer(&dir, PEER_IP).expect("bare line loads as a deny scope");
+        assert!(!scope.unrestricted);
+        assert!(
+            !scope.permits_model("any-model"),
+            "a bare selector line grants no model"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unrestricted_with_any_limit_key_is_a_loader_error() {
+        let dir = temp_access_dir("unrestricted-contradiction");
+        grant_test_peer(&dir);
+        // `unrestricted` combined with any limit key is a
+        // contradiction; the loader must hard-error (peer refused,
+        // fail closed), not honour one half of the line.
+        for line in [
+            format!("{PEER_NODE} unrestricted models=tiny"),
+            format!("{PEER_NODE} unrestricted quota=100"),
+            format!("{PEER_NODE} unrestricted rate=5"),
+            format!("{PEER_NODE} models=tiny unrestricted"),
+            format!("{PEER_NODE} unrestricted quota=100 rate=5"),
+        ] {
+            write_access_file(
+                &dir,
+                ACCESS_SCOPES_FILE,
+                &format!(
+                    "{line}
+"
+                ),
+            );
+            assert!(
+                admitted_peer(&dir, PEER_IP).is_err(),
+                "unrestricted + limits must refuse the peer: {line:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn explicit_unrestricted_scope_line_admits_any_model() {
+        let dir = temp_access_dir("unrestricted-line");
+        grant_test_peer(&dir);
+        // The marker alone is valid and is the only full-access
+        // grant.
+        write_access_file(
+            &dir,
+            ACCESS_SCOPES_FILE,
+            &format!(
+                "{PEER_NODE} unrestricted
+"
+            ),
+        );
+        let (_, scope) = admitted_peer(&dir, PEER_IP).expect("explicit unrestricted line admits");
+        assert!(scope.unrestricted);
+        assert!(scope.permits_model("any-model"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A granted peer with no scope line is refused at the
+    /// connection layer too: `serve_connection` turns the
+    /// `admitted_peer` refusal into a wire `Error` event before any
+    /// model is named. This is the network-level half of
+    /// `grant_present_scope_absent_refused_end_to_end` (there was no
+    /// serve_connection harness before; this adds a real loopback
+    /// socket pair rather than a seam).
+    #[test]
+    fn serve_connection_refuses_granted_peer_without_scope_line() {
+        let dir = temp_access_dir("serve-no-scope");
+        grant_test_peer(&dir);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let access_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept client");
+            let engine = MockEngine::serving(vec!["tiny".to_owned()]);
+            let enforcement = Mutex::new(EnforcementState::new());
+            let _ = serve_connection(stream, &engine, &enforcement, &access_dir);
+        });
+        // Map the loopback source the client actually connects from
+        // (127.0.0.1) to the peer node id, so identity resolution in
+        // peers.v1 matches.
+        write_access_file(&dir, ACCESS_PEERS_FILE, &format!("127.0.0.1 {PEER_NODE}\n"));
+        let mut client = TcpStream::connect(addr).expect("connect to gateway");
+        write_frame(
+            &mut client,
+            &protocol::encode_request(&Request::Complete {
+                model: "tiny".to_owned(),
+                prompt: "hello".to_owned(),
+            }),
+        )
+        .expect("send request frame");
+        let body = read_frame(&mut client)
+            .expect("read reply")
+            .expect("reply frame before close");
+        match protocol::decode_event(&body).expect("decode reply event") {
+            Event::Error { message } => {
+                assert!(
+                    message.contains("default-deny") && message.contains(PEER_NODE),
+                    "refusal must be the scope-missing default-deny message: {message}"
+                );
+            }
+            other => panic!("expected Error event, got {other:?}"),
+        }
+        handle.join().expect("serve thread finishes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Engine stub whose stream narrows the peer's scope on disk
+    /// between the first and second fragment, driving the T7
+    /// mid-stream scope-currency check.
+    struct ScopeNarrowingEngine {
+        models: Vec<String>,
+        access_dir: PathBuf,
+    }
+
+    impl InferenceEngine for ScopeNarrowingEngine {
+        fn list_models(&self) -> Result<Vec<String>, EngineError> {
+            Ok(self.models.clone())
+        }
+
+        fn probe_health(&self) -> Result<(), EngineError> {
+            Ok(())
+        }
+
+        fn stream_completion(
+            &self,
+            _model: &str,
+            _prompt: &str,
+        ) -> Result<
+            Box<dyn Iterator<Item = Result<CompletionEvent, EngineError>> + Send>,
+            EngineError,
+        > {
+            let access_dir = self.access_dir.clone();
+            Ok(Box::new(std::iter::from_fn(move || {
+                // Consumed lazily by stream_completion's event loop:
+                // the narrowing write lands when the SECOND fragment
+                // is produced, i.e. before the re-check that precedes
+                // that event's processing.
+                static NARROWED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let poll = NARROWED.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if poll == 2 {
+                    std::fs::write(
+                        access_dir.join(ACCESS_SCOPES_FILE),
+                        format!("{PEER_NODE} models=other\n"),
+                    )
+                    .expect("narrow the peer's scope mid-stream");
+                }
+                match poll {
+                    1 | 2 => Some(Ok(CompletionEvent::Fragment {
+                        text: format!("fragment-{poll} "),
+                        token_count: 1,
+                    })),
+                    _ => None,
+                }
+            })))
+        }
+    }
+
+    #[test]
+    fn midstream_scope_narrowing_severs_stream() {
+        let dir = temp_access_dir("midstream-narrow");
+        grant_test_peer(&dir);
+        write_access_file(
+            &dir,
+            ACCESS_SCOPES_FILE,
+            &format!(
+                "{PEER_NODE} models=tiny quota=100
+"
+            ),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let access_dir = dir.clone();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept client");
+            let engine = ScopeNarrowingEngine {
+                models: vec!["tiny".to_owned()],
+                access_dir: access_dir.clone(),
+            };
+            let enforcement = Mutex::new(EnforcementState::new());
+            let _ = stream_completion(
+                &mut stream,
+                &engine,
+                &enforcement,
+                &access_dir,
+                PEER_IP,
+                PEER_NODE,
+                Some(&LlmAccessScope {
+                    allowed_models: Some(vec!["tiny".to_owned()]),
+                    max_tokens_per_window: Some(100),
+                    max_requests_per_minute: None,
+                    unrestricted: false,
+                }),
+                "tiny",
+                "hello world",
+            );
+        });
+
+        let mut client = TcpStream::connect(addr).expect("connect to gateway");
+        write_frame(
+            &mut client,
+            &protocol::encode_request(&Request::Complete {
+                model: "tiny".to_owned(),
+                prompt: "hello world".to_owned(),
+            }),
+        )
+        .expect("send request frame");
+
+        // First fragment streams normally, then the narrowing lands
+        // and the second event boundary severs the stream.
+        let mut saw_token = false;
+        let mut severed = false;
+        while let Ok(Some(body)) = read_frame(&mut client) {
+            match protocol::decode_event(&body).expect("decode event") {
+                Event::Token { .. } => saw_token = true,
+                Event::Error { message } => {
+                    assert!(
+                        message.contains("narrowed or removed"),
+                        "severance must name the scope narrowing: {message}"
+                    );
+                    severed = true;
+                    break;
+                }
+                Event::Done => panic!("stream must not complete after a mid-stream narrowing"),
+                other => panic!("unexpected event mid-stream: {other:?}"),
+            }
+        }
+        assert!(
+            saw_token,
+            "the first fragment must stream before the narrowing"
+        );
+        assert!(severed, "the narrowing must sever the stream");
+        handle.join().expect("stream thread finishes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

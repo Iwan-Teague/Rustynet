@@ -293,7 +293,11 @@ The `llm` role is "done" when:
 
 - D13.d.1–5 land on `main` with passing gates.
 - A GPU/accelerator Linux host runs `rustynet role set llm`, ending with `rustynet-llm-gateway` + engine healthy, `serves_llm` advertised in signed membership, inference API bound tunnel-only, engine loopback-only, **default-deny** (no device reaches it yet).
-- The admin signs a policy authorising one device (optionally model/quota-scoped); a RustyAI client on that device streams a chat completion over the tunnel **with no API key**, identity derived from the tunnel; an un-authorised mesh peer is denied; an off-mesh attempt has no surface.
+- The admin signs a policy authorising one device (model/quota-scoped, or explicitly
+  `unrestricted` — a granted device with no scope line is denied, never unrestricted); a RustyAI
+  client on that device streams a chat completion over the tunnel **with no API key**, identity
+  derived from the tunnel; an un-authorised mesh peer is denied; an off-mesh attempt has no
+  surface.
 - With an exit node selected on the client, internet traffic egresses the exit while LLM traffic stays intra-mesh (route-precedence test green).
 - Revoking the device (owner-signed) severs the in-flight stream and refuses reconnect before the capability drops.
 - Logs contain no prompts, completions, uploaded context, or tokens.
