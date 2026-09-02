@@ -70,6 +70,7 @@ pub mod live_two_hop_validation;
 pub mod macos_anchor_bundle_pull_validation;
 pub mod macos_anchor_port_mapping_authority_validation;
 pub mod macos_anchor_profile_deploy;
+pub mod macos_role_transition_validation;
 pub mod membership_init;
 pub mod mesh_status_validation;
 pub mod negative_control;
@@ -236,6 +237,13 @@ define_stage_catalog! {
     MacosAnchorProfileDeploy => "deploy_macos_anchor_profile" @ Live / T1Role,
     MacosAnchorBundlePullValidation => "validate_macos_anchor_bundle_pull" @ Live / T1Role,
     MacosAnchorPortMappingAuthorityValidation => "validate_macos_anchor_port_mapping_authority" @ Live / T1Role,
+    // C6: live macOS role-transition validator, previously the legacy
+    // vm_lab hub block `validate_macos_role_transition` that never
+    // dispatched under the Rust engine (W5.7). Wire name matches the
+    // legacy registry vocabulary so run-matrix evidence stays comparable.
+    // Gated Live: skipped-with-reason unless the run elects macOS for
+    // role transition (--role-switch-platform macos).
+    MacosRoleTransitionValidation => "validate_macos_role_transition" @ Live / T1Role,
     LiveTwoHopValidation => "live_two_hop_validation" @ Live / T1Role,
     LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role,
     LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience,
