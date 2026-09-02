@@ -38277,7 +38277,8 @@ mod tests {
         // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
         // blind_exit_dataplane_validation + gossip_convergence_validation.
         // MAC-D3 (2026-08-29): 61 + the 3 macOS anchor validator stages.
-        assert_eq!(cli_ids.len(), 64);
+        // C6 (2026-09-02): + validate_macos_role_transition.
+        assert_eq!(cli_ids.len(), 65);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
