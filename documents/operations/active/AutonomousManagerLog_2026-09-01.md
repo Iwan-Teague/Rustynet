@@ -352,3 +352,34 @@ not compile at that tip and must start with `cargo check`). Old worktree of `…
 its branch retained as the relaunch base.
 
 **Fleet: 3 running**, fourth launch (C2 unquarantine / C3 pf ports) next.
+
+## Tick 17 — 2026-09-02 ~16:40–17:45Z
+
+**Reboot stage (C7) MERGED.** The GLM adversarial implementation review completed
+(`MacosRebootRecoveryStageImplementationReview_2026-09-02.md`, ACCEPT-WITH-FIXES) and confirmed
+all three of my own flags plus one more: F1 HIGH — a pre-dispatch SSH error was swallowed and
+nothing proved a reboot occurred; F2 — the alternate acceptance clause `contains("ok")` was dead;
+F3 — the loopback-pin loop word-split service names and passed vacuously on an empty list; F4 —
+`budget_secs: 180` below the helper's ~1270 s worst case. Hand-fixed on the branch
+(`3551b290`): both capture scripts emit `sysctl -n kern.boottime`, the helper extracts the single
+`boottime=` line from each and FAILS when unchanged; the typed fail-closed evaluator is the sole
+survival gate and the M1 recovery line is recorded as evidence of which path restored the posture
+(deliberate deviation from the review's "require the line" wording — a clean-shutdown reboot
+retires the backup and legitimately has no recovery line, so requiring it would fail a correct
+reboot); line-oriented pin check with an empty-list hard failure; budget 1200 s; four unit tests
+for the boottime parser. Re-gated: pinned fmt clean, clippy 1.88 clean, whole `rustynet-cli`
+2910 pass. Merged the stage (`abd48e8c`) then the review (`d70e1e27`, README index conflict
+resolved with the docs-only resolver). Its live cell still waits for the enforce-refresh fix.
+
+**Stall pattern identified and acted on.** Three of the four jobs relaunched in tick 16 showed
+IDENTICAL token spend across two polls 25 min apart with clean worktrees. Their OpenCode sessions
+(`/session/<sid>/message`) each showed an assistant turn with parts `[step-start, reasoning]`,
+`completed=false`, created 43–57 min earlier — the provider's reasoning stream hung and OpenCode
+waits forever. Killed the three serves (`kill -TERM`), settled their records (TIMED OUT, nothing
+produced), removed the empty worktrees/branches. Relaunched S2b/M2 fixes →
+`edit-1788367161603-86936-0` (base = the partial checkpoint branch `1a343e32`; task now says to
+work in small steps and commit after each compiling milestone); C2 unquarantine relaunched this
+tick; the enforce-refresh plan relaunch is next. The R2 clock-skew plan job
+(`edit-1788366061714-71947-0`) is progressing slowly (new turns appearing) and was kept.
+
+**Also launched:** Windows R2 clock-skew hardening plan (`edit-1788366061714-71947-0`, docs).
