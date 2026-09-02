@@ -5215,12 +5215,17 @@ mod registry_equivalence_tests {
                 "deploy_macos_anchor_profile"
                     | "validate_macos_anchor_bundle_pull"
                     | "validate_macos_anchor_port_mapping_authority"
+                    | "validate_macos_role_transition"
             ) {
                 // MAC-D3: the three macOS anchor validators are rust-native
                 // stages now, but they are platform-gated behind an ELECTED
                 // macOS anchor. This fixture has no anchor node at all, so on
                 // macos/windows they can only ever read `skip` — same
                 // noise-not-evidence rule as the gossip special case above.
+                // C6 (2026-09-02): the macOS live role-transition validator
+                // joined as a rust-native stage with the same shape — gated
+                // behind an ELECTED macOS role transition, which this fixture
+                // never elects.
                 vec!["linux".into()]
             } else if oracle_is_rust_native(bare) {
                 vec!["linux".into(), "macos".into(), "windows".into()]
