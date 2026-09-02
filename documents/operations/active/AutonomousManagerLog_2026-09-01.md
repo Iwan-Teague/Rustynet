@@ -740,3 +740,36 @@ the daemon serializes the report once and prints it verbatim, with the `--output
 byte-identical. Pin unchanged. main 20e6b249, clean. Fleet: the resolver-not-serving diagnosis
 (`edit-1788388747110-25220-0`) running — the release-blocking thread; I'll review it next tick and
 drive diagnosis→review→fix→live-prove.
+
+## Tick 30 — 2026-09-03 ~00:00–00:20Z — resolver defect diagnosed as an ordering bug
+
+**The resolver-not-serving diagnosis MERGED** (`1d0f6486`). Q1 root cause: a DETERMINISTIC ordering
+defect (not a race). The DNS serve loop drains the loopback socket only inside run_daemon's main
+loop (daemon.rs:12353), which runs AFTER `runtime.bootstrap()` (:11812); the fix's resolver probe
+runs INSIDE bootstrap's dataplane apply, so the bound socket has no drain yet and the probe
+deterministically gets no answer → rolls back fail-closed → 5 reconcile failures (~30s) →
+RestrictionMode::Permanent → both DnsFailclosed AND MeshStatus fail. `build_dns_response` needs no
+zone/role, confirming it is purely timing; I spot-checked the serve-drain-after-bootstrap and the
+re-assert latch anchors.
+
+Q2: for ScopedResolverOnly the probe runs BEFORE any mutation and rolls back to a zero-leak
+Untouched state, so restricting the whole node (killing mesh) is over-broad with no security gain
+(Requirements.md:90/:186 scope DNS fail-close to protected-DNS/routing modes; a client's machine DNS
+is untouched, only *.rustynet scoped). For FullyProtected a DNS apply failure IS leak-relevant → keep
+the strict full restriction.
+
+**Recommended fix:** (primary) defer the DNS-posture sub-apply out of bootstrap into the first
+reconcile pass (after the serve loop is live), reusing the dns_posture_reassert_pending latch,
+preserving the probe/rollback/three-state verbatim; (secondary) decouple a ScopedResolverOnly apply
+failure from whole-node restriction. Rejected: client Untouched (breaks Magic DNS + reintroduces the
+mesh-name leak).
+
+**Launched the PHASE B review** (`edit-1788389964469-33939-0`) with the make-or-break concern:
+deferring the apply to first-reconcile could open a ~1s DNS-LEAK WINDOW for a FullyProtected
+exit/full-tunnel node (tunnel up, but pf DNS-block floor + general pin not yet applied). The review
+must resolve whether the deferral is safe for FullyProtected or whether only ScopedResolverOnly may
+defer while FullyProtected keeps an in-bootstrap apply (bounded-retry probe waiting for the serve
+loop), and confirm build_dns_response truly always answers the probe.
+
+**Also merged: F2 freshness impl** (`20e6b249`, verified — stdout-capture, fail-closed, no fixed-file
+read). Fleet: resolver-fix review running. main 1d0f6486→log, clean, CI green.
