@@ -43,6 +43,11 @@
 # live-lab launch this session failed "worktree must be clean" against this
 # one directory, not against real dirt.
 /target-gate/
+# Pinned-toolchain and cross-target scratch build dirs (CI-faithful local gates);
+# untracked scratch, never committed, and excluded so the live-lab clean-tree
+# check (which counts untracked paths) is not tripped by them.
+/target-pinned*/
+/target-stable/
 
 # Editor-local config (absolute machine paths; wire up via scripts/mcp/install.sh).
 /.zed/
