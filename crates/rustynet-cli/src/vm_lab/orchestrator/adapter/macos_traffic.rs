@@ -966,8 +966,11 @@ mod tests {
             );
         }
         assert!(cmd.contains("launchctl bootout system/com.rustynet.anchor"));
-        assert!(cmd
-            .contains("launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist"));
+        assert!(
+            cmd.contains(
+                "launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist"
+            )
+        );
         assert!(cmd.contains("pkill -TERM -x rustynetd"));
         assert!(cmd.contains("pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper'"));
         assert!(cmd.contains("pkill -KILL -x rustynetd"));
@@ -1126,9 +1129,10 @@ mod tests {
     fn parse_macos_node_clean_probe_reports_running_daemon() {
         let err = parse_macos_node_clean_probe("pf=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(err
-            .to_string()
-            .contains("rustynetd or rustynet-relay still running"));
+        assert!(
+            err.to_string()
+                .contains("rustynetd or rustynet-relay still running")
+        );
     }
 
     #[test]
