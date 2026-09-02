@@ -5058,6 +5058,10 @@ mod tests {
         let _ = std::fs::remove_dir(&test_dir);
     }
 
+    // The 0600 pre-hardening of the fixture file is a Unix-only POSIX-mode
+    // property of the temp fixture, not of the assertion; gate the whole test
+    // rather than rewriting the setup.
+    #[cfg(unix)]
     #[test]
     fn trust_state_loader_refuses_oversized_file_before_parse() {
         use std::os::unix::fs::PermissionsExt;
@@ -5084,6 +5088,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&test_dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn trust_state_mac_key_loader_refuses_oversized_file() {
         use std::os::unix::fs::PermissionsExt;
