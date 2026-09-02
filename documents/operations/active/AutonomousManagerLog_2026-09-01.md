@@ -426,3 +426,50 @@ the change; re-ran the failed job (`gh run rerun --failed`). `0bd3f8ac` still in
 **Fleet.** S2b/M2 fixes (`…86936-0`): 5 commits, now updating the helper-ordering plan doc — near
 done, spend 1.10M. C2 unquarantine (`…87816-0`): 4 commits, editing `active_exit.rs`, spend 1.18M.
 Enforce-refresh plan review (`…4519-0`): 1 commit, 2 sub-agents. All turns fresh (<1 min old).
+
+## Tick 20 — 2026-09-02 ~18:40–19:40Z
+
+**Four jobs finished this tick; all four merged after gating.**
+- **S2b/M2 review fixes** (`dcd80af2`): tri-state helper probe (pid + socket), bootout-before-bootstrap
+  on restore, SIGKILL backstops before the helper bootout, job-scoped daemon-exit waits, symbolic
+  uninstall wait budget. The job had raised the raw-sink scanner pin 130 → 159 by anchoring the
+  `.as_str()` excuse to "alone on its own line", which re-counted 29 validated locals passed inline.
+  Hand-fixed at the gate (`ffc47f67`): the excuse now keys on the RECEIVER shape (a bare identifier
+  or field path is excused in either layout; a call/index/literal/turbofish receiver counts raw), so
+  `format!(…).as_str()` is caught and the pin stays at 130. Whole cli suite green before and after.
+- **macOS exit-serving adapter wiring, design A2** (`3f0be0c1`): both hub evaluators unquarantined,
+  `MacosNodeAdapter` exit methods assert the daemon's own lifecycle verifier over the seam,
+  precedence check only in the pre-activation baseline position, predicate stays false for macOS
+  (pinned by `macos_two_phase_stage_reports_skip_while_predicate_false`); 3372 tests.
+- **Enforce-refresh plan review** (`c219b3aa`) — **CRITICAL correction to my tick-15 root cause:**
+  `bootstrap()` (daemon.rs:8623, called at :11812) ALREADY applies the full dataplane generation
+  with `protected_dns: true` (:8878) on every startup, on both platforms. Verified myself: the
+  ApplyOptions literal in bootstrap carries `protected_dns: true`, and macOS `apply_dns_protection`
+  (phase10.rs:4609) does the pf rules AND the networksetup loopback pin. So "nothing re-applies the
+  posture after a restart" was wrong, and the Linux timer is redundancy, not the mechanism. What
+  remains unexplained is why the macOS restart at 07:08:22Z logged the PLAIN `runtime bootstrap
+  complete` (which means `bootstrap_error` was None — `restrict_recoverable` sets it — so the apply
+  returned Ok) yet the verifier saw no pin, no pf DNS rules 5 s later. The DryRun-system hypothesis
+  is dead (DryRun is `cfg(test)`-only). Diagnosis is now the primary product task; a 2-second
+  sampler (`/tmp/rn_watch_loop.sh` → `/tmp/rn_watch.log`) is running on the macOS guest to capture
+  pf rules, Ethernet DNS, resolver, launchd pids and the daemon log across the next harvest's
+  enforce→validate window.
+- **Enforce-refresh plan fold** (F-1..F-6 applied by a docs job; merged this tick).
+- **Clock-skew plan review** (`48c7c460`): ACCEPT-WITH-AMENDMENTS A-1..A-9 (generic drift never
+  remediated; drop the unreachable `Unparseable`; sign convention; fresh host reading at remedy time;
+  7205→7240 test fix; flag-off byte-identity test; inclusive band; duplicate preflight row is
+  run-scoped attribution; name the timestamp validator).
+
+**Incident (self-inflicted, contained).** The R2-review merge conflicted on the README index; the
+`&&` chain stopped silently after the refresh-review merge and I missed it, leaving main in a
+conflicted merge state (unpushed) for ~20 min. Consequences: the rank-1 harvest I launched
+(`labrun-1788371172581-62950-0`) was refused by `prepare_source_archive` ("git worktree must be
+clean"); two GLM jobs branched from the unpushed refresh-review commit (harmless — it is now on
+main). Repaired: README resolved with the docs-only resolver, merge committed (`48c7c460`), ledger
+rows of the refused run committed (`eebb1ad4`), pushed. Rule for the charter: after ANY merge chain,
+assert `git status --short` is empty and `rev-list origin/main..HEAD` is what you expect.
+
+**Launched.** R2 classifier core (`edit-1788370974520-55427-0`, preflight.rs only, amendments
+A-1/2/3/5/7 baked in). Gap A enforce-path refresh (`edit-1788371870504-83558-0`, macOS + Linux
+enforce issue `state refresh` after the socket wait, seam-only, order pinned, non-zero fails).
+CI: `9c907071` re-run green; docs commits in progress.
