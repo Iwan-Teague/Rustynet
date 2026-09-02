@@ -133,3 +133,4 @@ Folded from `Qh01TemplateInjectionEliminationPlanAdversarialReview_2026-09-02.md
 - A6: folded — QH-13 closure (`496bf2fb`, `cd573224`) cited in §2 as the seam precedent this plan succeeds.
 - A7: folded — CI-gate precision added: `#[cfg(test)]` exclusion, stated precedence against QH-12/QH-13, adversarially audited allowlist.
 - A8: folded — §8 Q5 answered with the explicit non-live-evidence policy and parity-ledger dependency record.
+- Step 4a landed — the three validator argv-join sink sites (linux.rs, macos.rs, windows.rs build_validator_script) now build their commands through the validated seam (`ValidatedArg::cli_token` + `RemoteCommand::from_args` / `PowerShellScript::from_call_argv`).

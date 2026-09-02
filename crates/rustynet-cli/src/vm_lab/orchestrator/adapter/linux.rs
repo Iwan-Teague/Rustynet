@@ -22,6 +22,30 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Build the `sudo -n <validator argv>` remote command from the probe's argv,
+/// validating each element at the seam: the binary as a POSIX path, every
+/// other element as a CLI token. The rendered command is the quoted,
+/// space-joined argv, which the remote POSIX shell parses identically to the
+/// previous unquoted form for these token classes.
+fn build_validator_command(argv: &[String]) -> Result<ssh::RemoteCommand, AdapterError> {
+    use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
+
+    if argv.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "validator argv must not be empty".to_owned(),
+        });
+    }
+    let mut args = vec![
+        ValidatedArg::cli_token("sudo").map_err(AdapterError::from)?,
+        ValidatedArg::cli_token("-n").map_err(AdapterError::from)?,
+    ];
+    args.push(ValidatedArg::path(&argv[0]).map_err(AdapterError::from)?);
+    for token in &argv[1..] {
+        args.push(ValidatedArg::cli_token(token).map_err(AdapterError::from)?);
+    }
+    ssh::RemoteCommand::from_args("linux validator", &args)
+}
+
 /// Linux node adapter — full W5.1 implementation.
 /// Dispatches all operations via SSH using `NodeConnection::Ssh`.
 #[derive(Debug)]
@@ -196,9 +220,9 @@ impl NodeAdapter for LinuxNodeAdapter {
                 extra_args,
             )
             .map_err(|message| AdapterError::Protocol { message })?;
-        // All argv elements come from `LinuxDaemonProbe::build_argv`, which produces
-        // a fixed set of known-safe strings: binary path + a `linux-*-check` subcommand
-        // + `--no-fail-on-drift`. No user-controlled input reaches argv.
+        // Every argv element is validated per class at the seam (path for the
+        // binary, cli_token for the rest) regardless of its origin, then
+        // rendered as a quoted, space-joined argv.
         //
         // Run with `sudo -n`: the validators inspect root-owned security state
         // (`/var/lib/rustynet/keys` 0700 root, `/etc/rustynet/credentials` 0700
@@ -206,9 +230,9 @@ impl NodeAdapter for LinuxNodeAdapter {
         // false "permission denied" drift, so validate_baseline_runtime fails on
         // a node whose posture is actually correct. Passwordless sudo is already
         // a precondition of the bootstrap + cleanup paths.
-        let script = format!("sudo -n {}", argv.join(" "));
+        let script = build_validator_command(&argv)?;
         let op_label = argv.get(1).cloned().unwrap_or_default();
-        let output = ssh::run_remote(&self.conn, &script, SHORT_TIMEOUT)?;
+        let output = ssh::run_remote(&self.conn, script.as_str(), SHORT_TIMEOUT)?;
         let passed = ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
             op_label,
@@ -341,5 +365,32 @@ mod tests {
     fn linux_adapter_alias_round_trips() {
         let adapter = make_adapter("exit-node-1");
         assert_eq!(adapter.alias(), "exit-node-1");
+    }
+
+    #[test]
+    fn build_validator_command_renders_quoted_argv_for_a_representative_validator() {
+        let argv = vec![
+            "/usr/local/bin/rustynetd".to_owned(),
+            "linux-key-custody-check".to_owned(),
+            "--no-fail-on-drift".to_owned(),
+        ];
+        let cmd = build_validator_command(&argv).unwrap();
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' '/usr/local/bin/rustynetd' 'linux-key-custody-check' \
+             '--no-fail-on-drift'"
+        );
+    }
+
+    #[test]
+    fn build_validator_command_rejects_empty_and_unsafe_argv() {
+        assert!(build_validator_command(&[]).is_err());
+        let relative = vec!["rustynetd".to_owned()];
+        assert!(build_validator_command(&relative).is_err());
+        let injected = vec![
+            "/usr/local/bin/rustynetd".to_owned(),
+            "linux-key-custody-check; id".to_owned(),
+        ];
+        assert!(build_validator_command(&injected).is_err());
     }
 }
