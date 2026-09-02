@@ -59,7 +59,7 @@ selectors only), OPERATOR (human/physical action, explicit authorization where n
 | 12 | Windows `status` subcommand (live node identity + role emission, cross-platform key=value contract); do NOT widen the identity gate | CODE | all 11 `windows_stage_*_check` columns + the validator-backed specials (`windows_dpapi_key_custody` etc.) | CODE-DEFECT (deferred §4.7 gap at `node_adapter.rs:516-524`) | M | Low today → the family becomes runnable once bootstrap is green; the gate's fail-closed posture is the control being tested | Windows §3.2, §4#2 |
 | 13 | macOS exit-serving adapter on the orchestrator (`active_exit.rs:184` + `adapter/macos.rs`), with the S2 end-to-end egress assertion (not a mechanism-translated nft assertion) | CODE | `macos_stage_exit_handoff`, `cross_os_exit_path` | CODE-DEFECT (adapter is Linux+Windows only) | M-L | Low until CP-1; Medium once adapter + network land (overall exit green still needs #19) | macOS §1 exit_handoff, §5#9 |
 | 14 | pf ports of the four Linux-only validators: `exit_nat_lifecycle` (two-phase), `exit_demotion_residue`, `blind_exit_dataplane` (sequence after a Linux green), `ipv6_leak` (pre-check lab v6 egress first — may be environmental) | CODE | `macos_stage_exit_nat_lifecycle_check`, `macos_stage_exit_demotion_residue_check`, `macos_stage_blind_exit_dataplane_check`, `macos_stage_ipv6_leak_check` | CODE-DEFECT (deliberate fail-closed Linux-only stubs, `role_validation/*.rs` predicates) | S-M each | Low each (need the role elected first) | macOS §2 |
-| 15 | Wire an `--enable-soak-suite` selector through `TargetSelectors`/orchestrator flags + mac/win target keys | CODE | `macos_stage_extended_soak` (zero rows on every platform — never dispatched) | WIRING/GATE (missing enable flag; `live_lab_stage_registry.rs:336-346`) | S | Medium (first dispatch is an unknown-unknown; expect a triage pass) | macOS §1 extended_soak, §5#6 |
+| 15 | ~~Wire an `--enable-soak-suite` selector through `TargetSelectors`/orchestrator flags + mac/win target keys~~ — **Corrected 2026-09-02: RETRACTED — premise refuted.** No action: `extended_soak` already dispatches in the default Linux full-suite plan (`plan.rs` `include()`: `StageSuite::Soak => !skip_live_suite && !skip_soak`; `--skip-soak` opts out); the per-stage ledger records 40 Linux pass node-rows (348 Linux skip) and the roll-up records 8 `linux_stage_extended_soak` run-level passes; the mac/win skips (15/2) are the `--skip-linux-live-suite` fast path by design | RETRACTED | ~~`macos_stage_extended_soak` (zero rows on every platform — never dispatched)~~ — per-stage truth: Linux 40 pass / 348 skip, macOS 15 skip, Windows 2 skip; the stage HAS dispatched and passed on Linux | ~~WIRING/GATE (missing enable flag; `live_lab_stage_registry.rs:336-346`)~~ — no missing flag; the `SoakSuite` rule (registry `:347`) already enables it in default Linux full-suite runs | S | ~~Medium (first dispatch is an unknown-unknown; expect a triage pass)~~ — n/a (retracted); the first macOS dispatch awaits a full-suite run, not a flag | macOS §1 extended_soak, §5#6 |
 | 16 | Add `cross_os: Some("cross_os_lan_toggle")` to the `--node` `live_lan_toggle_validation` registry spec | CODE | `cross_os_lan_toggle` (structurally unfed: only the bash-dialect `live_lan_toggle` spec, registry `:1951`, feeds it) | CONTAMINATION/DEAD-COLUMN (unfed aggregate) | S | Medium (inherits lan_toggle's Medium once it runs cross-platform) | macOS §3, §5#6 |
 | 17 | Confirm-then-fix: verify a `--node` StageId dispatches the mac role-transition cell when `--role-switch-platform macos` is set; if only in the legacy wrapper vocabulary, add the StageId + plan arm before spending a lab run | CODE | `macos_stage_role_transition` (242/242 not_run both OS) | WIRING/GATE (election knob exists at `live_lab_stage_registry.rs:1235-1236`; `--node` dispatch unconfirmed) | S | Medium (first run is triage) | macOS §1 role_transition, §5#6 |
 | 18 | Refresh the stale QH-07 "0 pass" doc-comment in `live_lab_run_matrix.rs` (~443-452) with the Linux doc's correction (small docs/comment change, tracked with QH-07(b)/(c)) | CODE (comment) | none directly — prevents future `two_hop` misattribution | CONTAMINATION/DEAD-COLUMN (stale 2026-07-27 count at commit `9cdd660f`) | S | n/a (docs hygiene) | Linux §1 |
@@ -129,6 +129,8 @@ evaluate-over-synthetic-pfctl-output logic. Fail-closed: predicates stay Linux-o
 each port lands; no validator greens against unenforced posture (that is why the
 `exit_dns_failclosed` evaluator is deferred behind row 19, not part of this item). Live
 proof: each `macos_stage_*_check` column's first real pass with the role elected.
+
+> **Corrected 2026-09-02:** Candidate 4 is **WITHDRAWN** — its premise is refuted. `extended_soak` is NOT missing an enable flag: `plan.rs`'s `include()` has `StageSuite::Soak => !skip_live_suite && !skip_soak`, so the stage is in the DEFAULT plan of every full-suite run (`--skip-soak` opts out), and the per-stage ledger (`live_lab_node_stage_results.csv`) records Linux 40 pass / 348 skip (macOS 15 skip, Windows 2 skip) — the stage HAS dispatched and passed on Linux under `--node`. The roll-up agrees: `linux_stage_extended_soak` = 8 pass / 113 skip / 121 not_run. The mac/win all-skip columns are the `--skip-linux-live-suite` fast path by design; the real macOS gap is a full-suite run electing macOS (with the second client `live_extended_soak_validation.rs:44-47` requires), not a flag. A soak opt-in flag would have REMOVED soak from the default plan — rejected. The original (retracted) text follows unchanged.
 
 **4. `--enable-soak-suite` selector.** Change: wire a `--enable-soak-suite` flag through
 `TargetSelectors`/`resolves` (the registry defines SoakSuite as
@@ -256,6 +258,17 @@ are unwired.
   column in the row. W-FIX-3 (the `run_scoped` flag, landed 2026-08-28) fixed this
   forward-only: the 5 historical rows are not evidence bootstrap failed five times, and
   forward rows are trustworthy.
+- **A "never dispatched" claim needs the per-stage ledger, not the roll-up column.**
+  (Corrected 2026-09-02.) A run-matrix column that reads all-skip/not_run can still
+  describe a stage that HAS dispatched and passed on another platform: the
+  `macos_stage_extended_soak` (15 skip / 227 not_run) and
+  `windows_stage_extended_soak` (2 skip / 240 not_run) columns led the 2026-09-01
+  docs to call `extended_soak` "never dispatched on any platform", but
+  `live_lab_node_stage_results.csv` shows Linux 40 pass / 348 skip — the stage runs
+  in every default Linux full-suite run (`plan.rs` `include()`: `StageSuite::Soak =>
+  !skip_live_suite && !skip_soak`) and the mac/win cells skip it only via
+  `--skip-linux-live-suite`. Join per-stage rows on `stage`+`platform` before
+  asserting a stage has never run.
 
 ---
 
