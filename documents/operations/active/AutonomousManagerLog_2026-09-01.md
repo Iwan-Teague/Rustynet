@@ -660,3 +660,31 @@ through the DNS-fix halt — collision-free (F2 owns macos_exit_killswitch_prece
 fix's macos_dns_failclosed/phase10-DNS). It checks whether Option A (print-verbatim) is truly
 strictest-secure and closes the stale-file window without a new stdout-interleaving risk. Fleet at 2.
 CI green through the recent merges. main b44a8ff6, clean.
+
+## Tick 28 — 2026-09-02 ~23:07–23:35Z — DNS fix complete + security-reviewed
+
+**The macOS DNS three-state fix finished all six milestones** on its branch (M1 posture decision →
+M6 doc fold) before halting on budget; no marker checkpoint, 6 proper commits. I ran the full
+security review of the ~1017-line diff and it is CORRECT and fail-closed at every load-bearing point:
+- The protected_dns arm (phase10.rs:7270) DECIDES the posture from the generation's exit posture
+  (`macos_dns_posture(exit_mode, serve_exit_node)` — never inferred from observed state) and calls
+  `apply_dns_protection_for_posture(posture)`.
+- `MacosCommandSystem` overrides the dispatch (phase10.rs:5123): Untouched→noop; ScopedResolverOnly→
+  rollback-if-previously-full then `apply_scoped_resolver_only`; FullyProtected→the full apply. The
+  exit-role inline apply at :4903 stays the full path (an exit is always FullyProtected — correct).
+- `apply_scoped_resolver_only` writes ONLY /etc/resolver/rustynet, FAIL-CLOSED (DnsApplyFailed on
+  write failure, not best-effort), and REFUSES if a service still pins loopback DNS (stranded
+  residue). FullyProtected probes the resolver is answering and rolls back on any failure.
+- The M5 verifier (macos_dns_failclosed.rs `evaluate_..._for_posture`) still FAILS a real leak under
+  every posture: scoped-resolver missing → drift ("*.rustynet queries leak to the LAN resolver"), a
+  stray general pin without the full posture → drift; the full-posture contract is unchanged. Tests
+  cover clean-pass and both drift cases.
+- The CLI ripple (gossip/key_custody/mesh_status/authenticode/etc.) is just the new
+  `expected_dns_posture: Option<&str>` param on `run_role_validator` — non-DNS callers pass None.
+
+Two-crate gate (rustynetd + rustynet-cli whole-crate, clippy, pinned fmt) RUNNING; merge on green,
+then rebuild the vm-lab CLI + harvest for the live proof (macOS DnsFailclosed must PASS, client
+ScopedResolverOnly). **Merged the F2 freshness-plan review** (`22c4ff26`, ACCEPT-WITH-AMENDMENTS,
+Option A print-verbatim confirmed strictest). Fleet briefly at 0 by design while gating the
+release-blocker — new launches held to avoid a main.rs/mod.rs collision with the merging DNS fix;
+refill from the merged HEAD next tick (F2 impl, QH-01 4d-ii). main 22c4ff26, clean.
