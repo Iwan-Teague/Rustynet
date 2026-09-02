@@ -157,15 +157,22 @@ is NOT unconditionally a mode requiring protected DNS. Per the read-order preced
 (Requirements.md over SecurityMinimumBar.md) and the strictest-secure rule (§2 rules: choose the
 strictest secure practical default and document the choice), the decision is:
 
-**Decision.** Protected DNS on macOS is a property of modes that CLAIM it — full-tunnel/exit
-postures, and any mode whose apply path pins services. A plain mesh client must be left
-UNTOUCHED (no service pins, no resolv.conf rewrite, no half floor). Critically, the current
-behavior cannot be defended as "client with protected DNS": the pin points general DNS at a port
-nothing listens on (§4), so the posture BREAKS resolution instead of protecting it — it is not
-a weakened control being removed, it is breakage being removed. Any mode that DOES pin must
-complete the full posture (§6 invariant). The lab verifier must be role-scoped to match: for a
-plain client, "untouched" is compliant and "pins present without the floor" is drift — the
-half-state is drift under EVERY reading.
+**Decision (AS IMPLEMENTED — three-state model, review A1).** Protected DNS on macOS is a
+property of modes that CLAIM it — full-tunnel/exit postures, and any mode whose apply path pins
+services. The fix landed as THREE postures, not two (`phase10::DnsPosture`):
+`FullyProtected` (full machine-wide fail-closed posture), `ScopedResolverOnly`, and
+`Untouched`. The original binary "plain client untouched" reading was REJECTED by the review
+(A1): a fully-untouched plain client breaks Magic DNS (Requirements §3.5) and LEAKS mesh query
+names to the LAN resolver. A plain mesh client (`ExitMode::Off`, not `serve_exit_node`) must
+get ONLY the scoped `/etc/resolver/rustynet` file routing `*.rustynet` at the daemon's live
+loopback listener — NO general pins, NO pf floor, NO resolv.conf/primary rewrite.
+`Untouched` is reserved for the `protected_dns=false` opt-out and is never a running node's
+posture. Critically, the pre-fix behavior cannot be defended as "client with protected DNS":
+the pin pointed general DNS at a port nothing listens on (§4), so it BREAKED resolution —
+breakage being removed, not a control. Any mode that DOES pin must complete the full posture
+(R1 invariant). The lab verifier is posture-scoped to match: for a plain client, the scoped
+file present + zero loopback pins is compliant; a scoped client with a stray general pin, or
+without the scoped file, is drift — the half-state is drift under EVERY reading.
 
 ## 6. Chosen fix + offline-testable core
 
@@ -173,40 +180,47 @@ half-state is drift under EVERY reading.
 that pins** — the combination that never weakens a real control and never leaves a half-applied
 posture:
 
-- **R1 — invariant enforcement on the apply path.** `apply_dns_protection` (phase10.rs:4609)
-  must never pin a service unless it can complete the full posture in fail-closed order: the
-  loopback resolver verified bound AND answering (post-bind probe of
-  `config.dns_resolver_bind_addr`), the pf DNS-block floor verified LIVE after load (wire
-  `assert_killswitch` :4831-4885 / `assert_dns_protection` :4744-4788 into the killswitch
-  branch of `apply_pf_rules`, closing the no-verification gap at :3852), services pinned, and
-  the primary advertised loopback. Any incomplete step → restore the M1 backup
-  (`rollback_dns_protection` :4790-4817 path) so the node ends UNTOUCHED, and return
-  `DnsApplyFailed`. Pin-without-live-primary is today's fail-open/breakage shape and is
-  forbidden.
-- **R2 — no silent downgrade on re-render.** The re-render callers
-  (`apply_peer_endpoint_bypass_routes` :4488, `apply_firewall_killswitch` :4496,
-  `apply_nat_forwarding` client branch :4541) must not render a floor-less anchor while pinned
-  services persist: detect live pins (`read_networksetup_dns_pin` :493-515) and either include
-  the floor or refuse/repair by re-running the full `apply_dns_protection`. This kills the
-  fresh-instance `dns_protected = false` clobber (phase10.rs:9554) that is the leading
-  root-cause chain in §3.
-- **R3 — plain client untouched + residue cleanup.** For a plain mesh client
-  (`ExitMode::Off`, not `serve_exit_node`), apply paths must not pin; startup reconcile must
-  detect leftover loopback pins (machine-persistent from a previous run) and restore them to
-  the M1 baseline, ending untouched. Removing pin-to-dead-:53 from the client removes breakage,
-  not a control (§5).
-- **R4 — role-scoped lab stage.** `validate_baseline_runtime`'s macOS DnsFailclosed verifier is
-  scoped by role: plain client → compliant when untouched, drift when pins exist without the
-  full posture (half-state always drift); exit/full-tunnel → the full seven-condition contract
-  of §2 unchanged.
+- **R1 — invariant enforcement on the apply path.** `apply_dns_protection`
+  (phase10.rs, `MacosCommandSystem`) must never pin a service unless it can complete the full
+  posture in fail-closed order: the loopback resolver verified bound AND answering (A6: an
+  in-apply UDP DNS probe of 127.0.0.1:53535, run BEFORE any mutation), the pf DNS-block floor
+  verified LIVE after load (`verify_live_pf_dns_floor`: `pfctl -a <anchor> -s rules` must carry
+  both labeled block rules — closing the no-verification gap at the killswitch branch of
+  `apply_pf_rules`, review A5), services pinned, resolv.conf and the scoped resolver written
+  (both now FAIL-CLOSED, not best-effort). Any incomplete step → `rollback_dns_protection` so
+  the node ends UNTOUCHED (never half), and return `DnsApplyFailed` (a failed rollback surfaces
+  `RollbackFailed`). Pin-without-live-primary is the forbidden fail-open/breakage shape.
+- **R2 — no silent downgrade on re-render (AS IMPLEMENTED).** The floor follows live pins,
+  not the flag: `killswitch_spec` reports the DNS floor whenever `dns_protected` OR
+  `has_live_loopback_dns_pins()` (fail-closed: an unreadable service enumeration counts as
+  pins-present). Every pf re-render flows through that spec — bypass routes, killswitch,
+  pre-NAT, and the privileged helper's re-render — so a floor can never be rendered away while
+  a general pin persists. (The review's A2 anchor: the REAL macOS fresh-init
+  `dns_protected = false` is the `MacosCommandSystem::new` initializer, not the Windows test
+  at the diagnosis's :9554.)
+- **R3 — plain client scoped + residue cleanup (AS IMPLEMENTED).** For a plain mesh client
+  the apply path installs ONLY the scoped resolver (`apply_scoped_resolver_only`): live-probe
+  first, stranded loopback pins refuse the apply (fail-closed), scoped-file write fail-closed.
+  Startup residue cleanup (`run_startup_dns_recovery`, daemon.rs, BEFORE preflight) restores
+  leftover loopback pins to the M1 baseline and is POSTURE-PRESERVING: it never touches the
+  scoped file or resolv.conf (source-scan test pins this), so a recovered client ends at the
+  correct ScopedResolverOnly posture once the daemon re-binds its listener. Removing
+  pin-to-dead-:53 from the client removes breakage, not a control (§5).
+- **R4 — posture-scoped verifier (AS IMPLEMENTED, review A7).** The macOS DnsFailclosed
+  verifier takes the node's posture THREADED from its planned role — never inferred from the
+  observed state (tautology). Daemon check: `rustynetd macos-dns-failclosed-check --posture
+  <fully-protected|scoped-resolver-only>` (fail-closed parse); the report embeds the posture it
+  was evaluated for (schema_version 2) and the CLI evaluator rejects a mismatch.
+  FullyProtected → the full seven-condition contract of §2 UNCHANGED; ScopedResolverOnly →
+  compliant iff the scoped resolver is present AND no service pins loopback DNS AND the
+  enumeration is readable; ANY half-state drifts; Untouched always drifts.
 
 **Offline-testable core** (pure functions / op-count, no live lab):
 
-1. New pure decision fn, e.g. `macos_dns_posture_decision(resolver_answering: bool,
-   pf_floor_live: bool, pins_present: bool) -> DnsPosture` with exactly two reachable
-   outcomes — `FullyProtected` (all three true) and `Untouched` (pins absent; floor/pins must
-   agree). No `Half` variant exists to construct. Unit tests: every incomplete combination →
-   `Untouched` + "rollback required".
+1. New pure decision fn `macos_dns_posture(exit_mode, serve_exit_node) -> DnsPosture`
+   (phase10.rs): `FullyProtected` iff full-tunnel or exit-serving, else `ScopedResolverOnly`;
+   `Untouched` is reserved for the `protected_dns=false` opt-out and never returned. Unit
+   tests cover every input combination plus the never-untouched invariant.
 2. `render_macos_killswitch_pf_rules` (phase10.rs:3442): existing emission-iff-`dns_protected`
    test, plus NEW test — a render request with `pinned_services` non-empty and DNS-block
    emission suppressed is refused (R2), never silently rendered floor-less.
