@@ -2,11 +2,13 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::vm_lab::DaemonProbeOp;
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
 use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    self, run_remote_ps, WINDOWS_RUSTYNETD_PATH,
+    self, WINDOWS_RUSTYNETD_PATH, run_remote_ps,
 };
 use crate::vm_lab::orchestrator::adapter::windows_membership;
 use crate::vm_lab::orchestrator::adapter::windows_traffic;
@@ -18,8 +20,6 @@ use crate::vm_lab::orchestrator::error::{
     ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
-use crate::vm_lab::DaemonProbeOp;
-use crate::vm_lab::VmGuestPlatform;
 
 const VALIDATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
