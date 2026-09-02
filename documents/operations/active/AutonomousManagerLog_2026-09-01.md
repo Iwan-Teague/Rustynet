@@ -701,3 +701,31 @@ next tick reads the stage report + ledger row + `scutil --dns` on the guest. If 
 the FIRST macOS role proven green on the `--node` engine — log it prominently and commit the ledger
 rows. **Refilled the fleet: launched the F2 freshness implementation** (`edit-1788387264479-11491-0`,
 Option A print-verbatim per the plan+review, gates both crates). main 345fe219, clean.
+
+## Tick 29 — 2026-09-02 ~23:34–23:55Z — DNS live-proof: fix correct, exposed a deeper defect
+
+**The live-proof harvest (`labrun-1788387277223-11683-0`) FAILED, but not because the fix is
+wrong — because it is RIGHT.** On macos-utm-1 (a plain mesh client) the daemon logged, repeatedly:
+`dns apply failed: the loopback DNS resolver on 127.0.0.1:53535 did not answer` → the apply rolls
+back fail-closed → `restrict_recoverable` → the node ends PERMANENTLY restricted, so BOTH checks
+fail (DnsFailclosed AND MeshStatus — a restricted node cannot mesh). The fix's
+`verify_loopback_resolver_live` probe (phase10.rs ~:4520, called first by `apply_scoped_resolver_only`)
+sends an A query for the mesh zone root to :53535 and requires an answer; over ~30s it never
+answered. Sampler confirms the general pin never applied (eth-dns=127: 0/602).
+
+**Root:** the macOS mesh client's loopback DNS resolver at 127.0.0.1:53535 does NOT serve — the
+daemon binds the socket (daemon.rs:12209) but nothing answers. The OLD code MASKED this (pinned
+general DNS to a dead :53, never probed :53535 = fail-OPEN); the new code correctly fail-closes.
+**I did NOT revert** — reverting would restore the fail-open leak, and the fix's three-state model is
+correct. Recorded the honest remedy against the run's real stub
+`livelab-1788387950-7087f2b755d8::validate_baseline_runtime` (`cc25ceac`).
+
+**Two open questions the diagnosis must settle** (do NOT weaken the probe/verifier): (Q1) why the
+client resolver doesn't serve (serving loop not started for a client? zone not loaded at bootstrap?
+an ordering race where the probe runs before the serve task?), and (Q2) whether a client's DNS-apply
+failure should restrict the WHOLE node/mesh or fail only the DNS posture. **Launched the grounded
+diagnosis** (`edit-1788388747110-25220-0` → MacosClientResolverNotServingDiagnosis).
+
+**Also: F2 freshness impl COMPLETE** (`edit-1788387264479-11491-0`, 3 commits) — gating both crates
+now; merge on green. Fleet: resolver diagnosis + (F2 gating). main cc25ceac, clean, CI green (the
+three-state fix's unit tests pass; the runtime issue is the resolver serving, not caught by units).
