@@ -1,16 +1,19 @@
 //! D13.d — `rustynet llm` admin verbs (LLM design §7).
 //!
 //! `rustynet llm allow <peer|group> [--models a,b] [--quota N]
-//! [--rate N]` / `rustynet llm deny <peer|group>` are convenience
-//! wrappers that build the **unsigned** service-access policy
-//! record for the membership owner to sign — mirroring the
+//! [--rate N] [--unrestricted]` / `rustynet llm deny <peer|group>`
+//! are convenience wrappers that build the **unsigned** service-access
+//! policy record for the membership owner to sign — mirroring the
 //! assignment/capability flow. Nothing here mutates policy: a node
 //! cannot grant LLM access to itself or anyone else; only the
 //! owner-signed policy applied through the membership path changes
 //! who may reach the service. `rustynet llm access list` is
 //! read-only and reports the access state the daemon materialised
 //! from signed policy (absent state ⇒ default-deny, honestly
-//! reported as "nobody authorised").
+//! reported as "nobody authorised"). A granted peer without a
+//! scope line is denied every model; `--unrestricted` is the only
+//! path to unrestricted access and is mutually exclusive with the
+//! limit flags.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -37,6 +40,7 @@ pub enum LlmCommand {
         models: Option<Vec<String>>,
         max_tokens_per_window: Option<u64>,
         max_requests_per_minute: Option<u32>,
+        unrestricted: bool,
     },
     Deny {
         peer: String,
@@ -48,6 +52,7 @@ pub enum LlmCommand {
 pub enum LlmCliError {
     InvalidPeerSelector { raw: String },
     InvalidFlagValue { flag: &'static str, raw: String },
+    ContradictoryScope,
 }
 
 impl fmt::Display for LlmCliError {
@@ -60,6 +65,10 @@ impl fmt::Display for LlmCliError {
             LlmCliError::InvalidFlagValue { flag, raw } => {
                 write!(f, "invalid value {raw:?} for {flag}")
             }
+            LlmCliError::ContradictoryScope => write!(
+                f,
+                "contradictory scope: --unrestricted cannot be combined with --models, --quota, or --rate"
+            ),
         }
     }
 }
@@ -91,6 +100,16 @@ pub fn validate_peer_selector(raw: &str) -> Result<String, LlmCliError> {
 /// Canonical unsigned record the owner signs and applies from the
 /// admin box. Line-oriented `key=value` (the same signing-input
 /// discipline as the membership pre-images).
+///
+/// Scope fields (`models=`, `max_tokens_per_window=`,
+/// `max_requests_per_minute=`, `unrestricted=true`) are
+/// **record-only** today: the signed policy rule schema carries no
+/// scope field, so the gateway enforces scopes from `scopes.v1`
+/// materialised by the daemon, and a granted peer without a scope
+/// line is denied every model. `unrestricted=true` in the record
+/// documents the operator's explicit grant; it lands in the
+/// gateway's grammar (`unrestricted` key in `scopes.v1`) only once
+/// the signed scope distribution exists.
 pub fn render_unsigned_access_record(command: &LlmCommand) -> Option<String> {
     match command {
         LlmCommand::Allow {
@@ -98,6 +117,7 @@ pub fn render_unsigned_access_record(command: &LlmCommand) -> Option<String> {
             models,
             max_tokens_per_window,
             max_requests_per_minute,
+            unrestricted,
         } => {
             let mut out = String::from("record=llm_access_v1\naction=allow\n");
             out.push_str(&format!("peer={peer}\n"));
@@ -110,6 +130,9 @@ pub fn render_unsigned_access_record(command: &LlmCommand) -> Option<String> {
             }
             if let Some(rate) = max_requests_per_minute {
                 out.push_str(&format!("max_requests_per_minute={rate}\n"));
+            }
+            if *unrestricted {
+                out.push_str("unrestricted=true\n");
             }
             Some(out)
         }
@@ -217,12 +240,17 @@ pub fn execute_llm(command: &LlmCommand, access_dir: Option<PathBuf>) -> Result<
 }
 
 /// Parse the flag tail of `llm allow <peer> [--models a,b]
-/// [--quota N] [--rate N]`.
+/// [--quota N] [--rate N] [--unrestricted]`.
+///
+/// `--unrestricted` is mutually exclusive with the limit flags:
+/// a contradictory combination fails closed here, before any
+/// record is rendered or written.
 pub fn parse_allow_flags(peer: &str, rest: &[String]) -> Result<LlmCommand, LlmCliError> {
     let peer = validate_peer_selector(peer)?;
     let mut models: Option<Vec<String>> = None;
     let mut max_tokens_per_window: Option<u64> = None;
     let mut max_requests_per_minute: Option<u32> = None;
+    let mut unrestricted = false;
     let mut iter = rest.iter();
     while let Some(flag) = iter.next() {
         match flag.as_str() {
@@ -273,6 +301,9 @@ pub fn parse_allow_flags(peer: &str, rest: &[String]) -> Result<LlmCommand, LlmC
                             })?,
                     );
             }
+            "--unrestricted" => {
+                unrestricted = true;
+            }
             other => {
                 return Err(LlmCliError::InvalidFlagValue {
                     flag: "llm allow",
@@ -281,11 +312,19 @@ pub fn parse_allow_flags(peer: &str, rest: &[String]) -> Result<LlmCommand, LlmC
             }
         }
     }
+    if unrestricted
+        && (models.is_some()
+            || max_tokens_per_window.is_some()
+            || max_requests_per_minute.is_some())
+    {
+        return Err(LlmCliError::ContradictoryScope);
+    }
     Ok(LlmCommand::Allow {
         peer,
         models,
         max_tokens_per_window,
         max_requests_per_minute,
+        unrestricted,
     })
 }
 
@@ -393,5 +432,95 @@ mod tests {
         let out =
             run_access_list(dir.path()).expect("exactly-at-cap grants must still be accepted");
         assert!(out.contains("node:a"), "got: {out}");
+    }
+
+    #[test]
+    fn allow_parses_unrestricted_alone() {
+        let rest: Vec<String> = ["--unrestricted"].iter().map(|s| s.to_string()).collect();
+        let command = parse_allow_flags("node:alpha", &rest)
+            .expect("--unrestricted alone must parse as an explicit unrestricted grant");
+        assert_eq!(
+            command,
+            LlmCommand::Allow {
+                peer: "node:alpha".to_owned(),
+                models: None,
+                max_tokens_per_window: None,
+                max_requests_per_minute: None,
+                unrestricted: true,
+            }
+        );
+    }
+
+    #[test]
+    fn allow_with_models_still_parses() {
+        let rest: Vec<String> = ["--models", "a,b"].iter().map(|s| s.to_string()).collect();
+        let command = parse_allow_flags("node:alpha", &rest)
+            .expect("scoped allow without --unrestricted must keep parsing");
+        assert_eq!(
+            command,
+            LlmCommand::Allow {
+                peer: "node:alpha".to_owned(),
+                models: Some(vec!["a".to_owned(), "b".to_owned()]),
+                max_tokens_per_window: None,
+                max_requests_per_minute: None,
+                unrestricted: false,
+            }
+        );
+    }
+
+    #[test]
+    fn allow_rejects_unrestricted_with_scope_flags() {
+        let combos: Vec<Vec<&str>> = vec![
+            vec!["--unrestricted", "--models", "x"],
+            vec!["--unrestricted", "--quota", "1"],
+            vec!["--unrestricted", "--rate", "1"],
+            vec!["--models", "x", "--unrestricted"],
+            vec!["--quota", "1", "--unrestricted"],
+            vec!["--rate", "1", "--unrestricted"],
+        ];
+        for combo in combos {
+            let rest: Vec<String> = combo.iter().map(|s| s.to_string()).collect();
+            let err = parse_allow_flags("node:alpha", &rest)
+                .expect_err("--unrestricted must be mutually exclusive with the limit flags");
+            assert_eq!(err, LlmCliError::ContradictoryScope, "combo: {combo:?}");
+            assert!(
+                err.to_string().contains("--unrestricted"),
+                "error must name the conflict: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn allow_renders_unrestricted_record() {
+        let command = LlmCommand::Allow {
+            peer: "node:alpha".to_owned(),
+            models: None,
+            max_tokens_per_window: None,
+            max_requests_per_minute: None,
+            unrestricted: true,
+        };
+        let record =
+            render_unsigned_access_record(&command).expect("allow must always render a record");
+        assert_eq!(
+            record,
+            "record=llm_access_v1\naction=allow\npeer=node:alpha\ncontext=llm_service\nunrestricted=true\n"
+        );
+    }
+
+    #[test]
+    fn allow_scoped_record_has_no_unrestricted_line() {
+        let command = LlmCommand::Allow {
+            peer: "node:alpha".to_owned(),
+            models: Some(vec!["a".to_owned()]),
+            max_tokens_per_window: Some(100),
+            max_requests_per_minute: Some(10),
+            unrestricted: false,
+        };
+        let record =
+            render_unsigned_access_record(&command).expect("allow must always render a record");
+        assert!(
+            !record.contains("unrestricted"),
+            "scoped record must never carry an unrestricted marker: {record}"
+        );
     }
 }
