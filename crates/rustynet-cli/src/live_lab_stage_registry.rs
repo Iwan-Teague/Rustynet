@@ -1248,7 +1248,10 @@ pub const STAGES: &[StageSpec] = &[
         stream: PlatformStream::Macos,
         direct_platform: Some(("macos", "reboot_recovery")),
         enable: EnableRule::RebootPlatform("macos"),
-        budget_secs: 180,
+        // Review F4: the helper's own worst case is ~120 s pre-capture + 30 s
+        // dispatch + 8 x (90 s + 20 s) return probing + 2 x 120 s post
+        // captures; 180 s would cut a legitimate reboot proof short.
+        budget_secs: 1200,
         ..DEFAULT_SPEC
     },
     StageSpec {
