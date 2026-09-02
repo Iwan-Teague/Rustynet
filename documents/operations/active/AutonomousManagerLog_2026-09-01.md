@@ -729,3 +729,14 @@ diagnosis** (`edit-1788388747110-25220-0` → MacosClientResolverNotServingDiagn
 **Also: F2 freshness impl COMPLETE** (`edit-1788387264479-11491-0`, 3 commits) — gating both crates
 now; merge on green. Fleet: resolver diagnosis + (F2 gating). main cc25ceac, clean, CI green (the
 three-state fix's unit tests pass; the runtime issue is the resolver serving, not caught by units).
+
+### Tick 29 continuation — F2 freshness impl MERGED (~00:00Z)
+
+The F2 impl gate came back green (fmt; clippy both crates; rustynetd + rustynet-cli tests). Verified
+the security behavior and **merged** (`20e6b249`): the adapter captures the check's stdout via
+`extract_precedence_report_stdout` (fail-closed with no fallback branch on empty / confirmation-only
+/ junk-wrapped / truncated / non-object stdout) and no longer reads the fixed-path artifact file;
+the daemon serializes the report once and prints it verbatim, with the `--output` file mode
+byte-identical. Pin unchanged. main 20e6b249, clean. Fleet: the resolver-not-serving diagnosis
+(`edit-1788388747110-25220-0`) running — the release-blocking thread; I'll review it next tick and
+drive diagnosis→review→fix→live-prove.
