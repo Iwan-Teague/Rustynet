@@ -7774,12 +7774,12 @@ mod tests {
         //    the Linux canonical path — behavior unchanged.
         #[cfg(target_os = "linux")]
         assert_eq!(
-            ASSIGNMENT_SIGNING_SECRET_PATH,
+            super::ASSIGNMENT_SIGNING_SECRET_PATH,
             "/etc/rustynet/assignment.signing.secret"
         );
         #[cfg(target_os = "linux")]
         assert_eq!(
-            MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            super::MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
             "/etc/rustynet/membership.owner.key"
         );
     }

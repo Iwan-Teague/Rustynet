@@ -2601,10 +2601,21 @@ mod tests {
         // must accept it (Done: an empty inner payload is a keepalive, not a
         // tunnel write). Any stale byte after the 32-byte slice would have
         // been observable in the length or in the counterpart's MAC check.
+        // The keepalive is due once a full second of silence has elapsed on the
+        // engine's own clock. Wall-clock sleeps are not that clock: tick until
+        // the keepalive appears, bounded so a genuinely missing keepalive still
+        // fails loudly instead of hanging.
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let observed = engine
-            .update_peer_timers(1, &mut sink)
-            .expect("timer tick never errors");
+        let mut observed = Vec::new();
+        for _ in 0..50 {
+            observed = engine
+                .update_peer_timers(1, &mut sink)
+                .expect("timer tick never errors");
+            if !sink.events.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
         // A live session makes `authenticated_handshake_unix` report the
         // established handshake on every tick — that is not a NEW handshake;
         // only the keepalive ciphertext is emitted.

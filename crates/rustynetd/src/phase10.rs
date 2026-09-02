@@ -12138,6 +12138,16 @@ mod tests {
     /// Scripted system for the anchoring tests: fail-closed SSH allow is ON
     /// with the given CIDRs, and the egress address observation answers with
     /// the given `ip -o addr show` output.
+    /// The scripted-helper handle set `anchoring_system` returns: the recorded
+    /// commands, the stop flag, the helper thread, and the system under test.
+    #[cfg(target_os = "linux")]
+    type AnchoringSystemParts = (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        LinuxCommandSystem,
+    );
+
     #[cfg(target_os = "linux")]
     fn anchoring_system(
         socket_path: &Path,
@@ -12145,12 +12155,7 @@ mod tests {
         engaged: bool,
         addr_show_stdout: &str,
         addr_show_status: i32,
-    ) -> (
-        Arc<Mutex<Vec<String>>>,
-        Arc<AtomicBool>,
-        std::thread::JoinHandle<()>,
-        LinuxCommandSystem,
-    ) {
+    ) -> AnchoringSystemParts {
         let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
             socket_path,
             vec![(
