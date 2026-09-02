@@ -321,9 +321,9 @@ mod imp {
     };
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
-        GetKernelObjectSecurity, GetTokenInformation, LookupAccountNameW,
-        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, RevertToSelf, SECURITY_ATTRIBUTES,
-        SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups, TokenUser,
+        GetTokenInformation, LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        RevertToSelf, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY,
+        TOKEN_USER, TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers,
@@ -1395,46 +1395,6 @@ mod imp {
         }
     }
 
-    #[allow(dead_code)]
-    fn inspect_handle_sddl(handle: HANDLE) -> Result<String, String> {
-        let requested = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
-        let mut needed = 0u32;
-        let first =
-            unsafe { GetKernelObjectSecurity(handle, requested, null_mut(), 0, &mut needed) };
-        if first != 0 {
-            return Err(
-                "GetKernelObjectSecurity unexpectedly succeeded with a zero-length buffer"
-                    .to_string(),
-            );
-        }
-        let err = unsafe { GetLastError() };
-        if err != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
-            return Err(format!(
-                "GetKernelObjectSecurity sizing failed with Windows error {err}"
-            ));
-        }
-        let mut buffer = vec![0u8; needed as usize];
-        let ok = unsafe {
-            GetKernelObjectSecurity(
-                handle,
-                requested,
-                buffer.as_mut_ptr().cast::<c_void>(),
-                needed,
-                &mut needed,
-            )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "GetKernelObjectSecurity failed with Windows error {}",
-                unsafe { GetLastError() }
-            ));
-        }
-        security_descriptor_to_sddl(
-            buffer.as_mut_ptr().cast::<c_void>(),
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        )
-    }
-
     /// Authenticode chain validation via `WinVerifyTrust`. Wraps the
     /// canonical `WINTRUST_ACTION_GENERIC_VERIFY_V2` verb with
     /// chain-revocation checking enabled (`WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT`)
@@ -1966,7 +1926,7 @@ mod imp {
     /// portable arbiter. Read-only: `FwpmFilterEnum0` inspects, never mutates.
     fn wfp_enumerate_forward_layer_filters()
     -> Result<Vec<crate::wfp_filter_shape::ForeignForwardFilterObservation>, String> {
-        let mut engine = wfp_engine_open()?;
+        let engine = wfp_engine_open()?;
         let result = (|| {
             let mut observations = Vec::new();
             for layer in [FWPM_LAYER_IPFORWARD_V4, FWPM_LAYER_IPFORWARD_V6] {
@@ -1996,7 +1956,7 @@ mod imp {
                             return Ok(());
                         }
                         for index in 0..returned as usize {
-                            let filter_ref = unsafe { &*entries.add(index) };
+                            let filter_ref = unsafe { &**entries.add(index) };
                             observations.push(
                                 crate::wfp_filter_shape::ForeignForwardFilterObservation {
                                     layer_key: guid_to_u128(&filter_ref.layerKey),
@@ -2755,8 +2715,8 @@ pub mod wfp_filter_shape {
 
 #[cfg(windows)]
 pub use imp::{
-    apply_wfp_tunnel_permit, call_named_pipe, dpapi_protect, dpapi_unprotect,
-    extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
+    apply_wfp_tunnel_permit, assert_forwarded_traffic_admitted, call_named_pipe, dpapi_protect,
+    dpapi_unprotect, extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
     inspect_named_pipe_sddl, inspect_registry_key_sddl, lookup_account_sid_string,
     remove_wfp_tunnel_permit, serve_named_pipe_one_message,
     serve_named_pipe_one_message_authorized, verify_authenticode_chain, wfp_tunnel_permit_present,
