@@ -14902,14 +14902,25 @@ pub fn exercise_macos_reboot_recovery_live(
 ) -> Result<String, String> {
     const RECOVERY_LOG_LINE: &str = "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)";
     const STATE_ROOT: &str = "/usr/local/var/rustynet";
-    const LOOPBACK_PIN_CHECK: &str = "for svc in $(networksetup -listallnetworkservices \
-         | tail -n +2 | grep -v '^\\*'); do \
+    // Line-oriented (review F3): service names carry spaces ("Thunderbolt
+    // Bridge"), so a `for svc in $(...)` word-split would visit bogus
+    // fragments; an EMPTY enabled-service list is a hard failure rather than
+    // a vacuous pass, matching the daemon's own enumeration contract.
+    const LOOPBACK_PIN_CHECK: &str = "SVCS=\"$(networksetup -listallnetworkservices \
+         | tail -n +2 | grep -v '^\\*' || true)\"; \
+         [ -n \"$SVCS\" ] || { echo 'no enabled network services listed' >&2; exit 1; }; \
+         printf '%s\\n' \"$SVCS\" | while IFS= read -r svc; do \
+           [ -n \"$svc\" ] || continue; \
            dns=\"$(networksetup -getdnsservers \"$svc\" 2>/dev/null || true)\"; \
            case \"$dns\" in \
              *127.0.0.1*) ;; \
              *) echo \"service $svc is not loopback-pinned: $dns\" >&2; exit 1 ;; \
            esac; \
          done";
+    // Review F1: the kernel boot time is captured before and after the
+    // dispatch; an unchanged value means no reboot happened, whatever the
+    // SSH transport reported.
+    const BOOTTIME_CAPTURE: &str = "echo \"boottime=$(sysctl -n kern.boottime)\"";
 
     let inventory = load_inventory(inventory_path)?;
     let macos_entry = inventory
@@ -14935,6 +14946,7 @@ pub fn exercise_macos_reboot_recovery_live(
          MODE=\"$(sudo -n stat -f %Lp \"$BAK\")\"; \
          [ \"$MODE\" = \"0600\" ] || {{ echo \"backup mode is $MODE, expected 0600\" >&2; exit 1; }}; \
          {LOOPBACK_PIN_CHECK}; \
+         {BOOTTIME_CAPTURE}; \
          echo \"pre-reboot evidence ok: backup present at $BAK, mode $MODE, all enabled services loopback-pinned\""
     );
     let pre_reboot_out = capture_remote_shell_command_for_target(
@@ -14946,6 +14958,8 @@ pub fn exercise_macos_reboot_recovery_live(
         Duration::from_secs(120),
     )
     .map_err(|e| format!("pre-reboot evidence capture on {macos_alias} failed: {e}"))?;
+    let pre_boottime = parse_macos_boottime_line(&pre_reboot_out)
+        .map_err(|e| format!("pre-reboot boot-time capture on {macos_alias}: {e}"))?;
 
     // 2. Reboot. Fire-and-forget: the SSH channel dies with the guest, so a
     //    transport error here is the EXPECTED shutdown path; only an explicit
@@ -15035,6 +15049,7 @@ pub fn exercise_macos_reboot_recovery_live(
            echo 'shutdown_residue_marker=absent'; \
          fi; \
          {LOOPBACK_PIN_CHECK}; \
+         {BOOTTIME_CAPTURE}; \
          echo 'post-reboot loopback pinning re-verified'"
     );
     let post_out = capture_remote_shell_command_for_target(
@@ -15046,6 +15061,14 @@ pub fn exercise_macos_reboot_recovery_live(
         Duration::from_secs(120),
     )
     .map_err(|e| format!("post-reboot verification on {macos_alias} failed: {e}"))?;
+    let post_boottime = parse_macos_boottime_line(&post_out)
+        .map_err(|e| format!("post-reboot boot-time capture on {macos_alias}: {e}"))?;
+    if post_boottime == pre_boottime {
+        return Err(format!(
+            "kernel boot time on {macos_alias} is unchanged across the dispatch ({pre_boottime}): \
+             no reboot occurred, so nothing about reboot survival was proven"
+        ));
+    }
 
     let startup_recovery_line_present = post_out.contains("startup_recovery_line=present");
     if post_out.contains("shutdown_residue_marker=present") {
@@ -15062,15 +15085,15 @@ pub fn exercise_macos_reboot_recovery_live(
         Duration::from_secs(120),
     )
     .map_err(|e| format!("macos-dns-failclosed-check on {macos_alias} failed: {e}"))?;
+    // The typed evaluator IS the survival gate: it fails this stage on any
+    // drift (review F2 removed a vacuous alternate clause here). The M1
+    // startup-recovery line is recorded as evidence of WHICH path restored
+    // the posture — present after a hard reset that left the backup behind,
+    // absent after a clean shutdown that retired it — not as a second gate.
     let failclosed_summary = evaluate_macos_dns_failclosed_report(macos_alias, &failclosed_json)?;
-    if !startup_recovery_line_present && !failclosed_summary.contains("ok") {
-        return Err(format!(
-            "neither the M1 startup-recovery log line nor a clean fail-closed re-apply was observed on {macos_alias}: the networksetup protection did not verifiably survive the reboot"
-        ));
-    }
 
     let summary = format!(
-        "macOS reboot-with-protection proven on {macos_alias}: node_id={node_id}; {}; startup_recovery_line={}; residue_marker=absent; failclosed-check: {failclosed_summary}",
+        "macOS reboot-with-protection proven on {macos_alias}: node_id={node_id}; {}; boottime {pre_boottime} -> {post_boottime}; startup_recovery_line={}; residue_marker=absent; failclosed-check: {failclosed_summary}",
         pre_reboot_out.trim(),
         if startup_recovery_line_present {
             "present"
@@ -15089,6 +15112,64 @@ pub fn exercise_macos_reboot_recovery_live(
     )?;
 
     Ok(summary)
+}
+
+/// Extract the `boottime=` line a reboot-recovery capture script emits
+/// (`sysctl -n kern.boottime`, e.g. `{ sec = 1788343748, usec = 945250 } …`).
+/// Exactly one such line must be present; the value is compared verbatim
+/// across the reboot, so it is returned as-is and never parsed further.
+fn parse_macos_boottime_line(capture: &str) -> Result<String, String> {
+    let mut values = capture
+        .lines()
+        .filter_map(|line| line.strip_prefix("boottime="))
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let first = values
+        .next()
+        .ok_or_else(|| "capture carries no boottime= line".to_owned())?;
+    if values.next().is_some() {
+        return Err("capture carries more than one boottime= line".to_owned());
+    }
+    Ok(first.to_owned())
+}
+
+#[cfg(test)]
+mod macos_reboot_recovery_boottime_tests {
+    use super::parse_macos_boottime_line;
+
+    #[test]
+    fn extracts_the_single_boottime_line_verbatim() {
+        let out = "pre-reboot evidence ok\nboottime={ sec = 1788343748, usec = 945250 } Wed Sep  2 03:09:08 2026\n";
+        assert_eq!(
+            parse_macos_boottime_line(out).expect("one line"),
+            "{ sec = 1788343748, usec = 945250 } Wed Sep  2 03:09:08 2026"
+        );
+    }
+
+    #[test]
+    fn rejects_a_capture_without_a_boottime_line() {
+        let err = parse_macos_boottime_line("pre-reboot evidence ok\n").expect_err("missing");
+        assert!(err.contains("no boottime= line"), "{err}");
+    }
+
+    #[test]
+    fn rejects_an_empty_or_duplicated_boottime_value() {
+        assert!(parse_macos_boottime_line("boottime=\n").is_err());
+        let err = parse_macos_boottime_line("boottime=a\nboottime=b\n").expect_err("dup");
+        assert!(err.contains("more than one"), "{err}");
+    }
+
+    #[test]
+    fn an_unchanged_boot_time_is_the_no_reboot_signal() {
+        // The helper compares the two captured values verbatim: equality
+        // means the kernel never rebooted, regardless of SSH transport
+        // errors around the dispatch (review F1).
+        let pre = parse_macos_boottime_line("boottime={ sec = 1, usec = 2 } x\n").unwrap();
+        let post = parse_macos_boottime_line("boottime={ sec = 1, usec = 2 } x\n").unwrap();
+        assert_eq!(pre, post);
+        let post2 = parse_macos_boottime_line("boottime={ sec = 9, usec = 2 } y\n").unwrap();
+        assert_ne!(pre, post2);
+    }
 }
 
 /// Persist the raw capture evidence for the C7 reboot-recovery proof under
