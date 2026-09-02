@@ -54,8 +54,7 @@ Consequences of the precedence order:
 
 Goal: both platforms' `enforce_daemon` issue a post-restart `state refresh`, making the enforce path self-contained instead of timer-lucky.
 
-- Seam: per QH-01 Step 4d, new remote commands use `RemoteCommand::from_args` / the macOS readiness-probe pattern in `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/validated_args.rs` (typed argv; no `format!`-built shell).
-  <!-- PENDING: verify exact fn names/shape in validated_args.rs before finalising. -->
+- Seam (verified): per QH-01 Step 4d, new remote commands go through `RemoteCommand::from_args` (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/validated_args.rs` — the single constructor; `validated_args.rs:656` pins that only `ssh.rs` may construct `RemoteCommand` directly, and `:614-638` extends the QH-01 scanner pin to `.as_str()` sinks so a `format!` bypass cannot hide). Arguments are typed via `ValidatedArg` constructors (`ValidatedArg::node_id`/`::path`/`::utun`, validated_args.rs:420-450) and each token is single-quote-wrapped by `from_args` (:290-315). The readiness probe to chain after is the existing `wait_for_macos_daemon_socket` (adapter call `macos_install.rs:832`; impl `ops_e2e.rs:1063-1075`, 45 s fail-closed poll).
 - Order to pin by unit test: restart → socket wait (`wait_for_macos_daemon_socket`) → `state refresh` → a non-zero refresh result FAILS enforce.
 - macOS precedent for the refresh-after-restart seam already exists: the mac role-transition path (`adapter/mod.rs:14753`, script `sudo $RN state refresh` at :14835-14837) and the live test binaries' post-restart refresh helpers (`live_linux_two_hop_test.rs:1841`, `live_linux_lan_toggle_test.rs:1957`, `live_linux_exit_handoff_test.rs:1564`).
 - Existing worker `execute_ops_e2e_worker_refresh_signed_state` (`ops_e2e.rs:7471-7487`; wired `main.rs:1472/5616/9315-9319`) shows the target command shape; the adapters currently never call it.
@@ -91,8 +90,8 @@ Goal: at daemon startup, if the persisted trust state says this node's protected
 ## 6) Deliverable checklist
 
 - [x] Root cause, evidence-cited (§1).
-- [ ] Precedence decision with exact clause citations (§2 — pending read).
+- [x] Precedence decision with exact clause citations (§2).
 - [x] Implementation plan skeleton, offline-testable core first (§3).
 - [x] Risks/collisions enumerated (§4).
 - [x] Unknown-needs-live-probe list (§5).
-- [ ] Index entry in `documents/operations/active/README.md`.
+- [x] Index entry in `documents/operations/active/README.md`.
