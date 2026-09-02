@@ -46,14 +46,14 @@
       },
       "exit_capable": false,
       "lab_role": "client",
-      "last_known_ip": "192.168.64.4",
+      "last_known_ip": "192.168.65.4",
       "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.65.4",
         "192.168.64.4",
         "10.47.225.61",
         "192.168.64.201",
         "192.168.0.201",
-        "192.168.65.4",
         "fd21:69d4:6afd:fa50:4344:bf8a:e4ff:3154",
         "fe80::a419:949:1c4a:4d9f"
       ],
@@ -64,7 +64,7 @@
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_target": "192.168.64.4",
+      "ssh_target": "192.168.65.4",
       "ssh_user": "debian"
     },
     {
@@ -76,15 +76,15 @@
       },
       "exit_capable": false,
       "lab_role": "client",
-      "last_known_ip": "192.168.64.10",
+      "last_known_ip": "192.168.65.5",
       "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
+        "192.168.65.5",
         "192.168.64.10",
         "10.230.76.58",
         "192.168.15.253",
         "10.47.225.60",
         "192.168.0.203",
-        "192.168.65.5",
         "192.168.64.6",
         "fd21:69d4:6afd:fa50:dc8c:2918:43ca:d40d",
         "fe80::cadd:6589:4e14:8590"
@@ -96,7 +96,7 @@
       "parent_device": "iwan's MacBook Pro",
       "relay_capable": false,
       "rustynet_src_dir": "/home/debian/Rustynet",
-      "ssh_target": "192.168.64.10",
+      "ssh_target": "192.168.65.5",
       "ssh_user": "debian"
     },
     {
@@ -121,11 +121,11 @@
       "exit_capable": false,
       "include_in_all": false,
       "lab_role": "macos_client",
-      "last_known_ip": "192.168.65.101",
+      "last_known_ip": "192.168.64.18",
       "last_known_network": "utm-shared-192.168.65.0/24",
       "live_ips": [
-        "192.168.65.101",
         "192.168.64.18",
+        "192.168.65.101",
         "192.168.65.2",
         "192.168.0.210"
       ],
@@ -137,7 +137,7 @@
       "platform": "macos",
       "relay_capable": false,
       "rustynet_src_dir": "/Users/mac/Rustynet",
-      "ssh_target": "192.168.65.101",
+      "ssh_target": "192.168.64.18",
       "ssh_user": "mac"
     },
     {
