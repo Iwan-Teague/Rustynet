@@ -154,3 +154,5 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - QH-26 marker gate branch: binary run on main exits 0 (loud-silence warning: no marker in the last 200 commits — correct, the eleven predate the window), self-test PASS, 2844 rustynet-cli tests, AGENTS/CLAUDE identical; clippy 1.88 red on `uninlined_format_args` → clippy --fix on the branch, re-gating.
 - LAUNCH: llm CLI `--unrestricted` follow-up (edit-1788322296181-93617-0). Running: QH-01 seam (edit-1788322224485-91126-0).
 - LAB: guests show on ARP (.4/.10/.18 and 192.168.65.101); waiting for sshd.
+- MERGED: QH-26 marker gate (87aa7b6d; hand fix 8ddaea6f inlined format args for clippy 1.88 in bin + tests). Runs green on the merged main. AGENTS/CLAUDE mirror byte-identical.
+- LAB: probe_and_recover found no live IP for the booted guests (discovery listed only Windows11), so nothing was recovered; the three still time out on 22 while answering ARP → next: utmctl guest-agent path for the Debians, wait/ARP for the macOS guest.
