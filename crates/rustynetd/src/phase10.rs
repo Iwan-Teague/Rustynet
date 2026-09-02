@@ -671,6 +671,21 @@ pub trait DataplaneSystem {
         reason: NatConntrackFlushReason,
     ) -> Result<crate::linux_conntrack_flush::ConntrackFlushOutcome, SystemError>;
     fn apply_dns_protection(&mut self) -> Result<(), SystemError>;
+    /// Apply the DNS control for a specific [`DnsPosture`] (M2,
+    /// MacosClientDnsFailclosedDiagnosis_2026-09-02 §6). The default forwards
+    /// to [`DataplaneSystem::apply_dns_protection`], which is the
+    /// FullyProtected behavior: safe to default BECAUSE it forwards to an
+    /// implemented method — unlike `flush_nat_conntrack`, whose deliberate
+    /// no-default guards against a silent no-op, this default can never turn
+    /// an installed control into a skipped one. A platform that only
+    /// implements full protection simply applies full protection for every
+    /// posture, which is fail-closed (over-protecting, never under-).
+    fn apply_dns_protection_for_posture(
+        &mut self,
+        _posture: DnsPosture,
+    ) -> Result<(), SystemError> {
+        self.apply_dns_protection()
+    }
     fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
         Ok(())
     }
@@ -730,11 +745,8 @@ impl NatConntrackFlushReason {
 /// The invariant this type encodes: DNS is EITHER fully protected OR
 /// mesh-scoped-only OR untouched. A half-applied general pin without a live
 /// loopback primary and a pf floor is never a valid posture.
-// Dead-code allowance is scoped to the M1 landing; the M2 apply-site wiring
-// consumes `Untouched` and `as_str` and removes the allowance.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DnsPosture {
+pub enum DnsPosture {
     /// Full fail-closed protection: live loopback resolver as the machine's
     /// primary, every general DNS path pinned to it, a pf DNS-block floor
     /// under the pins, and the scoped `*.rustynet` resolver. Guards
@@ -752,10 +764,7 @@ pub(crate) enum DnsPosture {
 }
 
 impl DnsPosture {
-    // Dead-code allowance is scoped to the M1 landing; the M2 apply-site wiring
-    // consumes this method and removes the allowance.
-    #[allow(dead_code)]
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             DnsPosture::FullyProtected => "fully_protected",
             DnsPosture::ScopedResolverOnly => "scoped_resolver_only",
@@ -771,9 +780,6 @@ impl DnsPosture {
 /// mesh client gets [`DnsPosture::ScopedResolverOnly`]. Never returns
 /// [`DnsPosture::Untouched`]: the untouched variant is reserved for the
 /// `protected_dns=false` opt-out, decided at the apply site, not here.
-// Dead-code allowance is scoped to the M1 landing; the M2 apply-site call
-// consumes this function and removes the allowance.
-#[allow(dead_code)]
 pub(crate) fn macos_dns_posture(exit_mode: ExitMode, serve_exit_node: bool) -> DnsPosture {
     if exit_mode == ExitMode::FullTunnel || serve_exit_node {
         DnsPosture::FullyProtected
@@ -3666,6 +3672,12 @@ pub struct MacosCommandSystem {
     allow_egress_interface: bool,
     ipv6_blocked: bool,
     dns_protected: bool,
+    /// The DNS fail-closed posture this system last INSTALLED (M2). Fresh
+    /// instance: [`DnsPosture::Untouched`] — nothing has been applied yet.
+    /// Drives `assert_dns_protection` branching and posture-transition
+    /// handling (FullyProtected → ScopedResolverOnly must tear the full
+    /// posture down before installing the scoped one).
+    dns_posture: DnsPosture,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
     managed_peer_egress_endpoints: Vec<SocketAddr>,
     blind_exit_pf_config: Option<MacosBlindExitPfConfig>,
@@ -3724,6 +3736,7 @@ impl MacosCommandSystem {
             allow_egress_interface: false,
             ipv6_blocked: false,
             dns_protected: false,
+            dns_posture: DnsPosture::Untouched,
             traversal_bootstrap_allow_endpoints: Vec::new(),
             managed_peer_egress_endpoints: Vec::new(),
             blind_exit_pf_config: None,
@@ -4467,6 +4480,183 @@ impl MacosCommandSystem {
             )),
         }
     }
+
+    /// Verify the daemon's loopback DNS resolver is bound AND answering on
+    /// the scoped-resolver port (127.0.0.1:53535) — BEFORE any DNS mutation
+    /// (review A6, MacosClientDnsFailclosedDiagnosisReview_2026-09-02). The
+    /// daemon binds `dns_resolver_bind_addr` in its run loop before applying
+    /// dataplane generations, but this apply-path probe does not trust that
+    /// ordering: a resolver that is not answering means every pin this apply
+    /// would write points at a dead :53535, and the scoped resolver file
+    /// would route `*.rustynet` nowhere. Fail closed BEFORE mutating.
+    ///
+    /// The probe is a minimal RFC 1035 A query for the mesh zone root
+    /// (`rustynet.`) over loopback UDP; any reply echoing the transaction id
+    /// proves a DNS-speaking listener owns the port.
+    fn verify_loopback_resolver_live(&self) -> Result<(), SystemError> {
+        use std::net::UdpSocket;
+        const PROBE_QUERY: [u8; 26] = [
+            // Header: id "RN", RD flag, QDCOUNT=1, rest zero.
+            0x52, 0x4e, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            // QNAME "rustynet." (length-prefixed labels), QTYPE=A, QCLASS=IN.
+            0x07, b'r', b'u', b's', b't', b'y', b'n', b'e', b't', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let port = crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT;
+        let socket = UdpSocket::bind("127.0.0.1:0").map_err(|err| {
+            SystemError::DnsApplyFailed(format!(
+                "loopback DNS resolver probe socket bind failed: {err}"
+            ))
+        })?;
+        socket
+            .set_read_timeout(Some(Duration::from_millis(2_000)))
+            .map_err(|err| {
+                SystemError::DnsApplyFailed(format!("loopback DNS resolver probe timeout: {err}"))
+            })?;
+        socket.connect(("127.0.0.1", port)).map_err(|err| {
+            SystemError::DnsApplyFailed(format!(
+                "no loopback DNS resolver is listening on 127.0.0.1:{port}: {err}"
+            ))
+        })?;
+        socket.send(&PROBE_QUERY).map_err(|err| {
+            SystemError::DnsApplyFailed(format!(
+                "loopback DNS resolver probe send to 127.0.0.1:{port} failed: {err}"
+            ))
+        })?;
+        let mut reply = [0u8; 512];
+        let len = socket.recv(&mut reply).map_err(|err| {
+            SystemError::DnsApplyFailed(format!(
+                "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
+            ))
+        })?;
+        if len < 12 || reply[0] != PROBE_QUERY[0] || reply[1] != PROBE_QUERY[1] {
+            return Err(SystemError::DnsApplyFailed(format!(
+                "127.0.0.1:{port} answered with a malformed DNS reply ({len} bytes)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Roll the node back to [`DnsPosture::Untouched`] after a failed apply,
+    /// then surface the ORIGINAL apply failure (a rollback failure dominates:
+    /// it means the node may still hold residue AND the apply failed).
+    fn rollback_after_failed_apply(&mut self, original: SystemError) -> SystemError {
+        match self.rollback_dns_protection() {
+            Ok(()) => original,
+            Err(rollback_err) => rollback_err,
+        }
+    }
+
+    /// Install the [`DnsPosture::ScopedResolverOnly`] posture (M2): ONLY the
+    /// scoped `/etc/resolver/rustynet` file, routing `*.rustynet` at the live
+    /// loopback resolver. NO general pins, NO pf floor, NO resolv.conf or
+    /// primary rewrite. Fail-closed end to end:
+    ///
+    /// 1. the resolver must answer (probe FIRST — a scoped file pointing at
+    ///    a dead listener routes mesh names nowhere);
+    /// 2. the system configuration must hold NO loopback general pin — one
+    ///    present means stranded residue from a prior full-protection apply
+    ///    whose teardown did not run. Startup recovery
+    ///    (`run_startup_dns_recovery`, daemon.rs) restores those from the
+    ///    durable backup BEFORE the daemon applies generations, so a pin seen
+    ///    here is residue recovery could not clear and applying over it
+    ///    would strand ALL of the machine's resolution at a listener this
+    ///    posture never justifies;
+    /// 3. the scoped-file write goes through the privileged helper's
+    ///    fixed-path builtin and MUST succeed — there is no pf floor behind
+    ///    this posture, so a silent failure would leak `*.rustynet` queries
+    ///    to the LAN resolver.
+    fn apply_scoped_resolver_only(&mut self) -> Result<(), SystemError> {
+        self.verify_loopback_resolver_live()?;
+        let services = self
+            .enumerate_networksetup_services()
+            .map_err(SystemError::DnsApplyFailed)?;
+        for service in &services {
+            let servers = self
+                .read_networksetup_service_dns(service)
+                .map_err(SystemError::DnsApplyFailed)?;
+            if let Some(servers) = servers {
+                if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
+                    return Err(SystemError::DnsApplyFailed(format!(
+                        "refusing {} posture: service '{service}' still pins loopback DNS (stranded residue; restore the original DNS before scoping)",
+                        DnsPosture::ScopedResolverOnly.as_str()
+                    )));
+                }
+            }
+        }
+        self.run(
+            PrivilegedCommandProgram::DnsFailclosedFile,
+            &[crate::linux_dns_protect::DNS_FILE_SELECTOR_MACOS_RESOLVER_APPLY],
+        )
+        .map_err(|err| {
+            SystemError::DnsApplyFailed(format!(
+                "macOS scoped resolver write failed (no pf floor behind this posture; failing closed): {err}"
+            ))
+        })?;
+        self.dns_posture = DnsPosture::ScopedResolverOnly;
+        self.dns_protected = false;
+        Ok(())
+    }
+
+    /// Assert the [`DnsPosture::ScopedResolverOnly`] posture: the scoped
+    /// resolver file must be PRESENT and readable (fail-closed direct read),
+    /// and no network service may advertise a general loopback pin (a pin
+    /// without the full posture's live primary + pf floor is exactly the
+    /// half-applied drift the three-state model exists to forbid).
+    fn assert_scoped_resolver_posture(&mut self) -> Result<(), SystemError> {
+        let path = crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_PATH;
+        if let Err(err) = std::fs::read_to_string(path) {
+            return Err(SystemError::DnsApplyFailed(format!(
+                "macOS DNS posture drifted ({}/{}): scoped resolver unreadable: {err}",
+                DnsPosture::ScopedResolverOnly.as_str(),
+                crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_PATH
+            )));
+        }
+        let services = self
+            .enumerate_networksetup_services()
+            .map_err(SystemError::DnsApplyFailed)?;
+        for service in &services {
+            let servers = self
+                .read_networksetup_service_dns(service)
+                .map_err(SystemError::DnsApplyFailed)?;
+            if let Some(servers) = servers {
+                if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
+                    return Err(SystemError::DnsApplyFailed(format!(
+                        "macOS DNS posture drifted ({}): service '{service}' advertises loopback DNS pins without the full-protection floor",
+                        DnsPosture::ScopedResolverOnly.as_str()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+    /// Verify the pf DNS-block floor is LIVE in the loaded anchor (not merely
+    /// rendered): query `pfctl -a <anchor> -s rules` and require both block
+    /// rules. Blind-exit applies have verified the anchor live since
+    /// MacosClientDnsFailclosedDiagnosis_2026-09-02 A5 flagged that the
+    /// killswitch branch never did.
+    fn verify_live_pf_dns_floor(&mut self) -> Result<(), SystemError> {
+        let anchor = self.anchor_name.clone().ok_or_else(|| {
+            SystemError::DnsApplyFailed("pf anchor missing after DNS apply".to_owned())
+        })?;
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Pfctl,
+            &["-a", anchor.as_str(), "-s", "rules"],
+        )?;
+        if !output.success() {
+            return Err(SystemError::DnsApplyFailed(format!(
+                "pf DNS floor query failed: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        for proto in ["udp", "tcp"] {
+            if !Self::ruleset_contains_dns_rule(&output.stdout, "block", proto, None) {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "pf DNS-block floor not live after apply ({proto}/53 missing from anchor {anchor})"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl DataplaneSystem for MacosCommandSystem {
@@ -4733,10 +4923,25 @@ impl DataplaneSystem for MacosCommandSystem {
     }
 
     fn apply_dns_protection(&mut self) -> Result<(), SystemError> {
+        // A6 (MacosClientDnsFailclosedDiagnosisReview_2026-09-02): BEFORE any
+        // mutation, the loopback resolver must be bound AND answering. The
+        // daemon binds `dns_resolver_bind_addr` in its run loop before
+        // applying generations, but this apply-path probe does not trust that
+        // ordering — pinning every service at a resolver that is not
+        // answering is the exact stranded state this hardening exists to
+        // forbid.
+        self.verify_loopback_resolver_live()?;
         self.dns_protected = true;
         if let Err(err) = self.apply_pf_rules(false) {
             self.dns_protected = false;
             return Err(SystemError::DnsApplyFailed(err.to_string()));
+        }
+        // A5: the pf load is not enough — VERIFY the DNS-block floor is LIVE
+        // in the anchor's ruleset before mutating the system configuration.
+        // Without this, a helper that loads a partial anchor leaves the pin
+        // loop installing pins under a floor that does not exist.
+        if let Err(err) = self.verify_live_pf_dns_floor() {
+            return Err(self.rollback_after_failed_apply(err));
         }
         // M1 (owner-approved; MacosDnsFailclosedEnforcementGap_2026-08-28 §4):
         // enforce fail-closed DNS at the system-configuration layer. pf alone
@@ -4747,17 +4952,16 @@ impl DataplaneSystem for MacosCommandSystem {
         // advertised posture match the enforced posture (the QH-39
         // macos-dns-failclosed verifier passes).
         //
-        // Fail-closed: enumeration, per-service backup capture, the backup
-        // write, and every per-service set are mandatory. Any failure aborts
-        // the apply. Note dns_protected intentionally stays TRUE on a
-        // system-configuration failure: the pf DNS-block rules above are
-        // installed, and reverting dns_protected would make the next reconcile
-        // re-render pf WITHOUT the DNS-block rules (killswitch_spec reads
-        // dns_protected), dropping protection entirely. This apply path
-        // asserts the posture once, at apply time. Drift that appears LATER
-        // on an otherwise-healthy node is surfaced by the daemon's periodic
-        // DNS posture re-assert (S1, MacosDnsFailclosedS1S4FixDesign_2026-08-31
-        // §2.2, 30 s cadence), which schedules exactly one re-apply through
+        // Fail-closed AND all-or-nothing (M2): enumeration, per-service backup
+        // capture, the backup write, every per-service set, the resolv.conf
+        // write, and the scoped-resolver write are mandatory. ANY failure after
+        // the first mutation rolls the node back through
+        // `rollback_dns_protection` so it ends UNTOUCHED — a half-applied
+        // posture (pins without a live primary, or pins without the floor) is
+        // never left behind. Drift that appears LATER on an otherwise-healthy
+        // node is surfaced by the daemon's periodic DNS posture re-assert
+        // (S1, MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.2, 30 s cadence),
+        // which schedules exactly one re-apply through
         // `dns_posture_reassert_pending`; a re-apply that fails escalates
         // through the standard apply-failure restriction ladder.
         let services = self
@@ -4816,33 +5020,37 @@ impl DataplaneSystem for MacosCommandSystem {
                 .map_err(SystemError::DnsApplyFailed)?;
             let output = self.run_capture(PrivilegedCommandProgram::NetworkSetup, &argv)?;
             if !output.success() {
-                return Err(SystemError::DnsApplyFailed(format!(
+                // M2: a failed pin no longer strands a floor-only node — roll
+                // the whole posture back so the node ends untouched.
+                let original = SystemError::DnsApplyFailed(format!(
                     "networksetup -setdnsservers '{service}' 127.0.0.1 failed: status={} stderr={}",
                     output.status, output.stderr
-                )));
+                ));
+                return Err(self.rollback_after_failed_apply(original));
             }
         }
         // Option-2 parity with Linux: point /etc/resolv.conf at the loopback
-        // resolver (backing up the original) so the macos-dns-failclosed verifier
-        // passes — every resolv.conf nameserver becomes loopback. The pf rules
-        // above are the defense-in-depth egress block; this owns resolv.conf. The
-        // write goes through the privileged helper's fixed-path/fixed-content
-        // builtin (macOS /etc is writable, so it uses the atomic temp+rename).
+        // resolver (backing up the original) so the macos-dns-failclosed
+        // verifier passes — every resolv.conf nameserver becomes loopback. The
+        // pf rules above are the defense-in-depth egress block; this owns
+        // resolv.conf. The write goes through the privileged helper's
+        // fixed-path/fixed-content builtin (macOS /etc is writable, so it uses
+        // the atomic temp+rename).
         //
-        // The resolv.conf write is best-effort on macOS: macOS manages this file
-        // via system-configuration and the atomic overwrite may fail or be
-        // reverted. The killswitch pf anchor with DNS-block rules (applied above)
-        // remains the primary fail-closed enforcement. Reverting dns_protected
-        // when the file write fails would cause the next reconcile tick to
-        // re-render pf rules WITHOUT DNS-block rules (since killswitch_spec()
-        // reads dns_protected=false), losing DNS protection altogether.
+        // M2: this write is now FAIL-CLOSED, not best-effort. The prior
+        // best-effort stance predates the all-or-nothing posture model: a
+        // silently-missing resolv.conf entry is verifier-visible drift and a
+        // leak path for non-scoped resolution hints. A failure rolls the node
+        // back to untouched; the M3 pin latch (has_live_loopback_dns_pins in
+        // killswitch_spec) keeps the pf floor rendered over any residue a
+        // partial failure could not clear.
         if let Err(err) = self.run(
             PrivilegedCommandProgram::DnsFailclosedFile,
             &[crate::linux_dns_protect::DNS_FILE_SELECTOR_RESOLV_APPLY],
         ) {
-            log::warn!(
-                "macOS resolv.conf write failed (best-effort; pf DNS-block rules remain active): {err}"
-            );
+            let original =
+                SystemError::DnsApplyFailed(format!("macOS resolv.conf write failed: {err}"));
+            return Err(self.rollback_after_failed_apply(original));
         }
         // Write the macOS scoped resolver (/etc/resolver/rustynet → loopback
         // resolver:53535) so the OS resolver (mDNSResponder / dscacheutil /
@@ -4851,70 +5059,105 @@ impl DataplaneSystem for MacosCommandSystem {
         // path — `/etc/resolver/<domain>` is the mechanism the OS honors, and,
         // because the daemon runs unprivileged (cannot bind :53) and macOS
         // installs no `:53`→resolver redirect, it is the ONLY route from the OS
-        // resolver to the resolver's :53535 bind. Best-effort like the
-        // resolv.conf write: the pf LAN-DNS block remains the fail-closed
-        // enforcement, so a write failure must NOT revert dns_protected (which
-        // would drop the egress block on the next reconcile). Scoped to the
-        // `rustynet` domain only — no other domain's resolution changes.
+        // resolver to the resolver's :53535 bind. Scoped to the `rustynet`
+        // domain only — no other domain's resolution changes.
+        //
+        // M2: FAIL-CLOSED like every other step — the full posture without a
+        // working scoped route means mesh names leak to the LAN resolver.
         if let Err(err) = self.run(
             PrivilegedCommandProgram::DnsFailclosedFile,
             &[crate::linux_dns_protect::DNS_FILE_SELECTOR_MACOS_RESOLVER_APPLY],
         ) {
-            log::warn!(
-                "macOS scoped resolver write failed (best-effort; mesh DNS OS-path unavailable): {err}"
-            );
+            let original =
+                SystemError::DnsApplyFailed(format!("macOS scoped resolver write failed: {err}"));
+            return Err(self.rollback_after_failed_apply(original));
         }
+        self.dns_posture = DnsPosture::FullyProtected;
         Ok(())
     }
 
+    /// M2 posture dispatch: macOS is the only platform that distinguishes
+    /// all three postures. `Untouched` is a no-op (the caller opted out via
+    /// `protected_dns=false`); `ScopedResolverOnly` installs only the scoped
+    /// resolver; `FullyProtected` is the full hardened sequence. A node
+    /// DOWNGRADING from full protection must tear it down first — the
+    /// rollback restores every service's original DNS and drops the pf
+    /// floor — otherwise the machine keeps advertising loopback pins with
+    /// no live primary behind the scoped posture.
+    fn apply_dns_protection_for_posture(&mut self, posture: DnsPosture) -> Result<(), SystemError> {
+        match posture {
+            DnsPosture::Untouched => Ok(()),
+            DnsPosture::ScopedResolverOnly => {
+                if self.dns_posture == DnsPosture::FullyProtected {
+                    self.rollback_dns_protection()?;
+                }
+                self.apply_scoped_resolver_only()
+            }
+            DnsPosture::FullyProtected => self.apply_dns_protection(),
+        }
+    }
+
     fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
-        if !self.dns_protected {
-            return Err(SystemError::DnsApplyFailed(
+        match self.dns_posture {
+            // Nothing was applied; asserting anything else would be a lie.
+            // The `dns_protected` gate below remains the secondary guard for
+            // the full posture (a system that cannot observe must never
+            // claim — CLAUDE.md trait doc).
+            DnsPosture::Untouched => Err(SystemError::DnsApplyFailed(
                 "macOS DNS protection is not active".to_owned(),
-            ));
-        }
-        let rules = self.render_pf_rules(false)?;
-        for proto in ["udp", "tcp"] {
-            if !Self::ruleset_contains_dns_rule(
-                &rules,
-                "pass",
-                proto,
-                Some(self.interface_name.as_str()),
-            ) || !Self::ruleset_contains_dns_rule(&rules, "block", proto, None)
-            {
-                return Err(SystemError::DnsApplyFailed(format!(
-                    "macOS DNS protection missing {proto}/53 tunnel-pass or egress-block rule"
-                )));
+            )),
+            DnsPosture::ScopedResolverOnly => self.assert_scoped_resolver_posture(),
+            DnsPosture::FullyProtected => {
+                if !self.dns_protected {
+                    return Err(SystemError::DnsApplyFailed(
+                        "macOS DNS protection is not active".to_owned(),
+                    ));
+                }
+                let rules = self.render_pf_rules(false)?;
+                for proto in ["udp", "tcp"] {
+                    if !Self::ruleset_contains_dns_rule(
+                        &rules,
+                        "pass",
+                        proto,
+                        Some(self.interface_name.as_str()),
+                    ) || !Self::ruleset_contains_dns_rule(&rules, "block", proto, None)
+                    {
+                        return Err(SystemError::DnsApplyFailed(format!(
+                            "macOS DNS protection missing {proto}/53 tunnel-pass or egress-block rule"
+                        )));
+                    }
+                }
+                // M1 system-configuration assertion: every enabled network service
+                // must still advertise ONLY the loopback resolver. Drift here is
+                // exactly the leak the pf anchor cannot see (mDNSResponder resolving
+                // through LAN DNS), so failing this assert drives the reconcile loop
+                // to re-apply protection.
+                let services = self
+                    .enumerate_networksetup_services()
+                    .map_err(SystemError::DnsApplyFailed)?;
+                for service in &services {
+                    let servers = self
+                        .read_networksetup_service_dns(service)
+                        .map_err(SystemError::DnsApplyFailed)?;
+                    let Some(servers) = servers else {
+                        return Err(SystemError::DnsApplyFailed(format!(
+                            "macOS DNS protection drifted: service '{service}' no longer pins any DNS server (expected 127.0.0.1)"
+                        )));
+                    };
+                    if !crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
+                        return Err(SystemError::DnsApplyFailed(format!(
+                            "macOS DNS protection drifted: service '{service}' advertises non-loopback DNS servers {servers:?}"
+                        )));
+                    }
+                }
+                Ok(())
             }
         }
-        // M1 system-configuration assertion: every enabled network service
-        // must still advertise ONLY the loopback resolver. Drift here is
-        // exactly the leak the pf anchor cannot see (mDNSResponder resolving
-        // through LAN DNS), so failing this assert drives the reconcile loop
-        // to re-apply protection.
-        let services = self
-            .enumerate_networksetup_services()
-            .map_err(SystemError::DnsApplyFailed)?;
-        for service in &services {
-            let servers = self
-                .read_networksetup_service_dns(service)
-                .map_err(SystemError::DnsApplyFailed)?;
-            let Some(servers) = servers else {
-                return Err(SystemError::DnsApplyFailed(format!(
-                    "macOS DNS protection drifted: service '{service}' no longer pins any DNS server (expected 127.0.0.1)"
-                )));
-            };
-            if !crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
-                return Err(SystemError::DnsApplyFailed(format!(
-                    "macOS DNS protection drifted: service '{service}' advertises non-loopback DNS servers {servers:?}"
-                )));
-            }
-        }
-        Ok(())
     }
 
     fn rollback_dns_protection(&mut self) -> Result<(), SystemError> {
         self.dns_protected = false;
+        self.dns_posture = DnsPosture::Untouched;
         // M1 teardown ordering (CLAUDE.md §10.7): restore every service's
         // backed-up system-configuration DNS BEFORE the pf anchor reload below
         // drops the DNS-block rules. The reverse order leaves a window where
@@ -6390,6 +6633,19 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    // Explicit dispatch, NOT the trait default: the default would forward to
+    // `RuntimeSystem::apply_dns_protection` and SILENTLY DROP the posture on
+    // every platform — the exact arm-by-arm hazard `flush_nat_conntrack`
+    // documents. macOS must see the posture to scope its apply.
+    fn apply_dns_protection_for_posture(&mut self, posture: DnsPosture) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.apply_dns_protection_for_posture(posture),
+            RuntimeSystem::Linux(system) => system.apply_dns_protection_for_posture(posture),
+            RuntimeSystem::Macos(system) => system.apply_dns_protection_for_posture(posture),
+            RuntimeSystem::Windows(system) => system.apply_dns_protection_for_posture(posture),
+        }
+    }
+
     fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.assert_dns_protection(),
@@ -6976,7 +7232,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
         }
 
         if options.protected_dns {
-            self.system.apply_dns_protection()?;
+            // M2: the posture is DECIDED from the generation's exit posture
+            // (never inferred from observed state), then applied for that
+            // posture. Exit-serving / full-tunnel nodes get the full
+            // fail-closed sequence; plain mesh clients get scoped-only.
+            let posture = macos_dns_posture(options.exit_mode, options.serve_exit_node);
+            self.system.apply_dns_protection_for_posture(posture)?;
             applied_stages.push(StageMarker::DnsApplied);
             self.system.assert_dns_protection()?;
         }
@@ -17107,6 +17368,43 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_untouched_posture_apply_is_a_no_op() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        assert_eq!(system.dns_posture, DnsPosture::Untouched);
+        DataplaneSystem::apply_dns_protection_for_posture(&mut system, DnsPosture::Untouched)
+            .expect("the untouched posture is an explicit opt-out and must not fail");
+        assert_eq!(system.dns_posture, DnsPosture::Untouched);
+        assert!(!system.dns_protected);
+        let err = DataplaneSystem::assert_dns_protection(&mut system)
+            .expect_err("nothing was applied; the assert must fail closed");
+        assert!(err.to_string().contains("DNS protection is not active"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_scoped_posture_fails_closed_without_live_resolver() {
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        // No daemon is bound on 127.0.0.1:53535 in the test process, so the
+        // apply-time probe must fail BEFORE any mutation (review A6): the
+        // scoped resolver file must not be written to point at a dead
+        // listener, and the posture must stay untouched.
+        let err = DataplaneSystem::apply_dns_protection_for_posture(
+            &mut system,
+            DnsPosture::ScopedResolverOnly,
+        )
+        .expect_err("scoped posture without a live loopback resolver must fail closed");
+        assert!(
+            err.to_string().contains("127.0.0.1:53535"),
+            "the error must name the unanswerable resolver endpoint: {err}"
+        );
+        assert_eq!(system.dns_posture, DnsPosture::Untouched);
+        assert!(!system.dns_protected);
+    }
+
     // The active-protection half resolves the real networksetup binary by its
     // absolute macOS path; on Linux the file does not exist and on Windows the
     // path is not even absolute, so on both the prerequisite check fails
@@ -17122,6 +17420,9 @@ mod tests {
         assert!(err.to_string().contains("DNS protection is not active"));
 
         system.dns_protected = true;
+        // M2: the assert dispatches on the INSTALLED posture; simulating an
+        // active full-protection posture requires both flags.
+        system.dns_posture = DnsPosture::FullyProtected;
         // The pf half of the assertion is host-independent: the rendered
         // ruleset must contain, for both protocols, the tunnel-scoped :53
         // pass and the interface-agnostic :53 block.
