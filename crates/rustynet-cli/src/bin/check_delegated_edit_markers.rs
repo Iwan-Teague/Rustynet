@@ -159,7 +159,7 @@ fn run_git(dir: &std::path::Path, args: &[&str]) -> Result<String, i32> {
         .current_dir(dir)
         .output()
         .map_err(|e| {
-            eprintln!("error [2]: failed to spawn git {:?}: {}", args, e);
+            eprintln!("error [2]: failed to spawn git {args:?}: {e}");
             2
         })?;
     if !out.status.success() {
@@ -181,7 +181,7 @@ fn scan(
     tip: &str,
     extra_allowlist: &[String],
 ) -> Result<(Vec<CommitRecord>, bool), i32> {
-    let depth_arg = format!("-n{}", depth);
+    let depth_arg = format!("-n{depth}");
     let fmt_arg = "--format=%H%x00%s%x00%B%x1e";
     let output = run_git(dir, &["log", fmt_arg, &depth_arg, tip])?;
     let commits = parse_log(&output);
@@ -247,13 +247,11 @@ fn run() -> Result<(), i32> {
             // clean history or a broken scan (shallow clone, wrong tip,
             // marker text drift) — warn loudly, do not silently pass.
             println!(
-                "WARNING: no delegated-edit marker observed in the last {} commit(s) at {} and no allowlisted SHA inside the window. If this is unexpected, check fetch depth / MARKER_SCAN_TIP / marker text.",
-                depth, tip
+                "WARNING: no delegated-edit marker observed in the last {depth} commit(s) at {tip} and no allowlisted SHA inside the window. If this is unexpected, check fetch depth / MARKER_SCAN_TIP / marker text."
             );
         }
         println!(
-            "check_delegated_edit_markers: PASS (no unallowlisted markers in the last {} commit(s) at {})",
-            depth, tip
+            "check_delegated_edit_markers: PASS (no unallowlisted markers in the last {depth} commit(s) at {tip})"
         );
         return Ok(());
     }
@@ -288,7 +286,7 @@ fn run_git_in(dir: &std::path::Path, args: &[&str]) -> Result<String, String> {
         .env("GIT_COMMITTER_NAME", "Test Committer")
         .env("GIT_COMMITTER_EMAIL", "test@example.com")
         .output()
-        .map_err(|e| format!("git {:?}: {}", args, e))?;
+        .map_err(|e| format!("git {args:?}: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "git {:?}: {}",
@@ -324,7 +322,7 @@ fn self_test() -> Result<(), i32> {
     let base = std::env::temp_dir().join(format!("marker-gate-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).map_err(|e| {
-        eprintln!("error [2]: tempdir: {}", e);
+        eprintln!("error [2]: tempdir: {e}");
         2
     })?;
     let result = self_test_inner(&base);
@@ -334,7 +332,7 @@ fn self_test() -> Result<(), i32> {
 
 fn self_test_inner(base: &std::path::Path) -> Result<(), i32> {
     let (clean, marked) = seed_scratch_repo(base).map_err(|e| {
-        eprintln!("error [2]: scratch repo seed failed: {}", e);
+        eprintln!("error [2]: scratch repo seed failed: {e}");
         2
     })?;
 
@@ -407,19 +405,19 @@ mod tests {
         let full = rec(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "wip",
-            &format!("{}\n{}\n", MARKER_A, MARKER_B),
+            &format!("{MARKER_A}\n{MARKER_B}\n"),
         );
         assert!(is_marked(&full));
         let only_a = rec(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "wip",
-            &format!("{}\n", MARKER_A),
+            &format!("{MARKER_A}\n"),
         );
         assert!(!is_marked(&only_a));
         let only_b = rec(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "wip",
-            &format!("{}\n", MARKER_B),
+            &format!("{MARKER_B}\n"),
         );
         assert!(!is_marked(&only_b));
         assert!(!is_marked(&rec(
@@ -456,9 +454,7 @@ mod tests {
     #[test]
     fn parse_log_splits_records() {
         let fmt_out = format!(
-            "1111{c}subj one{c}body one{r}2222{c}subj two{c}body two{r}",
-            c = FIELD_SEP,
-            r = RECORD_SEP
+            "1111{FIELD_SEP}subj one{FIELD_SEP}body one{RECORD_SEP}2222{FIELD_SEP}subj two{FIELD_SEP}body two{RECORD_SEP}"
         );
         let parsed = parse_log(&fmt_out);
         assert_eq!(parsed.len(), 2);
