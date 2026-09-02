@@ -799,3 +799,36 @@ security rigor before merge, then the live proof.
 — the sink-signature flip (run_remote takes a typed &RemoteCommand so raw &str/format! can't reach
 a sink), migrating the remaining raw sites and DROPPING the pin below 130; collision-free with the
 resolver fix (rustynet-cli adapters vs rustynetd DNS). main 2f7f9919→log, clean, CI green.
+
+## Tick 31 — 2026-09-03 ~23:39Z — main CI regression from the DNS fix ROOT-CAUSED and FIXED
+
+**The three-state DNS fix (345fe219) regressed CI on the Debian + Windows legs.** The three
+commits before this tick all show `Cross Platform CI = failure`. Root cause: `345fe219` added
+`has_live_loopback_dns_pins()` (the M3 pf-floor latch) and wired it into the killswitch_spec via
+`dns_protected: self.dns_protected || self.has_live_loopback_dns_pins()` (phase10.rs:3864). That
+function enumerates macOS `networksetup` services and, on a read error, fail-closed returns `true`
+to keep the DNS floor — correct on macOS. On Linux/Windows there is no `networksetup`, so the
+enumeration ALWAYS errors and the latch ALWAYS returned true, flipping the render's DNS floor on
+even when `dns_protected=false`. So `render_pf_rules(false)` emitted port-53 rules and two
+pure-logic render tests failed on the Debian + Windows legs:
+`macos_render_pf_rules_omits_dns_fail_closed_rules_when_disabled` and
+`macos_render_pf_rules_relay_with_upstream_snapshot`. My local macOS gate passed (no pins in the
+test env → the query returns false), which MASKED the regression. Lesson: a rustynetd change that
+touches a `networksetup`/macOS-command path must be reasoned about for the Linux/Windows legs even
+when the local macOS gate is green.
+
+**Fix (cd24a27c, pushed):** cfg-split `has_live_loopback_dns_pins` so it returns `false` off macOS
+after the `dns_protected` short-circuit — networksetup DNS pins are a macOS-only concept, so no live
+loopback pin can exist elsewhere and the M3 latch must not fire. macOS path byte-identical
+(including the fail-closed "keep the floor on a read error" default). The networksetup helpers stay
+used at other unconditional call sites → no dead-code warning. Verified: all 10
+`macos_render_pf_rules_*` unit tests pass on the pinned 1.88.0 toolchain (incl. the two that were
+red). Non-macOS path is a trivial `false` block; Linux cross-compile-check blocked locally only by a
+missing `x86_64-linux-gnu-gcc` (C toolchain), not by the fix. CI run 33696028311 in progress to
+confirm the Debian/Windows legs go green. Did NOT revert the three-state fix; no control weakened.
+
+**Fleet:** held at 2 vetted GLM jobs this tick (both actively progressing, near the 2M budget with
+milestone commits pending). Resolver ordering fix `edit-1788390672503-35403-0` at ~1.74M billable;
+QH-01 4d-ii `edit-1788390741319-35754-0` at ~1.75M billable. Both will checkpoint their worktrees at
+budget; will review/merge/relaunch-continue next tick rather than launch speculative third work that
+could collide with the DNS render area or the ssh seam.
