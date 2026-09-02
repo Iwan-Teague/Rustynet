@@ -2,6 +2,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::vm_lab::DaemonProbeOp;
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_exit_traffic;
 use crate::vm_lab::orchestrator::adapter::macos_install::{self, MACOS_RUSTYNETD_PATH};
 use crate::vm_lab::orchestrator::adapter::macos_membership;
@@ -18,8 +20,6 @@ use crate::vm_lab::orchestrator::error::{
     ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
-use crate::vm_lab::DaemonProbeOp;
-use crate::vm_lab::VmGuestPlatform;
 
 const VALIDATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 

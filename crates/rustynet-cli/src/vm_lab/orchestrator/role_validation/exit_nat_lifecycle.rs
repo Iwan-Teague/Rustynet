@@ -8,9 +8,9 @@
 //! (`evaluate_linux_exit_nat_lifecycle_artifact` /
 //! `evaluate_macos_exit_nat_lifecycle_artifact`).
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::orchestrator::role_validation::discover_single_generated_nft_table;
-use crate::vm_lab::VmGuestPlatform;
 
 pub fn exit_nat_lifecycle_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)

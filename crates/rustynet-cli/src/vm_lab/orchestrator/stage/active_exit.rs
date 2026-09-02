@@ -321,7 +321,6 @@ mod tests {
     #[test]
     fn macos_two_phase_stage_reports_skip_while_predicate_false() {
         use crate::vm_lab::orchestrator::adapter::macos::MacosNodeAdapter;
-        use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter as _;
         use crate::vm_lab::orchestrator::connection::NodeConnection;
         use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
         use std::io::Write as _;
@@ -381,16 +380,23 @@ mod tests {
 
         match ActiveExitStage.execute(&mut ctx) {
             StageOutcome::Skipped(reason) => {
-                assert!(reason.contains("Macos"), "skip must name the platform: {reason}");
+                assert!(
+                    reason.contains("Macos"),
+                    "skip must name the platform: {reason}"
+                );
             }
-            other => panic!(
-                "predicate-false macOS exit must report-skip, got {other:?}"
-            ),
+            other => panic!("predicate-false macOS exit must report-skip, got {other:?}"),
         }
         let note = std::fs::read_to_string(report_dir.join(REPORTED_SKIP_FILENAME))
             .expect("reported-skip note must be written");
-        assert!(note.contains("macos-utm-1"), "note must name the alias: {note}");
-        assert!(note.contains("Macos"), "note must name the platform: {note}");
+        assert!(
+            note.contains("macos-utm-1"),
+            "note must name the alias: {note}"
+        );
+        assert!(
+            note.contains("Macos"),
+            "note must name the platform: {note}"
+        );
         let _ = std::fs::remove_dir_all(&report_dir);
     }
 
