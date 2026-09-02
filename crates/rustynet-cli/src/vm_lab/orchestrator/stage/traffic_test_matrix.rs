@@ -237,6 +237,7 @@ mod tests {
             substrate_record: None,
             inventory_path: None,
             macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
         };
         // No assignments, no adapters, no mesh IPs → fail
         assert!(matches!(

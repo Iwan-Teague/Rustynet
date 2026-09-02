@@ -276,6 +276,16 @@ pub(crate) fn execute_rust_native_orchestration(
     );
     ctx.macos_anchor_validators_elected = anchor_platform_macos_elected;
 
+    // C6: the macOS live role-transition validator is elected purely from the
+    // run config (mirroring the legacy `is_macos_active_role_transition`
+    // election, which read `role_switch_platform` alone). Like the MAC-D3
+    // flag this is tightened further down, AFTER the plan is built, so the
+    // flag only stays true when the stage really is in this run's plan. A
+    // resumed context reloads `false`, the fail-closed direction.
+    let role_switch_platform_macos_elected =
+        role_switch_platform_macos_elected(config.role_switch_platform.as_deref());
+    ctx.macos_role_transition_elected = role_switch_platform_macos_elected;
+
     // MAC-D3: the macOS anchor validator stages need the inventory path to
     // resolve SSH targets inside the legacy vm_lab helpers they call. Run-local
     // only; a resumed context reloads `None` and the stages fail closed.
@@ -349,6 +359,10 @@ pub(crate) fn execute_rust_native_orchestration(
             // in the plan when a macOS anchor is elected, even under
             // skip_live_suite, so the delegation tightening below stays true.
             anchor_platform_macos_elected,
+            // C6 fast path: keep the macOS live role-transition validator in
+            // the plan when macOS role transition is elected, even under
+            // skip_live_suite, so the tightening below stays true.
+            role_switch_platform_macos_elected,
             enable_chaos_suite,
             enable_negative_control,
             enable_relay_forwarding_validation,
@@ -402,6 +416,14 @@ pub(crate) fn execute_rust_native_orchestration(
         ]
         .iter()
         .all(|id| plan_stage_ids.contains(id));
+
+    // C6: tighten the role-transition election the same way — the flag only
+    // stays true when the macOS live role-transition stage really is in THIS
+    // run's plan. When it was dropped (skip_live_suite / setup-only mode),
+    // the validator would never dispatch, so the stage must grade the run as
+    // a reported skip instead of attempted live evidence. Never silently green.
+    ctx.macos_role_transition_elected = role_switch_platform_macos_elected
+        && plan_stage_ids.contains(&orchestrator::stage::StageId::MacosRoleTransitionValidation);
 
     let reuse_binding: Option<(Vec<orchestrator::stage::StageId>, String)> = if run_only {
         Some((
@@ -933,6 +955,7 @@ fn build_rust_native_orchestration_stages(
     allow_dirty: bool,
     skip_live_suite: bool,
     anchor_platform_macos: bool,
+    role_switch_platform_macos: bool,
     enable_chaos_suite: bool,
     enable_negative_control: bool,
     enable_relay_forwarding_validation: bool,
@@ -947,6 +970,7 @@ fn build_rust_native_orchestration_stages(
         .with_allow_dirty(allow_dirty)
         .with_skip_live_suite(skip_live_suite)
         .with_anchor_platform_macos(anchor_platform_macos)
+        .with_role_switch_platform_macos(role_switch_platform_macos)
         .with_enable_chaos_suite(enable_chaos_suite)
         .with_enable_negative_control(enable_negative_control)
         .with_enable_relay_forwarding_validation(enable_relay_forwarding_validation)
@@ -1042,6 +1066,15 @@ fn anchor_platform_macos_elected(
     })
 }
 
+/// C6: election for the macOS live role-transition validator. Mirrors the
+/// legacy `is_macos_active_role_transition` gate (vm_lab/mod.rs), which read
+/// the run config's `role_switch_platform` alone — the flip target is the
+/// single macOS guest, so unlike the MAC-D3 anchor election there is no
+/// role-assignment disjunct.
+fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> bool {
+    role_switch_platform == Some("macos")
+}
+
 fn filter_rust_native_stages_for_mode(
     mut stages: Vec<Box<dyn orchestrator::stage::OrchestrationStage>>,
     setup_only: bool,
@@ -1076,6 +1109,7 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
         false,
         false,
         false,
+        false,
         orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         1,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1094,6 +1128,7 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
         build_rust_native_orchestration_stages(
             None,
             orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+            false,
             false,
             false,
             false,

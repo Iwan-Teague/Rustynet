@@ -11008,14 +11008,6 @@ fn run_macos_orchestration_stages(
         .as_deref()
         .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
 
-    // The macOS node is elected for the live role-transition proof when
-    // `--role-switch-platform macos` is set. Drives a real LocalOnly
-    // admin<->client flip; runs ONLY when elected, otherwise Skips.
-    let is_macos_active_role_transition = config
-        .role_switch_platform
-        .as_deref()
-        .is_some_and(|platform| platform.eq_ignore_ascii_case("macos"));
-
     // The macOS node is the elected blind_exit when `--blind-exit-platform
     // macos` is set. The blind_exit live stage drives the IRREVERSIBLE
     // `* -> blind_exit` transition and asserts the `pf` blind_exit anchor +
@@ -12647,71 +12639,6 @@ fn run_macos_orchestration_stages(
         }
     };
     outcomes.push(macos_admin_outcome);
-
-    // ── Stage: validate_macos_role_transition ─────────────────────────────
-    //
-    // Prove the macOS node can transition roles LIVE (the previously
-    // "stage unbuilt" cross-OS role-transitions cell,
-    // `CrossOsRoleSwitchPlan_2026-06-24.md`): drive a real
-    // `TransitionKind::LocalOnly` admin<->client flip via the actual
-    // `rustynet role set <to>` CLI (never a second apply path), perform the
-    // macOS-only launchd reload the CLI does not do itself, assert the
-    // daemon reports the new role post-restart, run `state refresh` (the one
-    // verified apply path), and assert mesh connectivity survived the flip.
-    // Runs only when elected (--role-switch-platform macos); else Skips.
-    // FAIL-LOUD: the live result is the stage status.
-    let macos_role_transition_log_path = logs_dir.join("validate_macos_role_transition.log");
-    let macos_role_transition_outcome = if dry_run {
-        stage_outcome(
-            "validate_macos_role_transition",
-            VmLabStageStatus::Skipped,
-            format!("dry-run: would drive a live admin<->client role transition on {macos_alias}"),
-            vec![],
-        )
-    } else if !is_macos_active_role_transition {
-        stage_outcome(
-            "validate_macos_role_transition",
-            VmLabStageStatus::Skipped,
-            format!(
-                "skipped: {macos_alias} is not elected for role transition (role_switch_platform != macos)"
-            ),
-            vec![],
-        )
-    } else if !mesh_join_passed {
-        stage_outcome(
-            "validate_macos_role_transition",
-            VmLabStageStatus::Skipped,
-            format!("skipped: validate_macos_mesh_join did not pass for {macos_alias}"),
-            vec![],
-        )
-    } else {
-        match exercise_macos_role_transition_live(
-            macos_alias,
-            inventory_path,
-            ssh_identity_file,
-            known_hosts_path,
-        ) {
-            Ok(summary) => {
-                let _ = std::fs::write(&macos_role_transition_log_path, summary.as_str());
-                stage_outcome(
-                    "validate_macos_role_transition",
-                    VmLabStageStatus::Pass,
-                    summary,
-                    vec![macos_role_transition_log_path.clone()],
-                )
-            }
-            Err(reason) => {
-                let _ = std::fs::write(&macos_role_transition_log_path, reason.as_str());
-                stage_outcome(
-                    "validate_macos_role_transition",
-                    VmLabStageStatus::Fail,
-                    format!("macOS live role transition failed for {macos_alias}: {reason}"),
-                    vec![macos_role_transition_log_path.clone()],
-                )
-            }
-        }
-    };
-    outcomes.push(macos_role_transition_outcome);
 
     // ── Stage: validate_macos_blind_exit (LAST — wipes node identity) ─────
     //
@@ -14819,8 +14746,7 @@ fn exercise_macos_admin_issue_live(
 /// is a Fail, not a silent Skip. SignedMembership-kind transitions
 /// (capability changes) need the admin cell's issue/ingest wiring and are a
 /// separate increment.
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
-fn exercise_macos_role_transition_live(
+pub fn exercise_macos_role_transition_live(
     macos_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
@@ -14937,7 +14863,6 @@ fn exercise_macos_role_transition_live(
 /// dropped) around a role transition rather than enforcing an absolute
 /// floor — a fast (`--skip-linux-live-suite`) run legitimately has zero live
 /// peers throughout, since no traffic-generating stage ever ran a handshake.
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 fn macos_mesh_peer_count(
     macos_alias: &str,
     inventory_path: &Path,

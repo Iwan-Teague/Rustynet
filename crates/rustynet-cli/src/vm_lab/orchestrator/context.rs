@@ -226,6 +226,14 @@ pub struct OrchestrationContext {
     /// (this run) from one whose runtime has no evidence path (reported
     /// skip; MAC-D1).
     pub macos_anchor_validators_elected: bool,
+    /// Run-local election flag for the C6 macOS live role-transition
+    /// validator (`validate_macos_role_transition`): true only when the run
+    /// elected `--role-switch-platform macos` AND the stage is really in
+    /// this run's plan (tightened in native.rs after the plan is built).
+    /// `false`, which grades the macOS role-transition cell as a reported
+    /// skip — the fail-closed direction (a resumed context reloads `false`;
+    /// the flag is re-derived from the selector on every run).
+    pub macos_role_transition_elected: bool,
     /// Absolute path of the resolved inventory this run started from,
     /// threaded so runtime stages can self-serve inventory lookups
     /// (e.g. the macOS anchor validator set re-reading per-node lab
@@ -259,6 +267,7 @@ impl OrchestrationContext {
             substrate: None,
             substrate_record: None,
             macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
             inventory_path: None,
         }
     }
@@ -386,6 +395,11 @@ impl OrchestrationContext {
             // runtime grades as a reported skip until the run is re-derived
             // from the `--anchor-platform macos` selector).
             macos_anchor_validators_elected: false,
+            // Same run-local rule for the role-transition election: never
+            // persisted, so a resumed context reloads `false` and the C6
+            // stage grades as a reported skip until the run is re-derived
+            // from the `--role-switch-platform macos` selector.
+            macos_role_transition_elected: false,
             // Same run-local rule: the absolute inventory path is never
             // persisted; macOS anchor stages fail closed on `None`.
             inventory_path: None,
