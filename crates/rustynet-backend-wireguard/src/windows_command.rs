@@ -1079,6 +1079,20 @@ mod tests {
         }
     }
 
+    /// True when a `0o555` directory actually rejects writes for this
+    /// process. Root (the Debian CI container) is exempt from mode bits, so
+    /// the read-only-directory tests must skip there instead of failing.
+    fn directory_mode_bits_are_enforced(read_only_dir: &std::path::Path) -> bool {
+        let probe = read_only_dir.join(".mode-bits-probe");
+        match fs::write(&probe, b"") {
+            Ok(()) => {
+                let _ = fs::remove_file(&probe);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+
     fn sample_peer(name: &str) -> PeerConfig {
         PeerConfig {
             node_id: NodeId::new(name).expect("valid node id"),
@@ -2207,6 +2221,16 @@ mod tests {
         // write inside write_config_atomically while the runtime `wg set`
         // remove succeeds and the map entry is dropped.
         fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+        if !directory_mode_bits_are_enforced(&cfg_dir) {
+            // A root-owned test process (the Debian CI container) writes
+            // through a 0o555 directory, so the staging failure this test
+            // manufactures cannot occur. Skip rather than assert a
+            // precondition the host does not provide.
+            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod rw");
+            eprintln!("skipped: this process bypasses directory mode bits (root)");
+            return;
+        }
         backend
             .remove_peer(&gone_id)
             .expect_err("sync failure must fail the removal");
@@ -2255,6 +2279,16 @@ mod tests {
         backend.configure_peer(peer).expect("configure");
 
         fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+        if !directory_mode_bits_are_enforced(&cfg_dir) {
+            // A root-owned test process (the Debian CI container) writes
+            // through a 0o555 directory, so the staging failure this test
+            // manufactures cannot occur. Skip rather than assert a
+            // precondition the host does not provide.
+            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod rw");
+            eprintln!("skipped: this process bypasses directory mode bits (root)");
+            return;
+        }
         backend
             .remove_peer(&gone_id)
             .expect_err("sync failure must fail the removal");
