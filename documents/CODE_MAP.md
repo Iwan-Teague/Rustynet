@@ -334,6 +334,7 @@ use rustynet_crypto::{PublicKey, SecretKey, NodeKeyPair};
 | A new security verifier | `rustynet-local-security` + per-OS adapter |
 | A new orchestration stage | `crates/rustynet-cli/src/vm_lab/orchestrator/stage/<name>.rs` |
 | A new MCP tool | `crates/rustynet-mcp/src/bin/<server>.rs` |
+| A new CI gate binary/script | `crates/rustynet-cli/src/bin/check_<name>.rs` (auto-discovered, no `[[bin]]` entry needed) + thin wrapper `scripts/ci/` |
 
 ## Key Files For Common Tasks
 

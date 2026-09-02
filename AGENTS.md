@@ -531,6 +531,7 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
 
 ### 12.2 Boundary & Security Gates (run for relevant scopes)
 - Backend leakage: `scripts/ci/check_backend_boundary_leakage.sh` (§10.3).
+- Delegated-edit markers: `scripts/ci/delegated_edit_marker_gate.sh` — fail-closed tripwire: any commit in the scan window carrying the delegated-edit checkpoint marker pair must be on the allowlist (QH-26).
 - Secrets hygiene: `scripts/ci/secrets_hygiene_gates.sh` (§10.6).
 - Supply chain: `cargo audit --deny warnings` and
   `cargo deny check bans licenses sources advisories`.
