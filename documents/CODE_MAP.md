@@ -112,6 +112,7 @@ Note: `rustynet-policy` is a single-file crate (`src/lib.rs`) — there is **no*
 | `MacosPfLoadSpec` | `src/macos_pf_load_spec.rs` | Structured spec for the `macos-pf-load` privileged builtin — daemon sends params, root helper re-renders the `pf` rule text + owns the `pfctl -f` (closes the `pfctl -f` boundary) |
 | `ReconnectPolicy` + `next_reconnect_delay_jittered_ms` | `src/resilience.rs` | Shared backoff primitive (deterministic ceiling + AWS Full Jitter, FIS-0016). Adoption rule: any NEW reconnect loop with inter-attempt delays MUST use the jittered fn; existing spec-timed ladders / condition-polls / local-race retries stay independent per the FIS-0016 classification |
 | `PathMtuDiscovery` + `PathMtuConfig` | `src/path_mtu.rs` | FIS-0027 Phase 1: pure RFC 8899 DPLPMTUD per-path MTU search machine (no I/O, no clocks; Base → Searching → SearchComplete, blackhole → Base). PTB is advisory-only (can never raise or override a confirmed value); unconfirmed ⇒ 1280 floor. Probe carriage (Phase 3) and dynamic apply (Phase 4) not yet wired. Static bring-up MTU (`SAFE_BRINGUP_TUNNEL_MTU`, 1420) is set by the `rustynet-backend-wireguard` per-OS command adapters (Phase 2) |
+| `AnchorTlsIdentity` + `AnchorCertResolver` | `src/anchor_tls.rs` | QH-26: anchor control-plane TLS 1.3 identity — self-signed identity generation/reload with POSIX-mode custody (fails closed off-Unix), rustls server config without `tls12`; test-only `PinnedFingerprintVerifier` |
 
 ### Service-Hosting Roles (`rustynet-nas`, `rustynet-llm-gateway`)
 

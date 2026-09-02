@@ -10249,6 +10249,16 @@ mod tests {
         (commands, stop, handle)
     }
 
+    /// Provenance (QH-26): this negative formerly exercised `tls13_valid:
+    /// false`. That field was retired as security theatre per DA-01
+    /// (`DocCodeDiscrepancyAudit_2026-07-18.md`) in commit `f1ef83b1` — an
+    /// unreviewed delegated-edit checkpoint; see
+    /// `Qh26HonestRetirementPlan_2026-09-02.md`. The assertion now covers
+    /// `signed_control_valid`, the sole remaining local attestation flag:
+    /// it is producer-signed, pinned-key-verified and replay-protected (see
+    /// the `verify_signed_trust_state_artifact` chain in `daemon.rs`) and is
+    /// an attestation of the producer's control plane, not an independent
+    /// measurement.
     #[test]
     fn transition_to_fail_closed_when_trust_is_invalid() {
         let policy = allow_shared_exit_policy();
