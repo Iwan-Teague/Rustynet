@@ -545,3 +545,33 @@ touches the rustynetd schema, so plan→review→impl per §1). CI green through
 **PRIMARY THREAD now unblocked:** Gap A landed, so the enforce restart will deterministically issue
 a refresh. Rebuilding the vm-lab CLI, then re-running the rank-1 harvest on the (now-stable) network
 with the guest sampler capturing the macOS enforce→validate window to DIAGNOSE the DnsFailclosed.
+
+## Tick 23 — 2026-09-02 ~21:23–21:55Z — macOS DnsFailclosed DIAGNOSED
+
+**The rank-1 harvest (`labrun-1788379406334-39222-0`, on the Gap A tree) reached
+validate_baseline_runtime and the macOS client STILL failed DnsFailclosed — Gap A did NOT close
+it.** The enforce refresh landed and fired (`signed state refresh completed (reason=command)` in
+the daemon log), so the failure is a REAL product defect, not the lab-side window.
+
+**Root cause, from the 2 s guest sampler over the whole run (656 samples) + the daemon log:** the
+daemon bootstrapped and refreshed with NO error (no `dataplane bootstrap apply failed` restrict);
+the networksetup loopback pin WAS applied (Ethernet DNS = 127.0.0.1 in 33 samples) and the daemon
+ran under launchd (pid in 38 samples) — but the pf `com.rustynet` DNS-block anchor was NEVER
+populated (`pf-rules 0` in ALL 656 samples) and the scutil PRIMARY resolver was NEVER loopback (0
+samples). The macos-dns-failclosed verifier requires `loopback_resolver_advertised` (scutil
+primary) AND the per-service pin AND a pf DNS-block anchor; it correctly rejects an INCONSISTENT
+posture — a plain mesh client (ExitMode::Off) pinned DNS to loopback with no loopback resolver as
+primary and no pf DNS-block rules. The fix is a diagnose-first product change (design → review →
+code); the verifier must NOT be weakened. Remedy recorded honestly against the real stub
+`livelab-1788380014-0e0c5b198748::validate_baseline_runtime`; ledger rows committed (`09834a41`).
+
+**This corrects the tick-20 open question definitively:** the apply does run and pin, but only
+PARTIALLY — the pf DNS-block rules and the loopback-primary-resolver are missing for a client. The
+central spec question the fix must answer: does a plain mesh client REQUIRE protected DNS at all,
+or is protected DNS a full-tunnel/exit property? The fail-closed invariant either way: DNS is
+either fully protected (resolver up as primary + services pinned + pf block) or untouched, never
+half.
+
+**Launched** the grounded diagnosis+design job (`edit-1788380923059-44890-0`, docs) →
+`MacosClientDnsFailclosedDiagnosis_2026-09-02.md` with the full per-condition pass/fail map, the
+spec decision, and the strictest-secure fix. F2 plan still running. Fleet at 2.
