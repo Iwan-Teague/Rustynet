@@ -318,3 +318,37 @@ anchored scanner exposes sites the loose one hid.
 
 **Fleet: 4 running** — reboot-stage review (`…11418-0`), Windows parity PHASE A
 (`…14626-0`), enforce-refresh parity plan (`…24366-0`), S2b/M2 fixes (`…28312-0`).
+
+## Tick 16 — 2026-09-02 ~15:30–16:00Z (after a connection loss)
+
+**What happened.** The client connection dropped after tick 15's re-arm. All four in-flight GLM
+jobs sat idle until the 6-hour overall wall-clock cap (finished 14:50:55Z) and were reported
+TIMED OUT; their serve processes were reaped on the first poll. Outcomes: the reboot-stage
+review (`…11418-0`) and the enforce-refresh plan (`…24366-0`) wrote NOTHING (branch tip = base,
+clean tree; worktrees + branches removed); the S2b/M2 fix job (`…28312-0`) left one partial,
+non-compiling checkpoint in `macos_install.rs` (the `HelperJobPresence` / `HelperRestoreReason`
+tri-state types and the `drive_restart_with_helper_liveness` signature change, call site not
+updated); the Windows PHASE A job (`…14626-0`) finished its doc.
+
+**Merged.** `WindowsNodeParityRootCauseAnalysis_2026-09-02.md` (`b3966a5f`). Merge-gate
+finding: its headline row counts were wrong (fail 4 / pass 10 / skip 169) — re-counted with the
+csv module: 185 Windows rows, 5 runs, **5 fail** (preflight ×2, bootstrap_hosts ×3), **2
+not_proven** (cleanup), **15 pass** (preflight, prepare_source_archive, verify_ssh_reachability,
+cleanup_hosts, cleanup; three each), **163 skip**. The per-stage breakdown and the six failure
+mappings (F1 topology, F2 winget config not staged → fixed `7bb72149`, F3 WinGet Configuration
+never enabled → fixed `03483da6`, F4 OPEN 3602 s clock skew at `preflight.rs:55-64`, F5 arm64
+signtool on x86 → fixed `003d5edc`, F6 cleanup collector `$null.Count` → fixed `45d27d56`) were
+spot-checked against the ledger and the code anchors and hold. Counts corrected on the branch
+before merging. Key conclusion: no Windows row has ever reached a validation stage, so the
+product is unproven, not failed; R1 = land the first `bootstrap_hosts` pass.
+
+**Relaunched (one per response).** Reboot-stage adversarial review → `edit-1788363128441-40424-0`
+(base = the amended branch tip `acb7f5c0`); enforce-refresh parity plan →
+`edit-1788363280049-41969-0` (task now carries the pinned trust-refresh-timer mechanism and
+requires the product-side startup re-apply to be primary); S2b/M2 fixes →
+`edit-1788363401449-43584-0` (base = the checkpoint branch, whose marker commit was first amended
+to a proper Iwan-Teague commit `1a343e32` describing it as partial; the job is told the crate does
+not compile at that tip and must start with `cargo check`). Old worktree of `…28312-0` removed;
+its branch retained as the relaunch base.
+
+**Fleet: 3 running**, fourth launch (C2 unquarantine / C3 pf ports) next.
