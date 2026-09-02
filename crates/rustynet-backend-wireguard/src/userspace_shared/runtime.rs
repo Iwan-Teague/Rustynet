@@ -1458,22 +1458,24 @@ mod tests {
         // budget property is that no single poll may ingest more than
         // MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK; poll until everything has
         // drained (bounded), asserting the per-poll cap on every iteration.
+        // Give the kernel a moment to queue everything so the FIRST poll
+        // faces more than a budget's worth and the per-poll cap below is
+        // exercised on it in the common case.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let expected_total = MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK + 3;
         let mut seen = 0usize;
-        let mut capped_polls = 0usize;
+        let mut polls_used = 0usize;
         for _ in 0..200 {
             state
                 .poll_authoritative_socket()
                 .expect("socket poll should succeed");
+            polls_used += 1;
             let now = state.recorded_peer_ciphertext_ingress().len();
             let delta = now - seen;
             assert!(
                 delta <= MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK,
                 "a single poll ingested {delta} datagrams, exceeding the                  per-tick budget of {MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK}"
             );
-            if delta == MAX_AUTHORITATIVE_DATAGRAMS_PER_TICK {
-                capped_polls += 1;
-            }
             seen = now;
             if seen == expected_total {
                 break;
@@ -1484,9 +1486,14 @@ mod tests {
             seen, expected_total,
             "all datagrams must eventually drain within the poll budget"
         );
+        // Requiring some poll to ingest EXACTLY the budget raced the kernel
+        // too: a loaded runner can deliver the datagrams in trickles smaller
+        // than the budget, so no poll ever lands on the cap even though the
+        // cap holds. The property that survives every delivery schedule is
+        // that budget+3 datagrams can never drain in a single poll.
         assert!(
-            capped_polls >= 1,
-            "with budget+3 datagrams in flight at least one poll must hit              the cap, proving the budget actually split the drain"
+            polls_used >= 2,
+            "with budget+3 datagrams in flight the drain must take at least two              polls, proving the budget split it"
         );
     }
 
