@@ -251,8 +251,7 @@ pub fn render_tandem_dns_redirect_install(input: &TandemDnsRedirectRenderInput) 
     // exempt (the sanctioned tunnel path), mirroring the :53 loop guard.
     for protocol in ["udp", "tcp"] {
         out.push_str(&format!(
-            "        iifname \"{iface}\" {source_match}ip daddr != {service} {protocol} dport {dot} drop\n",
-            dot = TANDEM_DNS_DOT_PORT,
+            "        iifname \"{iface}\" {source_match}ip daddr != {service} {protocol} dport {TANDEM_DNS_DOT_PORT} drop\n",
         ));
     }
     // Known-DoH-endpoint block (owner decision 3, default-on): the pinned,
@@ -264,8 +263,7 @@ pub fn render_tandem_dns_redirect_install(input: &TandemDnsRedirectRenderInput) 
     for ip in KNOWN_DOH_RESOLVER_IPS {
         for protocol in ["tcp", "udp"] {
             out.push_str(&format!(
-                "        iifname \"{iface}\" {source_match}ip daddr {ip} {protocol} dport {doh} drop\n",
-                doh = TANDEM_DNS_DOH_BLOCK_PORT,
+                "        iifname \"{iface}\" {source_match}ip daddr {ip} {protocol} dport {TANDEM_DNS_DOH_BLOCK_PORT} drop\n",
             ));
         }
     }

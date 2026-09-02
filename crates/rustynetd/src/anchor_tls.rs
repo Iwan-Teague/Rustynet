@@ -265,11 +265,8 @@ fn read_tls_file(
             return Err(AnchorTlsError::Io {
                 path: path.to_path_buf(),
                 context: Box::leak(
-                    format!(
-                        "file permissions too open: {:o}; expected {:o}",
-                        mode, expected_mode
-                    )
-                    .into_boxed_str(),
+                    format!("file permissions too open: {mode:o}; expected {expected_mode:o}")
+                        .into_boxed_str(),
                 ),
                 source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permissions"),
             });
