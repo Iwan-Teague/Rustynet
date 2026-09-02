@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
 use std::io::Read;
@@ -113,6 +113,33 @@ pub(crate) struct UserspaceEngine {
     /// answer exactly as a fresh scan would find. Empty sets are removed so
     /// index keys are precisely the endpoints with at least one peer.
     endpoint_index: BTreeMap<SocketAddr, BTreeSet<NodeId>>,
+    /// Reverse index for inbound demux by the canonical WireGuard receiver
+    /// index: local session index (`tunnel_index`) → the peer whose live
+    /// `Tunn` was built with it. Handshake responses, cookie replies, and
+    /// data packets echo `receiver_idx >> 8 == tunnel_index` back, so this
+    /// map routes a reply to the tunnel that initiated the handshake
+    /// regardless of the datagram source address. Maintained in exact
+    /// lockstep with `peer_states` by `configure_peer` / `remove_peer` (the
+    /// only two mutators that touch `tunnel_index`): every live peer's
+    /// `tunnel_index` has exactly one entry and no entry names a peer that
+    /// is not live — a bijection, asserted by
+    /// `verify_receiver_index_consistent` at every mutator boundary in
+    /// debug/test builds and by the mutation fuzz tests.
+    ///
+    /// Stale entries are retired, never reassigned: the allocator
+    /// (`allocate_tunnel_index`) is monotonic and never reuses an index, so
+    /// a retired index resolving to `None` (falling back to the endpoint
+    /// match) is the correct answer forever.
+    receiver_index: HashMap<u32, NodeId>,
+    /// Count of inbound datagrams whose receiver-index entry named a peer
+    /// with no live state. Unreachable while every mutator maintains the
+    /// map in lockstep (`set_tunnel_index` refuses collisions and runs
+    /// before any other mutation), so a nonzero value would indicate
+    /// internal state corruption; the packet path treats it as an index
+    /// miss and falls back to the endpoint match rather than panicking —
+    /// a panic here would tear down the engine's single worker thread and
+    /// every live session with it.
+    receiver_index_divergence_drops: u64,
     path_quality: BTreeMap<NodeId, PeerPathQuality>,
     recorded_peer_ciphertext_ingress: Vec<RecordedPeerCiphertextIngress>,
     recorded_tunnel_plaintext_packets: Vec<RecordedTunnelPlaintextPacket>,
@@ -318,6 +345,8 @@ impl UserspaceEngine {
             next_tunnel_index: 1,
             peer_states: BTreeMap::new(),
             endpoint_index: BTreeMap::new(),
+            receiver_index: HashMap::new(),
+            receiver_index_divergence_drops: 0,
             path_quality: BTreeMap::new(),
             recorded_peer_ciphertext_ingress: Vec::new(),
             recorded_tunnel_plaintext_packets: Vec::new(),
@@ -395,16 +424,33 @@ impl UserspaceEngine {
         );
 
         // All fallible steps are done; from here the peer table and the
-        // endpoint reverse index mutate together so they can never diverge.
-        let previous_endpoint = self
+        // reverse indexes mutate together so they can never diverge.
+        //
+        // Receiver-index write order (the invariant this protects): the
+        // fallible `set_tunnel_index` runs FIRST and before any other
+        // mutation — it refuses (failing the whole call, engine untouched)
+        // if the freshly allocated index already maps to a different peer.
+        // Under the monotonic allocator that refusal is unreachable, so
+        // hitting it would mean internal corruption, not a re-assignable
+        // slot. Only after it succeeds does the old peer's index get
+        // retired, the state replaced, and the endpoint entries relinked.
+        let previous = self
             .peer_states
             .get(&peer.node_id)
-            .map(|existing| existing.endpoint);
-        let disposition = if previous_endpoint.is_some() {
+            .map(|existing| (existing.endpoint, existing.tunnel_index));
+        let disposition = if previous.is_some() {
             ConfigurePeerDisposition::Replaced
         } else {
             ConfigurePeerDisposition::Added
         };
+        self.set_tunnel_index(&peer.node_id, tunnel_index)?;
+        if let Some((_previous_endpoint, previous_tunnel_index)) = &previous {
+            debug_assert_ne!(
+                *previous_tunnel_index, tunnel_index,
+                "allocate_tunnel_index is monotonic and must never hand out a live index"
+            );
+            self.clear_tunnel_index(*previous_tunnel_index);
+        }
         self.peer_states.insert(
             peer.node_id.clone(),
             PeerEngineState {
@@ -415,10 +461,12 @@ impl UserspaceEngine {
                 tunnel_index,
             },
         );
-        if let Some(previous_endpoint) = previous_endpoint {
+        if let Some((previous_endpoint, _)) = previous {
             self.unlink_endpoint(previous_endpoint, &peer.node_id);
         }
         self.link_endpoint(endpoint, peer.node_id.clone());
+        #[cfg(any(test, debug_assertions))]
+        self.verify_receiver_index_consistent();
         Ok(disposition)
     }
 
@@ -554,8 +602,12 @@ impl UserspaceEngine {
 
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) -> bool {
         self.path_quality.remove(node_id);
-        match self.peer_states.remove(node_id) {
+        let removed = match self.peer_states.remove(node_id) {
             Some(removed_state) => {
+                // Retire the peer's receiver-index entry beside its endpoint
+                // entries: a retired index must resolve to nothing forever,
+                // never to whichever peer a naive reuse would pick.
+                self.clear_tunnel_index(removed_state.tunnel_index);
                 // If this peer was the lowest-NodeId holder of a shared
                 // endpoint, dropping it from the per-endpoint set promotes
                 // the next-lowest sharer — the same answer a fresh linear
@@ -564,7 +616,10 @@ impl UserspaceEngine {
                 true
             }
             None => false,
-        }
+        };
+        #[cfg(any(test, debug_assertions))]
+        self.verify_receiver_index_consistent();
+        removed
     }
 
     /// Add `node_id` to the reverse-index entry for `endpoint`.
@@ -601,69 +656,90 @@ impl UserspaceEngine {
         // what lets a non-exit peer's handshake response reach the tunnel that
         // initiated it even before that peer's endpoint is authoritatively pinned.
         //
-        // `receiver_index_match` is unavoidably owned — `find_node_id_by_receiver_index`
-        // does its own linear scan-and-clone and is out of scope for this change (P4
-        // only replaces the endpoint-keyed lookup). The endpoint fallback below is
-        // resolved separately, after the split-borrow, as a `&NodeId` straight out of
-        // `endpoint_index` — no clone on that path.
-        let receiver_index_match = self.find_node_id_by_receiver_index(payload);
+        // The index extraction is a pure parse over the payload; the map lookup
+        // happens after the split borrow below as a `&NodeId` straight out of
+        // `receiver_index` — no clone on the hit path.
+        let tunnel_index = Self::extract_tunnel_index(payload);
 
         // Unbounded-growth guard: `recorded_peer_ciphertext_ingress` is a test-only
         // observability buffer; persisting every datagram in production would let an
         // attacker exhaust memory via a packet flood and would also retain a
         // long-lived plaintext+ciphertext history that the runtime never reads. The
         // match this records is recomputed with its own (test-only, cfg'd-out of
-        // release builds) endpoint lookup + clone; nothing mutates `peer_states` or
-        // `endpoint_index` between here and the production dispatch below, so it is
+        // release builds) lookup + clone; nothing mutates the peer table or either
+        // reverse index between here and the production dispatch below, so it is
         // guaranteed to agree with the production match.
-        #[cfg(test)]
-        {
-            let _ = local_addr;
-            let recorded_match = receiver_index_match
-                .clone()
-                .or_else(|| self.find_node_id_by_endpoint(remote_addr));
-            self.recorded_peer_ciphertext_ingress
-                .push(RecordedPeerCiphertextIngress {
-                    node_id: recorded_match,
-                    local_addr,
-                    remote_addr,
-                    payload: payload.to_vec(),
-                    transport_generation,
-                });
-        }
         #[cfg(not(test))]
         {
             let _ = local_addr;
             let _ = transport_generation;
         }
 
-        // Split-borrow: `peer_states` (mutable) and `endpoint_index` (read-only here)
-        // are disjoint fields of `Self`, so borrowing them independently lets the
-        // endpoint-reverse-index fallback hand back a `&NodeId` that feeds
-        // `peer_states.get_mut` directly, with no clone — the split-borrow this
-        // backlog item asks for.
+        // Split-borrow: `peer_states` (mutable) and the two reverse indexes
+        // (`receiver_index`, `endpoint_index` — read-only here) are disjoint
+        // fields of `Self`, so borrowing them independently lets the dispatch
+        // below hand back a `&NodeId` that feeds `peer_states.get_mut`
+        // directly, with no clone.
         let Self {
             peer_states,
             endpoint_index,
+            receiver_index,
+            receiver_index_divergence_drops,
+            #[cfg(test)]
+            recorded_peer_ciphertext_ingress,
             recorded_tunnel_plaintext_packets,
             decrypt_scratch,
             decrypt_follow_up_scratch,
             ..
         } = self;
 
-        let node_id: &NodeId = match &receiver_index_match {
-            Some(node_id) => node_id,
-            None => {
-                let Some(node_id) = Self::endpoint_index_lookup(endpoint_index, remote_addr) else {
-                    return Ok(None);
-                };
-                node_id
-            }
-        };
+        #[cfg(test)]
+        {
+            let _ = local_addr;
+            let recorded_match = tunnel_index
+                .and_then(|index| Self::receiver_index_lookup(receiver_index, index))
+                .cloned()
+                .or_else(|| Self::endpoint_index_lookup(endpoint_index, remote_addr).cloned());
+            recorded_peer_ciphertext_ingress.push(RecordedPeerCiphertextIngress {
+                node_id: recorded_match,
+                local_addr,
+                remote_addr,
+                payload: payload.to_vec(),
+                transport_generation,
+            });
+        }
 
-        let peer_state = peer_states
-            .get_mut(node_id)
-            .expect("matched peer state should exist");
+        let mapped =
+            tunnel_index.and_then(|index| Self::receiver_index_lookup(receiver_index, index));
+        let node_id: Option<&NodeId> = match mapped {
+            Some(node_id) if peer_states.contains_key(node_id) => Some(node_id),
+            Some(_) => {
+                // The index named a peer whose live state is gone. Unreachable
+                // while every mutator maintains both structures in lockstep —
+                // so it is debug-asserted, counted, and treated as an index
+                // MISS: fall back to the endpoint match instead of dispatching
+                // to, or panicking over, stale state. A panic here would kill
+                // the engine's single worker thread and every live session.
+                debug_assert!(
+                    false,
+                    "receiver_index named a peer with no live state; dropping to endpoint fallback"
+                );
+                *receiver_index_divergence_drops += 1;
+                Self::endpoint_index_lookup(endpoint_index, remote_addr)
+            }
+            None => Self::endpoint_index_lookup(endpoint_index, remote_addr),
+        };
+        let Some(node_id) = node_id else {
+            return Ok(None);
+        };
+        // The dispatch above guarantees `node_id` is live (hit arm checked
+        // `contains_key`; both fallback arms read it out of `endpoint_index`,
+        // which is maintained in lockstep with `peer_states`). The guard form
+        // is kept deliberately: the packet path must never panic, because the
+        // engine's worker thread dies with it.
+        let Some(peer_state) = peer_states.get_mut(node_id) else {
+            return Ok(None);
+        };
         let initial_result =
             peer_state
                 .tunnel
@@ -839,27 +915,117 @@ impl UserspaceEngine {
         Self::endpoint_index_lookup(&self.endpoint_index, remote_addr).cloned()
     }
 
-    /// Canonical WireGuard inbound demux: handshake responses, cookie replies,
-    /// and data packets echo our local session index back in `receiver_idx`
-    /// (`receiver_idx >> 8 == tunnel_index`, mirroring boringtun's own
-    /// `peers_by_idx` dispatch). Resolving the peer by that index — rather than
-    /// by the datagram source address — routes a reply to the tunnel that
-    /// initiated the handshake even before the peer's endpoint is confirmed,
-    /// which is required for tunnels whose endpoint is not authoritatively
-    /// pinned. Handshake inits carry no receiver index and unparsable/foreign
-    /// datagrams return `None`, both of which fall back to the endpoint match.
-    fn find_node_id_by_receiver_index(&self, payload: &[u8]) -> Option<NodeId> {
+    /// Canonical WireGuard inbound demux key: handshake responses, cookie
+    /// replies, and data packets echo our local session index back in
+    /// `receiver_idx` (`receiver_idx >> 8 == tunnel_index`, mirroring
+    /// boringtun's own `peers_by_idx` dispatch). Handshake inits carry no
+    /// receiver index and unparsable/foreign datagrams return `None`, both of
+    /// which fall back to the endpoint match.
+    fn extract_tunnel_index(payload: &[u8]) -> Option<u32> {
         let receiver_idx = match Tunn::parse_incoming_packet(payload).ok()? {
             Packet::HandshakeResponse(packet) => packet.receiver_idx,
             Packet::PacketCookieReply(packet) => packet.receiver_idx,
             Packet::PacketData(packet) => packet.receiver_idx,
             Packet::HandshakeInit(_) => return None,
         };
-        let tunnel_index = receiver_idx >> 8;
-        self.peer_states
-            .iter()
-            .find(|(_node_id, peer_state)| peer_state.tunnel_index == tunnel_index)
-            .map(|(node_id, _peer_state)| node_id.clone())
+        Some(receiver_idx >> 8)
+    }
+
+    /// O(1) map lookup over the split-borrowed `receiver_index` field —
+    /// free function over the bare map (rather than a `&self` method) so
+    /// `process_inbound_ciphertext` can call it while holding a mutable
+    /// borrow of the disjoint `peer_states` field, returning a borrow
+    /// instead of cloning.
+    fn receiver_index_lookup(
+        receiver_index: &HashMap<u32, NodeId>,
+        tunnel_index: u32,
+    ) -> Option<&NodeId> {
+        receiver_index.get(&tunnel_index)
+    }
+
+    /// Record `index` as the live receiver-index demux entry for `node`.
+    /// The ONLY writer of `receiver_index`. Refuses — failing the whole call
+    /// BEFORE any other mutation, leaving the engine untouched — an index
+    /// that already maps to a different live peer: under the monotonic
+    /// allocator that is unreachable, so a hit would mean internal state
+    /// corruption rather than a re-assignable slot. Re-recording the same
+    /// index for the same peer is an idempotent no-op.
+    fn set_tunnel_index(&mut self, node: &NodeId, index: u32) -> Result<(), BackendError> {
+        if let Some(existing) = self.receiver_index.get(&index) {
+            if existing != node {
+                return Err(BackendError::internal(format!(
+                    "tunnel index {index} already maps to another peer; refusing to remap"
+                )));
+            }
+            return Ok(());
+        }
+        self.receiver_index.insert(index, node.clone());
+        Ok(())
+    }
+
+    /// Retire `index` from `receiver_index`. Idempotent: clearing an absent
+    /// index is a no-op, so rebuild/retire paths never panic on stale state.
+    fn clear_tunnel_index(&mut self, index: u32) {
+        self.receiver_index.remove(&index);
+    }
+
+    /// Debug/test invariant: `receiver_index` is exactly the bijection
+    /// {live peer's tunnel_index → that peer}. Called at mutator function
+    /// boundaries only (never between the ordered mutation steps, where the
+    /// invariant is legitimately mid-flight) and after every mutation in the
+    /// random-mutation fuzz test.
+    #[cfg(any(test, debug_assertions))]
+    fn verify_receiver_index_consistent(&self) {
+        assert_eq!(
+            self.receiver_index.len(),
+            self.peer_states.len(),
+            "receiver_index size diverged from peer_states"
+        );
+        for (index, node_id) in &self.receiver_index {
+            let Some(state) = self.peer_states.get(node_id) else {
+                panic!("receiver_index {index} names peer {node_id:?} with no live state");
+            };
+            assert_eq!(
+                state.tunnel_index, *index,
+                "receiver_index entry {index} diverged from live tunnel index of {node_id:?}"
+            );
+        }
+        for (node_id, state) in &self.peer_states {
+            assert_eq!(
+                self.receiver_index.get(&state.tunnel_index),
+                Some(node_id),
+                "live tunnel index {} of {node_id:?} missing or misrouted in receiver_index",
+                state.tunnel_index
+            );
+        }
+    }
+
+    // `pub(crate)` under the same test-harness gates as
+    // `find_node_id_by_endpoint` so tests can probe the receiver-index demux
+    // directly; no wider exposure than that (still unreachable outside this
+    // crate and compiled out of release builds).
+    #[cfg(test)]
+    pub(crate) fn find_node_id_by_receiver_index(&self, payload: &[u8]) -> Option<NodeId> {
+        Self::extract_tunnel_index(payload)
+            .and_then(|tunnel_index| {
+                Self::receiver_index_lookup(&self.receiver_index, tunnel_index)
+            })
+            .cloned()
+    }
+
+    /// Test-only: direct mutable access to the receiver-index map so tests
+    /// can INJECT a divergence (an entry naming a peer with no live state)
+    /// that no public mutator can produce — proving the packet path degrades
+    /// to the endpoint fallback instead of panicking.
+    #[cfg(test)]
+    pub(crate) fn receiver_index_map_for_test(&mut self) -> &mut HashMap<u32, NodeId> {
+        &mut self.receiver_index
+    }
+
+    /// Test-only read of the divergence-drop counter.
+    #[cfg(test)]
+    pub(crate) fn receiver_index_divergence_drops(&self) -> u64 {
+        self.receiver_index_divergence_drops
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1983,6 +2149,393 @@ mod tests {
                     engine.has_endpoint(*addr),
                     expected.is_some(),
                     "step {step}: has_endpoint diverged from linear-scan reference for {addr}"
+                );
+            }
+        }
+    }
+
+    // ---- receiver_index: the canonical demux inverse map ----
+    //
+    // `receiver_index` must answer EXACTLY the live tunnel_index → peer
+    // bijection: a rebuilt peer's OLD index must resolve to nothing (never
+    // to the rebuilt tunnel), a removed peer's index must resolve to
+    // nothing, and dispatch must degrade (never panic) if the map ever
+    // named a peer with no live state.
+
+    #[test]
+    fn stale_receiver_index_after_rebuild_is_not_attributed() {
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let mut engine = fresh_engine(0x61);
+        let node_id = NodeId::new("peer-rebuild").expect("node id");
+        let config = |pubkey: u8| PeerConfig {
+            node_id: NodeId::new("peer-rebuild").expect("node id"),
+            endpoint: SocketEndpoint {
+                addr: "203.0.113.50".parse().expect("ip"),
+                port: 51820,
+            },
+            public_key: [pubkey; 32],
+            allowed_ips: vec!["100.64.50.0/24".to_owned()],
+            persistent_keepalive_secs: None,
+        };
+        let data_packet = |tunnel_index: u32| {
+            let mut pkt = vec![4u8, 0, 0, 0];
+            pkt.extend_from_slice(&(tunnel_index << 8).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 60]);
+            pkt
+        };
+
+        assert_eq!(
+            engine.configure_peer(&config(0x71)).expect("configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+        let stale_index = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer present")
+            .tunnel_index;
+
+        // Changing the key forces the rebuild (Replaced) path: a fresh
+        // tunnel, a fresh index, and the old index RETIRED.
+        assert_eq!(
+            engine.configure_peer(&config(0x72)).expect("rebuild"),
+            super::ConfigurePeerDisposition::Replaced
+        );
+        let live_index = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer present")
+            .tunnel_index;
+        assert_ne!(
+            stale_index, live_index,
+            "a rebuild must mint a fresh tunnel index"
+        );
+
+        // The stale index resolves to NOTHING — never to the rebuilt peer.
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(stale_index)),
+            None,
+            "a retired index must not attribute to the rebuilt peer"
+        );
+        // The live index resolves to the rebuilt peer.
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(live_index)),
+            Some(node_id.clone())
+        );
+
+        // Roaming (EndpointMoved) keeps the SAME index live: only a rebuild
+        // or a removal retires an index.
+        let mut roamed = config(0x72);
+        roamed.endpoint = SocketEndpoint {
+            addr: "203.0.113.51".parse().expect("ip"),
+            port: 51999,
+        };
+        assert_eq!(
+            engine.configure_peer(&roamed).expect("roam"),
+            super::ConfigurePeerDisposition::EndpointMoved
+        );
+        assert_eq!(
+            engine
+                .peer_states
+                .get(&node_id)
+                .expect("peer present")
+                .tunnel_index,
+            live_index,
+            "roaming must not rotate the tunnel index"
+        );
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(live_index)),
+            Some(node_id),
+            "the index must survive the endpoint move"
+        );
+    }
+
+    #[test]
+    fn removed_peer_receiver_index_entry_is_gone() {
+        let mut engine = fresh_engine(0x62);
+        let node_id = configure_peer_at(
+            &mut engine,
+            "peer-removed",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 52)), 51820),
+            0x73,
+            "100.64.52.0/24",
+        );
+        let data_packet = |tunnel_index: u32| {
+            let mut pkt = vec![4u8, 0, 0, 0];
+            pkt.extend_from_slice(&(tunnel_index << 8).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 60]);
+            pkt
+        };
+        let index = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer present")
+            .tunnel_index;
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(index)),
+            Some(node_id.clone())
+        );
+
+        assert!(engine.remove_peer(&node_id));
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(index)),
+            None,
+            "a removed peer's index must resolve to nothing"
+        );
+        assert_eq!(
+            engine.receiver_index_map_for_test().len(),
+            engine.peer_states.len(),
+            "the map stays exactly as long as the live peer set"
+        );
+        assert_eq!(
+            engine.receiver_index_divergence_drops(),
+            0,
+            "lockstep mutation never produces a divergence drop"
+        );
+    }
+
+    #[test]
+    fn duplicate_tunnel_index_collision_refusal_is_a_clean_no_op() {
+        let mut engine = fresh_engine(0x63);
+        let peer_a = configure_peer_at(
+            &mut engine,
+            "peer-a",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 53)), 51820),
+            0x74,
+            "100.64.53.0/24",
+        );
+        let peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 54)), 51820),
+            0x75,
+            "100.64.54.0/24",
+        );
+        let index_a = engine
+            .peer_states
+            .get(&peer_a)
+            .expect("peer a present")
+            .tunnel_index;
+        let index_b = engine
+            .peer_states
+            .get(&peer_b)
+            .expect("peer b present")
+            .tunnel_index;
+        assert_ne!(index_a, index_b);
+        let peers_before = engine.peer_states.len();
+        let map_before = engine.receiver_index_map_for_test().len();
+
+        // Force the collision through the private helper directly — no
+        // public mutator can produce it (the allocator is monotonic), so a
+        // hit here would mean internal corruption.
+        let err = engine
+            .set_tunnel_index(&peer_b, index_a)
+            .expect_err("a live index held by another peer must be refused");
+        assert!(
+            err.to_string().contains("already maps"),
+            "refusal should name the collision: {err}"
+        );
+
+        // Clean no-op: both tables unchanged, existing routing intact.
+        assert_eq!(engine.peer_states.len(), peers_before);
+        assert_eq!(engine.receiver_index_map_for_test().len(), map_before);
+        assert_eq!(
+            engine.receiver_index_map_for_test().get(&index_a),
+            Some(&peer_a),
+            "the refusing write must not have stolen the entry"
+        );
+        let data_packet = |tunnel_index: u32| {
+            let mut pkt = vec![4u8, 0, 0, 0];
+            pkt.extend_from_slice(&(tunnel_index << 8).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 60]);
+            pkt
+        };
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(index_a)),
+            Some(peer_a.clone()),
+            "the existing holder must still resolve"
+        );
+        assert_eq!(
+            engine.find_node_id_by_receiver_index(&data_packet(index_b)),
+            Some(peer_b),
+            "the refused peer must still resolve on its own index"
+        );
+    }
+
+    // Debug builds panic on this divergence BY DESIGN (`debug_assert!` in
+    // the dispatch path); this test exists to prove the RELEASE packet path
+    // degrades to the endpoint fallback instead of panicking, so it only
+    // compiles where debug assertions are off. Run with
+    // `cargo test --release -p rustynet-backend-wireguard` to execute it.
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn receiver_index_dispatch_never_panics_on_divergence() {
+        let mut engine = fresh_engine(0x65);
+        let node_id = configure_peer_at(
+            &mut engine,
+            "peer-live",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 51820),
+            0x76,
+            "100.64.55.0/24",
+        );
+        let index = engine
+            .peer_states
+            .get(&node_id)
+            .expect("peer present")
+            .tunnel_index;
+        let data_packet = |tunnel_index: u32| {
+            let mut pkt = vec![4u8, 0, 0, 0];
+            pkt.extend_from_slice(&(tunnel_index << 8).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 60]);
+            pkt
+        };
+
+        // Inject the divergence no public mutator can produce: an entry
+        // naming a peer with no live state.
+        let ghost = NodeId::new("ghost").expect("node id");
+        engine.receiver_index_map_for_test().insert(index, ghost);
+
+        let foreign_src: SocketAddr = "198.51.100.9:41000".parse().expect("addr");
+        let local: SocketAddr = "10.0.0.1:51820".parse().expect("addr");
+        let mut sink = RecordingSink::default();
+
+        // From a foreign source there is no endpoint fallback either: the
+        // datagram must be dropped cleanly (Ok(None)), never panic.
+        let outcome = engine
+            .process_inbound_ciphertext(foreign_src, local, &data_packet(index), 1, &mut sink)
+            .expect("inbound processing must not error");
+        assert!(outcome.is_none(), "a diverged index resolves to nothing");
+        assert_eq!(
+            engine.receiver_index_divergence_drops(),
+            1,
+            "the drop must be counted"
+        );
+
+        // From the peer's real endpoint the SAME diverged index falls back
+        // to the endpoint match and still routes to the live peer.
+        let peer_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 51820);
+        let outcome = engine
+            .process_inbound_ciphertext(peer_endpoint, local, &data_packet(index), 1, &mut sink)
+            .expect("inbound processing must not error");
+        assert!(
+            outcome.is_none(),
+            "the synthetic datagram decrypts to nothing, but the call must not error or panic"
+        );
+        assert_eq!(
+            engine.receiver_index_divergence_drops(),
+            2,
+            "the second diverged lookup is counted too"
+        );
+        // The fallback that rescued the lookup is the endpoint match: prove
+        // it resolved to the live peer (the routed node itself is not
+        // observable through the return value, which carries only
+        // successfully decrypted output).
+        assert_eq!(
+            engine.find_node_id_by_endpoint(peer_endpoint),
+            Some(node_id),
+            "the endpoint fallback resolves to the live peer"
+        );
+    }
+
+    #[test]
+    fn receiver_index_agrees_with_peer_states_under_random_mutations() {
+        let mut engine = fresh_engine(0x66);
+
+        // Same deterministic xorshift64* PRNG as the endpoint-index fuzz: a
+        // fixed seed keeps a failure exactly reproducible.
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_u64 = || {
+            rng ^= rng >> 12;
+            rng ^= rng << 25;
+            rng ^= rng >> 27;
+            rng.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+
+        let endpoints: Vec<SocketAddr> = (0..6)
+            .map(|i| {
+                SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(203, 0, 113, 200 + i as u8)),
+                    51820 + i as u16,
+                )
+            })
+            .collect();
+        let peer_names: Vec<String> = (0..8).map(|i| format!("rpeer-{i}")).collect();
+
+        // Linear-scan REFERENCE implementation: what the old per-packet scan
+        // answered for a receiver index — the first (lowest-NodeId) live
+        // peer whose tunnel_index equals the probed one.
+        let reference_lookup = |engine: &UserspaceEngine, index: u32| -> Option<NodeId> {
+            engine
+                .peer_states
+                .iter()
+                .find(|(_node_id, state)| state.tunnel_index == index)
+                .map(|(node_id, _state)| node_id.clone())
+        };
+        let data_packet = |tunnel_index: u32| {
+            let mut pkt = vec![4u8, 0, 0, 0];
+            pkt.extend_from_slice(&(tunnel_index << 8).to_le_bytes());
+            pkt.extend_from_slice(&[0u8; 60]);
+            pkt
+        };
+
+        for step in 0..400_u32 {
+            let roll = next_u64() % 3;
+            match roll {
+                0 => {
+                    let name = &peer_names[(next_u64() as usize) % peer_names.len()];
+                    let endpoint = endpoints[(next_u64() as usize) % endpoints.len()];
+                    configure_peer_at(
+                        &mut engine,
+                        name,
+                        endpoint,
+                        (next_u64() as u8) | 0x80,
+                        "100.64.9.0/24",
+                    );
+                }
+                1 => {
+                    let node_ids: Vec<NodeId> = engine.peer_states.keys().cloned().collect();
+                    if let Some(node_id) =
+                        node_ids.get((next_u64() as usize) % node_ids.len().max(1))
+                    {
+                        let node_id = node_id.clone();
+                        let endpoint = endpoints[(next_u64() as usize) % endpoints.len()];
+                        engine
+                            .update_peer_endpoint(
+                                &node_id,
+                                rustynet_backend_api::SocketEndpoint {
+                                    addr: endpoint.ip(),
+                                    port: endpoint.port(),
+                                },
+                            )
+                            .expect("endpoint update succeeds");
+                    }
+                }
+                _ => {
+                    let node_ids: Vec<NodeId> = engine.peer_states.keys().cloned().collect();
+                    if let Some(node_id) =
+                        node_ids.get((next_u64() as usize) % node_ids.len().max(1))
+                    {
+                        let node_id = node_id.clone();
+                        assert!(engine.remove_peer(&node_id));
+                    }
+                }
+            }
+
+            // The bijection must hold after EVERY mutation, and the map must
+            // answer exactly the linear-scan reference for every live index
+            // plus one index that was never minted.
+            engine.verify_receiver_index_consistent();
+            let mut probe_indexes: Vec<u32> = engine
+                .peer_states
+                .values()
+                .map(|state| state.tunnel_index)
+                .collect();
+            probe_indexes.push(engine.next_tunnel_index); // never minted
+            for index in &probe_indexes {
+                let expected = reference_lookup(&engine, *index);
+                assert_eq!(
+                    engine.find_node_id_by_receiver_index(&data_packet(*index)),
+                    expected,
+                    "step {step}: receiver_index lookup diverged from linear-scan reference for index {index}"
                 );
             }
         }
