@@ -4,10 +4,40 @@
 shape of the macOS exit-serving adapter for the Rust `--node` orchestrator (Phase-C
 candidate 13 in `LiveLabStagePassLikelihood_Summary_2026-09-01.md` §2, row 13) and the
 killswitch-precedence fold-in that closes the `macos_pf_killswitch` coverage gap.
+Adversarial review COMPLETE (verdict: READY-WITH-AMENDMENTS); design amended accordingly
+and implementation-ready. Implementation remains owner-gated stage work pending lab
+availability (CP-1).
 
 **Disposition:** docs-only design/review artifact. Every tree claim below was read from
 this worktree with a file:line anchor; items that could not be confirmed from source are
 marked **UNVERIFIED** and repeated in §10 as open questions.
+
+**Adversarial-review amendments folded (2026-09-02)** — amendments A1–A6 from
+`LiveLabMacosExitServingAdapterDesignAdversarialReview_2026-09-02.md` §9 (plus its §8
+anchor corrections) are folded into this document:
+- **A1** — the orchestrator role-mapping remap is added to scope: `role.rs:160` /
+  `:186-189` still map a macOS `Exit` election to the `blind_exit` daemon role (pinned
+  tests `:458-476`, `:508-545`); the remap, its pinned tests, and the `active_exit.rs`
+  comment refresh land with this work, with `phase10.rs:3877` / `:4485`/`:4495-4541` as
+  the enforce-time proof that the regular-exit posture is real (§2, §7, §8).
+- **A2** — the killswitch-precedence check is declared MUTATING (flush/tamper/restore,
+  `macos_exit_killswitch_precedence.rs:3-9`, pfctl write required) and re-sequenced:
+  before `activate_exit_serving`, or in a declared window with a post-check restore
+  snapshot — never mid-serving. Both CLI evaluators are `#[allow(dead_code)]`-quarantined
+  (`mod.rs:20075` / `mod.rs:21266`); unquarantining is in scope (§3, §5, §7).
+- **A3** — Q1 gains the in-tree `pfctl -ss` caution at `adapter/macos_traffic.rs:134-135`
+  and the anchors-enumeration precedent at `:113-115`; global `pfctl -s state` is the
+  reliable-but-broad surface; fail-closed until a captured fixture exists (§3).
+- **A4** — the rollout contract replaces "same change set as the run-matrix row" with the
+  enforceable ordering + equality contract: flip commit lands committed and clean BEFORE
+  the verifying run, and the appended row's `git_commit` must equal the flip commit;
+  pass/fail from the stage artifact (§6).
+- **A5** — stale anchor corrections folded: `windows_traffic.rs` retry/identity anchors
+  re-pinned (`:305-313`, `:318-332`, `:314-328`, doc `:275-299`, assert `:257-273`/`:300`),
+  `active_exit.rs:348` relabeled positive identity test (negative pair `:371`/`:406`),
+  `macos_exit_nat_lifecycle.rs:58` → `:59` (§1, §3).
+- **A6** — the S2 sink must sit on the exit's post-CP-1 egress segment `192.168.64.0/24`;
+  the two-phase fallback is acceptable only WITH pf-state capture (§4).
 
 ## 0. Decisions at a glance
 
@@ -16,7 +46,7 @@ marked **UNVERIFIED** and repeated in §10 as open questions.
 | 1 | Which role does the macOS exit cell prove? | The **regular `exit` role** (daemon-side `macos_exit_nat.rs` pf NAT + IPv4 forwarding). Not `blind_exit`, which is already live-proven on `--node`. |
 | 2 | Adapter surface | macOS implements three `NodeAdapter` exit methods by **asserting the daemon's own lifecycle verifier** (`rustynetd macos-exit-nat-lifecycle-snapshot`) — it never re-derives pf parsing in the CLI and never mutates the product firewall directly. |
 | 3 | Egress proof | Two-phase end-to-end S2 assertion: client burst (Linux client) + pf-state/translation identity on the exit + sink-observed translated source address. Written to `active_exit.egress_evidence.json`; fail-closed evaluation; dry-run can never pass. |
-| 4 | `macos_pf_killswitch` coverage | Restored as a live, StageId-backed check by running the daemon's `macos-exit-killswitch-precedence-check` subcommand and evaluating its artifact inside the exit-serving stage. The dead ledger column name is **not** resurrected. |
+| 4 | `macos_pf_killswitch` coverage | Restored as a live, StageId-backed check by running the daemon's `macos-exit-killswitch-precedence-check` subcommand and evaluating its artifact inside the exit-serving cell — the mutating check runs before activation or in a declared window, never mid-serving (A2, folded). The dead ledger column name is **not** resurrected. |
 | 5 | Rollout | `active_exit_runtime_implemented` stays `false` for `Macos` until the adapter is real **and** a live run passed; the predicate flip is the last commit, per the doc-comment contract. |
 
 ## 1. Grounding
@@ -27,8 +57,10 @@ marked **UNVERIFIED** and repeated in §10 as open questions.
   (`:95-171`); predicate `active_exit_runtime_implemented` admits only `Linux | Windows`
   (`:184-186`); comment `:177-183` records the macOS-exit→blind_exit mapping; doc-comment
   `:191-201` states promotion follows a live macOS run, never precedes it; reported-skip
-  artifacts `:188-189`; QH-25 egress evidence `:248-302`; negative tests `:310`, `:348`,
-  `:371`, `:406`.
+  artifacts `:188-189`; QH-25 egress evidence `:248-302`; pinned predicate test `:310`
+  (`:309-314`); egress-evidence tests `:348` (POSITIVE identity-proven test,
+  `egress_evidence_names_pair_and_identity_when_proven`), `:371` (weaker-claim negative),
+  `:406` (no-exit-node fail-closed negative) (A5, folded).
 - Daemon: `crates/rustynetd/src/macos_exit_nat.rs` — rules in the `com.rustynet/nat` pf
   anchor (`:7-22`, `DEFAULT_MACOS_EXIT_PF_ANCHOR` re-export `:33`), daemon enables IPv4
   forwarding, verification contract = `pfctl -a com.rustynet/nat -s nat` shows ≥1 `nat`
@@ -68,9 +100,11 @@ marked **UNVERIFIED** and repeated in §10 as open questions.
   `activate_exit_serving` `:589` (constant-argv `route advertise 0.0.0.0/0` over the
   daemon socket, daemon rejection surfaced as `AdapterError::Protocol` `:600-605`),
   `assert_exit_actively_serving` `:622-654`, `assert_mesh_client_nat_session` `:674-723`;
-  `adapter/windows_traffic.rs` is the second shape: named-pipe actuation `:187-216`,
+  `adapter/windows_traffic.rs` is the second shape: collect-active-tunnels fn `:195`,
   `Get-NetNatSession` assertion with the identity check performed in Rust, not in the
-  guest script `:265-308`.
+  guest script — assert fn `:300` (preceding fn ends `:273`), doc `:275-299`, identity
+  match `:314-328` (`is_none_or` at `:322-324`), 10×1.5 s bounded retry (`:305-313`
+  guest script, `:318-332` outer loop) (A5, folded).
 - Grounding docs: adversarial review §2
   (`LiveLabStagePassLikelihoodSummaryAdversarialReview_2026-09-01.md:49-61`, incl. the
   architectural note at `:55` and the role-mapping tension recorded as an open Phase-C
@@ -101,6 +135,23 @@ tension is resolvable without changing either today:
   `--node` on 2026-08-31 (`CrossPlatformRoleParityRefresh_2026-07-23.md:102`,
   run `livelab-1788172934687-17194-11`, commit `7bdcfe60`).
 
+**A1 (folded): the remap is part of this work.** The daemon already enforces the
+regular-exit posture: `phase10.rs` `apply_nat_forwarding` (`:4485`, body `:4495-4541`)
+takes the killswitch filter anchor first (`:4514-4520`, so NAT failure leaves egress
+blocked), then `activate_exit_nat` (`:3877`) loads `com.rustynet/nat` via the privileged
+helper (`MacosPfLoadSpec::ExitNat` → `PrivilegedCommandProgram::MacosPfLoad`,
+`:3926-3933`) and verifies + fail-closes on drift (`:3961-3973`); teardown flushes the
+anchor before restoring forwarding (`:3987`). The orchestrator, however, still maps a
+macOS `Exit` election to the `blind_exit` daemon role — `orchestrator/role.rs:160`
+(`NodeRole::Exit | NodeRole::BlindExit => Ok("blind_exit")`), the macOS capability pair
+at `:186-189`, and the pinned tests at `:458-476`
+(`is_supported_for_platform_macos_exit_maps_to_blind_exit_pf_posture`) and `:508-545`
+(daemon-role mapping pin asserting `"blind_exit"` at `:543-546`). This work therefore
+includes remapping the macOS `Exit` daemon role to the regular-exit posture (daemon role
+`client` + `ExitServer`, matching the Linux mapping at `role.rs:202-218`), updating those
+pinned tests, and refreshing the stage comment at `active_exit.rs:177-183` — otherwise
+the §8 run recipe deploys blind_exit and proves an already-proven role.
+
 **Stage-column mapping.** The live proof targets:
 
 - `macos_stage_exit_handoff` — the macOS face of `exit_handoff`/`active_exit`
@@ -127,13 +178,29 @@ New module `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_exit_traff
 the macOS adapter impl. All guest execution goes through the existing hardened
 `shell_host` seam (`node_adapter.rs:386`), argv-only, no shell construction.
 
+**A2 (folded): evaluator availability.** Both CLI evaluators this design reuses are
+currently quarantined dead code — `#[allow(dead_code)]` at `mod.rs:20075` (fn
+`evaluate_macos_exit_nat_lifecycle_artifact` `:20076`) and at `mod.rs:21266` (fn
+`evaluate_macos_exit_killswitch_precedence_artifact` `:21267`), retained since the W5.7
+bash-branch deletion for the G2 native re-wire. "Reuse the existing evaluator" is
+therefore not free: unquarantining and re-wiring both is in scope for this work (§7).
+
 | `NodeAdapter` method | macOS implementation |
 | --- | --- |
 | `activate_exit_serving` (`node_adapter.rs:296`) | **Assert, do not actuate.** macOS exit NAT is enforce-time — the daemon applies `com.rustynet/nat` + forwarding when the role is enforced, so there is no orchestrator-side actuation to perform (this is the documented mechanism divergence, `CrossPlatformRoleParityRefresh_2026-07-23.md:389-391`). The method runs the daemon's snapshot subcommand (`rustynetd macos-exit-nat-lifecycle-snapshot --mesh-cidr <cidr>`, `main.rs:454-456`, `:2005`) and returns `Ok` only if `pf_anchor_present` is true. Absent anchor → `AdapterError::Protocol` carrying the parsed snapshot reason (fail-closed; the Linux reference surfaces daemon reasons the same way, `linux_traffic.rs:600-605`). |
-| `assert_exit_actively_serving` (`node_adapter.rs:309`) | Run the snapshot subcommand and require: `pf_anchor_present == true`, `sysctl net.inet.ip.forwarding == 1`, and `internal_prefix` equal to the run's expected mesh CIDR (the snapshot already parses the observed NAT-rule CIDR, `macos_exit_nat_lifecycle.rs:58/:274`). Anchors compared as the verifier reports them — the CLI never parses `pfctl` output itself. |
+| `assert_exit_actively_serving` (`node_adapter.rs:309`) | Run the snapshot subcommand and require: `pf_anchor_present == true`, `sysctl net.inet.ip.forwarding == 1`, and `internal_prefix` equal to the run's expected mesh CIDR (the snapshot already parses the observed NAT-rule CIDR, `macos_exit_nat_lifecycle.rs:59/:274`). Anchors compared as the verifier reports them — the CLI never parses `pfctl` output itself. |
 | `drive_exit_egress_probe` (`node_adapter.rs:322`) | **Unchanged — stays Linux-only.** The client in this cell is a Linux guest (`cross_os_exit_path` is a Linux-client→macOS-exit proof); the Linux burst implementation (`linux_traffic.rs:549-552`) already exists. A macOS *client* is out of scope for this design. |
-| `assert_mesh_client_nat_session` (`node_adapter.rs:339`) | Run the snapshot subcommand for the anchor/prefix half, and `pfctl -s state` (read-only, argv-only) for the translation half: parse translation records whose original source lies in `100.64.0.0/10` and whose translated side matches the exit's egress address; the expected-client-mesh-addr identity check is applied in **Rust**, never in the guest command (the Windows pattern, `windows_traffic.rs:279-281`), with the same 10×1.5 s bounded retry (`:283-298`). The `pfctl -s state` output shape is **UNVERIFIED** on the UTM guest (§10 Q1); the parser is written against a captured fixture, and until one exists the method fail-closes on parse failure. |
+| `assert_mesh_client_nat_session` (`node_adapter.rs:339`) | Run the snapshot subcommand for the anchor/prefix half, and `pfctl -s state` (read-only, argv-only) for the translation half: parse translation records whose original source lies in `100.64.0.0/10` and whose translated side matches the exit's egress address; the expected-client-mesh-addr identity check is applied in **Rust**, never in the guest command (the Windows pattern, `windows_traffic.rs:314-328`, match at `:322-324`), with the same 10×1.5 s bounded retry (`:305-313` guest script, `:318-332` outer loop). The `pfctl -s state` output shape is **UNVERIFIED** on the UTM guest (§10 Q1); the parser is written against a captured fixture, and until one exists the method fail-closes on parse failure. |
 | two-phase lifecycle | The stage runs the snapshot subcommand twice (during exit mode + after daemon stop) and merges via `merge_macos_exit_nat_lifecycle_artifact` (`macos_exit_nat_lifecycle.rs:149`) into the artifact `evaluate_macos_exit_nat_lifecycle_artifact` (`mod.rs:20076`) validates — exactly the contract the producer doc-comment records (`main.rs:1998-2004`). The after-stop half must show the anchor flushed; a leftover anchor is a rejection (`mod.rs:45571` test). |
+
+**A3 (folded): Q1 in-tree precedent.** `adapter/macos_traffic.rs` enumerates anchors via
+`sudo -n pfctl -s Anchors` (`:113-115`) and warns at `:134-135` not to use anchor-scoped
+`pfctl -a <anchor> -ss` on macOS, because an empty parent anchor can still print
+unrelated global connection state. Global `pfctl -s state` is therefore the
+reliable-but-broad surface; the parser filters to the client's source address in Rust
+and fails closed on any unparseable line until a captured fixture exists. No
+`pfctl -s state` parser or fixture exists in the tree today, so Q1 remains open exactly
+as stated (§10).
 
 `probe_denied_peer` / `collect_active_tunnels` (`node_adapter.rs:282-284`) are not part
 of this cell's assertions and keep their platform defaults.
@@ -165,6 +232,14 @@ model.
    same client) is acceptable **only** if it also captures the pf state records — the
    decision between sink-observation and the fallback is open (§10 Q2).
 
+**A6 (folded): sink-segment requirement.** The sink must observe the exit's egress-side
+segment: after CP-1 that is `192.168.64.0/24` (the Debian bridge100 host or any bridged
+guest on it); the pre-CP-1 Shared-NAT segment (`192.168.65.0/24`) is host-unobservable
+and can never host the sink. Q2 resolves to: sink observation, or the two-phase
+reachability fallback WITH pf-state capture — never the fallback without pf-state capture
+(the Refresh §6 equivalent-strength bar at `:389-398`, esp. `:396`, admits nothing
+weaker).
+
 **Evidence artifact.** `active_exit.egress_evidence.json` is extended with the macOS
 fields: `translated_side` = the exit's egress address, `observed_via = "pf_state"`,
 `sink_observation` (or the fallback's two-phase record), and `identity_proven` computed
@@ -189,10 +264,22 @@ macOS exit-serving work" (`LiveLabStagePassLikelihood_macOS_CrossOS_2026-09-01.m
 column-name family confirmed in
 `NeverDispatchedLinuxStagesTriage_2026-08-27.md:443`). The fold-in:
 
-- The exit-serving stage additionally runs, on the macOS exit, the daemon's own
+- The exit-serving cell additionally runs, on the macOS exit, the daemon's own
   `macos-exit-killswitch-precedence-check` subcommand (`main.rs:451-453`), which
   produces the schema-v1 `macos_exit_killswitch_precedence.json` artifact
   (`macos_exit_killswitch_precedence.rs:20/:66`).
+
+**A2 (folded): the check is mutating — sequencing and privilege contract.** The
+precedence check is a mutating, root-required experiment: it snapshots the active
+anchor, flushes it, proves the assertion fails, and restores the exact rules
+(`macos_exit_killswitch_precedence.rs:3-9`). It therefore requires pfctl *write* (root
+or a privileged helper), unlike the lifecycle snapshot's read-only commands. It is run
+BEFORE `activate_exit_serving` (baseline posture), or in an explicitly declared window
+whose close is verified by a post-check lifecycle snapshot proving the restore; it is
+never run against a live exit-serving posture mid-serving. Its artifact records the
+experiment outcome only (baseline/tampered asserts; no live ruleset — evaluator contract
+`mod.rs:21260-21265`), so it proves the precedence *property*, not the live posture; the
+live posture is proven by the exit-serving stage's own asserts.
 - The CLI evaluates it with the existing `evaluate_macos_exit_killswitch_precedence_artifact`
   (`mod.rs:21267`; its negative tests already reject tampered success and zero exit
   codes, `:47199-47232`). The daemon-side evaluator enforces PF-05 — "Presence is not
@@ -220,8 +307,17 @@ The flip commit:
 1. extends the predicate to `Macos`,
 2. inverts the pinned test `runtime_implemented_linux_and_windows_not_macos` (`:310`)
    into the macOS-positive form, and
-3. lands **in the same change set as** the run-matrix row that carries the live pass —
-   never before it.
+3. **A4 (folded): ordering + equality contract.** The flip commit lands committed and
+   with a clean tree BEFORE the verifying run is launched; the run's appended row in
+   `live_lab_node_run_matrix.csv` must name exactly that commit with a clean dirty state.
+   The orchestrator attributes the deployed tree's provenance at run time, so row and
+   change set cannot be one commit's contents — equality of the row's `git_commit` with
+   the flip commit is the enforceable check (this replaces the earlier "same change set
+   as the run-matrix row" wording, which is not literally enforceable). Pass/fail is
+   read from the stage's own report artifact (status + data block), never from the
+   matrix column alone. This will be the first predicate flip in the stage's history
+   (git log on `active_exit.rs`: `b1c3989f`, `b4793800`, `8ec851a9` — none flip the
+   predicate), so the row-equality check is mandatory, not borrowed from precedent.
 
 No intermediate "implemented but unproven" state exists; that would silently convert
 the reported skip into a live-shaped failure the ledger cannot distinguish from a real
@@ -250,7 +346,13 @@ predicate flip is the only part that must wait for the lab:
 - Two-phase lifecycle: reuse the daemon-side parsers' own tests
   (`macos_exit_nat_lifecycle.rs:327-345`) plus the CLI-side negative tests that already
   exist (`mod.rs:45482-45604`); add `macos_two_phase_stage_reports_skip_while_predicate_false`
-  mirroring the `:310` pin so the rollout posture is itself tested.
+  mirroring the `:310` pin so the rollout posture is itself tested. **(A2, folded)**
+- **A2 (folded): evaluator unquarantine.** Removing `#[allow(dead_code)]` from
+  `evaluate_macos_exit_nat_lifecycle_artifact` (`mod.rs:20075`) and
+  `evaluate_macos_exit_killswitch_precedence_artifact` (`mod.rs:21266`) and re-wiring
+  their call sites is in-scope implementation work, not a precondition assumed done —
+  the existing negative tests (`mod.rs:45482-45604`, `:47199-47232`) re-activate with
+  them.
 - Sink-side capture format is defined in this design and versioned (`schema_version: 1`)
   so the evaluator can reject foreign payloads the same way the lifecycle artifact does.
 
@@ -275,7 +377,9 @@ predicate flip is the only part that must wait for the lab:
 3. Then the adapter (offline-tested core first, §7), then the live run, then the
    predicate flip (§6).
 
-**Run recipe** (after CP-1): `--node` run with the macOS node elected `exit` —
+**Run recipe** (after CP-1, and only after the §2 A1 role remap has landed — `alias:exit`
+is valid election syntax today but deploys the `blind_exit` daemon posture until the
+remap lands, so recipe and remap ship together): `--node` run with the macOS node elected `exit` —
 `nodes=["macos-utm-1:exit", "<debian-client>:client", "<debian-anchor/relay>:…"]`,
 Linux backbone unchanged, `rebuild_nodes` limited to newly patched aliases on re-verify.
 Acceptance per column: `macos_stage_exit_handoff` and `cross_os_exit_path` first-ever
@@ -310,17 +414,29 @@ is gone.
    gates egress but attributes the translation only via pf state records. Which does
    the owner accept as "equivalent-strength" for G2? Default proposed: sink
    observation when a lab-local sink exists; fallback only with pf-state capture.
+   **(A6, folded — RESOLVED):** sink observation, or the two-phase reachability
+   fallback WITH pf-state capture — never the fallback without pf-state capture; the
+   sink must sit on the post-CP-1 egress segment `192.168.64.0/24` (§4).
 3. **Enforce-time ordering.** Is the `com.rustynet/nat` anchor guaranteed applied
    before `exit_handoff`/`active_exit` executes (role enforce earlier in the chain), so
    the assert-only `activate_exit_serving` never spuriously fails? If not, which
    daemon command (argv) is the legitimate refresh trigger — the orchestrator must not
-   grow its own pf mutation path.
+   grow its own pf mutation path. **(RESOLVED by the adversarial review §2, folded):**
+   enforcement happens in the daemon's role-apply path BEFORE any stage-level assert
+   can succeed, so the assert-only method cannot spuriously fail on ordering; the
+   legitimate refresh trigger is the daemon's own `verify_exit_nat_anchor`/teardown,
+   never an orchestrator-side pf command.
 4. **Precedence semantics while exit-serving.** During active exit serving the
    generation-numbered killswitch anchor carries a forwarding pass while the NAT anchor
    translates. Does PF-05 evaluation (`macos_exit_killswitch_precedence.rs:148`) pass
    in that posture, or does the terminal-block-reachable check need an
    exit-serving-aware expectation? Must be answered from the evaluator before the live
-   run, not discovered live.
+   run, not discovered live. **(RESOLVED by the adversarial review §4, folded):** PF-05
+   CAN pass in exit posture — a narrowly-scoped quick pass (bounded `from`/`to`, e.g.
+   `from 100.64.0.0/10`, the mesh CIDR the NAT builder emits) counts as NarrowAllow and
+   satisfies "Presence is not precedence" while the terminal block stays reachable. The
+   actual deployed rule shapes remain unverified until measured. Regardless, the check
+   is mutating and must not run mid-serving — sequencing per §5 (A2).
 5. **After-stop snapshot ownership.** Which stage/cleanup step runs the second
    `macos-exit-nat-lifecycle-snapshot` after daemon stop, and is the existing Linux
    `exit_nat_lifecycle` stage structure (`role_validation/exit_nat_lifecycle.rs`,
