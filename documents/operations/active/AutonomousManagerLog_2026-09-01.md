@@ -227,3 +227,59 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - LAB: rank-1 macOS-client full suite RELAUNCHED as the live proof for S2b/M2 + the durable DNS backup (see the job id in the loop journal / state/deepseek-mcp-jobs).
 - LAUNCH: S2b/M2 post-merge refute review (edit-1788332482671-2798-0); QH-01 Step 4d-i typed renderer output `RenderedScript` + `from_rendered` (edit-1788332528611-3366-0). Running: macOS reboot stage (edit-1788331511666-45649-0). Harvest labrun-1788332375714-1644-0 in bootstrap_hosts.
 - CI: the DNS-backup merge broke the Windows and Debian legs on two tests — `derived_backup_path_is_durable_sibling_of_state_path` asserted the macOS state root literally (DEFAULT_STATE_PATH differs per OS) and `backup_write_failure_aborts_and_keeps_prior_backup_intact` relied on a 0400 mode that root bypasses on the Debian container. FIXED directly (d85bb56c: platform-derived expectation; root-tolerant write-failure assertion; gated on rustynetd tests + clippy 1.88 + windows-gnu check).
+
+## Tick 15 — 2026-09-02 ~07:20–08:40Z
+
+**Orientation.** main `9f1a490e` → `e742531e`, staleness 0. CI on main is GREEN again from
+`d85bb56c` (DNS-backup portability fix) through `e742531e` — three consecutive green runs
+after the `687d67d5..1bb6b2a7` red streak (the merge-resolver brace incident, fixed at
+`d2695632`; the DNS-backup platform-sensitive tests, fixed at `d85bb56c`).
+
+**Harvest re-run diagnosed (rank-1 macOS client, `labrun-1788332375714-1644-0`).** Still
+FAILS `validate_baseline_runtime` (`macos-utm-1/DnsFailclosed`, 15 pass / 1 fail). This is
+NOT the S2b residue path any more: the QH-40 shutdown-residue marker is clean and the daemon
+log shows no rollback failure across the enforce restart — S2b/M2 did their job. Root cause,
+read from `/usr/local/var/log/rustynet/rustynetd-error.log` BY LINE NUMBER (the unstamped
+stderr lines defeat any numeric `awk '$1>ts'` filter and produced a wrong
+"membership snapshot missing" hypothesis first — discarded): the daemon restarted by
+enforce at 07:08:22Z reaches `runtime bootstrap complete` at 07:08:28.9Z and then logs
+NOTHING until cleanup — no `signed state refresh completed` line. The Linux client
+(`debian-headless-2`) over the same window logs `signed state refresh completed
+(reason=command)` right after ITS enforce restart and passes: the Linux enforce path
+(`linux_install::enforce_daemon` → `rustynet ops e2e-enforce-host` → the signed-state
+refresh in `ops_e2e.rs`, IPC `state refresh`) re-applies the dataplane generation after the
+restart; `macos_install::enforce_daemon` (`macos_install.rs:752`) restarts and waits for the
+socket but issues no refresh, and on macOS `apply_dns_protection` runs only inside a
+signed-state refresh (`phase10.rs apply_dataplane_generation`, `protected_dns` arm). So the
+macOS client sits with NO DNS protection after a clean restart until an endpoint change or an
+operator command — the validator, 2 s later, correctly reports drift. Two-layer fix, both
+planned before code per the charter: (a) orchestrator parity — macOS enforce issues the same
+post-restart `state refresh`; (b) product — the daemon re-applies its persisted protected
+posture at startup itself (the fail-closed answer: a client that had protection before the
+restart must not come up unprotected waiting for a command). Remedy recorded for the launch
+gate; plan job launched (`MacosEnforceRefreshParityPlan_2026-09-02.md`).
+
+**Merged.** S2b/M2 post-merge adversarial review (`06c8c60b`, ACCEPT-WITH-FIXES; confirmed
+gaps F1 helper job-present-but-process-dead, F3 KILL fallback ordering inverted, F5 scanner
+`.as_str()` bypass — fix job to follow once Step 4d-i lands, to avoid a `validated_args.rs`
+collision). Harvest ledger rows (`e742531e`).
+
+**Reboot stage (C7).** Branch `ai-edit/edit-1788331511666-45649-0` (HALTED-BUDGET
+checkpoint) gated: pinned rustfmt drift in 6 files fixed, clippy 1.88 green, WHOLE
+`rustynet-cli` suite 2906 pass; marker checkpoint amended to a proper commit `acb7f5c0`.
+Merge HELD for the GLM adversarial implementation review (`edit-1788341319499-11418-0`) —
+my own read flagged three things for it to confirm: the stage `budget_secs: 180` is smaller
+than the helper's own worst-case wait (8 × (90 s + 20 s)); `shutdown -r now` swallows ANY
+SSH transport error as "the reboot tore the channel down" with no pre/post boot-time
+comparison proving a reboot happened; the unquoted `for svc in $(networksetup …)` word-splits
+service names with spaces.
+
+**Step 4d-i** (`edit-1788332528611-3366-0`) TIMED OUT but left a complete, properly authored
+commit `21a2ea44` (no marker): `RenderedScript` newtype (private field, no `From<String>`,
+length-only Debug) returned by every `render_*`, typed `RemoteCommand::from_rendered` /
+`PowerShellScript::from_rendered`, crate-wide source-scan pin, raw-sink pin 140 → 130.
+Diff read in full; gate running (clippy green, whole-crate tests in flight).
+
+**Fleet.** Running: reboot-stage review (`…11418-0`), Windows node-parity PHASE A root-cause
+analysis (`edit-1788341400379-14626-0`), macOS enforce-refresh parity plan (launched this
+tick). Loop note #604.
