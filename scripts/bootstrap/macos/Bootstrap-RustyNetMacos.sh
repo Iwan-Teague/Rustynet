@@ -796,7 +796,9 @@ clear_residual_state() {
         -exec rm -rf {} + 2>/dev/null || true
     fi
   done
-  rm -f "${STATE_ROOT}/rustynetd.state" "${STATE_ROOT}/rustynetd.state.lock" 2>/dev/null || true
+  rm -f "${STATE_ROOT}/rustynetd.state" "${STATE_ROOT}/rustynetd.state.lock" \
+    "${STATE_ROOT}/rustynetd.state.shutdown-residue.json" \
+    "${STATE_ROOT}/rustynetd.state.networksetup-dns.failclosed.bak" 2>/dev/null || true
 }
 
 # ── Build from source ─────────────────────────────────────────────────────────
