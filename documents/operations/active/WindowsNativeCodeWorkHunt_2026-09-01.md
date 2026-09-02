@@ -51,6 +51,7 @@ Already-tracked territory excluded per the dedup requirement:
 - **Why it matters:** a kernel-object SDDL reader with zero call sites anywhere in the repo (verified by repo-wide grep: the only references are the definition itself and nothing else) sits behind a suppression that will keep it compiling — and keep it exempt from the unused-code signal — forever. This is the same class as the prior hunt's F-2 (whole-file `allow(dead_code)` on two macOS backend files), which explicitly did not sweep this crate. The sibling allow pattern used elsewhere in the workspace is the per-item cross-platform `#[cfg_attr(not(windows|test), allow(dead_code))]`, which at least documents *why* an item is conditionally unused; a bare `#[allow(dead_code)]` on a Windows-only function documents nothing, because on Windows it is simply dead.
 - **Proposed offline fix:** delete `inspect_handle_sddl` (the one-path discipline favors removal; the file/pipe/registry SDDL readers are the live surfaces), or, if the Windows fixture work is expected to consume it soon, replace the blanket allow with a `#[cfg_attr(not(test), allow(dead_code))]` plus a comment naming the consuming slice.
 - **Offline-fixable:** yes. **Needs adversarial review:** no.
+- **Resolved 2026-09-02:** deleted; zero call sites. `GetKernelObjectSecurity` import removed with it (used by nothing else); all sibling SDDL readers (file/pipe/registry) untouched.
 
 ### WIN-F-3 (P3) — `owned_pwstr_to_string` leaks the Win32-allocated buffer when UTF-16 decoding fails
 
