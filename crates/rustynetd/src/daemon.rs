@@ -7319,7 +7319,7 @@ impl DaemonRuntime {
     /// Production callers must choose a failure classification explicitly, so
     /// they go through the detailed form; the tests only assert on the
     /// message.
-    #[cfg(test)]
+    #[cfg(all(test, not(windows)))]
     fn sync_traversal_runtime_state(&mut self, force_reprobe: bool) -> Result<(), String> {
         self.sync_traversal_runtime_state_detailed(force_reprobe, true)
             .map_err(TraversalSyncFailure::into_message)

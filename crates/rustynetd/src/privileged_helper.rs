@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
+#[cfg(not(windows))]
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 // `Path` is only referenced from the unix helper server / exec path and the
 // unix PF helpers; Windows uses only `PathBuf` (socket-path config fields).
@@ -1230,6 +1232,7 @@ fn execute_builtin(
 /// unbounded at extraction, so clamping only where exec output is captured let
 /// a long enough reply build a success field the codec refuses to encode, and
 /// the helper then dropped the connection silently.
+#[cfg(not(windows))]
 fn builtin_success_response(output: PrivilegedCommandOutput) -> HelperResponse {
     success_response_from_exec_output(
         output.status,
@@ -1853,12 +1856,14 @@ fn exit_status_code(status: ExitStatus) -> i32 {
 /// re-implementing the construction, so a reverted clamp fails them.
 /// Ungated: the builtin success path shares it on every platform the helper
 /// compiles on.
+#[cfg(not(windows))]
 fn success_response_from_exec_output(status: i32, stdout: &[u8], stderr: &[u8]) -> HelperResponse {
     let stdout = truncate_lossy(stdout, RESPONSE_FIELD_BUDGET_BYTES);
     let stderr = truncate_lossy(stderr, RESPONSE_FIELD_BUDGET_BYTES);
     HelperResponse::success(status, stdout, stderr)
 }
 
+#[cfg(not(windows))]
 fn truncate_lossy(bytes: &[u8], max_bytes: usize) -> String {
     // Bound the POST-conversion length, not the input: from_utf8_lossy
     // replaces each isolated ill-formed byte with a 3-byte U+FFFD and a
@@ -2153,6 +2158,7 @@ fn is_owned_dns_redirect_table_token(value: &str) -> bool {
 /// redirect points loopback `:53` at the rustynet resolver's unprivileged bind
 /// port; an address-bearing target (e.g. `1.2.3.4:53`) is rejected so the rule
 /// can only ever redirect to a local socket.
+#[cfg(not(windows))]
 fn is_loopback_dns_redirect_target(value: &str) -> bool {
     value
         .strip_prefix(':')
@@ -2171,10 +2177,12 @@ fn is_nft_chain_token(value: &str) -> bool {
     )
 }
 
+#[cfg(not(windows))]
 fn is_nft_daddr_family_token(value: &str) -> bool {
     matches!(value, "ip" | "ip6")
 }
 
+#[cfg(not(windows))]
 fn is_cidr_for_nft_family(cidr: &str, family: &str) -> bool {
     let Some((base, prefix)) = cidr.split_once('/') else {
         return false;
@@ -2192,6 +2200,7 @@ fn is_cidr_for_nft_family(cidr: &str, family: &str) -> bool {
     }
 }
 
+#[cfg(not(windows))]
 fn is_exact_ip_for_nft_family(address: &str, family: &str) -> bool {
     match family {
         "ip" => address.parse::<Ipv4Addr>().is_ok(),
@@ -2297,6 +2306,7 @@ fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
 /// argv carries table/chain names, addresses, ports, protocols and marks — rule
 /// SHAPE, never key material. `wg` argv can carry private keys, so its validator
 /// must NOT copy this; it is left disclosing nothing.
+#[cfg(not(windows))]
 fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
     match args {
         [
@@ -2792,6 +2802,7 @@ fn validate_nft_args(args: &[&str]) -> Result<(), String> {
             Ok(())
         }
         _ if args.starts_with(&["add", "chain"]) => validate_nft_add_chain_args(args),
+        #[cfg(not(windows))]
         _ if args.starts_with(&["add", "rule"]) => validate_nft_add_rule_args(args),
         _ => Err("unsupported nft argument schema".to_owned()),
     }
