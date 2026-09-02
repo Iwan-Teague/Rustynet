@@ -482,8 +482,15 @@ impl fmt::Debug for ValidatedArg {
 /// skipped. MUST ONLY GO DOWN — Step 4 migrates these call sites onto
 /// `RemoteCommand`; an increase reintroduces raw string interpolation at a
 /// sink and fails this test.
+///
+/// 159 (2026-09-02): +1 for the S2b helper-liveness commands in
+/// `macos_install.rs` (`probe`/`bootstrap`/socket-wait, all built via
+/// `ValidatedArg` + `RemoteCommand::from_args` and lowered through ONE shared
+/// sink helper, `run_validated`). The counter cannot distinguish validated
+/// lowering from raw interpolation, so the seam-routed addition is recorded
+/// here rather than hidden.
 #[cfg(test)]
-pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 158;
+pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 159;
 
 #[cfg(test)]
 mod tests {

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
@@ -23,6 +24,16 @@ pub const MACOS_SERVICE_LABEL: &str = "com.rustynet.daemon";
 pub const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 pub const MACOS_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
 pub const MACOS_DAEMON_SOCKET: &str = "/private/var/run/rustynet/rustynetd.sock";
+/// Privileged-helper launchd label (`Install-RustyNetMacosService.sh`).
+pub const MACOS_PRIVILEGED_HELPER_LABEL: &str = "com.rustynet.privileged-helper";
+/// Where `Install-RustyNetMacosService.sh` installs the helper plist
+/// (`HELPER_PLIST_DST`): the bootstrap source for the S2b liveness restore.
+pub const MACOS_PRIVILEGED_HELPER_PLIST: &str =
+    "/Library/LaunchDaemons/com.rustynet.privileged-helper.plist";
+/// The privileged-helper socket the daemon's shutdown rollback dials
+/// (`PRIVILEGED_HELPER_SOCKET` in `Install-RustyNetMacosService.sh`).
+pub const MACOS_PRIVILEGED_HELPER_SOCKET: &str =
+    "/private/var/run/rustynet/rustynetd-privileged.sock";
 pub const MACOS_MEMBERSHIP_DIR: &str = "/usr/local/var/rustynet/membership";
 /// Owner SIGNING (private) key path on macOS. Mirrors
 /// `ops_e2e::MACOS_OWNER_SIGNING_KEY_PATH`: the macOS genesis driver
@@ -490,10 +501,173 @@ pub fn stop_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
+/// What the pre-restart privileged-helper liveness step found and did
+/// (S2b of MacosHelperShutdownOrderingImplementationPlan_2026-09-02). Rendered
+/// into the restart's log line so the run's stage log records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelperLivenessStep {
+    /// `launchctl print system/com.rustynet.privileged-helper` succeeded: the
+    /// job is bootstrapped, so the probe-gated step is a no-op.
+    HelperPresent,
+    /// The job was absent; it was re-bootstrapped from its installed plist and
+    /// the socket appeared after `socket_probes` poll(s) of the bounded wait.
+    HelperRestored { socket_probes: usize },
+}
+
+impl std::fmt::Display for HelperLivenessStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HelperPresent => {
+                write!(f, "job present (probe-gated no-op)")
+            }
+            Self::HelperRestored { socket_probes } => write!(
+                f,
+                "job absent; re-bootstrapped from {MACOS_PRIVILEGED_HELPER_PLIST} \
+                 and socket appeared after {socket_probes} poll(s)"
+            ),
+        }
+    }
+}
+
+/// Order-enforcing driver behind [`restart_daemon`] (S2b): the daemon
+/// stop/start steps run ONLY after the helper-liveness step succeeds — a
+/// failed liveness probe restore propagates its error and the daemon restart
+/// commands are never issued. The remote effects are closures so the ordering
+/// guarantee (no daemon restart past a failed helper restore) is testable
+/// without SSH.
+fn drive_restart_with_helper_liveness(
+    probe_helper_job: &mut dyn FnMut() -> bool,
+    restore_helper: &mut dyn FnMut() -> Result<usize, AdapterError>,
+    stop_daemon: &mut dyn FnMut() -> Result<(), AdapterError>,
+    start_daemon: &mut dyn FnMut() -> Result<(), AdapterError>,
+) -> Result<HelperLivenessStep, AdapterError> {
+    let step = if probe_helper_job() {
+        HelperLivenessStep::HelperPresent
+    } else {
+        let socket_probes = restore_helper()?;
+        HelperLivenessStep::HelperRestored { socket_probes }
+    };
+    stop_daemon()?;
+    start_daemon()?;
+    Ok(step)
+}
+
+/// The ONE remote-sink lowering shared by every S2b helper-liveness command:
+/// each command is built through `RemoteCommand::from_args` (validated argv)
+/// and then lowered through the `run_remote` sink exactly here, so the new
+/// functionality contributes a single counted sink call site.
+fn run_validated(
+    conn: &NodeConnection,
+    command: &ssh::RemoteCommand,
+    timeout: Duration,
+) -> Result<String, AdapterError> {
+    ssh::run_remote(conn, command.as_str(), timeout)
+}
+
+/// Probe the privileged-helper launchd job through the validated seam:
+/// `sudo -n launchctl print system/com.rustynet.privileged-helper`. The
+/// `run_remote` sink maps a non-zero remote exit to `AdapterError::Command`,
+/// so `Ok` ⇒ the job is bootstrapped (present) and any error ⇒ absent
+/// (launchd reports no such job).
+fn probe_privileged_helper_job(conn: &NodeConnection) -> bool {
+    privileged_helper_job_probe_command()
+        .and_then(|probe| run_validated(conn, &probe, SHORT_TIMEOUT))
+        .is_ok()
+}
+
+/// The validated-argv probe command (QH-01 seam; fixed literals only — the
+/// target is derived from a const label, and the validator still gates it).
+fn privileged_helper_job_probe_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    ssh::RemoteCommand::from_args(
+        "macos privileged-helper job probe",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("launchctl")?,
+            ValidatedArg::cli_token("print")?,
+            ValidatedArg::cli_token(&format!("system/{MACOS_PRIVILEGED_HELPER_LABEL}"))?,
+        ],
+    )
+}
+
+/// Re-bootstrap the helper from its installed plist and wait, bounded (≤10 s,
+/// mirroring the installer's post-bootstrap socket wait at
+/// `Install-RustyNetMacosService.sh:614-625`), for its socket to appear.
+/// Returns the number of socket polls consumed.
+fn restore_privileged_helper(conn: &NodeConnection) -> Result<usize, AdapterError> {
+    eprintln!(
+        "[macos daemon restart] privileged-helper launchd job absent; \
+         re-bootstrapping from {MACOS_PRIVILEGED_HELPER_PLIST}"
+    );
+    let bootstrap = ssh::RemoteCommand::from_args(
+        "macos privileged-helper bootstrap",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("launchctl")?,
+            ValidatedArg::cli_token("bootstrap")?,
+            ValidatedArg::cli_token("system")?,
+            ValidatedArg::path(MACOS_PRIVILEGED_HELPER_PLIST)?,
+        ],
+    )?;
+    run_validated(conn, &bootstrap, SHORT_TIMEOUT)?;
+    wait_for_privileged_helper_socket(conn)
+}
+
+/// Bounded socket wait (20 × 0.5 s = 10 s): a `sudo -n test -S <socket>` probe
+/// polled from the adapter, mirroring the installer's post-bootstrap wait
+/// (`Install-RustyNetMacosService.sh:614-625`). Expiry is a loud refusal — the
+/// daemon restart that would follow is KNOWN to lose its shutdown rollback,
+/// because the rollback dials this socket.
+fn wait_for_privileged_helper_socket(conn: &NodeConnection) -> Result<usize, AdapterError> {
+    let probe = ssh::RemoteCommand::from_args(
+        "macos privileged-helper socket probe",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("test")?,
+            ValidatedArg::cli_token("-S")?,
+            ValidatedArg::path(MACOS_PRIVILEGED_HELPER_SOCKET)?,
+        ],
+    )?;
+    for attempt in 1..=20 {
+        if run_validated(conn, &probe, SHORT_TIMEOUT).is_ok() {
+            return Ok(attempt);
+        }
+        if attempt < 20 {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+    Err(AdapterError::Protocol {
+        message: format!(
+            "privileged helper socket {MACOS_PRIVILEGED_HELPER_SOCKET} did not appear within \
+             10 s of launchctl bootstrap; refusing to restart the daemon: its shutdown rollback \
+             dials the helper socket, so the restart would be known to lose its rollback \
+             (S2b, MacosHelperShutdownOrderingImplementationPlan_2026-09-02)"
+        ),
+    })
+}
+
 /// Restart the launchd service (stop + start; launchd has no native restart).
+///
+/// S2b (MacosHelperShutdownOrderingImplementationPlan_2026-09-02): before the
+/// daemon bootout/bootstrap, probe the privileged-helper launchd job; if it is
+/// absent, re-bootstrap it from its installed plist and wait (bounded, ≤10 s)
+/// for its socket to reappear. The daemon's shutdown rollback dials the helper
+/// socket, so restarting the daemon against an absent helper is the exact
+/// completion-order defect that failed `macos-utm-1` (run
+/// `livelab-1788325534-2e7bdaf7bf57`): the restart would be known to lose its
+/// rollback before it is issued. If the helper cannot be restored, the restart
+/// is refused loudly instead of proceeding.
 pub fn restart_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
-    stop_daemon(conn)?;
-    start_daemon(conn)
+    let step = drive_restart_with_helper_liveness(
+        &mut || probe_privileged_helper_job(conn),
+        &mut || restore_privileged_helper(conn),
+        &mut || stop_daemon(conn),
+        &mut || start_daemon(conn),
+    )?;
+    eprintln!("[macos daemon restart] privileged helper liveness: {step}");
+    Ok(())
 }
 
 /// Build the remote shell command that re-invokes the compiled macOS
@@ -2682,7 +2856,208 @@ mod tests {
         );
         assert!(
             WINDOWS_BOOTSTRAP_WRAPPER.contains("ServiceReadyTimeoutSecs"),
-            "rn_bootstrap_windows.ps1 must accept a configurable timeout"
+            "rn_bootstrap_windows.ps1 must wait for Status = Running"
         );
+    }
+
+    // ── S2b: helper-liveness restore before the daemon restart ──────────────
+
+    /// Shared recorder for the driver tests: each closure appends its step name
+    /// so the tests can assert exactly which remote effects ran, and in order.
+    #[derive(Clone, Default)]
+    struct StepRecorder(std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+
+    impl StepRecorder {
+        fn record(&self, step: &'static str) {
+            self.0.borrow_mut().push(step);
+        }
+        fn steps(&self) -> Vec<&'static str> {
+            self.0.borrow().clone()
+        }
+    }
+
+    /// Helper job present ⇒ probe-gated no-op: no restore, and the daemon
+    /// stop/start steps are the ONLY follow-ups. (No daemon restart may ever
+    /// be skipped silently, and no helper restore may ever run needlessly.)
+    #[test]
+    fn restart_helper_present_means_no_action() {
+        let rec = StepRecorder::default();
+        let (rec_probe, rec_restore, rec_stop, rec_start) =
+            (rec.clone(), rec.clone(), rec.clone(), rec.clone());
+        let step = drive_restart_with_helper_liveness(
+            &mut || {
+                rec_probe.record("probe");
+                true
+            },
+            &mut || {
+                rec_restore.record("restore");
+                Ok(1)
+            },
+            &mut || {
+                rec_stop.record("stop");
+                Ok(())
+            },
+            &mut || {
+                rec_start.record("start");
+                Ok(())
+            },
+        )
+        .expect("present helper must proceed");
+        assert_eq!(step, HelperLivenessStep::HelperPresent);
+        assert_eq!(
+            rec.steps(),
+            vec!["probe", "stop", "start"],
+            "present helper: no restore, straight to the daemon restart"
+        );
+    }
+
+    /// Helper job absent ⇒ restore runs BEFORE the daemon restart, and the
+    /// step reports what it did (bootstrap + bounded socket wait).
+    #[test]
+    fn restart_restores_absent_helper_before_daemon_restart() {
+        let rec = StepRecorder::default();
+        let (rec_probe, rec_restore, rec_stop, rec_start) =
+            (rec.clone(), rec.clone(), rec.clone(), rec.clone());
+        let step = drive_restart_with_helper_liveness(
+            &mut || {
+                rec_probe.record("probe");
+                false
+            },
+            &mut || {
+                rec_restore.record("restore");
+                Ok(4)
+            },
+            &mut || {
+                rec_stop.record("stop");
+                Ok(())
+            },
+            &mut || {
+                rec_start.record("start");
+                Ok(())
+            },
+        )
+        .expect("restorable helper must proceed");
+        assert_eq!(
+            step,
+            HelperLivenessStep::HelperRestored { socket_probes: 4 }
+        );
+        assert_eq!(
+            rec.steps(),
+            vec!["probe", "restore", "stop", "start"],
+            "absent helper: bootstrap + socket wait strictly before the daemon restart"
+        );
+    }
+
+    /// Restore failure ⇒ the error propagates and the daemon restart commands
+    /// are never issued: a restart known to lose its rollback must not run.
+    #[test]
+    fn restart_refused_when_helper_restore_fails() {
+        let rec = StepRecorder::default();
+        let (rec_probe, rec_restore, rec_stop, rec_start) =
+            (rec.clone(), rec.clone(), rec.clone(), rec.clone());
+        let err = drive_restart_with_helper_liveness(
+            &mut || {
+                rec_probe.record("probe");
+                false
+            },
+            &mut || {
+                rec_restore.record("restore");
+                Err(AdapterError::Protocol {
+                    message: "helper socket never appeared".to_owned(),
+                })
+            },
+            &mut || {
+                rec_stop.record("stop");
+                Ok(())
+            },
+            &mut || {
+                rec_start.record("start");
+                Ok(())
+            },
+        )
+        .expect_err("a failed restore must fail the restart");
+        assert!(err.to_string().contains("helper socket never appeared"));
+        assert_eq!(
+            rec.steps(),
+            vec!["probe", "restore"],
+            "no daemon bootout/bootstrap may follow a failed helper restore"
+        );
+    }
+
+    /// The three S2b remote commands render through the validated seam as
+    /// plain single-quoted argv (rendering pins).
+    #[test]
+    fn helper_liveness_commands_render_validated_argv() {
+        let probe = privileged_helper_job_probe_command().expect("fixed literals validate");
+        assert_eq!(
+            probe.as_str(),
+            "'sudo' '-n' 'launchctl' 'print' 'system/com.rustynet.privileged-helper'"
+        );
+        let bootstrap = ssh::RemoteCommand::from_args(
+            "macos privileged-helper bootstrap",
+            &[
+                ValidatedArg::cli_token("sudo").expect("token"),
+                ValidatedArg::cli_token("-n").expect("token"),
+                ValidatedArg::cli_token("launchctl").expect("token"),
+                ValidatedArg::cli_token("bootstrap").expect("token"),
+                ValidatedArg::cli_token("system").expect("token"),
+                ValidatedArg::path(MACOS_PRIVILEGED_HELPER_PLIST).expect("path"),
+            ],
+        )
+        .expect("ok");
+        assert_eq!(
+            bootstrap.as_str(),
+            "'sudo' '-n' 'launchctl' 'bootstrap' 'system' \
+             '/Library/LaunchDaemons/com.rustynet.privileged-helper.plist'"
+        );
+        let socket = ssh::RemoteCommand::from_args(
+            "macos privileged-helper socket probe",
+            &[
+                ValidatedArg::cli_token("sudo").expect("token"),
+                ValidatedArg::cli_token("-n").expect("token"),
+                ValidatedArg::cli_token("test").expect("token"),
+                ValidatedArg::cli_token("-S").expect("token"),
+                ValidatedArg::path(MACOS_PRIVILEGED_HELPER_SOCKET).expect("path"),
+            ],
+        )
+        .expect("ok");
+        assert_eq!(
+            socket.as_str(),
+            "'sudo' '-n' 'test' '-S' '/private/var/run/rustynet/rustynetd-privileged.sock'"
+        );
+    }
+
+    /// M2 site pin: both installer stop regions boot the helper out only
+    /// after a bounded daemon-exit poll (`launchctl print … | grep -q 'pid = '`
+    /// replaced the bare `sleep 1`), because the daemon's shutdown rollback
+    /// dials the helper socket and the helper must outlive the daemon (plan
+    /// MacosHelperShutdownOrderingImplementationPlan_2026-09-02 M2,
+    /// Install-RustyNetMacosService.sh:604-611 and
+    /// Bootstrap-RustyNetMacos.sh clear_residual_state).
+    #[test]
+    fn install_scripts_stop_the_helper_only_after_the_daemon_exit_wait() {
+        for (name, script) in [
+            ("Install-RustyNetMacosService.sh", INSTALL_SERVICE_SCRIPT),
+            ("Bootstrap-RustyNetMacos.sh", BOOTSTRAP_SCRIPT),
+        ] {
+            let daemon_bootout = script
+                .find("launchctl bootout system/com.rustynet.daemon")
+                .unwrap_or_else(|| panic!("{name}: daemon bootout present"));
+            let helper_bootout = script
+                .find("launchctl bootout system/com.rustynet.privileged-helper")
+                .unwrap_or_else(|| panic!("{name}: helper bootout present"));
+            assert!(
+                daemon_bootout < helper_bootout,
+                "{name}: the daemon must be stopped before the helper"
+            );
+            let between = &script[daemon_bootout..helper_bootout];
+            assert!(
+                between.contains("grep -q 'pid = '")
+                    && between.contains("seq 1 20")
+                    && between.contains("sleep 0.5"),
+                "{name}: a bounded daemon-exit pid poll must sit between the daemon \
+                 bootout and the helper bootout"
+            );
+        }
     }
 }
