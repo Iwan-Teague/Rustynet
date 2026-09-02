@@ -7,7 +7,7 @@
 //! because the full Unix-oriented `rustynet-cli` binary (`src/main.rs`)
 //! is not Windows-buildable (it unconditionally depends on the `nix`
 //! crate for uid/gid handling). It now also carries the daemon-control
-//! verbs (`role status`/`role set`/`state refresh`) over the Windows
+//! verbs (`status`/`role status`/`role set`/`state refresh`) over the Windows
 //! named-pipe control channel, reusing:
 //!
 //! - the exact wire protocol Linux/macOS already use
@@ -130,6 +130,7 @@ fn run() -> Result<String, String> {
                 parser.parse_u64_or_default("--nonce", generate_nonce())?,
             )
         }
+        [only] if only == "status" => execute_status(),
         [scope, action] if scope == "role" && (action == "status" || action == "show") => {
             execute_role_status()
         }
@@ -140,7 +141,7 @@ fn run() -> Result<String, String> {
         }
         [scope, action] if scope == "state" && action == "refresh" => execute_state_refresh(),
         _ => Err(
-            "usage: rustynet <trust <keygen|export-verifier-key|issue>|role <status|list|set <preset>>|state refresh> [options]"
+            "usage: rustynet <status|trust <keygen|export-verifier-key|issue>|role <status|list|set <preset>>|state refresh> [options]"
                 .to_owned(),
         ),
     }
@@ -474,6 +475,14 @@ fn execute_role_status() -> Result<String, String> {
     );
     out.push_str(&format!("description: {}\n", preset.description()));
     Ok(out)
+}
+
+fn execute_status() -> Result<String, String> {
+    let response = send_command(IpcCommand::Status)?;
+    if !response.ok {
+        return Err(format!("daemon error: {}", response.message));
+    }
+    Ok(response.message)
 }
 
 fn execute_state_refresh() -> Result<String, String> {

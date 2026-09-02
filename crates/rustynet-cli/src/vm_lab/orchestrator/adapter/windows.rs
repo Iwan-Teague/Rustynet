@@ -294,8 +294,9 @@ impl NodeAdapter for WindowsNodeAdapter {
         local_out_dir: &std::path::Path,
     ) -> Result<(), AdapterError> {
         // Bundle issuance runs locally on the orchestrator process.  The Windows
-        // trust CLI (`rustynet.exe`) only supports `trust` subcommands and cannot
-        // run `ops e2e-issue-*`; the full ops CLI is Linux-only.  Generate an
+        // trust CLI (`rustynet.exe`) supports only its `status`, `trust`, and
+        // `role`/`state` daemon-control subcommands — it cannot run
+        // `ops e2e-issue-*`; the full ops CLI is Linux-only.  Generate an
         // ephemeral signing key here and produce the bundle files locally.
         std::fs::create_dir_all(local_out_dir).map_err(|e| AdapterError::Io {
             message: format!("create bundle output dir: {e}"),
