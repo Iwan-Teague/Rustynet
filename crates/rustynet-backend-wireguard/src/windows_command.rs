@@ -695,8 +695,7 @@ fn read_private_key_value(path: &Path) -> Result<String, BackendError> {
         .len();
     if on_disk_len > MAX_PRIVATE_KEY_FILE_BYTES {
         return Err(BackendError::internal(format!(
-            "Windows private key file exceeds {}-byte cap; refusing to read",
-            MAX_PRIVATE_KEY_FILE_BYTES
+            "Windows private key file exceeds {MAX_PRIVATE_KEY_FILE_BYTES}-byte cap; refusing to read"
         )));
     }
     let contents = fs::read_to_string(path).map_err(|err| {
