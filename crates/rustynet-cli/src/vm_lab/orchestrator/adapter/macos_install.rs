@@ -635,15 +635,35 @@ fn run_validated(
     ssh::run_remote(conn, command.as_str(), timeout)
 }
 
+/// Classify `launchctl print system/com.rustynet.privileged-helper` stdout
+/// (post-merge review §1): launchd exits 0 for a *loaded* job whose process
+/// has exited, and the loaded job's description carries a `pid = <n>` line
+/// only while the process is alive — the same predicate
+/// `macos_daemon_job_reported_exit` in `install/uninstall.rs` relies on. An
+/// empty/failed print ⇒ not bootstrapped at all; a print without a live
+/// `pid = ` line ⇒ present-but-dead.
+fn classify_helper_job_stdout(stdout: &str) -> HelperJobPresence {
+    if stdout.contains("pid = ") {
+        HelperJobPresence::PresentAlive
+    } else {
+        HelperJobPresence::PresentDead
+    }
+}
+
 /// Probe the privileged-helper launchd job through the validated seam:
-/// `sudo -n launchctl print system/com.rustynet.privileged-helper`. The
-/// `run_remote` sink maps a non-zero remote exit to `AdapterError::Command`,
-/// so `Ok` ⇒ the job is bootstrapped (present) and any error ⇒ absent
-/// (launchd reports no such job).
-fn probe_privileged_helper_job(conn: &NodeConnection) -> bool {
-    privileged_helper_job_probe_command()
+/// `sudo -n launchctl print system/com.rustynet.privileged-helper`, capturing
+/// stdout. The `run_remote` sink maps a non-zero remote exit to
+/// `AdapterError::Command` — launchd reports no such job — so an error ⇒
+/// [`HelperJobPresence::Absent`]; a successful print is classified by its
+/// stdout, because exit 0 alone conflates "alive" with "loaded but dead"
+/// (review §1).
+fn probe_privileged_helper_job(conn: &NodeConnection) -> HelperJobPresence {
+    match privileged_helper_job_probe_command()
         .and_then(|probe| run_validated(conn, &probe, SHORT_TIMEOUT))
-        .is_ok()
+    {
+        Ok(stdout) => classify_helper_job_stdout(&stdout),
+        Err(_) => HelperJobPresence::Absent,
+    }
 }
 
 /// The validated-argv probe command (QH-01 seam; fixed literals only — the
@@ -661,15 +681,45 @@ fn privileged_helper_job_probe_command() -> Result<ssh::RemoteCommand, AdapterEr
     )
 }
 
-/// Re-bootstrap the helper from its installed plist and wait, bounded (≤10 s,
-/// mirroring the installer's post-bootstrap socket wait at
-/// `Install-RustyNetMacosService.sh:614-625`), for its socket to appear.
-/// Returns the number of socket polls consumed.
-fn restore_privileged_helper(conn: &NodeConnection) -> Result<usize, AdapterError> {
-    eprintln!(
-        "[macos daemon restart] privileged-helper launchd job absent; \
-         re-bootstrapping from {MACOS_PRIVILEGED_HELPER_PLIST}"
-    );
+/// The validated-argv socket probe (`sudo -n test -S <socket>`), shared by
+/// the restore path's bounded wait and the pre-restart liveness check.
+fn privileged_helper_socket_probe_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    ssh::RemoteCommand::from_args(
+        "macos privileged-helper socket probe",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("test")?,
+            ValidatedArg::cli_token("-S")?,
+            ValidatedArg::path(MACOS_PRIVILEGED_HELPER_SOCKET)?,
+        ],
+    )
+}
+
+/// Is the helper socket present right now? One poll of the validated probe.
+fn privileged_helper_socket_present(conn: &NodeConnection) -> bool {
+    privileged_helper_socket_probe_command()
+        .and_then(|probe| run_validated(conn, &probe, SHORT_TIMEOUT))
+        .is_ok()
+}
+
+/// The restore path's two launchd commands, IN ORDER: the bootout of any
+/// stale job slot comes FIRST (a bootstrapped job cannot be re-bootstrapped
+/// in place — `launchctl bootstrap` of an already-loaded job fails, review
+/// §1), the `launchctl bootstrap` from the installed plist comes SECOND.
+/// Returned as an ordered pair so the ordering is pinned by test without SSH.
+fn privileged_helper_restore_commands(
+) -> Result<(ssh::RemoteCommand, ssh::RemoteCommand), AdapterError> {
+    let bootout = ssh::RemoteCommand::from_args(
+        "macos privileged-helper bootout",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("launchctl")?,
+            ValidatedArg::cli_token("bootout")?,
+            ValidatedArg::cli_token(&format!("system/{MACOS_PRIVILEGED_HELPER_LABEL}"))?,
+        ],
+    )?;
     let bootstrap = ssh::RemoteCommand::from_args(
         "macos privileged-helper bootstrap",
         &[
@@ -681,6 +731,28 @@ fn restore_privileged_helper(conn: &NodeConnection) -> Result<usize, AdapterErro
             ValidatedArg::path(MACOS_PRIVILEGED_HELPER_PLIST)?,
         ],
     )?;
+    Ok((bootout, bootstrap))
+}
+
+/// Restore the helper launchd job so its socket serves the daemon's shutdown
+/// rollback again: boot out any stale job slot FIRST (`launchctl bootout … ||
+/// true` — a bootstrapped job cannot be re-bootstrapped in place, and the
+/// bootout of an already-absent job is a benign failure), THEN `launchctl
+/// bootstrap` from the installed plist, then wait, bounded (≤10 s, mirroring
+/// the installer's post-bootstrap socket wait at
+/// `Install-RustyNetMacosService.sh:614-625`), for the socket to appear.
+/// Returns the number of socket polls consumed.
+fn restore_privileged_helper(conn: &NodeConnection) -> Result<usize, AdapterError> {
+    eprintln!(
+        "[macos daemon restart] privileged-helper launchd job not live; \
+         booting out any stale job and re-bootstrapping from \
+         {MACOS_PRIVILEGED_HELPER_PLIST}"
+    );
+    let (bootout, bootstrap) = privileged_helper_restore_commands()?;
+    // Best-effort by construction: the bootout fails harmlessly when the job
+    // is not bootstrapped (the common `JobAbsent` path), so its error is
+    // deliberately not propagated — the bootstrap below is the real action.
+    let _ = run_validated(conn, &bootout, SHORT_TIMEOUT);
     run_validated(conn, &bootstrap, SHORT_TIMEOUT)?;
     wait_for_privileged_helper_socket(conn)
 }
@@ -691,16 +763,7 @@ fn restore_privileged_helper(conn: &NodeConnection) -> Result<usize, AdapterErro
 /// daemon restart that would follow is KNOWN to lose its shutdown rollback,
 /// because the rollback dials this socket.
 fn wait_for_privileged_helper_socket(conn: &NodeConnection) -> Result<usize, AdapterError> {
-    let probe = ssh::RemoteCommand::from_args(
-        "macos privileged-helper socket probe",
-        &[
-            ValidatedArg::cli_token("sudo")?,
-            ValidatedArg::cli_token("-n")?,
-            ValidatedArg::cli_token("test")?,
-            ValidatedArg::cli_token("-S")?,
-            ValidatedArg::path(MACOS_PRIVILEGED_HELPER_SOCKET)?,
-        ],
-    )?;
+    let probe = privileged_helper_socket_probe_command()?;
     for attempt in 1..=20 {
         if run_validated(conn, &probe, SHORT_TIMEOUT).is_ok() {
             return Ok(attempt);
@@ -722,17 +785,20 @@ fn wait_for_privileged_helper_socket(conn: &NodeConnection) -> Result<usize, Ada
 /// Restart the launchd service (stop + start; launchd has no native restart).
 ///
 /// S2b (MacosHelperShutdownOrderingImplementationPlan_2026-09-02): before the
-/// daemon bootout/bootstrap, probe the privileged-helper launchd job; if it is
-/// absent, re-bootstrap it from its installed plist and wait (bounded, ≤10 s)
-/// for its socket to reappear. The daemon's shutdown rollback dials the helper
-/// socket, so restarting the daemon against an absent helper is the exact
-/// completion-order defect that failed `macos-utm-1` (run
+/// daemon bootout/bootstrap, probe the privileged-helper launchd job; only a
+/// job that is bootstrapped with a live `pid = ` line AND a present socket
+/// counts as live — a loaded-but-dead job, or a live job whose socket is
+/// gone, enters the same restore path as an absent job (bootout of the stale
+/// slot, re-bootstrap, bounded socket wait). The daemon's shutdown rollback
+/// dials the helper socket, so restarting the daemon against a dead helper is
+/// the exact completion-order defect that failed `macos-utm-1` (run
 /// `livelab-1788325534-2e7bdaf7bf57`): the restart would be known to lose its
 /// rollback before it is issued. If the helper cannot be restored, the restart
 /// is refused loudly instead of proceeding.
 pub fn restart_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     let step = drive_restart_with_helper_liveness(
         &mut || probe_privileged_helper_job(conn),
+        &mut || privileged_helper_socket_present(conn),
         &mut || restore_privileged_helper(conn),
         &mut || stop_daemon(conn),
         &mut || start_daemon(conn),
@@ -2994,17 +3060,27 @@ mod tests {
         }
     }
 
-    /// Helper job present ⇒ probe-gated no-op: no restore, and the daemon
-    /// stop/start steps are the ONLY follow-ups. (No daemon restart may ever
-    /// be skipped silently, and no helper restore may ever run needlessly.)
+    /// Helper job present with a live socket ⇒ probe-gated no-op: no restore,
+    /// and the daemon stop/start steps are the ONLY follow-ups. (No daemon
+    /// restart may ever be skipped silently, and no helper restore may ever
+    /// run needlessly.)
     #[test]
     fn restart_helper_present_means_no_action() {
         let rec = StepRecorder::default();
-        let (rec_probe, rec_restore, rec_stop, rec_start) =
-            (rec.clone(), rec.clone(), rec.clone(), rec.clone());
+        let (rec_probe, rec_socket, rec_restore, rec_stop, rec_start) = (
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+        );
         let step = drive_restart_with_helper_liveness(
             &mut || {
                 rec_probe.record("probe");
+                HelperJobPresence::PresentAlive
+            },
+            &mut || {
+                rec_socket.record("socket");
                 true
             },
             &mut || {
@@ -3024,22 +3100,33 @@ mod tests {
         assert_eq!(step, HelperLivenessStep::HelperPresent);
         assert_eq!(
             rec.steps(),
-            vec!["probe", "stop", "start"],
-            "present helper: no restore, straight to the daemon restart"
+            vec!["probe", "socket", "stop", "start"],
+            "present live helper: socket checked, no restore, straight to the daemon restart"
         );
     }
 
     /// Helper job absent ⇒ restore runs BEFORE the daemon restart, and the
-    /// step reports what it did (bootstrap + bounded socket wait).
+    /// step reports what it did (bootout + bootstrap + bounded socket wait)
+    /// under the `JobAbsent` reason. A dead job never consults the socket
+    /// probe: the restore path is entered directly.
     #[test]
     fn restart_restores_absent_helper_before_daemon_restart() {
         let rec = StepRecorder::default();
-        let (rec_probe, rec_restore, rec_stop, rec_start) =
-            (rec.clone(), rec.clone(), rec.clone(), rec.clone());
+        let (rec_probe, rec_socket, rec_restore, rec_stop, rec_start) = (
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+        );
         let step = drive_restart_with_helper_liveness(
             &mut || {
                 rec_probe.record("probe");
-                false
+                HelperJobPresence::Absent
+            },
+            &mut || {
+                rec_socket.record("socket");
+                true
             },
             &mut || {
                 rec_restore.record("restore");
@@ -3057,12 +3144,116 @@ mod tests {
         .expect("restorable helper must proceed");
         assert_eq!(
             step,
-            HelperLivenessStep::HelperRestored { socket_probes: 4 }
+            HelperLivenessStep::HelperRestored {
+                socket_probes: 4,
+                reason: HelperRestoreReason::JobAbsent,
+            }
         );
         assert_eq!(
             rec.steps(),
             vec!["probe", "restore", "stop", "start"],
-            "absent helper: bootstrap + socket wait strictly before the daemon restart"
+            "absent helper: bootout + bootstrap + socket wait strictly before the daemon \
+             restart, and the socket probe is never consulted"
+        );
+    }
+
+    /// Present-but-dead (loaded, no live `pid = ` line) ⇒ demoted to the
+    /// restore path with the `PresentButDead` reason (review §1's exact
+    /// hole: a bare `is_ok()` probe used to sail straight through).
+    #[test]
+    fn restart_demotes_present_dead_helper_to_the_restore_path() {
+        let rec = StepRecorder::default();
+        let (rec_probe, rec_socket, rec_restore, rec_stop, rec_start) = (
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+        );
+        let step = drive_restart_with_helper_liveness(
+            &mut || {
+                rec_probe.record("probe");
+                HelperJobPresence::PresentDead
+            },
+            &mut || {
+                rec_socket.record("socket");
+                panic!("a dead job must not consult the socket probe");
+            },
+            &mut || {
+                rec_restore.record("restore");
+                Ok(2)
+            },
+            &mut || {
+                rec_stop.record("stop");
+                Ok(())
+            },
+            &mut || {
+                rec_start.record("start");
+                Ok(())
+            },
+        )
+        .expect("restorable helper must proceed");
+        assert_eq!(
+            step,
+            HelperLivenessStep::HelperRestored {
+                socket_probes: 2,
+                reason: HelperRestoreReason::PresentButDead,
+            }
+        );
+        assert_eq!(
+            rec.steps(),
+            vec!["probe", "restore", "stop", "start"],
+            "present-but-dead helper: restore before the daemon restart"
+        );
+    }
+
+    /// A live job whose socket is gone is ALSO demoted to the restore path
+    /// (`PresentButDead`): the daemon's shutdown rollback dials the socket,
+    /// so a live pid alone is not good enough to skip the restore.
+    #[test]
+    fn restart_demotes_present_alive_helper_without_socket() {
+        let rec = StepRecorder::default();
+        let (rec_probe, rec_socket, rec_restore, rec_stop, rec_start) = (
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+        );
+        let step = drive_restart_with_helper_liveness(
+            &mut || {
+                rec_probe.record("probe");
+                HelperJobPresence::PresentAlive
+            },
+            &mut || {
+                rec_socket.record("socket");
+                false
+            },
+            &mut || {
+                rec_restore.record("restore");
+                Ok(1)
+            },
+            &mut || {
+                rec_stop.record("stop");
+                Ok(())
+            },
+            &mut || {
+                rec_start.record("start");
+                Ok(())
+            },
+        )
+        .expect("restorable helper must proceed");
+        assert_eq!(
+            step,
+            HelperLivenessStep::HelperRestored {
+                socket_probes: 1,
+                reason: HelperRestoreReason::PresentButDead,
+            }
+        );
+        assert_eq!(
+            rec.steps(),
+            vec!["probe", "socket", "restore", "stop", "start"],
+            "live job, dead socket: restore before the daemon restart"
         );
     }
 
@@ -3071,12 +3262,21 @@ mod tests {
     #[test]
     fn restart_refused_when_helper_restore_fails() {
         let rec = StepRecorder::default();
-        let (rec_probe, rec_restore, rec_stop, rec_start) =
-            (rec.clone(), rec.clone(), rec.clone(), rec.clone());
+        let (rec_probe, rec_socket, rec_restore, rec_stop, rec_start) = (
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+            rec.clone(),
+        );
         let err = drive_restart_with_helper_liveness(
             &mut || {
                 rec_probe.record("probe");
-                false
+                HelperJobPresence::Absent
+            },
+            &mut || {
+                rec_socket.record("socket");
+                true
             },
             &mut || {
                 rec_restore.record("restore");
@@ -3099,6 +3299,47 @@ mod tests {
             rec.steps(),
             vec!["probe", "restore"],
             "no daemon bootout/bootstrap may follow a failed helper restore"
+        );
+    }
+
+    /// The tri-state classifier (review §1): `launchctl print` stdout with a
+    /// live `pid = ` line ⇒ PresentAlive; loaded-but-dead stdout (exit 0, no
+    /// pid line) ⇒ PresentDead — NOT absent, NOT alive.
+    #[test]
+    fn helper_job_stdout_classification_pins_the_pid_predicate() {
+        assert_eq!(
+            classify_helper_job_stdout(
+                "com.rustynet.privileged-helper => {\n\tpid = 4242\n\tstate = running\n}"
+            ),
+            HelperJobPresence::PresentAlive
+        );
+        assert_eq!(
+            classify_helper_job_stdout(
+                "com.rustynet.privileged-helper => {\n\tstate = not running\n}"
+            ),
+            HelperJobPresence::PresentDead
+        );
+        assert_eq!(
+            classify_helper_job_stdout(""),
+            HelperJobPresence::PresentDead
+        );
+    }
+
+    /// Restore-path ordering pin (review §Tests b): the bootout of any stale
+    /// job slot is built BEFORE the bootstrap, so a loaded-but-dead job can
+    /// actually be re-bootstrapped (`launchctl bootstrap` of an already-loaded
+    /// job fails). The ordered pair makes the order assertable without SSH.
+    #[test]
+    fn helper_restore_commands_put_bootout_before_bootstrap() {
+        let (bootout, bootstrap) = privileged_helper_restore_commands().expect("ok");
+        assert_eq!(
+            bootout.as_str(),
+            "'sudo' '-n' 'launchctl' 'bootout' 'system/com.rustynet.privileged-helper'"
+        );
+        assert_eq!(
+            bootstrap.as_str(),
+            "'sudo' '-n' 'launchctl' 'bootstrap' 'system' \
+             '/Library/LaunchDaemons/com.rustynet.privileged-helper.plist'"
         );
     }
 
