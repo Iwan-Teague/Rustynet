@@ -3704,6 +3704,16 @@ pub struct MacosCommandSystem {
     /// capture guard, the rollback restore, and the startup guard's derived
     /// path (daemon.rs) must ALL agree on this one path.
     dns_backup_path: std::path::PathBuf,
+    /// M1 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3):
+    /// the daemon's bootstrap-time DNS probe servicer, when installed. While
+    /// `bootstrap()` holds the runtime, the probe's wait window drains the
+    /// daemon's hoisted resolver socket through this handle (which answers
+    /// via the daemon's own `build_dns_response` responder) instead of
+    /// relying on the main serve loop, which cannot run yet. `None` keeps the
+    /// probe's original single-blocking-recv behaviour (reconcile-time
+    /// applies and tests, where the serve loop is already live or the
+    /// failure is the expected result).
+    dns_probe_servicer: Option<std::sync::Arc<crate::daemon::DnsProbeServicer>>,
 }
 
 impl MacosCommandSystem {
@@ -3751,6 +3761,7 @@ impl MacosCommandSystem {
             dns_backup_path: crate::macos_dns_sc_protect::networksetup_dns_backup_path(
                 std::path::Path::new(crate::daemon::default_state_path()),
             ),
+            dns_probe_servicer: None,
         })
     }
 
@@ -4558,18 +4569,55 @@ impl MacosCommandSystem {
                 "loopback DNS resolver probe send to 127.0.0.1:{port} failed: {err}"
             ))
         })?;
+        // M1: during bootstrap the main serve loop cannot be running (the
+        // daemon is single-threaded and `bootstrap()` holds the runtime), so
+        // when a probe servicer is installed its wait window must drain the
+        // daemon's hoisted resolver socket itself — through the SAME
+        // `build_dns_response` responder the serve loop uses, bounded by this
+        // probe's existing 2 s deadline. Without a servicer (reconcile-time
+        // applies, tests) the behaviour is the original single blocking recv.
+        let deadline = std::time::Instant::now() + Duration::from_millis(2_000);
+        let poll_interval = if self.dns_probe_servicer.is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(2_000)
+        };
+        socket
+            .set_read_timeout(Some(poll_interval))
+            .map_err(|err| {
+                SystemError::DnsApplyFailed(format!("loopback DNS resolver probe timeout: {err}"))
+            })?;
         let mut reply = [0u8; 512];
-        let len = socket.recv(&mut reply).map_err(|err| {
-            SystemError::DnsApplyFailed(format!(
-                "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
-            ))
-        })?;
-        if len < 12 || reply[0] != PROBE_QUERY[0] || reply[1] != PROBE_QUERY[1] {
-            return Err(SystemError::DnsApplyFailed(format!(
-                "127.0.0.1:{port} answered with a malformed DNS reply ({len} bytes)"
-            )));
+        loop {
+            if let Some(servicer) = &self.dns_probe_servicer {
+                servicer.service_once();
+            }
+            match socket.recv(&mut reply) {
+                Ok(len) => {
+                    if len < 12 || reply[0] != PROBE_QUERY[0] || reply[1] != PROBE_QUERY[1] {
+                        return Err(SystemError::DnsApplyFailed(format!(
+                            "127.0.0.1:{port} answered with a malformed DNS reply ({len} bytes)"
+                        )));
+                    }
+                    return Ok(());
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(SystemError::DnsApplyFailed(format!(
+                            "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
+                        )));
+                    }
+                }
+                Err(err) => {
+                    return Err(SystemError::DnsApplyFailed(format!(
+                        "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
+                    )));
+                }
+            }
         }
-        Ok(())
     }
 
     /// Roll the node back to [`DnsPosture::Untouched`] after a failed apply,
@@ -6476,6 +6524,21 @@ pub enum RuntimeSystem {
     Windows(WindowsCommandSystem),
 }
 
+impl RuntimeSystem {
+    /// M1: install the bootstrap-time DNS probe servicer. Only the macOS
+    /// system consults it (inside `verify_loopback_resolver_live`); the other
+    /// platforms' DNS paths have no loopback probe, so for them this is a
+    /// documented no-op.
+    pub(crate) fn set_dns_probe_servicer(
+        &mut self,
+        servicer: Option<std::sync::Arc<crate::daemon::DnsProbeServicer>>,
+    ) {
+        if let RuntimeSystem::Macos(system) = self {
+            system.dns_probe_servicer = servicer;
+        }
+    }
+}
+
 impl DataplaneSystem for RuntimeSystem {
     fn set_generation(&mut self, generation: u64) {
         match self {
@@ -6937,6 +7000,14 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     /// entry point, exactly like the apply path asserts at apply time.
     pub fn assert_dns_protection(&mut self) -> Result<(), SystemError> {
         self.system.assert_dns_protection()
+    }
+
+    /// Crate-internal escape hatch for system-only plumbing (M1: bootstrap
+    /// probe servicer installation). Deliberately NOT part of the hardened
+    /// state-machine surface: it forwards a closure to the system and adds no
+    /// transitions, audit events, or policy decisions.
+    pub(crate) fn with_system<R>(&mut self, apply: impl FnOnce(&mut S) -> R) -> R {
+        apply(&mut self.system)
     }
 
     pub fn lan_access_enabled(&self) -> bool {
@@ -17431,9 +17502,85 @@ mod tests {
         assert!(err.to_string().contains("DNS protection is not active"));
     }
 
+    /// The probe targets the fixed loopback port 53535. Tests that BIND that
+    /// port and tests that require it to be FREE must not race each other
+    /// inside one test binary, so they share this lock.
+    #[cfg(target_os = "macos")]
+    fn dns_probe_port_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// M1 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3): a
+    /// `FullyProtected`-equivalent bootstrap-time probe IS answered when the
+    /// daemon's hoisted resolver socket is drained through the probe servicer
+    /// — the shared `build_dns_response` responder, zone not yet loaded
+    /// (SERVFAIL still proves a live listener). Ordering alone must never
+    /// fail an in-bootstrap protected-DNS apply.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_answered_via_bootstrap_servicer() {
+        let _guard = dns_probe_port_lock()
+            .lock()
+            .expect("dns probe port lock poisoned");
+        let socket = std::sync::Arc::new(
+            std::net::UdpSocket::bind("127.0.0.1:53535")
+                .expect("hoisted resolver bind should succeed (test process owns the probe port)"),
+        );
+        socket
+            .set_nonblocking(true)
+            .expect("hoisted resolver nonblocking should succeed");
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_probe_servicer =
+            Some(std::sync::Arc::new(crate::daemon::DnsProbeServicer::new(
+                socket,
+                crate::daemon::DnsResponderState::new_unresolved("rustynet"),
+            )));
+        system
+            .verify_loopback_resolver_live()
+            .expect("the bootstrap-time probe must be answered through the servicer");
+    }
+
+    /// M1 negative control: a servicer whose socket does NOT own the probe
+    /// port answers nothing, so the probe still fails closed under its
+    /// existing 2 s bound — the servicer adds servicing, never success by
+    /// fiat.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_probe_servicer_cannot_answer_without_the_port() {
+        let _guard = dns_probe_port_lock()
+            .lock()
+            .expect("dns probe port lock poisoned");
+        // Bound to an EPHEMERAL port, never :53535: the servicer drains a
+        // socket no probe can reach.
+        let socket =
+            std::sync::Arc::new(std::net::UdpSocket::bind("127.0.0.1:0").expect("ephemeral bind"));
+        socket
+            .set_nonblocking(true)
+            .expect("nonblocking should succeed");
+        let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        system.dns_probe_servicer =
+            Some(std::sync::Arc::new(crate::daemon::DnsProbeServicer::new(
+                socket,
+                crate::daemon::DnsResponderState::new_unresolved("rustynet"),
+            )));
+        let err = system
+            .verify_loopback_resolver_live()
+            .expect_err("a servicer that owns no listener must not answer the probe");
+        assert!(
+            err.to_string().contains("127.0.0.1:53535"),
+            "the error must name the unanswerable resolver endpoint: {err}"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_scoped_posture_fails_closed_without_live_resolver() {
+        let _guard = dns_probe_port_lock()
+            .lock()
+            .expect("dns probe port lock poisoned");
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
             .expect("macos system should construct");
         // No daemon is bound on 127.0.0.1:53535 in the test process, so the

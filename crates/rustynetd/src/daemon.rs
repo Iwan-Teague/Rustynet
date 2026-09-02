@@ -5854,24 +5854,6 @@ impl DaemonRuntime {
         message
     }
 
-    fn resolve_dns_ipv4_record(&self, fqdn: &str) -> Option<(Ipv4Addr, u32)> {
-        let envelope = self.dns_zone.as_ref()?;
-        let normalized = fqdn.trim_end_matches('.').to_ascii_lowercase();
-        for record in &envelope.bundle.records {
-            if normalized == record.fqdn
-                || record
-                    .aliases
-                    .iter()
-                    .any(|alias| normalized == format!("{alias}.{}", envelope.bundle.zone_name))
-            {
-                let ip = record.expected_ip.parse::<Ipv4Addr>().ok()?;
-                let ttl = u32::try_from(record.ttl_secs).ok()?;
-                return Some((ip, ttl));
-            }
-        }
-        None
-    }
-
     fn update_verified_traversal_index(&mut self, envelope: &TraversalBundleSetEnvelope) {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -10881,6 +10863,25 @@ impl DaemonRuntime {
         Ok(())
     }
 
+    /// Snapshot the DNS responder state the loopback resolver is currently
+    /// answering from (M1: taken once, at bootstrap-probe-servicer
+    /// installation, before `bootstrap()` loads any signed zone).
+    pub(crate) fn dns_responder_state(&self) -> DnsResponderState {
+        DnsResponderState {
+            zone_name: self.dns_zone_name.clone(),
+            zone: self.dns_zone.clone(),
+            zone_error: self.dns_zone_error.clone(),
+        }
+    }
+
+    /// M1: install the bootstrap-time DNS probe servicer. Only the macOS
+    /// system consults it (inside `verify_loopback_resolver_live`); the Linux
+    /// and Windows DNS paths have no loopback probe, so they ignore it.
+    pub(crate) fn install_dns_probe_servicer(&mut self, servicer: Arc<DnsProbeServicer>) {
+        self.controller
+            .with_system(|system| system.set_dns_probe_servicer(Some(servicer)));
+    }
+
     fn desired_exit_mode(&self) -> ExitMode {
         if self.selected_exit_node.is_some() {
             ExitMode::FullTunnel
@@ -11809,6 +11810,36 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         }
     };
     log::info!("rustynetd startup: daemon runtime constructed");
+    // M1 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3): bind
+    // the DNS resolver socket BEFORE `bootstrap()` and service the
+    // bootstrap-time protected-DNS probe from it. The probe
+    // (`verify_loopback_resolver_live`) runs inside bootstrap's
+    // `apply_dataplane_generation`; with the previous ordering (bind after
+    // bootstrap returns) no listener existed on the probe port yet, so every
+    // macOS apply failed deterministically, rolled back, and climbed the
+    // reconcile ladder to Permanent. The main loop below reuses this SAME
+    // socket (single bind, single owner — no double bind); the probe servicer
+    // answers through `build_dns_response`, the one hardened responder.
+    // Windows keeps its own retrying bind below (SCM restart race) and is
+    // unaffected: its DNS posture path has no loopback probe.
+    #[cfg(not(windows))]
+    let dns_socket: Arc<UdpSocket> = {
+        let socket = UdpSocket::bind(config.dns_resolver_bind_addr)
+            .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+        log::info!(
+            "rustynetd startup: dns resolver bound to {} (before bootstrap)",
+            config.dns_resolver_bind_addr
+        );
+        Arc::new(socket)
+    };
+    #[cfg(not(windows))]
+    runtime.install_dns_probe_servicer(Arc::new(DnsProbeServicer::new(
+        Arc::clone(&dns_socket),
+        runtime.dns_responder_state(),
+    )));
     runtime.bootstrap();
     // QH-55: the bootstrap outcome must be visible to the operator. A
     // bootstrap that entered a restricted state (recoverable or permanent)
@@ -12206,11 +12237,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         listener
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("socket nonblocking failed: {err}")))?;
-        let dns_socket = UdpSocket::bind(config.dns_resolver_bind_addr)
-            .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
-        dns_socket
-            .set_nonblocking(true)
-            .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+        // `dns_socket` was bound (and made nonblocking) BEFORE `bootstrap()`
+        // above — M1 — so the bootstrap-time probe and this serve loop drain
+        // the same socket. Nothing to bind here.
         let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
         // Anchor enrollment-consume listener (D-3 §7(1)): opt-in, fail-closed
         // bind — see `bind_anchor_enrollment_listener` for the pre-bind gates.
@@ -12456,7 +12485,95 @@ struct DnsQuestion {
     qclass: u16,
 }
 
+/// The state `build_dns_response` consults, split out of `DaemonRuntime` so
+/// the bootstrap-time DNS probe servicer (M1,
+/// MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3) can dispatch
+/// through the SAME responder while the runtime is mutably borrowed by
+/// `bootstrap()`. Snapshotted at servicer installation: during bootstrap the
+/// signed zone is not yet loaded, which is exactly what the live responder
+/// would also observe at that moment, so the snapshot can never answer
+/// differently from the runtime it was taken from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DnsResponderState {
+    zone_name: String,
+    zone: Option<DnsZoneBundleEnvelope>,
+    zone_error: Option<String>,
+}
+
+impl DnsResponderState {
+    /// A snapshot for a daemon that has not loaded a signed zone yet (the
+    /// bootstrap-time state). In-zone queries answer SERVFAIL, out-of-zone
+    /// REFUSED — identical to `build_dns_response` on such a runtime.
+    #[cfg(test)]
+    pub(crate) fn new_unresolved(zone_name: impl Into<String>) -> Self {
+        Self {
+            zone_name: zone_name.into(),
+            zone: None,
+            zone_error: None,
+        }
+    }
+}
+
+/// M1: the bootstrap-time DNS probe servicer. Owns the hoisted resolver
+/// socket (bound in `run_daemon` BEFORE `bootstrap()`) plus a responder
+/// snapshot, and answers probe queries through `build_dns_response_with` —
+/// the same parser and responder the main serve loop drains through. There is
+/// deliberately no second DNS implementation and no fallback branch: this is
+/// the main responder, drained at a second point in time (while `bootstrap()`
+/// still holds the runtime), so a `FullyProtected` node's in-bootstrap probe
+/// is answered without opening any DNS leak window.
+#[derive(Debug, Clone)]
+pub(crate) struct DnsProbeServicer {
+    socket: Arc<UdpSocket>,
+    state: DnsResponderState,
+}
+
+/// Equality is SOCKET IDENTITY (Arc pointer), not socket contents — a
+/// `UdpSocket` has no meaningful value equality. Two servicers are equal iff
+/// they drain the same hoisted socket.
+impl PartialEq for DnsProbeServicer {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.socket, &other.socket)
+    }
+}
+
+impl Eq for DnsProbeServicer {}
+
+impl DnsProbeServicer {
+    pub(crate) fn new(socket: Arc<UdpSocket>, state: DnsResponderState) -> Self {
+        Self { socket, state }
+    }
+
+    /// Drain at most one pending datagram from the hoisted socket and answer
+    /// it through the shared responder. Returns whether a datagram was
+    /// processed. Send/recv errors are best-effort: the probe's own existing
+    /// 2 s bound owns the failure semantics, exactly as it does when the main
+    /// serve loop drains.
+    pub(crate) fn service_once(&self) -> bool {
+        let mut buffer = [0u8; 1536];
+        match self.socket.recv_from(&mut buffer) {
+            Ok((length, peer_addr)) => {
+                if let Some(response) = build_dns_response_with(&self.state, &buffer[..length]) {
+                    if let Err(err) = self.socket.send_to(&response, peer_addr) {
+                        log::debug!("bootstrap dns probe servicer send failed: {err}");
+                    }
+                }
+                true
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => false,
+            Err(err) => {
+                log::debug!("bootstrap dns probe servicer recv failed: {err}");
+                false
+            }
+        }
+    }
+}
+
 fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>> {
+    build_dns_response_with(&runtime.dns_responder_state(), request)
+}
+
+fn build_dns_response_with(state: &DnsResponderState, request: &[u8]) -> Option<Vec<u8>> {
     let fallback_id = request
         .get(0..2)
         .and_then(|value| value.try_into().ok())
@@ -12475,7 +12592,7 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
             ));
         }
     };
-    if !dns_name_in_managed_zone(&query.qname, &runtime.dns_zone_name) {
+    if !dns_name_in_managed_zone(&query.qname, &state.zone_name) {
         return Some(render_dns_question_response(
             &query,
             DNS_RCODE_REFUSED,
@@ -12489,7 +12606,7 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
             None,
         ));
     }
-    if runtime.dns_zone.is_none() || runtime.dns_zone_error.is_some() {
+    if state.zone.is_none() || state.zone_error.is_some() {
         return Some(render_dns_question_response(
             &query,
             DNS_RCODE_SERVFAIL,
@@ -12497,7 +12614,7 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
         ));
     }
     if query.qtype == DNS_TYPE_A {
-        let answer = runtime.resolve_dns_ipv4_record(&query.qname);
+        let answer = resolve_dns_ipv4_record_in(state.zone.as_ref(), &query.qname);
         return Some(match answer {
             Some((ip, ttl)) => {
                 render_dns_question_response(&query, DNS_RCODE_NOERROR, Some((ip, ttl)))
@@ -12517,6 +12634,31 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
         DNS_RCODE_NOERROR,
         None,
     ))
+}
+
+/// Resolve an A record from a loaded signed-zone envelope (the free-function
+/// core of `DaemonRuntime::resolve_dns_ipv4_record`, shared with
+/// `build_dns_response_with` so the bootstrap probe servicer resolves through
+/// the identical lookup).
+fn resolve_dns_ipv4_record_in(
+    envelope: Option<&DnsZoneBundleEnvelope>,
+    fqdn: &str,
+) -> Option<(Ipv4Addr, u32)> {
+    let envelope = envelope?;
+    let normalized = fqdn.trim_end_matches('.').to_ascii_lowercase();
+    for record in &envelope.bundle.records {
+        if normalized == record.fqdn
+            || record
+                .aliases
+                .iter()
+                .any(|alias| normalized == format!("{alias}.{}", envelope.bundle.zone_name))
+        {
+            let ip = record.expected_ip.parse::<Ipv4Addr>().ok()?;
+            let ttl = u32::try_from(record.ttl_secs).ok()?;
+            return Some((ip, ttl));
+        }
+    }
+    None
 }
 
 fn parse_dns_question(request: &[u8]) -> Result<DnsQuestion, String> {
@@ -18222,6 +18364,44 @@ mod tests {
     // baseline. The tests are macOS-gated because the S1 re-assert (and the
     // reconcile else-arm that drives it) is macOS-only — they run on the
     // macOS CI leg, which is the platform the fix targets.
+
+    /// M1: the bootstrap probe servicer's snapshot responder answers
+    /// BYTE-IDENTICALLY to the daemon's live `build_dns_response` at the
+    /// moment the snapshot is taken (pre-zone-load): same parser, same
+    /// responder, no second DNS implementation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_probe_servicer_responder_matches_live_responder() {
+        let relay_addr: SocketAddr = "203.0.113.71:40055".parse().expect("relay addr");
+        let (runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-m1-responder-parity",
+            relay_addr,
+            "relay-test",
+        );
+        // The M1 snapshot is installed before bootstrap loads any signed
+        // zone, so it must observe an unresolved zone here.
+        let state = runtime.dns_responder_state();
+        assert!(
+            state.zone.is_none() && state.zone_error.is_none(),
+            "a fresh runtime must not have a signed zone loaded yet"
+        );
+        // The probe's exact wire query: `rustynet. IN A`, txid 0x524e.
+        let request: &[u8] = &[
+            0x52, 0x4e, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'r',
+            b'u', b's', b't', b'y', b'n', b'e', b't', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let via_runtime = super::build_dns_response(&runtime, request);
+        let via_snapshot = super::build_dns_response_with(&state, request);
+        assert_eq!(
+            via_runtime, via_snapshot,
+            "the snapshot responder must answer identically to the live responder"
+        );
+        assert!(
+            via_snapshot.is_some(),
+            "the always-answer property must hold through the snapshot core"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
 
     #[cfg(target_os = "macos")]
     fn dns_posture_test_runtime(tag: &str) -> (DaemonRuntime, std::path::PathBuf) {
