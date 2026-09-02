@@ -252,8 +252,9 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         &self,
         kind: RoleValidatorKind,
         expected_node_id: Option<&str>,
+        expected_dns_posture: Option<&str>,
     ) -> Result<(), AdapterError> {
-        run_typed_role_validator(self, kind, expected_node_id)
+        run_typed_role_validator(self, kind, expected_node_id, expected_dns_posture)
     }
 
     fn supports_role_validator(&self, kind: RoleValidatorKind) -> bool {
@@ -482,6 +483,7 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     adapter: &T,
     kind: RoleValidatorKind,
     expected_node_id: Option<&str>,
+    expected_dns_posture: Option<&str>,
 ) -> Result<(), AdapterError> {
     use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
     use crate::vm_lab::orchestrator::role_validation::{
@@ -602,7 +604,12 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
             dns_failclosed::validate_linux_dns_failclosed(&*shell, daemon_path, alias)
         }
         (RoleValidatorKind::DnsFailclosed, VmGuestPlatform::Macos) => {
-            dns_failclosed::validate_macos_dns_failclosed(&*shell, daemon_path, alias)
+            dns_failclosed::validate_macos_dns_failclosed(
+                &*shell,
+                daemon_path,
+                alias,
+                expected_dns_posture,
+            )
         }
         (RoleValidatorKind::DnsFailclosed, VmGuestPlatform::Windows) => {
             dns_failclosed::validate_windows_dns_failclosed(&*shell, daemon_path, alias)

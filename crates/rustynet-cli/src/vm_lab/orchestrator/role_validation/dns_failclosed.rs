@@ -42,14 +42,30 @@ pub fn validate_macos_dns_failclosed(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
     alias: &str,
+    expected_dns_posture: Option<&str>,
 ) -> Result<(), String> {
     const SUBCOMMAND: &str = "macos-dns-failclosed-check";
-    let argv = [daemon_path, SUBCOMMAND, "--no-fail-on-drift"];
+    // Fail closed: the orchestrator must thread the node's expected posture
+    // (decided from its planned role). Without it the check could verify the
+    // wrong contract and still pass.
+    let Some(expected_dns_posture) = expected_dns_posture else {
+        return Err(
+            "macos-dns-failclosed-check requires an expected DNS posture threaded from the node's planned role"
+                .to_owned(),
+        );
+    };
+    let argv = [
+        daemon_path,
+        SUBCOMMAND,
+        "--no-fail-on-drift",
+        "--posture",
+        expected_dns_posture,
+    ];
     let out = shell
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::vm_lab::evaluate_macos_dns_failclosed_report(alias, &stdout)?;
+    crate::vm_lab::evaluate_macos_dns_failclosed_report(alias, &stdout, expected_dns_posture)?;
     Ok(())
 }
 

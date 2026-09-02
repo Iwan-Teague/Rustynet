@@ -830,6 +830,18 @@ pub fn startup_recovery_manual_restore_message(
 /// configured); restoring and observing require it, because
 /// `networksetup -setdnsservers` / `-getdnsservers` are privileged
 /// operations.
+///
+/// Posture-preserving (M4, MacosClientDnsFailclosedDiagnosis_2026-09-02 §6):
+/// the guard touches ONLY the general DNS pins (networksetup) — it never
+/// removes the scoped `/etc/resolver/rustynet` file nor rewrites
+/// resolv.conf. A plain mesh client that crashed out of a full-protection
+/// apply therefore ends startup with its original DNS restored AND its
+/// scoped `*.rustynet` route intact — exactly the ScopedResolverOnly
+/// posture the three-state model assigns it, once the daemon re-binds its
+/// loopback listener. The scoped file pointing at the listener's fixed port
+/// across a daemon restart is correct-by-construction, so there is nothing
+/// to clean: deleting it here would break the client's mesh resolution
+/// until the next apply.
 pub fn run_startup_dns_recovery(
     state_path: &std::path::Path,
     helper_socket_path: Option<&std::path::Path>,
@@ -1010,6 +1022,31 @@ fn verify_and_retire_backup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_recovery_never_invokes_dns_failclosed_file_selectors() {
+        // M4 (MacosClientDnsFailclosedDiagnosis_2026-09-02 §6): startup
+        // residue cleanup must restore the general DNS pins ONLY. Removing
+        // the scoped /etc/resolver/rustynet file or rewriting resolv.conf
+        // here would strip a plain mesh client's `*.rustynet` route on every
+        // reboot — the guard's whole write surface is the networksetup
+        // restore argvs plus the backup document.
+        let source = include_str!("macos_dns_sc_protect.rs");
+        let start = source
+            .find("pub(crate) fn run_startup_dns_recovery_with")
+            .expect("the decision+act core must exist");
+        let body = &source[start..];
+        let end = body
+            .find("\nfn verify_and_retire_backup")
+            .expect("tail boundary");
+        let body = &body[..end];
+        for selector in crate::linux_dns_protect::DNS_FAILCLOSED_FILE_SELECTORS {
+            assert!(
+                !body.contains(selector),
+                "startup recovery must not invoke DNS failclosed file selector '{selector}'"
+            );
+        }
+    }
 
     const SAMPLE_SERVICE_LIST: &str = "\
 An asterisk (*) denotes that a network service is currently disabled.
