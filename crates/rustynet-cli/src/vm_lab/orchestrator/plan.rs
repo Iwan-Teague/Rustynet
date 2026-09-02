@@ -149,6 +149,12 @@ pub struct PlanBuilder {
     /// `--enable-chaos-suite`: append the opt-in chaos stages. They remain
     /// outside the default plan so a normal live lab does not inject faults.
     enable_chaos_suite: bool,
+    /// `--enable-clock-remediation`: arm the preflight stage's ONE-SHOT
+    /// clock-skew self-heal (HourOffset class only, fresh host timestamp,
+    /// re-measured through the same gate; still fails closed on residual
+    /// skew). OFF keeps the preflight failure text byte-identical (review
+    /// A-6).
+    enable_clock_remediation: bool,
     /// `--enable-negative-control`: append the opt-in T5 negative-control /
     /// adjudication stages. Like chaos they stay outside the default plan so a
     /// normal live lab never injects the negative-control faults.
@@ -262,6 +268,12 @@ impl PlanBuilder {
         self
     }
 
+    /// Arm the preflight stage's opt-in one-shot clock-skew self-heal.
+    pub fn with_enable_clock_remediation(mut self, enable_clock_remediation: bool) -> Self {
+        self.enable_clock_remediation = enable_clock_remediation;
+        self
+    }
+
     /// Append the opt-in T5 negative-control / adjudication stages to the plan.
     pub fn with_enable_negative_control(mut self, enable_negative_control: bool) -> Self {
         self.enable_negative_control = enable_negative_control;
@@ -311,6 +323,7 @@ impl PlanBuilder {
             role_switch_platform_macos,
             reboot_platform_macos,
             enable_chaos_suite,
+            enable_clock_remediation,
             enable_negative_control,
             enable_relay_forwarding_validation,
             skip_soak,
@@ -368,7 +381,9 @@ impl PlanBuilder {
             .filter(|id| include(id))
             .map(|id| -> Box<dyn OrchestrationStage> {
                 match id {
-                    StageId::Preflight => Box::new(PreflightStage),
+                    StageId::Preflight => Box::new(PreflightStage {
+                        clock_remediation_enabled: enable_clock_remediation,
+                    }),
                     StageId::PrepareSourceArchive => {
                         Box::new(PrepareSourceArchiveStage::new(source_mode, allow_dirty))
                     }
