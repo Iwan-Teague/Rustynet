@@ -2205,8 +2205,25 @@ the client-facing consequence is a deliberate re-pin, not a silent one.
    version-gated parser, and the anchor persistence path — exactly the surface where a subtle
    encoding mistake becomes either a signature-breaking incident or a smuggling vector. Item 1's
    review should focus on the verifier (custom-certificate-verifier code is the classic place to
-   get certificate selection wrong: end-entity vs chain, SAN handling, `ServerName` choice) and
-   on the policy switch's default-deny posture.
+    get certificate selection wrong: end-entity vs chain, SAN handling, `ServerName` choice) and
+    on the policy switch's default-deny posture.
+
+**Disposition 2026-09-02 — marker gate implemented (allowlist-primary, eleven SHAs).** Item 4 of
+the retirement plan landed: `crates/rustynet-cli/src/bin/check_delegated_edit_markers.rs`
+(std-only, exit 0/1/2 fail-closed) + `scripts/ci/delegated_edit_marker_gate.sh` + one CI step on
+the debian13 leg (checkout pinned to `fetch-depth: 0` so the scan window has history). Semantics
+are allowlist-primary per the adversarial review (§A2/§A5 of
+`Qh26HonestRetirementPlanAdversarialReview_2026-09-02.md`): MARKER_SCAN_DEPTH bounds only the
+recency of *new*-marker detection and never absolves unreviewed history, so the const allowlist
+table in the binary names every known-marked commit — all eleven, each independently verified an
+ancestor of `main` — rather than just the three original `rustynetd` WIP checkpoints. `MARKER_ALLOWLIST`
+extends the table at runtime and is documented as deliberate post-hoc rescue only. Zero marked
+commits AND zero allowlisted SHAs inside the window prints a loud-silence warning (gate may be
+scanning the wrong tip) without failing. `--self-test` builds a scratch repo and exercises
+fail / pass-with-allowlist / clean-pass. Residual accepted by the review: an actor can rewrite a
+message to drop the marker pair — the gate is a tripwire for accidental landings, not a defense
+against a malicious committer.
+
 
 ### QH-27 — Rebasing across a moved base while holding uncommitted work silently reverts other lines' commits
 **Severity: medium-high (data loss, and it nearly landed twice). Confidence: VERIFIED — two independent near-misses in one session.**
