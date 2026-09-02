@@ -150,7 +150,7 @@ pub const BLIND_ADDR_VALIDATION_TTL_SECS: u64 = 30;
 pub const BLIND_ADDR_VALIDATION_TAG_LEN: usize = 20;
 
 /// Artifact size: must be exactly the 32-byte `relay_challenge` slot.
-const BLIND_ADDR_ARTIFACT_BYTES: usize = 4 + 8 + BLIND_ADDR_VALIDATION_TAG_LEN;
+pub const BLIND_ADDR_ARTIFACT_BYTES: usize = 4 + 8 + BLIND_ADDR_VALIDATION_TAG_LEN;
 const _: () = assert!(BLIND_ADDR_ARTIFACT_BYTES == 32);
 
 /// Epoch cap for the address-validation key ring. Old-epoch artifacts die at
