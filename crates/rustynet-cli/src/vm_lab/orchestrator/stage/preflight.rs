@@ -63,6 +63,115 @@ fn validate_clock_skew(host_unix: u64, guest_unix: u64, max_skew_secs: u64) -> R
     }
 }
 
+/// Classification of a measured host/guest clock difference beyond the
+/// preflight tolerance. Pure diagnosis only — this type never mutates
+/// anything and the gate (`validate_clock_skew`) remains the sole arbiter of
+/// pass/fail; classification only enriches the failure with a verdict
+/// (WindowsClockSkewHardeningPlan_2026-09-02 §3, as amended by the
+/// adversarial review A-1/A-2).
+///
+/// There is deliberately no `Unparseable` variant (review A-2): the
+/// classifier receives already-parsed u64 timestamps, and a guest clock
+/// string that fails to parse stays an `execute()`-level failure via
+/// `parse_remote_unix_time` — never a classifier verdict.
+///
+/// Sign convention (review A-3): the skew is `s = host_unix - guest_unix`;
+/// `s > 0` means the guest clock is BEHIND the host. `HourOffset::
+/// offset_hours` carries this sign (e.g. the observed 3602 s case —
+/// host ahead of guest by one hour plus two seconds — is `HourOffset
+/// { offset_hours: 1 }`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClockVerdict {
+    /// |host_unix - guest_unix| <= max_skew_secs; the gate passes, no remedy
+    /// is needed.
+    WithinTolerance,
+    /// Beyond tolerance, but within the inclusive ±30 s band of a nonzero
+    /// whole-hour quantum — the RTC-localtime / TZ-convention signature.
+    /// `offset_hours` is signed per the convention above.
+    HourOffset { offset_hours: i64 },
+    /// Beyond tolerance with no hour quantum — an uncharacterized drift
+    /// (free-running clock, pause/restore lag). Diagnose-only (review A-1):
+    /// never remediated.
+    GenericDrift { skew_secs: i64 },
+}
+
+/// The inclusive ±30 s residual band around a whole-hour quantum that still
+/// classifies as an `HourOffset` (review A-7: inclusive; 3630 s → 1 h,
+/// 3631 s → not quantized).
+const HOUR_QUANTUM_RESIDUAL_BAND_SECS: u64 = 30;
+const SECS_PER_HOUR: u64 = 3600;
+
+/// Pure classifier for a measured clock skew. Side-effect-free; never panics;
+/// never returns a verdict that contradicts the gate: whenever
+/// `classify_clock_skew` returns anything, `validate_clock_skew` with the
+/// same inputs returns `Ok` iff the verdict is `WithinTolerance` (pinned by
+/// `clock_verdict_negative_never_ok_when_skew_exceeds_max`).
+///
+/// Hour-quantization rule (plan §3, band amended inclusive by review A-7):
+/// with `m = |s|` and `round(m/3600)` the nearest whole hour, the skew is
+/// hour-quantized iff `|m - round(m/3600)·3600| <= 30` and
+/// `round(m/3600) >= 1`.
+pub(crate) fn classify_clock_skew(
+    host_unix: u64,
+    guest_unix: u64,
+    max_skew_secs: u64,
+) -> ClockVerdict {
+    let magnitude = host_unix.abs_diff(guest_unix);
+    if magnitude <= max_skew_secs {
+        return ClockVerdict::WithinTolerance;
+    }
+    // Beyond tolerance: the gate has already failed (or will), regardless of
+    // which verdict is produced below. Classification can never upgrade a
+    // failing skew to a pass because the WithinTolerance branch is decided
+    // by exactly the same comparison the gate uses.
+    debug_assert!(
+        magnitude > 0,
+        "magnitude > max_skew_secs >= 0 implies a nonzero magnitude"
+    );
+    let sign: i64 = if host_unix >= guest_unix { 1 } else { -1 };
+
+    // Signed skew s = host - guest (review A-3). The magnitude can exceed
+    // i64::MAX only for |s| > i64::MAX seconds (~2.9e11 years), which no
+    // real Unix timestamp can produce; saturate instead of wrapping so the
+    // classifier stays total and panic-free. The conversion is therefore
+    // error-free for every physically possible input and the saturation is
+    // documented, not silent.
+    let skew_secs = i64::try_from(magnitude).unwrap_or(if sign > 0 { i64::MAX } else { i64::MIN });
+
+    // Nearest whole hour to magnitude/3600, computed with integer arithmetic:
+    // `magnitude % 3600 >= 3300` means the residual to the NEXT hour
+    // (`3600 - residual`) is within the 30 s band, so round up; otherwise
+    // round down.
+    let hours_down = magnitude / SECS_PER_HOUR;
+    let residual_down = magnitude % SECS_PER_HOUR;
+    let (hours, residual) = if residual_down >= SECS_PER_HOUR - HOUR_QUANTUM_RESIDUAL_BAND_SECS {
+        (hours_down + 1, SECS_PER_HOUR - residual_down)
+    } else {
+        (hours_down, residual_down)
+    };
+    // `round(m/3600) >= 1` guard (plan §3): a sub-hour skew that rounds to
+    // zero hours is generic drift, not a whole-hour offset. `hours` is bounded
+    // by u64::MAX/3600 + 1 (~5.1e15), so this i64 conversion cannot overflow.
+    if residual <= HOUR_QUANTUM_RESIDUAL_BAND_SECS && hours >= 1 {
+        let hours = i64::try_from(hours).unwrap_or(i64::MAX);
+        ClockVerdict::HourOffset {
+            offset_hours: sign * hours,
+        }
+    } else {
+        ClockVerdict::GenericDrift { skew_secs }
+    }
+}
+
+/// Whether the guarded self-heal (a later, flag-gated step) may attempt a
+/// remedy for this verdict. Only `HourOffset` qualifies (review A-1): its
+/// cause is characterized (RTC-localtime / TZ convention). `GenericDrift` is
+/// an unknown-cause signature — diagnose-only, never mutated.
+/// `WithinTolerance` needs no remedy. This predicate is the single place
+/// that policy is expressed.
+pub(crate) fn remediation_allowed(verdict: &ClockVerdict) -> bool {
+    matches!(verdict, ClockVerdict::HourOffset { .. })
+}
+
 pub struct PreflightStage;
 
 impl OrchestrationStage for PreflightStage {
@@ -304,6 +413,131 @@ mod tests {
         assert!(validate_clock_skew(1_000, 910, 90).is_ok());
         assert!(validate_clock_skew(1_000, 909, 90).is_err());
         assert!(validate_clock_skew(909, 1_000, 90).is_err());
+    }
+
+    #[test]
+    fn preflight_failure_text_unchanged_by_classifier() {
+        // The classifier is additive diagnosis; the gate's failure text is
+        // the exact string live-lab triage greps for and must not move
+        // (review A-6's OFF-path byte-identity, pinned pre-flag).
+        assert_eq!(
+            validate_clock_skew(1_785_005_541, 1_785_001_939, 90),
+            Err(
+                "guest clock skew is 3602s (maximum 90s; host=1785005541, guest=1785001939)"
+                    .to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn clock_verdict_passes_within_max() {
+        // skew == max is inside tolerance (extends the 90-pass edge in
+        // remote_clock_parser_and_skew_check_fail_closed).
+        assert!(matches!(
+            classify_clock_skew(1_000, 910, 90),
+            ClockVerdict::WithinTolerance
+        ));
+        assert!(matches!(
+            classify_clock_skew(910, 1_000, 90),
+            ClockVerdict::WithinTolerance
+        ));
+        assert!(matches!(
+            classify_clock_skew(5, 5, 0),
+            ClockVerdict::WithinTolerance
+        ));
+    }
+
+    #[test]
+    fn clock_verdict_fails_beyond_max() {
+        // skew == max+1 is beyond tolerance: the classifier must NOT say
+        // WithinTolerance (and the gate must still reject).
+        assert!(!matches!(
+            classify_clock_skew(1_000, 909, 90),
+            ClockVerdict::WithinTolerance
+        ));
+        assert!(validate_clock_skew(1_000, 909, 90).is_err());
+    }
+
+    #[test]
+    fn clock_verdict_classifies_hour_offset() {
+        // 3602 s: the observed signature (host ahead — guest BEHIND, sign +).
+        assert_eq!(
+            classify_clock_skew(1_785_005_541, 1_785_001_939, 90),
+            ClockVerdict::HourOffset { offset_hours: 1 }
+        );
+        // Mirrored input pair: guest ahead by one hour (sign -).
+        assert_eq!(
+            classify_clock_skew(1_785_001_939, 1_785_005_541, 90),
+            ClockVerdict::HourOffset { offset_hours: -1 }
+        );
+        // 7195 s: |7195 - 2*3600| = 5 <= 30 → rounds up to 2 hours.
+        assert_eq!(
+            classify_clock_skew(7_200, 5, 90),
+            ClockVerdict::HourOffset { offset_hours: 2 }
+        );
+    }
+
+    #[test]
+    fn clock_verdict_rejects_non_hour_quantum() {
+        // 1800: exactly between quanta. 7240: |7240 - 7200| = 40 > 30
+        // (review A-5 replaced the plan's contradictory 7205 example).
+        assert_eq!(
+            classify_clock_skew(1_800, 0, 90),
+            ClockVerdict::GenericDrift { skew_secs: 1_800 }
+        );
+        assert_eq!(
+            classify_clock_skew(7_240, 0, 90),
+            ClockVerdict::GenericDrift { skew_secs: 7_240 }
+        );
+    }
+
+    #[test]
+    fn clock_verdict_band_boundary_is_inclusive() {
+        // Review A-7: the ±30 s residual band is inclusive.
+        assert_eq!(
+            classify_clock_skew(3_630, 0, 90),
+            ClockVerdict::HourOffset { offset_hours: 1 }
+        );
+        assert_eq!(
+            classify_clock_skew(3_631, 0, 90),
+            ClockVerdict::GenericDrift { skew_secs: 3_631 }
+        );
+    }
+
+    #[test]
+    fn clock_verdict_generic_drift_gets_no_remedy() {
+        // Review A-1: only the hour-quantized signature may ever be
+        // remediated; generic drift is diagnose-only and within-tolerance
+        // needs nothing.
+        assert!(remediation_allowed(&ClockVerdict::HourOffset {
+            offset_hours: 1
+        }));
+        assert!(!remediation_allowed(&ClockVerdict::GenericDrift {
+            skew_secs: 1_800
+        }));
+        assert!(!remediation_allowed(&ClockVerdict::WithinTolerance));
+    }
+
+    #[test]
+    fn clock_verdict_negative_never_ok_when_skew_exceeds_max() {
+        // For EVERY skew beyond the maximum the verdict is never
+        // WithinTolerance AND the gate still errors — classification can
+        // never upgrade a failing skew to a pass.
+        let max: u64 = 90;
+        for skew in (max + 1)..=7_200 {
+            let (host, guest) = (1_000_000, 1_000_000 - skew);
+            assert!(
+                !matches!(
+                    classify_clock_skew(host, guest, max),
+                    ClockVerdict::WithinTolerance
+                ),
+                "skew {skew} classified WithinTolerance"
+            );
+            assert!(
+                validate_clock_skew(host, guest, max).is_err(),
+                "gate accepted skew {skew}"
+            );
+        }
     }
 
     #[test]
