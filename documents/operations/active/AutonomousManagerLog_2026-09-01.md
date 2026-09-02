@@ -122,3 +122,5 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - MERGE anchor-TLS security review (ACCEPT-WITH-FIXES; no P0/P1; AT-1 P2 handshake deadline, AT-2 P2 client pinning gap, seven P3s) and QH-01 plan (Option B: single quoting seam + newtype sinks + hoisted validators; anchors verified). QH-01 branch kept as the base for its review.
 - LAUNCH edit-1788315006210-41820-0 full (docs): C2 design amendment fold (A1-A6).
 - GATE QH-26 impl (a00b07bd): pinned fmt clean; clippy 0; 11 trust_evidence tests incl. the two new pins pass.
+- MERGE 2d0cc7d4 QH-26 items 1-3 (gate green incl. true-1.88 clippy). FIX (phase10 CI-only): `.with_dns_resolver_port(53535)` on the Linux nft-argv test fixture; `#[cfg(unix)]` on macos_assert_dns_protection_requires_active_dns_rules (verified it still runs+passes here). Committed + pushed.
+- LAUNCH QH-01 plan adversarial review (base = the plan's branch; first launch attempt was skipped by a transient tool-safety timeout — re-issued).
