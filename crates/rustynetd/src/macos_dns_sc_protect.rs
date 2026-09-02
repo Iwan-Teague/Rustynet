@@ -1395,12 +1395,19 @@ Thunderbolt Bridge
         // Default install: sibling of the daemon state file with the exact
         // suffix, on the durable volume — never under the old volatile
         // /private/var/run runtime dir.
-        let derived =
-            networksetup_dns_backup_path(std::path::Path::new(crate::daemon::DEFAULT_STATE_PATH));
+        // The expectation is derived from the platform's own default state
+        // path (macOS /usr/local/var/rustynet, Linux /var/lib/rustynet, the
+        // Windows ProgramData root): the property under test is "sibling of
+        // the state file with the exact suffix", not one platform's literal.
+        let default_state = std::path::Path::new(crate::daemon::DEFAULT_STATE_PATH);
+        let derived = networksetup_dns_backup_path(default_state);
+        let state_name = default_state
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("the default state path has a file name");
         assert_eq!(
             derived,
-            std::path::PathBuf::from("/usr/local/var/rustynet/rustynetd.state")
-                .with_file_name("rustynetd.state.networksetup-dns.failclosed.bak")
+            default_state.with_file_name(format!("{state_name}{NETWORKSETUP_DNS_BACKUP_SUFFIX}"))
         );
         assert_eq!(
             derived.file_name().and_then(|n| n.to_str()),
@@ -1411,7 +1418,9 @@ Thunderbolt Bridge
         assert!(!derived_str.contains("/run/"));
         assert!(!derived_str.contains("/tmp/"));
         assert!(derived_str.ends_with(NETWORKSETUP_DNS_BACKUP_SUFFIX));
-        assert!(derived_str.starts_with("/usr/local/var/rustynet/"));
+        if cfg!(target_os = "macos") {
+            assert!(derived_str.starts_with("/usr/local/var/rustynet/"));
+        }
 
         // A --state-root override moves the derivation with it: the path is
         // always derived from the daemon's ACTUAL state path, never
@@ -1654,29 +1663,32 @@ Thunderbolt Bridge
             std::fs::set_permissions(&backup_path, std::fs::Permissions::from_mode(0o400))
                 .expect("chmod 0400 should succeed for the file owner");
         }
+        // A 0400 document only refuses the write for a non-root owner: root
+        // bypasses mode bits (the Debian CI container runs as root), so the
+        // failure expectation is asserted only when the mode is enforceable.
+        #[cfg(unix)]
+        let mode_enforced = !nix::unistd::Uid::effective().is_root();
+        #[cfg(not(unix))]
+        let mode_enforced = false;
         let replacement = sample_backup();
         let result = write_networksetup_dns_backup(&backup_path, &replacement);
-        #[cfg(unix)]
-        {
+        if mode_enforced {
             assert!(
                 result.is_err(),
                 "writing over a 0400 document must fail closed"
             );
-        }
-        #[cfg(not(unix))]
-        {
+        } else {
             let _ = result;
         }
         // Prior document intact: same bytes, still readable, still valid.
         let restored = read_networksetup_dns_backup(&backup_path);
-        #[cfg(unix)]
-        assert_eq!(
-            restored.expect("prior backup must stay readable"),
-            Some(prior),
-            "a failed write must leave the prior backup untouched"
-        );
-        #[cfg(not(unix))]
-        {
+        if mode_enforced {
+            assert_eq!(
+                restored.expect("prior backup must stay readable"),
+                Some(prior),
+                "a failed write must leave the prior backup untouched"
+            );
+        } else {
             let _ = restored;
         }
         #[cfg(unix)]
