@@ -576,10 +576,9 @@ mod tests {
         // Step 4 migrates these call sites; the count must never grow back.
         assert!(
             total <= BASELINE_RAW_SINK_CALL_SITES,
-            "raw sink-call sites grew to {total} (baseline {}): a new call \
+            "raw sink-call sites grew to {total} (baseline {BASELINE_RAW_SINK_CALL_SITES}): a new call \
              site is interpolating an unvalidated string at a remote sink; \
-             route it through RemoteCommand + ValidatedArg instead",
-            BASELINE_RAW_SINK_CALL_SITES
+             route it through RemoteCommand + ValidatedArg instead"
         );
     }
 
