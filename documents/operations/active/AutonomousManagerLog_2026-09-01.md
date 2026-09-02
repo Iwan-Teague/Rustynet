@@ -630,3 +630,17 @@ that fails closed, closure-driven and unit-tested; pin stays 130; 2956 tests.
 
 Fleet deliberately lean this tick — one focused job (the release-blocking DNS fix). CI green through
 all recent merges.
+
+## Tick 26 — 2026-09-02 ~22:30–22:45Z
+
+DNS three-state fix (`edit-1788383472503-67869-0`) progressing: M1 committed (`cae15846`), now on M2
+(the apply restructure in phase10.rs), spend 939k/2M, no stall. I front-loaded my review by
+validating the M1 foundation: `DnsPosture{FullyProtected,ScopedResolverOnly,Untouched}` (no Half),
+`macos_dns_posture(exit_mode, serve_exit_node)` = FullyProtected iff FullTunnel||serve_exit else
+ScopedResolverOnly, with Untouched reserved for the protected_dns=false path. Correct and matches
+the corrected design. The `#[allow(dead_code)]` on M1's enum/fn is expected until M2 wires it — will
+confirm it is removed at final review.
+
+Fleet intentionally lean at 1 (the charter sanctions 1-2 for this release-blocking security fix; it
+runs autonomously and I am reserving review bandwidth for its full diff). CI green through the
+recent merges. main 4e8f17f3, clean.
