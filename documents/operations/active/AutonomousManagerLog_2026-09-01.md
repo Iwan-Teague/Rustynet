@@ -518,3 +518,30 @@ wiring: assert-not-actuate (no CLI pf mutation), seam-only (no format!-built she
 killswitch-precedence ordering (mutating check only pre-activation, restore verified), fail-closed
 evaluators (negative tests still active), the predicate staying false for macOS, and the NAT-identity
 bounding to 100.64.0.0/10. Fleet at 2 running.
+
+## Tick 22 — 2026-09-02 ~20:57–21:25Z
+
+(The Bash safety classifier was overloaded for ~2 min at tick start — waited it out, no impact.)
+
+**Two jobs finished; both merged after gating.**
+- **Gap A — enforce-path post-restart `state refresh`** (`10e7532a`): the macOS enforce path issues
+  `sudo -n env RUSTYNET_DAEMON_SOCKET=... /usr/local/bin/rustynet state refresh` through the
+  validated seam (argv pinned by `enforce_state_refresh_command_pins_exact_argv`, no format!-built
+  shell), and Linux e2e-enforce-host issues the same in-process refresh after its socket wait; a
+  non-zero refresh fails enforce, one attempt, no retry loop. Verified: touches ONLY ops_e2e.rs +
+  macos_install.rs + the plan doc (no rustynetd/units/Windows), raw-sink pin stays 130. Gate green
+  (clippy + whole cli 2942 tests).
+- **C2 exit-adapter post-merge refute review** (`5a95680f`): SOUND-WITH-FOLLOWUPS, all six claims
+  upheld. I re-verified assert-not-actuate myself — `macos_exit_traffic.rs` has ZERO pf/networksetup/
+  sysctl mutation, only read-only `pfctl -s state` parsing; the mutating precedence experiment is the
+  daemon's own subcommand. Three non-blocking follow-ups (F1 module dead-code lint, F2 killswitch-
+  precedence artifact has no freshness field, F3 doc hazard).
+
+**Launched** the F2 freshness-hardening plan (`edit-1788379317630-37501-0`, docs-only) — a stale
+valid-shape killswitch-precedence artifact at the fixed path could re-pass; the plan weighs
+print-verbatim-on-stdout vs a captured_at_unix/nonce field and picks the strictest-secure fix (this
+touches the rustynetd schema, so plan→review→impl per §1). CI green through all recent code merges.
+
+**PRIMARY THREAD now unblocked:** Gap A landed, so the enforce restart will deterministically issue
+a refresh. Rebuilding the vm-lab CLI, then re-running the rank-1 harvest on the (now-stable) network
+with the guest sampler capturing the macOS enforce→validate window to DIAGNOSE the DnsFailclosed.
