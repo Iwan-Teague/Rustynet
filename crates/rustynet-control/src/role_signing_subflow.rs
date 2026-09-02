@@ -980,8 +980,7 @@ mod tests {
                 let state = NodeTransitionState::replay_healthy(&plan, &steps, completed);
                 assert!(
                     state.fail_closed_violations(&plan).is_empty(),
-                    "{from}->{to} boundary {completed}: {:?}",
-                    state
+                    "{from}->{to} boundary {completed}: {state:?}"
                 );
             }
         }
