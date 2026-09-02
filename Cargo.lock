@@ -1403,7 +1403,6 @@ dependencies = [
  "ed25519-dalek",
  "nix 0.29.0",
  "rand",
- "rustls",
  "rustynet-advisor",
  "rustynet-control",
  "rustynet-crypto",

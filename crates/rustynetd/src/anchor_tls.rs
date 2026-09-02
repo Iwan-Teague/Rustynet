@@ -44,12 +44,16 @@ pub enum AnchorTlsError {
     CertGeneration(String),
     FileWrite {
         path: PathBuf,
-        context: &'static str,
+        // AT-6: owned context string. The previous `&'static str` forced
+        // dynamic diagnostics (e.g. the exact observed file mode) to be
+        // leaked with `Box::leak` to satisfy the lifetime; an owned `String`
+        // carries them without leaking.
+        context: String,
         source: std::io::Error,
     },
     Io {
         path: PathBuf,
-        context: &'static str,
+        context: String,
         source: std::io::Error,
     },
     CertificateParse(String),
@@ -107,11 +111,43 @@ impl std::error::Error for AnchorTlsError {}
 /// `Clone` is deliberately NOT derived: `PrivateKeyDer` is not `Clone` (key
 /// material must not be silently duplicated), and every consumer re-loads the
 /// same persisted identity instead of sharing a copy.
-#[derive(Debug)]
+///
+/// AT-4: `Debug` is a manual impl (the derived one would recurse into the
+/// `PrivateKeyDer`/`CertificateDer` buffers) printing only non-secret
+/// metadata: buffer lengths and the certificate fingerprint.
+///
+/// AT-3: on drop the retained private key DER is zeroized through
+/// `rustls::pki_types`' `Zeroize` impl, so the in-memory key does not
+/// outlive the identity as uninitialized heap. (Copies taken *inside* the
+/// ring signer when a `CertifiedKey` is built are owned by the signer and
+/// outside this struct's reach — the scrub here covers what we hold.)
 pub struct AnchorTlsIdentity {
     pub certificate_der: CertificateDer<'static>,
     pub key_der: PrivateKeyDer<'static>,
     cert_fingerprint_sha256_hex: String,
+}
+
+impl std::fmt::Debug for AnchorTlsIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnchorTlsIdentity")
+            .field(
+                "certificate_der_bytes",
+                &self.certificate_der.as_ref().len(),
+            )
+            .field("key_der_bytes", &self.key_der.secret_der().len())
+            .field(
+                "cert_fingerprint_sha256_hex",
+                &self.cert_fingerprint_sha256_hex,
+            )
+            .finish()
+    }
+}
+
+impl Drop for AnchorTlsIdentity {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.key_der.zeroize();
+    }
 }
 
 impl AnchorTlsIdentity {
@@ -185,14 +221,14 @@ fn generate_and_persist_anchor_tls_identity(
     if let Some(parent) = cert_path.parent() {
         fs::create_dir_all(parent).map_err(|source| AnchorTlsError::FileWrite {
             path: parent.to_path_buf(),
-            context: "create parent directory",
+            context: "create parent directory".to_owned(),
             source,
         })?;
         #[cfg(unix)]
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|source| {
             AnchorTlsError::FileWrite {
                 path: parent.to_path_buf(),
-                context: "restrict parent directory to 0700",
+                context: "restrict parent directory to 0700".to_owned(),
                 source,
             }
         })?;
@@ -217,7 +253,7 @@ fn write_private_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Ancho
         let _ = (bytes, mode);
         Err(AnchorTlsError::FileWrite {
             path: path.to_path_buf(),
-            context: "POSIX permission enforcement unavailable on this platform",
+            context: "POSIX permission enforcement unavailable on this platform".to_owned(),
             source: std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "anchor TLS identity custody requires POSIX file modes",
@@ -233,19 +269,19 @@ fn write_private_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Ancho
             .open(path)
             .map_err(|source| AnchorTlsError::FileWrite {
                 path: path.to_path_buf(),
-                context: "create",
+                context: "create".to_owned(),
                 source,
             })?;
         file.set_permissions(fs::Permissions::from_mode(mode))
             .map_err(|source| AnchorTlsError::FileWrite {
                 path: path.to_path_buf(),
-                context: "set permissions",
+                context: "set permissions".to_owned(),
                 source,
             })?;
         file.write_all(bytes)
             .map_err(|source| AnchorTlsError::FileWrite {
                 path: path.to_path_buf(),
-                context: "write",
+                context: "write".to_owned(),
                 source,
             })?;
         Ok(())
@@ -257,31 +293,20 @@ fn write_private_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Ancho
 /// on the certificate. The mode check is a Unix-only security control; on
 /// platforms without POSIX modes this fails closed with an explicit error
 /// rather than reading with unverified custody.
+///
+/// AT-5: the file is OPENED first (with `O_NOFOLLOW`, so a symlink at the
+/// path fails the open with `ELOOP` instead of being followed) and every
+/// validation — regular-file type and exact permission mode — then runs
+/// against `fstat` of the already-open descriptor. No second path resolution
+/// happens between validation and read, so a local attacker cannot swap the
+/// file between the check and the open (the previous `symlink_metadata` +
+/// separate `File::open` TOCTOU window is closed).
 fn read_tls_file(
     path: &Path,
     kind: &'static str,
     expected_mode: u32,
 ) -> Result<Vec<u8>, AnchorTlsError> {
     let _ = kind;
-    let metadata = fs::symlink_metadata(path).map_err(|source| AnchorTlsError::Io {
-        path: path.to_path_buf(),
-        context: "stat",
-        source,
-    })?;
-    if metadata.file_type().is_symlink() {
-        return Err(AnchorTlsError::Io {
-            path: path.to_path_buf(),
-            context: "symlinks are not allowed",
-            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "symlink"),
-        });
-    }
-    if !metadata.is_file() {
-        return Err(AnchorTlsError::Io {
-            path: path.to_path_buf(),
-            context: "not a regular file",
-            source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
-        });
-    }
     #[cfg(not(unix))]
     {
         // Fail closed: without POSIX modes the 0600/0644 custody check cannot
@@ -290,7 +315,7 @@ fn read_tls_file(
         let _ = expected_mode;
         Err(AnchorTlsError::Io {
             path: path.to_path_buf(),
-            context: "POSIX permission verification unavailable on this platform",
+            context: "POSIX permission verification unavailable on this platform".to_owned(),
             source: std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "anchor TLS identity custody requires POSIX file modes",
@@ -299,27 +324,46 @@ fn read_tls_file(
     }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            // Never follow a symlink at `path`: with O_NOFOLLOW the open
+            // itself fails (ELOOP) rather than silently reading the target.
+            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+            .open(path)
+            .map_err(|source| AnchorTlsError::Io {
+                path: path.to_path_buf(),
+                context: "open (symlink following disabled)".to_owned(),
+                source,
+            })?;
+        // fstat the OPEN descriptor: this observes exactly the inode that the
+        // read below will consume, so the type/mode checks cannot race with a
+        // later path swap.
+        let metadata = file.metadata().map_err(|source| AnchorTlsError::Io {
+            path: path.to_path_buf(),
+            context: "fstat".to_owned(),
+            source,
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(AnchorTlsError::Io {
+                path: path.to_path_buf(),
+                context: "not a regular file".to_owned(),
+                source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
+            });
+        }
         let mode = metadata.permissions().mode() & 0o777;
         if mode != expected_mode {
             return Err(AnchorTlsError::Io {
                 path: path.to_path_buf(),
-                context: Box::leak(
-                    format!("file permissions too open: {mode:o}; expected {expected_mode:o}")
-                        .into_boxed_str(),
-                ),
+                context: format!("file permissions too open: {mode:o}; expected {expected_mode:o}"),
                 source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permissions"),
             });
         }
-        let mut file = fs::File::open(path).map_err(|source| AnchorTlsError::Io {
-            path: path.to_path_buf(),
-            context: "open",
-            source,
-        })?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)
             .map_err(|source| AnchorTlsError::Io {
                 path: path.to_path_buf(),
-                context: "read",
+                context: "read".to_owned(),
                 source,
             })?;
         Ok(bytes)
@@ -330,12 +374,21 @@ fn load_anchor_tls_identity(
     cert_path: &Path,
     key_path: &Path,
 ) -> Result<AnchorTlsIdentity, AnchorTlsError> {
-    let cert_bytes = read_tls_file(cert_path, "certificate", 0o644)?;
-    let key_bytes = read_tls_file(key_path, "key", 0o600)?;
+    // AT-3: both PEM buffers hold the private key material (the key file in
+    // the clear, the cert file indirectly). `Zeroizing` scrubs them on drop —
+    // covering every early-return error path below — instead of leaving the
+    // plaintext copies as uninitialized heap after the DER is extracted.
+    let cert_bytes = zeroize::Zeroizing::new(read_tls_file(cert_path, "certificate", 0o644)?);
+    let key_bytes = zeroize::Zeroizing::new(read_tls_file(key_path, "key", 0o600)?);
     let certificate_der = CertificateDer::from_pem_slice(&cert_bytes)
         .map_err(|error| AnchorTlsError::CertificateParse(error.to_string()))?;
     let key_der = PrivateKeyDer::from_pem_slice(&key_bytes)
         .map_err(|error| AnchorTlsError::KeyRejected(error.to_string()))?;
+    // AT-9: an expired (or not-yet-valid, or wrongly-named) persisted
+    // certificate must refuse the bind rather than waiting to fail at the
+    // first handshake. Checked FIRST so an expired certificate reports its
+    // precise reason rather than failing the later pairing probe.
+    certificate_is_within_validity(&certificate_der)?;
     // Fail closed at startup if rustls cannot build a signer from the loaded
     // key: this is the earliest point a corrupt/mismatched key is detectable
     // without a handshake.
@@ -348,10 +401,49 @@ fn load_anchor_tls_identity(
     })
 }
 
+/// AT-9: verify that the loaded certificate is currently within its validity
+/// window (and that its embedded SAN still names [`ANCHOR_TLS_CERT_NAME`]) by
+/// running it through rustls' own webpki verifier with itself as the only
+/// trust anchor — a self-signed certificate presented as its own root is
+/// validated for expiry, self-signature, name, and EKU, using standard
+/// primitives (no custom crypto, no new dependency).
+fn certificate_is_within_validity(
+    certificate_der: &CertificateDer<'static>,
+) -> Result<(), AnchorTlsError> {
+    use rustls::client::danger::ServerCertVerifier as _;
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(certificate_der.clone()).map_err(|error| {
+        AnchorTlsError::CertificateParse(format!(
+            "certificate is not a usable self-signed identity: {error}"
+        ))
+    })?;
+    let verifier = rustls::client::WebPkiServerVerifier::builder(std::sync::Arc::new(roots))
+        .build()
+        .map_err(|error| AnchorTlsError::ServerConfig(error.to_string()))?;
+    let server_name = rustls::pki_types::ServerName::try_from(ANCHOR_TLS_CERT_NAME.to_string())
+        .map_err(|error| AnchorTlsError::CertificateParse(error.to_string()))?;
+    verifier
+        .verify_server_cert(
+            certificate_der,
+            &[],
+            &server_name,
+            &[],
+            rustls::pki_types::UnixTime::now(),
+        )
+        .map_err(|error| {
+            AnchorTlsError::CertificateParse(format!(
+                "certificate is not currently valid for the anchor identity: {error}"
+            ))
+        })?;
+    Ok(())
+}
+
 /// Builds the rustls `CertifiedKey` for the loaded identity. A cert/key
-/// mismatch is not detectable without a signature round-trip, so a mismatched
-/// persisted pair surfaces loudly at the first TLS handshake (the connection
-/// is refused) rather than silently.
+/// mismatch is not detectable from parsing alone (both files parse
+/// independently), so the pairing is proven by an in-process TLS 1.3
+/// handshake probe (see [`verify_cert_and_key_are_paired`]). A mismatched
+/// persisted pair therefore refuses at
+/// bind/load time instead of surfacing at the first TLS handshake.
 fn build_certified_key(
     certificate_der: &CertificateDer<'static>,
     key_der: &PrivateKeyDer<'static>,
@@ -360,11 +452,116 @@ fn build_certified_key(
     // the ring feature is pinned in Cargo.toml so this is the only provider.
     let signing_key = rustls::crypto::ring::sign::any_supported_type(key_der)
         .map_err(|error| AnchorTlsError::KeyRejected(error.to_string()))?;
+    verify_cert_and_key_are_paired(certificate_der, key_der)?;
     Ok(Arc::new(CertifiedKey {
         cert: vec![certificate_der.clone()],
         key: signing_key,
         ocsp: None,
     }))
+}
+
+/// AT-9: prove `certificate_der` and `key_der` belong to the same identity.
+/// Parsing alone cannot detect a mismatched pair (both files parse
+/// independently), and rustls' signature-verification primitives require an
+/// internally-constructed `DigitallySignedStruct`, so the pairing is proven
+/// the same way a real peer would: by completing ONE full TLS 1.3 handshake
+/// in-process over a loopback socket pair, where the server presents this
+/// exact cert/key pair and the client roots its trust in the certificate
+/// itself. rustls' CertificateVerify verification fails the handshake for a
+/// mismatched key, so the mismatch refuses at load/bind time instead of at
+/// the first external handshake. Single-threaded (both sockets are
+/// non-blocking, the sides are driven alternately), bounded (step cap), and
+/// startup-only — standard rustls primitives only.
+fn verify_cert_and_key_are_paired(
+    certificate_der: &CertificateDer<'static>,
+    key_der: &PrivateKeyDer<'static>,
+) -> Result<(), AnchorTlsError> {
+    let pairing_failure = |detail: String| {
+        AnchorTlsError::KeyRejected(format!(
+            "anchor TLS private key does not match the certificate \
+             (cert/key pairing probe failed: {detail})"
+        ))
+    };
+
+    // Server side: present exactly this cert/key pair.
+    let certified_key = Arc::new(CertifiedKey {
+        cert: vec![certificate_der.clone()],
+        key: rustls::crypto::ring::sign::any_supported_type(key_der)
+            .map_err(|error| pairing_failure(error.to_string()))?,
+        ocsp: None,
+    });
+    let resolver: Arc<dyn ResolvesServerCert> = Arc::new(AnchorCertResolver(certified_key));
+    let server_config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(ring_provider())
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|error| pairing_failure(error.to_string()))?
+            .with_no_client_auth()
+            .with_cert_resolver(resolver),
+    );
+
+    // Client side: trust exactly this certificate (self-signed root), so the
+    // handshake verifies the server's CertificateVerify — produced by
+    // `key_der` — against the certificate's public key.
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(certificate_der.clone())
+        .map_err(|error| pairing_failure(format!("certificate unusable as root: {error}")))?;
+    let client_config = rustls::ClientConfig::builder_with_provider(ring_provider())
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|error| pairing_failure(error.to_string()))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let server_name = rustls::pki_types::ServerName::try_from(ANCHOR_TLS_CERT_NAME.to_string())
+        .map_err(|error| pairing_failure(error.to_string()))?;
+    let client_conn = rustls::ClientConnection::new(Arc::new(client_config), server_name)
+        .map_err(|error| pairing_failure(error.to_string()))?;
+    let server_conn = rustls::ServerConnection::new(server_config)
+        .map_err(|error| pairing_failure(error.to_string()))?;
+
+    // Loopback socket pair, both ends non-blocking, driven alternately.
+    let listener = std::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .map_err(|error| pairing_failure(error.to_string()))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|error| pairing_failure(error.to_string()))?;
+    let client_sock =
+        std::net::TcpStream::connect(addr).map_err(|error| pairing_failure(error.to_string()))?;
+    let (server_sock, _) = listener
+        .accept()
+        .map_err(|error| pairing_failure(error.to_string()))?;
+    drop(listener);
+    client_sock
+        .set_nonblocking(true)
+        .map_err(|error| pairing_failure(error.to_string()))?;
+    server_sock
+        .set_nonblocking(true)
+        .map_err(|error| pairing_failure(error.to_string()))?;
+
+    let mut client = rustls::StreamOwned::new(client_conn, client_sock);
+    let mut server = rustls::StreamOwned::new(server_conn, server_sock);
+    const MAX_PROBE_STEPS: usize = 200;
+    for _ in 0..MAX_PROBE_STEPS {
+        if !client.conn.is_handshaking() && !server.conn.is_handshaking() {
+            return Ok(());
+        }
+        // Drive each side; a non-blocking socket surfaces "waiting on the
+        // peer" as WouldBlock, which is progress-neutral, not a failure.
+        for outcome in [
+            client.conn.complete_io(&mut client.sock),
+            server.conn.complete_io(&mut server.sock),
+        ] {
+            match outcome {
+                Ok(_) => {}
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err(pairing_failure(err.to_string())),
+            }
+        }
+    }
+    Err(pairing_failure(format!(
+        "handshake did not complete within {MAX_PROBE_STEPS} steps"
+    )))
 }
 
 /// Always resolves the anchor's single certificate. `ResolvesServerCertUsingSni`
@@ -558,6 +755,184 @@ mod tests {
         assert!(
             error.to_string().contains("permissions too open"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn debug_output_contains_no_key_or_certificate_bytes() {
+        let dir = TempTlsDir::new("debug");
+        let identity = load_or_generate_anchor_tls_identity(
+            &dir.cert_path(),
+            &dir.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect("generation must succeed");
+        let rendered = format!("{identity:?}");
+        // The manual Debug impl is metadata-only; assert both buffers appear
+        // solely as lengths and that no window of the key DER or certificate
+        // DER bytes survives into the rendering.
+        assert!(rendered.contains("AnchorTlsIdentity"));
+        assert!(rendered.contains("key_der_bytes"));
+        assert!(rendered.contains("cert_fingerprint_sha256_hex"));
+        assert!(!rendered.contains("-----BEGIN"));
+        for buffer in [
+            identity.key_der.secret_der(),
+            identity.certificate_der.as_ref(),
+        ] {
+            for window in buffer.windows(8) {
+                assert!(
+                    !rendered.as_bytes().windows(8).any(|part| part == window),
+                    "Debug output leaked key/certificate bytes: {rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mismatched_cert_key_pair_is_refused_at_load() {
+        // Two independently generated identities; splicing A's certificate
+        // with B's key must refuse at load (cert/key pairing probe), not at
+        // the first handshake.
+        let dir_a = TempTlsDir::new("pair-a");
+        let dir_b = TempTlsDir::new("pair-b");
+        let _ = load_or_generate_anchor_tls_identity(
+            &dir_a.cert_path(),
+            &dir_a.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect("identity A generation must succeed");
+        let _ = load_or_generate_anchor_tls_identity(
+            &dir_b.cert_path(),
+            &dir_b.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect("identity B generation must succeed");
+        let mixed = TempTlsDir::new("pair-mixed");
+        std::fs::copy(dir_a.cert_path(), mixed.cert_path()).expect("copy cert A");
+        std::fs::copy(dir_b.key_path(), mixed.key_path()).expect("copy key B");
+        let error = load_or_generate_anchor_tls_identity(
+            &mixed.cert_path(),
+            &mixed.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect_err("mismatched cert/key pair must be refused at load");
+        assert!(
+            error.to_string().contains("does not match the certificate"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn expired_certificate_is_refused_at_load() {
+        // Generate an identity whose validity window has already closed and
+        // persist it with the exact enforced file modes, so the refusal comes
+        // from the validity check rather than any custody check.
+        let key_pair =
+            rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key generation");
+        let mut params = rcgen::CertificateParams::new(vec![ANCHOR_TLS_CERT_NAME.to_string()])
+            .expect("certificate params");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "RustyNet Anchor Expired Test");
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params.key_usages = vec![rcgen::KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(30);
+        params.not_after = now - time::Duration::days(1);
+        let certificate = params.self_signed(&key_pair).expect("self-signed cert");
+        let dir = TempTlsDir::new("expired");
+        write_private_bytes(
+            dir.cert_path().as_path(),
+            certificate.pem().as_bytes(),
+            0o644,
+        )
+        .expect("write expired cert");
+        write_private_bytes(
+            dir.key_path().as_path(),
+            key_pair.serialize_pem().as_bytes(),
+            0o600,
+        )
+        .expect("write key");
+        let error = load_anchor_tls_identity(&dir.cert_path(), &dir.key_path())
+            .expect_err("expired certificate must be refused at load");
+        assert!(
+            error.to_string().contains("not currently valid"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn over_permissive_cert_file_is_refused_on_reload() {
+        // Mode enforcement was only negatively tested for the key file; the
+        // certificate's exact 0644 check deserves the same proof.
+        let dir = TempTlsDir::new("opencert");
+        let _ = load_or_generate_anchor_tls_identity(
+            &dir.cert_path(),
+            &dir.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect("generation must succeed");
+        fs::set_permissions(dir.cert_path(), fs::Permissions::from_mode(0o666))
+            .expect("open cert perms");
+        let error = load_or_generate_anchor_tls_identity(
+            &dir.cert_path(),
+            &dir.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect_err("over-permissive cert must be refused");
+        assert!(
+            error.to_string().contains("permissions too open"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn tls12_client_hello_cannot_be_processed_by_compiled_stack() {
+        // AT-9: TLS 1.3-only is enforced twice — the workspace builds rustls
+        // WITHOUT the `tls12` cargo feature AND `build_anchor_server_config`
+        // pins `with_protocol_versions(&[&TLS13])`. A live TLS 1.2-only
+        // ClientHello cannot be driven without enabling the `tls12` feature
+        // (which would un-compile the structural guarantee this test is here
+        // to prove), so this test asserts the structural half instead:
+        // `rustls::ALL_VERSIONS` includes TLS 1.2 exactly when the
+        // feature is compiled in, so this stack must list TLS 1.3 only —
+        // no TLS 1.2-only ClientHello has any version to negotiate.
+        assert_eq!(
+            rustls::ALL_VERSIONS.len(),
+            1,
+            "the `tls12` cargo feature must stay compiled out: \
+             only TLS 1.3 may exist in this stack"
+        );
+        let rendered = format!("{:?}", rustls::ALL_VERSIONS);
+        assert!(
+            rendered.contains("TLSv1_3") && !rendered.contains("TLSv1_2"),
+            "unexpected compiled version set: {rendered}"
+        );
+    }
+
+    #[test]
+    fn oversized_client_hello_record_is_rejected() {
+        let dir = TempTlsDir::new("oversize");
+        let identity = load_or_generate_anchor_tls_identity(
+            &dir.cert_path(),
+            &dir.key_path(),
+            "RustyNet Anchor Test",
+        )
+        .expect("generation must succeed");
+        let config = build_anchor_server_config(&identity).expect("server config");
+        let mut conn =
+            rustls::ServerConnection::new(std::sync::Arc::new(config)).expect("server connection");
+        // One handshake record whose declared payload length (0xffff, far
+        // above rustls' maximum record size) is offered by a peer; the
+        // connection must be rejected rather than read.
+        let mut record = vec![0x16, 0x03, 0x01, 0xff, 0xff];
+        record.resize(5 + 0xffff, 0);
+        let mut cursor = std::io::Cursor::new(record);
+        assert!(
+            conn.complete_io(&mut cursor).is_err(),
+            "an oversized ClientHello record must be rejected"
         );
     }
 
