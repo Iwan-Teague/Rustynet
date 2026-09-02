@@ -132,3 +132,10 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - CI e66bef4c: Windows leg GREEN, macOS leg GREEN; Debian: 1 failure — macos_assert_dns_protection_requires_active_dns_rules (canonicalizing /usr/sbin/networksetup fails on Linux; the test had never reached Debian before because nextest's fail-fast cancelled earlier runs). FIX: cfg(target_os = "macos") (was cfg(unix)). Note: Debian's nextest is fail-fast, so further masked failures may surface one per run.
 - LAUNCH edit-1788317290668-46137-0 full (docs): F-1 plan amendment fold (A1-A10).
 - RUNNING: QH-01 review (-44037-0, 426k tokens, 1 sub-agent), anchor-TLS fixes (-44455-0), C2 core (-44828-0), F-1 fold (-46137-0).
+
+## Tick 9 — 2026-09-02 04:06
+
+- CI: d6d1f4da (macOS-gate fix) in progress; 76f13684 red = the pre-fix Debian test. Waiting for the first fully-green run.
+- COMPLETE: QH-01 review (READY-WITH-AMENDMENTS ×8: inventory holds exactly (162 call lines); windows.rs:329-345 rest.join(" ") is the third argv-join site; ValidatedArg::path must pair shape with confinement; ssh_config option injection via a newline in User=; validators must own position not just alphabet; source-scan pin must land with the FIRST migration); C2 core (960 lines, 20 tests; gate running); F-1 fold (A1-A10 verified) → MERGED.
+- LAUNCH edit-1788318446954-55024-0 full (code, AUTHORIZATION): F-1 implementation, Option B amended — None ⇒ deny across admit_request/record_tokens/visible_models, explicit `unrestricted` marker with contradiction rule, mid-stream sever-on-narrowing, retire main.rs:705, doc/comment fixes, llm_default_deny_gates.sh pins; no CLI change (follow-up: `rustynet llm allow --unrestricted`).
+- RUNNING: anchor-TLS fixes (-44455-0, ~965k tokens), F-1 impl (-55024-0).
