@@ -21,6 +21,30 @@ use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 
 const VALIDATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Build the `sudo -n <validator argv>` remote command from the probe's argv,
+/// validating each element at the seam: the binary as a POSIX path, every
+/// other element as a CLI token. The rendered command is the quoted,
+/// space-joined argv, which the remote POSIX shell parses identically to the
+/// previous unquoted form for these token classes.
+fn build_validator_command(argv: &[String]) -> Result<ssh::RemoteCommand, AdapterError> {
+    use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
+
+    if argv.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "validator argv must not be empty".to_owned(),
+        });
+    }
+    let mut args = vec![
+        ValidatedArg::cli_token("sudo").map_err(AdapterError::from)?,
+        ValidatedArg::cli_token("-n").map_err(AdapterError::from)?,
+    ];
+    args.push(ValidatedArg::path(&argv[0]).map_err(AdapterError::from)?);
+    for token in &argv[1..] {
+        args.push(ValidatedArg::cli_token(token).map_err(AdapterError::from)?);
+    }
+    ssh::RemoteCommand::from_args("macos validator", &args)
+}
+
 /// macOS node adapter — W5.3 implementation.
 /// Dispatches all operations via SSH. Service management uses launchd.
 #[derive(Debug)]
@@ -207,15 +231,16 @@ impl NodeAdapter for MacosNodeAdapter {
             .build_argv_with_extra_args(op, MACOS_RUSTYNETD_PATH.as_ref(), extra_args)
             .map_err(|message| AdapterError::Protocol { message })?;
         let op_label = argv.get(1).cloned().unwrap_or_default();
-        // All argv elements come from `MacosDaemonProbe::build_argv`, which produces
-        // a fixed set of known-safe strings. No user-controlled input reaches argv.
+        // Every argv element is validated per class at the seam (path for the
+        // binary, cli_token for the rest) regardless of its origin, then
+        // rendered as a quoted, space-joined argv.
         //
         // Run with `sudo -n`: the validators inspect root-owned state
         // (`/usr/local/var/rustynet/keys`, launchd config). Without sudo the
         // checks report false "permission denied" drift. Same fix as the Linux
         // adapter; the lab macOS guest has passwordless sudo.
-        let script = format!("sudo -n {}", argv.join(" "));
-        let output = ssh::run_remote(&self.conn, &script, VALIDATOR_TIMEOUT)?;
+        let script = build_validator_command(&argv)?;
+        let output = ssh::run_remote(&self.conn, script.as_str(), VALIDATOR_TIMEOUT)?;
         let passed = ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
             op_label,
@@ -343,5 +368,30 @@ mod tests {
         .unwrap();
         let adapter = MacosNodeAdapter::new("mac", conn, Some("/Users/admin/rustynet".to_owned()));
         assert_eq!(adapter.workdir.as_deref(), Some("/Users/admin/rustynet"));
+    }
+
+    #[test]
+    fn build_validator_command_renders_quoted_argv_for_a_representative_validator() {
+        let argv = vec![
+            "/usr/local/bin/rustynetd".to_owned(),
+            "macos-key-custody-check".to_owned(),
+            "--no-fail-on-drift".to_owned(),
+        ];
+        let cmd = build_validator_command(&argv).unwrap();
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' '/usr/local/bin/rustynetd' 'macos-key-custody-check' \
+             '--no-fail-on-drift'"
+        );
+    }
+
+    #[test]
+    fn build_validator_command_rejects_empty_and_unsafe_argv() {
+        assert!(build_validator_command(&[]).is_err());
+        let injected = vec![
+            "/usr/local/bin/rustynetd".to_owned(),
+            "macos-key-custody-check; id".to_owned(),
+        ];
+        assert!(build_validator_command(&injected).is_err());
     }
 }
