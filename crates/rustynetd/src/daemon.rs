@@ -24487,6 +24487,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    /// QH-26 pin: the retired `tls13_valid` key must be REJECTED, never
+    /// silently ignored. A writer that still believes the key is enforced
+    /// must fail loudly rather than have its claim dropped (DA-01,
+    /// `DocCodeDiscrepancyAudit_2026-07-18.md`; see
+    /// `Qh26HonestRetirementPlan_2026-09-02.md` §2). The payload is
+    /// well-formed v3 with a valid signature over the injected key, so the
+    /// unknown-key rejection is the only defect under test.
+    #[test]
+    fn trust_evidence_parser_rejects_retired_tls13_key() {
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-retired-tls13-key");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let record = TrustEvidenceRecord {
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: unix_now(),
+            nonce: 77,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        // Re-sign a body carrying the retired key, using the same seed the
+        // helper signs with, so the signature stays valid and only the key
+        // itself is wrong.
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let body =
+            trust_evidence_payload(&record).replace("version=3\n", "version=3\ntls13_valid=true\n");
+        let signature = signing_key.sign(body.as_bytes());
+        std::fs::write(
+            &trust_path,
+            format!("{body}signature={}\n", hex_encode(&signature.to_bytes())),
+        )
+        .expect("trust file with retired key should be written");
+        let err = load_trust_evidence(&trust_path, &verifier_path, TrustPolicy::default(), None)
+            .expect_err("retired tls13_valid key must fail closed");
+        match err {
+            super::TrustBootstrapError::InvalidFormat(msg) => {
+                assert!(
+                    msg.contains("tls13_valid"),
+                    "unknown-key rejection must name the offending key, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// QH-26 companion pin: the retired `tls13_valid` field rode v2 evidence
+    /// files, and the required format is now v3. Any pre-retirement v2 file
+    /// must keep failing closed via the unsupported-version gate.
+    #[test]
+    fn trust_evidence_parser_rejects_version_2() {
+        let test_dir = secure_test_dir("rustynetd-trust-evidence-version-2");
+        let trust_path = test_dir.join("trust.evidence");
+        let verifier_path = test_dir.join("trust.verifier.pub");
+        let record = TrustEvidenceRecord {
+            signed_control_valid: true,
+            signed_data_age_secs: 0,
+            clock_skew_secs: 0,
+            updated_at_unix: unix_now(),
+            nonce: 78,
+        };
+        write_trust_file_with_record(&trust_path, &verifier_path, record);
+        // Re-sign the same payload with only the version demoted, so the
+        // version gate is the only defect under test.
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let body = trust_evidence_payload(&record).replace("version=3\n", "version=2\n");
+        let signature = signing_key.sign(body.as_bytes());
+        std::fs::write(
+            &trust_path,
+            format!("{body}signature={}\n", hex_encode(&signature.to_bytes())),
+        )
+        .expect("version=2 trust file should be written");
+        let err = load_trust_evidence(&trust_path, &verifier_path, TrustPolicy::default(), None)
+            .expect_err("version=2 trust evidence must fail closed");
+        match err {
+            super::TrustBootstrapError::InvalidFormat(msg) => {
+                assert!(
+                    msg.contains("unsupported"),
+                    "version rejection must be the unsupported-version class, got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got: {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     #[test]
     fn load_trust_evidence_allows_equal_watermark_when_payload_digest_matches() {
         let test_dir = secure_test_dir("rustynetd-trust-evidence-equal-match");
