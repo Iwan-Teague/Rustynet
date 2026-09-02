@@ -600,3 +600,33 @@ not binary fully-protected-or-untouched. The review must resolve this before any
 every citation, and confirm R4 is not a verifier weakening.
 
 Fleet: DNS review (60267) + R2 self-heal (45558) running.
+
+## Tick 25 — 2026-09-02 ~22:08–22:40Z
+
+**macOS DNS fix direction CORRECTED and the product fix launched.** The PHASE B review
+(`35e1ab55`, ACCEPT-WITH-AMENDMENTS) confirmed my split-horizon concern was right: leaving a plain
+client "fully untouched" would LEAK `*.rustynet` mesh-name queries to the LAN resolver (a control-8
+leak revealing mesh topology), because macOS already routes `*.rustynet` through
+`/etc/resolver/rustynet` to the loopback scoped resolver (daemon binds 127.0.0.1:53535 at
+daemon.rs:12209, verified; the scoped write is in apply_dns_protection at phase10.rs:4721-4740,
+verified). The corrected model is THREE postures, not two: FullyProtected (exit/full-tunnel: scoped
+resolver + all-service pins + pf DNS-block floor), **ScopedResolverOnly** (plain client: write ONLY
+/etc/resolver/rustynet, no pins, no floor — mesh names resolve with no leak, general DNS normal),
+and Untouched. The review also re-anchored every citation (the diagnosis's fresh-instance
+dns_protected=false clobber at :9554 was WRONG — a Windows test).
+
+**Launched the product fix** (`edit-1788383472503-67869-0`) as six ordered milestones: M1 pure
+DnsPosture decision, M2 the three-state apply restructure (fail-closed ordering for FullyProtected,
+fail-closed scoped-resolver-only for the client — the scoped write becomes fail-closed since it is
+the only protection there — no half state), M3 no floor-less re-render, M4 startup residue cleanup,
+M5 role/posture-scoped verifier that still fails every real leak (half-state always drift, exit
+contract unchanged, NO weakening), M6 fold A1 into the diagnosis. Gates BOTH rustynetd and
+rustynet-cli whole-crate. This is a security control — I will review its diff with full rigor
+before merge and likely run a post-implementation review.
+
+**Also merged: R2 clock-skew self-heal offline core** (`e9c243e0`): the unix_seconds validator, the
+--enable-clock-remediation flag (default OFF, byte-identical), the HourOffset-only one-shot re-measure
+that fails closed, closure-driven and unit-tested; pin stays 130; 2956 tests.
+
+Fleet deliberately lean this tick — one focused job (the release-blocking DNS fix). CI green through
+all recent merges.
