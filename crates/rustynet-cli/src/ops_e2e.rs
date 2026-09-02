@@ -842,9 +842,65 @@ pub fn execute_ops_e2e_enforce_host(
         "install-systemd enforce pass failed",
     )?;
 
+    // Gap A (MacosEnforceRefreshParityPlan_2026-09-02 §3.1): install-systemd
+    // restarted the daemon; wait for its control socket to re-bind, then issue
+    // the same IPC signed-state refresh the systemd trust-refresh unit issues
+    // (`rustynetd-trust-refresh.service` ExecStartPost
+    // `ops state-refresh-if-socket-present`). A non-ok refresh response FAILS
+    // the enforce — one attempt, no retry loop that could mask a failing
+    // daemon. The restart → socket wait → refresh order is pinned by
+    // `enforce_refresh_sequences_socket_wait_before_refresh`.
+    let refresh_message = drive_post_restart_state_refresh(
+        &mut || wait_for_daemon_socket_locally(ENFORCE_DAEMON_SOCKET, 20, 2),
+        &mut || refresh_signed_state_via_ipc(ENFORCE_DAEMON_SOCKET),
+    )?;
+    println!("[enforce-host] {refresh_message}");
+
     Ok(format!(
         "e2e enforce host complete: role={role} node_id={node_id}",
     ))
+}
+
+/// The daemon control socket the Linux enforce path waits on and refreshes
+/// against (the lab install unit's `RUSTYNET_DAEMON_SOCKET`).
+#[cfg(not(windows))]
+const ENFORCE_DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
+
+/// Issue the IPC signed-state refresh against the daemon control socket and
+/// map a non-zero result to an `Err`. One attempt only.
+///
+/// The IPC client (`send_command_with_socket`) is bin-local (main.rs), so —
+/// exactly like the existing in-guest worker
+/// `execute_ops_e2e_worker_refresh_signed_state` — this drives the same IPC
+/// command (`state refresh` → `IpcCommand::StateRefresh` on the daemon
+/// control socket) by re-invoking this binary in-process-context with
+/// `RUSTYNET_DAEMON_SOCKET` pinned to the lab socket, the same command the
+/// systemd trust-refresh unit's ExecStartPost issues.
+#[cfg(not(windows))]
+fn refresh_signed_state_via_ipc(socket_path: &str) -> Result<String, String> {
+    run_status(
+        "rustynet",
+        &["state", "refresh"],
+        &[("RUSTYNET_DAEMON_SOCKET", socket_path)],
+        "signed state refresh failed",
+    )?;
+    Ok(format!(
+        "signed state refresh ok: IpcCommand::StateRefresh accepted by {socket_path}"
+    ))
+}
+
+/// The enforce-path refresh sequencing driver (Gap A, ordering pin): the
+/// post-restart signed-state refresh is issued ONLY after the daemon socket
+/// wait has succeeded, and a refresh `Err` propagates as the enforce error.
+/// Closure-driven so a unit test pins the order and the error propagation
+/// without touching a live socket.
+#[cfg(not(windows))]
+fn drive_post_restart_state_refresh(
+    wait_socket: &mut dyn FnMut() -> Result<(), String>,
+    refresh: &mut dyn FnMut() -> Result<String, String>,
+) -> Result<String, String> {
+    wait_socket()?;
+    refresh()
 }
 
 /// Embedded macOS launchd install/enforce script. Same file the orchestrator
@@ -7511,12 +7567,72 @@ mod tests {
     use super::{
         AssignmentRefreshEnv, REMOTE_SUDO_PROMPT, RUSTYNET_SELF, RUSTYNETD_INSTALL_PATH,
         RUSTYNETD_SELF, assignment_verifier_key_hex, decode_base64, decode_hex_32,
-        ensure_safe_token, extract_last_assignment_generated, issue_assignment_bundle_artifacts,
-        issue_dns_zone_bundle_artifacts, issue_traversal_bundle_artifacts,
-        issue_two_node_traversal_artifacts, parse_generic_allow_specs,
-        parse_generic_assignment_specs, parse_generic_nodes, resolve_self_program,
-        system_useradd_args, traversal_verifier_key_hex, write_assignment_refresh_env,
+        drive_post_restart_state_refresh, ensure_safe_token, extract_last_assignment_generated,
+        issue_assignment_bundle_artifacts, issue_dns_zone_bundle_artifacts,
+        issue_traversal_bundle_artifacts, issue_two_node_traversal_artifacts,
+        parse_generic_allow_specs, parse_generic_assignment_specs, parse_generic_nodes,
+        resolve_self_program, system_useradd_args, traversal_verifier_key_hex,
+        write_assignment_refresh_env,
     };
+
+    /// Gap A (MacosEnforceRefreshParityPlan_2026-09-02 §3.1) ordering pin:
+    /// the post-restart signed-state refresh is issued ONLY after the daemon
+    /// socket wait succeeds, and a refresh `Err` propagates as the enforce
+    /// error (one attempt — no retry that could mask a failing daemon).
+    #[test]
+    fn enforce_refresh_sequences_socket_wait_before_refresh() {
+        // Both driver closures record into one shared log; RefCell lets the
+        // two `FnMut` closures each borrow it without aliasing `&mut`.
+        let log = std::cell::RefCell::new(Vec::<&'static str>::new());
+
+        // (a) Socket wait fails ⇒ refresh never issued, wait error propagates.
+        let err = drive_post_restart_state_refresh(
+            &mut || {
+                log.borrow_mut().push("wait");
+                Err("socket never came up".to_owned())
+            },
+            &mut || {
+                log.borrow_mut().push("refresh");
+                Ok("refresh ok".to_owned())
+            },
+        )
+        .expect_err("wait failure must propagate");
+        assert_eq!(*log.borrow(), vec!["wait"]);
+        assert_eq!(err, "socket never came up");
+
+        // (b) Wait succeeds ⇒ refresh runs, in that order.
+        *log.borrow_mut() = Vec::new();
+        let message = drive_post_restart_state_refresh(
+            &mut || {
+                log.borrow_mut().push("wait");
+                Ok(())
+            },
+            &mut || {
+                log.borrow_mut().push("refresh");
+                Ok("refresh ok".to_owned())
+            },
+        )
+        .expect("refresh must run after a successful wait");
+        assert_eq!(*log.borrow(), vec!["wait", "refresh"]);
+        assert_eq!(message, "refresh ok");
+
+        // (c) Refresh fails after a good wait ⇒ the refresh error IS the
+        // enforce error, not a warning.
+        *log.borrow_mut() = Vec::new();
+        let err = drive_post_restart_state_refresh(
+            &mut || {
+                log.borrow_mut().push("wait");
+                Ok(())
+            },
+            &mut || {
+                log.borrow_mut().push("refresh");
+                Err("signed state refresh failed".to_owned())
+            },
+        )
+        .expect_err("refresh failure must fail the enforce");
+        assert_eq!(*log.borrow(), vec!["wait", "refresh"]);
+        assert_eq!(err, "signed state refresh failed");
+    }
 
     /// MAC-D12 source pin: the bundle-issuance credential materializer
     /// (`materialize_signing_passphrase_workspace`) must NEVER spawn

@@ -866,6 +866,51 @@ fn build_auto_tunnel_enforce_install_script(
     )
 }
 
+/// Budget for the post-restart `state refresh` IPC: the daemon re-applies the
+/// signed dataplane generation (trust, peers, DNS posture) synchronously
+/// before answering, which is bounded work on the lab guests.
+const STATE_REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The validated-argv post-restart signed-state refresh command (Gap A,
+/// `MacosEnforceRefreshParityPlan_2026-09-02` §3.1):
+/// `sudo -n env RUSTYNET_DAEMON_SOCKET=<socket> /usr/local/bin/rustynet state
+/// refresh` — the same command shape the C6 role-transition path
+/// (`vm_lab/mod.rs`) and `macos_daemon_readiness_probe` use to reach the
+/// daemon's control socket in-guest, and the same IPC the systemd
+/// trust-refresh unit issues on Linux via
+/// `ops state-refresh-if-socket-present`. Split out so the exact argv is
+/// pinned by test without SSH (QH-01 seam: typed `ValidatedArg` tokens only —
+/// no `format!`-built shell with runtime values).
+fn macos_state_refresh_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    ssh::RemoteCommand::from_args(
+        "macos daemon state refresh",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("env")?,
+            ValidatedArg::cli_token(&format!("RUSTYNET_DAEMON_SOCKET={MACOS_DAEMON_SOCKET}"))?,
+            ValidatedArg::path(MACOS_RUSTYNET_PATH)?,
+            ValidatedArg::cli_token("state")?,
+            ValidatedArg::cli_token("refresh")?,
+        ],
+    )
+}
+
+/// The enforce-path refresh sequencing driver (Gap A, ordering pin): the
+/// post-restart signed-state refresh is issued ONLY after the daemon socket
+/// wait has succeeded, and a refresh `Err` propagates as the enforce error.
+/// Closure-driven so a unit test pins the order and the error propagation
+/// without SSH. One attempt only — the refresh is never retried, so a
+/// persistently failing daemon surfaces loudly instead of being masked by a
+/// loop.
+fn drive_enforce_post_restart_refresh(
+    wait_socket: &mut dyn FnMut() -> Result<(), AdapterError>,
+    refresh: &mut dyn FnMut() -> Result<String, AdapterError>,
+) -> Result<String, AdapterError> {
+    wait_socket()?;
+    refresh()
+}
+
 /// Enforce production runtime for the macOS daemon.
 ///
 /// Mirrors `enforce_daemon` on Linux: re-installs the launchd plist with
@@ -880,6 +925,13 @@ fn build_auto_tunnel_enforce_install_script(
 /// Max-age windows: 86400 s (24 h). The pipeline issues bundles once and does
 /// not rotate them; production daemons rely on periodic refresh timers that do
 /// not exist in the lab. This matches the Linux lab setting.
+///
+/// Self-contained refresh (Gap A, `MacosEnforceRefreshParityPlan_2026-09-02`
+/// §3.1): after the restart the enforce path waits for the daemon socket, then
+/// issues the IPC signed-state refresh (`state refresh`) and FAILS on a
+/// non-zero result — one attempt, no retry loop. A refresh error propagates as
+/// the enforce error so a failing daemon surfaces loudly instead of the stage
+/// passing on stale signed state.
 pub fn enforce_daemon(
     conn: &NodeConnection,
     alias: &str,
@@ -960,7 +1012,22 @@ pub fn enforce_daemon(
     // its own. Wait for the socket to reappear so a mid-restart daemon does not
     // produce a spurious validation failure. Mirrors install_daemon and the
     // Windows enforce path's post-restart readiness wait.
-    wait_for_macos_daemon_socket(conn)?;
+    //
+    // Gap A (MacosEnforceRefreshParityPlan_2026-09-02 §3.1): after the socket
+    // wait succeeds, issue the IPC signed-state refresh so the enforce path is
+    // self-contained instead of timer-lucky (macOS installs no trust-refresh
+    // timer). A non-zero refresh result FAILS the enforce — one attempt, no
+    // retry loop that could mask a failing daemon. Ordering pinned by
+    // `enforce_refresh_runs_only_after_socket_wait_and_propagates_refresh_error`.
+    let refresh = macos_state_refresh_command()?;
+    let refresh_message = drive_enforce_post_restart_refresh(
+        &mut || wait_for_macos_daemon_socket(conn),
+        &mut || {
+            run_validated(conn, &refresh, STATE_REFRESH_TIMEOUT)
+                .map(|stdout| format!("macOS daemon state refresh ok: {}", stdout.trim()))
+        },
+    )?;
+    eprintln!("[macos daemon enforce] {refresh_message}");
     Ok(())
 }
 
@@ -3419,5 +3486,89 @@ mod tests {
                  bootout and the helper bootout"
             );
         }
+    }
+
+    /// Gap A (MacosEnforceRefreshParityPlan_2026-09-02 §3.1): the post-restart
+    /// signed-state refresh goes through the validated-argument seam with the
+    /// exact argv the C6 role-transition path and `macos_daemon_readiness_probe`
+    /// use to reach the daemon control socket in-guest —
+    /// `sudo -n env RUSTYNET_DAEMON_SOCKET=… /usr/local/bin/rustynet state
+    /// refresh` — never a `format!`-built shell string.
+    #[test]
+    fn enforce_state_refresh_command_pins_exact_argv() {
+        let cmd = macos_state_refresh_command().expect("validated refresh command");
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' 'env' \
+             'RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock' \
+             '/usr/local/bin/rustynet' 'state' 'refresh'",
+            "macOS enforce state-refresh argv drifted from the pinned seam contract"
+        );
+    }
+
+    /// Gap A ordering pin: the refresh is issued ONLY after the socket wait
+    /// has succeeded, and a refresh `Err` propagates as the enforce error
+    /// (one attempt — no retry that could mask a failing daemon).
+    #[test]
+    fn enforce_refresh_runs_only_after_socket_wait_and_propagates_refresh_error() {
+        // Both driver closures record into one shared log; RefCell lets the
+        // two `FnMut` closures each borrow it without aliasing `&mut`.
+        let log = std::cell::RefCell::new(Vec::<&'static str>::new());
+
+        // (a) Socket wait fails ⇒ refresh never issued, wait error propagates.
+        let err = drive_enforce_post_restart_refresh(
+            &mut || {
+                log.borrow_mut().push("wait");
+                Err(AdapterError::Protocol {
+                    message: "socket never came up".to_owned(),
+                })
+            },
+            &mut || {
+                log.borrow_mut().push("refresh");
+                Ok("refresh ok".to_owned())
+            },
+        )
+        .expect_err("wait failure must propagate");
+        assert_eq!(
+            *log.borrow(),
+            vec!["wait"],
+            "refresh must not run after a failed wait"
+        );
+        assert!(err.to_string().contains("socket never came up"));
+
+        // (b) Wait succeeds ⇒ refresh runs, in that order.
+        *log.borrow_mut() = Vec::new();
+        let message = drive_enforce_post_restart_refresh(
+            &mut || {
+                log.borrow_mut().push("wait");
+                Ok(())
+            },
+            &mut || {
+                log.borrow_mut().push("refresh");
+                Ok("refresh ok".to_owned())
+            },
+        )
+        .expect("refresh must run after a successful wait");
+        assert_eq!(*log.borrow(), vec!["wait", "refresh"]);
+        assert_eq!(message, "refresh ok");
+
+        // (c) Refresh fails after a good wait ⇒ the refresh error IS the
+        // enforce error, not a warning.
+        *log.borrow_mut() = Vec::new();
+        let err = drive_enforce_post_restart_refresh(
+            &mut || {
+                log.borrow_mut().push("wait");
+                Ok(())
+            },
+            &mut || {
+                log.borrow_mut().push("refresh");
+                Err(AdapterError::Protocol {
+                    message: "state refresh failed".to_owned(),
+                })
+            },
+        )
+        .expect_err("refresh failure must fail the enforce");
+        assert_eq!(*log.borrow(), vec!["wait", "refresh"]);
+        assert!(err.to_string().contains("state refresh failed"));
     }
 }
