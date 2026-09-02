@@ -3881,23 +3881,36 @@ impl MacosCommandSystem {
         if self.dns_protected {
             return true;
         }
-        let Ok(services) = self.enumerate_networksetup_services() else {
-            return true;
-        };
-        for service in &services {
-            match self.read_networksetup_service_dns(service) {
-                Ok(Some(servers)) => {
-                    if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
-                        return true;
-                    }
-                }
-                Ok(None) => {}
-                // A service we cannot read is a service that MAY be pinned:
-                // keep the floor.
-                Err(_) => return true,
-            }
+        // networksetup DNS service pins are a macOS-only concept. On other
+        // platforms a MacosCommandSystem is exercised only by the pure-logic
+        // pf-render tests, where there is no networksetup to enumerate (the
+        // enumeration would error and the macOS fail-closed default below
+        // would spuriously latch the DNS floor). No live loopback pin can
+        // exist off macOS, so the M3 latch does not fire.
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
         }
-        false
+        #[cfg(target_os = "macos")]
+        {
+            let Ok(services) = self.enumerate_networksetup_services() else {
+                return true;
+            };
+            for service in &services {
+                match self.read_networksetup_service_dns(service) {
+                    Ok(Some(servers)) => {
+                        if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
+                            return true;
+                        }
+                    }
+                    Ok(None) => {}
+                    // A service we cannot read is a service that MAY be pinned:
+                    // keep the floor.
+                    Err(_) => return true,
+                }
+            }
+            false
+        }
     }
 
     fn render_pf_rules(&self, strict_fail_closed: bool) -> Result<String, SystemError> {
