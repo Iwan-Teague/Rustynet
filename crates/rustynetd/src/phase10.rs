@@ -16903,10 +16903,11 @@ mod tests {
         );
     }
 
-    // The scripted networksetup binary is resolved by absolute Unix path; on
-    // Windows that path is not absolute and the prerequisite check refuses it
-    // before the assertion under test is reached.
-    #[cfg(unix)]
+    // The active-protection half resolves the real networksetup binary by its
+    // absolute macOS path; on Linux the file does not exist and on Windows the
+    // path is not even absolute, so on both the prerequisite check fails
+    // before the drift assertion under test is reached. macOS-host only.
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_assert_dns_protection_requires_active_dns_rules() {
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
