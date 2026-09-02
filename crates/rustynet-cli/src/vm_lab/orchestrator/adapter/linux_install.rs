@@ -481,6 +481,7 @@ mod tests {
             substrate_record: None,
             inventory_path: None,
             macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx).expect("env");
         assert!(
@@ -540,6 +541,7 @@ mod tests {
             substrate_record: None,
             inventory_path: None,
             macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
         };
         for role in [
             NodeRole::Client,
