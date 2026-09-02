@@ -564,13 +564,6 @@ use crate::vm_lab::orchestrator::error::AdapterError;
 /// adapter and the stage can never disagree about the expected prefix.
 pub(crate) const MACOS_EXIT_EXPECTED_MESH_CIDR: &str = "100.64.0.0/10";
 
-/// Guest-side path the daemon's own `macos-exit-killswitch-precedence-check`
-/// writes its schema-v1 artifact to. A compile-time constant, validated at
-/// the seam like every other argv element — no runtime value ever reaches a
-/// command line unvalidated.
-pub(crate) const MACOS_EXIT_KILLSWITCH_PRECEDENCE_ARTIFACT_PATH: &str =
-    "/usr/local/var/rustynet/macos_exit_killswitch_precedence.json";
-
 /// The mutating precedence experiment writes + restores the anchor; bound it
 /// generously but finitely like every other adapter command.
 const EXIT_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -611,6 +604,50 @@ pub(crate) fn capture_exit_snapshot(conn: &NodeConnection) -> Result<String, Ada
     ssh::run_remote(conn, script.as_str(), EXIT_COMMAND_TIMEOUT)
 }
 
+/// Build the daemon's killswitch-precedence check invocation — NO `--output`
+/// argument, so the guest never writes an artifact file at a fixed path. The
+/// report reaches this adapter only as the stdout of the just-run command,
+/// which IS the freshness binding: no file a prior run (or a stale guest
+/// binary) left behind can ever be read, because nothing is read.
+fn killswitch_precedence_check_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    daemon_command(
+        "macos exit killswitch precedence check",
+        "macos-exit-killswitch-precedence-check",
+        &[],
+    )
+}
+
+/// Extract the precedence report from the captured stdout of the check —
+/// fail-closed on every non-verbatim shape: empty output, the old
+/// confirmation-line-only stdout, junk wrapped around a JSON document, a
+/// truncated document, or a non-object document. There is deliberately no
+/// fallback branch: the check's stdout is the ONLY evidence channel (design
+/// §0 decision 2; F2 freshness fix — capture-on-this-invocation is the
+/// binding, so no path reads a file).
+fn extract_precedence_report_stdout(raw: &str) -> Result<&str, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("empty precedence check stdout: no report document was captured".to_owned());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        format!("precedence check stdout is not exactly one JSON document: {err}")
+    })?;
+    if !value.is_object() {
+        let kind = match &value {
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Null => "null",
+            serde_json::Value::Object(_) => "object",
+        };
+        return Err(format!(
+            "precedence check stdout is a JSON {kind} document, not a report object"
+        ));
+    }
+    Ok(trimmed)
+}
+
 /// Assert (never actuate) the exit-serving posture through the daemon's own
 /// snapshot: anchor present, forwarding enabled, prefix equal to the run's
 /// mesh CIDR. A missing, unparseable, or drifting snapshot is a named
@@ -639,32 +676,24 @@ pub(crate) fn run_killswitch_precedence_baseline(
     conn: &NodeConnection,
     alias: &str,
 ) -> Result<(), AdapterError> {
-    let check_script = daemon_command(
-        "macos exit killswitch precedence check",
-        "macos-exit-killswitch-precedence-check",
-        &[
-            ValidatedArg::cli_token("--output").map_err(AdapterError::from)?,
-            ValidatedArg::path(MACOS_EXIT_KILLSWITCH_PRECEDENCE_ARTIFACT_PATH)
-                .map_err(AdapterError::from)?,
-        ],
-    )?;
-    ssh::run_remote(conn, check_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
-
-    // Read the artifact back and evaluate it: a missing, stale, unparseable,
-    // or foreign-schema artifact is an error here — never a skip.
-    let read_script = ssh::RemoteCommand::from_args(
-        "read macos exit killswitch precedence artifact",
-        &[
-            ValidatedArg::cli_token("cat").map_err(AdapterError::from)?,
-            ValidatedArg::path(MACOS_EXIT_KILLSWITCH_PRECEDENCE_ARTIFACT_PATH)
-                .map_err(AdapterError::from)?,
-        ],
-    )?;
-    let raw_artifact = ssh::run_remote(conn, read_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
-    crate::vm_lab::evaluate_macos_exit_killswitch_precedence_artifact(alias, &raw_artifact)
-        .map_err(|reason| AdapterError::Protocol {
+    // The freshness binding is the transport itself: `run_remote` returns the
+    // stdout of the process executed BY THIS INVOCATION, and its exit-0 guard
+    // turns a failed experiment into `AdapterError::Command` before anything
+    // is read. The check runs with no `--output`, so no artifact file is
+    // created at a fixed path either — a leftover file from a prior run can
+    // be neither read nor mistaken for fresh evidence, because no code path
+    // reads it at all.
+    let check_script = killswitch_precedence_check_command()?;
+    let stdout = ssh::run_remote(conn, check_script.as_str(), EXIT_COMMAND_TIMEOUT)?;
+    let report_json =
+        extract_precedence_report_stdout(&stdout).map_err(|reason| AdapterError::Protocol {
             message: format!("macos exit killswitch precedence baseline: {reason}"),
         })?;
+    crate::vm_lab::evaluate_macos_exit_killswitch_precedence_artifact(alias, report_json).map_err(
+        |reason| AdapterError::Protocol {
+            message: format!("macos exit killswitch precedence baseline: {reason}"),
+        },
+    )?;
 
     // A2: the experiment window is closed by a post-check snapshot proving
     // the daemon restored the exact anchor it flushed.
@@ -1436,5 +1465,129 @@ tcp 10.0.0.2:49152 -> 10.0.0.1:22       ESTABLISHED:ESTABLISHED
         assert_eq!(records.len(), 2, "both self-prefixed translations parse");
         assert_eq!(skipped, 1, "the foreign tcp line is counted, not fatal");
         assert_eq!(records[1].original_source.to_string(), "100.64.0.7");
+    }
+
+    // ----- F2: stdout capture is the only precedence evidence channel ------
+
+    fn precedence_report_json() -> String {
+        // Exactly the shape the daemon prints: schema v1, baseline assertion
+        // passed, tampered assertion failed with a non-zero exit and a
+        // recorded reason.
+        r#"{"schema_version": 1, "pf_anchor": "com.apple/rustynet_g7", "baseline_assert": {"overall_ok": true, "exit_code": 0, "reason": "macOS pf killswitch rule present"}, "tampered_assert": {"overall_ok": false, "exit_code": 2, "reason": "macOS pf killswitch verification failed: a quick pass above the block wins"}}"#
+            .to_owned()
+    }
+
+    #[test]
+    fn precedence_stdout_capture_accepts_fresh_verbatim_json() {
+        // The only accept path: the verbatim document this invocation
+        // printed, extracted and handed to the hub evaluator.
+        let raw = precedence_report_json();
+        let extracted =
+            extract_precedence_report_stdout(&raw).expect("verbatim report must extract");
+        let verdict =
+            crate::vm_lab::evaluate_macos_exit_killswitch_precedence_artifact("macos-1", extracted)
+                .expect("fresh verbatim report must verify");
+        assert!(verdict.contains("verified"), "{verdict}");
+    }
+
+    #[test]
+    fn precedence_stdout_capture_rejects_empty_stdout() {
+        for raw in ["", "   ", "\n\t  \n"] {
+            let err =
+                extract_precedence_report_stdout(raw).expect_err("empty capture must fail closed");
+            assert!(err.contains("no report document was captured"), "{err}");
+        }
+    }
+
+    #[test]
+    fn precedence_stdout_capture_rejects_confirmation_line_only() {
+        // The pre-fix daemon's stdout shape: the human confirmation line and
+        // nothing else. Must fail closed — this pins that the daemon-side
+        // verbatim print is load-bearing.
+        let raw = format!(
+            "macos exit killswitch precedence {} written to /usr/local/var/rustynet/x.json",
+            "artifact"
+        );
+        let err = extract_precedence_report_stdout(&raw)
+            .expect_err("confirmation-line-only capture must fail closed");
+        assert!(err.contains("not exactly one JSON document"), "{err}");
+    }
+
+    #[test]
+    fn precedence_stdout_capture_rejects_leading_or_trailing_text_around_json() {
+        // No lenient substring extraction: text around the document, or a
+        // second document after it, is an error — and so is a non-object
+        // document that parses cleanly.
+        let report = precedence_report_json();
+        for raw in [
+            format!("noise before the report\n{report}"),
+            format!("{report}\nnoise after the report"),
+            format!("{report}\n{report}"),
+        ] {
+            let err = extract_precedence_report_stdout(&raw)
+                .expect_err("junk-wrapped capture must fail closed");
+            assert!(err.contains("not exactly one JSON document"), "{err}");
+        }
+        let err = extract_precedence_report_stdout("[1,2,3]")
+            .expect_err("a non-object document must fail closed");
+        assert!(err.contains("not a report object"), "{err}");
+    }
+
+    #[test]
+    fn precedence_stdout_capture_rejects_truncated_json() {
+        // A valid JSON PREFIX truncated mid-object must error at extraction —
+        // the helper extracts whole documents only, never a lenient prefix.
+        let report = precedence_report_json();
+        let cut = &report[..report.len() / 2];
+        let err = extract_precedence_report_stdout(cut)
+            .expect_err("a truncated document must fail closed");
+        assert!(err.contains("not exactly one JSON document"), "{err}");
+    }
+
+    #[test]
+    fn killswitch_precedence_baseline_sequence_has_no_artifact_path_read() {
+        // F2 structural pin, both halves:
+        //
+        // (1) The baseline check command carries no `--output` argument, so
+        //     the sequence does not even re-create the fixed-path file on the
+        //     guest, and it contains no read-back step at all.
+        // (2) This module contains no reference to the fixed artifact path
+        //     (needles assembled at runtime so this test's own source does
+        //     not match them — the same self-reference trap as grepping a
+        //     process table for your own command line). A stale file left by
+        //     a prior run can therefore be neither read nor re-created: it
+        //     cannot influence the baseline by construction.
+        let path_needle = format!(
+            "/usr/local/var/rustynet/macos_exit_{}_{}.json",
+            "killswitch", "precedence"
+        );
+        let output_flag = format!("--{}", "output");
+
+        let command = killswitch_precedence_check_command().expect("check command builds");
+        let rendered = command.as_str();
+        assert!(
+            !rendered.contains(&path_needle),
+            "the baseline command must not name the fixed artifact path: {rendered}"
+        );
+        assert!(
+            !rendered.contains(&output_flag),
+            "the baseline command must not pass {output_flag}: {rendered}"
+        );
+        assert!(
+            rendered.split(' ').all(|token| token != "cat"),
+            "the baseline command must contain no file read step: {rendered}"
+        );
+
+        let source = include_str!("macos_exit_traffic.rs");
+        assert!(
+            !source.contains(&path_needle),
+            "this module must hold no reference to the fixed artifact path"
+        );
+        let old_const = format!("MACOS_EXIT_KILLSWITCH_PRECEDENCE_ARTIFACT_{}", "PATH");
+        assert!(
+            !source.contains(&old_const),
+            "the fixed-path constant must stay deleted; reintroducing it would \
+             re-arm the stale-artifact side channel"
+        );
     }
 }
