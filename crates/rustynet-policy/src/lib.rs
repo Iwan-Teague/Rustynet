@@ -377,17 +377,20 @@ impl LlmAccessScope {
                 None => false,
             },
         };
-        let quota_ok = match baseline.max_tokens_per_window {
-            None => true,
-            Some(baseline_limit) => self
-                .max_tokens_per_window
-                .is_some_and(|limit| limit >= baseline_limit),
+        // A limit of `None` imposes no ceiling, so a current scope that
+        // dropped a limit is wider, never narrower; only a lower `Some`
+        // narrows. (The in-flight request keeps its admission-time
+        // accounting regardless, so a dropped limit never widens it.)
+        let quota_ok = match (baseline.max_tokens_per_window, self.max_tokens_per_window) {
+            (None, _) | (Some(_), None) => true,
+            (Some(baseline_limit), Some(limit)) => limit >= baseline_limit,
         };
-        let rate_ok = match baseline.max_requests_per_minute {
-            None => true,
-            Some(baseline_limit) => self
-                .max_requests_per_minute
-                .is_some_and(|limit| limit >= baseline_limit),
+        let rate_ok = match (
+            baseline.max_requests_per_minute,
+            self.max_requests_per_minute,
+        ) {
+            (None, _) | (Some(_), None) => true,
+            (Some(baseline_limit), Some(limit)) => limit >= baseline_limit,
         };
         models_ok && quota_ok && rate_ok
     }
@@ -2868,6 +2871,14 @@ mod tests {
             ..scoped.clone()
         };
         assert!(!lower_rate.is_at_least_as_permissive_as(&scoped));
+        // Dropping a limit altogether removes a ceiling: wider, not
+        // narrower, on that axis.
+        let no_limits = LlmAccessScope {
+            max_tokens_per_window: None,
+            max_requests_per_minute: None,
+            ..scoped.clone()
+        };
+        assert!(no_limits.is_at_least_as_permissive_as(&scoped));
         // A deny-all baseline is trivially matched by anything
         // equally scoped (no model grant to lose).
         let deny_all = LlmAccessScope::default();
