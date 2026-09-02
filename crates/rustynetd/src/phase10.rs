@@ -949,6 +949,12 @@ enum RollbackIntent {
 pub struct DryRunSystem {
     pub operations: Vec<String>,
     fail_operation: Option<String>,
+    /// The error the armed `fail_operation` fails with. `None` (the default,
+    /// and what `fail_on`/`fail_on_from_now` arm) preserves the historic
+    /// `RollbackFailed` behaviour; M3 tests arm a specific error (e.g.
+    /// `DnsApplyFailed`) to drive the DNS-degraded error path exactly as the
+    /// real macOS system reports it.
+    fail_error: Option<SystemError>,
     generation: u64,
     relay_forwarding_enabled: bool,
     /// Mirrors the real systems' runtime posture flag: set by
@@ -974,6 +980,15 @@ impl DryRunSystem {
         self.fail_operation = Some(operation.to_owned());
     }
 
+    /// Arm a failure with a SPECIFIC error (M3): lets state-machine tests
+    /// drive the DNS-degraded branch with the exact `SystemError` the macOS
+    /// scoped posture apply reports, rather than the generic
+    /// `RollbackFailed` stand-in.
+    pub fn fail_on_with(&mut self, operation: &str, error: SystemError) {
+        self.fail_operation = Some(operation.to_owned());
+        self.fail_error = Some(error);
+    }
+
     fn step(&mut self, operation: &str) -> Result<(), SystemError> {
         self.operations.push(operation.to_owned());
         if self
@@ -981,7 +996,10 @@ impl DryRunSystem {
             .as_ref()
             .is_some_and(|candidate| candidate == operation)
         {
-            return Err(SystemError::RollbackFailed(operation.to_owned()));
+            return Err(self
+                .fail_error
+                .clone()
+                .unwrap_or_else(|| SystemError::RollbackFailed(operation.to_owned())));
         }
         Ok(())
     }
