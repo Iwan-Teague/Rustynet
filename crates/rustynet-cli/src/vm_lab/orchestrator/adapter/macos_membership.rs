@@ -51,9 +51,6 @@ fn owner_key_read_script(path: &str) -> String {
              printf '%s{path} rc=%s %s\\n' '{OWNER_KEY_READ_FAILED_MARKER}' \"$rc\" \"$detail\"; exit 0; \
          fi; \
          printf '%s{path}\\n' '{OWNER_KEY_ABSENT_MARKER}'; exit 0",
-        path = path,
-        OWNER_KEY_READ_FAILED_MARKER = OWNER_KEY_READ_FAILED_MARKER,
-        OWNER_KEY_ABSENT_MARKER = OWNER_KEY_ABSENT_MARKER,
     )
 }
 
