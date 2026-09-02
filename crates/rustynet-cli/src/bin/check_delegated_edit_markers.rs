@@ -352,7 +352,7 @@ fn self_test_inner(base: &std::path::Path) -> Result<(), i32> {
     // scan() returns every marked commit; run() partitions them against the
     // allowlist, so here we assert the marked commit classifies as allowed.
     let prefix = marked[..8].to_string();
-    match scan(base, 200, "HEAD", &[prefix.clone()]) {
+    match scan(base, 200, "HEAD", std::slice::from_ref(&prefix)) {
         Ok((found, saw_allowed))
             if saw_allowed && found.len() == 1 && is_allowlisted(&found[0].sha, &[prefix]) => {}
         other => {

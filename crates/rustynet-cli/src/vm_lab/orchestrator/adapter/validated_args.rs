@@ -283,20 +283,24 @@ pub(crate) fn windows_path(value: &str) -> Result<(), ValidationError> {
 }
 
 /// A daemon-CLI subcommand or flag token: non-empty, restricted to
-/// `[A-Za-z0-9._=-]+`. Flags start with `-` and `key=value` flags carry `=`;
-/// whitespace and shell metacharacters are rejected outright.
+/// `[A-Za-z0-9._=/-]+`. Flags start with `-` and `key=value` flags carry `=`;
+/// `/` is admitted so `KEY=/absolute/path` env-assignment tokens (as consumed
+/// by `env`) stay a single token — the same character `ip_charset` allows.
+/// Whitespace and shell metacharacters are rejected outright; every admitted
+/// character is inert inside the single quotes `RemoteCommand::from_args`
+/// wraps each token in.
 pub(crate) fn cli_token(value: &str) -> Result<(), ValidationError> {
     if value.is_empty() {
         return Err(ValidationError::new("CLI token", "must not be empty"));
     }
     if !value
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '=' | '-'))
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '=' | '-' | '/'))
     {
         return Err(ValidationError::new(
             "CLI token",
             "contains characters not safe for shell embedding (allowed: \
-             alphanumeric, '.', '_', '=', '-'; a leading '-' marks a flag)",
+             alphanumeric, '.', '_', '=', '-', '/'; a leading '-' marks a flag)",
         ));
     }
     Ok(())
@@ -479,7 +483,7 @@ impl fmt::Debug for ValidatedArg {
 /// `RemoteCommand`; an increase reintroduces raw string interpolation at a
 /// sink and fails this test.
 #[cfg(test)]
-pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 160;
+pub(crate) const BASELINE_RAW_SINK_CALL_SITES: usize = 158;
 
 #[cfg(test)]
 mod tests {
@@ -743,6 +747,7 @@ mod tests {
         assert!(cli_token("linux-key-custody-check").is_ok());
         assert!(cli_token("sudo").is_ok());
         assert!(cli_token("key=value").is_ok());
+        assert!(cli_token("RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock").is_ok());
         assert!(cli_token("x; id").is_err());
         assert!(cli_token("$(id)").is_err());
         assert!(cli_token("a b").is_err());
