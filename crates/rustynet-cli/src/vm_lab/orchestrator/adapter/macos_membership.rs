@@ -7,6 +7,7 @@ use crate::vm_lab::orchestrator::adapter::macos_install::{
     MACOS_OWNER_SIGNING_KEY_PATH, MACOS_RUSTYNET_PATH, MACOS_STATE_ROOT,
 };
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, GossipIdentity, MembershipOwnerKey, MembershipSnapshot,
@@ -152,12 +153,32 @@ fn exit_node_id_from_peers(peers: &[NodeMembershipPeer]) -> Result<&str, Adapter
 /// "macOS keychain account is required" the moment its idempotent
 /// early-out misses (a fresh node or wiped state dir), so the account
 /// must travel with the invocation, not with the session environment.
-fn membership_init_script(exit_node_id_arg: &str) -> String {
-    format!(
-        "sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='{exit_node_id_arg}' \
-         RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-{exit_node_id_arg}' \
-         '{MACOS_RUSTYNET_PATH}' ops init-membership"
-    )
+///
+/// QH-01 Step 4c: the command is argv-shaped, so it renders through the
+/// validated seam (node ids validate via `ValidatedArg::node_id`, the
+/// keychain account token via the same class).
+fn membership_init_script(exit_node_id: &str) -> Result<ssh::RemoteCommand, AdapterError> {
+    // The node id (and the keychain account derived from it) validate through
+    // the `node_id` class first; the two `KEY=value` env assignments then
+    // render as single `cli_token`s (the `=` is in that alphabet, the id
+    // inside the value is already proven clean).
+    ValidatedArg::node_id(exit_node_id)?;
+    let node_id_env = ValidatedArg::cli_token(&format!("RUSTYNET_NODE_ID={exit_node_id}"))?;
+    let keychain_account_env = ValidatedArg::cli_token(&format!(
+        "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-{exit_node_id}"
+    ))?;
+    let args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin")?,
+        node_id_env,
+        keychain_account_env,
+        ValidatedArg::path(MACOS_RUSTYNET_PATH)?,
+        ValidatedArg::cli_token("ops")?,
+        ValidatedArg::cli_token("init-membership")?,
+    ];
+    ssh::RemoteCommand::from_args("macos init-membership", &args)
 }
 
 /// Build the remote `ops e2e-membership-add` command for one peer.
@@ -180,25 +201,40 @@ fn peer_add_script(
     pubkey_flag: &str,
     pubkey_arg: &str,
     capabilities_arg: &str,
-) -> Result<String, AdapterError> {
+) -> Result<ssh::RemoteCommand, AdapterError> {
     // owner_approver_id convention: "{exit_node_id}-owner" (matches ops_e2e.rs
     // and rustynetd membership init). There is no `rustynet ops
     // owner-approver-id` command; derive from the exit peer.
-    let owner_approver_id_arg = shell_safe_arg(&format!("{exit_node_id}-owner"))?;
+    let owner_approver_id_arg = ValidatedArg::node_id(&format!("{exit_node_id}-owner"))?;
     // MAC-D11: same keychain-account plumbing as `membership_init_script` —
     // `env` after `sudo -n` so `env_reset` cannot strip it. The e2e mutation
     // path resolves its passphrase via a hardcoded credential descriptor, so
     // today this variable is inert here; carrying it keeps the invocation
     // self-describing and correct if the e2e path ever honours it, and
     // matches the node-scoped item the bootstrap provisions.
-    Ok(format!(
-        "sudo -n env RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-{exit_node_id}' \
-         '{MACOS_RUSTYNET_PATH}' ops e2e-membership-add \
-             --client-node-id '{node_id_arg}' \
-             {pubkey_flag} '{pubkey_arg}' \
-             --capabilities '{capabilities_arg}' \
-             --owner-approver-id '{owner_approver_id_arg}'",
-    ))
+    let keychain_account_env = ValidatedArg::cli_token(&format!(
+        "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-{exit_node_id}"
+    ))?;
+    let args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        keychain_account_env,
+        ValidatedArg::path(MACOS_RUSTYNET_PATH)?,
+        ValidatedArg::cli_token("ops")?,
+        ValidatedArg::cli_token("e2e-membership-add")?,
+        ValidatedArg::cli_token("--client-node-id")?,
+        ValidatedArg::node_id(node_id_arg)?,
+        ValidatedArg::cli_token(pubkey_flag)?,
+        // hex_32_safe_arg is the stricter 64-hex shape guard layered under
+        // the seam's cli_token class (the hex alphabet is a subset).
+        ValidatedArg::cli_token(hex_32_safe_arg(pubkey_arg)?.as_str())?,
+        ValidatedArg::cli_token("--capabilities")?,
+        ValidatedArg::capability_csv(capabilities_arg)?,
+        ValidatedArg::cli_token("--owner-approver-id")?,
+        owner_approver_id_arg,
+    ];
+    ssh::RemoteCommand::from_args("macos e2e-membership-add", &args)
 }
 
 /// Build the remote read-back probe for the genesis membership snapshot.
@@ -234,19 +270,14 @@ pub fn init_membership_snapshot(
     // 1. Run ops init-membership (idempotent). RUSTYNET_NODE_ID is required
     //    by init-membership; sourced from the exit peer, fail-loud if absent.
     let exit_node_id = exit_node_id_from_peers(peers)?;
-    let exit_node_id_arg = shell_safe_arg(exit_node_id)?;
-    ssh::run_remote(
-        conn,
-        &membership_init_script(&exit_node_id_arg),
-        MEDIUM_TIMEOUT,
-    )?;
+    let init_script = membership_init_script(exit_node_id)?;
+    ssh::run_remote(conn, init_script.as_str(), MEDIUM_TIMEOUT)?;
 
     // 2. Add each non-exit peer.
     for peer in peers {
         if peer.role == NodeRole::Exit {
             continue;
         }
-        let node_id_arg = shell_safe_arg(&peer.node_id)?;
         // Branch on the SUBJECT peer, not on this producer's platform. This
         // function runs on a macOS exit node but writes membership for EVERY
         // peer in the topology, including Linux ones that DO have a real gossip
@@ -263,15 +294,14 @@ pub fn init_membership_snapshot(
                 hex_32_safe_arg(&peer.public_key_hex)?,
             ),
         };
-        let capabilities_arg = shell_safe_arg(&role_capability_csv(&peer.capabilities))?;
         let script = peer_add_script(
             exit_node_id,
-            &node_id_arg,
+            &peer.node_id,
             pubkey_flag,
             &pubkey_arg,
-            &capabilities_arg,
+            &role_capability_csv(&peer.capabilities),
         )?;
-        ssh::run_remote(conn, &script, MEDIUM_TIMEOUT)?;
+        ssh::run_remote(conn, script.as_str(), MEDIUM_TIMEOUT)?;
     }
 
     // 3. Read snapshot back as base64. The probe fails LOUDLY (own stderr
@@ -307,11 +337,14 @@ pub fn distribute_signed_bundle(
     let (remote_tmp, install_dst) = remote_bundle_paths(&kind);
     // Staging dir must exist before SCP; /tmp is always present but the
     // subdirectory may not have been created yet.
-    ssh::run_remote(
-        conn,
-        &format!("mkdir -p '{MACOS_STAGING_DIR}'"),
-        SHORT_TIMEOUT,
-    )?;
+    // QH-01 Step 4c: argv-shaped mkdir rendered through the validated seam.
+    let mkdir_args = vec![
+        ValidatedArg::cli_token("mkdir")?,
+        ValidatedArg::cli_token("-p")?,
+        ValidatedArg::path(MACOS_STAGING_DIR)?,
+    ];
+    let mkdir_script = ssh::RemoteCommand::from_args("macos staging dir", &mkdir_args)?;
+    ssh::run_remote(conn, mkdir_script.as_str(), SHORT_TIMEOUT)?;
     ssh::scp_to(conn, bundle_path, &remote_tmp, MEDIUM_TIMEOUT)?;
     let install_dir = install_dst
         .rsplit_once('/')
@@ -356,11 +389,13 @@ pub fn distribute_verifier_key(
         )?;
     let dst = macos_verifier_key_path(&kind);
     let remote_tmp = format!("{MACOS_STAGING_DIR}/rn-verifier-key.pub");
-    ssh::run_remote(
-        conn,
-        &format!("mkdir -p '{MACOS_STAGING_DIR}'"),
-        SHORT_TIMEOUT,
-    )?;
+    let mkdir_args = vec![
+        ValidatedArg::cli_token("mkdir")?,
+        ValidatedArg::cli_token("-p")?,
+        ValidatedArg::path(MACOS_STAGING_DIR)?,
+    ];
+    let mkdir_script = ssh::RemoteCommand::from_args("macos staging dir", &mkdir_args)?;
+    ssh::run_remote(conn, mkdir_script.as_str(), SHORT_TIMEOUT)?;
     ssh::scp_to(conn, pub_key_path, &remote_tmp, MEDIUM_TIMEOUT)?;
     let dst_dir = dst.rsplit_once('/').map_or(MACOS_STATE_ROOT, |(d, _)| d);
     // The verifier-key destination dir ({state}/trust) is shared with the
@@ -421,22 +456,9 @@ fn membership_log_header() -> String {
     format!("version={MEMBERSHIP_SCHEMA_VERSION}")
 }
 
-/// Reject shell-dangerous characters to prevent injection via alias strings.
-fn shell_safe_arg(value: &str) -> Result<String, AdapterError> {
-    if value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ','))
-    {
-        Ok(value.to_owned())
-    } else {
-        Err(AdapterError::Protocol {
-            message: format!(
-                "value '{value}' contains characters not safe for shell argument embedding \
-                 (allowed: alphanumeric, hyphen, underscore, dot, comma)"
-            ),
-        })
-    }
-}
+// (shell_safe_arg was superseded by the QH-01 validated seam: node ids
+// validate through `ValidatedArg::node_id` and capability CSVs through
+// `ValidatedArg::capability_csv` — see validated_args.rs.)
 
 fn hex_32_safe_arg(value: &str) -> Result<String, AdapterError> {
     if NodeMembershipPeer::is_valid_public_key_hex(value) {
@@ -541,11 +563,11 @@ mod tests {
         let script = owner_key_read_script(MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH);
         assert!(
             script.contains("sudo -n cat"),
-            "read must be privileged like the Linux twin: {script}"
+            "read must be privileged like the Linux twin: {script:?}"
         );
         assert!(
             script.contains(MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH),
-            "script must name the canonical path: {script}"
+            "script must name the canonical path: {script:?}"
         );
         // No bare `cat` without sudo escalation.
         for line in script.lines() {
@@ -623,21 +645,39 @@ mod tests {
     }
 
     #[test]
-    fn shell_safe_arg_accepts_valid() {
-        assert_eq!(shell_safe_arg("node-exit-1").unwrap(), "node-exit-1");
-        assert_eq!(shell_safe_arg("abc.def_ghi").unwrap(), "abc.def_ghi");
-        // capability CSVs contain commas (e.g. "client,entry_relay")
+    fn membership_init_and_peer_add_render_argv_through_the_validated_seam() {
+        let init_script = membership_init_script("exit-1").expect("render");
         assert_eq!(
-            shell_safe_arg("client,entry_relay").unwrap(),
-            "client,entry_relay"
+            init_script.as_str(),
+            "'sudo' '-n' 'env' 'RUSTYNET_NODE_ROLE=admin' \
+             'RUSTYNET_NODE_ID=exit-1' \
+             'RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-exit-1' \
+             '/usr/local/bin/rustynet' 'ops' 'init-membership'"
+        );
+
+        let add_script = peer_add_script(
+            "exit-1",
+            "client-1",
+            "--client-gossip-pubkey-hex",
+            &"a".repeat(64),
+            "client,entry_relay",
+        )
+        .expect("render");
+        assert_eq!(
+            add_script.as_str(),
+            "'sudo' '-n' 'env' \
+             'RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-exit-1' \
+             '/usr/local/bin/rustynet' 'ops' 'e2e-membership-add' \
+             '--client-node-id' 'client-1' '--client-gossip-pubkey-hex' \
+             'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+             '--capabilities' 'client,entry_relay' '--owner-approver-id' 'exit-1-owner'"
         );
     }
 
     #[test]
-    fn shell_safe_arg_rejects_special_chars() {
-        assert!(shell_safe_arg("node; rm -rf /").is_err());
-        assert!(shell_safe_arg("node$(whoami)").is_err());
-        assert!(shell_safe_arg("node`id`").is_err());
+    fn membership_init_rejects_a_metacharacter_node_id_at_the_seam() {
+        let err = membership_init_script("exit-1; rm -rf /").expect_err("must reject");
+        assert!(!err.to_string().is_empty());
     }
 
     #[test]
@@ -685,19 +725,22 @@ mod tests {
         // MAC-D5: the daemon fails closed without RUSTYNET_NODE_ID. The
         // command must set it (and the role) INSIDE the sudo invocation —
         // `env … sudo` has the variables stripped by sudo's env_reset.
-        let script = membership_init_script("node-exit-1");
+        // (QH-01 Step 4c: the rendered form quotes each argv token, so the
+        // assertions match the seam-rendered string.)
+        let script = membership_init_script("node-exit-1").expect("render");
         assert!(
-            script
-                .starts_with("sudo -n env RUSTYNET_NODE_ROLE=admin RUSTYNET_NODE_ID='node-exit-1'"),
-            "node id must be set after sudo -n env: {script}"
+            script.as_str().starts_with(
+                "'sudo' '-n' 'env' 'RUSTYNET_NODE_ROLE=admin' 'RUSTYNET_NODE_ID=node-exit-1'"
+            ),
+            "node id must be set after sudo -n env: {script:?}"
         );
         assert!(
-            script.contains("ops init-membership"),
-            "script must run init-membership: {script}"
+            script.as_str().contains("'ops' 'init-membership'"),
+            "script must run init-membership: {script:?}"
         );
         assert!(
-            script.contains(MACOS_RUSTYNET_PATH),
-            "script must use the canonical macOS rustynet path: {script}"
+            script.as_str().contains(MACOS_RUSTYNET_PATH),
+            "script must use the canonical macOS rustynet path: {script:?}"
         );
     }
 
@@ -711,16 +754,16 @@ mod tests {
         // is in the invocation env. The account is the node-scoped item the
         // bootstrap provisions (`trust-passphrase-<node_id>`), passed after
         // `sudo -n env` so env_reset cannot strip it.
-        let script = membership_init_script("node-exit-1");
+        let script = membership_init_script("node-exit-1").expect("render");
         assert!(
-            script.contains(
-                "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-node-exit-1'"
+            script.as_str().contains(
+                "'RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-node-exit-1'"
             ),
-            "init must carry the node-scoped keychain account: {script}"
+            "init must carry the node-scoped keychain account: {script:?}"
         );
         assert!(
-            script.starts_with("sudo -n env "),
-            "account env must sit inside the sudo invocation: {script}"
+            script.as_str().starts_with("'sudo' '-n' 'env' "),
+            "account env must sit inside the sudo invocation: {script:?}"
         );
     }
 
@@ -734,16 +777,16 @@ mod tests {
             &"a".repeat(64),
             "client",
         )
-        .unwrap();
+        .expect("render");
         assert!(
-            script.contains(
-                "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT='trust-passphrase-node-exit-1'"
+            script.as_str().contains(
+                "'RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-node-exit-1'"
             ),
-            "peer-add must carry the node-scoped keychain account: {script}"
+            "peer-add must carry the node-scoped keychain account: {script:?}"
         );
         assert!(
-            script.starts_with("sudo -n env "),
-            "account env must sit inside the sudo invocation: {script}"
+            script.as_str().starts_with("'sudo' '-n' 'env' "),
+            "account env must sit inside the sudo invocation: {script:?}"
         );
     }
 
@@ -759,15 +802,15 @@ mod tests {
         let script = membership_snapshot_readback_script();
         assert!(
             script.contains(">&2") && script.contains("exit 1"),
-            "read-back failure must emit its own message and exit 1: {script}"
+            "read-back failure must emit its own message and exit 1: {script:?}"
         );
         assert!(
             script.contains(MACOS_MEMBERSHIP_SNAPSHOT_PATH),
-            "the failure message must name the snapshot path: {script}"
+            "the failure message must name the snapshot path: {script:?}"
         );
         assert!(
             script.contains("missing or empty"),
-            "the failure message must distinguish the vanish: {script}"
+            "the failure message must distinguish the vanish: {script:?}"
         );
     }
 
@@ -779,11 +822,11 @@ mod tests {
         let script = membership_snapshot_readback_script();
         assert!(
             script.contains("sudo -n test -s") && script.contains("sudo -n cat"),
-            "probe and read must both run under sudo -n: {script}"
+            "probe and read must both run under sudo -n: {script:?}"
         );
         assert!(
             script.contains("| base64"),
-            "the snapshot body must still be base64-encoded for transport: {script}"
+            "the snapshot body must still be base64-encoded for transport: {script:?}"
         );
     }
 
@@ -820,10 +863,10 @@ mod tests {
     }
 
     #[test]
-    fn resolved_exit_node_id_survives_shell_safety_guard() {
+    fn resolved_exit_node_id_passes_the_seam_node_id_validator() {
         let peers = vec![peer(NodeRole::Exit, "node-exit-1")];
         let id = exit_node_id_from_peers(&peers).unwrap();
-        assert_eq!(shell_safe_arg(id).unwrap(), "node-exit-1");
+        assert!(ValidatedArg::node_id(id).is_ok());
     }
 
     // ── MAC-D6: the peer-add approver id must be DERIVED, never shelled out ──
@@ -842,8 +885,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            script.contains("--owner-approver-id 'node-exit-1-owner'"),
-            "approver id must be derived as {{exit_node_id}}-owner: {script}"
+            script
+                .as_str()
+                .contains("'--owner-approver-id' 'node-exit-1-owner'"),
+            "approver id must be derived as {{exit_node_id}}-owner: {script:?}"
         );
     }
 
@@ -860,17 +905,17 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !script.contains("ops owner-approver-id"),
+            !script.as_str().contains("'ops' 'owner-approver-id'"),
             "no `ops owner-approver-id` subcommand exists; the approver id must \
-             stay derived: {script}"
+             stay derived: {script:?}"
         );
         assert!(
-            !script.contains("|| echo none"),
-            "no failure may be swallowed into the approver id: {script}"
+            !script.as_str().contains("|| echo none"),
+            "no failure may be swallowed into the approver id: {script:?}"
         );
         assert!(
-            script.contains("ops e2e-membership-add"),
-            "the peer-add must still run the real verb: {script}"
+            script.as_str().contains("'ops' 'e2e-membership-add'"),
+            "the peer-add must still run the real verb: {script:?}"
         );
     }
 
@@ -887,10 +932,11 @@ mod tests {
         )
         .unwrap();
         // A malicious exit id would have been rejected upstream, but the
-        // derivation itself must not smuggle characters past the guard.
+        // derivation itself must not smuggle characters past the guard
+        // (now the seam's `node_id` class).
         let approver = format!("{0}-owner", "node-exit-1");
-        assert_eq!(shell_safe_arg(&approver).unwrap(), "node-exit-1-owner");
-        assert!(script.contains("node-exit-1-owner"));
+        assert!(ValidatedArg::node_id(&approver).is_ok());
+        assert!(script.as_str().contains("'node-exit-1-owner'"));
     }
 }
 

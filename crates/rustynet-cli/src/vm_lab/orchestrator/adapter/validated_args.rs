@@ -306,6 +306,30 @@ pub(crate) fn cli_token(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// A comma-separated capability list (`role_capability_csv` output, e.g.
+/// `client,entry_relay`): non-empty, restricted to
+/// `[A-Za-z0-9._,-]+`. Hoisted from `linux_membership.rs`, where the identical
+/// local `shell_safe_arg` guard covered exactly this alphabet. Commas are
+/// admitted because they are the list separator the remote consumer parses;
+/// every admitted character is inert inside the single quotes
+/// `RemoteCommand::from_args` wraps each token in.
+pub(crate) fn capability_csv(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        return Err(ValidationError::new("capability CSV", "must not be empty"));
+    }
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | ',' | '_' | '-'))
+    {
+        return Err(ValidationError::new(
+            "capability CSV",
+            "contains characters not safe for shell embedding (allowed: \
+             alphanumeric, '.', ',', '_', '-')",
+        ));
+    }
+    Ok(())
+}
+
 /// An IP-address-shaped argument: a charset allowlist safe for shell
 /// embedding. Hoisted from `linux_traffic.rs` / `windows_traffic.rs` (the two
 /// identical copies). Note this class intentionally accepts CIDR notation;
@@ -364,6 +388,7 @@ pub(crate) enum ValidatedArg {
     BundleFilename(String),
     Port(String),
     CliToken(String),
+    CapabilityCsv(String),
     WindowsPath(String),
 }
 
@@ -381,6 +406,7 @@ impl ValidatedArg {
             | Self::BundleFilename(v)
             | Self::Port(v)
             | Self::CliToken(v)
+            | Self::CapabilityCsv(v)
             | Self::WindowsPath(v) => v,
         }
     }
@@ -446,6 +472,11 @@ impl ValidatedArg {
         Ok(Self::CliToken(value.to_owned()))
     }
 
+    pub(crate) fn capability_csv(value: &str) -> Result<Self, ValidationError> {
+        capability_csv(value)?;
+        Ok(Self::CapabilityCsv(value.to_owned()))
+    }
+
     pub(crate) fn windows_path(value: &str) -> Result<Self, ValidationError> {
         windows_path(value)?;
         Ok(Self::WindowsPath(value.to_owned()))
@@ -468,6 +499,7 @@ impl fmt::Debug for ValidatedArg {
             Self::BundleFilename(_) => "BundleFilename",
             Self::Port(_) => "Port",
             Self::CliToken(_) => "CliToken",
+            Self::CapabilityCsv(_) => "CapabilityCsv",
             Self::WindowsPath(_) => "WindowsPath",
         };
         write!(f, "ValidatedArg::{variant}(len={})", self.value().len())
@@ -755,6 +787,18 @@ mod tests {
     }
 
     #[test]
+    fn capability_csv_rejects_metacharacters_and_accepts_separated_lists() {
+        assert!(capability_csv("client").is_ok());
+        assert!(capability_csv("client,entry_relay,serve_relay").is_ok());
+        assert!(capability_csv("nas._-9").is_ok());
+        assert!(capability_csv("client; id").is_err());
+        assert!(capability_csv("$(id)").is_err());
+        assert!(capability_csv("a b").is_err());
+        assert!(capability_csv("client\nentry").is_err());
+        assert!(capability_csv("").is_err());
+    }
+
+    #[test]
     fn hoisted_wrappers_still_error_as_adapter_protocol_failures() {
         assert!(validate_ip_arg("10.0.0.5;id").is_err());
         assert!(validate_ip_arg("10.0.0.5").is_ok());
@@ -779,6 +823,8 @@ mod tests {
         assert!(ValidatedArg::port("4242").is_ok());
         assert!(ValidatedArg::cli_token("x; id").is_err());
         assert!(ValidatedArg::cli_token("--no-fail-on-drift").is_ok());
+        assert!(ValidatedArg::capability_csv("client;id").is_err());
+        assert!(ValidatedArg::capability_csv("client,entry_relay").is_ok());
         assert!(ValidatedArg::windows_path("bad\0path").is_err());
         assert!(ValidatedArg::windows_path("C:\\ok").is_ok());
     }
