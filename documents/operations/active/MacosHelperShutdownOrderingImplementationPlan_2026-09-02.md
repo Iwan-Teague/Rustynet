@@ -209,11 +209,11 @@ Residual uncertainty is recorded rather than papered over: run logs prove *which
 | Adversarial refute pass | complete 2026-09-02 (review doc READY-WITH-AMENDMENTS; A1–A8 folded — see Review disposition) |
 | Q-1 resolution (A1 gate) | complete 2026-09-02 — answer (b)-locus; helper liveness undetermined from run logs; see Q-1 evidence |
 | Owner sign-off per design §3 (A2 gate) | pending — **BLOCKS S1; only S/M0 may proceed until recorded here** |
-| S/M0 constants | pending |
+| S/M0 constants | done 2026-09-02 (commit `1a343e32` + Phase C commits) |
 | S1 helper lease | pending (blocked on sign-off) |
 | S2 daemon lease lifecycle | pending (blocked on sign-off) |
-| S2b helper-liveness restore (A1 fallback) | implemented on branch (2026-09-02) — lab-adapter side only; live proof pending |
+| S2b helper-liveness restore (A1 fallback) | implemented on branch (2026-09-02) — lab-adapter side only; live proof pending. **Phase C post-merge review fixes 1-5 landed 2026-09-02**: tri-state `HelperJobPresence` probe (stdout `pid = ` classifier — a loaded-but-dead job no longer passes) + socket-probe gate on the `HelperPresent` no-op; restore path boots the stale job out BEFORE `launchctl bootstrap` (ordered pair pinned by test); `MACOS_LAUNCHD_STOP_COMMAND` daemon-exit polls are job-scoped (`launchctl print … | grep -q 'pid = '`, 20 × 0.5 s) instead of helper-conflating `pgrep -x rustynetd`; KILL backstops reordered strictly before the helper bootout; mis-priced wait comment trued. Raw-sink scanner seam exclusion anchored (review §5): inline `format!(…).as_str()` counts RAW again; baseline re-ratched ONCE 130 → 159 with all 29 un-excused one-line validated-local sites named in `validated_args.rs`'s baseline comment; uninstall wait budget pinned symbolically (compile-time 20 × 500 ms ≥ 10 s). Crate gates green (fmt + clippy `-D warnings` + full `cargo test -p rustynet-cli --all-targets --all-features --locked`, exit 0, 2026-09-02). |
 | S3 connect retry | pending |
 | M1 installer rendering | pending |
-| M2 site ordering repair | implemented on branch (2026-09-02) — `MACOS_LAUNCHD_STOP_COMMAND`, `uninstall.rs`, both installer stop regions; live proof pending |
+| M2 site ordering repair | implemented on branch (2026-09-02) — `MACOS_LAUNCHD_STOP_COMMAND`, `uninstall.rs`, both installer stop regions; live proof pending. Phase C review fixes 2+3+5 (KILL order, job-scoped predicate, comment truth) landed 2026-09-02 — see S2b row. |
 | Live proof (§5) | pending |
