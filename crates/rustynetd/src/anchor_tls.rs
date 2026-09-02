@@ -13,7 +13,9 @@
 //!   bind; there is no plaintext fallback path.
 
 use std::fs;
+#[cfg(unix)]
 use std::io::Read as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -205,40 +207,62 @@ fn generate_and_persist_anchor_tls_identity(
 }
 
 fn write_private_bytes(path: &Path, bytes: &[u8], mode: u32) -> Result<(), AnchorTlsError> {
-    use std::io::Write as _;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|source| AnchorTlsError::FileWrite {
+    #[cfg(not(unix))]
+    {
+        // Fail closed: the anchor TLS identity custody control is the POSIX
+        // file mode (0600 key / 0644 cert). Windows custody is DPAPI/ACL-based
+        // and is not implemented for this identity, so writing the key with
+        // unverifiable custody is refused instead of silently skipping the
+        // enforcement. Every caller surfaces this as a bind refusal.
+        let _ = (bytes, mode);
+        Err(AnchorTlsError::FileWrite {
             path: path.to_path_buf(),
-            context: "create",
-            source,
-        })?;
+            context: "POSIX permission enforcement unavailable on this platform",
+            source: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "anchor TLS identity custody requires POSIX file modes",
+            ),
+        })
+    }
     #[cfg(unix)]
-    file.set_permissions(fs::Permissions::from_mode(mode))
-        .map_err(|source| AnchorTlsError::FileWrite {
-            path: path.to_path_buf(),
-            context: "set permissions",
-            source,
-        })?;
-    file.write_all(bytes)
-        .map_err(|source| AnchorTlsError::FileWrite {
-            path: path.to_path_buf(),
-            context: "write",
-            source,
-        })?;
-    Ok(())
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|source| AnchorTlsError::FileWrite {
+                path: path.to_path_buf(),
+                context: "create",
+                source,
+            })?;
+        file.set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|source| AnchorTlsError::FileWrite {
+                path: path.to_path_buf(),
+                context: "set permissions",
+                source,
+            })?;
+        file.write_all(bytes)
+            .map_err(|source| AnchorTlsError::FileWrite {
+                path: path.to_path_buf(),
+                context: "write",
+                source,
+            })?;
+        Ok(())
+    }
 }
 
 /// Refuses symlinks and non-regular files (matching
 /// `open_anchor_state_file` hardening) and enforces 0600 on the key and 0644
-/// on the certificate.
+/// on the certificate. The mode check is a Unix-only security control; on
+/// platforms without POSIX modes this fails closed with an explicit error
+/// rather than reading with unverified custody.
 fn read_tls_file(
     path: &Path,
     kind: &'static str,
     expected_mode: u32,
 ) -> Result<Vec<u8>, AnchorTlsError> {
+    let _ = kind;
     let metadata = fs::symlink_metadata(path).map_err(|source| AnchorTlsError::Io {
         path: path.to_path_buf(),
         context: "stat",
@@ -258,6 +282,21 @@ fn read_tls_file(
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a regular file"),
         });
     }
+    #[cfg(not(unix))]
+    {
+        // Fail closed: without POSIX modes the 0600/0644 custody check cannot
+        // be evaluated (Windows custody is DPAPI/ACL-based, not implemented
+        // here), so the identity is refused instead of trusted unverified.
+        let _ = expected_mode;
+        Err(AnchorTlsError::Io {
+            path: path.to_path_buf(),
+            context: "POSIX permission verification unavailable on this platform",
+            source: std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "anchor TLS identity custody requires POSIX file modes",
+            ),
+        })
+    }
     #[cfg(unix)]
     {
         let mode = metadata.permissions().mode() & 0o777;
@@ -271,21 +310,20 @@ fn read_tls_file(
                 source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permissions"),
             });
         }
-    }
-    let mut file = fs::File::open(path).map_err(|source| AnchorTlsError::Io {
-        path: path.to_path_buf(),
-        context: "open",
-        source,
-    })?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|source| AnchorTlsError::Io {
+        let mut file = fs::File::open(path).map_err(|source| AnchorTlsError::Io {
             path: path.to_path_buf(),
-            context: "read",
+            context: "open",
             source,
         })?;
-    let _ = kind;
-    Ok(bytes)
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|source| AnchorTlsError::Io {
+                path: path.to_path_buf(),
+                context: "read",
+                source,
+            })?;
+        Ok(bytes)
+    }
 }
 
 fn load_anchor_tls_identity(
@@ -368,7 +406,10 @@ pub fn build_anchor_server_config(
         .with_cert_resolver(resolver))
 }
 
-#[cfg(test)]
+// Every test in this module exercises identity generation or reload, whose
+// security posture is POSIX-mode custody; on Windows the loader fails closed
+// (see `write_private_bytes` / `read_tls_file`), so the fixtures cannot exist.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write as _;
@@ -679,5 +720,47 @@ mod tests {
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
             self.algorithms.supported_schemes()
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    /// The custody control is POSIX-mode enforcement; on Windows the loader
+    /// must fail closed with the explicit unsupported-platform error rather
+    /// than trusting or writing identity files with unverified custody.
+    #[test]
+    fn anchor_tls_identity_fails_closed_on_windows() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-anchor-tls-win-closed-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp tls dir");
+        let cert_path = dir.join("anchor-tls-cert.pem");
+        let key_path = dir.join("anchor-tls-key.pem");
+        fs::write(&cert_path, b"not a pem").expect("write dummy cert");
+        fs::write(&key_path, b"not a pem").expect("write dummy key");
+
+        let load_error = load_or_generate_anchor_tls_identity(&cert_path, &key_path, "t")
+            .expect_err("loading must fail closed without POSIX modes");
+        assert!(
+            load_error.to_string().contains("POSIX"),
+            "unexpected load error: {load_error}"
+        );
+
+        let generate_error = load_or_generate_anchor_tls_identity(
+            &dir.join("new-cert.pem"),
+            &dir.join("new-key.pem"),
+            "t",
+        )
+        .expect_err("generation must fail closed without POSIX modes");
+        assert!(
+            generate_error.to_string().contains("POSIX"),
+            "unexpected generate error: {generate_error}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
