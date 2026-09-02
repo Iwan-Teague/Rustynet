@@ -332,8 +332,7 @@ pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAudit
     capped.truncate(filled);
     if capped.len() > MAX_ROLE_AUDIT_LOG_BYTES {
         return Err(RoleAuditError::Io(format!(
-            "role audit log exceeds {} byte cap; refusing to parse",
-            MAX_ROLE_AUDIT_LOG_BYTES
+            "role audit log exceeds {MAX_ROLE_AUDIT_LOG_BYTES} byte cap; refusing to parse"
         )));
     }
     let body = String::from_utf8(capped)
