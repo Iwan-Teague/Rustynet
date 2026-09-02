@@ -143,11 +143,11 @@ impl PowerShellScript {
         Ok(Self(ps_quote(value)?))
     }
 
-    /// Wrap a whole script body authored in-repo (not operator input). Still
-    /// routed through `ps_quote`'s control-character refusal.
-    pub(crate) fn from_script_body(script: String) -> Result<Self, AdapterError> {
-        Ok(Self(ps_quote(&script)?))
-    }
+    // Deliberately NO whole-script constructor from a plain `String`: it
+    // would accept any `format!` result (voiding the type boundary), and
+    // `ps_quote` turns a script body into a single-quoted literal, which is
+    // not how the `-EncodedCommand` sinks consume a script. Step 4d adds the
+    // typed renderer-output constructor with the sink signature flip.
 
     /// Sink-only accessor for the remote-PS sink family in THIS module.
     pub(crate) fn as_str(&self) -> &str {
@@ -2393,15 +2393,9 @@ mod powershell_script_seam_tests {
     }
 
     #[test]
-    fn from_script_body_rejects_control_characters_like_ps_quote() {
-        assert!(PowerShellScript::from_script_body("ok".to_owned()).is_ok());
-        assert!(PowerShellScript::from_script_body("a\nb".to_owned()).is_err());
-    }
-
-    #[test]
     fn powershell_script_debug_prints_length_only() {
         let script =
-            PowerShellScript::from_script_body("secret-body".to_owned()).expect("plain body");
+            PowerShellScript::from_single_value("svc", "secret-body").expect("plain value");
         let rendered = format!("{script:?}");
         assert!(!rendered.contains("secret-body"), "{rendered}");
         assert!(rendered.contains("len="), "{rendered}");

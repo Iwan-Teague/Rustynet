@@ -441,13 +441,11 @@ fn base_scp_command(
 pub(crate) struct RemoteCommand(String);
 
 impl RemoteCommand {
-    /// Wrap the output of a `script_template` render function. The caller
-    /// must pass the rendered string, not an ad-hoc template substitution —
-    /// placeholders are filled by the renderer's own binding alphabet, which
-    /// is what makes the result safe.
-    pub(crate) fn from_template(rendered: String) -> Self {
-        Self(rendered)
-    }
+    // Deliberately NO constructor from a plain `String`: the renderer's
+    // `render_*` functions return `String` today, so a "from rendered
+    // template" constructor would accept any `format!` result and void the
+    // compile-time proof this type exists for. Step 4d adds the typed
+    // renderer-output constructor together with the sink signature flip.
 
     /// Wrap a single value after quote-safety validation and shell quoting.
     /// `label` names the argument for the error message.
@@ -1376,9 +1374,10 @@ mod remote_command_seam_tests {
 
     #[test]
     fn remote_command_debug_prints_length_only() {
-        let cmd = RemoteCommand::from_template("echo secret-thing".to_owned());
+        let cmd = RemoteCommand::from_validated_single("target", "secret-thing")
+            .expect("plain value must validate");
         let rendered = format!("{cmd:?}");
         assert!(!rendered.contains("secret-thing"), "{rendered}");
-        assert!(rendered.contains("len=17"), "{rendered}");
+        assert!(rendered.contains("len=14"), "{rendered}");
     }
 }
