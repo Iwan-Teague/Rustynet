@@ -63,25 +63,13 @@ pub struct MacosExitKillswitchPrecedenceReport {
     pub tampered_assert: MacosKillswitchAssertReport,
 }
 
-pub fn write_macos_exit_killswitch_precedence_report(
-    output_path: &Path,
-    options: &MacosExitKillswitchPrecedenceOptions,
+/// Fail-closed outcome gate over a collected report: the baseline killswitch
+/// assertion must have passed and the tampered assertion must have failed.
+/// Shared by both output modes so a stdout-only run enforces exactly the same
+/// contract as a file-writing run.
+fn assert_precedence_report_outcome(
+    report: &MacosExitKillswitchPrecedenceReport,
 ) -> Result<(), String> {
-    let report = collect_macos_exit_killswitch_precedence_report(options)?;
-    if let Some(parent) = output_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("create {} failed: {err}", parent.display()))?;
-    }
-    let encoded = serde_json::to_string_pretty(&report)
-        .map_err(|err| format!("serialize macos killswitch precedence report failed: {err}"))?;
-    fs::write(output_path, encoded).map_err(|err| {
-        format!(
-            "write macos killswitch precedence report {} failed: {err}",
-            output_path.display()
-        )
-    })?;
     if !report.baseline_assert.overall_ok {
         return Err(format!(
             "baseline macOS killswitch assertion failed: {}",
@@ -92,6 +80,57 @@ pub fn write_macos_exit_killswitch_precedence_report(
         return Err("tampered macOS killswitch assertion unexpectedly passed".to_owned());
     }
     Ok(())
+}
+
+/// Serialize the report exactly once, from the collected value, so every
+/// consumer (stdout, artifact file) sees byte-identical JSON. The encoding is
+/// the single source of the printed document — the check command never
+/// re-serializes a divergent copy.
+fn encode_precedence_report(
+    report: &MacosExitKillswitchPrecedenceReport,
+) -> Result<String, String> {
+    serde_json::to_string_pretty(report)
+        .map_err(|err| format!("serialize macos killswitch precedence report failed: {err}"))
+}
+
+/// Run the precedence experiment and return the encoded report WITHOUT
+/// writing any artifact file. This is the stdout-only mode of the check
+/// subcommand: the caller prints the returned document verbatim, so the only
+/// copy that ever exists is the one just produced by this invocation.
+pub fn render_macos_exit_killswitch_precedence_report(
+    options: &MacosExitKillswitchPrecedenceOptions,
+) -> Result<String, String> {
+    let report = collect_macos_exit_killswitch_precedence_report(options)?;
+    let encoded = encode_precedence_report(&report)?;
+    assert_precedence_report_outcome(&report)?;
+    Ok(encoded)
+}
+
+/// Run the precedence experiment, write the encoded report to `output_path`
+/// (before the assert outcome is judged, so a failed assertion still leaves
+/// its evidence on disk for forensics), and return the same encoded document
+/// for the caller to print verbatim on stdout. The returned string is exactly
+/// the file's bytes — the command never re-serializes a divergent copy.
+pub fn write_macos_exit_killswitch_precedence_report(
+    output_path: &Path,
+    options: &MacosExitKillswitchPrecedenceOptions,
+) -> Result<String, String> {
+    let report = collect_macos_exit_killswitch_precedence_report(options)?;
+    let encoded = encode_precedence_report(&report)?;
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create {} failed: {err}", parent.display()))?;
+    }
+    fs::write(output_path, &encoded).map_err(|err| {
+        format!(
+            "write macos killswitch precedence report {} failed: {err}",
+            output_path.display()
+        )
+    })?;
+    assert_precedence_report_outcome(&report)?;
+    Ok(encoded)
 }
 
 pub fn build_macos_exit_killswitch_precedence_report(

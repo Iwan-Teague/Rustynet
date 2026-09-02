@@ -2652,21 +2652,54 @@ fn run_macos_exit_killswitch_precedence_check_command(args: &[String]) -> Result
             None => break,
         }
     }
-    let output = output
-        .ok_or_else(|| "macos-exit-killswitch-precedence-check: --output is required".to_owned())?;
     let options =
         rustynetd::macos_exit_killswitch_precedence::MacosExitKillswitchPrecedenceOptions {
             pf_anchor,
         };
-    rustynetd::macos_exit_killswitch_precedence::write_macos_exit_killswitch_precedence_report(
-        output.as_path(),
-        &options,
-    )?;
-    println!(
-        "macos exit killswitch precedence artifact written to {}",
-        output.display()
-    );
+    // One serialization, one stdout document: the encoded report returned by
+    // the producer IS what gets printed — never a re-serialized divergent
+    // copy. With no --output the report exists only on stdout, so no
+    // artifact file is left behind for a later reader to mistake for fresh
+    // evidence.
+    let encoded = match output.as_ref() {
+        Some(path) => rustynetd::macos_exit_killswitch_precedence::write_macos_exit_killswitch_precedence_report(
+            path, &options,
+        )?,
+        None => rustynetd::macos_exit_killswitch_precedence::render_macos_exit_killswitch_precedence_report(
+            &options,
+        )?,
+    };
+    let (stdout, stderr) =
+        macos_exit_killswitch_precedence_check_outputs(&encoded, output.as_deref());
+    println!("{stdout}");
+    eprintln!("{stderr}");
     Ok(())
+}
+
+/// The two output streams of the precedence check, derived from the single
+/// encoded report: stdout carries the report JSON verbatim (the freshness
+/// binding — the consumer captures the bytes this invocation printed), and
+/// stderr carries the human confirmation line. Split as a pure helper so the
+/// stream contract is unit-testable offline on every platform.
+fn macos_exit_killswitch_precedence_check_outputs(
+    encoded: &str,
+    output: Option<&std::path::Path>,
+) -> (String, String) {
+    match output {
+        Some(path) => (
+            encoded.to_owned(),
+            format!(
+                "macos exit killswitch precedence artifact written to {}",
+                path.display()
+            ),
+        ),
+        None => (
+            encoded.to_owned(),
+            "macos exit killswitch precedence check completed; report on stdout \
+             (no artifact file written)"
+                .to_owned(),
+        ),
+    }
 }
 
 fn run_windows_dns_failclosed_check_command(args: &[String]) -> Result<(), String> {
@@ -4807,7 +4840,8 @@ fn help_text() -> String {
 mod tests {
     use super::run_shutdown_residue_check_command;
     use super::{
-        classify_top_level_error, default_residue_check_state_path, help_text, parse_daemon_config,
+        classify_top_level_error, default_residue_check_state_path, help_text,
+        macos_exit_killswitch_precedence_check_outputs, parse_daemon_config,
         run_blind_exit_reversal_audit_command, run_enrollment_replay_audit_command,
         run_gossip_revoked_readmit_audit_command, run_linux_blind_exit_dataplane_check_command,
         run_linux_exit_dns_failclosed_capture_command, run_linux_ipv6_leak_capture_command,
@@ -5836,15 +5870,50 @@ mod tests {
     }
 
     #[test]
-    fn run_macos_exit_killswitch_precedence_check_command_requires_output() {
-        let err = run_macos_exit_killswitch_precedence_check_command(&[
-            "--pf-anchor".to_owned(),
-            "com.apple/rustynet_g1".to_owned(),
-        ])
-        .expect_err("missing output must reject");
+    fn precedence_check_stdout_is_report_json() {
+        // F2 freshness contract, daemon half: stdout is the report JSON
+        // verbatim from ONE serialization — the consumer captures the bytes
+        // this invocation printed, never a file a prior run could have left
+        // behind. The confirmation line lives on stderr only.
+        let report = rustynetd::macos_exit_killswitch_precedence::build_macos_exit_killswitch_precedence_report(
+            "com.apple/rustynet_g7",
+            "block drop out quick all\n",
+            "",
+        );
+        let encoded = serde_json::to_string_pretty(&report).expect("fixture report serialises");
+        let (stdout, stderr) = macos_exit_killswitch_precedence_check_outputs(
+            &encoded,
+            Some(std::path::Path::new("/var/db/rustynet/precedence.json")),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&stdout).expect("stdout must parse as the report schema");
+        assert_eq!(parsed["schema_version"].as_u64(), Some(1));
+        assert_eq!(parsed["pf_anchor"], "com.apple/rustynet_g7");
         assert!(
-            err.contains("--output is required"),
-            "unexpected error: {err}"
+            parsed["baseline_assert"]["overall_ok"]
+                .as_bool()
+                .unwrap_or(false),
+            "baseline assert must be readable from the stdout document"
+        );
+        assert!(
+            stderr.contains("artifact written to"),
+            "the confirmation line belongs on stderr: {stderr}"
+        );
+    }
+
+    #[test]
+    fn precedence_check_without_output_confirms_stdout_only_mode() {
+        // The stdout-only mode exists so the adapter can leave NO artifact
+        // file behind for a later reader to mistake for fresh evidence;
+        // stderr must say so plainly.
+        let (stdout, stderr) = macos_exit_killswitch_precedence_check_outputs("{\"x\":1}", None);
+        assert_eq!(
+            stdout, "{\"x\":1}",
+            "stdout must stay the verbatim document"
+        );
+        assert!(
+            stderr.contains("no artifact file written"),
+            "stderr must disclose the stdout-only mode: {stderr}"
         );
     }
 
