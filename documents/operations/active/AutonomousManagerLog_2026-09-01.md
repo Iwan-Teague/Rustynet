@@ -501,3 +501,20 @@ stays clean.
 issue a post-restart `state refresh` via the seam. The macOS DnsFailclosed DIAGNOSIS (now the
 primary open thread after the tick-20 root-cause correction) still needs one clean harvest run; the
 2 s guest sampler stands ready on macos-utm-1.
+
+## Tick 21 — 2026-09-02 ~20:38–20:50Z
+
+Head `cb00b83a`, clean, staleness 0. CI: `a1ec88ee`'s Windows-leg flake cleared on re-run (now
+success), `b77a7df9` success; `9a5d6e44` / `4a4d4512` / `cb00b83a` CI in progress (verify next tick).
+R2 classifier core confirmed merged (`4a4d4512`).
+
+**Gap A** (`edit-1788376800179-509-0`) progressing normally: the macOS enforce-path `state refresh`
+is committed, the agent is now on the Linux half in `ops_e2e.rs`; spend 1.06M of 2M, fresh turns.
+No stall.
+
+**Launched** the C2 exit-adapter post-merge refute review (`edit-1788377958495-28719-0`, docs-only,
+collision-free with Gap A) — adversarially refutes the six load-bearing claims of the merged 3f0be0c1
+wiring: assert-not-actuate (no CLI pf mutation), seam-only (no format!-built shell to a sink),
+killswitch-precedence ordering (mutating check only pre-activation, restore verified), fail-closed
+evaluators (negative tests still active), the predicate staying false for macOS, and the NAT-identity
+bounding to 100.64.0.0/10. Fleet at 2 running.
