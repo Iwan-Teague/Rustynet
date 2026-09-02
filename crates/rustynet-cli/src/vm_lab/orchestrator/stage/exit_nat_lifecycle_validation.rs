@@ -1,14 +1,15 @@
 #![allow(dead_code)]
-use crate::vm_lab::LINUX_RUSTYNETD_PATH;
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::exit_nat_lifecycle::{
     exit_nat_lifecycle_runtime_implemented, validate_linux_exit_nat_lifecycle,
+    validate_macos_exit_nat_lifecycle,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::LINUX_RUSTYNETD_PATH;
 
 const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
 
@@ -77,7 +78,16 @@ impl OrchestrationStage for ExitNatLifecycleValidationStage {
             VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
             _ => unreachable!("runtime implementation gate accepts desktop platforms only"),
         };
-        if let Err(e) = validate_linux_exit_nat_lifecycle(&*shell, daemon_path, &alias) {
+        let validation_result = match platform {
+            VmGuestPlatform::Linux => {
+                validate_linux_exit_nat_lifecycle(&*shell, daemon_path, &alias)
+            }
+            VmGuestPlatform::Macos => {
+                validate_macos_exit_nat_lifecycle(&*shell, daemon_path, &alias)
+            }
+            _ => unreachable!("runtime implementation gate accepts desktop platforms only"),
+        };
+        if let Err(e) = validation_result {
             return StageOutcome::Failed(format!("{alias}: {e}"));
         }
 
