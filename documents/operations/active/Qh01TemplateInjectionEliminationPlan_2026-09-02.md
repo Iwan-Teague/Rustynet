@@ -134,3 +134,35 @@ Folded from `Qh01TemplateInjectionEliminationPlanAdversarialReview_2026-09-02.md
 - A7: folded — CI-gate precision added: `#[cfg(test)]` exclusion, stated precedence against QH-12/QH-13, adversarially audited allowlist.
 - A8: folded — §8 Q5 answered with the explicit non-live-evidence policy and parity-ledger dependency record.
 - Step 4a landed — the three validator argv-join sink sites (linux.rs, macos.rs, windows.rs build_validator_script) now build their commands through the validated seam (`ValidatedArg::cli_token` + `RemoteCommand::from_args` / `PowerShellScript::from_call_argv`).
+- Step 4b landed — the argv-shaped traffic-adapter sites (linux_traffic: exit route-advertise, diag rm, issue mkdir + sudo-env issue; macos_traffic: mesh ping with stderr merged, diag rm, issue mkdir + env-sudo issue; windows_traffic: Get-Content pubkey, live-identity `& path status`, diag Remove-Item, both Stop-Service sites) now render through the validated seam via `RemoteCommand::from_args` / `from_args_with_stderr_merged` / `PowerShellScript::from_call_argv`; each migrated site has a rendering test and each adapter a rejection test. The seam's `cli_token` alphabet gained `/` so `KEY=/absolute/path` env-assignment tokens stay one safe token.
+
+## 10) Step 4b remainder (input to Step 4d)
+
+Sites whose script argument is built by `format!`/concatenation but are SHELL-shaped (pipes, `&&`/`||`, `;`, non-trailing redirections, `if`/`for`/`try` blocks, multi-statement PowerShell, command substitution). These cannot migrate to the argv seam without changing remote behavior; Step 4d's typed renderer-output constructor is the planned shape.
+
+| Site | Interpolated values (classes) | Shell operators present | Migration shape 4d needs |
+| --- | --- | --- | --- |
+| linux_traffic.rs gossip_export_remote_command (~:324) | unit/marker/user/secret/passphrase (compile-time consts) | `;`, `\|\|`, `{}` group | Multi-statement renderer emitting `RemoteCommand` |
+| linux_traffic.rs ping_mesh_peer (~:419) | mesh ip (validated via `validate_ip_arg`) | `;`, `$?`, `printf` marker protocol | Multi-statement renderer |
+| linux_traffic.rs probe_denied_peer (~:462) | ip (validated) | `>/dev/null 2>&1` (non-trailing), `\|\|` | Redirect-position-aware renderer |
+| linux_traffic.rs collect_artifacts tar_script (~:737) | remote_tmp (const-derived path) | `;`, `$(id -u)` substitution, `\|\|` fallback | Multi-statement renderer |
+| linux_traffic.rs issue chmod `&&`/glob (~:999) | dir (const-derived) | `&&`, glob `*` | Two-command or glob renderer |
+| linux_traffic.rs issue `ls -1 2>/dev/null` (~:1008) | dir (const-derived) | trailing `2>/dev/null` (fd-specific) | Fd-redirect trailer constructor |
+| linux_traffic.rs cleanup `rm -f && rm -rf` (~:1024) | env, dir (const-derived) | `&&` | Two-command renderer |
+| macos_traffic.rs collect_wireguard_public_key (~:250) | pub_key_path (const-derived) | `if/then/else/fi`, `>/dev/null`, `\|\|` | Branching renderer |
+| macos_traffic.rs probe_denied_peer (~:370) | ip (validated) | `>/dev/null 2>&1`, `&&`, `\|\|` | Redirect + branch renderer |
+| macos_traffic.rs collect_artifacts diag tar (~:400) | remote_tmp, MACOS_STATE_ROOT | `\|\|` fallback, multiple excludes | Multi-command renderer |
+| macos_traffic.rs cleanup sudo rm batch (~:466) | MACOS_STATE_ROOT paths | `2>/dev/null \|\| true` | Fd-redirect + ignore-failure trailer |
+| macos_traffic.rs collect_daemon_failure_reason (~:509) | log path (const-derived) | `2>/dev/null \|\| true` | Fd-redirect trailer |
+| windows_traffic.rs collect_node_id_script (~:84) | env_path (const-derived) | multi-statement, `throw`, regex | PS multi-statement renderer |
+| windows_traffic.rs ping_mesh_peer (~:146) | ip (ps-quoted, validated) | `try/catch`, `if/else`, `exit` | PS control-flow renderer |
+| windows_traffic.rs probe_denied_peer (~:176) | ip (ps-quoted, validated) | `if/else`, `exit` | PS control-flow renderer |
+| windows_traffic.rs build_diag_archive_script (~:460) | staging/logs/zip paths | multi-statement, `if/else`, `Join-Path` | PS multi-statement renderer |
+| windows_traffic.rs windows_dataplane_reset_script (~:599) | rule names (consts), `$($_.Name)` remote data | multi-statement, pipelines | PS multi-statement renderer (remote data must stay non-interpolated) |
+| windows_traffic.rs build_runtime_state_cleanup_script (~:630) | state root, staging | multi-statement, `foreach` | PS multi-statement renderer |
+| windows_traffic.rs collect_daemon_failure_reason (~:697) | log path | `if (Test-Path)` | PS control-flow renderer |
+| windows_traffic.rs windows_node_clean_assert_script (~:725) | service names (consts) | multi-statement, pipelines | PS multi-statement renderer |
+| windows_traffic.rs issue ensure_script (~:934) | staging dir, issue dir | two statements joined by `;` | PS multi-statement renderer |
+| windows_traffic.rs issue run_script (~:942) | rustynet path, subcmd, env, dir | `$env:` assignment, `;`, `if throw` | PS multi-statement renderer |
+| windows_traffic.rs issue list_script (~:954) | issue dir | pipeline `\|` | PS pipeline renderer |
+| windows_traffic.rs issue cleanup_script (~:975) | env, dir | two statements joined by `;` | PS multi-statement renderer |

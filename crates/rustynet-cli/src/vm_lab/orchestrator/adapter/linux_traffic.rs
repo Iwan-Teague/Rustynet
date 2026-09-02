@@ -7,6 +7,7 @@ use std::time::Duration;
 use crate::ops_e2e::parse_gossip_verifying_key_hex;
 use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
 use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
@@ -587,11 +588,21 @@ const LINUX_DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
 /// stage additionally appends `collect_daemon_failure_reason` for defence in
 /// depth.
 pub fn activate_exit_serving(conn: &NodeConnection) -> Result<(), AdapterError> {
-    let script = format!(
-        "sudo -n env RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET} \
-         /usr/local/bin/rustynet route advertise 0.0.0.0/0"
-    );
-    match ssh::run_remote(conn, &script, SHORT_TIMEOUT) {
+    // QH-01 Step 4b: the argv is built through the validated seam instead of a
+    // raw `format!`; every token is validated and shell-quoted before any
+    // command string exists.
+    let args = [
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        ValidatedArg::cli_token(&format!("RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET}"))?,
+        ValidatedArg::path("/usr/local/bin/rustynet")?,
+        ValidatedArg::cli_token("route")?,
+        ValidatedArg::cli_token("advertise")?,
+        ValidatedArg::ip("0.0.0.0/0")?,
+    ];
+    let script = ssh::RemoteCommand::from_args("linux exit route advertise", &args)?;
+    match ssh::run_remote(conn, script.as_str(), SHORT_TIMEOUT) {
         Ok(_) => Ok(()),
         // A non-zero exit carries the daemon's own rejection reason. `rustynet`
         // prints its error to stdout (`error [..]: route advertise denied: ..`);
@@ -754,7 +765,15 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
     ssh::scp_from(conn, remote_tmp, dst, Duration::from_secs(120))?;
 
     // Remove temp archive from remote (best-effort).
-    let _ = ssh::run_remote(conn, &format!("rm -f {remote_tmp}"), SHORT_TIMEOUT);
+    // QH-01 Step 4b: the temp-archive cleanup is built through the validated
+    // seam so the path is validated and shell-quoted before any command exists.
+    let rm_args = [
+        ValidatedArg::cli_token("rm")?,
+        ValidatedArg::cli_token("-f")?,
+        ValidatedArg::path(remote_tmp)?,
+    ];
+    let rm_cmd = ssh::RemoteCommand::from_args("linux remove diagnostic archive", &rm_args)?;
+    let _ = ssh::run_remote(conn, rm_cmd.as_str(), SHORT_TIMEOUT);
 
     // Verify the archive contains no key material — security invariant check.
     verify_no_key_material(dst)?;
@@ -965,11 +984,15 @@ pub fn issue_bundles_to_dir(
     ssh::scp_to(conn, &env_tmp, &remote_env, MEDIUM_TIMEOUT)?;
     let _ = std::fs::remove_file(&env_tmp);
 
-    ssh::run_remote(
-        conn,
-        &format!("mkdir -p '{remote_issue_dir}'"),
-        SHORT_TIMEOUT,
-    )?;
+    // QH-01 Step 4b: argv-shaped script built through the validated seam; the
+    // issue dir is path-validated and shell-quoted before any command exists.
+    let mkdir_args = [
+        ValidatedArg::cli_token("mkdir")?,
+        ValidatedArg::cli_token("-p")?,
+        ValidatedArg::path(&remote_issue_dir)?,
+    ];
+    let mkdir_cmd = ssh::RemoteCommand::from_args("linux create issue dir", &mkdir_args)?;
+    ssh::run_remote(conn, mkdir_cmd.as_str(), SHORT_TIMEOUT)?;
 
     // Ensure /etc/rustynet/ has the strict mode 0750 root:rustynetd that
     // validate_key_custody_permissions requires before the signing-secret load.
@@ -983,16 +1006,24 @@ pub fn issue_bundles_to_dir(
         SHORT_TIMEOUT,
     )?;
 
-    let safe_rustynet = rustynet_path.replace('\'', "'\"'\"'");
-    ssh::run_remote(
-        conn,
-        &format!(
-            "sudo -n env RUSTYNET_NODE_ROLE=admin \
-             '{safe_rustynet}' ops {issue_subcmd} \
-             --env-file '{remote_env}' --issue-dir '{remote_issue_dir}'"
-        ),
-        MEDIUM_TIMEOUT,
-    )?;
+    // QH-01 Step 4b: the previous `safe_rustynet` manual quote-escape is
+    // replaced by `ValidatedArg::path` + `RemoteCommand::from_args`, which
+    // validates then shell-quotes every argument before any command exists.
+    let issue_args = [
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin")?,
+        ValidatedArg::path(rustynet_path)?,
+        ValidatedArg::cli_token("ops")?,
+        ValidatedArg::cli_token(issue_subcmd)?,
+        ValidatedArg::cli_token("--env-file")?,
+        ValidatedArg::path(&remote_env)?,
+        ValidatedArg::cli_token("--issue-dir")?,
+        ValidatedArg::path(&remote_issue_dir)?,
+    ];
+    let issue_cmd = ssh::RemoteCommand::from_args("linux issue bundles", &issue_args)?;
+    ssh::run_remote(conn, issue_cmd.as_str(), MEDIUM_TIMEOUT)?;
 
     // rustynet creates the issue dir as root:root 0700; make it and its
     // files readable by the SSH user so the listing and scp_from below work.
@@ -1952,5 +1983,65 @@ table ip other_nat {
         // An unparseable / empty status must fail closed, never a phantom tunnel.
         assert!(super::tunnels_from_daemon_status("").is_empty());
         assert!(super::tunnels_from_daemon_status("garbage output").is_empty());
+    }
+
+    // ── QH-01 Step 4b: seam-rendered argv-shaped sites ────────────────────────
+
+    #[test]
+    fn exit_route_advertise_renders_the_sudo_env_argv() {
+        let args = [
+            ValidatedArg::cli_token("sudo").expect("token"),
+            ValidatedArg::cli_token("-n").expect("token"),
+            ValidatedArg::cli_token("env").expect("token"),
+            ValidatedArg::cli_token("RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock")
+                .expect("token"),
+            ValidatedArg::path("/usr/local/bin/rustynet").expect("path"),
+            ValidatedArg::cli_token("route").expect("token"),
+            ValidatedArg::cli_token("advertise").expect("token"),
+            ValidatedArg::ip("0.0.0.0/0").expect("cidr"),
+        ];
+        let cmd = ssh::RemoteCommand::from_args("linux exit route advertise", &args).expect("ok");
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' 'env' 'RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock' \
+             '/usr/local/bin/rustynet' 'route' 'advertise' '0.0.0.0/0'"
+        );
+    }
+
+    #[test]
+    fn issue_bundles_renders_the_sudo_env_invocation_argv() {
+        let args = [
+            ValidatedArg::cli_token("sudo").expect("token"),
+            ValidatedArg::cli_token("-n").expect("token"),
+            ValidatedArg::cli_token("env").expect("token"),
+            ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin").expect("token"),
+            ValidatedArg::path("/usr/local/bin/rustynet").expect("path"),
+            ValidatedArg::cli_token("ops").expect("token"),
+            ValidatedArg::cli_token("e2e-issue-traversal-bundles-from-env").expect("token"),
+            ValidatedArg::cli_token("--env-file").expect("token"),
+            ValidatedArg::path("/tmp/rn_issue_env_4242.env").expect("path"),
+            ValidatedArg::cli_token("--issue-dir").expect("token"),
+            ValidatedArg::path("/tmp/rn_issue_4242").expect("path"),
+        ];
+        let cmd = ssh::RemoteCommand::from_args("linux issue bundles", &args).expect("ok");
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' 'env' 'RUSTYNET_NODE_ROLE=admin' '/usr/local/bin/rustynet' 'ops' \
+             'e2e-issue-traversal-bundles-from-env' '--env-file' '/tmp/rn_issue_env_4242.env' \
+             '--issue-dir' '/tmp/rn_issue_4242'"
+        );
+    }
+
+    #[test]
+    fn linux_traffic_rejection_refuses_an_injection_ip_before_any_command_exists() {
+        let err = ValidatedArg::ip("100.64.0.1; rm -rf /")
+            .expect_err("metacharacters must be rejected at construction");
+        assert!(
+            err.to_string().contains("IP argument"),
+            "unexpected error: {err}"
+        );
+        // A rejected argument means from_args never produces a command string.
+        let rejected = ValidatedArg::ip("100.64.0.1 && id");
+        assert!(rejected.is_err(), "metacharacter ip must be rejected");
     }
 }
