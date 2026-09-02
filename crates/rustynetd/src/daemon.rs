@@ -283,6 +283,20 @@ const ANCHOR_ENROLLMENT_REQUEST_LINE_BUDGET: Duration = Duration::from_secs(2);
 /// is a single short line, never an 8 MiB bundle — a peer that cannot drain
 /// one line in 5s is stalling the inline serve loop, not downloading.
 const ANCHOR_ENROLLMENT_RESPONSE_WRITE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Total wall-clock budget for completing one anchor control-plane TLS 1.3
+/// handshake, enforced as a single absolute deadline across the whole
+/// handshake (AT-1). The per-record 2-second socket timeouts remain the inner
+/// bound — rustls drives its record I/O directly on the socket — but a
+/// deadline is what a dribbling peer (one ClientHello byte every ~1.9s)
+/// cannot reset: without it, each record read succeeds just before its
+/// timeout while the handshake as a whole never ends, and because the anchor
+/// listeners serve inline, one such peer wedges both control-plane listeners
+/// indefinitely. 5s is ~2.5x the per-record bound and generous for a TLS 1.3
+/// 1-RTT handshake on a LAN, where a legitimate client completes in
+/// milliseconds; a peer that cannot finish in 5s is dropped and the listener
+/// moves on.
+const ANCHOR_TLS_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 pub const ANCHOR_ENROLLMENT_ADDR_ENV: &str = "RUSTYNET_ANCHOR_ENROLLMENT_ADDR";
 pub const ANCHOR_ENROLLMENT_ALLOW_LAN_ENV: &str = "RUSTYNET_ANCHOR_ENROLLMENT_ALLOW_LAN";
 #[cfg(target_os = "macos")]
@@ -1549,11 +1563,11 @@ fn read_optional_anchor_bundle_pull_have_line<R: std::io::Read>(stream: &mut R) 
 /// Transport for one accepted anchor control-plane connection: the raw TCP
 /// stream (loopback-only local-IPC mode) or a TLS 1.3 stream (`--allow-lan`
 /// mode, where TLS is mandatory). Implements Read/Write above the existing
-/// bounded line-protocol readers/writers so those stay unchanged; the TLS
-/// handshake runs lazily inside the first read/write, bounded by the
-/// socket's own 2-second timeouts (rustls drives the handshake over the
-/// underlying socket, so an unresponsive or hostile peer cannot hold the
-/// inline serve loop open past the same budget the plaintext path had).
+/// bounded line-protocol readers/writers so those stay unchanged. The TLS
+/// handshake is completed EAGERLY, before the handler sees the stream, under
+/// one absolute [`ANCHOR_TLS_HANDSHAKE_DEADLINE`] (AT-1) — see
+/// [`complete_anchor_tls_handshake`] — so a dribbling peer cannot hold the
+/// inline serve loop open past that budget.
 enum AnchorControlStream {
     Plain(TcpStream),
     // Boxed: the rustls stream is ~1.2KB against the 4-byte TcpStream and the
@@ -1619,8 +1633,11 @@ struct AnchorListenerBinding {
 
 /// Wrap an accepted connection in the binding's transport. With `tls: Some`
 /// this builds a rustls server connection from the shared TLS-1.3-only
-/// server config; handshake completion is deferred to the first read/write
-/// inside the handler (bounded by the handler's socket timeouts).
+/// server config and drives the handshake to completion RIGHT HERE, under
+/// the total [`ANCHOR_TLS_HANDSHAKE_DEADLINE`], before any line protocol
+/// runs (AT-1). Any handshake failure — bad TLS, deadline exceeded, stalled
+/// peer — is returned as `Err`, which the accept loops translate into a
+/// logged, non-secret drop followed by serving the next connection.
 fn anchor_control_stream(
     stream: TcpStream,
     tls: Option<&std::sync::Arc<rustls::ServerConfig>>,
@@ -1632,11 +1649,80 @@ fn anchor_control_stream(
                 .map_err(|err| {
                     DaemonError::Io(format!("anchor TLS server connection failed: {err}"))
                 })?;
-            Ok(AnchorControlStream::Tls(Box::new(
-                rustls::StreamOwned::new(conn, stream),
-            )))
+            let mut tls_stream = rustls::StreamOwned::new(conn, stream);
+            complete_anchor_tls_handshake(
+                &mut tls_stream,
+                Instant::now() + ANCHOR_TLS_HANDSHAKE_DEADLINE,
+            )?;
+            Ok(AnchorControlStream::Tls(Box::new(tls_stream)))
         }
     }
+}
+
+/// AT-1: drive the rustls TLS handshake to completion under ONE absolute
+/// `deadline` before the connection enters the line protocol. The existing
+/// 2-second per-read/write socket timeouts stay as the inner bound for any
+/// blocking phase, but the deadline is the bound a dribbling peer cannot
+/// reset. To make that enforceable, the socket is switched to NON-BLOCKING
+/// for the handshake and `complete_io` is driven in a small poll loop: with
+/// a blocking socket, a peer feeding one ClientHello byte every ~1.9s keeps
+/// every internal read of `complete_io` succeeding just before its timeout,
+/// so control never returns to this loop and no between-calls deadline
+/// check would ever fire. Non-blocking, `complete_io` returns between
+/// records, the deadline is re-checked every iteration, and the peer is
+/// dropped when the total budget expires. Blocking mode and the 2-second
+/// timeouts are restored before the stream is handed to the line protocol.
+///
+/// Errors (bad TLS, protocol failure, deadline exceeded) carry a non-secret
+/// reason; the caller logs and drops the connection and keeps serving.
+fn complete_anchor_tls_handshake(
+    tls: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+    deadline: Instant,
+) -> Result<(), DaemonError> {
+    const HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    // Inner bound carried over from the previous posture; re-applied after
+    // the handshake alongside blocking mode for the line protocol.
+    tls.sock
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| DaemonError::Io(format!("anchor TLS read timeout failed: {err}")))?;
+    tls.sock
+        .set_write_timeout(Some(Duration::from_secs(2)))
+        .map_err(|err| DaemonError::Io(format!("anchor TLS write timeout failed: {err}")))?;
+    tls.sock
+        .set_nonblocking(true)
+        .map_err(|err| DaemonError::Io(format!("anchor TLS nonblocking failed: {err}")))?;
+    let outcome: Result<(), DaemonError> = loop {
+        if Instant::now() >= deadline {
+            break Err(DaemonError::Io(
+                "anchor TLS handshake deadline exceeded".to_owned(),
+            ));
+        }
+        match tls.conn.complete_io(&mut tls.sock) {
+            Ok(_) if !tls.conn.is_handshaking() => break Ok(()),
+            Ok(_) => {}
+            // No data yet (or EINTR): the handshake is pending, not failed.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                std::thread::sleep(HANDSHAKE_POLL_INTERVAL);
+            }
+            Err(err) => {
+                break Err(DaemonError::Io(format!(
+                    "anchor TLS handshake failed: {err}"
+                )));
+            }
+        }
+    };
+    // Restore the blocking, timeout-bounded semantics the handlers expect.
+    // A restore failure fails the connection closed (the caller drops it).
+    let restored = tls
+        .sock
+        .set_nonblocking(false)
+        .and_then(|()| tls.sock.set_read_timeout(Some(Duration::from_secs(2))))
+        .and_then(|()| tls.sock.set_write_timeout(Some(Duration::from_secs(2))))
+        .map_err(|err| DaemonError::Io(format!("anchor TLS restore failed: {err}")));
+    outcome.and(restored)
 }
 
 /// On-disk location of the anchor control-plane TLS identity: a dedicated
@@ -17994,21 +18080,22 @@ mod tests {
     };
 
     use super::{
-        ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, AnchorControlStream, AnchorListenerBinding,
-        AutoTunnelBundle, AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
-        DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
-        DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig,
-        DaemonError, DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext,
-        MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES,
-        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
-        MAX_RELAY_FLEET_BUNDLE_BYTES, MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
+        ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, ANCHOR_TLS_HANDSHAKE_DEADLINE, AnchorControlStream,
+        AnchorListenerBinding, AutoTunnelBundle, AutoTunnelWatermark,
+        DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
+        DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
+        DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
+        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+        MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
+        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole,
         SignedStateRefreshReason, StateFetcher, TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,
         TraversalCandidate, TraversalCandidateType, TrustEvidenceRecord, TrustPolicy,
         TrustWatermark, anchor_bundle_pull_token_thumbprint, bind_anchor_bundle_pull_listener,
         bind_anchor_enrollment_listener, build_dns_response, build_gossip_node,
-        collect_traversal_host_candidate_snapshot_with_retry,
+        collect_traversal_host_candidate_snapshot_with_retry, complete_anchor_tls_handshake,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
         load_anchor_bundle_pull_bundle, load_anchor_bundle_pull_token, load_auto_tunnel_bundle,
         load_auto_tunnel_watermark, load_dns_zone_bundle, load_dns_zone_watermark,
@@ -18765,6 +18852,141 @@ mod tests {
         let bytes = std::fs::read(&path).expect("read snapshot");
         let _ = std::fs::remove_dir_all(&dir);
         bytes
+    }
+
+    /// AT-1: a peer that dribbles the TLS handshake — feeding one record
+    /// byte every ~80ms so every per-record 2s read timeout is satisfied —
+    /// must still be dropped when the TOTAL handshake deadline expires, and
+    /// the listener must go on to serve the next connection. The production
+    /// constant is 5s (`ANCHOR_TLS_HANDSHAKE_DEADLINE`); this test drives
+    /// [`complete_anchor_tls_handshake`] directly with a short deadline so
+    /// the dribble scenario proves the deadline (not the per-record timeout)
+    /// is what ends the handshake, in well under a second.
+    #[test]
+    fn anchor_tls_handshake_deadline_drops_dribbling_peer_and_serves_next_connection() {
+        use crate::anchor_tls::{build_anchor_server_config, load_or_generate_anchor_tls_identity};
+        use rustls::pki_types::ServerName;
+        use std::io::Write as _;
+        use std::net::{SocketAddr, TcpListener, TcpStream};
+        use std::path::PathBuf;
+        use std::sync::Arc;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-anchor-handshake-deadline-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let cert_path: PathBuf = dir.join("anchor-cert.pem");
+        let key_path: PathBuf = dir.join("anchor-key.pem");
+        let identity = load_or_generate_anchor_tls_identity(
+            &cert_path,
+            &key_path,
+            "RustyNet Anchor Deadline Test",
+        )
+        .expect("identity generation must succeed");
+        let config = Arc::new(build_anchor_server_config(&identity).expect("server config"));
+        let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = std::thread::spawn(move || {
+            // First connection: the dribbler. Must be dropped by the
+            // absolute deadline, NOT by the 2s per-record socket timeout
+            // (the dribble keeps every record read under 2s).
+            let (stream, _) = listener.accept().expect("accept dribbler");
+            let conn =
+                rustls::ServerConnection::new(Arc::clone(&config)).expect("server connection");
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            let started = std::time::Instant::now();
+            let error = complete_anchor_tls_handshake(
+                &mut tls,
+                std::time::Instant::now() + Duration::from_millis(400),
+            )
+            .expect_err("a dribbling handshake must be dropped by the deadline");
+            assert!(
+                error.to_string().contains("deadline"),
+                "unexpected error: {error}"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "deadline must bound the handshake well below the per-record-timeout drift: {:?}",
+                started.elapsed()
+            );
+            drop(tls);
+
+            // Second connection: a legitimate client must be served after
+            // the dribbler was dropped.
+            let (stream, _) = listener.accept().expect("accept next connection");
+            let conn =
+                rustls::ServerConnection::new(Arc::clone(&config)).expect("server connection");
+            let mut tls = rustls::StreamOwned::new(conn, stream);
+            complete_anchor_tls_handshake(
+                &mut tls,
+                std::time::Instant::now() + ANCHOR_TLS_HANDSHAKE_DEADLINE,
+            )
+            .expect("next connection must complete its handshake");
+        });
+
+        // Client 1: the dribbler. The bytes parse as a VALID but
+        // never-completing ClientHello record (legacy record header, then a
+        // handshake header declaring 2048 payload bytes of which only a
+        // trickle ever arrives): every 80ms byte keeps each per-record 2s
+        // read timeout satisfied, so ONLY the total deadline can end it.
+        let mut dribble = vec![
+            0x16, 0x03, 0x01, 0x08, 0x00, 0x01, 0x00, 0x08, 0x00, 0x03, 0x03,
+        ];
+        dribble.resize(60, 0x00);
+        let mut dribbler =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("dribbler connect");
+        dribbler.write_all(&dribble[..1]).expect("write first byte");
+        for byte in &dribble[1..] {
+            std::thread::sleep(Duration::from_millis(80));
+            // Writes may start failing once the server drops us; that is
+            // the disposition under test, not a client-side failure.
+            let _ = dribbler.write_all(&[*byte]);
+        }
+        drop(dribbler);
+
+        // Client 2: a legitimate TLS client, rooted at the anchor
+        // certificate itself, must complete the handshake after the
+        // dribbler was dropped.
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(identity.certificate_der.clone())
+            .expect("anchor cert as root");
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("client protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let server_name = ServerName::try_from(crate::anchor_tls::ANCHOR_TLS_CERT_NAME.to_string())
+            .expect("anchor server name");
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let client_conn = rustls::ClientConnection::new(Arc::new(client_config), server_name)
+            .expect("client connection");
+        let mut client = rustls::StreamOwned::new(client_conn, stream);
+        let client_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while client.conn.is_handshaking() {
+            assert!(
+                std::time::Instant::now() < client_deadline,
+                "client handshake hung"
+            );
+            match client.conn.complete_io(&mut client.sock) {
+                Ok(_) => {}
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => panic!("client handshake failed: {err}"),
+            }
+        }
+
+        server.join().expect("server thread");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A4 end-to-end: an anchor serving an ATTESTED snapshot through the
