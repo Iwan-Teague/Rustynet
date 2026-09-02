@@ -126,3 +126,9 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 - LAUNCH QH-01 plan adversarial review (base = the plan's branch; first launch attempt was skipped by a transient tool-safety timeout — re-issued).
 - MERGE C2 design fold (A1-A6; anchors re-verified). LAUNCH edit-1788316232260-44037-0 (docs): QH-01 plan adversarial review (base = plan branch). LAUNCH edit-1788316332322-44455-0 (code, security): anchor-TLS fixes AT-1 (handshake deadline + dribbled-ClientHello test), AT-3 zeroize, AT-4 redacting Debug, AT-5 open-then-fstat, AT-6 no Box::leak, AT-7 dead rustls dep (verify first), AT-9 negative tests; AT-2/AT-8 excluded (design-gated).
 - LAUNCH edit-1788316390691-44828-0 full (code): C2 OFFLINE core adapter/macos_exit_traffic.rs (snapshot verdicts, pf-state translation parser + identity selector, egress-evidence evaluator; unquarantine excluded). TICK 7 END: in flight = QH-01 review (-44037-0), anchor-TLS fixes (-44455-0), C2 core (-44828-0). Wakeup 03:47.
+
+## Tick 8 — 2026-09-02 03:47
+
+- CI e66bef4c: Windows leg GREEN, macOS leg GREEN; Debian: 1 failure — macos_assert_dns_protection_requires_active_dns_rules (canonicalizing /usr/sbin/networksetup fails on Linux; the test had never reached Debian before because nextest's fail-fast cancelled earlier runs). FIX: cfg(target_os = "macos") (was cfg(unix)). Note: Debian's nextest is fail-fast, so further masked failures may surface one per run.
+- LAUNCH edit-1788317290668-46137-0 full (docs): F-1 plan amendment fold (A1-A10).
+- RUNNING: QH-01 review (-44037-0, 426k tokens, 1 sub-agent), anchor-TLS fixes (-44455-0), C2 core (-44828-0), F-1 fold (-46137-0).
