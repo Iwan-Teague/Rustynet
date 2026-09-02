@@ -81,8 +81,6 @@ Goal: at daemon startup, if the persisted trust state says this node's protected
 
 ## 5) Unknown — needs a live probe
 
-- Exact clause text of the Requirements.md / SecurityMinimumBar.md fail-closed provisions (doc citation task, in progress — no code probe needed).
-- `validated_args.rs` seam exact API (`RemoteCommand::from_args` signature; macOS readiness-probe helper names).
 - Whether the persisted state on disk after a protected-mode refresh carries everything `apply_dataplane_generation`'s `protected_dns` arm needs at startup without network I/O (or whether a refresh is genuinely required for posture, which would re-weight 3.1 vs 3.2).
 - Linux startup ordering: exact point where nft killswitch + resolv restore happen relative to first packet, to size the Linux-side window the timer currently masks.
 - Whether `state-refresh-if-socket-present` would race the product startup re-apply (both firing shortly after restart) and whether that is harmless.
