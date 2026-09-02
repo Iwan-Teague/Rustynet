@@ -107,6 +107,7 @@ mod tests {
             inventory_path: None,
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
         };
         assert_eq!(
             EnforceBaselineRuntimeStage::new(

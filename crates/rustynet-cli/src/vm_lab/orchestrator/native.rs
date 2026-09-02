@@ -286,6 +286,15 @@ pub(crate) fn execute_rust_native_orchestration(
         role_switch_platform_macos_elected(config.role_switch_platform.as_deref());
     ctx.macos_role_transition_elected = role_switch_platform_macos_elected;
 
+    // C7: the macOS live reboot-recovery validator is elected purely from the
+    // run config (`--reboot-platform macos`), mirroring the C6 election. Like
+    // the C6 flag this is tightened further down, AFTER the plan is built, so
+    // the flag only stays true when the stage really is in this run's plan. A
+    // resumed context reloads `false`, the fail-closed direction.
+    let reboot_platform_macos_elected =
+        reboot_platform_macos_elected(config.reboot_platform.as_deref());
+    ctx.macos_reboot_recovery_elected = reboot_platform_macos_elected;
+
     // MAC-D3: the macOS anchor validator stages need the inventory path to
     // resolve SSH targets inside the legacy vm_lab helpers they call. Run-local
     // only; a resumed context reloads `None` and the stages fail closed.
@@ -363,6 +372,10 @@ pub(crate) fn execute_rust_native_orchestration(
             // the plan when macOS role transition is elected, even under
             // skip_live_suite, so the tightening below stays true.
             role_switch_platform_macos_elected,
+            // C7 fast path: keep the macOS live reboot-recovery validator in
+            // the plan when macOS reboot recovery is elected, even under
+            // skip_live_suite, so the tightening below stays true.
+            reboot_platform_macos_elected,
             enable_chaos_suite,
             enable_negative_control,
             enable_relay_forwarding_validation,
@@ -424,6 +437,14 @@ pub(crate) fn execute_rust_native_orchestration(
     // a reported skip instead of attempted live evidence. Never silently green.
     ctx.macos_role_transition_elected = role_switch_platform_macos_elected
         && plan_stage_ids.contains(&orchestrator::stage::StageId::MacosRoleTransitionValidation);
+
+    // C7: tighten the reboot-recovery election the same way — the flag only
+    // stays true when the macOS live reboot-recovery stage really is in THIS
+    // run's plan. When it was dropped (skip_live_suite / setup-only mode),
+    // the validator would never dispatch, so the stage must grade the run as
+    // a reported skip instead of attempted live evidence. Never silently green.
+    ctx.macos_reboot_recovery_elected = reboot_platform_macos_elected
+        && plan_stage_ids.contains(&orchestrator::stage::StageId::MacosRebootRecoveryValidation);
 
     let reuse_binding: Option<(Vec<orchestrator::stage::StageId>, String)> = if run_only {
         Some((
@@ -596,6 +617,7 @@ pub(crate) fn execute_rust_native_orchestration(
         admin_platform: String::new(),
         blind_exit_platform: String::new(),
         role_switch_platform: String::new(),
+        reboot_platform: String::new(),
         skip_linux_live_suite: skip_live_suite,
         chaos_suite: enable_chaos_suite && !skip_live_suite,
         cross_network_suite: enable_cross_network_suite && !skip_live_suite,
@@ -956,6 +978,7 @@ fn build_rust_native_orchestration_stages(
     skip_live_suite: bool,
     anchor_platform_macos: bool,
     role_switch_platform_macos: bool,
+    reboot_platform_macos: bool,
     enable_chaos_suite: bool,
     enable_negative_control: bool,
     enable_relay_forwarding_validation: bool,
@@ -971,6 +994,7 @@ fn build_rust_native_orchestration_stages(
         .with_skip_live_suite(skip_live_suite)
         .with_anchor_platform_macos(anchor_platform_macos)
         .with_role_switch_platform_macos(role_switch_platform_macos)
+        .with_reboot_platform_macos(reboot_platform_macos)
         .with_enable_chaos_suite(enable_chaos_suite)
         .with_enable_negative_control(enable_negative_control)
         .with_enable_relay_forwarding_validation(enable_relay_forwarding_validation)
@@ -1075,6 +1099,14 @@ fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> boo
     role_switch_platform == Some("macos")
 }
 
+/// C7: election for the macOS live reboot-recovery validator. Mirrors the C6
+/// role-transition election: the reboot target is the single macOS guest, so
+/// the run config's `reboot_platform` alone decides the election — no
+/// role-assignment disjunct.
+fn reboot_platform_macos_elected(reboot_platform: Option<&str>) -> bool {
+    reboot_platform == Some("macos")
+}
+
 fn filter_rust_native_stages_for_mode(
     mut stages: Vec<Box<dyn orchestrator::stage::OrchestrationStage>>,
     setup_only: bool,
@@ -1110,6 +1142,7 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
         false,
         false,
         false,
+        false,
         orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         1,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1128,6 +1161,7 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
         build_rust_native_orchestration_stages(
             None,
             orchestrator::stage::source_archive::ArchiveSourceMode::Head,
+            false,
             false,
             false,
             false,
