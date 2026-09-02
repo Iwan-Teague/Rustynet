@@ -113,6 +113,21 @@ These extend, and must not regress, the existing tests (`preflight_passes_with_e
 
 ## 4) Optional guarded self-heal (flag-gated, one-shot, fail-closed)
 
+> **Status (2026-09-02): the offline core is IMPLEMENTED** (Phase C, second R2
+> step, on top of the classifier core at `4a4d4512`). `--enable-clock-remediation`
+> is threaded CLI → `VmLabOrchestrateLiveLabConfig` → `PlanBuilder` →
+> `PreflightStage.clock_remediation_enabled` (default OFF: absent-flag failure is
+> byte-identical, pinned by `preflight_failure_text_identical_with_flag_off`). ON +
+> `HourOffset` runs ONE bounded attempt: a FRESH host reading validated through the
+> new `ValidatedArg::unix_seconds` class (A-9), the argv built by
+> `build_clock_remediation_argv` (`Set-Date` / `timedatectl set-time @<secs>`),
+> applied via the `apply: &mut dyn FnMut(&[String]) -> Result<(), String>` seam
+> (`attempt_clock_remediation` in `stage/preflight.rs`), then re-measured through
+> the SAME `validate_clock_skew` gate — residual skew still fails with the enriched
+> message. The production `apply` closure is the not-yet-wired offline seam (the
+> live exec lands with the live-guest step, §5); `GenericDrift`/`WithinTolerance`
+> never trigger a remedy (A-1). Live efficacy remains unproven until §5 unblocks.
+
 **Proposal** — an orchestrator-level flag, **default OFF** (absent flag ⇒ behavior identical to today's fail-only gate):
 
 - Scope: preflight stage only; elected in the same way other orchestrate flags are (CLI flag on the `--node` orchestrate path).

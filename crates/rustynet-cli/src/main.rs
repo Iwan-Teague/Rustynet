@@ -4457,6 +4457,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 windows_only: parser.has_flag("--windows-only"),
                 validate_linux_daemon_state: parser.has_flag("--validate-linux-daemon-state"),
                 enable_chaos_suite: parser.has_flag("--enable-chaos-suite"),
+                enable_clock_remediation: parser.has_flag("--enable-clock-remediation"),
                 enable_negative_control: parser.has_flag("--enable-negative-control"),
                 enable_relay_forwarding_validation: parser
                     .has_flag("--enable-relay-forwarding-validation"),

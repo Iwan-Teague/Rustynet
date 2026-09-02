@@ -172,7 +172,135 @@ pub(crate) fn remediation_allowed(verdict: &ClockVerdict) -> bool {
     matches!(verdict, ClockVerdict::HourOffset { .. })
 }
 
-pub struct PreflightStage;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
+
+/// Build the validated, seam-rendered remedy argv for ONE clock-skew
+/// remediation attempt (plan §4; review A-9). The remedy target is a
+/// [`ValidatedArg::UnixSeconds`] — it reaches this builder only after the
+/// `unix_seconds` class validator accepted it, and it is embedded as inert
+/// ASCII digits (`@<secs>` / a digits-only PowerShell expression), never via
+/// a shell string assembled from unvalidated input. The live exec against a
+/// real guest is deliberately NOT wired here: `execute` drives this argv
+/// through an `apply` closure so the ordering and the fail-closed re-measure
+/// are unit-testable offline without a live Windows/Linux guest.
+pub(crate) fn build_clock_remediation_argv(
+    platform: crate::vm_lab::VmGuestPlatform,
+    target_unix: &ValidatedArg,
+) -> Vec<String> {
+    match platform {
+        crate::vm_lab::VmGuestPlatform::Windows => vec![
+            "powershell.exe".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            format!(
+                "Set-Date -Date ([DateTimeOffset]::FromUnixTimeSeconds({}).UtcDateTime)",
+                target_unix.value()
+            ),
+        ],
+        _ => vec![
+            "sudo".to_owned(),
+            "timedatectl".to_owned(),
+            "set-time".to_owned(),
+            format!("@{}", target_unix.value()),
+        ],
+    }
+}
+
+fn fresh_unix_seconds() -> Result<u64, String> {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => Ok(duration.as_secs()),
+        Err(err) => Err(format!(
+            "orchestrator host clock precedes Unix epoch: {err}"
+        )),
+    }
+}
+
+/// ONE bounded remediation attempt followed by a re-measure through the SAME
+/// [`validate_clock_skew`] gate (plan §4; review A-4). Only an
+/// `HourOffset`-classified drift is remediable (`remediation_allowed`); every
+/// other class, every remediation failure, and every residual skew fails
+/// closed. Every `Err` carries the ORIGINAL gate text (`skew_err`) plus an
+/// enriched suffix; the caller prefixes the node alias.
+pub(crate) fn attempt_clock_remediation(
+    platform: crate::vm_lab::VmGuestPlatform,
+    probe_host_unix: u64,
+    probe_guest_unix: u64,
+    max_skew_secs: u64,
+    skew_err: &str,
+    apply: &mut dyn FnMut(&[String]) -> Result<(), String>,
+    remeasure_guest_unix: &mut dyn FnMut() -> Result<u64, String>,
+) -> Result<(), String> {
+    let verdict = classify_clock_skew(probe_host_unix, probe_guest_unix, max_skew_secs);
+    if !remediation_allowed(&verdict) {
+        return Err(format!(
+            "{skew_err}; clock remediation is enabled but this drift class has no \
+             automatic remedy; failing closed"
+        ));
+    }
+    // A-4: the remedy target is captured FRESH inside the attempt — never the
+    // probe-time reading, which is already stale by the time a fix would land.
+    let fresh_host_unix = fresh_unix_seconds()?;
+    let target = ValidatedArg::unix_seconds(&fresh_host_unix.to_string())
+        .map_err(|err| format!("fresh remediation timestamp rejected: {err}"))?;
+    let argv = build_clock_remediation_argv(platform, &target);
+    apply(&argv).map_err(|err| {
+        format!("{skew_err}; clock remediation attempt failed: {err}; failing closed")
+    })?;
+    let remeasured_guest_unix = remeasure_guest_unix().map_err(|err| {
+        format!("{skew_err}; clock remediation re-measure failed: {err}; failing closed")
+    })?;
+    let remeasured_host_unix = fresh_unix_seconds()?;
+    if let Err(recheck_err) =
+        validate_clock_skew(remeasured_host_unix, remeasured_guest_unix, max_skew_secs)
+    {
+        return Err(format!(
+            "{skew_err}; clock remediation did not resolve the skew ({recheck_err}); \
+             failing closed"
+        ));
+    }
+    Ok(())
+}
+
+/// The stage's decision on a skew-gate failure, factored out so the OFF
+/// path's byte-identity (review A-6) and the ON path's fail-closed behaviour
+/// are testable offline without a live guest.
+#[allow(clippy::too_many_arguments)]
+fn clock_skew_failure_outcome(
+    alias: &str,
+    skew_err: &str,
+    remediation_enabled: bool,
+    platform: crate::vm_lab::VmGuestPlatform,
+    probe_host_unix: u64,
+    probe_guest_unix: u64,
+    max_skew_secs: u64,
+    apply: &mut dyn FnMut(&[String]) -> Result<(), String>,
+    remeasure_guest_unix: &mut dyn FnMut() -> Result<u64, String>,
+) -> StageOutcome {
+    if !remediation_enabled {
+        // Flag OFF: byte-identical to the pre-flag behaviour (A-6).
+        return StageOutcome::Failed(format!("{alias}: {skew_err}"));
+    }
+    match attempt_clock_remediation(
+        platform,
+        probe_host_unix,
+        probe_guest_unix,
+        max_skew_secs,
+        skew_err,
+        apply,
+        remeasure_guest_unix,
+    ) {
+        Ok(()) => StageOutcome::Passed,
+        Err(remediation_err) => StageOutcome::Failed(format!("{alias}: {remediation_err}")),
+    }
+}
+
+pub struct PreflightStage {
+    /// `--enable-clock-remediation`: arms the ONE-SHOT self-heal below. OFF
+    /// (the default) keeps every failure text byte-identical to the
+    /// pre-flag behaviour (review A-6).
+    pub clock_remediation_enabled: bool,
+}
 
 impl OrchestrationStage for PreflightStage {
     fn id(&self) -> StageId {
@@ -317,7 +445,48 @@ impl OrchestrationStage for PreflightStage {
                 }
             };
             if let Err(err) = validate_clock_skew(host_unix, guest_unix, MAX_LAB_CLOCK_SKEW_SECS) {
-                return StageOutcome::Failed(format!("{alias}: {err}"));
+                // The flag-gated seam: OFF = today's failure exactly (A-6);
+                // ON = one bounded remediation attempt through validated argv
+                // + a re-measure through the SAME gate (still fail-closed).
+                // The live exec against the guest is intentionally not wired:
+                // the production closure refuses, so a flag-ON run can never
+                // silently "succeed" without a real fix landing on the guest.
+                let mut apply = |_attempted: &[String]| -> Result<(), String> {
+                    Err("live clock-remediation exec is not wired (offline seam); \
+                         the live-guest step supplies the exec closure"
+                        .to_owned())
+                };
+                let mut remeasure = || -> Result<u64, String> {
+                    let status = retry_transient(
+                        CLOCK_PROBE_ATTEMPTS,
+                        CLOCK_PROBE_RETRY_BACKOFF,
+                        || host.run_argv(argv, &[], &[]),
+                    )
+                    .map_err(|err| {
+                        format!(
+                            "remote clock probe failed after {CLOCK_PROBE_ATTEMPTS} attempts: {err}"
+                        )
+                    })?;
+                    if !status.is_success() {
+                        return Err(format!(
+                            "remote clock probe exited {}: {}",
+                            status.code,
+                            String::from_utf8_lossy(&status.stderr).trim()
+                        ));
+                    }
+                    parse_remote_unix_time(&status.stdout)
+                };
+                return clock_skew_failure_outcome(
+                    alias,
+                    &err,
+                    self.clock_remediation_enabled,
+                    platform,
+                    host_unix,
+                    guest_unix,
+                    MAX_LAB_CLOCK_SKEW_SECS,
+                    &mut apply,
+                    &mut remeasure,
+                );
             }
         }
 
@@ -363,7 +532,10 @@ mod tests {
     fn preflight_passes_with_exit_node_and_writable_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let mut ctx = make_ctx_with_exit(tmp.path());
-        let outcome = PreflightStage.execute(&mut ctx);
+        let outcome = PreflightStage {
+            clock_remediation_enabled: false,
+        }
+        .execute(&mut ctx);
         assert!(
             matches!(outcome, StageOutcome::Passed | StageOutcome::Failed(_)),
             "must produce a terminal outcome: {outcome:?}"
@@ -398,7 +570,10 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
         };
-        let outcome = PreflightStage.execute(&mut ctx);
+        let outcome = PreflightStage {
+            clock_remediation_enabled: false,
+        }
+        .execute(&mut ctx);
         assert!(
             matches!(outcome, StageOutcome::Failed(_)),
             "must fail with no exit node: {outcome:?}"
@@ -538,6 +713,225 @@ mod tests {
                 "gate accepted skew {skew}"
             );
         }
+    }
+
+    // ── Clock-skew self-heal (flag-gated; plan §4, review A-4/A-6/A-9) ──────
+
+    const A6_SKEW_ERR: &str =
+        "guest clock skew is 3602s (maximum 90s; host=1785005541, guest=1785001939)";
+
+    fn hour_offset_pair() -> (u64, u64) {
+        (1785005541, 1785001939) // exactly 3602s ≈ 1h behind
+    }
+
+    #[test]
+    fn preflight_failure_text_identical_with_flag_off() {
+        // The gate text is verbatim today's (A-6).
+        let err = validate_clock_skew(1785005541, 1785001939, 90)
+            .expect_err("a 3602s skew must fail the gate");
+        assert_eq!(err, A6_SKEW_ERR);
+        let mut apply_calls = 0usize;
+        {
+            let mut apply = |_argv: &[String]| -> Result<(), String> {
+                apply_calls += 1;
+                Ok(())
+            };
+            let mut remeasure = || -> Result<u64, String> { Ok(1785005541) };
+            let (host, guest) = hour_offset_pair();
+            let outcome = clock_skew_failure_outcome(
+                "win-guest",
+                &err,
+                false,
+                crate::vm_lab::VmGuestPlatform::Windows,
+                host,
+                guest,
+                90,
+                &mut apply,
+                &mut remeasure,
+            );
+            match outcome {
+                StageOutcome::Failed(text) => assert_eq!(
+                    text,
+                    "win-guest: guest clock skew is 3602s (maximum 90s; host=1785005541, guest=1785001939)"
+                ),
+                other => panic!("flag OFF must fail exactly as today: {other:?}"),
+            }
+        }
+        assert_eq!(apply_calls, 0, "flag OFF: no clock_remediation may happen");
+    }
+
+    #[test]
+    fn clock_remediation_builds_validated_set_date_argv_only_for_hour_offset() {
+        let (host, guest) = hour_offset_pair();
+        let verdict = classify_clock_skew(host, guest, 90);
+        assert!(remediation_allowed(&verdict), "hour quantum is remediable");
+        let target = ValidatedArg::unix_seconds("1788381043").expect("plausible timestamp");
+        let win_argv =
+            build_clock_remediation_argv(crate::vm_lab::VmGuestPlatform::Windows, &target);
+        assert_eq!(win_argv[0], "powershell.exe");
+        assert!(
+            win_argv
+                .last()
+                .expect("argv")
+                .contains("Set-Date -Date ([DateTimeOffset]::FromUnixTimeSeconds(1788381043)"),
+            "Set-Date remedy embeds the validated timestamp: {:?}",
+            win_argv.last()
+        );
+        let linux_argv =
+            build_clock_remediation_argv(crate::vm_lab::VmGuestPlatform::Linux, &target);
+        assert_eq!(
+            linux_argv,
+            vec![
+                "sudo".to_owned(),
+                "timedatectl".to_owned(),
+                "set-time".to_owned(),
+                "@1788381043".to_owned(),
+            ]
+        );
+
+        // GenericDrift (over max, not an hour quantum): remediation is
+        // refused outright and nothing is applied.
+        let drift_guest = host - 600;
+        let skew_err = validate_clock_skew(host, drift_guest, 90).expect_err("skewed");
+        let mut apply_calls = 0usize;
+        {
+            let mut apply = |_argv: &[String]| -> Result<(), String> {
+                apply_calls += 1;
+                Ok(())
+            };
+            let mut remeasure = || -> Result<u64, String> { Ok(host) };
+            let outcome = attempt_clock_remediation(
+                crate::vm_lab::VmGuestPlatform::Linux,
+                host,
+                drift_guest,
+                90,
+                &skew_err,
+                &mut apply,
+                &mut remeasure,
+            );
+            match outcome {
+                Err(msg) => {
+                    assert!(msg.contains(&skew_err), "keeps the original gate text");
+                    assert!(msg.contains("no automatic remedy"), "{msg}");
+                }
+                Ok(()) => panic!("GenericDrift must not be remediated"),
+            }
+        }
+        assert_eq!(apply_calls, 0, "no argv may be applied for GenericDrift");
+    }
+
+    #[test]
+    fn clock_remediation_uses_a_fresh_timestamp_not_the_probe_value() {
+        let (probe_host, probe_guest) = hour_offset_pair();
+        let test_start = fresh_unix_seconds().expect("host clock reads");
+        let captured: std::cell::RefCell<Option<Vec<String>>> = std::cell::RefCell::new(None);
+        {
+            let mut apply = |argv: &[String]| -> Result<(), String> {
+                *captured.borrow_mut() = Some(argv.to_vec());
+                Ok(())
+            };
+            let mut remeasure = || -> Result<u64, String> { fresh_unix_seconds() };
+            let skew_err = validate_clock_skew(probe_host, probe_guest, 90)
+                .expect_err("a 3602s skew must fail the gate");
+            attempt_clock_remediation(
+                crate::vm_lab::VmGuestPlatform::Windows,
+                probe_host,
+                probe_guest,
+                90,
+                &skew_err,
+                &mut apply,
+                &mut remeasure,
+            )
+            .expect("a fresh-target remediation with a synced re-measure resolves");
+        }
+        let argv = captured
+            .into_inner()
+            .expect("the apply closure captured the argv");
+        let digits: String = argv
+            .last()
+            .expect("argv")
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
+        let applied_secs: u64 = digits.parse().expect("digits-only timestamp");
+        assert!(
+            applied_secs >= test_start,
+            "the remedy target must be a FRESH host reading (A-4), got {applied_secs} < {test_start}"
+        );
+        assert_ne!(
+            applied_secs, probe_host,
+            "the remedy target must never be the probe-time host value"
+        );
+    }
+
+    #[test]
+    fn clock_remediation_still_fails_closed_when_remeasure_is_still_skewed() {
+        let (host, guest) = hour_offset_pair();
+        let skew_err =
+            validate_clock_skew(host, guest, 90).expect_err("a 3602s skew must fail the gate");
+        let mut apply_calls = 0usize;
+        {
+            let mut apply = |_argv: &[String]| -> Result<(), String> {
+                apply_calls += 1;
+                Ok(())
+            };
+            // The guest is still 3602s behind after the attempt.
+            let mut remeasure = || -> Result<u64, String> { Ok(guest) };
+            let outcome = attempt_clock_remediation(
+                crate::vm_lab::VmGuestPlatform::Linux,
+                host,
+                guest,
+                90,
+                &skew_err,
+                &mut apply,
+                &mut remeasure,
+            );
+            match outcome {
+                Err(msg) => {
+                    assert!(msg.contains(&skew_err), "keeps the original gate text");
+                    assert!(msg.contains("did not resolve the skew"), "{msg}");
+                    assert!(msg.contains("failing closed"), "{msg}");
+                }
+                Ok(()) => panic!("a still-skewed re-measure must fail closed"),
+            }
+        }
+        assert_eq!(apply_calls, 1, "exactly ONE bounded attempt");
+    }
+
+    #[test]
+    fn clock_remediation_apply_failure_fails_closed() {
+        let (host, guest) = hour_offset_pair();
+        let skew_err =
+            validate_clock_skew(host, guest, 90).expect_err("a 3602s skew must fail the gate");
+        let mut remeasure_calls = 0usize;
+        {
+            let mut apply = |_argv: &[String]| -> Result<(), String> { Err("boom".to_owned()) };
+            let mut remeasure = || -> Result<u64, String> {
+                remeasure_calls += 1;
+                Ok(host)
+            };
+            let outcome = attempt_clock_remediation(
+                crate::vm_lab::VmGuestPlatform::Linux,
+                host,
+                guest,
+                90,
+                &skew_err,
+                &mut apply,
+                &mut remeasure,
+            );
+            match outcome {
+                Err(msg) => {
+                    assert!(msg.contains(&skew_err), "keeps the original gate text");
+                    assert!(
+                        msg.contains("clock remediation attempt failed: boom"),
+                        "{msg}"
+                    );
+                    assert!(msg.contains("failing closed"), "{msg}");
+                }
+                Ok(()) => panic!("a failed apply must fail closed"),
+            }
+        }
+        assert_eq!(remeasure_calls, 0, "no re-measure after a failed apply");
     }
 
     #[test]

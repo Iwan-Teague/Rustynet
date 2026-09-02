@@ -416,6 +416,7 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         orchestrate_ssh_allow_cidrs: _,
         macos_promote_exit: _,
         enable_chaos_suite: _,
+        enable_clock_remediation: _,
         enable_negative_control: _,
         enable_relay_forwarding_validation: _,
         stage_timeout_secs: _,

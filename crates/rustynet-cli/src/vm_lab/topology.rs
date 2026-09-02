@@ -927,6 +927,7 @@ mod tests {
             reboot_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
+            enable_clock_remediation: false,
             enable_negative_control: false,
             enable_relay_forwarding_validation: false,
             stage_timeout_secs: 0,

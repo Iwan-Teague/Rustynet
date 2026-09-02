@@ -330,6 +330,36 @@ pub(crate) fn capability_csv(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// A unix-seconds timestamp argument (the `Set-Date`/`timedatectl` remedy
+/// target for the flag-gated clock-skew self-heal): ASCII digits only — no
+/// leading `+`/`-` sign, no whitespace, no separators — and inside a plausible
+/// unix-seconds window (`> 1_000_000_000`, `< 4_000_000_000`, i.e. years
+/// 2001–2096). Empty, non-numeric, and out-of-range inputs are rejected
+/// fail-closed; the offending value is never echoed.
+pub(crate) fn unix_seconds(value: &str) -> Result<(), ValidationError> {
+    const MIN_UNIX_SECS: u64 = 1_000_000_000;
+    const MAX_UNIX_SECS: u64 = 4_000_000_000;
+    if value.is_empty() {
+        return Err(ValidationError::new("unix seconds", "must not be empty"));
+    }
+    if !value.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ValidationError::new(
+            "unix seconds",
+            "must be ASCII digits only (no sign, whitespace, or separators)",
+        ));
+    }
+    let parsed: u64 = value
+        .parse()
+        .map_err(|_| ValidationError::new("unix seconds", "does not fit in u64"))?;
+    if parsed <= MIN_UNIX_SECS || parsed >= MAX_UNIX_SECS {
+        return Err(ValidationError::new(
+            "unix seconds",
+            format!("must be in the plausible range ({MIN_UNIX_SECS}, {MAX_UNIX_SECS}) exclusive"),
+        ));
+    }
+    Ok(())
+}
+
 /// An IP-address-shaped argument: a charset allowlist safe for shell
 /// embedding. Hoisted from `linux_traffic.rs` / `windows_traffic.rs` (the two
 /// identical copies). Note this class intentionally accepts CIDR notation;
@@ -390,6 +420,7 @@ pub(crate) enum ValidatedArg {
     CliToken(String),
     CapabilityCsv(String),
     WindowsPath(String),
+    UnixSeconds(String),
 }
 
 impl ValidatedArg {
@@ -407,7 +438,8 @@ impl ValidatedArg {
             | Self::Port(v)
             | Self::CliToken(v)
             | Self::CapabilityCsv(v)
-            | Self::WindowsPath(v) => v,
+            | Self::WindowsPath(v)
+            | Self::UnixSeconds(v) => v,
         }
     }
 
@@ -481,6 +513,11 @@ impl ValidatedArg {
         windows_path(value)?;
         Ok(Self::WindowsPath(value.to_owned()))
     }
+
+    pub(crate) fn unix_seconds(value: &str) -> Result<Self, ValidationError> {
+        unix_seconds(value)?;
+        Ok(Self::UnixSeconds(value.to_owned()))
+    }
 }
 
 impl fmt::Debug for ValidatedArg {
@@ -501,6 +538,7 @@ impl fmt::Debug for ValidatedArg {
             Self::CliToken(_) => "CliToken",
             Self::CapabilityCsv(_) => "CapabilityCsv",
             Self::WindowsPath(_) => "WindowsPath",
+            Self::UnixSeconds(_) => "UnixSeconds",
         };
         write!(f, "ValidatedArg::{variant}(len={})", self.value().len())
     }
@@ -958,6 +996,27 @@ mod tests {
         assert!(capability_csv("a b").is_err());
         assert!(capability_csv("client\nentry").is_err());
         assert!(capability_csv("").is_err());
+    }
+
+    #[test]
+    fn unix_seconds_rejects_non_numeric_and_out_of_range_and_accepts_plausible_timestamps() {
+        assert!(unix_seconds("1785005541").is_ok());
+        assert!(unix_seconds("1_000_000_001").is_err());
+        assert!(unix_seconds("+1785005541").is_err());
+        assert!(unix_seconds("-1785005541").is_err());
+        assert!(unix_seconds("1785005541; touch /tmp/pwned").is_err());
+        assert!(unix_seconds("").is_err());
+        assert!(unix_seconds("1e12").is_err());
+        assert!(
+            unix_seconds("999999999").is_err(),
+            "below the plausible floor"
+        );
+        assert!(unix_seconds("1000000000").is_err(), "floor is exclusive");
+        assert!(unix_seconds("4000000000").is_err(), "ceiling is exclusive");
+        assert!(
+            unix_seconds("99999999999999999999").is_err(),
+            "u64 overflow"
+        );
     }
 
     #[test]
