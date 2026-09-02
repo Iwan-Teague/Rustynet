@@ -20,7 +20,10 @@
 //! - enforces the admin's per-peer model allow-list, token quota,
 //!   and request rate ([`enforce`], scoped by
 //!   `rustynet_policy::LlmAccessScope` — restrictions on a grant,
-//!   never a grant source);
+//!   never a grant source). Deny-on-absent: a granted peer with no
+//!   scope entry is denied every model — absence never means
+//!   unrestricted; the only full-access value is the explicit
+//!   `unrestricted` marker on the peer's scope line;
 //! - may issue a short-lived, single-audience, node-signed session
 //!   token ([`session`]) as defence-in-depth; the token is
 //!   re-checked against current signed policy on every use and can

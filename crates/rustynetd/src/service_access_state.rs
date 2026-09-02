@@ -22,6 +22,10 @@
 //! A missing or unreadable file means deny-all on the binary side,
 //! so the daemon writing these files IS the authorisation hand-off:
 //! an empty `grants.v1` is exactly as fail-closed as an absent one.
+//! The same holds for `scopes.v1`: since the gateway's deny-on-absent
+//! flip, an absent/empty `scopes.v1` denies every model too — a
+//! granted peer needs an explicit scope line (limits, or the
+//! `unrestricted` marker) before it may consume anything.
 //! Everything here is deterministic; the daemon (`daemon.rs`) owns
 //! the seam that decides *when* to materialise (after each
 //! successful signed-state apply) and *where* (env-overridable
@@ -55,9 +59,12 @@ pub struct ServiceAccessSnapshot {
     pub peers: Vec<(IpAddr, String)>,
     /// Rendered `scopes.v1` lines. Empty for now: admin scope
     /// distribution rides the signed policy bundle later — we render
-    /// nothing rather than something wrong, and an absent/empty
-    /// scope entry means "unrestricted grant" on the gateway side
-    /// (scopes restrict, they never grant).
+    /// nothing rather than something wrong. Under the gateway's
+    /// deny-on-absent semantics an absent/empty scope entry DENIES
+    /// every model (absence never means unrestricted); until signed
+    /// scope distribution lands, a daemon-managed deployment is
+    /// deny-by-default per peer, and full access requires the
+    /// explicit `unrestricted` marker on the peer's scope line.
     pub scopes: Vec<String>,
 }
 
