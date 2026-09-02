@@ -773,3 +773,29 @@ loop), and confirm build_dns_response truly always answers the probe.
 
 **Also merged: F2 freshness impl** (`20e6b249`, verified — stdout-capture, fail-closed, no fixed-file
 read). Fleet: resolver-fix review running. main 1d0f6486→log, clean, CI green.
+
+### Tick 30 continuation — resolver-fix review MERGED + fix launched (~00:35Z)
+
+Owner going to sleep; directive: keep the loop and the GLM agents working through the night.
+
+**The resolver-fix review COMPLETED and MERGED** (`2f7f9919`, ACCEPT-WITH-AMENDMENTS) — a MATERIAL
+correction I verified: `build_dns_response` does always answer (defect is pure timing), and the Q2
+decoupling is not a weakening, BUT deferring the DNS apply out of bootstrap for ALL postures would
+open a real DNS LEAK WINDOW for a FullyProtected exit/full-tunnel node (tunnel/exit mode up before
+the pf floor + general pin). Corrected fix = POSTURE SPLIT: ScopedResolverOnly defers to first
+reconcile (safe); FullyProtected keeps its in-bootstrap apply, made satisfiable by HOISTING the
+loopback DNS socket bind above bootstrap and draining that same socket through the same
+build_dns_response during the probe (one hardened path, no second resolver); the ScopedResolverOnly
+failure gets its own error path so it never restricts the node. Anchors all re-verified in the doc.
+
+**Launched the resolver ORDERING FIX** (`edit-1788390672503-35403-0`) as four milestones: M1
+FullyProtected hoist-bind + in-bootstrap probe servicing via build_dns_response; M2 ScopedResolverOnly
+defer to first reconcile via the dns_posture_reassert_pending latch; M3 Q2 error-path split
+(ScopedResolverOnly failure does not increment toward permanent restriction; FullyProtected stays
+strict); M4 docs. Gates both crates. This is the release-blocker; I will review its full diff with
+security rigor before merge, then the live proof.
+
+**Also launched QH-01 Step 4d-ii** (`edit-1788390741319-35754-0`) to keep the fleet at 2 overnight
+— the sink-signature flip (run_remote takes a typed &RemoteCommand so raw &str/format! can't reach
+a sink), migrating the remaining raw sites and DROPPING the pin below 130; collision-free with the
+resolver fix (rustynet-cli adapters vs rustynetd DNS). main 2f7f9919→log, clean, CI green.
