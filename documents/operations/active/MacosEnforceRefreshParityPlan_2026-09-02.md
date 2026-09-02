@@ -31,11 +31,22 @@ Net: on Linux the timer usually closes the window ≤60 s after restart; on macO
 
 ## 2) Precedence decision (Requirements.md > SecurityMinimumBar.md > active scope docs)
 
-<!-- PENDING (next commit): exact clause citations from documents/Requirements.md and
-     documents/SecurityMinimumBar.md (fail-closed when trust state stale/missing;
-     default-deny across DNS/killswitch flows). Do not paraphrase before quoting. -->
+**Ratified: the fail-open window is a product defect the daemon must close, not a lab artifact to route around.**
 
-Decision to be ratified in this section: "a restarted client is up with no DNS protection until a refresh command arrives" is a fail-open window the PRODUCT must close — the daemon re-applies its persisted protected posture at startup and fails closed on apply failure — independent of any lab-parity fix. The macOS enforce-path refresh is the lab-side parity/proof enabler, not the fix. Linux's reliance on the trust-refresh timer is itself a fail-open window that the product fix demotes to benign redundancy (defense in depth), to be noted in the lab docs.
+Clause citations, in precedence order:
+
+- `documents/Requirements.md:90` — "DNS fail-close behavior must prevent DNS leakage outside Rustynet policy when VPN mode requires protected DNS." A restarted client whose protected DNS mode is persisted but not re-applied leaks DNS outside Rustynet policy for the entire window until the next refresh (on macOS, indefinitely). That directly violates this clause for the window's duration.
+- `documents/Requirements.md:186` — "VPN operating modes requiring protected routing must fail closed for traffic and DNS on tunnel failure." Restart is a hard tunnel-failure event; the requirement is fail closed, not "fail closed once a timer gets around to re-signing state". Restoring the operator's pre-protection DNS at startup (M1) and waiting for an external refresh is the opposite of fail-closed-on-failure.
+- `documents/Requirements.md:197` — "Trusted-signing/authorization state must fail closed: when trust state cannot be loaded or persisted, trust-required connectivity must be denied with explicit operator-visible errors." The stale-state case is the mirror image: when trust state CAN be loaded and it declares protected posture, the posture must be enforced, and when the enforcement cannot be established, the failure must be operator-visible and closed — not silently deferred to an out-of-process timer.
+- `documents/SecurityMinimumBar.md:240-243` — control 8, "Data-plane leak prevention": "DNS fail-close behavior in protected DNS modes." The bar is a continuous property of the mode, not a property of the most recent IPC command.
+- `documents/SecurityMinimumBar.md:283` — "Leak tests for tunnel and DNS fail-close behavior" — requires the verification method this plan's §3.2 tests provide.
+- `documents/Requirements.md:146` — the cross-platform parity mandate lists "DNS fail-closed" among the per-role platform-native dataplane capabilities that must be proven live on macOS/Windows. Today the macOS proof depends on the absence of a timer the Linux proof silently enjoys — the parity run as configured measures different properties on the two platforms.
+
+Consequences of the precedence order:
+
+1. **Primary fix (product, both platforms):** the daemon re-applies its persisted protected posture at startup, fail-closed on apply failure (§3.2). This is required by Requirements.md:90/:186/:197 regardless of any lab consideration.
+2. **Secondary fix (lab parity/proof enabler):** the enforce paths issue a post-restart `state refresh` (§3.1). This is not the fix — it restores the lab's ability to PROVE the product property deterministically instead of racing a timer, and removes the macOS/Linux proof asymmetry.
+3. **Linux timer reclassification:** `rustynetd-trust-refresh.timer` is itself a fail-open window (up to 60 s of unprotected posture after every restart, currently load-bearing). Once §3.2 lands it becomes benign redundancy (defense in depth); the lab docs should stop treating it as the mechanism that closes the window.
 
 ## 3) Implementation plan (offline-testable core first)
 
