@@ -4788,6 +4788,7 @@ mod registry_equivalence_tests {
             | "validate_macos_ipv6_leak" => Some(("macos", "exit_handoff")),
             "validate_macos_exit_dns_failclosed" => Some(("macos", "managed_dns")),
             "validate_macos_role_transition" => Some(("macos", "role_transition")),
+            "validate_macos_reboot_recovery" => Some(("macos", "reboot_recovery")),
             "gossip_convergence_validation" => Some(("linux", "gossip_peer_convergence")),
             "validate_linux_relay_service_lifecycle" => Some(("linux", "relay_service_lifecycle")),
             "validate_linux_anchor_bundle_pull" => Some(("linux", "anchor")),
@@ -5216,6 +5217,7 @@ mod registry_equivalence_tests {
                     | "validate_macos_anchor_bundle_pull"
                     | "validate_macos_anchor_port_mapping_authority"
                     | "validate_macos_role_transition"
+                    | "validate_macos_reboot_recovery"
             ) {
                 // MAC-D3: the three macOS anchor validators are rust-native
                 // stages now, but they are platform-gated behind an ELECTED
@@ -5226,6 +5228,10 @@ mod registry_equivalence_tests {
                 // joined as a rust-native stage with the same shape — gated
                 // behind an ELECTED macOS role transition, which this fixture
                 // never elects.
+                // C7 (2026-09-02): the macOS live reboot-recovery validator
+                // joined with the same shape — gated behind an ELECTED macOS
+                // reboot recovery (--reboot-platform macos), which this
+                // fixture never elects.
                 vec!["linux".into()]
             } else if oracle_is_rust_native(bare) {
                 vec!["linux".into(), "macos".into(), "windows".into()]

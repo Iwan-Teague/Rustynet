@@ -1255,6 +1255,18 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// connectivity post-restart. `Some("macos")` runs that stage;
     /// unset/other Skips it.
     pub role_switch_platform: Option<String>,
+    /// Counterpart of [`Self::role_switch_platform`] for the live
+    /// reboot-recovery cell (`MacosDnsBackupRebootSurvivalPlan_2026-09-02.md`).
+    /// Like role_switch it is NOT threaded into `topology::resolve_topology`;
+    /// it only elects the macOS live reboot-recovery stage
+    /// `validate_macos_reboot_recovery`, which proves the M1 networksetup-DNS
+    /// fail-closed protection survives a real `sudo -n shutdown -r now`:
+    /// pre-reboot evidence (durable backup present, mode 0600, loopback-pinned
+    /// DNS), a bounded SSH-return wait, the daemon LIVE again with the
+    /// protection restored, the typed fail-closed check reporting overall_ok,
+    /// and the QH-40 shutdown-residue marker absent. `Some("macos")` runs
+    /// that stage; unset/other Skips it.
+    pub reboot_platform: Option<String>,
     /// Promote the macOS node to a SECONDARY regular (NATing) exit while a
     /// Linux node remains the PRIMARY exit and the membership/assignment
     /// authority. Unlike `--exit-platform macos` (which would make the macOS
@@ -14856,6 +14868,271 @@ pub fn exercise_macos_role_transition_live(
         "macOS live role transition proven on {macos_alias}: {}; mesh peers before={before_peer_count} after={after_peer_count} ({after_mesh_summary})",
         out.trim()
     ))
+}
+
+/// C7 (`MacosDnsBackupRebootSurvivalPlan_2026-09-02.md`): prove the M1
+/// networksetup-DNS fail-closed protection survives a REAL reboot of the
+/// macOS guest. Sequence, all fail-loud:
+///
+/// 1. Pre-reboot evidence over SSH: the durable backup exists at
+///    `<state>.networksetup-dns.failclosed.bak` with mode 0600, and every
+///    enabled networksetup service is pinned to loopback (127.0.0.1).
+/// 2. `sudo -n shutdown -r now`. The SSH channel dies with the guest; a
+///    transport error on this dispatch is the expected shutdown path (the
+///    pre-reboot capture proved SSH seconds earlier), while an explicit
+///    non-zero exit status is a failure.
+/// 3. Bounded wait for SSH to return AND the daemon to report LIVE
+///    (`rustynet status` output carrying the `daemon-live` marker AND a
+///    parseable node id — the same probe contract as
+///    `macos_daemon_readiness_probe`).
+/// 4. Post-reboot proof: the startup-recovery line is in the daemon log (or
+///    the fail-closed check proves the protection re-applied cleanly), the
+///    typed `macos-dns-failclosed-check --no-fail-on-drift` evaluator
+///    reports overall_ok, every enabled service is loopback-pinned again,
+///    and the QH-40 shutdown-residue marker is ABSENT.
+///
+/// `report_dir`, when given, receives the raw evidence under
+/// `<report_dir>/logs/validate_macos_reboot_recovery.{log,json}`.
+pub fn exercise_macos_reboot_recovery_live(
+    macos_alias: &str,
+    inventory_path: &Path,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    report_dir: Option<&Path>,
+) -> Result<String, String> {
+    const RECOVERY_LOG_LINE: &str = "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)";
+    const STATE_ROOT: &str = "/usr/local/var/rustynet";
+    const LOOPBACK_PIN_CHECK: &str = "for svc in $(networksetup -listallnetworkservices \
+         | tail -n +2 | grep -v '^\\*'); do \
+           dns=\"$(networksetup -getdnsservers \"$svc\" 2>/dev/null || true)\"; \
+           case \"$dns\" in \
+             *127.0.0.1*) ;; \
+             *) echo \"service $svc is not loopback-pinned: $dns\" >&2; exit 1 ;; \
+           esac; \
+         done";
+
+    let inventory = load_inventory(inventory_path)?;
+    let macos_entry = inventory
+        .iter()
+        .find(|entry| entry.alias == macos_alias)
+        .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
+        .clone();
+    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+        return Err(format!(
+            "alias {macos_alias} resolved to non-macOS platform: {}",
+            macos_entry.platform_profile().platform.as_str()
+        ));
+    }
+    let target = remote_target_from_inventory_entry(&macos_entry, None);
+
+    // 1. Pre-reboot evidence. A single capture proves the backup, its mode,
+    //    and the live loopback pinning BEFORE anything is disturbed.
+    let pre_reboot_script = format!(
+        "set -eu; \
+         ST={STATE_ROOT}/rustynetd.state; \
+         BAK=\"$ST.networksetup-dns.failclosed.bak\"; \
+         sudo -n test -f \"$BAK\" || {{ echo 'durable networksetup DNS backup missing before reboot' >&2; exit 1; }}; \
+         MODE=\"$(sudo -n stat -f %Lp \"$BAK\")\"; \
+         [ \"$MODE\" = \"0600\" ] || {{ echo \"backup mode is $MODE, expected 0600\" >&2; exit 1; }}; \
+         {LOOPBACK_PIN_CHECK}; \
+         echo \"pre-reboot evidence ok: backup present at $BAK, mode $MODE, all enabled services loopback-pinned\""
+    );
+    let pre_reboot_out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        &pre_reboot_script,
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("pre-reboot evidence capture on {macos_alias} failed: {e}"))?;
+
+    // 2. Reboot. Fire-and-forget: the SSH channel dies with the guest, so a
+    //    transport error here is the EXPECTED shutdown path; only an explicit
+    //    non-zero exit status (dispatched but rejected in-guest) fails.
+    let shutdown_status = run_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        "sudo -n shutdown -r now",
+        Duration::from_secs(30),
+    );
+    match shutdown_status {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            return Err(format!(
+                "shutdown -r now dispatched but exited non-zero ({status}) on {macos_alias}"
+            ));
+        }
+        // Transport died mid-dispatch: the pre-reboot capture proved SSH
+        // seconds earlier, so this is the reboot tearing the channel down.
+        Err(_) => {}
+    }
+
+    // 3. Bounded SSH-return + daemon-LIVE wait. Each attempt runs the same
+    //    readiness contract as `macos_daemon_readiness_probe` (in-guest
+    //    retries, then a `daemon-live` marker + parseable node id), but over
+    //    the vm_lab capture runner because the guest address is only known
+    //    through the inventory target here.
+    let probe_script = "set -eu; \
+         RN=/usr/local/bin/rustynet; \
+         for _i in $(seq 1 8); do \
+           OUT=\"$(sudo env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock $RN status 2>/dev/null || true)\"; \
+           if [ -n \"$OUT\" ]; then printf '%s\\n' \"$OUT\"; echo 'daemon-live'; exit 0; fi; \
+           sleep 1; \
+         done; \
+         exit 1";
+    let mut probe_out = String::new();
+    let mut ssh_back = false;
+    for attempt in 1..=8 {
+        match capture_remote_shell_command_for_target(
+            &target,
+            None,
+            Some(ssh_identity_file),
+            known_hosts_path,
+            probe_script,
+            Duration::from_secs(90),
+        ) {
+            Ok(out) if out.contains("daemon-live") => {
+                probe_out = out;
+                ssh_back = true;
+                break;
+            }
+            _ => {
+                std::thread::sleep(Duration::from_secs(20));
+                let _ = attempt;
+            }
+        }
+    }
+    if !ssh_back {
+        return Err(format!(
+            "macOS guest {macos_alias} did not come back with a LIVE daemon within the bounded SSH-return window after the reboot"
+        ));
+    }
+    let node_id = crate::vm_lab::orchestrator::adapter::ssh::parse_status_node_id(&probe_out)
+        .ok_or_else(|| {
+            format!(
+                "post-reboot `rustynet status` on {macos_alias} carried the daemon-live marker but no parseable node id"
+            )
+        })?;
+
+    // 4. Post-reboot proof: recovery log line (or clean re-apply via the
+    //    typed check), typed fail-closed evaluation, live loopback pinning,
+    //    and the QH-40 residue marker absent. The typed check runs as its
+    //    own capture so its stdout is pure JSON for the evaluator.
+    let post_script = format!(
+        "set -eu; \
+         ST={STATE_ROOT}/rustynetd.state; \
+         if sudo -n grep -hF '{RECOVERY_LOG_LINE}' /usr/local/var/log/rustynet/*.log >/dev/null 2>&1; then \
+           echo 'startup_recovery_line=present'; \
+         else \
+           echo 'startup_recovery_line=absent'; \
+         fi; \
+         if sudo -n test -f \"$ST.shutdown-residue.json\"; then \
+           echo 'shutdown_residue_marker=present'; \
+         else \
+           echo 'shutdown_residue_marker=absent'; \
+         fi; \
+         {LOOPBACK_PIN_CHECK}; \
+         echo 'post-reboot loopback pinning re-verified'"
+    );
+    let post_out = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        &post_script,
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("post-reboot verification on {macos_alias} failed: {e}"))?;
+
+    let startup_recovery_line_present = post_out.contains("startup_recovery_line=present");
+    if post_out.contains("shutdown_residue_marker=present") {
+        return Err(format!(
+            "QH-40 shutdown-residue marker found on {macos_alias} after the reboot; a rollback-residue reboot must not read as a Pass"
+        ));
+    }
+    let failclosed_json = capture_remote_shell_command_for_target(
+        &target,
+        None,
+        Some(ssh_identity_file),
+        known_hosts_path,
+        "sudo -n /usr/local/bin/rustynetd macos-dns-failclosed-check --no-fail-on-drift",
+        Duration::from_secs(120),
+    )
+    .map_err(|e| format!("macos-dns-failclosed-check on {macos_alias} failed: {e}"))?;
+    let failclosed_summary = evaluate_macos_dns_failclosed_report(macos_alias, &failclosed_json)?;
+    if !startup_recovery_line_present && !failclosed_summary.contains("ok") {
+        return Err(format!(
+            "neither the M1 startup-recovery log line nor a clean fail-closed re-apply was observed on {macos_alias}: the networksetup protection did not verifiably survive the reboot"
+        ));
+    }
+
+    let summary = format!(
+        "macOS reboot-with-protection proven on {macos_alias}: node_id={node_id}; {}; startup_recovery_line={}; residue_marker=absent; failclosed-check: {failclosed_summary}",
+        pre_reboot_out.trim(),
+        if startup_recovery_line_present {
+            "present"
+        } else {
+            "absent (clean re-apply proven by failclosed-check)"
+        }
+    );
+
+    write_macos_reboot_recovery_evidence(
+        report_dir,
+        macos_alias,
+        &pre_reboot_out,
+        &probe_out,
+        &post_out,
+        &summary,
+    )?;
+
+    Ok(summary)
+}
+
+/// Persist the raw capture evidence for the C7 reboot-recovery proof under
+/// `<report_dir>/logs/validate_macos_reboot_recovery.{log,json}`. Evidence
+/// writing is best-effort relative to the PROOF itself: a failure to write
+/// artifacts fails the stage (fail-loud — an unrecorded proof is not a
+/// recorded proof), with the reason in the error.
+fn write_macos_reboot_recovery_evidence(
+    report_dir: Option<&Path>,
+    macos_alias: &str,
+    pre_reboot_out: &str,
+    probe_out: &str,
+    post_out: &str,
+    summary: &str,
+) -> Result<(), String> {
+    let Some(report_dir) = report_dir else {
+        return Ok(());
+    };
+    let logs_dir = report_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)
+        .map_err(|e| format!("create evidence logs dir {}: {e}", logs_dir.display()))?;
+    let log_path = logs_dir.join("validate_macos_reboot_recovery.log");
+    std::fs::write(
+        &log_path,
+        format!(
+            "== pre-reboot evidence ==\n{pre_reboot_out}\n\
+             == post-reboot daemon probe ==\n{probe_out}\n\
+             == post-reboot verification ==\n{post_out}\n\
+             == summary ==\n{summary}\n"
+        ),
+    )
+    .map_err(|e| format!("write {}: {e}", log_path.display()))?;
+    let json_path = logs_dir.join("validate_macos_reboot_recovery.json");
+    let observations = serde_json::json!({
+        "stage": "validate_macos_reboot_recovery",
+        "alias": macos_alias,
+        "pre_reboot_evidence": pre_reboot_out.trim(),
+        "post_reboot_daemon_probe": probe_out.trim(),
+        "post_reboot_verification": post_out.trim(),
+        "summary": summary,
+    });
+    std::fs::write(&json_path, format!("{observations}\n"))
+        .map_err(|e| format!("write {}: {e}", json_path.display()))?;
+    Ok(())
 }
 
 /// Live peer count from the macOS node's mesh-status snapshot, alongside the
@@ -38278,7 +38555,8 @@ mod tests {
         // blind_exit_dataplane_validation + gossip_convergence_validation.
         // MAC-D3 (2026-08-29): 61 + the 3 macOS anchor validator stages.
         // C6 (2026-09-02): + validate_macos_role_transition.
-        assert_eq!(cli_ids.len(), 65);
+        // C7 (2026-09-02): + validate_macos_reboot_recovery.
+        assert_eq!(cli_ids.len(), 66);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)
@@ -50434,6 +50712,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             admin_platform: None,
             blind_exit_platform: None,
             role_switch_platform: None,
+            reboot_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
             enable_negative_control: false,

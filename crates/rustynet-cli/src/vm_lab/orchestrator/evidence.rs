@@ -138,6 +138,7 @@ pub(crate) fn orchestrate_manifest_selectors(
             config.admin_platform.as_deref(),
             config.blind_exit_platform.as_deref(),
             config.role_switch_platform.as_deref(),
+            config.reboot_platform.as_deref(),
         ]
         .into_iter()
         .any(|selector| selector == Some(platform))
@@ -156,6 +157,7 @@ pub(crate) fn orchestrate_manifest_selectors(
         admin_platform: config.admin_platform.clone().unwrap_or_default(),
         blind_exit_platform: config.blind_exit_platform.clone().unwrap_or_default(),
         role_switch_platform: config.role_switch_platform.clone().unwrap_or_default(),
+        reboot_platform: config.reboot_platform.clone().unwrap_or_default(),
         skip_linux_live_suite: config.skip_linux_live_suite,
         chaos_suite: config.enable_chaos_suite,
         cross_network_suite: !config.skip_cross_network,

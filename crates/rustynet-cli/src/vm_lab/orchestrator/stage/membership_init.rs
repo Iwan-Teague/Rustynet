@@ -169,6 +169,7 @@ mod tests {
             inventory_path: None,
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
         };
         assert!(matches!(
             MembershipInitStage.execute(&mut ctx),
@@ -207,6 +208,7 @@ mod tests {
             inventory_path: None,
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
         };
         let exit_key = "a".repeat(64);
         let client_key = "b".repeat(64);
@@ -306,6 +308,7 @@ mod tests {
             inventory_path: None,
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
         };
         ctx.collected_pubkeys
             .insert("client-1".to_owned(), WireguardPublicKey("b".repeat(64)));
@@ -343,6 +346,7 @@ mod tests {
             inventory_path: None,
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
         };
         ctx.node_ids
             .insert("client-1".to_owned(), "client-node-id".to_owned());

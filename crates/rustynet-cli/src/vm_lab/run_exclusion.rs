@@ -373,6 +373,7 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         admin_platform,
         blind_exit_platform,
         role_switch_platform,
+        reboot_platform,
         // ── a dry run validates wiring and touches no guest ──
         dry_run,
         // ── everything below names no guest ──
@@ -466,6 +467,7 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         (admin_platform, "--admin-platform"),
         (blind_exit_platform, "--blind-exit-platform"),
         (role_switch_platform, "--role-switch-platform"),
+        (reboot_platform, "--reboot-platform"),
     ] {
         if value.is_some() {
             unresolved.push(flag);
