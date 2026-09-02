@@ -2911,6 +2911,8 @@ mod tests {
         assert!(ValidatedArg::path("/Users/lab\nrm -rf /").is_err());
         let quoted = ValidatedArg::path("/Users/lab; rm -rf /").expect("shape-valid path");
         assert_eq!(quoted.quoted(), "'/Users/lab; rm -rf /'");
+    }
+
     // ── S2b: helper-liveness restore before the daemon restart ──────────────
 
     /// Shared recorder for the driver tests: each closure appends its step name
