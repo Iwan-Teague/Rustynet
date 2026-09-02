@@ -135,10 +135,10 @@ pub(crate) struct UserspaceEngine {
     /// with no live state. Unreachable while every mutator maintains the
     /// map in lockstep (`set_tunnel_index` refuses collisions and runs
     /// before any other mutation), so a nonzero value would indicate
-    /// internal state corruption; the packet path treats it as an index
-    /// miss and falls back to the endpoint match rather than panicking —
-    /// a panic here would tear down the engine's single worker thread and
-    /// every live session with it.
+    /// internal state corruption; the packet path fails closed on it —
+    /// the datagram is dropped and counted, never re-attributed through
+    /// the endpoint match and never panicked over (a panic here would tear
+    /// down the engine's single worker thread and every live session).
     receiver_index_divergence_drops: u64,
     path_quality: BTreeMap<NodeId, PeerPathQuality>,
     recorded_peer_ciphertext_ingress: Vec<RecordedPeerCiphertextIngress>,
@@ -715,17 +715,16 @@ impl UserspaceEngine {
             Some(node_id) if peer_states.contains_key(node_id) => Some(node_id),
             Some(_) => {
                 // The index named a peer whose live state is gone. Unreachable
-                // while every mutator maintains both structures in lockstep —
-                // so it is debug-asserted, counted, and treated as an index
-                // MISS: fall back to the endpoint match instead of dispatching
-                // to, or panicking over, stale state. A panic here would kill
-                // the engine's single worker thread and every live session.
-                debug_assert!(
-                    false,
-                    "receiver_index named a peer with no live state; dropping to endpoint fallback"
-                );
+                // while every mutator maintains both structures in lockstep,
+                // so a hit here means internal state corruption. Fail closed:
+                // count it and DROP the datagram. It is deliberately NOT
+                // re-attributed through the endpoint match — a datagram that
+                // claims a session we no longer hold must not be steered to
+                // whichever peer shares its source address — and it never
+                // panics or asserts in any build: a panic here would kill the
+                // engine's single worker thread and every live session.
                 *receiver_index_divergence_drops += 1;
-                Self::endpoint_index_lookup(endpoint_index, remote_addr)
+                return Ok(None);
             }
             None => Self::endpoint_index_lookup(endpoint_index, remote_addr),
         };
@@ -2361,12 +2360,10 @@ mod tests {
         );
     }
 
-    // Debug builds panic on this divergence BY DESIGN (`debug_assert!` in
-    // the dispatch path); this test exists to prove the RELEASE packet path
-    // degrades to the endpoint fallback instead of panicking, so it only
-    // compiles where debug assertions are off. Run with
-    // `cargo test --release -p rustynet-backend-wireguard` to execute it.
-    #[cfg(not(debug_assertions))]
+    // A diverged receiver-index entry (naming a peer with no live state)
+    // is internal corruption; the packet path must fail closed on it in
+    // EVERY build — drop and count, no endpoint re-attribution, no panic or
+    // assertion — because a panic kills the engine's worker thread.
     #[test]
     fn receiver_index_dispatch_never_panics_on_divergence() {
         let mut engine = fresh_engine(0x65);
@@ -2410,29 +2407,30 @@ mod tests {
             "the drop must be counted"
         );
 
-        // From the peer's real endpoint the SAME diverged index falls back
-        // to the endpoint match and still routes to the live peer.
+        // From the peer's REAL endpoint the same diverged index is dropped
+        // too: a datagram claiming a session the engine no longer holds is
+        // never re-attributed by source address, even to the live peer that
+        // owns that address.
         let peer_endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55)), 51820);
         let outcome = engine
             .process_inbound_ciphertext(peer_endpoint, local, &data_packet(index), 1, &mut sink)
             .expect("inbound processing must not error");
         assert!(
             outcome.is_none(),
-            "the synthetic datagram decrypts to nothing, but the call must not error or panic"
+            "a diverged index is dropped even from the live peer's own endpoint"
         );
         assert_eq!(
             engine.receiver_index_divergence_drops(),
             2,
             "the second diverged lookup is counted too"
         );
-        // The fallback that rescued the lookup is the endpoint match: prove
-        // it resolved to the live peer (the routed node itself is not
-        // observable through the return value, which carries only
-        // successfully decrypted output).
+        // The endpoint index itself is intact: a datagram WITHOUT a claimed
+        // session (a handshake init carries no receiver index) would still
+        // resolve to the live peer by its endpoint.
         assert_eq!(
             engine.find_node_id_by_endpoint(peer_endpoint),
             Some(node_id),
-            "the endpoint fallback resolves to the live peer"
+            "the endpoint index still resolves the live peer"
         );
     }
 
