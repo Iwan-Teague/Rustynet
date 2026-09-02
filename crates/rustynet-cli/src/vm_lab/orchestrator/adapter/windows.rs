@@ -8,7 +8,7 @@ use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
 use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    self, WINDOWS_RUSTYNETD_PATH, run_remote_ps,
+    self, PowerShellScript, WINDOWS_RUSTYNETD_PATH, run_remote_ps,
 };
 use crate::vm_lab::orchestrator::adapter::windows_membership;
 use crate::vm_lab::orchestrator::adapter::windows_traffic;
@@ -205,11 +205,12 @@ impl NodeAdapter for WindowsNodeAdapter {
             .build_argv_with_extra_args(op, WINDOWS_RUSTYNETD_PATH.as_ref(), extra_args)
             .map_err(|message| AdapterError::Protocol { message })?;
         // argv: [daemon_path, subcommand, "--no-fail-on-drift"]
-        // All elements come from `WindowsDaemonProbe::build_argv`, which produces
-        // a fixed set of known-safe strings. No user-controlled input reaches argv.
+        // Every argv element is validated per class at the seam (Windows path
+        // for the binary, cli_token for the rest) regardless of its origin,
+        // and the rendered script quotes every element.
         let op_label = argv.get(1).cloned().unwrap_or_default();
-        let script = build_validator_script(&argv);
-        let output = run_remote_ps(&self.conn, &script, VALIDATOR_TIMEOUT)?;
+        let script = build_validator_script(&argv)?;
+        let output = run_remote_ps(&self.conn, script.as_str(), VALIDATOR_TIMEOUT)?;
         let passed = crate::vm_lab::orchestrator::adapter::ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
             op_label,
@@ -325,23 +326,24 @@ impl NodeAdapter for WindowsNodeAdapter {
 
 /// Build a `PowerShell` script that invokes the validator binary.
 /// argv must be [`daemon_path`, subcommand, ...flags] as produced by
-/// `WindowsDaemonProbe::build_argv`.
-fn build_validator_script(argv: &[String]) -> String {
-    use crate::vm_lab::orchestrator::adapter::windows_install::ps_quote;
+/// `WindowsDaemonProbe::build_argv`. Every element is validated per class at
+/// the seam (Windows path for the binary, CLI token for the rest) and the
+/// rendered script quotes every element; an empty or invalid argv is an
+/// error, never a script.
+fn build_validator_script(argv: &[String]) -> Result<PowerShellScript, AdapterError> {
+    use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
+
     if argv.is_empty() {
-        return String::new();
+        return Err(AdapterError::Protocol {
+            message: "validator argv must not be empty".to_owned(),
+        });
     }
-    // Quote binary path; remaining args are fixed safe strings (subcommand + flags).
-    let binary = ps_quote(argv[0].as_str()).unwrap_or_else(|_| format!("'{}'", argv[0]));
-    let rest: Vec<&str> = argv[1..].iter().map(String::as_str).collect();
-    if rest.is_empty() {
-        format!("& {binary}")
-    } else {
-        format!(
-            "$out = & {binary} {} 2>&1; Write-Output $out",
-            rest.join(" ")
-        )
+    let mut args = Vec::with_capacity(argv.len());
+    args.push(ValidatedArg::windows_path(&argv[0]).map_err(AdapterError::from)?);
+    for token in &argv[1..] {
+        args.push(ValidatedArg::cli_token(token).map_err(AdapterError::from)?);
     }
+    PowerShellScript::from_call_argv("windows validator", &args)
 }
 
 #[cfg(test)]
@@ -415,23 +417,39 @@ mod tests {
             "windows-runtime-acls-check".to_owned(),
             "--no-fail-on-drift".to_owned(),
         ];
-        let script = build_validator_script(&argv);
-        assert!(
-            script.contains("& "),
-            "script must use PS call operator: {script}"
+        let script = build_validator_script(&argv).unwrap();
+        assert_eq!(
+            script.as_str(),
+            "$out = & 'C:\\Program Files\\RustyNet\\rustynetd.exe' \
+             'windows-runtime-acls-check' '--no-fail-on-drift' 2>&1; Write-Output $out"
         );
         assert!(
-            script.contains("windows-runtime-acls-check"),
-            "script must contain subcommand: {script}"
-        );
-        assert!(
-            script.contains("--no-fail-on-drift"),
-            "script must contain flag: {script}"
+            script.as_str().contains("& '"),
+            "script must use PS call operator on a quoted binary: {}",
+            script.as_str()
         );
     }
 
     #[test]
-    fn build_validator_script_empty_argv_returns_empty() {
-        assert_eq!(build_validator_script(&[]), "");
+    fn build_validator_script_empty_argv_is_rejected() {
+        let err = build_validator_script(&[]).unwrap_err();
+        assert!(
+            matches!(err, AdapterError::Protocol { .. }),
+            "empty argv must fail closed, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn build_validator_script_rejects_metacharacter_in_subcommand_before_any_script() {
+        let argv = vec![
+            r"C:\Program Files\RustyNet\rustynetd.exe".to_owned(),
+            "windows-runtime-acls-check; id".to_owned(),
+        ];
+        let err = build_validator_script(&argv).unwrap_err();
+        assert!(
+            err.to_string().contains("CLI token"),
+            "metacharacter in argv[1] must be rejected by the cli_token \
+             validator, got: {err}"
+        );
     }
 }
