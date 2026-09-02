@@ -2,11 +2,11 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::vm_lab::DaemonProbeOp;
-use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::adapter::macos_exit_traffic;
 use crate::vm_lab::orchestrator::adapter::macos_install::{self, MACOS_RUSTYNETD_PATH};
 use crate::vm_lab::orchestrator::adapter::macos_membership;
 use crate::vm_lab::orchestrator::adapter::macos_traffic;
+use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
 use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::adapter::ssh;
@@ -18,6 +18,8 @@ use crate::vm_lab::orchestrator::error::{
     ValidatorReport, WireguardPublicKey,
 };
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+use crate::vm_lab::DaemonProbeOp;
+use crate::vm_lab::VmGuestPlatform;
 
 const VALIDATOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -261,6 +263,32 @@ impl NodeAdapter for MacosNodeAdapter {
 
     fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
         macos_traffic::collect_active_tunnels(&self.conn)
+    }
+
+    // ── Active full-tunnel exit serving ───────────────────────────────────────
+    //
+    // Assert-not-actuate (design §0 decision 2 / §3): the daemon holds the
+    // enforce-time pf NAT; the adapter verifies it through the daemon's own
+    // verifier subcommands and never mutates the product firewall from the
+    // CLI. The killswitch-precedence fold-in is ordered by
+    // MacosExitActivationSequence (design §5/A2): the mutating experiment is
+    // issued ONLY from the pre-activation baseline position inside
+    // activate_exit_serving, and its window is closed by a post-check
+    // lifecycle snapshot proving the restore.
+
+    fn activate_exit_serving(&self) -> Result<(), AdapterError> {
+        macos_exit_traffic::activate_exit_serving(&self.conn, &self.alias)
+    }
+
+    fn assert_exit_actively_serving(&self) -> Result<(), AdapterError> {
+        macos_exit_traffic::assert_exit_actively_serving(&self.conn)
+    }
+
+    fn assert_mesh_client_nat_session(
+        &self,
+        expected_client_mesh_addr: Option<&str>,
+    ) -> Result<MeshClientNatSession, AdapterError> {
+        macos_exit_traffic::assert_mesh_client_nat_session(&self.conn, expected_client_mesh_addr)
     }
 
     // ── Diagnostics + cleanup ─────────────────────────────────────────────────
