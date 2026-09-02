@@ -225,3 +225,4 @@ Conventions: `MERGE <sha> <branch>: <what>` · `LAUNCH <job_id> <mode>: <task>` 
 
 - Whole rustynet-cli suite on the merged main: 2908 passed, 0 failed (post-incident confirmation). vm-lab CLI rebuilt from the fixed main.
 - LAB: rank-1 macOS-client full suite RELAUNCHED as the live proof for S2b/M2 + the durable DNS backup (see the job id in the loop journal / state/deepseek-mcp-jobs).
+- LAUNCH: S2b/M2 post-merge refute review (edit-1788332482671-2798-0); QH-01 Step 4d-i typed renderer output `RenderedScript` + `from_rendered` (edit-1788332528611-3366-0). Running: macOS reboot stage (edit-1788331511666-45649-0). Harvest labrun-1788332375714-1644-0 in bootstrap_hosts.
