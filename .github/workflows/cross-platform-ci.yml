@@ -112,6 +112,10 @@ jobs:
           git config --global --add safe.directory '*'
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # Full history: the delegated-edit marker gate scans a git log
+          # window, which needs real history, not a shallow clone.
+          fetch-depth: 0
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
@@ -148,6 +152,14 @@ jobs:
             exit 1
           }
           echo "repo hygiene: doc pair identical, pre-commit hook present"
+      - name: Delegated-edit marker gate
+        # QH-26 item 4: no commit carrying the delegated-edit checkpoint
+        # marker pair may land outside the allowlist. The binary is
+        # std-only and scans the checked-out history directly (hence the
+        # fetch-depth: 0 above), so this step is near-free next to the
+        # workspace build it piggybacks on.
+        run: |
+          ./scripts/ci/delegated_edit_marker_gate.sh
       - name: Shipped-binary feature gate
         # Everything above builds --all-features, so nothing here ever compiles
         # the CLI the way it actually ships. That gap is not cosmetic: features
