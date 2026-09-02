@@ -37,7 +37,8 @@ use rustynetd::linux_runtime_acls::collect_linux_runtime_acl_report;
 use rustynetd::linux_service_hardening::collect_linux_service_hardening_report;
 use rustynetd::macos_authenticode::collect_macos_authenticode_report;
 use rustynetd::macos_dns_failclosed::{
-    build_macos_dns_failclosed_report, collect_macos_dns_failclosed_snapshot,
+    build_macos_dns_failclosed_report_for_posture, collect_macos_dns_failclosed_snapshot,
+    parse_macos_dns_posture,
 };
 use rustynetd::macos_key_custody::collect_macos_key_custody_report;
 use rustynetd::macos_mesh_status::{MacosMeshStatusOptions, collect_macos_mesh_status_report};
@@ -2520,12 +2521,28 @@ fn run_linux_exit_dns_failclosed_capture_command(args: &[String]) -> Result<(), 
 
 fn run_macos_dns_failclosed_check_command(args: &[String]) -> Result<(), String> {
     let mut fail_on_drift = true;
+    let mut posture = rustynetd::phase10::DnsPosture::FullyProtected;
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
             Some("--no-fail-on-drift") => {
                 fail_on_drift = false;
                 index += 1;
+            }
+            Some("--posture") => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(
+                        "--posture requires a value (fully-protected | scoped-resolver-only)"
+                            .to_owned(),
+                    );
+                };
+                posture = parse_macos_dns_posture(value)
+                    .ok_or_else(|| {
+                        format!(
+                            "unknown macos-dns-failclosed-check --posture value: {value} (expected fully-protected | scoped-resolver-only)"
+                        )
+                    })?;
+                index += 2;
             }
             Some(flag) => {
                 return Err(format!(
@@ -2536,7 +2553,7 @@ fn run_macos_dns_failclosed_check_command(args: &[String]) -> Result<(), String>
         }
     }
     let snapshot = collect_macos_dns_failclosed_snapshot();
-    let report = build_macos_dns_failclosed_report(snapshot);
+    let report = build_macos_dns_failclosed_report_for_posture(snapshot, posture);
     println!(
         "{}",
         serde_json::to_string_pretty(&report)

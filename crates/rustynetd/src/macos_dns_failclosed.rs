@@ -106,6 +106,13 @@ pub struct MacosDnsFailclosedSnapshot {
     /// loopback-only DNS (including services with no configured
     /// servers — those inherit DHCP resolvers and can leak).
     pub unpinned_services: Vec<String>,
+    /// Scoped `*.rustynet` resolver: `/etc/resolver/rustynet` is present
+    /// and readable (M5). Required by the ScopedResolverOnly posture;
+    /// ignored by the FullyProtected evaluation, which demands the full
+    /// machine-wide posture (the full posture installs the scoped file,
+    /// but its contract is the general resolver state).
+    #[serde(default)]
+    pub scoped_resolver_present: bool,
 }
 
 /// Raw pf DNS block floor observation (S6 layer 3), as collected from
@@ -128,9 +135,22 @@ pub struct NetworksetupDnsPinObservation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MacosDnsFailclosedReport {
     pub schema_version: u32,
+    /// The DNS posture the report was evaluated FOR, as
+    /// [`crate::phase10::DnsPosture::as_str`] (self-describing: the CLI
+    /// evaluator rejects a report whose posture does not match the role
+    /// the node is supposed to hold). Defaults to `fully_protected` when
+    /// deserializing a schema-1 payload that predates the field.
+    #[serde(default = "default_report_posture")]
+    pub posture: String,
     pub overall_ok: bool,
     pub snapshot: MacosDnsFailclosedSnapshot,
     pub drift_reasons: Vec<String>,
+}
+
+fn default_report_posture() -> String {
+    crate::phase10::DnsPosture::FullyProtected
+        .as_str()
+        .to_owned()
 }
 
 /// Pure evaluator: every nameserver must be loopback.
@@ -381,6 +401,9 @@ pub fn build_macos_dns_failclosed_snapshot_with_host_layers(
         networksetup_readable: false,
         pinned_services: Vec::new(),
         unpinned_services: Vec::new(),
+        // Scoped layer: the pure builders cannot observe /etc and FAIL
+        // CLOSED (absent); the live collector overwrites it below.
+        scoped_resolver_present: false,
     };
     snapshot.pfctl_readable = pf_observation.is_some();
     snapshot.pf_block_rules_present = pf_observation.is_some_and(|o| o.block_rules_present);
@@ -519,24 +542,111 @@ pub fn collect_macos_dns_failclosed_snapshot() -> MacosDnsFailclosedSnapshot {
     let scutil_dns_body = read_scutil_dns();
     let pf_observation = read_pf_dns_block_floor();
     let networksetup_observation = read_networksetup_dns_pin();
-    build_macos_dns_failclosed_snapshot_with_host_layers(
+    let mut snapshot = build_macos_dns_failclosed_snapshot_with_host_layers(
         resolv_conf_body.as_deref(),
         scutil_dns_body.as_deref(),
         pf_observation.as_ref(),
         networksetup_observation.as_ref(),
-    )
+    );
+    snapshot.scoped_resolver_present =
+        std::fs::read_to_string(crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_PATH).is_ok();
+    snapshot
 }
 
 pub fn build_macos_dns_failclosed_report(
     snapshot: MacosDnsFailclosedSnapshot,
 ) -> MacosDnsFailclosedReport {
-    let drift_reasons = evaluate_macos_dns_failclosed_snapshot(&snapshot);
+    build_macos_dns_failclosed_report_for_posture(
+        snapshot,
+        crate::phase10::DnsPosture::FullyProtected,
+    )
+}
+
+/// Build a report evaluated FOR a specific DNS posture (M5). The posture is
+/// THREADED by the caller from the role/exit posture the daemon holds —
+/// never inferred from the snapshot being checked (that would make the
+/// check a tautology). The report embeds the posture so a consumer can
+/// verify the evaluation matches the role it asked about.
+pub fn build_macos_dns_failclosed_report_for_posture(
+    snapshot: MacosDnsFailclosedSnapshot,
+    posture: crate::phase10::DnsPosture,
+) -> MacosDnsFailclosedReport {
+    let drift_reasons = evaluate_macos_dns_failclosed_snapshot_for_posture(&snapshot, posture);
     let overall_ok = drift_reasons.is_empty();
     MacosDnsFailclosedReport {
-        schema_version: 1,
+        schema_version: 2,
+        posture: posture.as_str().to_owned(),
         overall_ok,
         snapshot,
         drift_reasons,
+    }
+}
+
+/// Parse the wire form of a DNS posture (accepts both the `as_str` form
+/// and the CLI flag spelling). `None` = unrecognized (callers must fail
+/// closed, never default).
+pub fn parse_macos_dns_posture(value: &str) -> Option<crate::phase10::DnsPosture> {
+    match value.trim() {
+        "fully_protected" | "fully-protected" => Some(crate::phase10::DnsPosture::FullyProtected),
+        "scoped_resolver_only" | "scoped-resolver-only" => {
+            Some(crate::phase10::DnsPosture::ScopedResolverOnly)
+        }
+        _ => None,
+    }
+}
+
+/// Posture-aware snapshot evaluation (M5,
+/// MacosClientDnsFailclosedDiagnosisReview_2026-09-02 A7). The
+/// FullyProtected contract is the existing seven-condition check,
+/// UNCHANGED. The ScopedResolverOnly contract (plain mesh client): the
+/// scoped `*.rustynet` resolver MUST be present (its absence means mesh
+/// names leak to the LAN resolver), NO service may pin the loopback
+/// resolver as its general DNS (a pin without the full posture's live
+/// primary + pf floor is the forbidden half state), and the system
+/// configuration must be readable (an unreadable state cannot prove the
+/// absence of a pin). The machine's own resolv.conf/scutil/pf state is
+/// deliberately NOT demanded — this posture leaves the machine's general
+/// DNS untouched by design. `Untouched` always drifts: a running node
+/// always holds one of the two protective postures.
+pub fn evaluate_macos_dns_failclosed_snapshot_for_posture(
+    snapshot: &MacosDnsFailclosedSnapshot,
+    posture: crate::phase10::DnsPosture,
+) -> Vec<String> {
+    match posture {
+        crate::phase10::DnsPosture::FullyProtected => {
+            evaluate_macos_dns_failclosed_snapshot(snapshot)
+        }
+        crate::phase10::DnsPosture::Untouched => vec![
+            "no DNS posture is applied; a running mesh node must hold either the fully-protected or scoped-resolver-only posture"
+                .to_owned(),
+        ],
+        crate::phase10::DnsPosture::ScopedResolverOnly => {
+            let mut reasons: Vec<String> = Vec::new();
+            if !snapshot.scoped_resolver_present {
+                reasons.push(format!(
+                    "scoped resolver {} is missing; *.rustynet queries leak to the LAN resolver; scoped DNS posture cannot be verified",
+                    crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_PATH
+                ));
+            }
+            // Fail closed: an unreadable enumeration cannot prove the
+            // absence of a stranded loopback pin.
+            if !snapshot.networksetup_readable {
+                reasons.push(
+                    "networksetup service enumeration unreadable; the absence of stranded loopback pins cannot be verified; scoped DNS posture cannot be verified"
+                        .to_owned(),
+                );
+            }
+            // A service PINNED to loopback outside the full posture is
+            // residue: it advertises a resolver this posture does not
+            // justify. Non-loopback or DHCP-inherited general DNS is the
+            // machine's own business and is NOT drift here.
+            for service in &snapshot.pinned_services {
+                reasons.push(format!(
+                    "network service {service:?} pins loopback DNS without the fully-protected posture (stranded residue); scoped DNS posture cannot be verified"
+                ));
+            }
+            reasons
+        }
     }
 }
 
@@ -560,6 +670,7 @@ mod tests {
             networksetup_readable: true,
             pinned_services: vec!["Wi-Fi".to_owned()],
             unpinned_services: Vec::new(),
+            scoped_resolver_present: true,
         }
     }
 
@@ -856,14 +967,143 @@ mod tests {
 
     // ----- X4 coverage parity sweep ---------------------------------------
 
+    // ----- M5 posture-aware evaluation (review A7) -----------------------
+
     #[test]
-    fn report_schema_version_pinned_at_one() {
+    fn fully_protected_complete_snapshot_passes() {
+        let report = build_macos_dns_failclosed_report_for_posture(
+            compliant_snapshot(),
+            crate::phase10::DnsPosture::FullyProtected,
+        );
+        assert!(report.overall_ok, "drift: {:?}", report.drift_reasons);
+        assert_eq!(report.posture, "fully_protected");
+    }
+
+    #[test]
+    fn fully_protected_missing_pf_floor_drifts() {
+        let mut snapshot = compliant_snapshot();
+        snapshot.pf_block_rules_present = false;
+        let report = build_macos_dns_failclosed_report_for_posture(
+            snapshot,
+            crate::phase10::DnsPosture::FullyProtected,
+        );
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|reason| reason.contains("pf DNS block floor not verified")),
+            "drift must name the missing floor: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn scoped_resolver_only_clean_snapshot_passes() {
+        let mut snapshot = compliant_snapshot();
+        // A plain client leaves the machine's general DNS untouched: the
+        // primary is NOT loopback, services carry their own (non-loopback)
+        // DNS, and there is no pf floor. ONLY the scoped resolver matters.
+        snapshot.resolv_conf_present = false;
+        snapshot.nameservers = Vec::new();
+        snapshot.loopback_resolver_advertised = false;
+        snapshot.pfctl_readable = false;
+        snapshot.pf_block_rules_present = false;
+        snapshot.pinned_services = Vec::new();
+        snapshot.unpinned_services = Vec::new();
+        let report = build_macos_dns_failclosed_report_for_posture(
+            snapshot,
+            crate::phase10::DnsPosture::ScopedResolverOnly,
+        );
+        assert!(report.overall_ok, "drift: {:?}", report.drift_reasons);
+        assert_eq!(report.posture, "scoped_resolver_only");
+    }
+
+    #[test]
+    fn scoped_resolver_only_missing_scoped_file_drifts() {
+        let mut snapshot = compliant_snapshot();
+        snapshot.pinned_services = Vec::new();
+        snapshot.scoped_resolver_present = false;
+        let report = build_macos_dns_failclosed_report_for_posture(
+            snapshot,
+            crate::phase10::DnsPosture::ScopedResolverOnly,
+        );
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|reason| reason.contains("/etc/resolver/rustynet is missing")),
+            "drift must name the missing scoped resolver: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn scoped_resolver_only_with_stray_general_pin_drifts() {
+        let mut snapshot = compliant_snapshot();
+        snapshot.scoped_resolver_present = true;
+        // Stranded residue: a service pinned to loopback outside the full
+        // posture advertises a resolver this posture never justifies.
+        snapshot.pinned_services = vec!["Wi-Fi".to_owned()];
+        let report = build_macos_dns_failclosed_report_for_posture(
+            snapshot,
+            crate::phase10::DnsPosture::ScopedResolverOnly,
+        );
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|reason| { reason.contains("Wi-Fi") && reason.contains("stranded residue") }),
+            "drift must name the stranded pin: {:?}",
+            report.drift_reasons
+        );
+    }
+
+    #[test]
+    fn untouched_posture_always_drifts() {
+        let report = build_macos_dns_failclosed_report_for_posture(
+            compliant_snapshot(),
+            crate::phase10::DnsPosture::Untouched,
+        );
+        assert!(!report.overall_ok);
+        assert!(
+            report
+                .drift_reasons
+                .iter()
+                .any(|reason| reason.contains("no DNS posture is applied"))
+        );
+    }
+
+    #[test]
+    fn parse_macos_dns_posture_accepts_both_spellings_and_fails_closed() {
+        assert_eq!(
+            parse_macos_dns_posture("fully-protected"),
+            Some(crate::phase10::DnsPosture::FullyProtected)
+        );
+        assert_eq!(
+            parse_macos_dns_posture("scoped_resolver_only"),
+            Some(crate::phase10::DnsPosture::ScopedResolverOnly)
+        );
+        assert_eq!(parse_macos_dns_posture("untouched"), None);
+        assert_eq!(parse_macos_dns_posture(""), None);
+        assert_eq!(parse_macos_dns_posture("bogus"), None);
+    }
+
+    #[test]
+    fn report_schema_version_pinned_at_two() {
         let report = build_macos_dns_failclosed_report(compliant_snapshot());
-        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.schema_version, 2);
+        assert_eq!(report.posture, "fully_protected");
         let body = serde_json::to_string(&report).expect("serialize");
         assert!(
-            body.contains("\"schema_version\":1"),
-            "schema_version JSON shape must be int=1: {body}"
+            body.contains("\"schema_version\":2"),
+            "schema_version JSON shape must be int=2: {body}"
+        );
+        assert!(
+            body.contains("\"posture\":\"fully_protected\""),
+            "the report must embed its evaluated posture: {body}"
         );
     }
 

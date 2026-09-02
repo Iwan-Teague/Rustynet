@@ -39,14 +39,14 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
-        if aliases.is_empty() {
+        if ctx.assignments.is_empty() {
             return StageOutcome::Passed;
         }
 
         let mut failures: Vec<String> = Vec::new();
         let mut reported_skips: Vec<(String, String)> = Vec::new();
-        for alias in &aliases {
+        for assignment in &ctx.assignments {
+            let alias = &assignment.alias;
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
                 None => {
@@ -60,9 +60,15 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
                 continue;
             }
             let expected_node_id = ctx.node_ids.get(alias.as_str()).map(String::as_str);
-            if let Err(e) =
-                adapter.run_role_validator(RoleValidatorKind::DnsFailclosed, expected_node_id)
-            {
+            // M5: the expected DNS posture is THREADED from the node's
+            // planned role — never inferred from the state the check
+            // observes (that would make the verification a tautology).
+            let expected_dns_posture = expected_dns_posture_for_role(&assignment.role);
+            if let Err(e) = adapter.run_role_validator(
+                RoleValidatorKind::DnsFailclosed,
+                expected_node_id,
+                Some(expected_dns_posture),
+            ) {
                 failures.push(format!("{alias}: {e}"));
             }
         }
@@ -71,6 +77,26 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
             write_reported_skips_note(ctx, &reported_skips);
         }
         outcome_for(&failures, &reported_skips)
+    }
+}
+
+/// The DNS posture the orchestrator EXPECTS a node with this planned role to
+/// hold (MacosClientDnsFailclosedDiagnosis_2026-09-02 §6, review A1). Exit
+/// and blind-exit nodes carry the machine's traffic and hold the full
+/// fail-closed posture; every other role is a plain mesh node holding the
+/// scoped-resolver-only posture. The macOS validator/daemon check verify the
+/// report against this expectation.
+fn expected_dns_posture_for_role(role: &NodeRole) -> &'static str {
+    match role {
+        NodeRole::Exit | NodeRole::BlindExit => "fully_protected",
+        NodeRole::Anchor | NodeRole::Admin | NodeRole::Relay | NodeRole::Client => {
+            "scoped_resolver_only"
+        }
+        NodeRole::Entry | NodeRole::Aux | NodeRole::Extra => "scoped_resolver_only",
+        NodeRole::Custom(name) => match name.as_str() {
+            "exit" | "blind_exit" => "fully_protected",
+            _ => "scoped_resolver_only",
+        },
     }
 }
 
