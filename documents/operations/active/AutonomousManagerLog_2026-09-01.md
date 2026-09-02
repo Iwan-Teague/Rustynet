@@ -283,3 +283,38 @@ Diff read in full; gate running (clippy green, whole-crate tests in flight).
 **Fleet.** Running: reboot-stage review (`…11418-0`), Windows node-parity PHASE A root-cause
 analysis (`edit-1788341400379-14626-0`), macOS enforce-refresh parity plan (launched this
 tick). Loop note #604.
+
+### Tick 15 addendum — ~08:40–09:00Z
+
+**Step 4d-i merged** (`ca44f598`): pinned rustfmt clean, clippy 1.88 clean, whole
+`rustynet-cli` suite 3363 pass on the branch (the crate-wide `RenderedScript` source scan and
+the 130 raw-sink pin both hold). Worktree removed, branch deleted.
+
+**Launch-gate remedy recorded** (`12bb7b26`) against the real stub
+`livelab-1788332954-9f1a490ec5c4::validate_baseline_runtime` — the stub id is the
+orchestrator's `livelab-<unix>-<sha12>` run id, not the MCP `labrun-*` job id.
+
+**Mechanism behind the Linux/macOS difference, pinned.** The Linux client's post-restart
+`signed state refresh completed (reason=command)` is not issued by the enforce path at all: it
+comes from `scripts/systemd/rustynetd-trust-refresh.timer` (`OnBootSec=45s`,
+`OnUnitActiveSec=60s`) → `rustynetd-trust-refresh.service` → `ExecStartPost=rustynet ops
+state-refresh-if-socket-present` (`main.rs` `execute_ops_state_refresh_if_socket_present`:
+skip if the daemon socket is absent, else IPC `state refresh`). So on Linux the protected
+posture after a restart is restored by a periodic external timer within ~60 s — in the harvest
+it happened to land 0.1 s after bootstrap — and `validate_baseline_runtime` passes by that
+timing. The macOS lab guest has no launchd counterpart (LaunchDaemons: anchor, daemon, exit,
+privileged-helper only) and the macOS bootstrap installs none, so nothing ever re-applies the
+posture after a clean restart. This sharpens the plan job's question: the product-side startup
+re-apply (b) is the real fix on BOTH platforms — Linux is currently rescued by a timer, which
+is a race, not a guarantee — and the orchestrator parity refresh (a) is the lab-side proof
+enabler. Folded into the loop journal; the plan job (`edit-1788341753952-24366-0`) must be
+checked against this when it reports.
+
+**S2b/M2 fix job launched** (`edit-1788341910134-28312-0`, base `ca44f598`): the review's
+Fixes 1–5 (tri-state helper probe with pid + socket, bootout-before-bootstrap on restore, KILL
+before helper bootout, job-scoped exit predicate, anchored scanner exclusion) plus its
+mandatory tests, with the explicit rule that the raw-sink pin may not be raised silently if the
+anchored scanner exposes sites the loose one hid.
+
+**Fleet: 4 running** — reboot-stage review (`…11418-0`), Windows parity PHASE A
+(`…14626-0`), enforce-refresh parity plan (`…24366-0`), S2b/M2 fixes (`…28312-0`).
