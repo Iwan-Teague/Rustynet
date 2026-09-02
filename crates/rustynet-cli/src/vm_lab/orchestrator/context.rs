@@ -234,6 +234,14 @@ pub struct OrchestrationContext {
     /// skip — the fail-closed direction (a resumed context reloads `false`;
     /// the flag is re-derived from the selector on every run).
     pub macos_role_transition_elected: bool,
+    /// Run-local election flag for the C7 macOS live reboot-recovery
+    /// validator (`validate_macos_reboot_recovery`): true only when the run
+    /// elected `--reboot-platform macos` AND the stage is really in this
+    /// run's plan (tightened in native.rs after the plan is built).
+    /// `false`, which grades the macOS reboot-recovery cell as a reported
+    /// skip — the fail-closed direction (a resumed context reloads `false`;
+    /// the flag is re-derived from the selector on every run).
+    pub macos_reboot_recovery_elected: bool,
     /// Absolute path of the resolved inventory this run started from,
     /// threaded so runtime stages can self-serve inventory lookups
     /// (e.g. the macOS anchor validator set re-reading per-node lab
@@ -268,6 +276,7 @@ impl OrchestrationContext {
             substrate_record: None,
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
             inventory_path: None,
         }
     }
@@ -400,6 +409,7 @@ impl OrchestrationContext {
             // stage grades as a reported skip until the run is re-derived
             // from the `--role-switch-platform macos` selector.
             macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
             // Same run-local rule: the absolute inventory path is never
             // persisted; macOS anchor stages fail closed on `None`.
             inventory_path: None,

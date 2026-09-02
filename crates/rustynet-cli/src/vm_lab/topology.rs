@@ -924,6 +924,7 @@ mod tests {
             admin_platform: None,
             blind_exit_platform: None,
             role_switch_platform: None,
+            reboot_platform: None,
             macos_promote_exit: false,
             enable_chaos_suite: false,
             enable_negative_control: false,

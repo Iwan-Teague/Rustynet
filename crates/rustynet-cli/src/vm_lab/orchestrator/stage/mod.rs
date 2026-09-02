@@ -70,6 +70,7 @@ pub mod live_two_hop_validation;
 pub mod macos_anchor_bundle_pull_validation;
 pub mod macos_anchor_port_mapping_authority_validation;
 pub mod macos_anchor_profile_deploy;
+pub mod macos_reboot_recovery_validation;
 pub mod macos_role_transition_validation;
 pub mod membership_init;
 pub mod mesh_status_validation;
@@ -248,6 +249,12 @@ define_stage_catalog! {
     LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role,
     LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience,
     LiveRebootRecoveryValidation => "live_reboot_recovery_validation" @ Live / T2Resilience,
+    // C7: live macOS reboot-with-protection validator
+    // (MacosDnsBackupRebootSurvivalPlan_2026-09-02.md). Wire name matches the
+    // registry vocabulary so run-matrix evidence stays comparable. Gated
+    // Live: skipped-with-reason unless the run elects macOS for reboot
+    // recovery (--reboot-platform macos).
+    MacosRebootRecoveryValidation => "validate_macos_reboot_recovery" @ Live / T2Resilience,
     LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation" @ Live / T4Security,
     LiveKeyCustodyValidation => "live_key_custody_validation" @ Live / T4Security,
     // Daemon killed MID-enrollment, then trust state must be consistent
