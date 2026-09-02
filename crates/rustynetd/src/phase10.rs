@@ -3560,6 +3560,12 @@ pub struct MacosCommandSystem {
     /// an IPv4 mesh, `net.inet6.ip6.forwarding` for an IPv6 mesh. Restore and
     /// teardown must use the SAME key that was enabled.
     exit_forwarding_key: Option<&'static str>,
+    /// Durable path of the macOS DNS fail-closed backup document, derived
+    /// from the daemon's actual state path (`--state` installs consult the
+    /// backup beside their own state file). The apply write, the prior-read
+    /// capture guard, the rollback restore, and the startup guard's derived
+    /// path (daemon.rs) must ALL agree on this one path.
+    dns_backup_path: std::path::PathBuf,
 }
 
 impl MacosCommandSystem {
@@ -3599,11 +3605,27 @@ impl MacosCommandSystem {
             tandem_dns_anchor: None,
             prior_ip_forwarding: None,
             exit_forwarding_key: None,
+            // Platform default; the daemon overrides this with the path
+            // derived from its actual `--state` at construction
+            // (`with_dns_backup_path`). Tests that never touch the DNS
+            // apply/rollback paths only ever read this field.
+            dns_backup_path: crate::macos_dns_sc_protect::networksetup_dns_backup_path(
+                std::path::Path::new(crate::daemon::default_state_path()),
+            ),
         })
     }
 
     pub fn with_traversal_bootstrap_allow_endpoints(mut self, endpoints: Vec<SocketAddr>) -> Self {
         self.traversal_bootstrap_allow_endpoints = dedupe_socket_addrs(endpoints);
+        self
+    }
+
+    /// Point the DNS fail-closed backup at the durable sibling of THIS
+    /// daemon's state file. Wired from `DaemonConfig::state_path` at
+    /// construction so apply/rollback and the startup guard always agree on
+    /// one path (MacosDnsBackupRebootSurvivalPlan_2026-09-02 Option A).
+    pub fn with_dns_backup_path(mut self, path: std::path::PathBuf) -> Self {
+        self.dns_backup_path = path;
         self
     }
 
@@ -4253,9 +4275,8 @@ impl MacosCommandSystem {
     /// command fails — the backup file is retained in that case so a retry
     /// (or the startup guard) can try again.
     fn restore_networksetup_dns_from_backup(&self) -> Result<(), String> {
-        let backup_path =
-            std::path::Path::new(crate::macos_dns_sc_protect::NETWORKSETUP_DNS_BACKUP_PATH);
-        match crate::macos_dns_sc_protect::read_networksetup_dns_backup(backup_path) {
+        let backup_path = self.dns_backup_path.clone();
+        match crate::macos_dns_sc_protect::read_networksetup_dns_backup(&backup_path) {
             Ok(Some(backup)) => {
                 for entry in &backup.services {
                     let argv = match &entry.servers {
@@ -4286,7 +4307,7 @@ impl MacosCommandSystem {
                         ));
                     }
                 }
-                crate::macos_dns_sc_protect::remove_networksetup_dns_backup(backup_path)?;
+                crate::macos_dns_sc_protect::remove_networksetup_dns_backup(&backup_path)?;
                 Ok(())
             }
             Ok(None) => {
@@ -4309,6 +4330,7 @@ impl MacosCommandSystem {
                     Err(
                         crate::macos_dns_sc_protect::startup_recovery_manual_restore_message(
                             &stranded,
+                            &backup_path,
                         ),
                     )
                 }
@@ -4625,10 +4647,12 @@ impl DataplaneSystem for MacosCommandSystem {
         // present-but-unreadable prior backup fails the apply here (an
         // unverifiable document cannot vouch for an original); residue with
         // no prior entry refuses loudly naming the manual fix.
-        let backup_path =
-            std::path::Path::new(crate::macos_dns_sc_protect::NETWORKSETUP_DNS_BACKUP_PATH);
+        // The durable backup path derived from THIS daemon's state file
+        // (Option A): the capture guard, the pre-mutation write, the
+        // rollback restore, and the startup guard all use the same sibling.
+        let backup_path = self.dns_backup_path.clone();
         let prior_backup = match crate::macos_dns_sc_protect::read_networksetup_dns_backup(
-            backup_path,
+            &backup_path,
         ) {
             Ok(found) => found,
             Err(err) => {
@@ -4654,14 +4678,13 @@ impl DataplaneSystem for MacosCommandSystem {
         }
         // The backup is written BEFORE the first mutation: a crash mid-apply
         // leaves the host in a state the startup-recovery guard (daemon.rs)
-        // can fully restore from.
+        // can fully restore from. A write failure aborts the apply here —
+        // before any `networksetup -setdnsservers` argv is issued — with the
+        // prior backup intact (the node stays pf-protected, SC-unmutated).
         let backup = crate::macos_dns_sc_protect::build_networksetup_dns_backup(backup_entries)
             .map_err(SystemError::DnsApplyFailed)?;
-        crate::macos_dns_sc_protect::write_networksetup_dns_backup(
-            std::path::Path::new(crate::macos_dns_sc_protect::NETWORKSETUP_DNS_BACKUP_PATH),
-            &backup,
-        )
-        .map_err(SystemError::DnsApplyFailed)?;
+        crate::macos_dns_sc_protect::write_networksetup_dns_backup(&backup_path, &backup)
+            .map_err(SystemError::DnsApplyFailed)?;
         for service in &services {
             let argv = crate::macos_dns_sc_protect::networksetup_setdns_loopback_args(service)
                 .map_err(SystemError::DnsApplyFailed)?;
@@ -8714,6 +8737,44 @@ mod tests {
     /// configuration half of the assert runs against the real host, like the
     /// legend test further below); what needs protecting here is the
     /// operator-facing naming, not the enumeration.
+    /// Invariant 2 of MacosDnsBackupRebootSurvivalPlan_2026-09-02 (apply
+    /// ordering, against the durable path): in
+    /// `MacosCommandSystem::apply_dns_protection` the backup write — with
+    /// its abort-on-error `?` — appears BEFORE the first per-service
+    /// mutation argv (`networksetup_setdns_loopback_args`), so a backup
+    /// write failure can never be followed by a mutation (zero mutation
+    /// argvs issued, prior backup intact). Source-pinned because exercising
+    /// the ordering behaviorally requires the live privileged helper.
+    #[test]
+    fn macos_apply_writes_backup_before_first_mutation_argv() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        let macos_impl = code
+            .find("impl DataplaneSystem for MacosCommandSystem")
+            .expect("MacosCommandSystem must implement DataplaneSystem");
+        let body = &code[macos_impl..];
+        let fn_at = body
+            .find("fn apply_dns_protection(&mut self) -> Result<(), SystemError> {")
+            .expect("MacosCommandSystem must apply DNS protection");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+
+        let write_at = body
+            .find("write_networksetup_dns_backup(&backup_path, &backup)")
+            .expect("apply must write the durable backup document");
+        let first_mutation_at = body
+            .find("networksetup_setdns_loopback_args")
+            .expect("apply must pin services to loopback");
+        assert!(
+            write_at < first_mutation_at,
+            "the backup write must precede the first networksetup mutation argv"
+        );
+    }
+
     #[test]
     fn assert_dns_protection_drift_error_names_service_and_servers() {
         let source = include_str!("phase10.rs");

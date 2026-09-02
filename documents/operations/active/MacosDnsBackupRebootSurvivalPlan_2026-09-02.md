@@ -401,3 +401,5 @@ Adversarial review: `MacosDnsBackupRebootSurvivalPlanAdversarialReview_2026-09-0
 - A6: folded — §6 reframed from "Linux twin" to "macOS branch + Linux twin": the macOS branch of `RESOLV_CONF_FAILCLOSED_BACKUP_PATH` (`linux_dns_protect.rs:250-251`) and the durable `/etc/resolver/rustynet` artifact (`phase10.rs:4698-4712`) are recorded with their explicitly accepted bounds; only the Linux `/run` branch remains the follow-up.
 
 The review's guard-vs-state-dir ordering finding (§B.4) is folded as §3 invariant 6 and resolves former §5 open question 1; its fail-closed tests list is folded verbatim as the authoritative §4 step 3 list.
+
+Status: implemented on branch 2026-09-02. §4 step 5 choice recorded per the amendment: the derived backup path (`rustynetd.state.networksetup-dns.failclosed.bak`) and the already-missed QH-40 marker were added to the existing `cleanup_runtime_state` rm batch in `macos_traffic.rs` (literal list, no new shell shape) and to `Bootstrap-RustyNetMacos.sh`'s state-file rm line; `assert_node_clean` was left probe-free. The §4 step 4 live-proof (macOS reboot-with-protection stage) remains open as the plan states — no matrix row claims it.

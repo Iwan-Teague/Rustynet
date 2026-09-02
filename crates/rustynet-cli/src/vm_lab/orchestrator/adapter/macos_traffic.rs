@@ -485,6 +485,17 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // daemon to re-derive its exit selection from the current signed
     // auto-tunnel bundle. It carries no anti-replay watermark (those are the
     // separate `*.watermark` files cleared above), so removal is safe.
+    // Also purge the two durable sibling markers of the state file: the QH-40
+    // shutdown-residue marker (`rustynetd.state.shutdown-residue.json`) and
+    // the DNS fail-closed backup
+    // (`rustynetd.state.networksetup-dns.failclosed.bak`,
+    // MacosDnsBackupRebootSurvivalPlan_2026-09-02 §4 step 5). Cleanup stops
+    // the daemon mid-protection without teardown, so SC loopback residue
+    // persists by design; a surviving durable backup would make the next
+    // run's startup guard auto-restore the previous run's baseline — or, on
+    // service-set drift, refuse to start and fail `bootstrap_hosts`. Removal
+    // keeps every run on a clean slate (the apply re-captures the operator's
+    // DNS fresh).
     ssh::run_remote(
         conn,
         &format!(
@@ -501,6 +512,8 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
              '{MACOS_STATE_ROOT}/trust/rustynetd.dns-zone' \
              '{MACOS_STATE_ROOT}/trust/rustynetd.dns-zone.watermark' \
              '{MACOS_STATE_ROOT}/rustynetd.state' \
+             '{MACOS_STATE_ROOT}/rustynetd.state.shutdown-residue.json' \
+             '{MACOS_STATE_ROOT}/rustynetd.state.networksetup-dns.failclosed.bak' \
              '{MACOS_STATE_ROOT}/keys/wireguard.key' \
              2>/dev/null || true"
         ),
@@ -806,6 +819,43 @@ fn verify_no_key_material_tarball(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests-first item 7 of MacosDnsBackupRebootSurvivalPlan_2026-09-02
+    /// (review A4): the macOS cleanup's explicit rm batch must include the
+    /// DURABLE sibling markers of the state file — the QH-40
+    /// shutdown-residue marker and the DNS fail-closed backup derived at
+    /// `<state>.networksetup-dns.failclosed.bak` — otherwise cleanup stops
+    /// the daemon mid-protection (SC loopback residue persists) and the next
+    /// run's startup guard auto-restores the previous run's baseline, or
+    /// refuses to start on service-set drift and fails `bootstrap_hosts`.
+    /// Source-pinned because exercising `cleanup_runtime_state` behaviorally
+    /// requires a live SSH node connection; the batch is a single-quoted
+    /// literal list (no interpolated values), so presence of the literal is
+    /// the contract.
+    #[test]
+    fn cleanup_rm_batch_includes_durable_state_sibling_markers() {
+        let source = include_str!("macos_traffic.rs");
+        let fn_at = source
+            .find("pub fn cleanup_runtime_state(")
+            .expect("cleanup_runtime_state must exist");
+        let body = &source[fn_at..];
+        let body = &body[..body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+        let rm_batch_at = body
+            .find("sudo rm -f")
+            .expect("cleanup must run its rm batch");
+        let batch = &body[rm_batch_at..];
+        assert!(
+            batch.contains("rustynetd.state.shutdown-residue.json"),
+            "cleanup must remove the QH-40 shutdown-residue marker"
+        );
+        assert!(
+            batch.contains("rustynetd.state.networksetup-dns.failclosed.bak"),
+            "cleanup must remove the durable DNS fail-closed backup"
+        );
+    }
 
     #[test]
     fn macos_node_clean_probe_covers_pf_daemon_and_interface() {
