@@ -13139,14 +13139,24 @@ mod tests {
             .expect("helper thread should join cleanly");
         let _ = std::fs::remove_file(&socket_path);
 
+        // Three commands: the D-6c tandem-anchor probe (`pfctl -s Anchors`,
+        // read-only, no tandem anchors in the captured output so nothing
+        // further is flushed), the fixed NAT-anchor flush, and the forwarding
+        // reset.
         assert_eq!(
-            after_not_serving, 2,
-            "not-serving reconcile must flush the NAT anchor AND reset forwarding; got: {command_log:?}"
+            after_not_serving, 3,
+            "not-serving reconcile must probe tandem anchors, flush the NAT anchor AND reset forwarding; got: {command_log:?}"
         );
         assert_eq!(
             command_log.len(),
-            2,
+            3,
             "serving reconcile must issue no command; got: {command_log:?}"
+        );
+        assert!(
+            command_log
+                .iter()
+                .any(|c| c.contains("pfctl") && c.contains("-s") && c.contains("Anchors")),
+            "must probe the tandem-owned anchors before flushing; got: {command_log:?}"
         );
         assert!(
             command_log.iter().any(|c| c.contains("pfctl")

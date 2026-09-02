@@ -355,7 +355,21 @@ fn acquire_lock(path: &Path) -> Result<StateLockGuard, ResilienceError> {
                     _handle: handle,
                 });
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // `PermissionDenied` is retried alongside `AlreadyExists`: the
+            // releasing guard unlinks the lock file while its own handle is
+            // still open, and on Windows that leaves the name in a
+            // delete-pending state until the handle closes. A concurrent
+            // `create_new` on a delete-pending name fails with
+            // ERROR_ACCESS_DENIED rather than ERROR_FILE_EXISTS, so treating
+            // it as fatal turned an ordinary contention window into a spurious
+            // I/O error. The same bounded deadline still applies, so a genuine
+            // permission problem surfaces as `Io` once it expires.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
                 if Instant::now() >= deadline {
                     return Err(ResilienceError::Io);
                 }
