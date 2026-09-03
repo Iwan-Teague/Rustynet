@@ -101,6 +101,11 @@ pub struct ValidatorReport {
     pub op_label: String,
     pub output: String,
     pub passed: bool,
+    /// Every successfully parsed daemon report object, verbatim (§5.2 Item 2
+    /// structured-drift evidence threading). Copied from
+    /// `adapter::ssh::ValidatorVerdict.reports`; empty when the output
+    /// contained no parseable JSON object.
+    pub reports: Vec<serde_json::Value>,
 }
 
 // ── AdapterError ──────────────────────────────────────────────────────────────

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::report::ValidatorResult;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -69,6 +70,63 @@ fn probe_expectations(op: crate::vm_lab::DaemonProbeOp) -> Vec<String> {
     }
 }
 
+/// Generic drift surfacing (design §5.2 Item 2): pull the first
+/// `drift_reasons` entry out of a kept daemon report. No hard-coded drift
+/// strings — whatever the daemon reported is what surfaces in the failure
+/// message. Non-string reasons render via their JSON form so nothing is
+/// silently dropped.
+fn first_drift_reason(report: &serde_json::Value) -> Option<String> {
+    report
+        .get("drift_reasons")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|reasons| reasons.first())
+        .map(|first| match first {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        })
+}
+
+/// `logs/<stage>.validator-evidence.json` schema (design §5.2 Item 2): the
+/// daemon's report is embedded VERBATIM (P1 — no re-shaping), so the evidence
+/// artifact carries what the node actually said, not a re-derived summary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ValidatorEvidence {
+    schema_version: u32,
+    stage: String,
+    results: Vec<ValidatorEvidenceEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ValidatorEvidenceEntry {
+    alias: String,
+    op: String,
+    passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    report: Option<serde_json::Value>,
+}
+
+fn build_validator_evidence(
+    stage: &str,
+    records: &std::collections::HashMap<String, Vec<ValidatorResult>>,
+) -> ValidatorEvidence {
+    let mut results = Vec::new();
+    for (alias, node_records) in records {
+        for record in node_records {
+            results.push(ValidatorEvidenceEntry {
+                alias: alias.clone(),
+                op: record.op.clone(),
+                passed: record.passed,
+                report: record.report.clone(),
+            });
+        }
+    }
+    ValidatorEvidence {
+        schema_version: 1,
+        stage: stage.to_owned(),
+        results,
+    }
+}
+
 impl OrchestrationStage for ValidateBaselineRuntimeStage {
     fn id(&self) -> StageId {
         StageId::ValidateBaselineRuntime
@@ -106,12 +164,13 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
             self.max_parallel_node_workers,
             &self.shutdown_flag,
             |alias| {
-                let op_results: Vec<Result<bool, String>> = OPS
+                let op_results: Vec<
+                    Result<crate::vm_lab::orchestrator::error::ValidatorReport, String>,
+                > = OPS
                     .iter()
                     .map(|&op| match ctx.adapters.get(alias.as_str()) {
                         Some(adapter) => adapter
                             .run_validator(op, probe_expectations(op).as_slice())
-                            .map(|r| r.passed)
                             .map_err(|e| e.to_string()),
                         None => Err(format!("no adapter for '{alias}'")),
                     })
@@ -128,7 +187,6 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
             },
         );
 
-        use crate::vm_lab::orchestrator::report::ValidatorResult;
         use std::collections::HashMap;
 
         let mut errors = Vec::new();
@@ -139,20 +197,41 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
         for (alias, op_results) in all_results {
             let mut node_records: Vec<ValidatorResult> = Vec::new();
             for (op, r) in OPS.iter().zip(op_results) {
-                let (passed, summary) = match &r {
-                    Ok(true) => (true, "passed".to_owned()),
-                    Ok(false) => (false, "validator reported not passed".to_owned()),
-                    Err(e) => (false, e.clone()),
+                // §5.2 Item 2: keep the daemon's parsed report verbatim (last
+                // object wins when the output carried several). The verdict is
+                // unchanged — only what is KEPT differs.
+                let (passed, summary, report) = match &r {
+                    Ok(report_out) if report_out.passed => (
+                        true,
+                        "passed".to_owned(),
+                        report_out.reports.last().cloned(),
+                    ),
+                    Ok(report_out) => (
+                        false,
+                        "validator reported not passed".to_owned(),
+                        report_out.reports.last().cloned(),
+                    ),
+                    Err(e) => (false, e.clone(), None),
                 };
+                // Generic drift surfacing: read the first `drift_reasons`
+                // entry straight out of the kept report. No hard-coded drift
+                // strings — whatever the daemon reports is what surfaces.
+                let drift_note = report.as_ref().and_then(first_drift_reason);
                 node_records.push(ValidatorResult {
                     op: format!("{op:?}"),
                     passed,
                     summary,
+                    report,
                 });
                 match r {
-                    Ok(false) => errors.push(format!("{alias}/{op:?}: validation not passed")),
+                    Ok(report_out) if !report_out.passed => match drift_note {
+                        Some(reason) => errors.push(format!(
+                            "{alias}/{op:?}: validation not passed — drift: {reason}"
+                        )),
+                        None => errors.push(format!("{alias}/{op:?}: validation not passed")),
+                    },
                     Err(e) => errors.push(format!("{alias}/{op:?}: {e}")),
-                    Ok(true) => {}
+                    Ok(_) => {}
                 }
             }
             records.insert(alias, node_records);
@@ -164,6 +243,19 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
         if let Ok(json) = serde_json::to_string_pretty(&records) {
             let path = ctx.report_dir.join("validator_results.json");
             let _ = std::fs::write(path, json);
+        }
+
+        // §5.2 Item 2 evidence artifact: per-node, per-op verdicts with the
+        // daemon report embedded verbatim. Best-effort like the artifact above.
+        let evidence = build_validator_evidence("validate_baseline_runtime", &records);
+        let logs_dir = ctx.report_dir.join("logs");
+        if std::fs::create_dir_all(&logs_dir).is_ok() {
+            if let Ok(json) = serde_json::to_string_pretty(&evidence) {
+                let _ = std::fs::write(
+                    logs_dir.join("validate_baseline_runtime.validator-evidence.json"),
+                    json,
+                );
+            }
         }
 
         if errors.is_empty() {
@@ -337,5 +429,101 @@ mod tests {
                 .expect_err("an unsafe extra must be rejected");
             assert!(err.contains("not a shell-safe token"), "{label}: {err}");
         }
+    }
+
+    /// §5.2 Item 2: the validator-evidence artifact round-trips with the
+    /// schema it promises — {schema_version:1, stage, results:[{alias, op,
+    /// passed, report}]} — and the embedded daemon report survives VERBATIM
+    /// (P1: no re-shaping).
+    #[test]
+    fn validator_evidence_artifact_round_trips_with_verbatim_report() {
+        let daemon_report: serde_json::Value = serde_json::json!({
+            "overall_ok": false,
+            "drift_reasons": ["resolver drifted from signed zone"],
+            "checks": { "dns": { "ok": false } }
+        });
+        let mut records = std::collections::HashMap::new();
+        records.insert(
+            "macos-utm-1".to_owned(),
+            vec![
+                ValidatorResult {
+                    op: "DnsFailclosed".to_owned(),
+                    passed: false,
+                    summary: "validator reported not passed".to_owned(),
+                    report: Some(daemon_report.clone()),
+                },
+                ValidatorResult {
+                    op: "MeshStatus".to_owned(),
+                    passed: true,
+                    summary: "passed".to_owned(),
+                    report: None,
+                },
+            ],
+        );
+
+        let evidence = build_validator_evidence("validate_baseline_runtime", &records);
+        assert_eq!(evidence.schema_version, 1);
+        assert_eq!(evidence.stage, "validate_baseline_runtime");
+        assert_eq!(evidence.results.len(), 2);
+
+        let json = serde_json::to_string_pretty(&evidence).expect("evidence must serialize");
+        let round: ValidatorEvidence =
+            serde_json::from_str(&json).expect("evidence must deserialize under its own schema");
+
+        assert_eq!(round.schema_version, 1);
+        assert_eq!(round.stage, "validate_baseline_runtime");
+        let dns = round
+            .results
+            .iter()
+            .find(|e| e.op == "DnsFailclosed")
+            .expect("dns entry present");
+        assert!(!dns.passed);
+        assert_eq!(dns.alias, "macos-utm-1");
+        // Verbatim: byte-equal to the report that went in, no re-shaping.
+        assert_eq!(dns.report.as_ref(), Some(&daemon_report));
+
+        let mesh = round
+            .results
+            .iter()
+            .find(|e| e.op == "MeshStatus")
+            .expect("mesh entry present");
+        assert!(mesh.passed);
+        assert!(mesh.report.is_none());
+        // An absent report is OMITTED, not serialized as null — a consumer
+        // must be able to distinguish "no report" from "empty report".
+        assert!(
+            !json.contains("\"report\": null"),
+            "absent reports must be skipped, not null: {json}"
+        );
+    }
+
+    /// §5.2 Item 2 generic drift surfacing: the failure message carries the
+    /// daemon's own first drift reason, with no hard-coded drift strings.
+    #[test]
+    fn first_drift_reason_extracts_daemons_own_reason_verbatim() {
+        let report: serde_json::Value = serde_json::json!({
+            "overall_ok": true,
+            "drift_reasons": ["resolver drifted", "second reason"]
+        });
+        assert_eq!(
+            first_drift_reason(&report).as_deref(),
+            Some("resolver drifted"),
+            "first reason surfaces, verbatim"
+        );
+
+        // No drift_reasons / empty array / non-string first entry.
+        assert_eq!(
+            first_drift_reason(&serde_json::json!({ "overall_ok": true })),
+            None
+        );
+        assert_eq!(
+            first_drift_reason(&serde_json::json!({ "drift_reasons": [] })),
+            None
+        );
+        // Non-string reasons render via their JSON form rather than dropping.
+        assert_eq!(
+            first_drift_reason(&serde_json::json!({ "drift_reasons": [7] })).as_deref(),
+            Some("7")
+        );
     }
 }
