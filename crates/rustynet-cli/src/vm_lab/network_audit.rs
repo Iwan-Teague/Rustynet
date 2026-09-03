@@ -839,6 +839,121 @@ pub fn detect_inventory_findings(entries: &[VmInventoryEntry]) -> Vec<AuditFindi
     findings
 }
 
+/// A diagnostic drift finding comparing a node's declared `network_group` label
+/// against its live address, derived purely from the parsed inventory. This is a
+/// read-only diagnostic: it never mutates the inventory and never auto-fixes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetworkGroupDriftFinding {
+    /// The label's /24 disagrees with the /24 of the node's live address.
+    Drift {
+        alias: String,
+        labeled_subnet: String,
+        live_subnet: String,
+        live_addr: String,
+    },
+    /// The label does not end in a parseable CIDR, so no comparison is possible.
+    UnparseableLabel { alias: String, label: String },
+    /// The node has no live address candidate (neither an IPv4-literal
+    /// `ssh_target` nor a recorded `last_known_ip`), so nothing can be compared.
+    /// This is an observation, not drift.
+    NoLiveAddress { alias: String },
+}
+
+impl NetworkGroupDriftFinding {
+    pub fn alias(&self) -> &str {
+        match self {
+            Self::Drift { alias, .. }
+            | Self::UnparseableLabel { alias, .. }
+            | Self::NoLiveAddress { alias } => alias,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Drift { .. } => "network_group_drift",
+            Self::UnparseableLabel { .. } => "unparseable_network_group_label",
+            Self::NoLiveAddress { .. } => "network_group_no_live_address",
+        }
+    }
+
+    /// Human-readable, IP-redacted summary suitable for WARNING-grade output.
+    pub fn summary(&self) -> String {
+        match self {
+            Self::Drift {
+                alias: _,
+                labeled_subnet,
+                live_subnet,
+                live_addr,
+            } => format!(
+                "network_group label {labeled_subnet} disagrees with live address plane {live_subnet} (live {}); the label is stale",
+                redact_ip_str(live_addr)
+            ),
+            Self::UnparseableLabel { alias: _, label } => {
+                format!("network_group label {label:?} does not end in a parseable CIDR")
+            }
+            Self::NoLiveAddress { alias: _ } => {
+                "no live address recorded; network_group label cannot be compared".to_owned()
+            }
+        }
+    }
+}
+
+/// The node's live-address candidate as an IPv4 literal: the `ssh_target` host
+/// when it is an IPv4 literal, otherwise the recorded `last_known_ip`. The typed
+/// inventory struct carries no `live_ips` field; the discover path front-loads
+/// the live address onto `ssh_target`/`last_known_ip`, so this pair IS the live
+/// address as far as the parsed inventory can express it.
+fn live_address_candidate(entry: &VmInventoryEntry) -> Option<Ipv4Addr> {
+    let host = ssh_target_host(&entry.ssh_target);
+    if let Ok(addr) = host.parse::<Ipv4Addr>() {
+        return Some(addr);
+    }
+    entry
+        .last_known_ip
+        .as_deref()
+        .and_then(|ip| ip.parse::<Ipv4Addr>().ok())
+}
+
+/// Compare each node's `network_group` /24 against the /24 of its live address
+/// (see [`live_address_candidate`]). Purely diagnostic and read-only: a labeled
+/// node whose live address sits outside the labeled /24 is drift; a label with
+/// no parseable CIDR is reported separately; a node with no live address is NOT
+/// drift. Unlabeled nodes are skipped entirely.
+pub fn detect_network_group_drift_findings(
+    entries: &[VmInventoryEntry],
+) -> Vec<NetworkGroupDriftFinding> {
+    let mut findings = Vec::new();
+    for entry in entries {
+        let Some(group) = entry.network_group.as_deref() else {
+            continue;
+        };
+        let Some(labeled_cidr) = network_group_cidr(group) else {
+            findings.push(NetworkGroupDriftFinding::UnparseableLabel {
+                alias: entry.alias.clone(),
+                label: group.to_owned(),
+            });
+            continue;
+        };
+        let Some(addr) = live_address_candidate(entry) else {
+            findings.push(NetworkGroupDriftFinding::NoLiveAddress {
+                alias: entry.alias.clone(),
+            });
+            continue;
+        };
+        if labeled_cidr.contains_v4(addr) {
+            continue;
+        }
+        let octets = addr.octets();
+        findings.push(NetworkGroupDriftFinding::Drift {
+            alias: entry.alias.clone(),
+            labeled_subnet: labeled_cidr.to_string(),
+            live_subnet: format!("{}.{}.{}.0/24", octets[0], octets[1], octets[2]),
+            live_addr: addr.to_string(),
+        });
+    }
+    findings
+}
+
 /// Cross-fleet L2 reachability check. [`detect_profile_drift_findings`] validates
 /// only the UTM attachment *mode*, and [`detect_inventory_findings`] validates a
 /// node's recorded IP against its *own* `network_group` label — neither notices a
@@ -2814,5 +2929,120 @@ mod tests {
             service_manager: None,
             controller: None,
         }
+    }
+
+    fn labeled_entry(alias: &str, ssh_target: &str, group: Option<&str>) -> VmInventoryEntry {
+        let mut entry = test_inventory_entry(alias, ssh_target);
+        entry.network_group = group.map(str::to_owned);
+        entry
+    }
+
+    #[test]
+    fn network_group_drift_flags_label_live_subnet_mismatches() {
+        let entries = vec![
+            labeled_entry(
+                "debian-headless-2",
+                "lab@192.168.65.4",
+                Some("utm-shared-192.168.64.0/24"),
+            ),
+            labeled_entry(
+                "debian-headless-4",
+                "lab@192.168.65.5",
+                Some("utm-shared-192.168.64.0/24"),
+            ),
+            labeled_entry(
+                "macos-utm-1",
+                "lab@192.168.64.18",
+                Some("utm-shared-192.168.65.0/24"),
+            ),
+            labeled_entry(
+                "debian-headless-1",
+                "lab@192.168.64.3",
+                Some("utm-shared-192.168.64.0/24"),
+            ),
+            labeled_entry("rogue-node", "lab@192.168.70.9", Some("lan")),
+        ];
+        let findings = detect_network_group_drift_findings(&entries);
+        let drifts: Vec<_> = findings
+            .iter()
+            .filter_map(|finding| match finding {
+                NetworkGroupDriftFinding::Drift {
+                    alias,
+                    labeled_subnet,
+                    live_subnet,
+                    live_addr,
+                } => Some((
+                    alias.as_str(),
+                    labeled_subnet.as_str(),
+                    live_subnet.as_str(),
+                    live_addr.as_str(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            drifts,
+            vec![
+                (
+                    "debian-headless-2",
+                    "192.168.64.0/24",
+                    "192.168.65.0/24",
+                    "192.168.65.4"
+                ),
+                (
+                    "debian-headless-4",
+                    "192.168.64.0/24",
+                    "192.168.65.0/24",
+                    "192.168.65.5"
+                ),
+                (
+                    "macos-utm-1",
+                    "192.168.65.0/24",
+                    "192.168.64.0/24",
+                    "192.168.64.18"
+                ),
+            ]
+        );
+        let unparseable: Vec<_> = findings
+            .iter()
+            .filter_map(|finding| match finding {
+                NetworkGroupDriftFinding::UnparseableLabel { alias, label } => {
+                    Some((alias.as_str(), label.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(unparseable, vec![("rogue-node", "lan")]);
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.alias() == "debian-headless-1"),
+            "consistent guest must not be flagged"
+        );
+    }
+
+    #[test]
+    fn network_group_drift_reports_no_live_address_instead_of_drift() {
+        let findings = detect_network_group_drift_findings(&[labeled_entry(
+            "hostname-only",
+            "host.example.test",
+            Some("utm-shared-192.168.64.0/24"),
+        )]);
+        assert_eq!(
+            findings,
+            vec![NetworkGroupDriftFinding::NoLiveAddress {
+                alias: "hostname-only".to_owned(),
+            }]
+        );
+
+        // A hostname ssh_target with a recorded last_known_ip falls back to the
+        // recorded address and stays consistent inside the labeled /24.
+        let mut fallback = labeled_entry(
+            "fallback-node",
+            "host.example.test",
+            Some("utm-shared-192.168.64.0/24"),
+        );
+        fallback.last_known_ip = Some("192.168.64.9".to_owned());
+        assert!(detect_network_group_drift_findings(&[fallback]).is_empty());
     }
 }

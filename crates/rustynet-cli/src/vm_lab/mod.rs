@@ -7441,6 +7441,20 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
     } else {
         None
     };
+    // Diagnostic (read-only, WARNING-grade, non-fatal): compare each inventory
+    // node's `network_group` /24 against its live address. Purely derived from
+    // the parsed inventory; it never blocks discovery and never mutates it.
+    let network_group_drift: Vec<serde_json::Value> =
+        network_audit::detect_network_group_drift_findings(inventory.as_slice())
+            .iter()
+            .map(|finding| {
+                json!({
+                    "alias": finding.alias(),
+                    "kind": finding.kind(),
+                    "summary": finding.summary(),
+                })
+            })
+            .collect();
     let payload = json!({
         "schema_version": 1,
         "mode": "vm_lab_local_utm_discovery",
@@ -7464,6 +7478,7 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
         "inventory_error": inventory_error,
         "bundle_scan_error": bundle_scan_error,
         "inventory_update": inventory_update,
+        "network_group_drift": network_group_drift,
         "entries": entries,
     });
     let rendered = serde_json::to_string_pretty(&payload)
@@ -7597,6 +7612,34 @@ fn render_local_utm_discovery_summary(
         && !value.trim().is_empty()
     {
         lines.push(format!("discovery_summary.inventory_update={value}"));
+    }
+    // WARNING-grade, non-fatal diagnostics: a network_group label whose /24
+    // disagrees with the node's live address. Presence never changes the
+    // discovery status; it is surfaced so a stale label cannot hide silently.
+    if let Some(findings) = report.get("network_group_drift").and_then(Value::as_array)
+        && !findings.is_empty()
+    {
+        lines.push(format!(
+            "discovery_summary.network_group_drift_count={}",
+            findings.len()
+        ));
+        for finding in findings {
+            let alias = finding
+                .get("alias")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>");
+            let kind = finding
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let summary = finding
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or("<no summary>");
+            lines.push(format!(
+                "WARNING.network_group_drift.{alias}[{kind}]={summary}"
+            ));
+        }
     }
 
     for (index, entry) in entries.iter().enumerate() {
