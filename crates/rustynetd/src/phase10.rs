@@ -4784,7 +4784,7 @@ impl MacosCommandSystem {
         for proto in ["udp", "tcp"] {
             if !Self::ruleset_contains_dns_rule(&output.stdout, "block", proto, None) {
                 return Err(SystemError::DnsApplyFailed(format!(
-                    "pf DNS-block floor not live after apply ({proto}/53 missing from anchor {anchor})"
+                    "pf DNS-block floor not live ({proto}/53 missing from anchor {anchor})"
                 )));
             }
         }
@@ -5300,6 +5300,21 @@ impl DataplaneSystem for MacosCommandSystem {
                         )));
                     }
                 }
+                // Floor-persistence invariant (MacosPfFloorPersistence_
+                // 2026-09-03 §3): the rendered-ruleset half above validates the
+                // SPEC text, not the kernel. The pf anchor is kernel-resident
+                // only — nothing on disk re-loads it — so an external pf
+                // reload/flush (e.g. the system re-applying /etc/pf.conf on a
+                // network-configuration change) drops the DNS-block floor
+                // silently while the SC pins persist, leaving the exact
+                // pin-without-floor half state the plain-client flap
+                // photographed. Verify the LIVE anchor carries both labeled
+                // block rules; an externally flushed floor fails the assert
+                // and the reconcile loop's single scheduled re-apply
+                // (`dns_posture_reassert_pending`, daemon.rs
+                // `maybe_assert_dns_posture`) re-installs it through the
+                // normal generation apply — fail-closed, no new failure path.
+                self.verify_live_pf_dns_floor()?;
                 Ok(())
             }
         }
@@ -9395,6 +9410,54 @@ mod tests {
         assert!(
             pins_probe_at < refloor_at,
             "the floor re-render must be gated on the live-pins probe"
+        );
+    }
+
+    /// Floor-persistence invariant (MacosPfFloorPersistence_2026-09-03 §3):
+    /// `MacosCommandSystem::assert_dns_protection` must verify the LIVE pf
+    /// anchor (`verify_live_pf_dns_floor`) while the node is FullyProtected,
+    /// not only the rendered spec text and the system-configuration pins —
+    /// otherwise an externally flushed pf anchor (system pf reload on a
+    /// network-configuration change) is invisible to the reconcile loop's
+    /// periodic re-assert and the pin-without-floor half state holds
+    /// indefinitely. Source-pinned because exercising the live-anchor query
+    /// behaviorally requires the live privileged helper (same rationale as
+    /// `macos_prune_owned_tables_reestablishes_dns_floor_while_pins_live`).
+    #[test]
+    fn macos_assert_dns_protection_verifies_live_pf_floor_while_fully_protected() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        let macos_impl = code
+            .find("impl DataplaneSystem for MacosCommandSystem")
+            .expect("MacosCommandSystem must implement DataplaneSystem");
+        let body = &code[macos_impl..];
+        let fn_at = body
+            .find("fn assert_dns_protection(&mut self) -> Result<(), SystemError> {")
+            .expect("MacosCommandSystem must assert the DNS posture");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+
+        let rendered_at = body
+            .find("self.render_pf_rules(false)?")
+            .expect("assert must still validate the rendered ruleset text");
+        let services_at = body
+            .find("enumerate_networksetup_services()")
+            .expect("assert must still validate the system-configuration pins");
+        let live_floor_at = body
+            .find("self.verify_live_pf_dns_floor()?")
+            .expect("FullyProtected assert must verify the LIVE pf anchor floor");
+        let ok_at = body
+            .rfind("Ok(())")
+            .expect("assert must report success explicitly");
+        assert!(
+            live_floor_at > rendered_at && live_floor_at > services_at && live_floor_at < ok_at,
+            "the live pf-floor verification must run inside the FullyProtected \
+             arm, after the render-text and SC-pin halves, and gate the assert's \
+             success — a flushed anchor must fail the assert"
         );
     }
 
