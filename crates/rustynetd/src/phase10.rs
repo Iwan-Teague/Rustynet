@@ -9515,6 +9515,36 @@ mod tests {
         );
     }
 
+    /// Divergence guard (5.4 item f): `list_owned_anchors` MUST enumerate BOTH the
+    /// top-level `pfctl -s Anchors` set AND the nested `pfctl -a com.apple -s
+    /// Anchors` set. Top-level `-s Anchors` never lists the nested
+    /// `com.apple/rustynet_g{N}` generation anchors, so dropping the nested query
+    /// silently re-introduces the enumeration blindness the prune fix corrected
+    /// (the same class the DNS-check enum-fix `2c10f9d9` fixed). Source-pinned
+    /// because the enumeration behaviorally requires the live privileged helper.
+    #[test]
+    fn macos_list_owned_anchors_queries_both_top_level_and_nested_com_apple() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let fn_at = code
+            .find("fn list_owned_anchors(&self) -> Result<Vec<String>, SystemError> {")
+            .expect("MacosCommandSystem must define list_owned_anchors");
+        let body = &code[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+        assert!(
+            body.contains("&[\"-s\", \"Anchors\"]"),
+            "list_owned_anchors must query the top-level anchor set"
+        );
+        assert!(
+            body.contains("&[\"-a\", \"com.apple\", \"-s\", \"Anchors\"]"),
+            "list_owned_anchors must ALSO query the nested com.apple sub-anchors — \
+             dropping this re-introduces the pf-anchor enumeration blindness"
+        );
+    }
+
     /// Floor-persistence invariant (MacosPfFloorPersistence_2026-09-03 §3):
     /// `MacosCommandSystem::assert_dns_protection` must verify the LIVE pf
     /// anchor (`verify_live_pf_dns_floor`) while the node is FullyProtected,
