@@ -31,6 +31,19 @@
 
 set -eu
 
+# Mirror guard: AGENTS.md and CLAUDE.md are intentionally byte-identical
+# (different tools read each by literal path, so a silent divergence hands two
+# agents different contracts). Run the shared check on EVERY commit, before the
+# staleness logic below returns early — a drift fails the commit here rather than
+# only in CI.
+mirror_check="$(git rev-parse --show-toplevel)/scripts/ci/check_agents_claude_mirror.sh"
+if [ -x "$mirror_check" ]; then
+  if ! "$mirror_check" >/dev/null 2>&1; then
+    "$mirror_check" >&2 2>&1 || true
+    exit 1
+  fi
+fi
+
 # Detached HEAD or no upstream: nothing to compare against, so allow.
 upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)
 [ -n "$upstream" ] || exit 0
