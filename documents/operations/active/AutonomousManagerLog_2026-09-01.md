@@ -1110,3 +1110,11 @@ Owner: "keep working. Use those GLM agents as much as possible." → maxed the f
 - FIX (in flight, edit-1788458891386-49869-0): add minimal #[cfg_attr(<platform>, allow(dead_code))] to each of the 6 definitions — behavior-neutral, silences the lint ONLY where no caller compiles (windows for the first 4; not(target_os="macos") for the last 2). §1 CI-blocking-fix grant. Mechanical → delegated + will verify (macOS clippy rc 0 + Windows cross-compile if the gnu target is present, else CI confirms).
 - This UNBLOCKS CI verification of the whole session's work once merged.
 - STATE: main @eb8daf97. Fleet=1 (dead_code fix). lenovo still down. External read-only providers DOWN.
+
+## Tick 62 — 2026-09-03 ~19:25Z — CI dead_code fix VERIFIED (mac+win) + MERGED; CI should go green
+
+- CI-red dead_code fix (edit-1788458891386-49869-0) COMPLETE + MERGED (0044ae29). Diff was exactly the 6 cfg_attr(allow(dead_code)) additions I specified (windows for the 4 startup-path fns; not(target_os="macos") for new_unresolved + build_runtime), clear comments, no removals/behavior change.
+- VERIFIED BOTH LEGS before merge: macOS pinned clippy -p rustynetd --all-targets --all-features -D warnings rc 0 (no regression — fns still used on macOS, allows don't fire); Windows cross-clippy x86_64-pc-windows-gnu rc 0 (was 101 with all 6 dead_code errors on the pre-fix tree). Because the Windows target is not(macos), its pass ALSO confirms the not(macos) allows cover the Debian leg (new_unresolved + build_runtime) — full 2-leg verification without a separate Linux compile. fmt clean.
+- This UNBLOCKS CI for the whole session's work (which was locally-gated-clean but never CI-confirmed because CI died upstream at this pre-existing compile error). WATCH the 0044ae29 CI run — expect the first GREEN Cross Platform CI of the session.
+- NEXT SELF-WORK: 5.4 §5.9 orphaned_pf_anchors drift dimension (macos_dns_failclosed.rs, diagnostic ADD, no floor/verdict change) + the item-f divergence unit test. Tree clean, CI fix landed first as planned.
+- STATE: main @0044ae29. Fleet=0. lenovo down. External read-only providers DOWN.
