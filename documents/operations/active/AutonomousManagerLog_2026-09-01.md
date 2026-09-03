@@ -832,3 +832,19 @@ milestone commits pending). Resolver ordering fix `edit-1788390672503-35403-0` a
 QH-01 4d-ii `edit-1788390741319-35754-0` at ~1.75M billable. Both will checkpoint their worktrees at
 budget; will review/merge/relaunch-continue next tick rather than launch speculative third work that
 could collide with the DNS render area or the ssh seam.
+
+## Tick 32 — 2026-09-03 ~00:15–01:00Z — CI fix confirmed GREEN + resolver ordering fix MERGED
+
+**CI fix confirmed:** run 33696028311 (cd24a27c, has_live_loopback_dns_pins cfg-split) = `completed success` — the Debian+Windows regression is fixed. The three prior main runs show the failure; the fix run is green.
+
+**Both GLM jobs HALTED-BUDGET** (poll-driven enforcement; I under-polled so they overshot — resolver 3.86M billable, 4d-ii 3.34M). Both left complete work on their branches.
+
+**Resolver ordering fix REVIEWED + GATED + MERGED (551efad7).** The branch had 4 clean milestone commits (no WIP/marker → no amend). I reviewed all four security invariants against the real code:
+- M1 (hoist bind + DnsProbeServicer, daemon.rs): the probe (verify_loopback_resolver_live, phase10.rs:4578) is LIVENESS-only — it accepts any reply echoing the "RN" query id, so the pre-bootstrap empty-zone snapshot satisfies it. The servicer's service_once↔probe hand-off is single-threaded and correct; 2s fail-closed deadline preserved. Windows keeps its own #[cfg(windows)] retrying bind (SCM race) → no double-bind; non-Windows reuses the hoisted Arc socket.
+- M2 (defer, daemon.rs:8867): `defer_scoped_dns = cfg!(macos) && macos_dns_posture(...)==ScopedResolverOnly`. FullyProtected is NEVER deferred → applied in-bootstrap → NO DNS leak window for exit/full-tunnel. Deferral sets dns_posture_reassert_pending (S1 first-reconcile heal). At deferred reconcile the probe is answered by service_once (same-thread as the serve-loop drain, so no double-drain race).
+- M3 (error-path, daemon.rs:10725): softening gates on `applied_dns_posture==ScopedResolverOnly && err is DnsApplyFailed`, and applied_dns_posture is computed from the GENERATION not observed state — a FullyProtected node cannot reach the lenient path. FullyProtected, any non-DNS error, and any key-custody cleanup failure keep the full restriction ladder byte-for-byte. Probe-precedes-mutation ⇒ a ScopedResolverOnly failure leaves DNS Untouched (zero-leak), so the softening is availability-only.
+Gate GREEN (pinned 1.88.0): rustynetd clippy -D warnings clean; full -p rustynetd --all-targets --all-features = 2394+ tests, 0 failed, incl. the new bootstrap_probe_servicer_responder_matches_live_responder. Clean auto-merge with cd24a27c (different phase10.rs regions); re-gated the MERGED tree green before committing. Did NOT revert the three-state fix; no control weakened.
+
+**Fleet:** launched a docs-only GLM refute-review of the resolver fix (edit-1788393736724-75167-0, based on the merged branch → documents/operations/active/ResolverFixRefuteReview_2026-09-03.md) as an independent audit in parallel with the live proof. 4d-ii branch (bd1b96b4 WIP checkpoint, 5 adapter files) waits for next tick's merge.
+
+**NEXT:** vm-lab CLI rebuild from merged main in flight (scratchpad/build_vmlab_t32.log); once build_rc=0 and lab idle, launch the rank1 macOS-client harvest (args_labrun_rank1.json) as the LIVE PROOF that macOS DnsFailclosed + MeshStatus pass during bootstrap and the node is not restricted.
