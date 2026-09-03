@@ -6656,6 +6656,8 @@ impl RuntimeSystem {
     /// system consults it (inside `verify_loopback_resolver_live`); the other
     /// platforms' DNS paths have no loopback probe, so for them this is a
     /// documented no-op.
+    // used only on non-windows (via install_dns_probe_servicer); present cross-platform, dead on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn set_dns_probe_servicer(
         &mut self,
         servicer: Option<std::sync::Arc<crate::daemon::DnsProbeServicer>>,
@@ -7133,6 +7135,8 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
     /// probe servicer installation). Deliberately NOT part of the hardened
     /// state-machine surface: it forwards a closure to the system and adds no
     /// transitions, audit events, or policy decisions.
+    // used only on non-windows (via install_dns_probe_servicer); present cross-platform, dead on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn with_system<R>(&mut self, apply: impl FnOnce(&mut S) -> R) -> R {
         apply(&mut self.system)
     }
