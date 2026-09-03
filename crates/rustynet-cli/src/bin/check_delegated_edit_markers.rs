@@ -89,6 +89,14 @@ const ALLOWLIST: &[AllowedMarker] = &[
         date: "2026-08-30",
         rationale: "lab tooling / ledger; allowlist-safe (review table row)",
     },
+    AllowedMarker {
+        sha: "76372bfadbd278f7169dd3ee2ace9f9b72aeb817",
+        date: "2026-09-03",
+        rationale: "dev-QoL #7 AGENTS/CLAUDE mirror guard (merged 02288df2); diff reviewed \
+                     — the two inline CI cmp blocks DRY'd into scripts/ci/check_agents_claude_mirror.sh, \
+                     no enforcement weakened, and its false pre-commit-hook-wiring claim was caught and \
+                     completed in 33d46fe1; docs + CI-tooling only, no product code",
+    },
 ];
 
 /// A commit as parsed out of `git log`.
