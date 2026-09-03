@@ -18608,11 +18608,10 @@ mod tests {
     #[test]
     fn bootstrap_scoped_dns_apply_failure_degrades_without_restriction() {
         let relay_addr: SocketAddr = "203.0.113.48:40035".parse().expect("relay addr");
-        let (mut runtime, test_dir) =
-            build_runtime_with_custom_relay_exitless_assignment(
-                "rustynetd-m2-bootstrap-scoped-degraded",
-                relay_addr,
-            );
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay_exitless_assignment(
+            "rustynetd-m2-bootstrap-scoped-degraded",
+            relay_addr,
+        );
         dry_run_fail_on_with(
             &mut runtime,
             "apply_dns_protection",
