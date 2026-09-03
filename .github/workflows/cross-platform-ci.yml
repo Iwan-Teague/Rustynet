@@ -75,6 +75,23 @@ jobs:
         # the Windows leg.
         run: |
           ./scripts/ci/lab_monitor_gates.sh
+      - name: Fuzz-target compile gate
+        # fuzz/ is a workspace of its own, so the workspace
+        # validation above never compiles its targets — a fuzz target that
+        # stopped building was invisible to CI. This compiles every [[bin]]
+        # in fuzz/Cargo.toml under the pinned stable toolchain (the repo's
+        # rust-toolchain.toml reaches fuzz/ because it is a subdirectory).
+        # No cargo-fuzz/nightly: `cargo build --bins` typechecks and links
+        # the libfuzzer-sys harnesses uninstrumented, which is exactly the
+        # "targets still compile" assertion — instrumentation is what
+        # cargo-fuzz adds at link time, not what the source needs. cargo
+        # build fails on any target's compile error, so this gate cannot
+        # pass over a broken target. libfuzzer-sys builds its bundled C++
+        # runtime via cc, so a C++ compiler must exist (macOS runners ship
+        # clang). macOS/Linux only — the Windows leg omits it (MSVC has no
+        # libFuzzer runtime to link), mirroring lab_monitor_gates.sh.
+        run: |
+          ./scripts/ci/fuzz_build_gate.sh
       - name: Security gates
         run: |
           cargo audit --deny warnings
@@ -173,6 +190,13 @@ jobs:
         # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.
         run: |
           ./scripts/ci/lab_monitor_gates.sh
+      - name: Fuzz-target compile gate
+        # Same rationale as the macOS leg's step: fuzz/ is excluded from the
+        # workspace, so this is its only CI compile check. bootstrap_ci_tools
+        # installs build-essential on this leg, which provides the C++
+        # compiler libfuzzer-sys' bundled runtime needs.
+        run: |
+          ./scripts/ci/fuzz_build_gate.sh
       - name: Security gates
         run: |
           cargo audit --deny warnings
