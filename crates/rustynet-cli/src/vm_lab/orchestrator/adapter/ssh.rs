@@ -867,6 +867,27 @@ pub fn parse_status_node_id(status_text: &str) -> Option<String> {
     parse_status_field(status_text, "node_id")
 }
 
+/// Verdict plus verbatim evidence from [`validator_report_ok`].
+///
+/// Named distinctly from the adapter's `ValidatorReport`
+/// (`orchestrator/error.rs`), which carries the raw output string; this is
+/// the parsed half the adapters copy their `reports` field from.
+///
+/// §5.2 Item 2 (structured drift in stage evidence): the function additionally
+/// returns every parsed report verbatim alongside the verdict — see
+/// [`ValidatorVerdict`]. The verdict rules themselves are UNCHANGED.
+pub struct ValidatorVerdict {
+    /// The verdict under exactly the fail-closed rules above — byte-for-byte
+    /// identical logic to the pre-§5.2 bool-only implementation. This is what
+    /// is JUDGED; the threading below only changes what is KEPT.
+    pub ok: bool,
+    /// Every successfully parsed JSON object candidate the scanner found,
+    /// embedded VERBATIM (no re-shaping) so stage evidence keeps the daemon's
+    /// actual report instead of only a bool. Candidates that fail to parse or
+    /// are not objects are NOT kept — only parsed objects are evidence.
+    pub reports: Vec<serde_json::Value>,
+}
+
 /// Decide whether a daemon `*-check` JSON report indicates success.
 ///
 /// The daemon prints a report whose top-level `overall_ok` boolean is the
@@ -884,41 +905,43 @@ pub fn parse_status_node_id(status_text: &str) -> Option<String> {
 /// - empty, truncated, non-JSON, or field-missing output → `false`;
 /// - any report with a top-level `overall_ok: false` → `false`;
 /// - an INCONSISTENT report — `overall_ok: true` alongside a non-empty
-///   `drift_reasons` array — → `false` (every baseline probe derives
-///   `overall_ok` from `drift_reasons.is_empty()`, so such a report is
-///   self-contradictory evidence and must not green a stage);
+///   `drift_reasons` array — → `false`;
 /// - an `overall_ok` occurrence inside a string value or log line, with no
-///   parseable report verdict, → `false` (a substring match would green on
-///   exactly this output);
+///   parseable report verdict, → `false`;
 /// - otherwise, at least one `overall_ok: true` → `true`.
-pub fn validator_report_ok(output: &str) -> bool {
+pub fn validator_report_ok(output: &str) -> ValidatorVerdict {
     let mut saw_ok = false;
+    let mut reports = Vec::new();
     for candidate in json_object_candidates(output) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate) else {
             continue;
         };
-        let Some(object) = value.as_object() else {
+        if !value.is_object() {
             continue;
-        };
-        let Some(verdict) = object
-            .get("overall_ok")
-            .and_then(serde_json::Value::as_bool)
-        else {
-            continue;
-        };
-        if !verdict {
-            return false;
         }
-        let drifted = object
+        // Judge the object first (borrow), then keep it verbatim: evidence is
+        // complete even when the verdict fails closed on this very report.
+        let verdict = value.get("overall_ok").and_then(serde_json::Value::as_bool);
+        let drifted = value
             .get("drift_reasons")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|reasons| !reasons.is_empty());
+        reports.push(value);
+        let Some(verdict) = verdict else {
+            continue;
+        };
+        if !verdict {
+            return ValidatorVerdict { ok: false, reports };
+        }
         if drifted {
-            return false;
+            return ValidatorVerdict { ok: false, reports };
         }
         saw_ok = true;
     }
-    saw_ok
+    ValidatorVerdict {
+        ok: saw_ok,
+        reports,
+    }
 }
 
 /// Extract every balanced JSON object candidate from `output`, string-aware so
@@ -1136,15 +1159,11 @@ mod tests {
     #[test]
     fn validator_report_ok_true_only_on_explicit_overall_ok_true() {
         // Pretty-printed (spaced) form the daemon emits via to_string_pretty.
-        assert!(validator_report_ok(
-            "{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}"
-        ));
+        assert!(validator_report_ok("{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}").ok);
         // Compact form.
-        assert!(validator_report_ok("{\"overall_ok\":true}"));
+        assert!(validator_report_ok("{\"overall_ok\":true}").ok);
         // Tolerant of a merged stderr log line preceding the JSON.
-        assert!(validator_report_ok(
-            "WARN something\n{\n  \"overall_ok\": true\n}"
-        ));
+        assert!(validator_report_ok("WARN something\n{\n  \"overall_ok\": true\n}").ok);
     }
 
     #[test]
@@ -1198,18 +1217,18 @@ mod tests {
     #[test]
     fn validator_report_ok_fails_closed() {
         // Drift reported.
-        assert!(!validator_report_ok(
-            "{\n  \"overall_ok\": false,\n  \"drift_reasons\": [\"x\"]\n}"
-        ));
+        assert!(
+            !validator_report_ok("{\n  \"overall_ok\": false,\n  \"drift_reasons\": [\"x\"]\n}").ok
+        );
         // Field absent (e.g. wrong schema / old `passed` schema) → fail closed.
-        assert!(!validator_report_ok("{\"passed\": true}"));
+        assert!(!validator_report_ok("{\"passed\": true}").ok);
         // Empty / non-JSON output → fail closed.
-        assert!(!validator_report_ok(""));
-        assert!(!validator_report_ok("command not found"));
+        assert!(!validator_report_ok("").ok);
+        assert!(!validator_report_ok("command not found").ok);
         // Both present (top-level false plus a nested true) → fail closed.
-        assert!(!validator_report_ok(
-            "{\"overall_ok\": false, \"sub\": {\"overall_ok\": true}}"
-        ));
+        assert!(
+            !validator_report_ok("{\"overall_ok\": false, \"sub\": {\"overall_ok\": true}}").ok
+        );
     }
 
     #[test]
@@ -1218,15 +1237,16 @@ mod tests {
         // a non-empty `drift_reasons` is self-contradictory evidence — every
         // baseline probe derives `overall_ok` from `drift_reasons.is_empty()` —
         // so the report must not green a stage. Empty reasons stay green.
-        assert!(!validator_report_ok(
-            "{\n  \"overall_ok\": true,\n  \"drift_reasons\": [\"resolver drifted\"]\n}"
-        ));
-        assert!(validator_report_ok(
-            "{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}"
-        ));
+        assert!(
+            !validator_report_ok(
+                "{\n  \"overall_ok\": true,\n  \"drift_reasons\": [\"resolver drifted\"]\n}"
+            )
+            .ok
+        );
+        assert!(validator_report_ok("{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}").ok);
         // Absent field (e.g. the authenticode report carries no drift_reasons)
         // imposes no constraint.
-        assert!(validator_report_ok("{\"overall_ok\": true}"));
+        assert!(validator_report_ok("{\"overall_ok\": true}").ok);
     }
 
     #[test]
@@ -1235,30 +1255,101 @@ mod tests {
         // typed JSON report, not from any text that happens to contain the
         // substring. An occurrence inside a string value, a log line, or a
         // wrong-schema object is not a verdict.
-        assert!(!validator_report_ok(
-            r#"{"drift_reasons": ["note: \"overall_ok\": true observed in log"]}"#
-        ));
-        assert!(!validator_report_ok(r#"log line: "overall_ok": true"#));
+        assert!(
+            !validator_report_ok(
+                r#"{"drift_reasons": ["note: \"overall_ok\": true observed in log"]}"#
+            )
+            .ok
+        );
+        assert!(!validator_report_ok(r#"log line: "overall_ok": true"#).ok);
         // Wrong-schema object that parses but has no top-level overall_ok.
-        assert!(!validator_report_ok(
-            r#"{"passed": true, "detail": {"overall_ok": true}}"#
-        ));
+        assert!(!validator_report_ok(r#"{"passed": true, "detail": {"overall_ok": true}}"#).ok);
     }
 
     #[test]
     fn validator_report_ok_rejects_truncated_report() {
         // A truncated report that merely CLAIMS ok must fail closed; the old
         // substring match greened on exactly this shape.
-        assert!(!validator_report_ok("{\"overall_ok\": true, \"drift_re"));
+        assert!(!validator_report_ok("{\"overall_ok\": true, \"drift_re").ok);
     }
 
     #[test]
     fn validator_report_ok_reads_pretty_report_after_merged_stderr() {
         // The robustness the typed parser must keep: pretty-printed report with
         // a merged stderr line before AND after, plus braces in the log noise.
-        assert!(validator_report_ok(
-            "WARN {init} something\n{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}\nbye"
-        ));
+        assert!(
+            validator_report_ok(
+                "WARN {init} something\n{\n  \"overall_ok\": true,\n  \"drift_reasons\": []\n}\nbye"
+            )
+            .ok
+        );
+    }
+
+    #[test]
+    fn validator_report_ok_keeps_parsed_reports_when_verdict_fails_closed() {
+        // §5.2 Item 2: a fail-closed verdict must still KEEP the parsed
+        // reports as evidence — the inconsistent shape (overall_ok: true plus
+        // a non-empty drift_reasons) is exactly the evidence an operator needs.
+        let verdict =
+            validator_report_ok(r#"{"overall_ok": true, "drift_reasons": ["resolver drifted"]}"#);
+        assert!(!verdict.ok, "inconsistent report must fail closed");
+        assert_eq!(verdict.reports.len(), 1, "the parsed report is kept");
+        assert_eq!(
+            verdict.reports[0]
+                .get("drift_reasons")
+                .and_then(|r| r.get(0)),
+            Some(&serde_json::Value::String("resolver drifted".to_owned())),
+            "report is kept VERBATIM"
+        );
+
+        // Unparseable candidates are NOT kept (only parsed objects are
+        // evidence) and the verdict still fails closed.
+        let verdict = validator_report_ok("{\"overall_ok\": true, \"drift_re");
+        assert!(!verdict.ok);
+        assert!(verdict.reports.is_empty(), "truncated JSON is not evidence");
+
+        // Non-JSON output keeps nothing.
+        let verdict = validator_report_ok("command not found");
+        assert!(!verdict.ok);
+        assert!(verdict.reports.is_empty());
+    }
+
+    #[test]
+    fn validator_report_ok_keeps_every_parsed_object_across_multiple_reports() {
+        // §5.2 Item 2: multiple balanced JSON objects in one output each
+        // become one verbatim report. Verdict precedence is unchanged:
+        // any overall_ok:false → false even when another object said true.
+        let verdict = validator_report_ok(
+            "{\"overall_ok\": true}\nnoise\n{\"overall_ok\": false, \"drift_reasons\": [\"late\"]}",
+        );
+        assert!(!verdict.ok);
+        assert_eq!(verdict.reports.len(), 2, "both parsed objects are kept");
+        assert_eq!(
+            verdict.reports[0].get("overall_ok"),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            verdict.reports[1].get("overall_ok"),
+            Some(&serde_json::Value::Bool(false))
+        );
+
+        // All-green multi-report output stays true and keeps both.
+        let verdict = validator_report_ok("{\"overall_ok\": true}\n{\"overall_ok\": true}");
+        assert!(verdict.ok);
+        assert_eq!(verdict.reports.len(), 2);
+
+        // Nested objects are NOT separate candidates: the outermost object is
+        // kept once, whole, verbatim.
+        let verdict = validator_report_ok(r#"{"passed": true, "detail": {"overall_ok": true}}"#);
+        assert!(!verdict.ok, "nested verdict is not a top-level verdict");
+        assert_eq!(verdict.reports.len(), 1, "only the outermost object");
+        assert!(
+            verdict.reports[0]
+                .get("detail")
+                .and_then(|d| d.get("overall_ok"))
+                .is_some(),
+            "kept verbatim including nested detail"
+        );
     }
 }
 

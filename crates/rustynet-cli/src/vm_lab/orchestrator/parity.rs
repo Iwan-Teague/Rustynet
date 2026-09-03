@@ -691,6 +691,7 @@ mod tests {
                 op: op.to_owned(),
                 passed,
                 summary: String::new(),
+                report: None,
             })
             .collect();
         (
