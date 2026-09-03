@@ -243,11 +243,12 @@ impl NodeAdapter for MacosNodeAdapter {
         // adapter; the lab macOS guest has passwordless sudo.
         let script = build_validator_command(&argv)?;
         let output = ssh::run_remote(&self.conn, script.as_str(), VALIDATOR_TIMEOUT)?;
-        let passed = ssh::validator_report_ok(&output);
+        let verdict = ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
             op_label,
             output,
-            passed,
+            passed: verdict.ok,
+            reports: verdict.reports,
         })
     }
 

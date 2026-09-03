@@ -233,11 +233,12 @@ impl NodeAdapter for LinuxNodeAdapter {
         let script = build_validator_command(&argv)?;
         let op_label = argv.get(1).cloned().unwrap_or_default();
         let output = ssh::run_remote(&self.conn, script.as_str(), SHORT_TIMEOUT)?;
-        let passed = ssh::validator_report_ok(&output);
+        let verdict = ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
             op_label,
             output,
-            passed,
+            passed: verdict.ok,
+            reports: verdict.reports,
         })
     }
 
