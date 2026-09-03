@@ -323,3 +323,34 @@ listener (closing the §1.3 prediction).
   regression surface.
 - **Diagnosis's line-drift caveat:** legitimate — two citations drifted ≤6 lines
   on this tree; none changed meaning.
+
+## 9. Amendment (2026-09-03): M2 deferral removed — scoped posture applies in-bootstrap
+
+The §5 fix (M2) deferred the `ScopedResolverOnly` DNS posture out of bootstrap to
+the first reconcile. That deferral is now REMOVED: bootstrap applies the scoped
+posture in-place, because the `validate_baseline_runtime` validator runs
+immediately after `enforce_baseline_runtime` — inside the former deferral window
+— so a plain macOS client failed `DnsFailclosed` validation with
+`/etc/resolver/rustynet` still absent.
+
+This is safe because M1 (probe hoist + `DnsProbeServicer`) already answers the
+bootstrap probe for ANY posture, so the scoped apply's
+`verify_loopback_resolver_live` gate passes during bootstrap and the resolver
+file is written before validation runs. `FullyProtected` behavior is unchanged
+(in-bootstrap apply, full restrict-on-failure ladder).
+
+Failure handling now mirrors the reconcile path: a scoped-posture bootstrap
+`DnsApplyFailed` is availability-only — the daemon logs the degradation, sets
+`dns_scoped_apply_degraded` + `dns_posture_reassert_pending` (reconcile retries
+and clears both on success), and does NOT restrict; the mesh is unaffected since
+the probe precedes every mutation (posture stays untouched on failure). A
+`FullyProtected` bootstrap DNS failure still runs the full
+`restrict_recoverable` + `force_fail_closed_or_restrict` ladder, and the
+cleanup-failure arm keeps full restrict (key custody dominates).
+
+The `defer_scoped_dns_posture` flag is retained in `ApplyOptions` (legacy
+caller-unset path; both daemon call sites now pass `false`); the
+`bootstrap_defers_scoped_dns_posture_to_first_reconcile` and
+`bootstrap_deferred_scoped_posture_emits_no_dns_ops` tests were replaced by
+applies-in-bootstrap and retained-defer-flag tests, plus new
+degrades-without-restricting / still-restricts bootstrap failure tests.
