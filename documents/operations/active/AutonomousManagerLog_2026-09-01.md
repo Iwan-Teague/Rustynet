@@ -1061,3 +1061,16 @@ Decisive host+guest investigation (mine, parallel to the running GLM analysis ed
 - Per §4C (security-sensitive teardown next to the green DNS floor): merged the FINDING but NOT implementing yet. Launched an ADVERSARIAL REVIEW (edit-1788442640955-20863-0) of the Q5 fix — bar: PROVE the current-generation floor can never be flushed; else NOT-READY. When COMPLETE: verify hard, and if READY/READY-WITH-AMENDMENTS, implement CAREFULLY (likely myself — GLM code-fix quality vs its solid docs work; a wrong prune guard breaks DNS protection), gate, then a live re-prove is NOT needed (the DNS chain green run already exercises the floor; add a unit test proving current-floor preservation).
 - lenovo-bot still DOWN (QH-64 guest-blocked). Frontier still thin but this prune fix is genuine unblocked security-hygiene code work.
 - STATE: main @89d443df. DNS chain green+stable. Fleet=1 (prune review). External read-only providers DOWN; GLM producing consistently sound grounded docs this session (5 solid jobs).
+
+## Tick 57 — 2026-09-03 ~14:50Z — OWNER GREENLIT the dev-QoL batch; work stream redirected
+
+Owner (awake, direct): "greenlight info-accuracy top-2 and build #8 plus #4-7." New active work stream (owner-sanctioned) — un-thins the frontier:
+- KEY COUPLING confirmed by the design itself (§5.9): "prune's blind spot and the check's blind spot are the same bug; fix once." So 5.4 (shared enumerate_owned_pf_anchor_names + divergence gate) SUBSUMES the prune fix, and §5.9 (orphaned_pf_anchors drift dimension) is the prune-hygiene fix folded into the DNS check. ONE unified security cluster → SELF-implement.
+- Prune review MERGED (c826af5e, READY-WITH-AMENDMENTS A1-A7). A1: preserve-set is CURRENT ONLY (the immediately-previous anchor is already emptied by the rotate-flush at phase10.rs:4031-4042 before the target loads), delete all older; two-name guard kept as defensive belt-and-braces. A3 fix the privileged arm; A4 blind_exit exclusion; A5 fail-closed; A6 exact-name current-gen guard AFTER enumeration; A2/A7 preservation test.
+- #5 DONE: staleness hook installed in this clone (core.hooksPath -> scripts/git-hooks).
+- 5.2 (structured drift into stage result) LAUNCHED to GLM (edit-1788443697305-23524-0) — §5.2 is PLUMBING, independent of 5.4, surfaces daemon reports VERBATIM (forward-compatible with §5.9). Verdict logic untouched; secret-scan required.
+
+DIVISION OF LABOR:
+- SELF (security-sensitive / small): 5.4+prune+§5.9 unified cluster (phase10.rs enumerate_owned_pf_anchor_names + list_owned_anchors + prune_owned_tables; macos_dns_failclosed.rs read_pf_dns_block_floor uses the shared fn + §5.9 orphaned drift; privileged_helper.rs allowlist arm for ["-a","com.apple","-s","Anchors"]; scripts/ci divergence gate + grep tripwire; tests incl. current-floor-never-flushed). #7 mirror check (cmp CI + pre-commit). #6 toolchain guard (justfile/wrapper forcing pinned 1.88 PATH). #4 MCP freshness pre-lab hook (wire check_mcp_binaries_fresh.sh — LOCAL not CI, per its own note).
+- GLM: 5.2 (in flight); #8 inventory drift detector (network_group vs live subnet — launch next tick).
+- current: main @c826af5e. Fleet=1 (5.2). External read-only providers DOWN.
