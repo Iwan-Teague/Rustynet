@@ -4099,17 +4099,47 @@ impl MacosCommandSystem {
 
     fn list_owned_anchors(&self) -> Result<Vec<String>, SystemError> {
         let output = self.run_capture(PrivilegedCommandProgram::Pfctl, &["-s", "Anchors"])?;
-        if output.success() {
-            return Ok(Self::owned_anchor_names_from_output(&output.stdout));
+        if !output.success() {
+            let stderr = output.stderr.to_ascii_lowercase();
+            if stderr.contains("pf not enabled") {
+                return Ok(Vec::new());
+            }
+            return Err(SystemError::Io(format!(
+                "pfctl anchor query failed: status={} stderr={}",
+                output.status, output.stderr
+            )));
         }
-        let stderr = output.stderr.to_ascii_lowercase();
-        if stderr.contains("pf not enabled") {
-            return Ok(Vec::new());
+        // The generation-numbered killswitch anchors are NESTED under Apple's
+        // `com.apple` parent (`com.apple/rustynet_g{N}`); top-level
+        // `pfctl -s Anchors` never lists them — the exact blindness the
+        // DNS-check enum-fix (`2c10f9d9`) corrected in `read_pf_dns_block_floor`.
+        // Without the nested query this enumeration returned an empty set on
+        // every real macOS system, so `prune_owned_tables` swept nothing and
+        // stale old-generation anchors accumulated across restarts
+        // (MacosPruneNestedAnchorHygiene_2026-09-03). Query the nested set too
+        // and union it in. The filter stays `owned_anchor_names_from_output`
+        // (`com.apple/rustynet_g*` only) — NOT the broader DNS-check filter —
+        // so the fixed-name `com.rustynet/nat` exit-NAT anchor and
+        // `com.rustynet/blind_exit` (owned by `reconcile_exit_nat_residue` /
+        // `flush_anchor`, not the generation sweep) are never returned here.
+        // The nested query is best-effort: a failure only narrows the set, and
+        // the current-generation guard in `prune_owned_tables` means a missing
+        // nested anchor can never cause the LIVE floor to be flushed — the
+        // failure mode is a leaked stale anchor, never a dropped floor.
+        let mut anchors = Self::owned_anchor_names_from_output(&output.stdout);
+        if let Ok(nested) = self.run_capture(
+            PrivilegedCommandProgram::Pfctl,
+            &["-a", "com.apple", "-s", "Anchors"],
+        ) {
+            if nested.success() {
+                for anchor in Self::owned_anchor_names_from_output(&nested.stdout) {
+                    if !anchors.contains(&anchor) {
+                        anchors.push(anchor);
+                    }
+                }
+            }
         }
-        Err(SystemError::Io(format!(
-            "pfctl anchor query failed: status={} stderr={}",
-            output.status, output.stderr
-        )))
+        Ok(anchors)
     }
 
     fn flush_anchor(&mut self) {
@@ -4815,27 +4845,43 @@ impl DataplaneSystem for MacosCommandSystem {
     }
 
     fn prune_owned_tables(&mut self) -> Result<(), SystemError> {
+        // Sweep ONLY stale older generations; NEVER the live floor. The current
+        // generation's nested anchor (`current_anchor_name`) carries the live
+        // DNS-block floor and the default-deny killswitch, so flushing it would
+        // strand the node in a pin-without-floor half state (A1/A6,
+        // MacosPruneNestedAnchorHygieneReview_2026-09-03). The
+        // immediately-previous generation is already emptied by the rotate-flush
+        // in `apply_pf_rules`, but preserve it too as defensive belt-and-braces
+        // (mirrors the Linux twin's active+target preserve-set). blind-exit
+        // anchors are irreversible and are never swept by the generation prune
+        // (A4). The exact-name guard is applied AFTER enumeration and BEFORE the
+        // flush.
+        let current = self.current_anchor_name();
+        let previous = format!("com.apple/rustynet_g{}", self.generation.saturating_sub(1));
         for anchor in self.list_owned_anchors()? {
+            if is_macos_blind_exit_anchor(anchor.as_str()) {
+                continue;
+            }
+            if anchor == current || anchor == previous {
+                continue;
+            }
             self.run_allow_failure(
                 PrivilegedCommandProgram::Pfctl,
                 &["-a", anchor.as_str(), "-F", "all"],
             );
         }
         self.anchor_name = None;
-        // D2 (DnsPosture invariant — no half-states): the flush above just
-        // dropped a live DNS-block floor along with every other owned anchor,
-        // but loopback service pins are system-configuration state that prune
-        // never touches. If pins are still installed — the previous
-        // generation's FullyProtected posture, or residue a rollback could
-        // not restore — the node would sit in the pin-without-floor half
-        // state (the exact "pinned with pf rules absent" signature the
-        // plain-client flap produced) until the DNS arm re-renders, and would
-        // keep it for good when that apply fails and rolls back. The M3 latch
-        // (`killswitch_spec`) puts the floor into every render while pins
-        // persist, so one immediate re-render re-establishes it. A failure
-        // propagates: the generation flow rolls this apply back fail-closed
-        // (rollback restores pins BEFORE dropping the floor), so no error
-        // path can leave pins over a dropped floor.
+        // D2 (DnsPosture invariant — no half-states): the current-generation
+        // floor now SURVIVES this prune (guarded above), so the sweep no longer
+        // drops a live floor. The re-render below is retained as defensive
+        // belt-and-braces: loopback service pins are system-configuration state
+        // that prune never touches, so if pins are somehow live while the pf
+        // floor is not (e.g. an externally flushed anchor, or residue a rollback
+        // could not restore), the M3 latch (`killswitch_spec`) puts the floor
+        // into every render and one immediate re-render re-establishes it. A
+        // failure propagates: the generation flow rolls this apply back
+        // fail-closed (rollback restores pins BEFORE dropping the floor), so no
+        // error path can leave pins over a dropped floor.
         if self.has_live_loopback_dns_pins() {
             self.apply_pf_rules(false)?;
         }
@@ -9410,6 +9456,58 @@ mod tests {
         assert!(
             pins_probe_at < refloor_at,
             "the floor re-render must be gated on the live-pins probe"
+        );
+    }
+
+    /// The macOS owned-anchor prune must NEVER flush the current-generation
+    /// nested floor (`com.apple/rustynet_g{N}`) — flushing it strands the node
+    /// in the pin-without-floor half state. The sweep is guarded by exact name
+    /// (current + previous generation) plus the irreversible blind-exit anchor,
+    /// applied AFTER enumeration and BEFORE the flush
+    /// (MacosPruneNestedAnchorHygieneReview_2026-09-03 A1/A4/A6). Source-pinned
+    /// because the sweep behaviorally requires the live privileged helper (same
+    /// rationale as
+    /// `macos_prune_owned_tables_reestablishes_dns_floor_while_pins_live`).
+    #[test]
+    fn macos_prune_owned_tables_preserves_the_current_generation_floor() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let macos_impl = code
+            .find("impl DataplaneSystem for MacosCommandSystem")
+            .expect("MacosCommandSystem must implement DataplaneSystem");
+        let body = &code[macos_impl..];
+        let fn_at = body
+            .find("fn prune_owned_tables(&mut self) -> Result<(), SystemError> {")
+            .expect("MacosCommandSystem must prune owned tables");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+
+        let current_at = body
+            .find("let current = self.current_anchor_name();")
+            .expect("prune must bind the current-generation anchor name");
+        let guard_at = body
+            .find("if anchor == current || anchor == previous {")
+            .expect("prune must skip the current + previous generation anchors");
+        let blind_exit_at = body
+            .find("if is_macos_blind_exit_anchor(anchor.as_str()) {")
+            .expect("prune must skip the irreversible blind-exit anchor");
+        let flush_at = body
+            .find("\"-a\", anchor.as_str(), \"-F\", \"all\"")
+            .expect("prune must flush stale anchors");
+        assert!(
+            current_at < guard_at,
+            "the current anchor must be bound before the guard"
+        );
+        assert!(
+            guard_at < flush_at,
+            "the current-generation guard must precede the flush (never flush the live floor)"
+        );
+        assert!(
+            blind_exit_at < flush_at,
+            "the blind-exit skip must precede the flush"
         );
     }
 

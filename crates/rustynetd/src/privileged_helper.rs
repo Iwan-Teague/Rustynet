@@ -3060,6 +3060,19 @@ fn validate_pfctl_args(args: &[&str]) -> Result<(), String> {
         ["-E"] => Ok(()),
         ["-s", "info"] => Ok(()),
         ["-s", "Anchors"] => Ok(()),
+        // Read-only enumeration of Apple's `com.apple` parent anchor's nested
+        // sub-anchors (`pfctl -a com.apple -s Anchors`). Top-level `-s Anchors`
+        // does not recurse, so the generation-numbered killswitch anchors nested
+        // under `com.apple` are invisible without this; the owned-anchor prune
+        // sweep needs it to see the stale generations it must flush. Matched as
+        // an EXACT LITERAL parent, NOT via `is_anchor_name_token` — that
+        // predicate by design accepts only rustynet-owned LEAF anchors
+        // (`com.apple/rustynet_g*`, `com.rustynet/nat`, `com.rustynet/blind_exit`)
+        // and never the bare `com.apple` parent, so a guarded arm could never
+        // admit this query. `com.apple` is the only parent the daemon ever
+        // enumerates, so the literal is the tightest possible allowlist. Read-only
+        // — no rule mutation, no `-f` path.
+        ["-a", "com.apple", "-s", "Anchors"] => Ok(()),
         ["-a", anchor, "-F", "all"] if is_anchor_name_token(anchor) => Ok(()),
         // NOTE: `-f <path>` / `-n -a <anchor> -f <path>` are DELIBERATELY NOT
         // accepted from the privileged boundary. Loading a daemon-authored rules
@@ -6110,6 +6123,23 @@ mod tests {
         );
         // A non-allowlisted anchor stays denied even for the read-only show.
         assert!(validate_pfctl_args(&["-a", "com.rustynet/other", "-s", "nat"]).is_err());
+    }
+
+    #[test]
+    fn validate_pfctl_args_permits_nested_anchor_enumeration_read_only() {
+        // The owned-anchor prune sweep enumerates com.apple's nested
+        // sub-anchors (`pfctl -a com.apple -s Anchors`) to find the generation
+        // killswitch anchors that top-level `-s Anchors` cannot list. Admitted
+        // ONLY as the exact literal `com.apple` parent.
+        assert!(validate_pfctl_args(&["-a", "com.apple", "-s", "Anchors"]).is_ok());
+        // The literal is the whole allowlist: an arbitrary parent, a rustynet
+        // leaf anchor, and a path-traversal token are all denied for `-s Anchors`
+        // (the daemon never enumerates any of them).
+        assert!(validate_pfctl_args(&["-a", "com.apple/rustynet_g3", "-s", "Anchors"]).is_err());
+        assert!(validate_pfctl_args(&["-a", "com.rustynet/nat", "-s", "Anchors"]).is_err());
+        assert!(validate_pfctl_args(&["-a", "com.apple/rustynet_g1/..", "-s", "Anchors"]).is_err());
+        // The enumeration schema cannot smuggle a rule-loading `-f <path>`.
+        assert!(validate_pfctl_args(&["-a", "com.apple", "-f", "/tmp/x.pf"]).is_err());
     }
 
     /// Tests-first item 5 of MacosDnsBackupRebootSurvivalPlan_2026-09-02:
