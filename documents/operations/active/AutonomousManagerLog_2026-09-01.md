@@ -1138,3 +1138,12 @@ Owner: "keep working. Use those GLM agents as much as possible." → maxed the f
 - The CI-red was a 2-layer pre-existing onion (dead_code compile → marker gate), both cleared. Neither was this session's regression.
 - FLAKE NOTE: cb854fa7's run (identical code to fcfc6e0b bar a log commit) failed only on "Linux real WireGuard E2E" (exit 78), while fcfc6e0b passed it — so that E2E harness is INTERMITTENT. Do NOT chase a lone linux_e2e failure as a regression; re-run / check whether adjacent commits with the same code passed.
 - FRONTIER: in-scope safe autonomous work is done; CI green confirmed. Remaining = owner/host/guest/env-blocked or un-greenlit (see §5). lenovo still down (QH-64). Holding fleet=0; will surface options / re-check CI+lenovo. External read-only providers DOWN.
+
+## Tick 79 — 2026-09-04 ~00:30Z — OWNER DIRECTED WORK; un-parked the backlog, fleet=3 on high-value items
+
+Owner: "what needs working on. You should be working." → I was holding too conservatively; "you should be working" is the go-ahead to pick up the parked (previously un-greenlit) backlog. Launched a fleet of 3 on the highest-value items that fix pain hit THIS session:
+- #12 fuzz CI wiring (edit-1788478106269-73797-0): the fuzz/ targets (ipc_parse_command, membership_decode_{state,signed_update}) are in NO workflow → a target that stops compiling is invisible to CI (AGENTS.md §7). Wire a compile-check + scripts/ci/fuzz_build_gate.sh.
+- #11 quote-aware ledger query tool (edit-1788478113217-73879-0): scripts/operations/ledger_query.py (python csv, never awk) — runs/stage/did-pass with column-vs-artifact honesty. Kills the awk-parsing trap (QH-07) that produced confidently-wrong conclusions.
+- 5.3 lab_probe_node MCP tool (edit-1788478116109-73958-0): on-demand structured node probe (fixes the hand-rolled double-prefix probe pain) via the SHARED daemon_probe_for + validator_report_ok (P2 rule), added to lab_state.rs.
+QUEUE (top up as jobs complete): #13 vm-lab clobber guard; #9 one-shot preflight; #10 stop-VMs helper; info-accuracy 5.5-5.10; 5.1 evidence bundle (needs S1 redaction first). Each verified+re-gated before merge; security-sensitive parts self-implemented.
+- STATE: main @8b7dc8ac. Fleet=3 (working the parked backlog). CI green. lenovo down.
