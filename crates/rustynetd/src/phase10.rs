@@ -4822,6 +4822,23 @@ impl DataplaneSystem for MacosCommandSystem {
             );
         }
         self.anchor_name = None;
+        // D2 (DnsPosture invariant — no half-states): the flush above just
+        // dropped a live DNS-block floor along with every other owned anchor,
+        // but loopback service pins are system-configuration state that prune
+        // never touches. If pins are still installed — the previous
+        // generation's FullyProtected posture, or residue a rollback could
+        // not restore — the node would sit in the pin-without-floor half
+        // state (the exact "pinned with pf rules absent" signature the
+        // plain-client flap produced) until the DNS arm re-renders, and would
+        // keep it for good when that apply fails and rolls back. The M3 latch
+        // (`killswitch_spec`) puts the floor into every render while pins
+        // persist, so one immediate re-render re-establishes it. A failure
+        // propagates: the generation flow rolls this apply back fail-closed
+        // (rollback restores pins BEFORE dropping the floor), so no error
+        // path can leave pins over a dropped floor.
+        if self.has_live_loopback_dns_pins() {
+            self.apply_pf_rules(false)?;
+        }
         Ok(())
     }
 
@@ -9330,6 +9347,54 @@ mod tests {
         assert!(
             write_at < first_mutation_at,
             "the backup write must precede the first networksetup mutation argv"
+        );
+    }
+
+    /// D2 (DnsPosture invariant — no half-states): `MacosCommandSystem::
+    /// prune_owned_tables` flushes every owned pf anchor, which drops a live
+    /// DNS-block floor, while loopback service pins survive the prune as
+    /// system-configuration state. Whenever pins are still live the prune must
+    /// re-establish the floor IMMEDIATELY (via the M3 latch's floor-carrying
+    /// render) and propagate failure, so the generation flow rolls back
+    /// fail-closed instead of parking the node in the pin-without-floor half
+    /// state the plain-client flap photographed. Source-pinned because
+    /// exercising the ordering behaviorally requires the live privileged
+    /// helper (same rationale as
+    /// `macos_apply_writes_backup_before_first_mutation_argv`).
+    #[test]
+    fn macos_prune_owned_tables_reestablishes_dns_floor_while_pins_live() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+
+        let macos_impl = code
+            .find("impl DataplaneSystem for MacosCommandSystem")
+            .expect("MacosCommandSystem must implement DataplaneSystem");
+        let body = &code[macos_impl..];
+        let fn_at = body
+            .find("fn prune_owned_tables(&mut self) -> Result<(), SystemError> {")
+            .expect("MacosCommandSystem must prune owned tables");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+
+        let pins_probe_at = body
+            .find("if self.has_live_loopback_dns_pins()")
+            .expect("prune must probe for live loopback DNS pins after the anchor flush");
+        let refloor_at = body
+            .find("self.apply_pf_rules(false)?")
+            .expect("prune must re-establish the pf DNS floor while pins are live");
+        let ok_at = body
+            .rfind("Ok(())")
+            .expect("prune must report success explicitly");
+        assert!(
+            refloor_at < ok_at,
+            "the floor re-render must gate the prune's success"
+        );
+        assert!(
+            pins_probe_at < refloor_at,
+            "the floor re-render must be gated on the live-pins probe"
         );
     }
 
