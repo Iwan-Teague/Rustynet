@@ -1131,3 +1131,10 @@ Owner: "keep working. Use those GLM agents as much as possible." → maxed the f
 - FIX (cb854fa7): 76372bfa is reviewed + safe (docs/CI-tooling only; DRY'd the inline CI cmp into check_agents_claude_mirror.sh, no enforcement weakened; false hook claim already completed in 33d46fe1). Added to the const ALLOWLIST in check_delegated_edit_markers.rs (sanctioned post-hoc rescue). Verified: marker gate PASS (1 marked, all allowlisted); clippy clean; fmt clean.
 - With BOTH the dead_code compile + the marker gate fixed, the next CI run should be the first GREEN Cross Platform CI of the session — CONFIRM next tick.
 - STATE: main @cb854fa7. Fleet=0. lenovo down. External read-only providers DOWN.
+
+## Tick 65 — 2026-09-03 ~20:14Z — ★ FIRST GREEN CROSS PLATFORM CI OF THE SESSION ★
+
+- fcfc6e0b (main HEAD) = Cross Platform CI **completed SUCCESS** — the first green CI since before tick 51. All legs (macOS, Debian 13, Windows, Linux real-WireGuard E2E) passed. This CONFIRMS the whole session's work is CI-clean: the dev-QoL batch (5.2, 5.4-core, #4-8), 5.4 item-f, the macOS DnsFailclosed close, the prune-blindness fix, and the two pre-existing CI-blocker fixes (M1/M3 dead_code 0044ae29 + QH-26 marker allowlist cb854fa7).
+- The CI-red was a 2-layer pre-existing onion (dead_code compile → marker gate), both cleared. Neither was this session's regression.
+- FLAKE NOTE: cb854fa7's run (identical code to fcfc6e0b bar a log commit) failed only on "Linux real WireGuard E2E" (exit 78), while fcfc6e0b passed it — so that E2E harness is INTERMITTENT. Do NOT chase a lone linux_e2e failure as a regression; re-run / check whether adjacent commits with the same code passed.
+- FRONTIER: in-scope safe autonomous work is done; CI green confirmed. Remaining = owner/host/guest/env-blocked or un-greenlit (see §5). lenovo still down (QH-64). Holding fleet=0; will surface options / re-check CI+lenovo. External read-only providers DOWN.
