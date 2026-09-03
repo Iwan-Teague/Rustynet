@@ -93,7 +93,7 @@ Every cell here is "as proven on `--node`," independent of the bash archive.
 
 | Role | macOS (`--node`) | Windows (`--node`) |
 |---|---|---|
-| **client** | 🔴 `two_hop` fails → `macos_client=fail` | ⬛ bootstrap never green |
+| **client** | 🟡 **DNS release-blocker CLOSED 2026-09-03; baseline chain now green** (`livelab-1788433705-bf4b1b1187c8`, commit `bf4b1b1187c8`, clean): macos-utm-1 as a full-tunnel client (`build_bundle_env` assigns every non-exit node the run's exit → `exit_mode=FullTunnel` → `FullyProtected`) now passes `validate_baseline_runtime`, `dns_failclosed_validation`, `security_audit_validation`, `runtime_acls_validation`, and `mesh_status_validation` — the first time a macOS client run advances through the full baseline+DNS+security+ACL+mesh validator chain on `--node`. Two fixes closed the 16-tick `DnsFailclosed` blocker: the daemon-side check now enumerates the nested `com.apple/rustynet_g{N}` pf DNS-block floor it was blind to (`2c10f9d9`, `macos_dns_failclosed.rs` — top-level `pfctl -s Anchors` never saw the nested anchor the daemon installs+verifies, so the check false-failed while the floor was present), and `dns_failclosed_validation` now derives the expected posture from the run topology instead of a role-based scoped guess (`e36a2295`). Neither weakened a control. **Still NOT overall-green:** `traffic_test_matrix` fails — now root-caused (CP-1 below) as a host/lab-topology gap (the UTM fleet is split across two isolated vmnet nets with no cross-vmnet underlay path), NOT a rustynet defect; the fix needs a host change (deferred, owner). | ⬛ bootstrap never green |
 | **admin** | 🟢 `macos_admin=pass` (`livelab-1784501586`, commit `537e1901`, clean) — run overall failed on `two_hop` | ⬛ bootstrap blocker |
 | **relay** (lifecycle) | 🟢 `macos_stage_relay_service_lifecycle=pass` (`livelab-1784497253`, `11620a6`, clean) | ⬛ / 🟠 SCM contract only |
 | **relay** (frame-forwarding) | 🟠 **provable on demand, opt-in** (HP-3 wiring landed 2026-09-01: `relay_forwards_frame_validation` stage, `--enable-relay-forwarding-validation`; disrupts the mesh — nft blocks + two peer daemon restarts, QH-64 — so it is OUT of the default plan; first live pass still pending) | 🔒 HP-3 (same opt-in stage; not yet elected on Windows) |
@@ -127,7 +127,20 @@ hardware; a fourth (Windows bootstrap) must be triaged.
   have explained macOS `two_hop` or has stopped applying. **First action is a fresh
   triage of a current macOS `two_hop` report**, not a fix on the stale hypothesis. It
   is *probably* the highest-value macOS-column lever (it caps every macOS run's
-  overall verdict), but that ranking is provisional pending triage. Owning area is
+  overall verdict), but that ranking is provisional pending triage. ★ **Triage DONE
+  2026-09-03** (`MacosCrossNetworkTrafficBlocker_2026-09-03.md`; run
+  `livelab-1788433705-bf4b1b1187c8`): the current macOS traffic failure is NOT the
+  stale client↔client transport hypothesis — it is a **host/lab-topology gap**. The
+  UTM fleet is now split across two isolated vmnet "Shared" nets (macos-utm-1 on
+  `192.168.64.x`/bridge100, the debian peers on `192.168.65.x`/bridge101); a direct
+  underlay probe (2026-09-03) shows **100% packet loss both ways at L3**, so the peer
+  WireGuard endpoints (raw underlay `host:51820`, no substrate elected) can never
+  handshake. Neither raw endpoints nor a vxlan substrate nor a relay can bridge this
+  on a single host without a HOST change (re-pin all guests to one vmnet, or enable
+  host inter-bridge IP-forwarding+pf) — both need sudo + owner sign-off (deferred).
+  `traffic_test_matrix` is correctly fail-closed and must not be weakened. The 16-tick
+  `DnsFailclosed` blocker that previously masked this stage is now closed (client cell
+  above), which is why the traffic failure surfaces cleanly. Owning area is
   core-dataplane, §13.2 security-sensitive.
 
   **CP-1 TRIAGE VERDICT (2026-08-29) — ENVIRONMENTAL (lab network topology), NOT
