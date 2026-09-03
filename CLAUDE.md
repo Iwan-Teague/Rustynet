@@ -158,11 +158,13 @@ commands, not by reading them:
   inside the standalone crate). CI runs it on the macOS and Debian legs; the
   crate is macOS/Linux-only, so the Windows leg omits it.
   `fuzz/` also declares its own `[workspace]`, so it is outside every command
-  above as well — and unlike `rustynet-lab-monitor` it has **no** wired gate:
-  nothing in `.github/workflows/` references it, so a fuzz target that stops
-  compiling is invisible to CI. Same for `gui/`. If you change either, gate it
+  above as well. Its compile gate is wired: `./scripts/ci/fuzz_build_gate.sh`
+  (`cd fuzz && cargo build --bins` — stable toolchain, no cargo-fuzz needed)
+  runs on the macOS and Debian CI legs, so a fuzz target that stops
+  compiling fails CI; it is still a compile check only — run `cargo fuzz`
+  locally for actual fuzzing. `gui/` remains unwired: if you change it, gate it
   by hand and say so in the ledger; do not report a green §7 run as covering
-  them.
+  it.
 - **CI adds `--locked`; the commands above do not.** Every CI validation leg
   runs clippy and the test stage with `--locked`, so a local gate run that
   quietly refreshes `Cargo.lock` can pass on a commit CI then fails. Prefer
