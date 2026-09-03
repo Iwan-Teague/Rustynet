@@ -481,6 +481,25 @@ fn read_networksetup(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Union the rustynet-owned pf anchor names from a top-level `pfctl -s Anchors`
+/// dump and (when available) a nested `pfctl -a com.apple -s Anchors` dump,
+/// preserving order and deduplicating. The nested dump surfaces the
+/// `com.apple/rustynet_g{N}` DNS-block-floor anchors that the top-level dump
+/// omits (they are sub-anchors of Apple's `com.apple` parent). Both dumps are
+/// filtered through `parse_pf_anchor_names`, so only prefix-matched, structurally
+/// valid rustynet-owned anchors survive.
+pub fn merge_rustynet_anchor_names(top_output: &str, nested_output: Option<&str>) -> Vec<String> {
+    let mut anchors = parse_pf_anchor_names(top_output);
+    if let Some(nested_output) = nested_output {
+        for anchor in parse_pf_anchor_names(nested_output) {
+            if !anchors.contains(&anchor) {
+                anchors.push(anchor);
+            }
+        }
+    }
+    anchors
+}
+
 /// Observe the pf DNS block floor (S6 layer 3): enumerate anchors via
 /// `pfctl -s Anchors`, then read every rustynet-owned anchor's rules via
 /// `pfctl -a <anchor> -s rules`, reporting whether SOME anchor carries
@@ -490,10 +509,26 @@ fn read_networksetup(args: &[&str]) -> Option<String> {
 /// absent floor (`block_rules_present=false`), also a failure
 /// downstream.
 pub fn read_pf_dns_block_floor() -> Option<PfDnsBlockFloorObservation> {
-    let anchors_output = read_pfctl(&["-s", "Anchors"])?;
+    // The rustynet DNS-block floor anchor is `com.apple/rustynet_g{N}` — NESTED
+    // under Apple's `com.apple` parent anchor. `pfctl -s Anchors` lists only
+    // TOP-LEVEL anchor names (e.g. `com.apple`, `com.rustynet`), so the nested
+    // floor anchor is invisible to it; the daemon loads and verifies that anchor
+    // by its full path (`pfctl -a com.apple/rustynet_g{N} -s rules`, see
+    // phase10::verify_live_pf_dns_floor). Enumerate BOTH the top-level set (which
+    // still catches the top-level `com.rustynet/` family) AND `com.apple`'s
+    // sub-anchors, so this check observes the same floor the daemon installed.
+    //
+    // Fail-closed is preserved: a failed top-level query still returns `None`
+    // (unverifiable); the nested query is best-effort because an UNFOUND floor
+    // yields `block_rules_present = false` (a failure downstream) — a missing
+    // nested query can therefore never make the check PASS, only limit which
+    // anchors are scanned; and every per-anchor rule read stays `?`-fail-closed.
+    let top_output = read_pfctl(&["-s", "Anchors"])?;
+    let nested_output = read_pfctl(&["-a", "com.apple", "-s", "Anchors"]);
+    let anchors = merge_rustynet_anchor_names(&top_output, nested_output.as_deref());
     let mut anchors_scanned = Vec::new();
     let mut block_rules_present = false;
-    for anchor in parse_pf_anchor_names(&anchors_output) {
+    for anchor in anchors {
         let rules = read_pfctl(&["-a", &anchor, "-s", "rules"])?;
         if anchor_rules_contain_both_dns_block_labels(&rules) {
             block_rules_present = true;
@@ -1248,6 +1283,48 @@ mod tests {
             ],
             "only prefix-matched, structurally valid anchor names are ours"
         );
+    }
+
+    #[test]
+    fn floor_scan_unions_top_level_and_nested_com_apple_anchors() {
+        // `pfctl -s Anchors` lists only top-level anchors (com.apple, com.rustynet);
+        // the DNS-block floor lives NESTED at com.apple/rustynet_g{N}, surfaced by
+        // `pfctl -a com.apple -s Anchors`. read_pf_dns_block_floor unions both — the
+        // regression that false-failed a FULLY-PROTECTED node whose floor WAS present.
+        let top = "com.apple
+com.rustynet
+";
+        let nested = "com.apple/rustynet_g5
+com.apple/250.ApplicationFirewall
+";
+        let anchors = merge_rustynet_anchor_names(top, Some(nested));
+        assert!(
+            anchors.contains(&"com.apple/rustynet_g5".to_owned()),
+            "the nested com.apple/rustynet_g floor anchor must be scanned; got {anchors:?}"
+        );
+        // bare top-level com.apple / com.rustynet are NOT rustynet-owned floor anchors.
+        assert!(
+            !anchors
+                .iter()
+                .any(|a| a == "com.apple" || a == "com.rustynet")
+        );
+        // A top-level com.rustynet/ family anchor is still found without the nested dump.
+        let top_only = merge_rustynet_anchor_names(
+            "com.rustynet/blind_exit
+",
+            None,
+        );
+        assert_eq!(top_only, vec!["com.rustynet/blind_exit".to_owned()]);
+        // Dedup: an anchor present in both dumps appears once.
+        let deduped = merge_rustynet_anchor_names(
+            "com.apple/rustynet_g5
+",
+            Some(
+                "com.apple/rustynet_g5
+",
+            ),
+        );
+        assert_eq!(deduped, vec!["com.apple/rustynet_g5".to_owned()]);
     }
 
     #[test]
