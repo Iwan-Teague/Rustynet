@@ -78,6 +78,24 @@ refresh `documents/operations/active/vm_lab_inventory.json` without first
 forcing a restart. Add `--report-dir <path>` when you want the JSON report and
 summary written as artifacts.
 
+## Build and Validate
+
+**Use `just clippy` / `just gates`, not bare cargo.** On this Mac, bare `cargo`
+and even `rustup run 1.88.0 cargo` can resolve `rustc` and `cargo-clippy` to the
+Homebrew-installed toolchain (currently 1.97) that shadows them on `PATH`, while
+CI builds with the pinned 1.88.0 toolchain from `rust-toolchain.toml` — so a
+locally green run can still be red in CI. The repo-root `justfile` (and
+`scripts/dev/cargo-pinned.sh` if you do not have `just`) forces the pinned
+toolchain's `bin` directory onto `PATH`, builds into the dedicated
+`target-pinned/` directory, and echoes the pinned `rustc --version` first so
+drift is visible. Make this the habit before every push:
+
+```bash
+just gates                              # fmt --check -> clippy -D warnings -> test
+just check rustynet-relay               # scoped check
+scripts/dev/cargo-pinned.sh test -p rustynetd --all-targets --all-features
+```
+
 ## Live Lab Workflow
 
 Use this four-step path when you want to exercise the local UTM lab end to end:
