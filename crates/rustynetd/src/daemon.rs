@@ -38,9 +38,9 @@ use crate::key_rotation::{
 #[cfg(target_os = "macos")]
 use crate::phase10::MacosCommandSystem;
 use crate::phase10::{
-    ApplyOptions, DataplaneState, DataplaneSystem, ManagementCidr, PathMode, Phase10Controller,
-    RouteGrantRequest, RuntimeSystem, TraversalProbeDecision, TraversalProbeEvaluation,
-    TraversalProbeReason, TrustEvidence, TrustPolicy,
+    ApplyOptions, DataplaneState, DataplaneSystem, DnsPosture, ManagementCidr, PathMode,
+    Phase10Controller, RouteGrantRequest, RuntimeSystem, TraversalProbeDecision,
+    TraversalProbeEvaluation, TraversalProbeReason, TrustEvidence, TrustPolicy, macos_dns_posture,
 };
 #[cfg(target_os = "linux")]
 use crate::phase10::{LinuxCommandSystem, LinuxDataplaneMode};
@@ -4754,6 +4754,13 @@ struct DaemonRuntime {
     /// heal); a heal that fails escalates through the standard apply-failure
     /// ladder, and a successful apply clears the latch.
     dns_posture_reassert_pending: bool,
+    /// M3 (MacosClientResolverNotServingDiagnosisReview §3.3/F4): a
+    /// ScopedResolverOnly DNS apply failed and the node was deliberately NOT
+    /// restricted (mesh alive, Magic DNS unavailable, posture rolled back to
+    /// the zero-leak Untouched state). Surfaced in the status line so a
+    /// silently-absent scoped file can never read as healthy. Cleared only
+    /// by a successful dataplane apply (which re-applies the posture).
+    dns_scoped_apply_degraded: bool,
     /// QH-04: true from the moment a reconcile pass decides it will apply a
     /// new dataplane generation until that apply has been attempted.
     ///
@@ -5274,6 +5281,7 @@ impl DaemonRuntime {
             last_applied_assignment: None,
             local_route_reconcile_pending: false,
             dns_posture_reassert_pending: false,
+            dns_scoped_apply_degraded: false,
             pending_generation_apply: false,
             max_reconcile_failures: config.max_reconcile_failures.get(),
             remote_ops_expected_subject: config.remote_ops_expected_subject.clone(),
@@ -5852,24 +5860,6 @@ impl DaemonRuntime {
             ));
         }
         message
-    }
-
-    fn resolve_dns_ipv4_record(&self, fqdn: &str) -> Option<(Ipv4Addr, u32)> {
-        let envelope = self.dns_zone.as_ref()?;
-        let normalized = fqdn.trim_end_matches('.').to_ascii_lowercase();
-        for record in &envelope.bundle.records {
-            if normalized == record.fqdn
-                || record
-                    .aliases
-                    .iter()
-                    .any(|alias| normalized == format!("{alias}.{}", envelope.bundle.zone_name))
-            {
-                let ip = record.expected_ip.parse::<Ipv4Addr>().ok()?;
-                let ttl = u32::try_from(record.ttl_secs).ok()?;
-                return Some((ip, ttl));
-            }
-        }
-        None
     }
 
     fn update_verified_traversal_index(&mut self, envelope: &TraversalBundleSetEnvelope) {
@@ -8875,6 +8865,26 @@ impl DaemonRuntime {
             self.force_fail_closed_or_restrict("bootstrap_exit_overlay_exception_violated");
             return;
         }
+        // M2 posture-split (MacosClientResolverNotServingDiagnosisReview
+        // §3.3): at BOOTSTRAP, a plain client's `ScopedResolverOnly` DNS
+        // sub-apply is deferred to the first reconcile pass (the serve loop is
+        // not live yet); `FullyProtected` stays in-bootstrap, serviced by M1's
+        // hoisted-bind probe servicer. macOS only: Linux/Windows DNS paths
+        // have no loopback probe and keep their existing in-bootstrap apply.
+        let bootstrap_exit_mode = if self.node_role.is_blind_exit() {
+            ExitMode::Off
+        } else if self.auto_tunnel_enforce {
+            if auto_exit.is_some() {
+                ExitMode::FullTunnel
+            } else {
+                ExitMode::Off
+            }
+        } else {
+            self.desired_exit_mode()
+        };
+        let defer_scoped_dns = cfg!(target_os = "macos")
+            && macos_dns_posture(bootstrap_exit_mode, serve_exit_node)
+                == DnsPosture::ScopedResolverOnly;
         let apply_result = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
@@ -8890,22 +8900,21 @@ impl DaemonRuntime {
                 ipv6_parity_supported: false,
                 serve_exit_node,
                 blind_exit: self.node_role.is_blind_exit(),
-                exit_mode: if self.node_role.is_blind_exit() {
-                    ExitMode::Off
-                } else if self.auto_tunnel_enforce {
-                    if auto_exit.is_some() {
-                        ExitMode::FullTunnel
-                    } else {
-                        ExitMode::Off
-                    }
-                } else {
-                    self.desired_exit_mode()
-                },
+                exit_mode: bootstrap_exit_mode,
+                defer_scoped_dns_posture: defer_scoped_dns,
             },
         );
         let cleanup_result = self.scrub_runtime_private_key_material();
         match (apply_result, cleanup_result) {
-            (Ok(()), Ok(())) => {}
+            (Ok(()), Ok(())) => {
+                if defer_scoped_dns {
+                    // M2: the scoped DNS posture was deliberately skipped
+                    // during bootstrap; schedule the first-reconcile heal
+                    // through the existing S1 latch so its pass applies the
+                    // posture while the serve loop is live.
+                    self.dns_posture_reassert_pending = true;
+                }
+            }
             (Err(err), Ok(())) => {
                 self.restrict_recoverable(format!("dataplane bootstrap apply failed: {err}"));
                 self.force_fail_closed_or_restrict("bootstrap_apply_failed");
@@ -9188,8 +9197,12 @@ impl DaemonRuntime {
                 // arguments, where adding eleven more makes a silent
                 // transposition the realistic failure mode.
                 let gossip_suffix = self.gossip_status_suffix();
+                // M3: a scoped-DNS-degraded node is NOT restricted (mesh
+                // alive) but its Magic DNS is down — this field must exist so
+                // a silently-absent scoped file never reads as healthy.
+                let dns_scoped_apply_degraded = self.dns_scoped_apply_degraded;
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={}{gossip_suffix}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={} dns_scoped_apply_degraded={dns_scoped_apply_degraded}{gossip_suffix}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -10565,6 +10578,26 @@ impl DaemonRuntime {
                 .managed_peer_ids()
                 .into_iter()
                 .collect::<BTreeSet<_>>();
+            // M3: the posture the apply is ABOUT to decide (macOS only — the
+            // Linux/Windows DNS paths have no scoped posture to degrade), so
+            // a failure can be classified without inferring posture from
+            // observed state (the review §5 invariant).
+            let reconcile_exit_mode = if self.node_role.is_blind_exit() {
+                ExitMode::Off
+            } else if self.auto_tunnel_enforce {
+                if auto_exit.is_some() {
+                    ExitMode::FullTunnel
+                } else {
+                    ExitMode::Off
+                }
+            } else {
+                self.desired_exit_mode()
+            };
+            let applied_dns_posture = if cfg!(target_os = "macos") {
+                Some(macos_dns_posture(reconcile_exit_mode, serve_exit_node))
+            } else {
+                None
+            };
             let apply_result = self.controller.apply_dataplane_generation(
                 trust,
                 RuntimeContext {
@@ -10580,17 +10613,11 @@ impl DaemonRuntime {
                     ipv6_parity_supported: false,
                     serve_exit_node,
                     blind_exit: self.node_role.is_blind_exit(),
-                    exit_mode: if self.node_role.is_blind_exit() {
-                        ExitMode::Off
-                    } else if self.auto_tunnel_enforce {
-                        if auto_exit.is_some() {
-                            ExitMode::FullTunnel
-                        } else {
-                            ExitMode::Off
-                        }
-                    } else {
-                        self.desired_exit_mode()
-                    },
+                    // M2: reconcile-time applies NEVER defer — the serve
+                    // loop is live by then, so the posture applies (and its
+                    // probe is answered) right here.
+                    defer_scoped_dns_posture: false,
+                    exit_mode: reconcile_exit_mode,
                 },
             );
             // QH-04: the apply has been attempted; from here the controller's
@@ -10682,6 +10709,9 @@ impl DaemonRuntime {
                     self.bootstrap_error = None;
                     self.reconcile_failures = 0;
                     self.local_route_reconcile_pending = false;
+                    // M3: a successful apply (re)installed the DNS posture,
+                    // so any prior scoped-DNS degradation is healed.
+                    self.dns_scoped_apply_degraded = false;
                     // Persist runtime state after every successful dataplane apply so
                     // external validators (e.g. windows-mesh-status-check) can observe
                     // a current snapshot without requiring an operator command.
@@ -10693,12 +10723,44 @@ impl DaemonRuntime {
                     }
                 }
                 (Err(err), Ok(())) => {
-                    self.reconcile_failures = self.reconcile_failures.saturating_add(1);
-                    let message = format!("reconcile dataplane apply failed: {err}");
-                    self.last_reconcile_error = Some(message.clone());
-                    self.restrict_recoverable(message);
-                    self.force_fail_closed_or_restrict("reconcile_apply_failed");
-                    self.promote_to_permanent_if_over_limit();
+                    // M3 (MacosClientResolverNotServingDiagnosisReview §3.3,
+                    // finding F4): a ScopedResolverOnly DNS sub-apply failure
+                    // is NOT a mesh failure. The probe precedes every
+                    // mutation, so the posture is already rolled back to
+                    // Untouched — the zero-leak state (machine DNS untouched,
+                    // no scoped file, no pins, no resolv.conf rewrite). It
+                    // takes its OWN degraded branch — DNS degraded, mesh
+                    // alive — and never the restriction ladder: no
+                    // reconcile_failures increment, no restrict, no
+                    // fail-close, no promote. The latch re-arms so the next
+                    // pass retries at S1 cadence. FullyProtected failures are
+                    // leak-relevant and keep the full ladder byte-for-byte;
+                    // so does any non-DNS failure, and any cleanup failure
+                    // below (key custody dominates everything).
+                    let scoped_dns_degraded = applied_dns_posture
+                        == Some(DnsPosture::ScopedResolverOnly)
+                        && matches!(
+                            err,
+                            crate::phase10::Phase10Error::System(
+                                crate::phase10::SystemError::DnsApplyFailed(_)
+                            )
+                        );
+                    if scoped_dns_degraded {
+                        let message = format!(
+                            "macOS scoped DNS posture apply failed (DNS degraded, mesh unaffected): {err}"
+                        );
+                        log::error!("rustynetd reconcile: scoped DNS posture degraded: {message}");
+                        self.last_reconcile_error = Some(message);
+                        self.dns_posture_reassert_pending = true;
+                        self.dns_scoped_apply_degraded = true;
+                    } else {
+                        self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                        let message = format!("reconcile dataplane apply failed: {err}");
+                        self.last_reconcile_error = Some(message.clone());
+                        self.restrict_recoverable(message);
+                        self.force_fail_closed_or_restrict("reconcile_apply_failed");
+                        self.promote_to_permanent_if_over_limit();
+                    }
                 }
                 (Err(err), Err(cleanup_err)) => {
                     self.reconcile_failures = self.reconcile_failures.saturating_add(1);
@@ -10879,6 +10941,25 @@ impl DaemonRuntime {
             eprintln!("rustynetd: ignoring LAN route assignment for blind_exit role");
         }
         Ok(())
+    }
+
+    /// Snapshot the DNS responder state the loopback resolver is currently
+    /// answering from (M1: taken once, at bootstrap-probe-servicer
+    /// installation, before `bootstrap()` loads any signed zone).
+    pub(crate) fn dns_responder_state(&self) -> DnsResponderState {
+        DnsResponderState {
+            zone_name: self.dns_zone_name.clone(),
+            zone: self.dns_zone.clone(),
+            zone_error: self.dns_zone_error.clone(),
+        }
+    }
+
+    /// M1: install the bootstrap-time DNS probe servicer. Only the macOS
+    /// system consults it (inside `verify_loopback_resolver_live`); the Linux
+    /// and Windows DNS paths have no loopback probe, so they ignore it.
+    pub(crate) fn install_dns_probe_servicer(&mut self, servicer: Arc<DnsProbeServicer>) {
+        self.controller
+            .with_system(|system| system.set_dns_probe_servicer(Some(servicer)));
     }
 
     fn desired_exit_mode(&self) -> ExitMode {
@@ -11809,6 +11890,36 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         }
     };
     log::info!("rustynetd startup: daemon runtime constructed");
+    // M1 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3): bind
+    // the DNS resolver socket BEFORE `bootstrap()` and service the
+    // bootstrap-time protected-DNS probe from it. The probe
+    // (`verify_loopback_resolver_live`) runs inside bootstrap's
+    // `apply_dataplane_generation`; with the previous ordering (bind after
+    // bootstrap returns) no listener existed on the probe port yet, so every
+    // macOS apply failed deterministically, rolled back, and climbed the
+    // reconcile ladder to Permanent. The main loop below reuses this SAME
+    // socket (single bind, single owner — no double bind); the probe servicer
+    // answers through `build_dns_response`, the one hardened responder.
+    // Windows keeps its own retrying bind below (SCM restart race) and is
+    // unaffected: its DNS posture path has no loopback probe.
+    #[cfg(not(windows))]
+    let dns_socket: Arc<UdpSocket> = {
+        let socket = UdpSocket::bind(config.dns_resolver_bind_addr)
+            .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+        log::info!(
+            "rustynetd startup: dns resolver bound to {} (before bootstrap)",
+            config.dns_resolver_bind_addr
+        );
+        Arc::new(socket)
+    };
+    #[cfg(not(windows))]
+    runtime.install_dns_probe_servicer(Arc::new(DnsProbeServicer::new(
+        Arc::clone(&dns_socket),
+        runtime.dns_responder_state(),
+    )));
     runtime.bootstrap();
     // QH-55: the bootstrap outcome must be visible to the operator. A
     // bootstrap that entered a restricted state (recoverable or permanent)
@@ -12206,11 +12317,9 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         listener
             .set_nonblocking(true)
             .map_err(|err| DaemonError::Io(format!("socket nonblocking failed: {err}")))?;
-        let dns_socket = UdpSocket::bind(config.dns_resolver_bind_addr)
-            .map_err(|err| DaemonError::Io(format!("dns resolver bind failed: {err}")))?;
-        dns_socket
-            .set_nonblocking(true)
-            .map_err(|err| DaemonError::Io(format!("dns resolver nonblocking failed: {err}")))?;
+        // `dns_socket` was bound (and made nonblocking) BEFORE `bootstrap()`
+        // above — M1 — so the bootstrap-time probe and this serve loop drain
+        // the same socket. Nothing to bind here.
         let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
         // Anchor enrollment-consume listener (D-3 §7(1)): opt-in, fail-closed
         // bind — see `bind_anchor_enrollment_listener` for the pre-bind gates.
@@ -12456,7 +12565,95 @@ struct DnsQuestion {
     qclass: u16,
 }
 
+/// The state `build_dns_response` consults, split out of `DaemonRuntime` so
+/// the bootstrap-time DNS probe servicer (M1,
+/// MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3) can dispatch
+/// through the SAME responder while the runtime is mutably borrowed by
+/// `bootstrap()`. Snapshotted at servicer installation: during bootstrap the
+/// signed zone is not yet loaded, which is exactly what the live responder
+/// would also observe at that moment, so the snapshot can never answer
+/// differently from the runtime it was taken from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DnsResponderState {
+    zone_name: String,
+    zone: Option<DnsZoneBundleEnvelope>,
+    zone_error: Option<String>,
+}
+
+impl DnsResponderState {
+    /// A snapshot for a daemon that has not loaded a signed zone yet (the
+    /// bootstrap-time state). In-zone queries answer SERVFAIL, out-of-zone
+    /// REFUSED — identical to `build_dns_response` on such a runtime.
+    #[cfg(test)]
+    pub(crate) fn new_unresolved(zone_name: impl Into<String>) -> Self {
+        Self {
+            zone_name: zone_name.into(),
+            zone: None,
+            zone_error: None,
+        }
+    }
+}
+
+/// M1: the bootstrap-time DNS probe servicer. Owns the hoisted resolver
+/// socket (bound in `run_daemon` BEFORE `bootstrap()`) plus a responder
+/// snapshot, and answers probe queries through `build_dns_response_with` —
+/// the same parser and responder the main serve loop drains through. There is
+/// deliberately no second DNS implementation and no fallback branch: this is
+/// the main responder, drained at a second point in time (while `bootstrap()`
+/// still holds the runtime), so a `FullyProtected` node's in-bootstrap probe
+/// is answered without opening any DNS leak window.
+#[derive(Debug, Clone)]
+pub(crate) struct DnsProbeServicer {
+    socket: Arc<UdpSocket>,
+    state: DnsResponderState,
+}
+
+/// Equality is SOCKET IDENTITY (Arc pointer), not socket contents — a
+/// `UdpSocket` has no meaningful value equality. Two servicers are equal iff
+/// they drain the same hoisted socket.
+impl PartialEq for DnsProbeServicer {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.socket, &other.socket)
+    }
+}
+
+impl Eq for DnsProbeServicer {}
+
+impl DnsProbeServicer {
+    pub(crate) fn new(socket: Arc<UdpSocket>, state: DnsResponderState) -> Self {
+        Self { socket, state }
+    }
+
+    /// Drain at most one pending datagram from the hoisted socket and answer
+    /// it through the shared responder. Returns whether a datagram was
+    /// processed. Send/recv errors are best-effort: the probe's own existing
+    /// 2 s bound owns the failure semantics, exactly as it does when the main
+    /// serve loop drains.
+    pub(crate) fn service_once(&self) -> bool {
+        let mut buffer = [0u8; 1536];
+        match self.socket.recv_from(&mut buffer) {
+            Ok((length, peer_addr)) => {
+                if let Some(response) = build_dns_response_with(&self.state, &buffer[..length]) {
+                    if let Err(err) = self.socket.send_to(&response, peer_addr) {
+                        log::debug!("bootstrap dns probe servicer send failed: {err}");
+                    }
+                }
+                true
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => false,
+            Err(err) => {
+                log::debug!("bootstrap dns probe servicer recv failed: {err}");
+                false
+            }
+        }
+    }
+}
+
 fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>> {
+    build_dns_response_with(&runtime.dns_responder_state(), request)
+}
+
+fn build_dns_response_with(state: &DnsResponderState, request: &[u8]) -> Option<Vec<u8>> {
     let fallback_id = request
         .get(0..2)
         .and_then(|value| value.try_into().ok())
@@ -12475,7 +12672,7 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
             ));
         }
     };
-    if !dns_name_in_managed_zone(&query.qname, &runtime.dns_zone_name) {
+    if !dns_name_in_managed_zone(&query.qname, &state.zone_name) {
         return Some(render_dns_question_response(
             &query,
             DNS_RCODE_REFUSED,
@@ -12489,7 +12686,7 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
             None,
         ));
     }
-    if runtime.dns_zone.is_none() || runtime.dns_zone_error.is_some() {
+    if state.zone.is_none() || state.zone_error.is_some() {
         return Some(render_dns_question_response(
             &query,
             DNS_RCODE_SERVFAIL,
@@ -12497,7 +12694,7 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
         ));
     }
     if query.qtype == DNS_TYPE_A {
-        let answer = runtime.resolve_dns_ipv4_record(&query.qname);
+        let answer = resolve_dns_ipv4_record_in(state.zone.as_ref(), &query.qname);
         return Some(match answer {
             Some((ip, ttl)) => {
                 render_dns_question_response(&query, DNS_RCODE_NOERROR, Some((ip, ttl)))
@@ -12517,6 +12714,31 @@ fn build_dns_response(runtime: &DaemonRuntime, request: &[u8]) -> Option<Vec<u8>
         DNS_RCODE_NOERROR,
         None,
     ))
+}
+
+/// Resolve an A record from a loaded signed-zone envelope (the free-function
+/// core of `DaemonRuntime::resolve_dns_ipv4_record`, shared with
+/// `build_dns_response_with` so the bootstrap probe servicer resolves through
+/// the identical lookup).
+fn resolve_dns_ipv4_record_in(
+    envelope: Option<&DnsZoneBundleEnvelope>,
+    fqdn: &str,
+) -> Option<(Ipv4Addr, u32)> {
+    let envelope = envelope?;
+    let normalized = fqdn.trim_end_matches('.').to_ascii_lowercase();
+    for record in &envelope.bundle.records {
+        if normalized == record.fqdn
+            || record
+                .aliases
+                .iter()
+                .any(|alias| normalized == format!("{alias}.{}", envelope.bundle.zone_name))
+        {
+            let ip = record.expected_ip.parse::<Ipv4Addr>().ok()?;
+            let ttl = u32::try_from(record.ttl_secs).ok()?;
+            return Some((ip, ttl));
+        }
+    }
+    None
 }
 
 fn parse_dns_question(request: &[u8]) -> Result<DnsQuestion, String> {
@@ -18223,6 +18445,121 @@ mod tests {
     // reconcile else-arm that drives it) is macOS-only — they run on the
     // macOS CI leg, which is the platform the fix targets.
 
+    /// M1: the bootstrap probe servicer's snapshot responder answers
+    /// BYTE-IDENTICALLY to the daemon's live `build_dns_response` at the
+    /// moment the snapshot is taken (pre-zone-load): same parser, same
+    /// responder, no second DNS implementation.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_probe_servicer_responder_matches_live_responder() {
+        let relay_addr: SocketAddr = "203.0.113.71:40055".parse().expect("relay addr");
+        let (runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-m1-responder-parity",
+            relay_addr,
+            "relay-test",
+        );
+        // The M1 snapshot is installed before bootstrap loads any signed
+        // zone, so it must observe an unresolved zone here.
+        let state = runtime.dns_responder_state();
+        assert!(
+            state.zone.is_none() && state.zone_error.is_none(),
+            "a fresh runtime must not have a signed zone loaded yet"
+        );
+        // The probe's exact wire query: `rustynet. IN A`, txid 0x524e.
+        let request: &[u8] = &[
+            0x52, 0x4e, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'r',
+            b'u', b's', b't', b'y', b'n', b'e', b't', 0x00, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let via_runtime = super::build_dns_response(&runtime, request);
+        let via_snapshot = super::build_dns_response_with(&state, request);
+        assert_eq!(
+            via_runtime, via_snapshot,
+            "the snapshot responder must answer identically to the live responder"
+        );
+        assert!(
+            via_snapshot.is_some(),
+            "the always-answer property must hold through the snapshot core"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// M2 posture-split deferral (MacosClientResolverNotServingDiagnosisReview
+    /// §3.3): a plain client's BOOTSTRAP must not apply the ScopedResolverOnly
+    /// DNS posture — no `apply_dns_protection` op, because the serve loop
+    /// cannot be live yet — and must latch the heal; the FIRST reconcile pass
+    /// then applies it for real and clears the latch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_defers_scoped_dns_posture_to_first_reconcile() {
+        let test_dir = secure_test_dir("rustynetd-m2-scoped-defer");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let mut runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        runtime.bootstrap();
+
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::None,
+            "a healthy plain client must bootstrap unrestricted"
+        );
+        assert!(
+            runtime.dns_posture_reassert_pending,
+            "bootstrap must latch the scoped DNS posture heal for the first reconcile pass"
+        );
+        let bootstrap_ops = match runtime.controller.system_mut_for_test() {
+            crate::phase10::RuntimeSystem::DryRun(system) => system.operations.clone(),
+            _ => panic!("M2 test requires the InMemory (DryRun) system"),
+        };
+        assert!(
+            !bootstrap_ops.contains(&"apply_dns_protection".to_owned()),
+            "bootstrap must not apply the scoped DNS posture; ops={bootstrap_ops:?}"
+        );
+
+        // First reconcile pass: the latch fires the real scoped apply, now
+        // that the serve loop is (would be) live.
+        runtime.reconcile();
+        assert!(
+            !runtime.dns_posture_reassert_pending,
+            "a successful heal must clear the re-assert latch"
+        );
+        let heal_ops = match runtime.controller.system_mut_for_test() {
+            crate::phase10::RuntimeSystem::DryRun(system) => system.operations.clone(),
+            _ => panic!("M2 test requires the InMemory (DryRun) system"),
+        };
+        assert!(
+            heal_ops.contains(&"apply_dns_protection".to_owned()),
+            "the first reconcile pass must apply the scoped DNS posture; ops={heal_ops:?}"
+        );
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     #[cfg(target_os = "macos")]
     fn dns_posture_test_runtime(tag: &str) -> (DaemonRuntime, std::path::PathBuf) {
         let relay_addr: SocketAddr = "203.0.113.45:40032".parse().expect("relay addr");
@@ -18485,8 +18822,11 @@ mod tests {
     /// §2.4 test 5: a heal that FAILS escalates through the standard
     /// apply-failure ladder — `reconcile_failures` increments,
     /// `restrict_recoverable` fires, and five consecutive failures promote to
-    /// `RestrictionMode::Permanent`. No separate DNS-posture failure path
-    /// exists.
+    /// `RestrictionMode::Permanent`. This runtime's assignment selects an
+    /// exit node, so its heal failures are `FullyProtected` (leak-relevant):
+    /// the M3 scoped-DNS degraded path does not apply, and even with the M3
+    /// split a `FullyProtected` failure keeps the full ladder (see
+    /// `fully_protected_dns_apply_failure_still_restricts`).
     #[cfg(target_os = "macos")]
     #[test]
     fn dns_posture_heal_failure_follows_reconcile_ladder() {
@@ -18539,6 +18879,206 @@ mod tests {
                 );
             }
         }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// M3: like [`dns_posture_test_runtime`], but the auto-tunnel assignment
+    /// selects NO exit node, so every reconcile apply decides the
+    /// `ScopedResolverOnly` DNS posture (exit Off, not serving) — the plain
+    /// client this fix targets.
+    #[cfg(target_os = "macos")]
+    fn scoped_dns_posture_test_runtime(tag: &str) -> (DaemonRuntime, std::path::PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.47:40034".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay_exitless_assignment(tag, relay_addr);
+        {
+            use crate::phase10::DataplaneSystem;
+            runtime
+                .controller
+                .system_mut_for_test()
+                .apply_dns_protection()
+                .expect("dry-run apply_dns_protection must succeed");
+        }
+        (runtime, test_dir)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn dry_run_fail_on_with(
+        runtime: &mut DaemonRuntime,
+        operation: &str,
+        error: crate::phase10::SystemError,
+    ) {
+        match runtime.controller.system_mut_for_test() {
+            crate::phase10::RuntimeSystem::DryRun(system) => system.fail_on_with(operation, error),
+            _ => panic!("S1 posture tests require the InMemory (DryRun) system"),
+        }
+    }
+
+    /// M3 test 1 (MacosClientResolverNotServingDiagnosisReview §3.3/F4): a
+    /// ScopedResolverOnly DNS apply failure (`DnsApplyFailed` — exactly what
+    /// the macOS scoped posture reports) must NOT restrict the node and must
+    /// NOT enter the failure accounting: zero-leak posture stays, mesh stays
+    /// alive, the heal latch re-arms, and the failure is surfaced.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scoped_dns_apply_failure_does_not_restrict() {
+        let (mut runtime, test_dir) =
+            scoped_dns_posture_test_runtime("rustynetd-m3-scoped-degraded");
+        runtime.reconcile(); // converge
+        assert_eq!(runtime.reconcile_failures, 0);
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        // Drift schedules the heal; the heal fails the way the real macOS
+        // scoped posture fails (probe unreachable).
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+        dry_run_fail_on(&mut runtime, "assert_dns_protection");
+        runtime.reconcile();
+        assert!(runtime.dns_posture_reassert_pending);
+
+        dry_run_fail_on_with(
+            &mut runtime,
+            "apply_dns_protection",
+            crate::phase10::SystemError::DnsApplyFailed(
+                "the loopback DNS resolver on 127.0.0.1:53535 did not answer: timed out".to_owned(),
+            ),
+        );
+        runtime.reconcile();
+
+        assert_eq!(
+            runtime.reconcile_failures, 0,
+            "a scoped DNS-apply failure must never enter the reconcile-failure accounting"
+        );
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::None,
+            "a scoped DNS-apply failure must not restrict the node"
+        );
+        // The CONTROLLER fail-closes itself on any failed apply (it cannot
+        // know how much of the generation landed) — that is pre-existing
+        // behaviour and self-heals on the next successful apply. What M3
+        // forbids is the DAEMON's restriction ladder (restrict + permanent
+        // + mesh fail-closed anchor), asserted above and below.
+        assert!(
+            runtime.dns_posture_reassert_pending,
+            "the degraded heal must re-arm the latch so the next pass retries"
+        );
+        assert!(
+            runtime.dns_scoped_apply_degraded,
+            "the degraded state must be recorded"
+        );
+        assert!(
+            runtime
+                .last_reconcile_error
+                .as_deref()
+                .is_some_and(|message| message.contains("DNS degraded")),
+            "the failure must be surfaced for the operator: {:?}",
+            runtime.last_reconcile_error
+        );
+
+        // Heal: the next pass re-applies successfully; the degraded flag and
+        // the latch clear and the node was never restricted in between.
+        dry_run_fail_on(&mut runtime, "no-dry-run-stage-matches-this");
+        runtime.reconcile();
+        assert!(!runtime.dns_posture_reassert_pending);
+        assert!(
+            !runtime.dns_scoped_apply_degraded,
+            "a successful apply must clear the scoped-DNS-degraded flag"
+        );
+        assert_eq!(runtime.reconcile_failures, 0);
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// M3 test 2: repeated scoped DNS-apply failures NEVER reach
+    /// `RestrictionMode::Permanent` — the decoupled path does not climb the
+    /// ladder — while the latch keeps retrying at reconcile cadence.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn scoped_dns_apply_failure_never_reaches_permanent() {
+        let (mut runtime, test_dir) =
+            scoped_dns_posture_test_runtime("rustynetd-m3-scoped-never-permanent");
+        runtime.max_reconcile_failures = 5;
+        runtime.reconcile(); // converge
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+        dry_run_fail_on(&mut runtime, "assert_dns_protection");
+        runtime.reconcile(); // drift schedules the heal
+        dry_run_fail_on_with(
+            &mut runtime,
+            "apply_dns_protection",
+            crate::phase10::SystemError::DnsApplyFailed(
+                "the loopback DNS resolver did not answer".to_owned(),
+            ),
+        );
+
+        for pass in 0..8 {
+            runtime.reconcile();
+            assert_eq!(
+                runtime.reconcile_failures, 0,
+                "pass {pass}: the degraded path must never increment failures"
+            );
+            assert_eq!(
+                runtime.restriction_mode,
+                RestrictionMode::None,
+                "pass {pass}: the degraded path must never restrict, let alone reach Permanent"
+            );
+            assert!(runtime.dns_posture_reassert_pending);
+        }
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// M3 test 3: a FullyProtected DNS apply failure is leak-relevant and
+    /// keeps today's FULL restriction ladder byte-for-byte — increments,
+    /// restricts Recoverable, and promotes to Permanent at the threshold.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn fully_protected_dns_apply_failure_still_restricts() {
+        let (mut runtime, test_dir) = dns_posture_test_runtime("rustynetd-m3-protected-ladder");
+        runtime.max_reconcile_failures = 5;
+        runtime.reconcile(); // converge (this runtime's assignment selects an exit: FullyProtected)
+        assert_eq!(runtime.reconcile_failures, 0);
+        runtime.last_dns_posture_assert_unix =
+            Some(unix_now().saturating_sub(super::DEFAULT_DNS_POSTURE_ASSERT_INTERVAL_SECS));
+        dry_run_fail_on(&mut runtime, "assert_dns_protection");
+        runtime.reconcile();
+        assert!(runtime.dns_posture_reassert_pending);
+
+        dry_run_fail_on_with(
+            &mut runtime,
+            "apply_dns_protection",
+            crate::phase10::SystemError::DnsApplyFailed(
+                "the loopback DNS resolver on 127.0.0.1:53535 did not answer: timed out".to_owned(),
+            ),
+        );
+        runtime.reconcile();
+
+        assert_eq!(
+            runtime.reconcile_failures, 1,
+            "a FullyProtected DNS-apply failure is a reconcile failure"
+        );
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::Recoverable,
+            "a FullyProtected DNS-apply failure must restrict (leak-relevant)"
+        );
+        assert!(
+            !runtime.dns_scoped_apply_degraded,
+            "the scoped-degraded flag must not be set for a FullyProtected failure"
+        );
+
+        for expected in 2..=5 {
+            runtime.reconcile();
+            assert_eq!(runtime.reconcile_failures, expected);
+        }
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::Permanent,
+            "five consecutive FullyProtected failures must promote to Permanent"
+        );
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
@@ -22225,6 +22765,77 @@ mod tests {
             2,
             relay_addr,
             relay_label,
+        );
+
+        let config = DaemonConfig {
+            state_path,
+            trust_evidence_path: trust_path,
+            trust_verifier_key_path: trust_verifier_path,
+            trust_watermark_path,
+            membership_snapshot_path,
+            membership_log_path,
+            membership_watermark_path,
+            auto_tunnel_enforce: true,
+            auto_tunnel_bundle_path: Some(assignment_path),
+            auto_tunnel_verifier_key_path: Some(assignment_verifier_path),
+            auto_tunnel_watermark_path: Some(assignment_watermark_path),
+            traversal_bundle_path: traversal_path,
+            traversal_verifier_key_path: traversal_verifier_path,
+            traversal_watermark_path,
+            traversal_probe_handshake_freshness_secs: NonZeroU64::new(15)
+                .expect("test traversal handshake freshness should be non-zero"),
+            traversal_probe_reprobe_interval_secs: NonZeroU64::new(60)
+                .expect("test traversal reprobe interval should be non-zero"),
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let runtime = DaemonRuntime::new(&config).expect("runtime should be created");
+        (runtime, test_dir)
+    }
+
+    /// M3: [`build_runtime_with_custom_relay`] with an EXITLESS auto-tunnel
+    /// assignment, so every reconcile apply decides the `ScopedResolverOnly`
+    /// DNS posture (exit Off, not serving) — the plain client the resolver
+    /// fix targets.
+    fn build_runtime_with_custom_relay_exitless_assignment(
+        test_name: &str,
+        relay_addr: SocketAddr,
+    ) -> (DaemonRuntime, std::path::PathBuf) {
+        let test_dir = secure_test_dir(test_name);
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        let assignment_path = test_dir.join("assignment.bundle");
+        let assignment_verifier_path = test_dir.join("assignment.verifier.pub");
+        let assignment_watermark_path = test_dir.join("assignment.watermark");
+        let traversal_path = test_dir.join("traversal.bundle");
+        let traversal_verifier_path = test_dir.join("traversal.pub");
+        let traversal_watermark_path = test_dir.join("traversal.watermark");
+
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        write_auto_tunnel_file_exitless(
+            &assignment_path,
+            &assignment_verifier_path,
+            "daemon-local",
+            1,
+        );
+        write_traversal_file_with_custom_relay(
+            &traversal_path,
+            &traversal_verifier_path,
+            "daemon-local",
+            "node-exit",
+            2,
+            relay_addr,
+            "relay-test-exitless",
         );
 
         let config = DaemonConfig {
@@ -31334,10 +31945,17 @@ mod tests {
                 .all(|key| key.starts_with("gossip_")),
             "gossip fields must form an unbroken suffix, not be interleaved"
         );
+        // M3 appended `dns_scoped_apply_degraded` after the previous last
+        // field; the gossip block must still be the unbroken suffix after it.
+        assert_eq!(
+            keys[first_gossip - 2],
+            "membership_active_nodes",
+            "the previously last field must not move"
+        );
         assert_eq!(
             keys[first_gossip - 1],
-            "membership_active_nodes",
-            "the gossip block must be appended after the previous last field"
+            "dns_scoped_apply_degraded",
+            "the M3 degraded flag must sit between membership_active_nodes and the gossip block"
         );
         assert_eq!(keys[0], "node_id", "the first field must not move");
         assert_eq!(
