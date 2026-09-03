@@ -211,11 +211,12 @@ impl NodeAdapter for WindowsNodeAdapter {
         let op_label = argv.get(1).cloned().unwrap_or_default();
         let script = build_validator_script(&argv)?;
         let output = run_remote_ps(&self.conn, script.as_str(), VALIDATOR_TIMEOUT)?;
-        let passed = crate::vm_lab::orchestrator::adapter::ssh::validator_report_ok(&output);
+        let verdict = crate::vm_lab::orchestrator::adapter::ssh::validator_report_ok(&output);
         Ok(ValidatorReport {
             op_label,
             output,
-            passed,
+            passed: verdict.ok,
+            reports: verdict.reports,
         })
     }
 

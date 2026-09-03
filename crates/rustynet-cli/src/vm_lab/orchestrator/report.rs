@@ -59,4 +59,9 @@ pub struct ValidatorResult {
     pub op: String,
     pub passed: bool,
     pub summary: String,
+    /// The daemon's validator report, embedded VERBATIM (no re-shaping) —
+    /// design §5.2 Item 2. `None` when the op errored before a report could
+    /// be parsed (connection failure, cancelled, no adapter).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<serde_json::Value>,
 }
