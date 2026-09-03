@@ -86,19 +86,7 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
 /// fail-closed posture; every other role is a plain mesh node holding the
 /// scoped-resolver-only posture. The macOS validator/daemon check verify the
 /// report against this expectation.
-///
-/// Shared with `validate_baseline_runtime`, which must thread the SAME
-/// expected posture into its per-node `macos-dns-failclosed-check` dispatch:
-/// without it the daemon check defaults to `fully_protected`
-/// (`rustynetd/src/main.rs:2524`) and reds every plain-client macOS node.
-/// This is the orchestrator's planned-role mirror of the daemon's own
-/// `macos_dns_posture` rule (`rustynetd/src/phase10.rs:801`: FullyProtected
-/// iff FullTunnel exit_mode OR serve_exit_node) — in the planned-role model
-/// the only roles that carry the machine's traffic / serve an exit are
-/// exit and blind_exit. If the orchestrator ever grows a role whose nodes
-/// route ALL traffic through an exit (a full-tunnel client), it MUST map to
-/// `fully_protected` here too.
-pub(crate) fn expected_dns_posture_for_role(role: &NodeRole) -> &'static str {
+fn expected_dns_posture_for_role(role: &NodeRole) -> &'static str {
     match role {
         NodeRole::Exit | NodeRole::BlindExit => "fully_protected",
         NodeRole::Anchor | NodeRole::Admin | NodeRole::Relay | NodeRole::Client => {
