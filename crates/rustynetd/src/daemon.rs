@@ -10995,6 +10995,8 @@ impl DaemonRuntime {
     /// M1: install the bootstrap-time DNS probe servicer. Only the macOS
     /// system consults it (inside `verify_loopback_resolver_live`); the Linux
     /// and Windows DNS paths have no loopback probe, so they ignore it.
+    // used only on non-windows (startup path); present cross-platform, dead on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn install_dns_probe_servicer(&mut self, servicer: Arc<DnsProbeServicer>) {
         self.controller
             .with_system(|system| system.set_dns_probe_servicer(Some(servicer)));
@@ -12623,6 +12625,8 @@ impl DnsResponderState {
     /// bootstrap-time state). In-zone queries answer SERVFAIL, out-of-zone
     /// REFUSED — identical to `build_dns_response` on such a runtime.
     #[cfg(test)]
+    // used only by macOS tests; present cross-platform, dead on other test builds.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) fn new_unresolved(zone_name: impl Into<String>) -> Self {
         Self {
             zone_name: zone_name.into(),
@@ -12658,6 +12662,8 @@ impl PartialEq for DnsProbeServicer {
 impl Eq for DnsProbeServicer {}
 
 impl DnsProbeServicer {
+    // used only on non-windows (startup install, macOS tests); present cross-platform, dead on Windows.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn new(socket: Arc<UdpSocket>, state: DnsResponderState) -> Self {
         Self { socket, state }
     }
@@ -22936,6 +22942,8 @@ mod tests {
     /// assignment, so every reconcile apply decides the `ScopedResolverOnly`
     /// DNS posture (exit Off, not serving) — the plain client the resolver
     /// fix targets.
+    // used only by macOS tests; present cross-platform, dead on other test builds.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     fn build_runtime_with_custom_relay_exitless_assignment(
         test_name: &str,
         relay_addr: SocketAddr,
