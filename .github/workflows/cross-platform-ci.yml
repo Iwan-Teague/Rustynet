@@ -39,18 +39,15 @@ jobs:
         # materialises as a 10-byte text file on a Windows checkout without
         # core.symlinks, and this workflow has a Windows leg). They have never
         # diverged in 2552 commits — by discipline alone, with nothing mechanical
-        # holding them together. This is that mechanism.
+        # holding them together. The mirror guard script is that mechanism.
         #
         # The pre-commit hook refuses commits from a checkout behind its
-        # upstream. It lives in the repo but `core.hooksPath` is per-clone
-        # config, so an uninstalled hook is silent — verify at least that the
-        # hook is present and executable, or it rots unnoticed.
+        # upstream (and now also runs the same mirror guard). It lives in the
+        # repo but `core.hooksPath` is per-clone config, so an uninstalled hook
+        # is silent — verify at least that the hook is present and executable,
+        # or it rots unnoticed.
         run: |
-          cmp -s AGENTS.md CLAUDE.md || {
-            echo "AGENTS.md and CLAUDE.md have diverged; they must stay byte-identical" >&2
-            diff AGENTS.md CLAUDE.md | head -40 >&2
-            exit 1
-          }
+          bash scripts/ci/check_agents_claude_mirror.sh
           test -x scripts/git-hooks/pre-commit || {
             echo "scripts/git-hooks/pre-commit missing or not executable" >&2
             exit 1
@@ -135,18 +132,15 @@ jobs:
         # materialises as a 10-byte text file on a Windows checkout without
         # core.symlinks, and this workflow has a Windows leg). They have never
         # diverged in 2552 commits — by discipline alone, with nothing mechanical
-        # holding them together. This is that mechanism.
+        # holding them together. The mirror guard script is that mechanism.
         #
         # The pre-commit hook refuses commits from a checkout behind its
-        # upstream. It lives in the repo but `core.hooksPath` is per-clone
-        # config, so an uninstalled hook is silent — verify at least that the
-        # hook is present and executable, or it rots unnoticed.
+        # upstream (and now also runs the same mirror guard). It lives in the
+        # repo but `core.hooksPath` is per-clone config, so an uninstalled hook
+        # is silent — verify at least that the hook is present and executable,
+        # or it rots unnoticed.
         run: |
-          cmp -s AGENTS.md CLAUDE.md || {
-            echo "AGENTS.md and CLAUDE.md have diverged; they must stay byte-identical" >&2
-            diff AGENTS.md CLAUDE.md | head -40 >&2
-            exit 1
-          }
+          bash scripts/ci/check_agents_claude_mirror.sh
           test -x scripts/git-hooks/pre-commit || {
             echo "scripts/git-hooks/pre-commit missing or not executable" >&2
             exit 1
