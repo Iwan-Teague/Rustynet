@@ -56,14 +56,44 @@ impl ValidateBaselineRuntimeStage {
 /// so no node id can ever match one and passing `ctx.node_ids` here would red
 /// every node in the run. That mismatch is a separate daemon-side defect;
 /// asserting peer visibility has to wait for it.
-fn probe_expectations(op: crate::vm_lab::DaemonProbeOp) -> Vec<String> {
+/// NOT emitted on macOS `DnsFailclosed` either — the `--posture` expectation,
+/// that is, is now REQUIRED there. The daemon's `macos-dns-failclosed-check`
+/// defaults to `fully_protected` when no `--posture` is given
+/// (`rustynetd/src/main.rs:2524`), but a plain-client macOS node correctly
+/// holds only the ScopedResolverOnly posture (scoped /etc/resolver/rustynet,
+/// general DNS untouched, NO pf DNS-block floor), so the un-argued dispatch
+/// failed every plain-client macOS node with
+/// "macos-utm-1/DnsFailclosed: validation not passed". The expected posture
+/// is therefore THREADED from the node's PLANNED role — the same derivation
+/// the dedicated `dns_failclosed_validation` stage uses
+/// (`expected_dns_posture_for_role`) — never inferred from observed state.
+/// Exit / blind-exit nodes keep `fully_protected`: threading their posture
+/// down to `scoped_resolver_only` would WEAKEN the check (a missing pf
+/// DNS-block floor on an exit node must still fail).
+///
+/// The flag is emitted ONLY for the macOS adapter: the daemon's
+/// `linux-dns-failclosed-check` / `windows-dns-failclosed-check` argument
+/// parsers reject unknown flags fail-closed (`rustynetd/src/main.rs:2547`),
+/// so appending `--posture` there would turn a healthy check into an argv
+/// error.
+fn probe_expectations(
+    op: crate::vm_lab::DaemonProbeOp,
+    platform: crate::vm_lab::VmGuestPlatform,
+    role: &NodeRole,
+) -> Vec<String> {
     use crate::vm_lab::DaemonProbeOp;
+    use crate::vm_lab::VmGuestPlatform;
     use crate::vm_lab::orchestrator::role_validation::mesh_status::SNAPSHOT_MAX_AGE_SECONDS;
+    use crate::vm_lab::orchestrator::stage::dns_failclosed_validation::expected_dns_posture_for_role;
 
-    match op {
-        DaemonProbeOp::MeshStatus => vec![
+    match (op, platform) {
+        (DaemonProbeOp::MeshStatus, _) => vec![
             "--max-age-seconds".to_owned(),
             SNAPSHOT_MAX_AGE_SECONDS.to_owned(),
+        ],
+        (DaemonProbeOp::DnsFailclosed, VmGuestPlatform::Macos) => vec![
+            "--posture".to_owned(),
+            expected_dns_posture_for_role(role).to_owned(),
         ],
         _ => Vec::new(),
     }
@@ -99,6 +129,14 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
         ];
 
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        // The planned role per alias, for expectation derivation that depends
+        // on it (the macOS DNS-failclosed posture). Aliases above are built
+        // from these same assignments, so every lookup below hits.
+        let roles: std::collections::HashMap<String, NodeRole> = ctx
+            .assignments
+            .iter()
+            .map(|a| (a.alias.clone(), a.role.clone()))
+            .collect();
 
         // Collect pass: gather all results before any mutation
         let all_results = crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
@@ -109,10 +147,16 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
                 let op_results: Vec<Result<bool, String>> = OPS
                     .iter()
                     .map(|&op| match ctx.adapters.get(alias.as_str()) {
-                        Some(adapter) => adapter
-                            .run_validator(op, probe_expectations(op).as_slice())
-                            .map(|r| r.passed)
-                            .map_err(|e| e.to_string()),
+                        Some(adapter) => {
+                            let role = roles
+                                .get(alias.as_str())
+                                .expect("alias was collected from ctx.assignments");
+                            let expectations = probe_expectations(op, adapter.platform(), role);
+                            adapter
+                                .run_validator(op, expectations.as_slice())
+                                .map(|r| r.passed)
+                                .map_err(|e| e.to_string())
+                        }
                         None => Err(format!("no adapter for '{alias}'")),
                     })
                     .collect();
@@ -215,8 +259,10 @@ mod tests {
 
     // ----- QH-39: the baseline mesh-status dispatch must assert something --
 
+    use crate::vm_lab::orchestrator::role::NodeRole;
     use crate::vm_lab::{
-        DaemonProbe, DaemonProbeOp, LinuxDaemonProbe, MacosDaemonProbe, WindowsDaemonProbe,
+        DaemonProbe, DaemonProbeOp, LinuxDaemonProbe, MacosDaemonProbe, VmGuestPlatform,
+        WindowsDaemonProbe,
     };
     use std::path::Path;
 
@@ -233,9 +279,15 @@ mod tests {
             .build_argv_with_extra_args(
                 op,
                 Path::new("/usr/local/bin/rustynetd"),
-                probe_expectations(op).as_slice(),
+                probe_expectations(op, VmGuestPlatform::Linux, &NodeRole::Client).as_slice(),
             )
             .expect("probe must build argv")
+    }
+
+    fn posture_flag_in(argv: &[String]) -> Option<&String> {
+        argv.windows(2)
+            .position(|w| w[0] == "--posture")
+            .map(|i| &argv[i + 1])
     }
 
     /// THE test whose absence let the defect live: the rendered argv must
@@ -313,12 +365,99 @@ mod tests {
             DaemonProbeOp::ServiceHardening,
             DaemonProbeOp::KeyCustody,
             DaemonProbeOp::Authenticode,
-            DaemonProbeOp::DnsFailclosed,
         ] {
             assert!(
-                probe_expectations(op).is_empty(),
+                probe_expectations(op, VmGuestPlatform::Macos, &NodeRole::Client).is_empty(),
                 "{op:?} takes no expectation flags today"
             );
+        }
+    }
+
+    /// The macOS DnsFailclosed dispatch must thread the expected posture from
+    /// the node's PLANNED role: a plain-client node gets the scoped-resolver
+    /// posture it actually holds (the daemon check otherwise defaults to
+    /// `fully_protected` and reds every healthy client), while exit-class
+    /// roles keep the full posture — scoping an exit node would WEAKEN its
+    /// check, so the exit mapping is pinned to `fully_protected` here.
+    #[test]
+    fn macos_dns_failclosed_dispatch_threads_posture_from_the_planned_role() {
+        let scoped = [
+            NodeRole::Client,
+            NodeRole::Anchor,
+            NodeRole::Admin,
+            NodeRole::Relay,
+            NodeRole::Entry,
+            NodeRole::Aux,
+            NodeRole::Extra,
+            NodeRole::Custom("client".to_owned()),
+        ];
+        for role in scoped {
+            let argv = MacosDaemonProbe
+                .build_argv_with_extra_args(
+                    DaemonProbeOp::DnsFailclosed,
+                    Path::new("/usr/local/bin/rustynetd"),
+                    probe_expectations(DaemonProbeOp::DnsFailclosed, VmGuestPlatform::Macos, &role)
+                        .as_slice(),
+                )
+                .expect("macos probe must build argv");
+            assert_eq!(
+                posture_flag_in(&argv),
+                Some(&"scoped_resolver_only".to_owned()),
+                "{role:?} is a plain mesh node: expected the scoped-resolver posture, argv {argv:?}"
+            );
+        }
+
+        let full = [
+            NodeRole::Exit,
+            NodeRole::BlindExit,
+            NodeRole::Custom("exit".to_owned()),
+            NodeRole::Custom("blind_exit".to_owned()),
+        ];
+        for role in full {
+            let argv = MacosDaemonProbe
+                .build_argv_with_extra_args(
+                    DaemonProbeOp::DnsFailclosed,
+                    Path::new("/usr/local/bin/rustynetd"),
+                    probe_expectations(DaemonProbeOp::DnsFailclosed, VmGuestPlatform::Macos, &role)
+                        .as_slice(),
+                )
+                .expect("macos probe must build argv");
+            assert_eq!(
+                posture_flag_in(&argv),
+                Some(&"fully_protected".to_owned()),
+                "{role:?} carries the machine's traffic: the full fail-closed check must NOT be scoped, argv {argv:?}"
+            );
+        }
+    }
+
+    /// The `--posture` flag is macOS-only: the daemon's
+    /// `linux-dns-failclosed-check` / `windows-dns-failclosed-check` argument
+    /// parsers reject unknown flags fail-closed, so appending the flag there
+    /// would turn a healthy node's check into an argv error.
+    #[test]
+    fn dns_failclosed_posture_flag_stays_off_non_macos_adapters() {
+        for (label, probe) in platform_probes() {
+            if label == "macos" {
+                continue;
+            }
+            for role in [NodeRole::Client, NodeRole::Exit] {
+                let argv = probe
+                    .build_argv_with_extra_args(
+                        DaemonProbeOp::DnsFailclosed,
+                        Path::new("/usr/local/bin/rustynetd"),
+                        probe_expectations(
+                            DaemonProbeOp::DnsFailclosed,
+                            VmGuestPlatform::Linux,
+                            &role,
+                        )
+                        .as_slice(),
+                    )
+                    .expect("probe must build argv");
+                assert!(
+                    posture_flag_in(&argv).is_none(),
+                    "{label} dns-failclosed check must not receive --posture, argv {argv:?}"
+                );
+            }
         }
     }
 
