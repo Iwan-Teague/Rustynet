@@ -32,6 +32,21 @@ abort; `124` on stall or wall-clock timeout.
 Env knobs: `WATCHDOG_STALL_SECS` (default 240), `WATCHDOG_MAX_SECS` (2400),
 `WATCHDOG_POLL_SECS` (15), `WATCHDOG_MIN_FREE_GIB` (5), `WATCHDOG_LOG`.
 
+## cargo-pinned.sh
+
+Thin wrapper that runs `cargo` under the CI-pinned toolchain instead of the
+Homebrew rustc that shadows bare `cargo` on this Mac. It prepends the pinned
+rustup toolchain's `bin` directory to `PATH`, points `CARGO_TARGET_DIR` at the
+dedicated `target-pinned/` dir (gitignored), echoes the pinned
+`rustc --version` first, and fails closed if the pinned toolchain is missing:
+
+```sh
+scripts/dev/cargo-pinned.sh clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+The repo-root `justfile` (`just gates`, `just clippy`, …) does the same thing
+with nicer ergonomics; use this wrapper when `just` is not installed.
+
 ### Build/test hygiene notes
 
 - Prefer `--bin rustynet-cli` over `--bins` when exercising `vm_lab` unit tests:
