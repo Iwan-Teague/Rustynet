@@ -401,21 +401,22 @@ pub struct ApplyOptions {
     /// key their blind-vs-regular exit dataplane on this flag; Windows
     /// blind_exit is out of scope by design (Linux/macOS only).
     pub blind_exit: bool,
-    /// M2 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3):
-    /// when set — BOOTSTRAP-time applies only — the `ScopedResolverOnly`
-    /// posture sub-apply is SKIPPED here and left to the daemon's
-    /// first-reconcile heal (the `dns_posture_reassert_pending` latch), whose
-    /// pass runs while the daemon's DNS serve loop is already live. The
-    /// scoped posture's only mutation is the single `/etc/resolver/rustynet`
-    /// file and the probe precedes it, so deferring costs at most one
-    /// reconcile tick of Magic-DNS availability and opens no leak window.
-    /// `FullyProtected` is NEVER deferred by this flag: the review's §3.1
-    /// finding is that deferring the full posture would leave a tunnel-up
-    /// node resolving general DNS with no pf floor and no pins — a real leak
-    /// window under Requirements.md:186 / SecurityMinimumBar §8 — so that
-    /// posture stays in-bootstrap (serviced by M1's hoisted-bind probe
-    /// servicer). Default `false`: reconcile-time applies never defer (the
-    /// serve loop is live by then).
+    /// M2 amendment (MacosClientResolverNotServingDiagnosisReview_2026-09-02
+    /// §3.3): when set, the `ScopedResolverOnly` posture sub-apply would be
+    /// SKIPPED here and left to a later heal pass. NO caller sets it anymore:
+    /// the original M2 bootstrap deferral is RETIRED — M1's hoisted-bind probe
+    /// servicer answers the loopback resolver probe for ANY posture, so the
+    /// scoped apply completes in-bootstrap and `validate_baseline_runtime`
+    /// (which runs inside the old deferral window) sees the resolver live.
+    /// Retained so the deferral path stays expressible (and unit-tested) at
+    /// the engine layer without a signature change; both daemon call sites
+    /// (bootstrap and reconcile) now pass `false`. The skip emits NO ops — no
+    /// probe, no scoped-file write, no assert — so the generation's DNS
+    /// posture stays exactly `Untouched` (the zero-leak state).
+    /// `FullyProtected` is NEVER deferred by this flag: deferring the full
+    /// posture would leave a tunnel-up node resolving general DNS with no pf
+    /// floor and no pins — a real leak window under Requirements.md:186 /
+    /// SecurityMinimumBar §8. Default `false`.
     pub defer_scoped_dns_posture: bool,
 }
 
@@ -7393,15 +7394,16 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
             // fail-closed sequence; plain mesh clients get scoped-only.
             let posture = macos_dns_posture(options.exit_mode, options.serve_exit_node);
             if options.defer_scoped_dns_posture && posture == DnsPosture::ScopedResolverOnly {
-                // M2 posture-split deferral (bootstrap-time only): the scoped
-                // sub-apply moves to the daemon's first-reconcile heal latch.
-                // The DNS arm emits NO ops here — no probe, no scoped-file
+                // Retained deferral path (no daemon caller sets the flag
+                // anymore — see the M2 amendment note on the field): the
+                // scoped
+                // sub-apply is skipped. The DNS arm emits NO ops here — no
+                // probe, no scoped-file
                 // write, no assert — and records nothing as applied, so this
                 // generation's DNS posture remains exactly `Untouched` (the
-                // zero-leak state) until the serve loop is live and the heal
-                // pass applies it for real.
+                // zero-leak state) until a later pass applies it for real.
                 log::info!(
-                    "bootstrap deferred the {scoped} DNS posture; the first reconcile pass owns it",
+                    "the {scoped} DNS posture sub-apply was deferred by the caller; a later pass owns it",
                     scoped = DnsPosture::ScopedResolverOnly.as_str()
                 );
             } else {
@@ -11298,13 +11300,15 @@ mod tests {
         );
     }
 
-    /// M2 posture-split deferral: a bootstrap apply (`defer_scoped_dns_posture`)
-    /// for a plain client (exit Off, not serving) — the `ScopedResolverOnly`
-    /// posture — must emit NO DNS ops at all: no apply, no probe, no assert.
-    /// The DNS posture of this generation stays `Untouched` (zero-leak); the
-    /// daemon's first-reconcile heal latch owns the real apply.
+    /// M2 amendment: the retained (caller-unset) deferral path — a scoped
+    /// apply with `defer_scoped_dns_posture` set — must emit NO DNS ops at
+    /// all: no apply, no probe, no assert. The DNS posture of this
+    /// generation stays `Untouched` (zero-leak). No daemon caller sets the
+    /// flag anymore (bootstrap applies the scoped posture in-place via M1's
+    /// hoisted-bind probe servicer), but the engine-level contract is kept
+    /// and tested.
     #[test]
-    fn bootstrap_deferred_scoped_posture_emits_no_dns_ops() {
+    fn defer_flag_scoped_posture_emits_no_dns_ops() {
         let policy = allow_shared_exit_policy();
         let mut controller = Phase10Controller::new(
             RecordingBackend::default(),
@@ -11338,7 +11342,7 @@ mod tests {
                 .system
                 .operations
                 .contains(&"apply_dns_protection".to_owned()),
-            "bootstrap must not apply the scoped DNS posture; ops={:?}",
+            "a deferred scoped DNS posture must not apply; ops={:?}",
             controller.system.operations
         );
         assert!(
@@ -11346,7 +11350,61 @@ mod tests {
                 .system
                 .operations
                 .contains(&"assert_dns_protection".to_owned()),
-            "bootstrap must not assert the skipped scoped DNS posture; ops={:?}",
+            "a deferred scoped DNS posture must not assert; ops={:?}",
+            controller.system.operations
+        );
+        assert_eq!(controller.state(), DataplaneState::DataplaneApplied);
+    }
+
+    /// M2 amendment: with the deferral flag UNSET — the configuration BOTH
+    /// daemon call sites now pass — a plain client's bootstrap apply
+    /// (`ScopedResolverOnly`, exit Off, not serving) must EMIT the scoped
+    /// DNS apply AND its assert: the hoisted-bind probe servicer answers the
+    /// loopback probe in-bootstrap, so the resolver file lands before
+    /// `validate_baseline_runtime` runs.
+    #[test]
+    fn scoped_posture_applies_in_bootstrap_when_not_deferred() {
+        let policy = allow_shared_exit_policy();
+        let mut controller = Phase10Controller::new(
+            RecordingBackend::default(),
+            DryRunSystem::default(),
+            policy,
+            TrustPolicy::default(),
+        );
+
+        controller
+            .apply_dataplane_generation(
+                trust_ok(),
+                test_runtime_context(),
+                vec![sample_peer("node-b")],
+                vec![Route {
+                    destination_cidr: "10.0.0.0/8".to_owned(),
+                    via_node: NodeId::new("node-b").expect("node should parse"),
+                    kind: RouteKind::Mesh,
+                }],
+                ApplyOptions {
+                    exit_mode: ExitMode::Off,
+                    serve_exit_node: false,
+                    protected_dns: true,
+                    ..ApplyOptions::default()
+                },
+            )
+            .expect("a scoped apply with no deferral must succeed");
+
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"apply_dns_protection".to_owned()),
+            "bootstrap must apply the scoped DNS posture; ops={:?}",
+            controller.system.operations
+        );
+        assert!(
+            controller
+                .system
+                .operations
+                .contains(&"assert_dns_protection".to_owned()),
+            "bootstrap must assert the scoped DNS posture; ops={:?}",
             controller.system.operations
         );
         assert_eq!(controller.state(), DataplaneState::DataplaneApplied);

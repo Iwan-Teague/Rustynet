@@ -8865,12 +8865,21 @@ impl DaemonRuntime {
             self.force_fail_closed_or_restrict("bootstrap_exit_overlay_exception_violated");
             return;
         }
-        // M2 posture-split (MacosClientResolverNotServingDiagnosisReview
-        // §3.3): at BOOTSTRAP, a plain client's `ScopedResolverOnly` DNS
-        // sub-apply is deferred to the first reconcile pass (the serve loop is
-        // not live yet); `FullyProtected` stays in-bootstrap, serviced by M1's
-        // hoisted-bind probe servicer. macOS only: Linux/Windows DNS paths
-        // have no loopback probe and keep their existing in-bootstrap apply.
+        // M2 amendment (MacosClientResolverNotServingDiagnosisReview §3.3):
+        // BOTH macOS postures now apply in-bootstrap. The original M2 split
+        // deferred a plain client's `ScopedResolverOnly` sub-apply to the
+        // first reconcile pass because the serve loop was not yet live — but
+        // M1's hoisted-bind probe servicer answers the loopback resolver
+        // probe for ANY posture, so the scoped apply can complete before the
+        // serve loop starts. The deferral is gone: `validate_baseline_runtime`
+        // runs immediately after `enforce_baseline_runtime`, i.e. INSIDE the
+        // old deferral window, so a deferred posture read as "DNS fail-closed
+        // validation not passed". A scoped failure at bootstrap is
+        // availability-only (the probe precedes every mutation, leaving the
+        // posture `Untouched`) and takes the degraded branch below; a
+        // `FullyProtected` failure stays leak-relevant and keeps the full
+        // restriction ladder. Linux/Windows DNS paths have no loopback probe
+        // and keep their existing in-bootstrap apply.
         let bootstrap_exit_mode = if self.node_role.is_blind_exit() {
             ExitMode::Off
         } else if self.auto_tunnel_enforce {
@@ -8882,9 +8891,11 @@ impl DaemonRuntime {
         } else {
             self.desired_exit_mode()
         };
-        let defer_scoped_dns = cfg!(target_os = "macos")
-            && macos_dns_posture(bootstrap_exit_mode, serve_exit_node)
-                == DnsPosture::ScopedResolverOnly;
+        let applied_dns_posture = if cfg!(target_os = "macos") {
+            Some(macos_dns_posture(bootstrap_exit_mode, serve_exit_node))
+        } else {
+            None
+        };
         let apply_result = self.controller.apply_dataplane_generation(
             trust,
             RuntimeContext {
@@ -8901,24 +8912,51 @@ impl DaemonRuntime {
                 serve_exit_node,
                 blind_exit: self.node_role.is_blind_exit(),
                 exit_mode: bootstrap_exit_mode,
-                defer_scoped_dns_posture: defer_scoped_dns,
+                // M2 amendment: bootstrap applies the decided DNS posture
+                // in-place (scoped included) — never defers.
+                defer_scoped_dns_posture: false,
             },
         );
         let cleanup_result = self.scrub_runtime_private_key_material();
         match (apply_result, cleanup_result) {
-            (Ok(()), Ok(())) => {
-                if defer_scoped_dns {
-                    // M2: the scoped DNS posture was deliberately skipped
-                    // during bootstrap; schedule the first-reconcile heal
-                    // through the existing S1 latch so its pass applies the
-                    // posture while the serve loop is live.
-                    self.dns_posture_reassert_pending = true;
-                }
-            }
+            (Ok(()), Ok(())) => {}
             (Err(err), Ok(())) => {
-                self.restrict_recoverable(format!("dataplane bootstrap apply failed: {err}"));
-                self.force_fail_closed_or_restrict("bootstrap_apply_failed");
-                return;
+                // M2 amendment (mirrors the M3 reconcile classification):
+                // a ScopedResolverOnly DNS sub-apply failure is NOT a mesh
+                // failure. The probe precedes every mutation, so the posture
+                // is already rolled back to `Untouched` — the zero-leak
+                // state. It takes its own degraded branch — DNS degraded,
+                // mesh alive — and never the restriction ladder: no
+                // restrict, no fail-close. The latch re-arms so the first
+                // reconcile pass retries the posture. FullyProtected
+                // failures are leak-relevant and keep the full ladder
+                // byte-for-byte, as does any non-DNS failure.
+                let scoped_dns_degraded = applied_dns_posture
+                    == Some(DnsPosture::ScopedResolverOnly)
+                    && matches!(
+                        err,
+                        crate::phase10::Phase10Error::System(
+                            crate::phase10::SystemError::DnsApplyFailed(_)
+                        )
+                    );
+                if scoped_dns_degraded {
+                    let message = format!(
+                        "macOS scoped DNS posture apply failed at bootstrap (DNS degraded, mesh unaffected): {err}"
+                    );
+                    log::error!("rustynetd bootstrap: scoped DNS posture degraded: {message}");
+                    // Not recorded in `bootstrap_error`: the bootstrap
+                    // continuation below clears it before persisting, and the
+                    // mesh is ALIVE here — the durable degraded signals are
+                    // `dns_scoped_apply_degraded` (persisted) and this
+                    // last-error message.
+                    self.last_reconcile_error = Some(message);
+                    self.dns_posture_reassert_pending = true;
+                    self.dns_scoped_apply_degraded = true;
+                } else {
+                    self.restrict_recoverable(format!("dataplane bootstrap apply failed: {err}"));
+                    self.force_fail_closed_or_restrict("bootstrap_apply_failed");
+                    return;
+                }
             }
             (Err(err), Err(cleanup_err)) => {
                 self.restrict_recoverable(format!(
@@ -18483,14 +18521,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
-    /// M2 posture-split deferral (MacosClientResolverNotServingDiagnosisReview
-    /// §3.3): a plain client's BOOTSTRAP must not apply the ScopedResolverOnly
-    /// DNS posture — no `apply_dns_protection` op, because the serve loop
-    /// cannot be live yet — and must latch the heal; the FIRST reconcile pass
-    /// then applies it for real and clears the latch.
+    /// M2 amendment (MacosClientResolverNotServingDiagnosisReview §3.3): a
+    /// plain client's BOOTSTRAP now APPLIES the ScopedResolverOnly DNS
+    /// posture in-place — M1's hoisted-bind probe servicer answers the
+    /// loopback probe before the serve loop starts — so `apply_dns_protection`
+    /// and `assert_dns_protection` both run during bootstrap, and NO heal
+    /// latch is set on success. `validate_baseline_runtime`, which runs right
+    /// after bootstrap, therefore finds the resolver live.
     #[cfg(target_os = "macos")]
     #[test]
-    fn bootstrap_defers_scoped_dns_posture_to_first_reconcile() {
+    fn bootstrap_applies_scoped_dns_posture_in_bootstrap() {
         let test_dir = secure_test_dir("rustynetd-m2-scoped-defer");
         let state_path = test_dir.join("daemon.state");
         let trust_path = test_dir.join("trust.evidence");
@@ -18528,34 +18568,134 @@ mod tests {
             "a healthy plain client must bootstrap unrestricted"
         );
         assert!(
-            runtime.dns_posture_reassert_pending,
-            "bootstrap must latch the scoped DNS posture heal for the first reconcile pass"
+            !runtime.dns_posture_reassert_pending,
+            "a successful in-bootstrap scoped apply must set NO heal latch"
+        );
+        assert!(
+            !runtime.dns_scoped_apply_degraded,
+            "a successful in-bootstrap scoped apply is not degraded"
         );
         let bootstrap_ops = match runtime.controller.system_mut_for_test() {
             crate::phase10::RuntimeSystem::DryRun(system) => system.operations.clone(),
             _ => panic!("M2 test requires the InMemory (DryRun) system"),
         };
         assert!(
-            !bootstrap_ops.contains(&"apply_dns_protection".to_owned()),
-            "bootstrap must not apply the scoped DNS posture; ops={bootstrap_ops:?}"
+            bootstrap_ops.contains(&"apply_dns_protection".to_owned()),
+            "bootstrap must apply the scoped DNS posture in-place; ops={bootstrap_ops:?}"
+        );
+        assert!(
+            bootstrap_ops.contains(&"assert_dns_protection".to_owned()),
+            "bootstrap must assert the scoped DNS posture; ops={bootstrap_ops:?}"
         );
 
-        // First reconcile pass: the latch fires the real scoped apply, now
-        // that the serve loop is (would be) live.
+        // First reconcile pass: nothing to heal — the latch was never set.
         runtime.reconcile();
         assert!(
             !runtime.dns_posture_reassert_pending,
-            "a successful heal must clear the re-assert latch"
-        );
-        let heal_ops = match runtime.controller.system_mut_for_test() {
-            crate::phase10::RuntimeSystem::DryRun(system) => system.operations.clone(),
-            _ => panic!("M2 test requires the InMemory (DryRun) system"),
-        };
-        assert!(
-            heal_ops.contains(&"apply_dns_protection".to_owned()),
-            "the first reconcile pass must apply the scoped DNS posture; ops={heal_ops:?}"
+            "no heal latch may appear after bootstrap applied the posture"
         );
         assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// M2 amendment: a ScopedResolverOnly DNS apply failure AT BOOTSTRAP is
+    /// availability-only (the probe precedes every mutation, so the posture
+    /// is `Untouched` — zero-leak). It must take the degraded branch — latches
+    /// set, NO restriction, no reconcile-failure accounting — and the first
+    /// reconcile pass must heal it through the re-armed latch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_scoped_dns_apply_failure_degrades_without_restriction() {
+        let relay_addr: SocketAddr = "203.0.113.48:40035".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay_exitless_assignment(
+                "rustynetd-m2-bootstrap-scoped-degraded",
+                relay_addr,
+            );
+        dry_run_fail_on_with(
+            &mut runtime,
+            "apply_dns_protection",
+            crate::phase10::SystemError::DnsApplyFailed(
+                "the loopback DNS resolver on 127.0.0.1:53535 did not answer: timed out".to_owned(),
+            ),
+        );
+        runtime.bootstrap();
+
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::None,
+            "a scoped DNS-apply failure at bootstrap must not restrict the node"
+        );
+        assert_eq!(
+            runtime.reconcile_failures, 0,
+            "the bootstrap degraded branch must not enter reconcile-failure accounting"
+        );
+        assert!(
+            runtime.dns_posture_reassert_pending,
+            "the degraded bootstrap must re-arm the heal latch for the first reconcile pass"
+        );
+        assert!(
+            runtime.dns_scoped_apply_degraded,
+            "the degraded state must be recorded"
+        );
+        assert!(
+            runtime
+                .last_reconcile_error
+                .as_deref()
+                .is_some_and(|message| message.contains("DNS degraded")),
+            "the failure must be surfaced for the operator: {:?}",
+            runtime.last_reconcile_error
+        );
+
+        // Heal: the next reconcile pass re-applies successfully.
+        dry_run_fail_on(&mut runtime, "no-dry-run-stage-matches-this");
+        runtime.reconcile();
+        assert!(!runtime.dns_posture_reassert_pending);
+        assert!(
+            !runtime.dns_scoped_apply_degraded,
+            "a successful apply must clear the scoped-DNS-degraded flag"
+        );
+        assert_eq!(runtime.reconcile_failures, 0);
+        assert_eq!(runtime.restriction_mode, RestrictionMode::None);
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// M2 amendment negative control: a FullyProtected DNS apply failure at
+    /// BOOTSTRAP is leak-relevant and keeps the FULL restriction ladder —
+    /// restrict (Recoverable), no degraded latch.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bootstrap_fully_protected_dns_apply_failure_still_restricts() {
+        let relay_addr: SocketAddr = "203.0.113.49:40036".parse().expect("relay addr");
+        let (mut runtime, test_dir) = build_runtime_with_custom_relay(
+            "rustynetd-m2-bootstrap-protected-restrict",
+            relay_addr,
+            "relay-test",
+        );
+        dry_run_fail_on_with(
+            &mut runtime,
+            "apply_dns_protection",
+            crate::phase10::SystemError::DnsApplyFailed(
+                "the loopback DNS resolver on 127.0.0.1:53535 did not answer: timed out".to_owned(),
+            ),
+        );
+        runtime.bootstrap();
+
+        assert_eq!(
+            runtime.restriction_mode,
+            RestrictionMode::Recoverable,
+            "a FullyProtected bootstrap DNS failure must restrict the node"
+        );
+        assert!(
+            !runtime.dns_scoped_apply_degraded,
+            "the degraded branch is scoped-posture-only and must not fire"
+        );
+        assert_eq!(
+            runtime.reconcile_failures, 0,
+            "the bootstrap error path does not enter reconcile-failure accounting"
+        );
 
         let _ = std::fs::remove_dir_all(test_dir);
     }
