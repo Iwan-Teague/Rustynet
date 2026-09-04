@@ -7,6 +7,12 @@
 
 The design doc's architecture (§1–§4) and fail-closed story match the shipped code closely, but the document is stale in four load-bearing places — its status header, §5, the §6.2 remaining-work list, and roughly fifteen file:line citations — because the very increments it describes landed after those sections were written. Refresh before using it as a spec.
 
+## Merge-time verification (Iwan-Teague, 2026-09-04)
+
+Spot-verified before merge (this review is UNTRUSTED GLM output). **Confirmed correct:** finding 2 (no `cross` alias — `source_archive.rs:48` accepts only `host-cross-binary`), finding 6 (`deploy_relay.rs` has no service-file read at `:275`; only a doc comment at `:47`), finding 3 (both macOS install sites push `RN_PREBUILT_BINARIES` — `macos_install.rs:129` and `:275`), the fail-closed trio, and SHA `e41267b0` (real, ancestor of HEAD).
+
+**Correction to finding 4:** the verified pass count is **37**, not 36. Recounted directly from `state/manual-lab-hostcrossv5-1788504478/state/stages.tsv` and `state/manual-lab-hostcross-1788500276/state/stages.tsv` on the status column (field 3): **37 pass / 0 fail / 17 skip across 54 rows** in *both* runs. So the design doc's "38" **and** this review's initial "36" are each off by one — the true figure is 37. (The review read the correct nested `stages.tsv` but miscounted by one; the manager log's tick-98/101 "38" was also off by one.) The `bootstrap_hosts = 42s` measurement stands. Finding 4's *direction* — the doc's 38 is wrong — holds; only its replacement number needed fixing.
+
 ## Findings
 
 ### 1. HIGH — The status header contradicts §6.2, and the header is the stale half
