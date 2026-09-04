@@ -358,7 +358,7 @@ use rustynet_crypto::{PublicKey, SecretKey, NodeKeyPair};
 
 When working on trust/security paths, every call site that reads state must
 fail closed. The canonical pattern lives in `rustynetd/src/daemon.rs` — look
-for the `force_fail_closed` helper. There are 44 call sites; 10 were
+for the `force_fail_closed_or_restrict` helper. There are 44 call sites; 10 were
 discarded (RN-03, open P0). When adding a new trust-sensitive path, add
 the fail-closed guard.
 
@@ -375,3 +375,18 @@ cargo fmt --all -- --check       (formatting)
 
 Convenience: `cargo run -p rustynet-xtask -- gates`
 Fast skip: `cargo run -p rustynet-xtask -- gates --skip-test`
+
+## Citation Audit
+
+Last citation audit: 2026-09-04, commit `09a340b0`. This revision carries
+**no `file.rs:NNN` line-number citations** — all citations are symbol→file
+mappings, audited as such. 149 file/dir citations verified to exist; 179
+symbol→file citations verified against definition sites (plus the
+Purpose-column cross-references); 1 corrected (`force_fail_closed` →
+`force_fail_closed_or_restrict`, `rustynetd/src/daemon.rs`); 0 unresolved.
+Noted for a human prose refresh (not citation defects): the
+`force_fail_closed_or_restrict` call-site count is now 41 in `daemon.rs`
+(paragraph above still says 44/10-discarded), and RN-03 is recorded **Fixed**
+in `SecurityReview_2026-05-24.md` §18 (paragraph above still says open P0).
+`VerifiedDownload`/`FromDir`/`BuildFromSource` in `install/acquire.rs` are
+`AcquisitionMode` enum variants (not standalone defs) — cited correctly.
