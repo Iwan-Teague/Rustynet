@@ -1,7 +1,7 @@
 # Cross-Compile-Then-Clone Design: Build Lab Binaries on the macOS Host
 
 **Date:** 2026-09-04
-**Status:** DESIGN — not adopted. The measurement plan (§6) must be run and the correctness gates (§4.6, §7) must pass before any orchestrator change lands. UNTRUSTED until the manager verifies each file:line claim and each number.
+**Status:** DESIGN — host-side macOS measurement DONE (§6.1, 2026-09-04): substantial speedup, **increment 1 = macOS-guest cross-clone recommended**. Still owed before any orchestrator change lands: isolated on-guest build number, Linux zigbuild measurement, §4.6 equivalence gate, and the `host-cross-binary` `source_mode` impl (§5). UNTRUSTED until the manager verifies each file:line claim and each number.
 
 ## 0) Problem Statement
 
@@ -208,6 +208,44 @@ ssh <guest> 'sudo install -m 0755 /tmp/rustynetd /usr/local/bin/rustynetd'
 | windows-utm-1 | x86_64-windows | ___ | ___ | (phase 2) | — | ___ | ___ | — | — |
 
 **Decision rule (proposed, manager sets final):** adopt for a target when (a) cross total (build+transfer+install) ≤ **0.5×** native *warm* and ≤ **0.2×** native cold; (b) the §4.6 equivalence gate is green for that target; (c) provenance stamping works end-to-end. Multiply the per-run saving by fleet size × runs/week to state hours reclaimed; also measure one full `--node` orchestrate run before/after (the stage that should shrink is `bootstrap_hosts`, `install.rs:51`).
+
+### 6.1 Measured results — macOS-guest side (2026-09-04, tick 84)
+
+Host = this Mac (aarch64-apple-darwin, ~10 perf cores), pinned toolchain 1.88.0,
+`CARGO_TARGET_DIR=/private/tmp/tpxc-host`. The macOS UTM guest is the **same
+triple**, so its "cross build" is a plain host `cargo build` + `scp` — **no zig,
+no cross toolchain, zero glibc risk** (§2.1 confirmed).
+
+Measured on the host (rc 0 each):
+- **rustynetd, release, cold: 28.85s** (`real`; user 123.87s across cores).
+- **rustynetd + rustynet-cli --features vm-lab, release (warm rustynetd deps, cli
+  cold): 1m50s** — the exact guest artifact set (`Bootstrap-RustyNetMacos.sh:864`,
+  verified `--release -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab`).
+
+On-guest-path proxy (the real production cost cross-clone replaces): the
+`bootstrap_hosts` stage of run `labrun-1788432982031` took **7m53s**
+(10:56:51→11:04:44Z) = source sync + toolchain check + **build** + install; build
+is the dominant term.
+
+**Decisive structural fact:** the macOS guest has **no persistent repo** —
+`/Users/mac/Rustynet` does not exist between runs (probed 2026-09-04), so every
+run's node rebuilds **cold**. The host target dir persists, so run-over-run the
+host build is **warm/incremental** (seconds–1min) while the guest pays the full
+cold build **every time**. Cross-clone wins by more the more runs you do.
+
+| Guest | Triple | Native (bootstrap proxy) | Host cross (cold) | Host cross (warm) | scp+install |
+| --- | --- | --- | --- | --- | --- |
+| macos-utm-1 | aarch64-apple-darwin | build-dominated 7m53s bootstrap | 1m50s full set / 28.85s rustynetd | seconds–1min incremental | seconds |
+
+**Preliminary decision: adopt cross-compile-clone for the macOS guest as
+increment 1** — trivial (same triple: `cargo build` + `scp` + `install`, no cross
+toolchain). The speedup is substantial and grows with run count (warm host vs
+always-cold guest). Owed before it lands: (i) a direct isolated on-guest macOS
+`cargo build` number to fill "native cold" exactly (needs rust+source staged on
+the guest — deferred, proxied by the bootstrap number above); (ii) the §4.6
+equivalence gate green for aarch64-apple-darwin; (iii) the `host-cross-binary`
+`source_mode` implementation (§5). Linux (zigbuild) is increment 2 — measure it
+on `debian-headless-*` once the current defect-hunt run frees them.
 
 ## 7) Rollout Plan
 
