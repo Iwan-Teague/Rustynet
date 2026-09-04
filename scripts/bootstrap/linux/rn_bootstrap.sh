@@ -538,7 +538,22 @@ pin_regular_resolv_conf 1.1.1.1 8.8.8.8
 # during dependency resolution on a cache miss, so the bootstrap still fails
 # loudly for a genuine network problem and never silently builds stale/partial
 # state. Mirrors the macOS bootstrap's existing `cargo build --offline` path.
-if wait_for_cargo_registry_endpoint; then
+if [[ "${RN_PREBUILT_BINARIES:-0}" == "1" ]]; then
+  # host-cross-binary mode: the orchestrator cross-built the node binaries on the
+  # host and scp'd them here, so install those and SKIP the guest build entirely
+  # (this is where the reclaimed build time lands). Fail closed: a missing
+  # prebuilt binary aborts the bootstrap rather than silently falling through to
+  # a guest build, which would defeat the whole point and hide a transfer bug.
+  rn_bin_src="${RN_PREBUILT_DIR:-/tmp/rn_prebuilt}"
+  echo "[bootstrap] host-cross: installing prebuilt binaries from ${rn_bin_src}, skipping guest build" >&2
+  for rn_b in rustynetd rustynet-cli rustynet-relay; do
+    if [[ ! -f "${rn_bin_src}/${rn_b}" ]]; then
+      echo "[bootstrap] FATAL: RN_PREBUILT_BINARIES=1 but prebuilt '${rn_b}' is missing in ${rn_bin_src}" >&2
+      exit 1
+    fi
+  done
+elif wait_for_cargo_registry_endpoint; then
+  rn_bin_src="target/release"
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --features vm-lab --bin rustynet-cli
   # rustynet-relay is a separate binary whose bin target requires the `daemon`
@@ -551,13 +566,14 @@ if wait_for_cargo_registry_endpoint; then
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-relay --features daemon
 else
   echo "[bootstrap] cargo registry unreachable; falling back to offline build from cargo cache" >&2
+  rn_bin_src="target/release"
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-cli --features vm-lab --bin rustynet-cli
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-relay --features daemon
 fi
-run_root install -m 0755 target/release/rustynetd /usr/local/bin/rustynetd
-run_root install -m 0755 target/release/rustynet-cli /usr/local/bin/rustynet
-run_root install -m 0755 target/release/rustynet-relay /usr/local/bin/rustynet-relay
+run_root install -m 0755 "${rn_bin_src}/rustynetd" /usr/local/bin/rustynetd
+run_root install -m 0755 "${rn_bin_src}/rustynet-cli" /usr/local/bin/rustynet
+run_root install -m 0755 "${rn_bin_src}/rustynet-relay" /usr/local/bin/rustynet-relay
 # Re-pin after the potentially long build. Distro DNS managers can recreate a
 # stub-resolver symlink while cargo runs; rustynetd must start from a regular
 # fail-closed file because its privileged helper deliberately refuses symlinks.
