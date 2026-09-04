@@ -5241,6 +5241,15 @@ fn apparmor_profile_status_internal() -> Vec<AppArmorProfile> {
     Vec::new()
 }
 
+// AppArmor is a Linux-only LSM; Windows has no equivalent to enumerate, so the
+// Windows arm reports no profiles (matching the macOS fallback). Without this
+// arm the unconditional call in `apparmor_profile_status` fails to compile on
+// Windows (E0425), which broke the Windows daemon/trust-CLI build-release.
+#[cfg(target_os = "windows")]
+fn apparmor_profile_status_internal() -> Vec<AppArmorProfile> {
+    Vec::new()
+}
+
 /// Build one [`KeyPermissionCheck`] from a `stat -c "%U:%G %a" <path>`
 /// invocation's outcome. `stat_success` is the child's exit status; `stdout`
 /// is `None` when the spawn itself failed or the output was not UTF-8.
