@@ -861,7 +861,24 @@ build_rustynet() {
   # falls through to the online path, which requires the registry and fetches.
   # This keeps fresh-VM provisioning working while no longer making a transient
   # or absent upstream route a hard bootstrap failure when the cache suffices.
-  if as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab; then
+  if [[ "${RN_PREBUILT_BINARIES:-0}" == "1" ]]; then
+    # host-cross: the orchestrator cross-built the node binaries on the host
+    # (same aarch64-apple-darwin triple) and scp'd them here; stage them into
+    # target/release so install_binaries picks them up, and skip the guest build.
+    # Fail closed on a missing prebuilt binary.
+    rn_prebuilt_dir="${RN_PREBUILT_DIR:-/tmp/rn_prebuilt}"
+    echo "[bootstrap] host-cross: staging prebuilt binaries from ${rn_prebuilt_dir} into target/release, skipping guest build" >&2
+    for rn_b in rustynetd rustynet-cli rustynet-relay; do
+      if [[ ! -f "${rn_prebuilt_dir}/${rn_b}" ]]; then
+        echo "[bootstrap] FATAL: RN_PREBUILT_BINARIES=1 but prebuilt '${rn_b}' is missing in ${rn_prebuilt_dir}" >&2
+        exit 1
+      fi
+    done
+    mkdir -p target/release
+    install -m 0755 "${rn_prebuilt_dir}/rustynetd" target/release/rustynetd
+    install -m 0755 "${rn_prebuilt_dir}/rustynet-cli" target/release/rustynet-cli
+    install -m 0755 "${rn_prebuilt_dir}/rustynet-relay" target/release/rustynet-relay
+  elif as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab; then
     echo "[bootstrap] built rustynetd + rustynet-cli from warm cargo cache (offline)"
   else
     echo "[bootstrap] offline build unavailable (cold cache or new dependency); fetching from registry" >&2
@@ -876,12 +893,16 @@ build_rustynet() {
   # launchd com.rustynet.relay service; building it on every node also keeps a
   # later role-switch to Relay possible without a re-bootstrap. Same offline-
   # first fallback as the daemon/cli build above.
-  if as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynet-relay --features daemon; then
-    echo "[bootstrap] built rustynet-relay from warm cargo cache (offline)"
-  else
-    echo "[bootstrap] offline rustynet-relay build unavailable (cold cache or new dependency); fetching from registry" >&2
-    wait_for_cargo_registry_endpoint || exit 1
-    as_user "${brew_rustup}" run stable cargo build --release -p rustynet-relay --features daemon
+  # host-cross staged rustynet-relay above (with the daemon/cli), so only build
+  # it in the normal (non-prebuilt) path.
+  if [[ "${RN_PREBUILT_BINARIES:-0}" != "1" ]]; then
+    if as_user "${brew_rustup}" run stable cargo build --release --offline -p rustynet-relay --features daemon; then
+      echo "[bootstrap] built rustynet-relay from warm cargo cache (offline)"
+    else
+      echo "[bootstrap] offline rustynet-relay build unavailable (cold cache or new dependency); fetching from registry" >&2
+      wait_for_cargo_registry_endpoint || exit 1
+      as_user "${brew_rustup}" run stable cargo build --release -p rustynet-relay --features daemon
+    fi
   fi
 
   popd >/dev/null
