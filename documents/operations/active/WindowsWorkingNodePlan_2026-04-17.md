@@ -51,7 +51,7 @@ Primary truth anchors:
 - `crates/rustynetd/src/windows_backend_gate.rs`
 - `crates/rustynet-cli/src/vm_lab/bootstrap/windows.rs`
 - `documents/operations/PlatformSupportMatrix.md`
-- `documents/operations/active/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`
+- `documents/archive/WindowsVmLabAccessOrchestrationRecoveryPlan_2026-04-16.md`
 
 ## Current Phase 2 Baseline
 
@@ -91,6 +91,8 @@ Current Phase 2 validation blocker:
   not measured proof of a Windows backend
 
 ## Current Phase 4 Evidence Snapshot
+
+**HISTORICAL — 2026-04-17 run; the cited artifacts/windows_phase4/… root is gitignored and not retained in git, so these run facts cannot be re-verified from the repository.**
 
 Latest measured local Windows UTM attempt on 2026-04-17:
 
