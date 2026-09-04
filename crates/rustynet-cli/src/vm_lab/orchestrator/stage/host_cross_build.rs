@@ -401,6 +401,44 @@ fn objdump_dynamic_symbols(bin: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Filename of the run-local alias→prebuilt-binaries manifest, written under
+/// the report dir by the host-cross build step and read by the install adapter.
+pub const HOST_CROSS_MANIFEST_FILENAME: &str = "host_cross_binaries.json";
+
+/// Write the alias→binary-paths manifest that the install adapter reads to
+/// decide whether (and what) to ship as prebuilt binaries. A `BTreeMap` for
+/// deterministic output. Its presence is the signal that this run is host-cross;
+/// absence means a normal build-on-guest run.
+pub fn write_host_cross_manifest(
+    report_dir: &Path,
+    alias_to_binaries: &std::collections::BTreeMap<String, Vec<PathBuf>>,
+) -> Result<PathBuf, String> {
+    let path = report_dir.join(HOST_CROSS_MANIFEST_FILENAME);
+    let json = serde_json::to_string_pretty(alias_to_binaries)
+        .map_err(|e| format!("serialize host-cross manifest: {e}"))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("write host-cross manifest {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Read the prebuilt binary paths for `alias` from the manifest. `Ok(None)` when
+/// the manifest is absent (not a host-cross run) or carries no entry for the
+/// alias — the caller then takes the normal build-on-guest path.
+pub fn read_host_cross_binaries(
+    report_dir: &Path,
+    alias: &str,
+) -> Result<Option<Vec<PathBuf>>, String> {
+    let path = report_dir.join(HOST_CROSS_MANIFEST_FILENAME);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let json = std::fs::read_to_string(&path)
+        .map_err(|e| format!("read host-cross manifest {}: {e}", path.display()))?;
+    let map: std::collections::BTreeMap<String, Vec<PathBuf>> =
+        serde_json::from_str(&json).map_err(|e| format!("parse host-cross manifest: {e}"))?;
+    Ok(map.get(alias).cloned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,6 +673,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("produced no"));
+    }
+
+    #[test]
+    fn manifest_round_trips_and_absence_reads_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Absent manifest → None (a normal build-on-guest run).
+        assert_eq!(read_host_cross_binaries(dir, "any").unwrap(), None);
+
+        let mut m = std::collections::BTreeMap::new();
+        m.insert(
+            "debian-headless-2".to_owned(),
+            vec![
+                PathBuf::from("/t/aarch64-unknown-linux-gnu/release/rustynetd"),
+                PathBuf::from("/t/aarch64-unknown-linux-gnu/release/rustynet-cli"),
+                PathBuf::from("/t/aarch64-unknown-linux-gnu/release/rustynet-relay"),
+            ],
+        );
+        write_host_cross_manifest(dir, &m).unwrap();
+        let got = read_host_cross_binaries(dir, "debian-headless-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got[0].ends_with("rustynetd"));
+        // An alias not in the manifest reads None (fail-safe: takes normal path).
+        assert_eq!(read_host_cross_binaries(dir, "not-listed").unwrap(), None);
     }
 
     #[test]
