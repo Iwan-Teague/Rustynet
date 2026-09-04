@@ -553,6 +553,160 @@ mod tests {
         );
     }
 
+    /// Deny-by-empty: an empty candidate set yields a recommendation with
+    /// zero candidates and `insufficient_data` set — never a panic, never a
+    /// default "recommend the first/only thing", and the operator render
+    /// says so explicitly.
+    #[test]
+    fn empty_candidate_set_yields_no_recommendation_and_fails_closed() {
+        for role in [RoleType::Anchor, RoleType::Relay, RoleType::Exit] {
+            let recommendation = recommend_role_placement(role, &[]);
+            assert!(recommendation.candidates.is_empty());
+            assert!(
+                recommendation.insufficient_data,
+                "an empty set is flagged, never presented as evidence-backed"
+            );
+            assert_eq!(recommendation.role, role);
+            let text = render_recommendation(&recommendation);
+            assert!(
+                text.contains("no eligible candidates — nothing recommended"),
+                "render must say nothing was recommended: {text}"
+            );
+        }
+    }
+
+    /// A fully data-starved candidate is never silently presented as
+    /// viable. OBSERVED behavior (pinned, not changed): the scorer does
+    /// not exclude the candidate — it scores it at exactly 0.0 from the
+    /// evidence present, flags it `data_starved`, and poisons the whole
+    /// recommendation's `insufficient_data` so the output is advisory.
+    /// Exclusion would be a production-behavior change; the fail-closed
+    /// contract here is the explicit flag, not removal.
+    #[test]
+    fn fully_missing_observation_is_never_presented_as_viable() {
+        let starved = CandidateObservation {
+            node_id: "no-evidence".to_owned(),
+            uptime_ratio_ewma: None,
+            nat_class: NatClassCode::InsufficientData,
+            handshake_success_ewma: None,
+            bandwidth_headroom: BandwidthHeadroom::Unknown,
+            centrality: None,
+            observed_at_unix: 1_000,
+        };
+        let viable = full_observation("viable");
+
+        // Alone: ranked, but at score zero with both flags set.
+        let alone = recommend_role_placement(RoleType::Relay, &[starved.clone()]);
+        assert_eq!(alone.candidates.len(), 1);
+        assert_eq!(alone.candidates[0].score, 0.0);
+        assert!(alone.candidates[0].data_starved);
+        assert!(alone.insufficient_data);
+        assert!(
+            render_recommendation(&alone).contains("ADVISORY"),
+            "all-starved output must carry the advisory marker"
+        );
+
+        // Mixed: the evidence-backed candidate outranks the starved one
+        // (0.0 can never beat a scored candidate), and the starved entry
+        // still poisons the recommendation's confidence.
+        let mixed = recommend_role_placement(RoleType::Relay, &[starved, viable]);
+        assert_eq!(mixed.candidates[0].node_id, "viable");
+        assert_eq!(mixed.candidates[1].node_id, "no-evidence");
+        assert!(!mixed.candidates[0].data_starved);
+        assert!(mixed.candidates[1].data_starved);
+        assert!(mixed.insufficient_data);
+    }
+
+    /// One partially-blind criterion is enough to starve: a candidate
+    /// missing only centrality (the phase-3 Brandes collector's default
+    /// state) is flagged and marks the whole recommendation advisory even
+    /// though its score is otherwise strong.
+    #[test]
+    fn partially_missing_single_criterion_still_starves_the_recommendation() {
+        let mut phase3_candidate = full_observation("pre-brandes");
+        phase3_candidate.centrality = None;
+        let recommendation = recommend_role_placement(RoleType::Anchor, &[phase3_candidate]);
+        assert!(
+            recommendation.candidates[0].score > 0.0,
+            "observed criteria still score"
+        );
+        assert!(recommendation.candidates[0].data_starved);
+        assert!(recommendation.insufficient_data);
+    }
+
+    /// Determinism: the same inputs produce bitwise-identical scores and
+    /// the same ranking across repeated runs — no hidden clock, RNG, or
+    /// map-iteration order feeds the scorer.
+    #[test]
+    fn repeated_recommendation_runs_are_bitwise_identical() {
+        let build = || -> Vec<CandidateObservation> {
+            let mut weak = full_observation("node-weak");
+            weak.uptime_ratio_ewma = Some(400);
+            weak.bandwidth_headroom = BandwidthHeadroom::Low;
+            let mut starved = full_observation("node-starved");
+            starved.handshake_success_ewma = None;
+            vec![weak, starved, full_observation("node-strong")]
+        };
+        let first = recommend_role_placement(RoleType::Exit, &build());
+        let second = recommend_role_placement(RoleType::Exit, &build());
+        assert_eq!(first, second, "identical inputs must give identical output");
+        assert_eq!(first.candidates.len(), second.candidates.len());
+        for (a, b) in first.candidates.iter().zip(&second.candidates) {
+            assert_eq!(a.score.to_bits(), b.score.to_bits());
+            assert_eq!(a.node_id, b.node_id);
+        }
+    }
+
+    /// Documented tie-break: equal scores order by ascending `node_id`,
+    /// and the result is independent of the input permutation — feeding
+    /// the same candidates in every rotation yields the same ranking.
+    #[test]
+    fn tie_break_is_deterministic_across_input_permutations() {
+        let build = |ids: [&str; 3]| -> Vec<CandidateObservation> {
+            let mut out = Vec::new();
+            // Reverse the id order relative to `ids` so the desired
+            // ranking is never trivially the input order.
+            for id in ids.iter().rev() {
+                out.push(full_observation(id));
+            }
+            out
+        };
+        let ids = ["node-a", "node-b", "node-c"];
+        let reference = recommend_role_placement(RoleType::Relay, &build(ids));
+        let ranked: Vec<&str> = reference
+            .candidates
+            .iter()
+            .map(|candidate| candidate.node_id.as_str())
+            .collect();
+        assert_eq!(ranked, ids, "equal scores rank by ascending node id");
+        // Every permutation of the same observations lands on the same order.
+        for rotated in [build(ids), build(ids).into_iter().rev().collect::<Vec<_>>()] {
+            let again = recommend_role_placement(RoleType::Relay, &rotated);
+            let ranked_again: Vec<&str> = again
+                .candidates
+                .iter()
+                .map(|candidate| candidate.node_id.as_str())
+                .collect();
+            assert_eq!(ranked, ranked_again);
+        }
+    }
+
+    /// A single fully-observed candidate is handled correctly: ranked as
+    /// a list of one, unflagged, and NOT marked insufficient — evidence
+    /// quality, never candidate count, drives `insufficient_data`.
+    #[test]
+    fn single_viable_candidate_is_ranked_and_not_flagged() {
+        let solo = full_observation("only-node");
+        let recommendation = recommend_role_placement(RoleType::Exit, &[solo]);
+        assert_eq!(recommendation.candidates.len(), 1);
+        assert_eq!(recommendation.candidates[0].node_id, "only-node");
+        assert!(!recommendation.candidates[0].data_starved);
+        assert!(!recommendation.insufficient_data);
+        let text = render_recommendation(&recommendation);
+        assert!(text.contains("#1 only-node"));
+        assert!(!text.contains("ADVISORY"));
+    }
+
     /// Pins the exact operator-facing render for a known ranking: header
     /// carries the role, ranks are 1-based, scores and components print
     /// at 3-decimal fixed precision, and a fully-backed recommendation
