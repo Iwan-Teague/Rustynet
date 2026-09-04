@@ -59,10 +59,25 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
         ValidatedArg::cli_token("-Raw")?,
     ];
     let script = PowerShellScript::from_call_argv("windows read wireguard public key", &argv)?;
-    let raw = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
-    let hex = decode_wireguard_pubkey_to_hex(raw.trim())
-        .map_err(|err| AdapterError::Protocol { message: err })?;
-    Ok(hex)
+    // The daemon writes wireguard.pub non-atomically (truncate then write) as it
+    // (re)derives the key at startup/reconcile, so a single read can catch it
+    // mid-write and come back empty even though the bootstrap readiness probe
+    // confirmed it non-empty moments earlier (run-2026-09-04-windows-7, where the
+    // pubkey was a valid 45-char key on the guest immediately after). Retry the
+    // read a few times -- the Linux collector does the same -- and only fail
+    // closed once every attempt came back empty/undecodable.
+    let mut last_err = "empty base64 input".to_owned();
+    for attempt in 0..8 {
+        let raw = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
+        match decode_wireguard_pubkey_to_hex(raw.trim()) {
+            Ok(hex) => return Ok(hex),
+            Err(err) => last_err = err,
+        }
+        if attempt < 7 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+    Err(AdapterError::Protocol { message: last_err })
 }
 
 /// Read the local `node_id` from `rustynetd.env`
@@ -603,15 +618,24 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
 /// reviewed contract in rustynetd `phase10` (`WINDOWS_KS_RULE_*` /
 /// `WINDOWS_DNS_RULE_*`); the NRPT match targets the DNS fail-closed rule that
 /// points the root namespace at the loopback resolver (`windows_dns_failclosed`).
-/// Wait (bounded) for the RustyNet daemon + relay services to reach Stopped, so
-/// [`cleanup_runtime_state`] can reset the killswitch without the still-live
-/// daemon re-applying the default-deny outbound policy afterward. Read-only
-/// polling -- mutates nothing. `WINDOWS_SERVICE_NAME` / `WINDOWS_RELAY_SERVICE_NAME`
-/// are compile-time constants (no untrusted value), keeping the command
-/// argv-only-safe.
-fn windows_wait_services_stopped_script() -> String {
+/// Stop the RustyNet daemon + relay services with `sc.exe stop` (which reliably
+/// signals the SCM and returns at once) and then wait, bounded, for both to
+/// reach Stopped -- so [`cleanup_runtime_state`] can reset the killswitch
+/// without the still-live daemon re-applying the default-deny outbound policy
+/// afterward.
+///
+/// Live-lab evidence (run-2026-09-04-windows-7): the prior `Stop-Service -Force`
+/// left the daemon Running, so the dataplane reset cleared the killswitch and
+/// the daemon re-applied it, leaving the node "still dirty" (service running +
+/// outbound blocking) and failing the next run's cleanup_hosts. A manual
+/// `sc.exe stop` stopped the same daemon in ~4s, so `sc.exe stop` is used here
+/// for that reliability. The two service names are compile-time constants (no
+/// untrusted value), keeping the command argv-only-safe.
+fn windows_stop_and_wait_services_script() -> String {
     format!(
         "$ErrorActionPreference = 'SilentlyContinue'; \
+         & sc.exe stop '{WINDOWS_SERVICE_NAME}' 2>&1 | Out-Null; \
+         & sc.exe stop '{WINDOWS_RELAY_SERVICE_NAME}' 2>&1 | Out-Null; \
          for ($i = 0; $i -lt 20; $i++) {{ \
              $svc = Get-Service -Name '{WINDOWS_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
              $relay = Get-Service -Name '{WINDOWS_RELAY_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
@@ -735,16 +759,20 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     )?;
     let _ = run_remote_ps(conn, stop_relay_script.as_str(), SHORT_TIMEOUT);
 
-    // Wait for the daemon (and relay) service to reach Stopped BEFORE resetting
-    // the dataplane below. The Stop-Service calls above only INITIATE the stop;
-    // if the killswitch reset ran while the daemon were still up, its reconcile
-    // loop would re-apply the default-deny outbound policy right after we
-    // cleared it -- the race that left the node "still dirty" (service running +
-    // outbound blocking) and failed the next run's cleanup_hosts, bricking the
-    // guest. Live-lab evidence: run-2026-09-04-windows-6. Best-effort + bounded
-    // (<= ~20s, well inside SHORT_TIMEOUT); a clean/absent service breaks out at
-    // once.
-    let _ = run_remote_ps(conn, &windows_wait_services_stopped_script(), SHORT_TIMEOUT);
+    // Reliably stop the daemon (and relay) with `sc.exe stop` and wait for both
+    // to reach Stopped BEFORE resetting the dataplane below. The best-effort
+    // `Stop-Service -Force` calls above did NOT reliably stop the running daemon
+    // (run-2026-09-04-windows-7: the node was left "still dirty" — service
+    // running + outbound blocking — because the killswitch reset ran while the
+    // daemon were still up and its reconcile loop re-applied the default-deny
+    // outbound policy); a manual `sc.exe stop` stopped the same daemon in ~4s.
+    // Best-effort + bounded (<= ~20s, well inside SHORT_TIMEOUT); a clean/absent
+    // service breaks out at once.
+    let _ = run_remote_ps(
+        conn,
+        &windows_stop_and_wait_services_script(),
+        SHORT_TIMEOUT,
+    );
 
     // Best-effort reset of leftover RustyNet dataplane artifacts (killswitch
     // firewall rules + default-deny outbound policy, the DNS fail-closed NRPT
