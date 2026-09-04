@@ -115,7 +115,17 @@ pub fn install_daemon(
     // skips the guest build. Names are preserved (rustynetd / rustynet-cli /
     // rustynet-relay), matching the bootstrap's RN_PREBUILT_DIR install loop.
     if let Some(binaries) = &prebuilt_binaries {
-        ssh::run_remote(conn, "mkdir -p /tmp/rn_prebuilt", short_timeout)?;
+        // Route the mkdir through the validated seam (RemoteCommand + ValidatedArg)
+        // rather than a raw interpolated string at the remote sink.
+        let mkdir = ssh::RemoteCommand::from_args(
+            "host-cross prebuilt dir",
+            &[
+                ValidatedArg::cli_token("mkdir")?,
+                ValidatedArg::cli_token("-p")?,
+                ValidatedArg::path("/tmp/rn_prebuilt")?,
+            ],
+        )?;
+        ssh::run_remote(conn, mkdir.as_str(), short_timeout)?;
         for bin in binaries {
             let name =
                 bin.file_name()
@@ -703,8 +713,11 @@ mod tests {
             "bootstrap must build the rustynet-relay binary"
         );
         assert!(
-            BOOTSTRAP_SCRIPT.contains("install -m 0755 target/release/rustynet-relay"),
-            "bootstrap must install rustynet-relay to /usr/local/bin"
+            BOOTSTRAP_SCRIPT.contains(
+                "install -m 0755 \"${rn_bin_src}/rustynet-relay\" /usr/local/bin/rustynet-relay"
+            ),
+            "bootstrap must install rustynet-relay to /usr/local/bin (from the selected \
+             source dir: target/release for a guest build, /tmp/rn_prebuilt for host-cross)"
         );
     }
 
