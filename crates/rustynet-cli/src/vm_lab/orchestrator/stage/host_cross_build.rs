@@ -1,14 +1,16 @@
 //! Host-side cross-build primitives for the opt-in `host-cross-binary`
 //! source mode (`CrossCompileThenCloneDesign_2026-09-04.md` §5/§6).
 //!
-//! These are the pure, side-effect-free building blocks of the eventual flow:
-//! map a lab node's `(platform, arch)` onto a Rust target triple, and build the
-//! exact `cargo` / `cargo zigbuild` argument vector that produces the node's
-//! binaries on the host. Nothing here spawns a process, touches the filesystem,
-//! or is wired into a live run yet — the dispatch site in
-//! [`super::source_archive`] still fails closed. Keeping these isolated and
-//! unit-tested is what lets the risky adapter/bootstrap wiring land later
-//! against a verified foundation.
+//! Layers: pure helpers ([`target_triple`], [`host_build_argv`],
+//! [`plan_host_builds`], [`check_glibc_floor`]) map a lab node's
+//! `(platform, arch)` onto a triple, build the exact `cargo`/`cargo zigbuild`
+//! argv, and enforce the glibc floor; [`execute_host_builds`] orchestrates them
+//! with the build/objdump effects INJECTED so it is unit-tested fail-closed;
+//! [`run_planned_host_builds`] is the production wrapper that spawns real
+//! `cargo`/`objdump`. Wired live by `native.rs` when `--source-mode
+//! host-cross-binary` is selected (increment 3c). The fail-closed guarantee is
+//! enforced here (build error / glibc-floor violation aborts the run before
+//! deploy), not at the source-archive dispatch.
 //!
 //! Fail-closed everywhere: an unknown arch, an unsupported platform (iOS /
 //! Android have no host-cross story), or a malformed input is an error, never a
@@ -215,11 +217,25 @@ fn parse_glibc_version(s: &str) -> Option<GlibcVersion> {
 /// `GLIBC_<version>` symbol version the binary requires. `None` if the binary
 /// references no versioned glibc symbols (a static or non-glibc binary — which
 /// is trivially within any floor).
+///
+/// The `GLIBC_` marker is matched as a SUBSTRING anywhere in the text, not as a
+/// whitespace-delimited token: Apple's LLVM `objdump -T` (the host's objdump
+/// when cross-inspecting a Linux ELF) prints the version parenthesised —
+/// `(GLIBC_2.17) __libc_start_main` — so a `strip_prefix("GLIBC_")` on a
+/// `(GLIBC_2.17)` token finds nothing and the floor check would silently pass
+/// (fail-open). Matching the substring makes the guard robust to both GNU and
+/// LLVM objdump formats.
 pub fn parse_max_glibc_version(objdump_output: &str) -> Option<GlibcVersion> {
     objdump_output
-        .split_whitespace()
-        .filter_map(|tok| tok.strip_prefix("GLIBC_"))
-        .filter_map(parse_glibc_version)
+        .match_indices("GLIBC_")
+        .filter_map(|(i, marker)| {
+            let rest = &objdump_output[i + marker.len()..];
+            let ver: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            parse_glibc_version(ver.trim_end_matches('.'))
+        })
         .max()
 }
 
@@ -455,19 +471,38 @@ mod tests {
 
     #[test]
     fn glibc_scan_finds_max_numerically_not_lexically() {
-        // Real objdump -T shape; 2.29 must beat 2.3 (numeric), and 2.2.5.
+        // EXACT Apple LLVM `objdump -T` shape (parenthesised version) — the host
+        // format a token-prefix parser silently misses. 2.29 must beat 2.3
+        // (numeric) and 2.2.5.
         let dump = "\
-0000000000000000  DF *UND*  0000000000000000  GLIBC_2.2.5 memcpy
-0000000000000000  DF *UND*  0000000000000000  GLIBC_2.3   __register_atfork
-0000000000000000  DF *UND*  0000000000000000  GLIBC_2.29  pow
+0000000000000000  DF *UND*  0000000000000000 (GLIBC_2.2.5) memcpy
+0000000000000000  DF *UND*  0000000000000000 (GLIBC_2.3) __register_atfork
+0000000000000000  DF *UND*  0000000000000000 (GLIBC_2.29) pow
 ";
         assert_eq!(parse_max_glibc_version(dump).unwrap().to_string(), "2.29");
     }
 
     #[test]
+    fn glibc_scan_handles_both_gnu_and_llvm_formats() {
+        // GNU objdump prints a bare token, Apple LLVM parenthesises it. Both parse.
+        assert_eq!(
+            parse_max_glibc_version("... GLIBC_2.29 pow")
+                .unwrap()
+                .to_string(),
+            "2.29"
+        );
+        assert_eq!(
+            parse_max_glibc_version("... (GLIBC_2.29) pow")
+                .unwrap()
+                .to_string(),
+            "2.29"
+        );
+    }
+
+    #[test]
     fn glibc_floor_passes_within_and_fails_when_exceeded() {
-        let dump = "GLIBC_2.29 pow\nGLIBC_2.17 clock_gettime\n";
-        // This is the real measured zigbuild result: max 2.29 under a 2.31 floor.
+        // Real host objdump lines (parenthesised) — the actual measured result.
+        let dump = "(GLIBC_2.29) pow\n(GLIBC_2.17) clock_gettime\n";
         assert_eq!(
             check_glibc_floor(dump, "2.31")
                 .unwrap()
@@ -553,7 +588,7 @@ mod tests {
                 Ok(())
             },
             |_bin| true,
-            |_bin| Ok("GLIBC_2.17 clock_gettime\nGLIBC_2.29 pow\n".to_owned()),
+            |_bin| Ok("(GLIBC_2.17) clock_gettime\n(GLIBC_2.29) pow\n".to_owned()),
         )
         .unwrap();
         assert_eq!(out.len(), 1);
@@ -583,7 +618,7 @@ mod tests {
             |_argv, _tr| Ok(()),
             |_bin| true,
             // 2.40 exceeds the 2.31 floor — must abort, never ship.
-            |_bin| Ok("GLIBC_2.40 some_new_symbol\n".to_owned()),
+            |_bin| Ok("(GLIBC_2.40) some_new_symbol\n".to_owned()),
         )
         .unwrap_err();
         assert!(err.contains("exceeds the declared floor"));
