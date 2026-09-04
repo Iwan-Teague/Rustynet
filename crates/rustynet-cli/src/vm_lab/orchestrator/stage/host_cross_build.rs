@@ -132,6 +132,66 @@ pub fn host_build_argv(triple: &str, glibc_floor: Option<&str>) -> Result<Vec<St
     Ok(argv)
 }
 
+/// A parsed glibc symbol version (`GLIBC_2.31` → `[2, 31]`), ordered
+/// numerically component-by-component so `2.9 < 2.29 < 2.31 < 2.34.1` (a plain
+/// string sort gets `2.29` vs `2.3` backwards, which is exactly the kind of
+/// mistake that would wave a too-new binary through the floor check).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GlibcVersion(Vec<u32>);
+
+impl std::fmt::Display for GlibcVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = self.0.iter().map(u32::to_string).collect();
+        write!(f, "{}", parts.join("."))
+    }
+}
+
+/// Parse a dotted glibc version string (`"2.31"`, `"2.34.1"`) into ordered
+/// numeric components. Any non-numeric or empty component makes it `None` —
+/// never a partial/guessed version.
+fn parse_glibc_version(s: &str) -> Option<GlibcVersion> {
+    if s.is_empty() {
+        return None;
+    }
+    let comps: Option<Vec<u32>> = s.split('.').map(|c| c.parse::<u32>().ok()).collect();
+    comps.map(GlibcVersion)
+}
+
+/// Scan `objdump -T` (dynamic symbol table) output for the highest
+/// `GLIBC_<version>` symbol version the binary requires. `None` if the binary
+/// references no versioned glibc symbols (a static or non-glibc binary — which
+/// is trivially within any floor).
+pub fn parse_max_glibc_version(objdump_output: &str) -> Option<GlibcVersion> {
+    objdump_output
+        .split_whitespace()
+        .filter_map(|tok| tok.strip_prefix("GLIBC_"))
+        .filter_map(parse_glibc_version)
+        .max()
+}
+
+/// Fail-closed glibc-floor check (§4.2): the binary's highest required glibc
+/// symbol version must be ≤ the declared floor, so the artifact runs on any
+/// distro at or above that floor. A binary requiring a HIGHER version than the
+/// floor is rejected — shipping it would fault on a guest at the floor. This is
+/// the single guard that keeps a host cross-build from being mistaken for a
+/// portable artifact.
+pub fn check_glibc_floor(
+    objdump_output: &str,
+    floor: &str,
+) -> Result<Option<GlibcVersion>, String> {
+    let floor_v =
+        parse_glibc_version(floor).ok_or_else(|| format!("malformed glibc floor '{floor}'"))?;
+    match parse_max_glibc_version(objdump_output) {
+        // No versioned glibc deps — trivially within any floor.
+        None => Ok(None),
+        Some(max) if max <= floor_v => Ok(Some(max)),
+        Some(max) => Err(format!(
+            "binary requires glibc {max} which exceeds the declared floor {floor_v}; \
+             it would fail on a guest at the floor (fail closed)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,5 +258,46 @@ mod tests {
         assert!(host_build_argv("aarch64-apple-darwin", Some("2.31")).is_err());
         // An unrecognised triple family.
         assert!(host_build_argv("wasm32-unknown-unknown", None).is_err());
+    }
+
+    #[test]
+    fn glibc_scan_finds_max_numerically_not_lexically() {
+        // Real objdump -T shape; 2.29 must beat 2.3 (numeric), and 2.2.5.
+        let dump = "\
+0000000000000000  DF *UND*  0000000000000000  GLIBC_2.2.5 memcpy
+0000000000000000  DF *UND*  0000000000000000  GLIBC_2.3   __register_atfork
+0000000000000000  DF *UND*  0000000000000000  GLIBC_2.29  pow
+";
+        assert_eq!(parse_max_glibc_version(dump).unwrap().to_string(), "2.29");
+    }
+
+    #[test]
+    fn glibc_floor_passes_within_and_fails_when_exceeded() {
+        let dump = "GLIBC_2.29 pow\nGLIBC_2.17 clock_gettime\n";
+        // This is the real measured zigbuild result: max 2.29 under a 2.31 floor.
+        assert_eq!(
+            check_glibc_floor(dump, "2.31")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            "2.29"
+        );
+        // Exactly at the floor passes.
+        assert_eq!(
+            check_glibc_floor(dump, "2.29")
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            "2.29"
+        );
+        // One below the max fails closed — this is the guard that matters.
+        assert!(check_glibc_floor(dump, "2.28").is_err());
+    }
+
+    #[test]
+    fn glibc_scan_handles_no_versioned_symbols_and_bad_floor() {
+        assert!(parse_max_glibc_version("nothing versioned here").is_none());
+        assert_eq!(check_glibc_floor("no glibc symbols", "2.31").unwrap(), None);
+        assert!(check_glibc_floor("GLIBC_2.29 x", "not-a-version").is_err());
     }
 }
