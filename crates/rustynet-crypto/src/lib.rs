@@ -2153,10 +2153,12 @@ mod tests {
 
     /// The unimplemented-platform arm must FAIL, not pass.
     ///
-    /// Runs only where the arm exists. The source pin below is what protects
-    /// this on unix hosts, where the arm is compiled out and this test cannot
-    /// execute at all.
-    #[cfg(not(unix))]
+    /// Runs only on a platform that still hits the refuse stub — neither unix
+    /// (real mode/uid check) nor windows (real SDDL check, added for CRY-05 in
+    /// commit 77262024). On unix and windows the stub is compiled out and this
+    /// test cannot execute at all; the source pin below is what protects the
+    /// stub there.
+    #[cfg(not(any(unix, windows)))]
     #[test]
     fn key_custody_permission_check_fails_closed_when_unimplemented() {
         let dir = std::env::temp_dir();
