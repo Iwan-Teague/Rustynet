@@ -1294,3 +1294,11 @@ LAB STATE: 5 UTM guests UP (debian-headless-2/-4, macOS, Fedora, ubuntu). But ma
 - RE-VALIDATING: host-cross v5 (state/manual-lab-hostcrossv5-1788504478, pid 73460) launched with the fix — locks acquired, host-cross trigger fired. NEXT TICK: confirm the WHOLE run PASSES (build skipped + install-from-staged works). (Aside: a sed slip first pointed v5 at the v4 report dir; killed that run — it fails fast on the non-fresh dir before taking locks — and relaunched with a clean dir.)
 - If v5 passes → host-cross Linux END-TO-END COMPLETE + the build-skip time win PROVEN. Then increment 5 (binary_provenance) + macOS adapter + measure/report the full-run saving.
 - STATE: main @df2bd3fa. Fleet: host-cross v5 re-validating. Providers down. lenovo down.
+
+## Tick 98 — 2026-09-04 ~08:05Z — HOST-CROSS LINUX END-TO-END COMPLETE + PROVEN (bootstrap 5m45s→42s, 38/0)
+
+- Providers still DOWN.
+- **MILESTONE: host-cross-binary is DONE + LIVE-PROVEN on Linux.** Re-validation run state/manual-lab-hostcrossv5-1788504478 = **38 pass / 0 FAIL / 17 skip, RC=0.** Guest build SKIPPED (log: "staging prebuilt binaries from /tmp/rn_prebuilt into target/release, skipping guest build"), glibc_max=2.29, both nodes got prebuilts, whole run PASSED. **bootstrap_hosts = 42s vs ~5m45s native** — the owner's reclaimed build time, proven with a number. The target/release staging fix (606d0b9c) resolved the v4 ops_e2e gap. Saved memory host-cross-binary-landed-2026-09-04 (capability + 4 gotchas). Design §6.2 updated.
+- This delivers the owner's core ask: "run cross compile for the --node live lab testing with vms" — host-cross is now a working, opt-in --source-mode on the real orchestrator, saving ~5min/node/run on Linux (host builds once per triple; native built per node). Increments: 3c (wire, tick 94-95) + 4 (skip guest build, tick 96-98).
+- REMAINING (follow-ups, not blocking the Linux win): increment 5 = run-matrix binary_provenance (thread HostBuildArtifact triple/glibc/sha into evidence so a cross pass is never mistaken for a native pass — a correctness/attribution item); make the glibc floor + run_host_cargo toolchain configurable (currently PATH-reliant); macos_install.rs prebuilt path (same-triple, no zig — simpler); Windows phase 2. Mobile reviews still blocked on providers.
+- STATE: main @11726811. host-cross Linux COMPLETE. Providers down. lenovo down.

@@ -279,6 +279,17 @@ targets `x86_64/aarch64-unknown-linux-gnu` on pinned 1.88.0 (already present).
   lenovo/libvirt guests. Quantify (b) with a cold native build on an x86 guest once
   one is up.
 
+**BUILD-SKIP PROVEN END-TO-END (2026-09-04, tick 96-98):** increment 4 landed —
+`install_daemon` scp's the host-built binaries + sets `RN_PREBUILT_BINARIES=1`, and
+`rn_bootstrap.sh` stages them into `target/release` and skips the guest build (both
+the rn_bootstrap build block AND `ops e2e-bootstrap-host`, which under the lab's
+`--skip-apt` only installs). Run `state/manual-lab-hostcrossv5-1788504478`: **38 pass
+/ 0 fail**, guest build skipped, **`bootstrap_hosts` 42s vs ~5m45s native** — the
+reclaimed on-guest build time, and the host build runs once per triple (shared by all
+same-triple nodes) vs native building per node. host-cross-binary is END-TO-END on
+Linux. Remaining: run-matrix `binary_provenance`, configurable glibc floor + pinned
+run_host_cargo toolchain, the macOS adapter, Windows phase 2.
+
 **LIVE-VALIDATED (2026-09-04, tick 94-95):** increment 3c wired host-cross into
 the orchestrator and a real 2-node run (`state/manual-lab-hostcross-1788500276`)
 fired it live — arch probe (uname -m → aarch64), triple dedup, and a host
