@@ -544,14 +544,24 @@ if [[ "${RN_PREBUILT_BINARIES:-0}" == "1" ]]; then
   # (this is where the reclaimed build time lands). Fail closed: a missing
   # prebuilt binary aborts the bootstrap rather than silently falling through to
   # a guest build, which would defeat the whole point and hide a transfer bug.
-  rn_bin_src="${RN_PREBUILT_DIR:-/tmp/rn_prebuilt}"
-  echo "[bootstrap] host-cross: installing prebuilt binaries from ${rn_bin_src}, skipping guest build" >&2
+  rn_prebuilt_dir="${RN_PREBUILT_DIR:-/tmp/rn_prebuilt}"
+  echo "[bootstrap] host-cross: staging prebuilt binaries from ${rn_prebuilt_dir} into target/release, skipping guest build" >&2
   for rn_b in rustynetd rustynet-cli rustynet-relay; do
-    if [[ ! -f "${rn_bin_src}/${rn_b}" ]]; then
-      echo "[bootstrap] FATAL: RN_PREBUILT_BINARIES=1 but prebuilt '${rn_b}' is missing in ${rn_bin_src}" >&2
+    if [[ ! -f "${rn_prebuilt_dir}/${rn_b}" ]]; then
+      echo "[bootstrap] FATAL: RN_PREBUILT_BINARIES=1 but prebuilt '${rn_b}' is missing in ${rn_prebuilt_dir}" >&2
       exit 1
     fi
   done
+  # Stage into target/release so BOTH the install below AND the downstream
+  # `ops e2e-bootstrap-host` step find them: ops_e2e installs from
+  # <src-dir>/target/release and, because the lab passes --skip-apt, does not
+  # rebuild — so placing the prebuilt binaries there is all that is needed to
+  # skip every guest build while leaving the rest of bootstrap unchanged.
+  mkdir -p target/release
+  install -m 0755 "${rn_prebuilt_dir}/rustynetd" target/release/rustynetd
+  install -m 0755 "${rn_prebuilt_dir}/rustynet-cli" target/release/rustynet-cli
+  install -m 0755 "${rn_prebuilt_dir}/rustynet-relay" target/release/rustynet-relay
+  rn_bin_src="target/release"
 elif wait_for_cargo_registry_endpoint; then
   rn_bin_src="target/release"
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
