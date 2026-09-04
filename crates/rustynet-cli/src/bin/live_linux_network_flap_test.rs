@@ -286,23 +286,42 @@ fn run() -> Result<(), String> {
     // silently never matches the real traffic. Fail closed when the port
     // cannot be determined — a block rule against a guessed port is exactly
     // the silent no-op class of defect this stage must never reintroduce.
-    let wg_show = match ctx.capture_root_allow_failure(&client_host, &["wg", "show", "all"]) {
-        Ok(out) => out,
-        Err(e) => {
-            return Err(format!(
-                "failed to determine client's WireGuard peer endpoint port for block rule: \
-                 `wg show all` capture failed: {e}"
-            ));
-        }
-    };
+    // Primary source: the peer's negotiated endpoint port from `wg show all`.
+    // Fallback: userspace/boringtun backend nodes have no kernel WireGuard
+    // interface, so `wg show all` is empty even with the tunnel up — read the
+    // port from the daemon status field `selected_exit_peer_endpoint=<ip>:<port>`
+    // instead. Fail closed only when BOTH sources are unreadable; never guess a
+    // port (a block rule against a guessed port is the silent no-op class this
+    // stage must never reintroduce).
+    let wg_show = ctx
+        .capture_root_allow_failure(&client_host, &["wg", "show", "all"])
+        .unwrap_or_default();
     let wg_port = match parse_wg_peer_endpoint_port(&wg_show) {
         Some(port) => port,
         None => {
-            return Err(
-                "failed to determine client's WireGuard peer endpoint port for block rule: \
-                 no `endpoint: <ip>:<port>` line parsable in `wg show all` output"
-                    .to_owned(),
-            );
+            let status = ctx
+                .capture_root_allow_failure(
+                    &client_host,
+                    &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+                )
+                .unwrap_or_default();
+            match parse_status_selected_exit_peer_endpoint_port(&status) {
+                Some(port) => {
+                    logger.line(
+                        "[network-flap] `wg show all` reported no endpoint (userspace WG \
+                         backend?); using selected_exit_peer_endpoint port from daemon status",
+                    )?;
+                    port
+                }
+                None => {
+                    return Err(
+                        "failed to determine client's WireGuard peer endpoint port for block \
+                         rule: no `endpoint: <ip>:<port>` in `wg show all` and no parsable \
+                         `selected_exit_peer_endpoint=<ip>:<port>` in daemon status"
+                            .to_owned(),
+                    );
+                }
+            }
         }
     };
     logger.line(format!(
@@ -562,6 +581,37 @@ fn parse_wg_peer_endpoint_port(wg_show_output: &str) -> Option<String> {
     }
 }
 
+/// Extract the peer's endpoint port from `rustynet status` output.
+///
+/// Fallback for [`parse_wg_peer_endpoint_port`] on nodes running the userspace
+/// (boringtun) WireGuard backend: those have no kernel WireGuard interface, so
+/// `wg show all` is empty even while the tunnel is up. The daemon status line
+/// carries the negotiated peer endpoint as `selected_exit_peer_endpoint=<ip>:<port>`
+/// (`daemon.rs` status render), which is exactly the destination the client's WG
+/// packets go to and therefore the port the flap block rule must target.
+///
+/// Matches the `selected_exit_peer_endpoint=` key EXACTLY — not the sibling
+/// `selected_exit_peer_endpoint_error=` field, which shares a prefix. Returns
+/// `None` when the field is absent, is the literal `none`, or the port segment
+/// does not parse as a valid port number — unreadable must never fall back to a
+/// guess, the same fail-closed rule as the `wg show` path. IPv4-only, matching
+/// [`parse_wg_peer_endpoint_port`].
+fn parse_status_selected_exit_peer_endpoint_port(status_output: &str) -> Option<String> {
+    let value = status_output
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("selected_exit_peer_endpoint="))?;
+    if value == "none" {
+        return None;
+    }
+    // `<ip>:<port>` — the port is everything after the last `:`.
+    let port = value.rsplit(':').next().unwrap_or("").trim();
+    if port.parse::<u16>().is_ok() {
+        Some(port.to_owned())
+    } else {
+        None
+    }
+}
+
 /// Age in seconds of the peer handshake the daemon last observed, or `None`
 /// when the metric could not be read at all.
 ///
@@ -661,4 +711,76 @@ fn print_usage() {
         [--report-path <path>] \
         [--log-path <path>]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_status_selected_exit_peer_endpoint_port, parse_wg_peer_endpoint_port};
+
+    #[test]
+    fn wg_show_empty_yields_no_port() {
+        // The userspace-backend case that motivated the status fallback:
+        // `wg show all` returns nothing, so the wg parser must yield None (and
+        // the caller falls back to daemon status).
+        assert_eq!(parse_wg_peer_endpoint_port(""), None);
+    }
+
+    #[test]
+    fn wg_show_endpoint_line_parses_port() {
+        let out = "peer: abcd\n  endpoint: 192.168.0.29:41328\n  latest handshake: 1s ago\n";
+        assert_eq!(parse_wg_peer_endpoint_port(out), Some("41328".to_owned()));
+    }
+
+    #[test]
+    fn status_fallback_extracts_selected_exit_peer_endpoint_port() {
+        // A realistic status line, including the sibling
+        // `selected_exit_peer_endpoint_error=` field that shares a prefix and
+        // must NOT be matched instead.
+        let status = "node_id=linux-x86-client-1-bootstrap node_role=client \
+            state=ExitActive generation=1 exit_node=linux-x86-exit-1-bootstrap \
+            selected_exit_peer_endpoint=192.168.121.26:51820 \
+            selected_exit_peer_endpoint_error=none managed_peer_endpoints=x";
+        assert_eq!(
+            parse_status_selected_exit_peer_endpoint_port(status),
+            Some("51820".to_owned())
+        );
+    }
+
+    #[test]
+    fn status_fallback_handles_non_default_port() {
+        let status = "state=ExitActive selected_exit_peer_endpoint=203.0.113.77:443 \
+            selected_exit_peer_endpoint_error=none";
+        assert_eq!(
+            parse_status_selected_exit_peer_endpoint_port(status),
+            Some("443".to_owned())
+        );
+    }
+
+    #[test]
+    fn status_fallback_none_when_endpoint_is_none() {
+        // No exit selected: fail closed, never guess.
+        let status = "state=DataplaneApplied selected_exit_peer_endpoint=none \
+            selected_exit_peer_endpoint_error=none";
+        assert_eq!(parse_status_selected_exit_peer_endpoint_port(status), None);
+    }
+
+    #[test]
+    fn status_fallback_does_not_match_error_sibling_field() {
+        // Only the `_error` sibling is present (no real endpoint field): must
+        // NOT false-match it.
+        let status = "state=Restricted selected_exit_peer_endpoint_error=some_error_text";
+        assert_eq!(parse_status_selected_exit_peer_endpoint_port(status), None);
+    }
+
+    #[test]
+    fn status_fallback_none_when_field_absent() {
+        let status = "node_role=client state=DataplaneApplied generation=1 exit_node=none";
+        assert_eq!(parse_status_selected_exit_peer_endpoint_port(status), None);
+    }
+
+    #[test]
+    fn status_fallback_none_when_port_unparsable() {
+        let status = "selected_exit_peer_endpoint=1.2.3.4:notaport";
+        assert_eq!(parse_status_selected_exit_peer_endpoint_port(status), None);
+    }
 }
