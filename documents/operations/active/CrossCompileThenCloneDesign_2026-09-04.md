@@ -1,11 +1,13 @@
 # Cross-Compile-Then-Clone Design: Build Lab Binaries on the macOS Host
 
 **Date:** 2026-09-04
-**Status:** DESIGN — host-side macOS measurement DONE (§6.1, 2026-09-04): substantial speedup, **increment 1 = macOS-guest cross-clone recommended**. Still owed before any orchestrator change lands: isolated on-guest build number, Linux zigbuild measurement, §4.6 equivalence gate, and the `host-cross-binary` `source_mode` impl (§5). UNTRUSTED until the manager verifies each file:line claim and each number.
+**Status:** DESIGN — host-side macOS measurement DONE (§6.1, 2026-09-04): substantial speedup, **increment 1 = macOS-guest cross-clone recommended**. **Increment 4 (`host-cross-binary` `source_mode`, §5) HAS LANDED** — mode parse, host build (`stage/host_cross_build.rs`), orchestrator wiring, and the Linux AND macOS adapter prebuilt paths are live and end-to-end-validated on Linux (§6.2). Still owed: isolated on-guest build number, §4.6 equivalence gate, run-matrix `binary_provenance` stamping, per-run configurable glibc floor (+ pinned `run_host_cargo` toolchain), Windows phase 2. UNTRUSTED until the manager verifies each file:line claim and each number.
+
+> **Errata applied 2026-09-04 (per `CrossCompileThenCloneDesign_AdversarialReview_2026-09-04.md`):** (1) status header + §5 re-framed — the `host-cross-binary` increment landed after this doc was written; §5 is part-implemented (mode value, host build, Linux+macOS adapters), part-open (`binary_provenance`, per-run configurable floor). (2) §5.1's proposed `cross` alias removed — `parse_archive_source_mode` (`source_archive.rs:48`) accepts only the literal `host-cross-binary`. (3) §6.2 remaining-work list: the macOS adapter is wired (`macos_install.rs:129`, `:275` both push `RN_PREBUILT_BINARIES=1`) — removed as remaining. (4) Pass counts corrected to **37 / 0 / 17** per run (doc said 38; recounted from both runs' `state/stages.tsv`). (5) ~15 drifted file:line citations updated, each re-verified by grep against the tree at edit time. (6) `deploy_relay.rs:275` service-file cite corrected — the source-root read lives in the adapter layer (`linux_install.rs:324`). (7) `bootstrap/windows.rs:41192-41221` test cite annotated as not found.
 
 ## 0) Problem Statement
 
-Every `--node` live-lab run rebuilds the daemon toolchain **on every guest**, on every run, on every node, with guest-class CPUs. The build step is the single largest fixed cost in the loop: the Linux bootstrap budgets **900 s** for it (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/linux_install.rs:80` — `let build_timeout = Duration::from_secs(900); // cargo build can take a while`) and the standalone bootstrap phases time each cargo invocation at **7200 s** (`scripts/bootstrap/linux/rn_bootstrap.sh:542,543,551,554-556`). Windows has its own budget knob, `RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS` (`adapter/windows_install.rs:66,221-248`), sized on the same assumption.
+Every `--node` live-lab run rebuilds the daemon toolchain **on every guest**, on every run, on every node, with guest-class CPUs. The build step is the single largest fixed cost in the loop: the Linux bootstrap budgets **900 s** for it (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/linux_install.rs:91` — `let build_timeout = Duration::from_secs(900); // cargo build can take a while`) and the standalone bootstrap phases time each cargo invocation at **7200 s** (`scripts/bootstrap/linux/rn_bootstrap.sh:567,568,576` online and `:580-582` `--offline`). Windows has its own budget knob, `RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS` (`adapter/windows_install.rs:69,221`), sized on the same assumption.
 
 The proposal: **cross-compile on the macOS host (Apple Silicon, fast, always warm) and clone the finished binaries to each guest**, per target triple. For the macOS UTM guest this is not even a cross-compile — the host and guest share `aarch64-apple-darwin`, so the host build **is** the guest binary (§2.1). For Linux and Windows guests it is a real cross-compile; §3 picks the toolchain per target and §4 argues correctness.
 
@@ -19,31 +21,31 @@ Ground truth, with citations (verified on this tree):
 
 - **Run config:** `OrchestrationContext`/`RunConfig.source_mode` — `crates/rustynet-cli/src/vm_lab/orchestrator/context.rs:66` (field), defaults `"working-tree"` (`context.rs:461,498,526`).
 - **Parse + plumb:** `adapter/../native.rs` parses `source_mode` at `native.rs:189-190` and `:346-347`, passes it at `:482`/`:955`, applies it via `with_source_mode` at `:995`; `plan.rs:225` (`with_source_mode`), `plan.rs:388` (inserts `PrepareSourceArchiveStage`).
-- **Accepted values:** `orchestrator/stage/source_archive.rs:13` (`ArchiveSourceMode` enum) and `:31` (`parse_archive_source_mode`): `None`/`""`/`"working-tree"`/`"worktree"` → `WorkingTree`; `"head"`/`"local-head"` → `Head`; anything else (incl. `"repo-url"`) → error. Tests at `source_archive.rs:517-543`.
-- **Source tarball:** `prepare_source_archive` stage calls `build_source_tarball` (`stage/source_archive.rs` ~`:256`/`:292`), which also records a git-provenance marker (commit + dirty state). Evidence records `source_mode` and provenance (`orchestrator/evidence.rs:83,119,583,661,925,940`).
+- **Accepted values:** `orchestrator/stage/source_archive.rs:13` (`ArchiveSourceMode` enum) and `:43` (`parse_archive_source_mode`): `None`/`""`/`"working-tree"`/`"worktree"` → `WorkingTree`; `"head"`/`"local-head"` → `Head`; `"host-cross-binary"` → `HostCrossBinary`; anything else (incl. `"repo-url"`) → error. Tests at `source_archive.rs:540` (`parse_archive_source_mode_maps_known_values`).
+- **Source tarball:** `prepare_source_archive` stage calls `build_source_tarball` (`stage/source_archive.rs:111`), which also records a git-provenance marker (commit + dirty state). Evidence records `source_mode` and provenance (`orchestrator/evidence.rs:83,119,583,661,925,940`).
 - **Bootstrap stage:** `orchestrator/stage/install.rs` — `BootstrapHosts` stage (`StageId::BootstrapHosts`, id at `:48`, name `"bootstrap_hosts"` at `:51`, depends on `CleanupHosts` at `:53-54`, parallel fanout at `:59-62`). Its `execute` (`:63-90`) calls `ctx.install_daemon(&source, alias, ctx)` at `:90` through the per-OS adapter. Nodes **outside** `--rebuild-nodes` are skipped and reused intact (`install.rs:17-24, 68-79`), with a liveness probe `validate_reused_daemon` (`install.rs:116-131`) that fails loudly if a reused node is not daemon-ready.
 - **Per-OS adapters:**
-  - **Linux:** `adapter/linux_install.rs:48` `install_daemon` — scp's `rn_bootstrap.sh`, an env file, and the source tarball to `/tmp/rn_source.tar.gz` (`:82-99`, archive transfer budget 300 s at `:79`), then runs the bootstrap on-guest. Build timeout 900 s (`:80`).
-  - **macOS:** `adapter/macos_install.rs:84` `install_daemon` — same shape; scp's `rn_macos_bootstrap.sh` + `Install-RustyNetMacosService.sh` + env, then runs the build on-guest.
+  - **Linux:** `adapter/linux_install.rs:49` `install_daemon` — scp's `rn_bootstrap.sh`, an env file, and the source tarball to `/tmp/rn_source.tar.gz` (tarball path at `:110`; the block shifted — prebuilt-path code was added above it; archive transfer budget 300 s at `:90`), then runs the bootstrap on-guest. Build timeout 900 s (`:91`).
+  - **macOS:** `adapter/macos_install.rs:85` `install_daemon` — same shape; scp's `rn_macos_bootstrap.sh` + `Install-RustyNetMacosService.sh` + env, then runs the build on-guest.
   - **Windows:** `adapter/windows_install.rs` — pushes the source via `tar.exe`, then runs `Bootstrap-RustyNetWindows.ps1 -Phase build-release` (`:653`), polled through a JSON manifest at `C:\Windows\Temp\rustynet-stage\build-release\manifest.json` (`:77`); low-memory guests cap cargo parallelism (`:1753-1757` and tests `:2072,2391`).
 
 ### 1.2 The build itself — what gets built, per OS
 
-**Linux** (`scripts/bootstrap/linux/rn_bootstrap.sh:542-560`; the script is the `BOOTSTRAP_SCRIPT` embedded by `linux_install.rs`):
+**Linux** (`scripts/bootstrap/linux/rn_bootstrap.sh`; build block now `:565-582` — the `RN_PREBUILT_BINARIES` staging block `:541-563` (errata 2026-09-04) now occupies the formerly-cited `:542-560` range; the script is the `BOOTSTRAP_SCRIPT` embedded by `linux_install.rs`):
 
 ```
 cargo build --release -p rustynetd
 cargo build --release -p rustynet-cli --features vm-lab --bin rustynet-cli
 cargo build --release -p rustynet-relay --features daemon
-# offline fallback (--offline variants) at :554-556 for killswitch-behind guests
-install -m 0755 target/release/{rustynetd,rustynet-cli,rustynet-relay} → /usr/local/bin/{rustynetd,rustynet,rustynet-relay}   # :558-560
+# offline fallback (--offline variants) at :580-582 for killswitch-behind guests
+install -m 0755 target/release/{rustynetd,rustynet-cli,rustynet-relay} → /usr/local/bin/{rustynetd,rustynet,rustynet-relay}   # :584-586
 ```
 
-The scope is deliberately narrow — tests pin it: build **only** the installed cli binary with `vm-lab` (RNQ-17), never the whole package bin set, and always the relay binary (`linux_install.rs:660-690`, tests `bootstrap_script_builds_only_the_installed_cli_binary` at `:674-690`).
+The scope is deliberately narrow — tests pin it: build **only** the installed cli binary with `vm-lab` (RNQ-17), never the whole package bin set, and always the relay binary (`linux_install.rs` tests; `bootstrap_script_builds_only_the_installed_cli_binary` now at `:725`).
 
-**macOS** (`scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:864-905`): `cargo build --release --offline -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab` (online retry at `:869`), then relay (`:879-884`), then `install_binaries()` (`:891-905`) installs to the launchd service paths.
+**macOS** (`scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh:864-912`): `RN_PREBUILT_BINARIES` prebuilt-staging block `:864-880`, else `cargo build --release --offline -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab` (online retry at `:886`), then relay (`:898-904`), then `install_binaries()` (`:912`) installs to the launchd service paths.
 
-**Windows** (`bootstrap/windows.rs` + `Bootstrap-RustyNetWindows.ps1 -Phase build-release`): same three binaries; `rustynet-relay.exe` must exist for relay audits and the offline fallback (tests at `bootstrap/windows.rs:41192-41221`). Manifest schema v2 with `complete.marker` (parse/validation `bootstrap/windows.rs:1291-1380`, SSH report poll `:1797-1948`).
+**Windows** (`bootstrap/windows.rs` + `Bootstrap-RustyNetWindows.ps1 -Phase build-release`): same three binaries; `rustynet-relay.exe` must exist for relay audits and the offline fallback (errata 2026-09-04: the doc's test cite `bootstrap/windows.rs:41192-41221` is **not found** — the file is 4102 lines and contains no `rustynet-relay` reference; the relay-existence tests could not be located at that path and the original cite is retained here only as a known-bad marker). Manifest schema v2 with `complete.marker` (parse/validation `bootstrap/windows.rs:1291-1380`, SSH report poll `:1797-1948`).
 
 **Two more on-guest build sites** (also in scope for cross):
 
@@ -52,7 +54,7 @@ The scope is deliberately narrow — tests pin it: build **only** the installed 
 
 ### 1.3 Toolchain prerequisites this design can eventually drop per-guest
 
-The on-guest build is why every Linux guest needs rustup pinned to `rust-toolchain.toml` + shims on the default PATH (a non-login SSH shell never sources `~/.profile`; otherwise `ssh guest cargo build` exits 127 — `vm_lab/script_template.rs:787-800`), plus clang/llvm, gcc, pkg-config `openssl-devel` + `sqlite-devel` (`rn_bootstrap.sh:101-106,184-185`). A cross-clone path removes the *compiler* requirement (rustup, clang, gcc, pkg-config dev packages) while keeping the *runtime* requirements (nftables, wireguard-tools, etc.). Note `libsqlite3-sys` is `bundled` (`crates/rustynet-control/Cargo.toml:15`) and `ring` is in the lock (both cc-compiled C), while `openssl-sys` is **absent** from `Cargo.lock` — so the only C the cross build must handle is what cc-rs compiles from vendored sources (§4.3).
+The on-guest build is why every Linux guest needs rustup pinned to `rust-toolchain.toml` + shims on the default PATH (a non-login SSH shell never sources `~/.profile`; otherwise `ssh guest cargo build` exits 127 — `vm_lab/script_template.rs:783-800`), plus clang/llvm, gcc, pkg-config `openssl-devel` + `sqlite-devel` (`rn_bootstrap.sh:101-106,184-185`). A cross-clone path removes the *compiler* requirement (rustup, clang, gcc, pkg-config dev packages) while keeping the *runtime* requirements (nftables, wireguard-tools, etc.). Note `libsqlite3-sys` is `bundled` (`crates/rustynet-control/Cargo.toml:15`) and `ring` is in the lock (both cc-compiled C), while `openssl-sys` is **absent** from `Cargo.lock` — so the only C the cross build must handle is what cc-rs compiles from vendored sources (§4.3).
 
 ## 2) Cross-Compile Matrix per Guest
 
@@ -73,7 +75,7 @@ From `documents/operations/active/vm_lab_inventory.json` (entries; hosts = `mac-
 
 ### 2.1 The macOS guest is the trivial, biggest quick win
 
-`macos-utm-1` runs the **same triple the host builds natively**. `cargo build --release -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab` on the M-series MacBook Pro produces a binary that is byte-equivalent-in-kind to what `Bootstrap-RustyNetMacos.sh:864-884` produces on the guest (same rust-toolchain channel, same triple, same features). Cross-compiling is unnecessary; only **clone** is needed: build on host → scp → install to the launchd paths (`install_binaries`, `Bootstrap-RustyNetMacos.sh:891-905`). This single guest eliminates the largest per-node build in the fleet (macOS guests are notoriously slow rust builders under UTM) with essentially **zero toolchain risk**. Ship this first as `source_mode`-adjacent phase 1 (§7).
+`macos-utm-1` runs the **same triple the host builds natively**. `cargo build --release -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab` on the M-series MacBook Pro produces a binary that is byte-equivalent-in-kind to what `Bootstrap-RustyNetMacos.sh:881-904` produces on the guest (same rust-toolchain channel, same triple, same features). Cross-compiling is unnecessary; only **clone** is needed: build on host → scp → install to the launchd paths (`install_binaries`, `Bootstrap-RustyNetMacos.sh:912`). This single guest eliminates the largest per-node build in the fleet (macOS guests are notoriously slow rust builders under UTM) with essentially **zero toolchain risk**. Ship this first as `source_mode`-adjacent phase 1 (§7).
 
 ### 2.2 Glibc floors (drives the zig pin, §4.2)
 
@@ -134,11 +136,13 @@ Cross becomes the *bulk default*; the native path is never deleted:
 
 ## 5) Automation Design
 
+**Status (errata 2026-09-04): §5 is now PART-IMPLEMENTED.** The `host-cross-binary` mode value (`source_archive.rs:48`), the host cross-build step (`stage/host_cross_build.rs`), orchestrator wiring (`native.rs:594`), and the Linux adapter prebuilt path (`linux_install.rs:81` pushes `RN_PREBUILT_BINARIES=1`; `rn_bootstrap.sh:541-563` stages them) are live and end-to-end-validated (§6.2). The **macOS adapter is also wired** (`macos_install.rs:129` and `:275` push the same env). Still open: `binary_provenance` stamping and a per-run configurable glibc floor (the 2.31 floor is hardcoded at the `plan_host_builds` call site).
+
 ### 5.1 New source/binary mode
 
-Add a new mode value alongside `working-tree`/`head` in `parse_archive_source_mode` (`stage/source_archive.rs:31`): **`host-cross-binary`** (aliases `cross`). Semantics:
+Add a new mode value alongside `working-tree`/`head` in `parse_archive_source_mode` (`stage/source_archive.rs:43`): **`host-cross-binary`** (errata 2026-09-04: no alias — the parser accepts only the literal string; a proposed `cross` alias does not exist in the code). Semantics:
 
-- `prepare_source_archive` still runs and still records git provenance — the source tree must keep shipping to guests because non-build stages read from it (e.g. `deploy_relay.rs:275` reads `scripts/systemd/rustynet-relay.service` relative to the source root). What changes is that the tarball is accompanied by **prebuilt binaries** and the on-guest build step is skipped.
+- `prepare_source_archive` still runs and still records git provenance — the source tree must keep shipping to guests because non-build stages read from it (errata 2026-09-04: the relay service file is read from the source root by the adapter layer, not `deploy_relay.rs` — `linux_install.rs:324` documents the exact relative path `scripts/systemd/rustynet-relay.service` and the read happens in the shared deploy helper; `deploy_relay.rs:47` mentions it only in a doc comment). What changes is that the tarball is accompanied by **prebuilt binaries** and the on-guest build step is skipped.
 - The host, once, builds the matrix of binaries for the run's assigned nodes: `{rustynetd, rustynet-cli(vm-lab), rustynet-relay(daemon)}` × target triples actually present in the topology (+ `rustynet-netns-probe` where cross-network stages are planned).
 
 ### 5.2 Where it plugs into the orchestrator
@@ -147,16 +151,16 @@ Add a new mode value alongside `working-tree`/`head` in `parse_archive_source_mo
 2. **`native.rs`** — parse the flag where `source_mode` is parsed (`:189-190`, `:346-347`), plumb through `:482`/`:955`/`:995` in the same style.
 3. **New host-side build step** (new stage or part of `prepare_source_archive`): for each distinct triple in the assignment set, run `cargo zigbuild --release --target <triple>[.<glibc-floor>] <exact same -p/--features/--bin strings as the guest scripts>` on the host; artifacts land in a run-local dir. Reuse `node_in_rebuild_set` (`install.rs:17`) so `--rebuild-nodes` only builds triples of nodes actually being rebuilt.
 4. **Adapters, per OS:**
-   - **Linux** (`install_daemon`, `linux_install.rs:48`): additionally scp the three binaries (+probe) to `/tmp`, and set an env flag (e.g. `RN_PREBUILT_BINARIES=1`) read by `rn_bootstrap.sh`; the script's build block (`:542-556`) becomes `install -m 0755 /tmp/rn_prebuilt/{...} /usr/local/bin/{...}` (`:558-560`), everything else (service install, users, smoke) unchanged. The offline-fallback path is irrelevant in this mode (nothing to build) and must be skipped, not fallen into.
-   - **macOS** (`macos_install.rs:84`): clone host-built (same-triple) binaries into the guest's build dir path that `install_binaries()` (`Bootstrap-RustyNetMacos.sh:891-905`) expects — or add the same env-flag shortcut — so launchd service install is untouched.
+   - **Linux** (`install_daemon`, `linux_install.rs:49`): additionally scp the three binaries (+probe) to `/tmp`, and set an env flag (e.g. `RN_PREBUILT_BINARIES=1`) read by `rn_bootstrap.sh`; the script's build block (now `:565-582` — errata) becomes `install -m 0755 /tmp/rn_prebuilt/{...} /usr/local/bin/{...}` (`:584-586`), everything else (service install, users, smoke) unchanged. The offline-fallback path is irrelevant in this mode (nothing to build) and must be skipped, not fallen into.
+   - **macOS** (`macos_install.rs:85`): clone host-built (same-triple) binaries into the guest's build dir path that `install_binaries()` (`Bootstrap-RustyNetMacos.sh:912`) expects — or add the same env-flag shortcut — so launchd service install is untouched.
    - **Windows** (`windows_install.rs`): phase-2 only; the PS helper gains a `-UsePrebuiltBinaries` path that skips `build-release` while still writing the v2 manifest (`:77`) so downstream report-poll logic (`bootstrap/windows.rs:1291-1380,1797-1948`) is unchanged.
-5. **Timeouts:** the 900 s build budget (`linux_install.rs:80`) and 7200 s phase budgets (`rn_bootstrap.sh:542` etc.) become *transfer+install* budgets in this mode (binary ≈ tens of MB; keep the existing 300 s archive budget class, `linux_install.rs:79`).
+5. **Timeouts:** the 900 s build budget (`linux_install.rs:91`) and 7200 s phase budgets (`rn_bootstrap.sh:567` etc.) become *transfer+install* budgets in this mode (binary ≈ tens of MB; keep the existing 300 s archive budget class, `linux_install.rs:90`).
 
 ### 5.3 Provenance, gates, and downstream assumptions that must change
 
 - **Binary-provenance record:** new post-build check stamps each artifact with: host git commit + dirty state, toolchain channel, triple, glibc floor, and the `objdump -T` glibc-max-version scan (§4.2). Evidence rows carry it (`evidence.rs` — alongside existing `source_mode` fields `:83,583,661,925,940`), and the run-matrix row records `binary_provenance` so no cross pass is ever mistaken for native proof (§4.6).
 - **`bootstrap_vm` MCP flow unchanged:** the standalone `vm-lab-bootstrap-phase` tool path (sync-source/build-release/…) keeps building natively on guests — cross mode is an *orchestrator run* optimization, introduced behind its own flag, so the lower-level bootstrap contract does not silently change meaning.
-- **Tests to add/update (same files):** `source_archive.rs` parse tests (`:517-543` pattern) for the new mode; `install.rs` reuse-gate tests (`:210-231` pattern) for "reused node in cross mode still gets cloned binaries if rebuild-set says so"; `linux_install.rs` script asserts (`:660-690`) extended for the prebuilt path; `evidence.rs` for provenance fields.
+- **Tests to add/update (same files):** `source_archive.rs` parse tests (`:540` `parse_archive_source_mode_maps_known_values` pattern) for the new mode; `install.rs` reuse-gate tests (`:210-231` pattern) for "reused node in cross mode still gets cloned binaries if rebuild-set says so"; `linux_install.rs` script asserts (test `bootstrap_script_builds_only_the_installed_cli_binary` at `:725`) extended for the prebuilt path; `evidence.rs` for provenance fields.
 - **Guest toolchain provisioning may shrink later** (drop rustup/clang from `provision_guest_toolchain`) — deliberately *not* in phase 1; keep guests able to run the native path (§4.6).
 
 ### 5.4 MCP / AI-agent surface
@@ -182,7 +186,7 @@ ssh <guest> 'cd ~/Rustynet && cargo clean'
   cargo build --release -p rustynetd -p rustynet-cli --features vm-lab --bin rustynet-cli -p rustynet-relay --features daemon'
 ```
 
-macOS guest: identical with `Bootstrap-RustyNetMacos.sh`'s exact feature string (`-p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab`, `:864`). Windows: read the wall time from `build-release/manifest.json` timings after a `build-release` phase (or `RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS` run logs).
+macOS guest: identical with `Bootstrap-RustyNetMacos.sh`'s exact feature string (`-p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab`, `:881`). Windows: read the wall time from `build-release/manifest.json` timings after a `build-release` phase (or `RUSTYNET_WINDOWS_BUILD_TIMEOUT_SECS` run logs).
 
 **Baseline B — host cross-build + clone (proposed path), same guests:**
 
@@ -219,7 +223,7 @@ no cross toolchain, zero glibc risk** (§2.1 confirmed).
 Measured on the host (rc 0 each):
 - **rustynetd, release, cold: 28.85s** (`real`; user 123.87s across cores).
 - **rustynetd + rustynet-cli --features vm-lab, release (warm rustynetd deps, cli
-  cold): 1m50s** — the exact guest artifact set (`Bootstrap-RustyNetMacos.sh:864`,
+  cold): 1m50s** — the exact guest artifact set (`Bootstrap-RustyNetMacos.sh:881`,
   verified `--release -p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab`).
 
 On-guest-path proxy (the real production cost cross-clone replaces): the
@@ -283,17 +287,20 @@ targets `x86_64/aarch64-unknown-linux-gnu` on pinned 1.88.0 (already present).
 `install_daemon` scp's the host-built binaries + sets `RN_PREBUILT_BINARIES=1`, and
 `rn_bootstrap.sh` stages them into `target/release` and skips the guest build (both
 the rn_bootstrap build block AND `ops e2e-bootstrap-host`, which under the lab's
-`--skip-apt` only installs). Run `state/manual-lab-hostcrossv5-1788504478`: **38 pass
+`--skip-apt` only installs). Run `state/manual-lab-hostcrossv5-1788504478`: **37 pass
 / 0 fail**, guest build skipped, **`bootstrap_hosts` 42s vs ~5m45s native** — the
 reclaimed on-guest build time, and the host build runs once per triple (shared by all
 same-triple nodes) vs native building per node. host-cross-binary is END-TO-END on
-Linux. Remaining: run-matrix `binary_provenance`, configurable glibc floor + pinned
-run_host_cargo toolchain, the macOS adapter, Windows phase 2.
+Linux, and the macOS adapter prebuilt path is wired (`macos_install.rs:129`, `:275`).
+Remaining: run-matrix `binary_provenance`, configurable glibc floor + pinned
+run_host_cargo toolchain, Windows phase 2.
 
 **LIVE-VALIDATED (2026-09-04, tick 94-95):** increment 3c wired host-cross into
 the orchestrator and a real 2-node run (`state/manual-lab-hostcross-1788500276`)
 fired it live — arch probe (uname -m → aarch64), triple dedup, and a host
-`cargo zigbuild` producing 3 binaries — then the whole run passed **38 / 0 / 17**
+`cargo zigbuild` producing 3 binaries — then the whole run passed **37 / 0 / 17**
+(errata 2026-09-04: corrected from 38; recounted from `state/stages.tsv` in both runs —
+37 pass / 0 fail / 17 skip across 54 stage rows each)
 (guest build still runs this increment). The live run surfaced a fail-open the
 unit tests missed: Apple LLVM `objdump -T` parenthesises the version
 (`(GLIBC_2.17) …`), so the token-prefix parser found no symbols and the floor
