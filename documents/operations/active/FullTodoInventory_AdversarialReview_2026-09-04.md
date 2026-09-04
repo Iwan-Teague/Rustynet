@@ -83,3 +83,11 @@ The inventory's §2a addendum and its SHA citations are solid, but roughly **17 
 ## Self-verification
 
 Per the full-mode self-verify requirement, five key findings were re-grepped after drafting: the nas/llm crate+`[[bin]]` existence (#22/#23), the 62-pass `linux_stage_two_hop` count (#1), the `pull-bundle` dispatch at `main.rs:6163` (#39), the rustls dependency line (#35), and the `acquire_append_lock` call sites at `live_lab_run_matrix.rs:872`/`:2632` (#4). All five held on re-check.
+
+## Merge-time verification (Iwan-Teague, 2026-09-04)
+
+Spot-verified before merge. Confirmed clean: #20 (both bash-retirement docs are in `operations/done/`), #35 (`rustls = "0.23"` at `crates/rustynetd/Cargo.toml:41`), #39 (`pull-bundle` dispatch at `main.rs:6163`), and the SHA-existence checks.
+
+**Correction to #1/#29 (the headline).** The finding's *direction* is right — two_hop is no longer "never passed" — but its "62 pass" is the `linux_stage_two_hop` **column**, which AGENTS.md §12.3 documents as contaminated by the historical `traffic_test_matrix` alias. The **authoritative** figure, read from the per-row stage-results ledger (`documents/operations/live_lab_node_stage_results.csv`, filtered to `stage == live_two_hop_validation`), is **134 pass / 121 fail / 559 skip** — genuine two_hop passes on the `--node` engine beginning **2026-08-14** (commit `dda439a2`, the firewalld root-cause fix). So the inventory's "never passed" claim is indeed stale, but the correct evidence is the 134 genuine stage passes, not the 62-count column.
+
+**Follow-on flag:** AGENTS.md §12.3 / CLAUDE.md §12.3 still state `live_two_hop_validation` is "0 pass — it has never passed" (re-counted at `9cdd660f`, before the firewalld fix). The column-lies half of that caution remains valid, but its "0 pass" half is now stale — needs a careful edit that preserves the column caution while correcting the count. Not done here (load-bearing text + AGENTS/CLAUDE mirror; warrants a deliberate change).
