@@ -42,7 +42,7 @@ All four tests exist in `crates/rustynetd/src/daemon.rs`: `load_auto_tunnel_bund
 
 ### 1.5 §E.4 DPAPI startup self-test — DONE (via `9394053`) (MED)
 
-`crates/rustynet-crypto/src/key_material.rs:89` holds `static WINDOWS_DPAPI_STARTUP_SELF_TEST: OnceLock<Result<(), String>>` — the fail-closed startup self-test the plan lists as work. Marked DONE.
+`crates/rustynetd/src/key_material.rs:89` holds `static WINDOWS_DPAPI_STARTUP_SELF_TEST: OnceLock<Result<(), String>>` — the fail-closed startup self-test the plan lists as work. Marked DONE.
 
 ### 1.6 §E.2 peer-map wire bump — genuinely OPEN (LOW, status correct)
 
