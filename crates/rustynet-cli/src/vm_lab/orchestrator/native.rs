@@ -583,6 +583,78 @@ pub(crate) fn execute_rust_native_orchestration(
         ctx.adapters.insert(assignment.alias.clone(), adapter);
     }
 
+    // host-cross-binary (opt-in): build the node binaries on the HOST, per
+    // target triple, before deploy. A strict no-op for every other source mode,
+    // so a working-tree/head run takes the identical path it always has. The
+    // fail-closed guarantee lives here: any arch-probe, build, or glibc-floor
+    // error aborts the whole run before deploy (a host cross-build that would
+    // fault on a guest must never reach the install step). The guest build still
+    // runs today (a later increment skips it via a prebuilt-binaries flag), so
+    // this is a superset of working-tree that additionally proves the host build.
+    if source_mode == orchestrator::stage::source_archive::ArchiveSourceMode::HostCrossBinary {
+        use orchestrator::adapter::ssh;
+        use orchestrator::stage::host_cross_build;
+
+        let repo_dir = std::env::current_dir()
+            .map_err(|e| format!("host-cross: cannot resolve host repo dir: {e}"))?;
+        // Persistent host target dir → warm/incremental across runs (the whole
+        // point vs the guest's always-cold rebuild). Outside the repo tree.
+        let target_root = std::env::temp_dir().join("rustynet-host-cross-target");
+
+        let mut nodes_pa: Vec<(VmGuestPlatform, String)> = Vec::with_capacity(node_entries.len());
+        for (entry, assignment) in &node_entries {
+            let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+            let host = entry
+                .last_known_ip
+                .as_deref()
+                .unwrap_or(entry.ssh_target.as_str())
+                .to_owned();
+            let conn = NodeConnection::ssh(
+                host.clone(),
+                config.ssh_port,
+                entry.ssh_user.clone(),
+                config.ssh_identity_file.clone(),
+                known_hosts.clone(),
+                entry.ssh_password.clone(),
+            )
+            .map_err(|err| {
+                format!(
+                    "host-cross: build SSH connection for '{}' ({host}): {err}",
+                    assignment.alias
+                )
+            })?;
+            let arch = ssh::run_remote(&conn, "uname -m", std::time::Duration::from_secs(30))
+                .map_err(|err| {
+                    format!(
+                        "host-cross: arch probe (uname -m) for '{}' ({host}): {err}",
+                        assignment.alias
+                    )
+                })?
+                .trim()
+                .to_owned();
+            eprintln!("[host-cross] {} -> {platform:?}/{arch}", assignment.alias);
+            nodes_pa.push((platform, arch));
+        }
+
+        // 2.31 floor: every reachable lab guest ships glibc >= 2.31, so a binary
+        // capped at 2.31 runs on all of them. (Configurable in a later increment.)
+        let tasks = host_cross_build::plan_host_builds(&nodes_pa, Some("2.31"))?;
+        eprintln!(
+            "[host-cross] building {} host triple(s) -> {}",
+            tasks.len(),
+            target_root.display()
+        );
+        let artifacts = host_cross_build::run_planned_host_builds(&repo_dir, &target_root, &tasks)?;
+        for a in &artifacts {
+            eprintln!(
+                "[host-cross] built {} ({} binaries, glibc_max={:?})",
+                a.triple,
+                a.binaries.len(),
+                a.glibc_max.as_ref().map(std::string::ToString::to_string)
+            );
+        }
+    }
+
     // Collect per-node OS version strings for nodes.tsv evidence. This must be a
     // real, attributable distro+version: the probe retries transient SSH, and a
     // bare platform placeholder ("linux"/"macos"/"windows") is rejected here and
