@@ -1885,7 +1885,32 @@ pub fn validate_key_custody_permissions(
         )
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // CRY-05 / AUDIT-027 (Windows implementation). Map the owner-only
+        // key-custody policy onto an SDDL assertion, reusing the same audited
+        // checks Windows DPAPI custody uses. `validate_windows_dpapi_root`
+        // requires the directory to carry a PROTECTED DACL (`D:P`) that grants
+        // no broad principal — Everyone (`WD`), Authenticated Users (`AU`) or
+        // Builtin Users (`BU`); `validate_windows_dpapi_file` requires the
+        // file's DACL to grant none of those either. That is at least as strict
+        // as the unix owner-only mode this policy expresses — every caller uses
+        // the 0o700/0o600 default — because access is confined to SYSTEM,
+        // Administrators and specific user SIDs, never a broad group. Any SDDL
+        // read failure or broad ACE fails closed
+        // (`PermissionValidationUnavailable` / `PermissionDenied`), so an
+        // unimplemented or misconfigured ACL can never read as a pass — the
+        // fail-open shape CRY-05 exists to prevent.
+        //
+        // The unix mode bits do not translate to Windows; the SDDL assertion is
+        // the enforcement, so `policy` is intentionally unused here.
+        let _ = policy;
+        validate_windows_dpapi_root(directory)?;
+        validate_windows_dpapi_file(file)?;
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
     {
         // FAIL CLOSED. This used to return `Ok(())` with the note "Windows ACL
         // validation not yet implemented; defer to OS enforcement" — but the
@@ -1896,20 +1921,15 @@ pub fn validate_key_custody_permissions(
         // `read_encrypted_key_file`, i.e. the encrypted-at-rest FALLBACK used
         // when the OS secure store is unavailable. The SecurityMinimumBar
         // requires that fallback to carry "strict permissions and startup
-        // permission checks"; on a non-unix target it carried neither, so the
-        // one control standing between a world-readable key file and the
-        // process was absent. "Defer to OS enforcement" is not enforcement —
-        // nothing had asked the OS anything.
+        // permission checks"; on a target with no permission model we can
+        // assert, it carries neither, so the one control standing between a
+        // world-readable key file and the process is absent. "Defer to OS
+        // enforcement" is not enforcement — nothing had asked the OS anything.
         //
-        // `PermissionValidationUnavailable` is the honest answer, and the
-        // variant already existed for exactly this shape (the Windows DPAPI
-        // validators return it when an SDDL read fails). Windows key custody
-        // proper goes through DPAPI, which has its own SDDL checks, so this
-        // arm bites only on the fallback path that was never validated.
-        //
-        // Implementing it means mapping `KeyCustodyPermissionPolicy`'s unix
-        // mode bits onto an SDDL assertion; until then a loud failure is
-        // correct. CRY-05 / AUDIT-027.
+        // `PermissionValidationUnavailable` is the honest answer. Windows now
+        // has a real SDDL arm above (the same validators DPAPI custody uses);
+        // this stub bites only on platforms that are neither unix nor Windows,
+        // where no permission mapping exists. CRY-05 / AUDIT-027.
         let _ = (directory, file, policy);
         Err(CryptoError::PermissionValidationUnavailable)
     }
