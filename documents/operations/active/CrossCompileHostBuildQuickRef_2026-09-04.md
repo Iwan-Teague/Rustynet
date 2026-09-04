@@ -18,7 +18,7 @@ Proven, live, on the `--node` engine (validation runs `manual-lab-hostcrossv5-17
 
 **When to use:** an idle powerful host paired with slow/small guests. A 2-core guest building under SSH-starved load is exactly the case; a fleet-wide rebuild between code patches is the other. Skip it when the host is busy — the host build then just relocates the bottleneck.
 
-**Defaults:** `--source-mode` defaults to `working-tree` (`LiveLabHandover_2026-08-14.md:281`); accepted values are parsed in `crates/rustynet-cli/src/vm_lab/capability.rs:850-860`.
+**Defaults:** `--source-mode` defaults to `working-tree` (`LiveLabHandover_2026-08-14.md:281`); its accepted values (`working-tree`, `local-head`, `host-cross-binary`) are parsed by `ArchiveSourceMode::from_arg` in `crates/rustynet-cli/src/vm_lab/orchestrator/stage/source_archive.rs:44-51`. (Note: `capability.rs`'s separate `parse_source_mode_arg` is a different, CLI-level source-mode enum that does **not** include `host-cross-binary` — do not cite it for this flag.)
 
 ## 2. Invocation
 
