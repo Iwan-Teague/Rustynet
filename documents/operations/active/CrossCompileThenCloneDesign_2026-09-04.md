@@ -247,6 +247,39 @@ equivalence gate green for aarch64-apple-darwin; (iii) the `host-cross-binary`
 `source_mode` implementation (§5). Linux (zigbuild) is increment 2 — measure it
 on `debian-headless-*` once the current defect-hunt run frees them.
 
+### 6.2 Measured — Linux zigbuild + the warm-repo nuance (2026-09-04, tick 85)
+
+cargo-zigbuild works out of the box: `brew install zig cargo-zigbuild`; rustup
+targets `x86_64/aarch64-unknown-linux-gnu` on pinned 1.88.0 (already present).
+
+- **Host Linux cross-build** (`x86_64-unknown-linux-gnu.2.31`, COLD, same set
+  `-p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab`): **2m26s** (rc 0).
+  Binaries: rustynetd 6.9M, rustynet-cli 16M.
+- **glibc floor clean:** `objdump -T` shows max **GLIBC_2.29** (under the 2.31 pin;
+  runs on any distro ≥ 2.29 — Debian 13 trixie ships 2.41). The §4.2 glibc-skew
+  risk does NOT materialize with the zig floor pin — the single biggest correctness
+  worry for the Linux target is empirically a non-issue on this binary.
+
+**The warm-repo nuance (probed 2026-09-04) — refines the whole calculus:**
+`debian-headless-2` HAS a persistent `~/Rustynet` with a **537M warm `target/`**
+(nproc=4), UNLIKE the macOS guest (no persistent repo at all). Therefore:
+- **macOS guest** rebuilds COLD every run → cross-clone wins big EVERY run →
+  increment 1 unchanged.
+- **Linux UTM guests** rebuild WARM (persistent `target/`) → incremental, fast →
+  cross-clone's win is SMALLER for a *steady* aarch64 UTM guest. It still wins
+  decisively for: (a) fresh/rebuilt nodes (`rebuild_nodes`, a newly provisioned
+  guest); (b) the **x86 emulated guests** (`linux-x86-*`, `fedora-x86-1`,
+  `windows-x86-1` — x86 on an aarch64 host is emulated, so a native build is slow;
+  a host x86_64 zigbuild at 2m26s cold likely beats them by a wide margin); (c) the
+  lenovo/libvirt guests. Quantify (b) with a cold native build on an x86 guest once
+  one is up.
+
+**Refined recommendation:** increment 1 = macOS cross-clone (biggest, every-run
+win, zero toolchain risk). Increment 2 = Linux zigbuild **targeted at the COLD/x86
+cases** (fresh nodes + emulated x86 guests), NOT the steady warm aarch64 UTM guests
+where native-warm is already fast — so the `host-cross-binary` `source_mode` should
+be *opt-in per node/run*, not a blanket default. Windows is increment 3.
+
 ## 7) Rollout Plan
 
 1. **Phase 1 — macOS clone** (§2.1): no new toolchain, biggest win, exercises all the plumbing (flag, adapters, provenance, evidence) with zero cross risk.
