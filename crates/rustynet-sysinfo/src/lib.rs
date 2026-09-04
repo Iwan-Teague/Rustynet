@@ -8548,4 +8548,47 @@ UnknownState                  9
             "AppArmor has no non-Linux equivalent; the fallback must report no profiles"
         );
     }
+
+    // ---- Additional edge pins (not covered by the golden-fixture blocks
+    // ---- above): the macOS listening-socket parser's address-column quirk
+    // ---- and the arp -n PERM flag.
+
+    #[test]
+    fn parse_netstat_listening_sockets_macos_pins_local_address_column_quirk() {
+        use super::parse_netstat_listening_sockets_macos;
+        // QUIRK (documented, left as-is): the parser both checks for "LISTEN"
+        // in and extracts address:port from column 4 (parts[3]), so only rows
+        // whose fourth field carries both parse. A genuine macOS
+        // `netstat -an` listening row (state in the last column) is dropped:
+        let realistic = "\
+Active Internet connections (only listening)
+tcp4 0 0 *.22 *.* LISTEN
+";
+        assert!(
+            parse_netstat_listening_sockets_macos(realistic).is_empty(),
+            "pins current behavior: state-in-last-column rows do not parse"
+        );
+        // A row shaped the way the parser accepts: suffix after the final '.'
+        // is the port, everything before it the address.
+        let sockets = parse_netstat_listening_sockets_macos("hdr\ntcp4 0 0 x.LISTEN.8443 *.* -\n");
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].protocol, "tcp4");
+        assert_eq!(sockets[0].address, "x.LISTEN");
+        assert_eq!(sockets[0].port, 8443);
+    }
+
+    #[test]
+    fn parse_arp_n_row_flags_perm_rows() {
+        use super::parse_arp_n_row;
+        let entry = parse_arp_n_row("10.0.0.2 0x1 aa:bb:cc:dd:ee:ff * brd eth0 PERM")
+            .expect("six-column PERM row must parse");
+        assert_eq!(entry.ip, "10.0.0.2");
+        assert_eq!(entry.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(entry.interface, "eth0");
+        assert!(entry.is_permanent);
+        assert_eq!(entry.age_secs, None);
+        let entry = parse_arp_n_row("10.0.0.3 0x1 11:22:33:44:55:66 * brd eth0 REACHABLE")
+            .expect("row without PERM must parse");
+        assert!(!entry.is_permanent);
+    }
 }
