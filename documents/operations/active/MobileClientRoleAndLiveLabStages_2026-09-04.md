@@ -3,7 +3,7 @@
 - **Date:** 2026-09-04
 - **Status:** DESIGN ONLY — greenfield proposal, **untrusted until reviewed and built**. No code, stage, or matrix row in this document exists yet. Every "proposed" marker below means exactly that.
 - **Companion:** `MobileClientRustArchitecture_2026-09-04.md` (architecture of the mobile Rust stack itself: engine, PacketTunnelProvider / VpnService integration, key custody). This document owns the **node-role semantics** and the **live-lab proving plan**. The architecture doc does not yet exist in the tree at the time of writing; this doc references it by its planned name only.
-- **Mandate served:** `CrossPlatformRoleParityPlan_2026-06-21.md` §2 — no node role is complete until it is **LIVE-LAB-PROVEN**, and no OS may be a capability limiter. The parity status of record is `CrossPlatformRoleParityRefresh_2026-07-23.md` §1 (engine of record: the Rust `--node` orchestrator ledger `documents/operations/live_lab_node_run_matrix.csv`).
+- **Relationship to the parity mandate (corrected 2026-09-04):** this is a **newly-scoped greenfield program, not part of the existing release-blocking parity mandate.** `CrossPlatformRoleParityPlan_2026-06-21.md` scopes parity to **macOS + Windows** and explicitly classifies mobile clients as *"out of scope by design … not a parity gap"* (§3 matrix; echoed at `CrossPlatformRoleParityRoadmap_2026-06-22.md`:81). This design does **not** claim mobile is mandated; it *adopts* the mandate's Definition of Done — no role is complete until it is **LIVE-LAB-PROVEN** on the engine of record (the Rust `--node` orchestrator ledger `documents/operations/live_lab_node_run_matrix.csv`, status of record `CrossPlatformRoleParityRefresh_2026-07-23.md` §1) — as the quality bar a mobile program would have to clear. Promotion is gated on live evidence exactly as the desktop cells are, but **adding mobile is a scope decision for the owner, not a pre-existing obligation.**
 - **Read order:** this document follows the repository precedence (`AGENTS.md` §2): Requirements → SecurityMinimumBar → the parity ledgers → this design.
 
 ---
@@ -13,9 +13,46 @@
 1. **No new `NodeRole` variant.** The mobile client *is* `NodeRole::Client`, on a new *platform* (`VmGuestPlatform::Ios` / `::Android`). The platform plumbing already exists; the role-assignment gate and the stage set do not.
 2. **Product capability set on a phone is client-only:** membership, gossip, managed DNS, tunnel dataplane. No exit, anchor, relay, blind-exit, or service-hosting capability is proposed for mobile.
 3. **Enrollment reuses the existing signed single-use token flow unchanged** — new *transports* (QR / deep-link / adb intent), same `verify_and_consume` semantics, same single-use ledger, same replay posture.
-4. **Six new live-lab stage IDs** (plus one setup stage) are proposed for the `--node` engine, with an honest simulator/emulator vs. real-device split per stage, driven by a new **mobile probe transport** (the orchestrator's SSH plane does not apply to a phone or a Simulator).
+4. **Eight new live-lab stage IDs** (plus one setup stage) are proposed for the `--node` engine, with an honest simulator/emulator vs. real-device split per stage, driven by a new **mobile probe transport** (the orchestrator's SSH plane does not apply to a phone or a Simulator).
 5. **Parity matrix gains `ios_client` and `android_client` cells** on the `--node` engine, with the same LIVE-LAB-PROVEN Definition of Done as every desktop cell.
-6. **Phased plan M0–M4**, smallest live proof first: boot → enroll+join → dataplane → resilience → parity promotion. The role gate (`role.rs:93-94,110`) is widened **only after** M1–M3 are green — the same posture-promotion discipline the Windows exit role followed.
+6. **Phased plan M0–M4**, smallest live proof first: boot → enroll+join → dataplane → resilience → parity promotion. The role gate (`role.rs:94,110` and the sibling arms in expanded §1.4) is widened **only after** M1–M3 are green — the same posture-promotion discipline the Windows exit role followed.
+
+---
+
+## 0.1 Corrections and caveats from adversarial review (2026-09-04)
+
+This design was adversarially reviewed in
+`MobileClientRoleAndLiveLabStages_AdversarialReview_2026-09-04.md`. Its findings
+are folded in here, each re-verified against the working tree:
+
+- **This is not mandated parity work.** The header's original "mandate served"
+  framing was corrected: `CrossPlatformRoleParityPlan_2026-06-21.md` scopes
+  parity to macOS + Windows and classifies mobile clients as "out of scope by
+  design … not a parity gap" (§3 matrix; echoed at
+  `CrossPlatformRoleParityRoadmap_2026-06-22.md`:81). Mobile is a greenfield
+  program that *adopts* the parity Definition of Done; adding it is a scope
+  decision for the owner, not a pre-existing release obligation. Summary item 5's
+  "same LIVE-LAB-PROVEN DoD as every desktop cell" is the bar a mobile cell would
+  have to clear, not a claim that the mandate already requires it.
+- **The promotion gate is wider than §1.4 first stated.** Beyond
+  `is_supported_for_platform` / `is_lab_assignable_for_platform`,
+  `daemon_node_role_for_platform` (`role.rs:172`),
+  `product_capabilities_for_platform` (`role.rs:183`, which returns `Err`), and
+  `impl TryFrom<VmGuestPlatform> for TopologyPlatform` (`vm_lab/topology.rs:101`)
+  also fail closed on `Ios | Android` and must be widened in the same commit —
+  see the expanded §1.4 item 4. A promotion that flips only the support gate
+  dead-ends at daemon-role assignment and capability emission.
+- **Citation fix:** the replay-report evaluator is `evaluate_enrollment_replay_report`
+  at `vm_lab/mod.rs:21222`, not `lab_state.rs:7620` (corrected at §1.5 and §7).
+  The separate MCP flag-mapping cite `lab_state.rs:6491-6495` is correct and
+  unchanged.
+- **Stage count fix:** the summary said "six new stage IDs"; the §3.3 table and
+  §3's own "nine rows" wording list **eight** new live-lab stages plus one setup
+  stage (nine total). Corrected to eight.
+
+Review verdict: buildable as a newly-scoped program, sound in its
+reuse-`Client`-add-a-platform thesis, provided the mandate framing and the full
+gate list above are read as corrected here.
 
 ---
 
@@ -60,6 +97,7 @@ The fail-closed rejection at `role.rs:93-94` / `role.rs:110` is **correct today*
 1. `is_lab_assignable_for_platform` widened for `Client × (Ios | Android)` **first** — lab-only, so the orchestrator can run the new stages against a Simulator/emulator without the product claiming support.
 2. `is_supported_for_platform` widened for `Client × (Ios | Android)` **only after** M2 (dataplane) and M3 (resilience) are green on real devices (§5), and the parity refresh matrix is updated in the same change.
 3. The role×platform doc table at `role.rs:61-71` is updated in the same commit as whichever gate moves — the table and the match arms must never drift.
+4. **The other fail-closed mobile arms must widen in the same lockstep, or promotion dead-ends at capability emission.** Widening `is_supported_for_platform` (`role.rs:94`) and `is_lab_assignable_for_platform` (`role.rs:110`) is necessary but not sufficient: the `Ios | Android` arms of `daemon_node_role_for_platform` (`role.rs:172`) and `product_capabilities_for_platform` (`role.rs:183`, which returns `Err`), plus `impl TryFrom<VmGuestPlatform> for TopologyPlatform` (`vm_lab/topology.rs:101`), also reject mobile today. Each is a correct default now, and each must be widened — keeping its negative test for the roles that stay unsupported — in the same commit that flips `is_supported_for_platform`; otherwise a "supported" mobile client still cannot be assigned a daemon role or emit capabilities. (The bootstrap / `VerifySshReachability` plane is handled separately by the mobile probe transport, §2.2, not here.)
 
 ---
 
@@ -71,7 +109,7 @@ The enrollment machinery is platform-agnostic and is reused **unchanged**:
 
 - Token model: `rustynetd/src/enrollment_token.rs:104` (`pub struct EnrollmentToken`), 32-byte secret, `mint_token(_with_clock)` / `verify_and_consume_token(_with_now)`; the secret is zeroised on drop (`enrollment_token.rs:1359`) and `Debug` redacts to tag + token id (`enrollment_token_audit.rs:55`, `secret_log_audit.rs:263`).
 - Consumption is a **two-step** verify-then-ledger (`rustynetd/src/enrollment_consume.rs:9-11`), with the single-use ledger under a lock (RSA-0023, `acquire_ledger_lock`).
-- Replay posture is already lab-proven (ENR-1 / TOCTOU-1 / RSA-0023 — sequential replay denied; 8 concurrent racers yield exactly 1 winner; validator `evaluate_enrollment_replay_report`, cited at `lab_state.rs:7620`).
+- Replay posture is already lab-proven (ENR-1 / TOCTOU-1 / RSA-0023 — sequential replay denied; 8 concurrent racers yield exactly 1 winner; validator `evaluate_enrollment_replay_report`, cited at `vm_lab/mod.rs:21222`).
 - Anchor serves the enrollment endpoint (`RoleCapability::AnchorEnrollmentEndpoint`, `roles.rs`); the admin path writes hardened 0600 token files (`rustynet-cli/src/main.rs:8129-8315`, consume at `main.rs:8265`, mint subcommand at `main.rs:8181-8196`).
 
 ### 2.2 New piece: token *transport* to the phone (design)
@@ -235,7 +273,7 @@ Each milestone lands as its own commit(s) with the full §7 gate list for touche
 - `crates/rustynet-cli/src/vm_lab/orchestrator/stage/mod.rs:30-90,92-97,99-132,134-167,173-330` — stage modules, catalog macro, suites/tiers, existing rows.
 - `crates/rustynet-control/src/roles.rs:6-41,18-21,44-62` — `RoleCapability`, append-only ordering/signed pre-image.
 - `rustynetd/src/enrollment_token.rs:104,1359`; `rustynetd/src/enrollment_consume.rs:9-11`; `rustynetd/src/enrollment_replay_audit.rs`; `rustynet-cli/src/main.rs:8129-8315,8181-8196,8265`; `rustynet-cli/src/ops_install_systemd.rs:56` — enrollment token, consume, ledger, replay audit, hardened token files.
-- `rustynet-cli/src/main.rs:4478-4484`; `vm_lab/topology.rs:511-515`; `vm_lab/run_exclusion.rs:465-471`; `lab_state.rs:7620` (evaluator), `:6491-6495` (MCP flag mapping) — selectors and MCP plumbing.
+- `rustynet-cli/src/main.rs:4478-4484`; `vm_lab/topology.rs:511-515`; `vm_lab/run_exclusion.rs:465-471`; `vm_lab/mod.rs:21222` (evaluator), `lab_state.rs:6491-6495` (MCP flag mapping) — selectors and MCP plumbing.
 - `documents/operations/live_lab_node_run_matrix.csv` — ledger schema the `ios_*`/`android_*` blocks extend.
 - `documents/operations/active/CrossPlatformRoleParityRefresh_2026-07-23.md` §0-§2 — mandate, status matrix, critical path.
 - `documents/operations/active/CrossPlatformRoleParityPlan_2026-06-21.md`, `CrossPlatformRoleParityRoadmap_2026-06-22.md` — decree + FAIL-LOUD live-stage spec.

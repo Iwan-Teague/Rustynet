@@ -9,12 +9,52 @@
 
 ## 0) Executive summary
 
-1. **The tunnel core can be ~100% Rust, shared with desktop, unchanged.** The vendored boringtun fork (`third_party/boringtun`) is already a *noise-only* library — its platform I/O (epoll/kqueue/tun device code, FFI, JNI) exists in-tree but is **not compiled in** (`third_party/boringtun/src/lib.rs:13` exposes only `pub mod noise`). Rustynet's own engine (`crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:10`) drives `boringtun::noise::{Packet, Tunn, TunnResult}` directly from its own I/O loop, with no platform dependency beyond a UDP socket and a tun fd. Both of those exist on mobile: the OS hands the app a tun fd, and boringtun handles the rest.
+1. **The tunnel core can be ~100% Rust, shared with desktop, unchanged.** The vendored boringtun fork (`third_party/boringtun`) is already a *noise-only* library — its platform I/O (epoll/kqueue/tun device code, FFI, JNI) exists in-tree but is **not compiled in** (`third_party/boringtun/src/lib.rs:8` exposes only `pub mod noise`). Rustynet's own engine (`crates/rustynet-backend-wireguard/src/userspace_shared/engine.rs:10`) drives `boringtun::noise::{Packet, Tunn, TunnResult}` directly from its own I/O loop, with no platform dependency beyond a UDP socket and a tun fd. Both of those exist on mobile: the OS hands the app a tun fd, and boringtun handles the rest.
 2. **The external-fd injection path already exists on macOS** — `userspace_shared_macos/tun.rs:979` (`open_utun_device`) wraps an externally-created utun via `rustynet_tun::SyncDevice::from_raw_fd` (:997). An iOS PacketTunnelProvider hands the extension exactly such an fd. The same constructor pattern is what Android needs (~20 lines: a `from_raw_fd`-style constructor over a plain read/write fd with no header framing).
 3. **The honest overall verdict is NO for "100% Rust app," YES for "≈100% Rust core,"** with an irreducible native shim per platform of roughly 5–12% of the client codebase (UI + VPN-service lifecycle + key-store plumbing + packaging). Numbers in §8.
 4. **The key-custody seam for mobile key stores already exists:** `rustynet-crypto` defines `pub trait OsSecureStore` (`crates/rustynet-crypto/src/lib.rs:312`) and a generic `KeyCustodyManager<S: OsSecureStore>` (:381). iOS Keychain and Android Keystore adapters implement this trait; no core change is required. This directly satisfies SecurityMinimumBar §4 ("OS key store usage where available", `documents/SecurityMinimumBar.md:216-222`).
 5. **Biggest architectural caution:** `rustynetd`'s `DaemonRuntime` (`crates/rustynetd/src/daemon.rs:4655`, 38,215 LOC file, 187 `cfg(target_os)` sites in that file alone) is *not* the thing to port. The mobile core should reuse the **domain layer + the backend abstraction + the userspace engine**, and build a new, small, mobile-native orchestrator on top — not shrink the desktop daemon. Detail in §2.4 and §7.
 6. **Recommended FFI:** UniFFI for both platforms (one interface definition, Swift + Kotlin bindings generated, async-friendly, no C header management). swift-bridge/cxx are better only if the iOS side demands zero-copy Swift-native types at scale, which a control-plane API does not. Detail in §6.
+
+---
+
+## 0.1) Corrections and caveats from adversarial review (2026-09-04)
+
+This study was adversarially reviewed in
+`MobileClientRustArchitecture_AdversarialReview_2026-09-04.md`. Its findings are
+folded in here. Three factual citations in the body were re-verified against the
+working tree and corrected in place:
+
+- boringtun's `pub mod noise` is at `third_party/boringtun/src/lib.rs:8`, not `:13`.
+- `RolePreset` has **9** variants, not 8 — the original list omitted `BlindRelay`
+  (Client/Admin/Exit/BlindExit/Relay/Anchor/Nas/Llm/**BlindRelay**;
+  `crates/rustynet-control/src/role_presets.rs:41`).
+- The compiled boringtun surface is **~2,700 LOC** (the `src/noise/` tree measures
+  2,678), not ~3,600; the itemized file sizes already sum to ~2,655.
+
+Three design-level caveats the body understates — none fatal, but each is real
+work the "≈100% Rust core" headline must carry as an asterisk:
+
+1. **Android has a native seam *in the dataplane*, not only in the lifecycle.**
+   The WireGuard transport UDP socket the Rust engine opens must be excluded from
+   the tunnel via `VpnService.protect(fd)`, or the app's own encrypted packets are
+   routed back into the tun and loop. So "everything after the fd is Rust" needs a
+   qualifier: the outbound transport socket's fd must round-trip through a
+   one-call native `protect()` hook (per socket, and again on roam/rebind). This
+   is small, but it is a native call on the packet path — §3.4 and the §0 summary
+   should not imply the dataplane is native-free once the tun fd exists.
+2. **The FFI must not hardcode `fn start_tunnel(fd: i32, …)`** (as sketched at §7).
+   §3.2 and §9 already concede iOS may hand the extension an `NEPacketTunnelFlow`
+   packet-array object rather than a raw fd; the entry point must therefore take
+   an abstract packet-source handle (resolved by prototype P1), not an `i32`, or
+   it contradicts the study's own device-seam plan.
+3. **"No core change required" for custody is compile-true but security-false.**
+   The `OsSecureStore` *trait* is reused unchanged, but each platform adapter
+   (Secure-Enclave-wrapped storage on iOS; StrongBox/TEE with fail-loud fallback
+   on Android; the `RequireOsSecureStore` posture; any key attestation) is **new
+   security-bearing code** that must independently satisfy SecurityMinimumBar §4.
+   The 5–12% shim figure (§8) counts lines of code, not security-review surface —
+   the custody adapters deserve core-equivalent scrutiny, not "plumbing" scrutiny.
 
 ---
 
@@ -40,9 +80,9 @@ This trait is the exact seam a mobile backend implements. A `MobileVpnBackend` w
 
 The vendored boringtun fork (`third_party/boringtun`, version 0.7.0, 7,586 LOC in-tree) is described in its own `Cargo.toml` as a *"Rustynet-local fork of boringtun with a noise-only dependency surface"*. Critically:
 
-- `third_party/boringtun/src/lib.rs:13` exposes **only** `pub mod noise` (plus an `x25519` re-export at :19-25). The upstream platform code that exists in the tree — `device/mod.rs` (884 LOC), `epoll.rs` (416), `kqueue.rs` (337), `tun_darwin.rs` (256), `tun_linux.rs` (159), `ffi/mod.rs` (397), `jni.rs` (271) — is **not compiled**.
+- `third_party/boringtun/src/lib.rs:8` exposes **only** `pub mod noise` (plus an `x25519` re-export at :19-25). The upstream platform code that exists in the tree — `device/mod.rs` (884 LOC), `epoll.rs` (416), `kqueue.rs` (337), `tun_darwin.rs` (256), `tun_linux.rs` (159), `ffi/mod.rs` (397), `jni.rs` (271) — is **not compiled**.
 - Dependencies are pure crypto/utility: x25519-dalek 2.0.1, chacha20poly1305 0.10.0-pre.1, blake2, hmac, aead, rand_core, parking_lot, nix (time-only), tracing. **No tokio. No socket code.**
-- The compiled surface (~3,600 LOC: `noise/handshake.rs` 950, `noise/mod.rs` 845 with `Tunn`/`TunnResult`/`Packet`, timers 335, session 330, rate_limiter 195) is *pure packet-processing state*: handshake state machine, session key derivation, encrypt/decrypt, timers, anti-replay rate limiting. Zero platform assumption.
+- The compiled surface (~2,700 LOC: `noise/handshake.rs` 950, `noise/mod.rs` 845 with `Tunn`/`TunnResult`/`Packet`, timers 335, session 330, rate_limiter 195) is *pure packet-processing state*: handshake state machine, session key derivation, encrypt/decrypt, timers, anti-replay rate limiting. Zero platform assumption.
 
 This is the single most important fact in this document: **Rustynet already ships a userspace WireGuard core that is I/O-free**, and its own engine — not upstream's — drives it.
 
@@ -61,7 +101,7 @@ The tun layer itself, `third_party/rustynet-tun/src/lib.rs` (547 LOC, single fil
 
 Per the import rules (`documents/CODE_MAP.md:311-329`), these crates may be used from any context, including a mobile app:
 
-- **`rustynet-control`** (32,319 LOC) — membership bundles (`SignedMembershipUpdate`, `MembershipState`, Ed25519 `MembershipSignature`), replay watermarks (`MembershipWatermark` + `PerEpochReplayWatermark`), role system: 8-value `RolePreset` enum (Client/Admin/Exit/BlindExit/Relay/Anchor/Nas/Llm) + `validate_transition()` in `crates/rustynet-control/src/role_presets.rs`, gossip, enrollment-token verification.
+- **`rustynet-control`** (32,319 LOC) — membership bundles (`SignedMembershipUpdate`, `MembershipState`, Ed25519 `MembershipSignature`), replay watermarks (`MembershipWatermark` + `PerEpochReplayWatermark`), role system: 9-value `RolePreset` enum (Client/Admin/Exit/BlindExit/Relay/Anchor/Nas/Llm/BlindRelay) + `validate_transition()` in `crates/rustynet-control/src/role_presets.rs`, gossip, enrollment-token verification.
 - **`rustynet-policy`** (3,194 LOC, single `src/lib.rs`) — default-deny `PolicySet`/`PolicyRule`/`AccessRequest` ACL evaluation.
 - **`rustynet-dns-zone`** (1,664 LOC) — Magic DNS signed-zone schema.
 - **`rustynet-crypto`** (4,973 LOC, single `src/lib.rs`) — keys, signing, custody (§5).
@@ -274,7 +314,7 @@ Component-by-component disposition (LOC from the audit; "core" = shared library 
 
 | Component | Disposition | Notes |
 | --- | --- | --- |
-| boringtun noise core (~3,600 LOC compiled) | **Rust** | unchanged, vendored |
+| boringtun noise core (~2,700 LOC compiled) | **Rust** | unchanged, vendored |
 | userspace engine + runtime + fair_drain (~7,500 LOC) | **Rust** | generalize fd acquisition (Android arm) |
 | rustynet-tun (547 LOC) | **Rust** | + ~20-40 LOC Android/iOS arms |
 | backend-api (442 LOC) | **Rust** | unchanged |
