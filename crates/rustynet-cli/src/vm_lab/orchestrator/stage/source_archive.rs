@@ -18,29 +18,19 @@ pub enum ArchiveSourceMode {
     /// (via `git stash create`), so a fix can be guest-tested before it is
     /// committed. Untracked files are not captured.
     WorkingTree,
-    /// OPT-IN cross-compile-then-clone: build the node binaries on the HOST for
-    /// the node's target triple and ship the binary (not the source tree) to
-    /// the guest, per `CrossCompileThenCloneDesign_2026-09-04.md` §5/§6.
+    /// OPT-IN cross-compile-then-clone: ship the same working-tree source AND
+    /// build the node binaries on the HOST for each node's target triple, per
+    /// `CrossCompileThenCloneDesign_2026-09-04.md` §5/§6.
     ///
-    /// SCAFFOLD ONLY — the host build + binary transfer + provenance flow is
-    /// not wired yet. Selecting it is accepted at parse time but fails closed at
-    /// dispatch (see [`resolve_source_tree_ish`] +
-    /// [`HOST_CROSS_BINARY_NOT_IMPLEMENTED`]); it must NEVER silently degrade to
-    /// a source-archive mode, because that would deploy source-built guest
-    /// binaries while reporting host-cross provenance.
+    /// Source still ships (non-build stages read the source root); what this
+    /// mode adds is a host build (native.rs `run_host_cross_build`). The
+    /// fail-closed guarantee lives THERE — a build or glibc-floor error fails the
+    /// run before deploy, so a host cross-build can never be misattributed or
+    /// silently degrade to a source-built guest binary. (The guest build is
+    /// skipped in a later increment; today it still runs, so host-cross is a
+    /// superset of working-tree.)
     HostCrossBinary,
 }
-
-/// Fail-closed message for the not-yet-implemented host-cross-binary mode.
-///
-/// Emitted wherever the archive path would otherwise have to produce a source
-/// tree for [`ArchiveSourceMode::HostCrossBinary`]. Keeping this a hard error
-/// (rather than a fallback) is the whole point of the scaffold: the mode is
-/// reachable end-to-end so the wiring can be verified, but it cannot ship a
-/// misattributed build.
-pub(crate) const HOST_CROSS_BINARY_NOT_IMPLEMENTED: &str = "--source-mode host-cross-binary is accepted but not yet implemented: the host \
-     build + binary transfer + provenance flow (CrossCompileThenCloneDesign_2026-09-04.md \
-     §5/§6) is not wired. Refusing to fall back to a source-archive mode (fail closed).";
 
 /// Map a `--source-mode` CLI value onto the archive mode the Rust-native
 /// orchestrator supports.
@@ -75,11 +65,12 @@ pub fn parse_archive_source_mode(value: Option<&str>) -> Result<ArchiveSourceMod
 fn resolve_source_tree_ish(repo_dir: &Path, mode: ArchiveSourceMode) -> Result<String, String> {
     match mode {
         ArchiveSourceMode::Head => Ok("HEAD".to_owned()),
-        // Fail closed: the host-cross-binary flow ships a host-built binary, not
-        // a source tree, so there is no tree-ish to resolve. Until that flow is
-        // wired, refuse rather than silently archiving source.
-        ArchiveSourceMode::HostCrossBinary => Err(HOST_CROSS_BINARY_NOT_IMPLEMENTED.to_owned()),
-        ArchiveSourceMode::WorkingTree => {
+        // host-cross-binary ships the SAME working-tree source (non-build stages
+        // still read the source root, §5.1) — it additionally builds the node
+        // binaries on the host (native.rs `run_host_cross_build`), where the
+        // fail-closed guarantee now lives: a build or glibc-floor error fails the
+        // whole run before deploy.
+        ArchiveSourceMode::WorkingTree | ArchiveSourceMode::HostCrossBinary => {
             if !working_tree_has_tracked_changes(repo_dir)? {
                 // Clean tracked tree (nothing `git stash create` can snapshot) —
                 // equivalent to HEAD. Untracked files are intentionally excluded
@@ -586,19 +577,24 @@ mod tests {
     }
 
     #[test]
-    fn host_cross_binary_fails_closed_until_implemented() {
-        // Accepted at parse time (wired end-to-end) but MUST refuse to resolve a
-        // source tree — it fails closed rather than degrading to a source
-        // archive. The error precedes any filesystem access, so the path is
-        // irrelevant.
-        let err = resolve_source_tree_ish(
-            Path::new("/nonexistent"),
-            ArchiveSourceMode::HostCrossBinary,
-        )
-        .expect_err("host-cross-binary must not resolve a source tree yet");
-        assert!(
-            err.contains("not yet implemented"),
-            "expected fail-closed not-implemented error, got: {err}"
+    fn host_cross_binary_resolves_source_like_working_tree() {
+        // host-cross ships the SAME working-tree source (the host build is
+        // triggered separately in native.rs); resolving the tree-ish must be
+        // identical to WorkingTree, never a special/error path. On a clean tree
+        // both fall back to HEAD deterministically.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        git(repo, &["init", "-q"]);
+        std::fs::write(repo.join("f.txt"), b"x").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "init"]);
+        assert_eq!(
+            resolve_source_tree_ish(repo, ArchiveSourceMode::HostCrossBinary).unwrap(),
+            resolve_source_tree_ish(repo, ArchiveSourceMode::WorkingTree).unwrap(),
+        );
+        assert_eq!(
+            resolve_source_tree_ish(repo, ArchiveSourceMode::HostCrossBinary).unwrap(),
+            "HEAD"
         );
     }
 
