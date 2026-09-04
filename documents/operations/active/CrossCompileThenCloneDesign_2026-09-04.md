@@ -279,6 +279,17 @@ targets `x86_64/aarch64-unknown-linux-gnu` on pinned 1.88.0 (already present).
   lenovo/libvirt guests. Quantify (b) with a cold native build on an x86 guest once
   one is up.
 
+**LIVE-VALIDATED (2026-09-04, tick 94-95):** increment 3c wired host-cross into
+the orchestrator and a real 2-node run (`state/manual-lab-hostcross-1788500276`)
+fired it live — arch probe (uname -m → aarch64), triple dedup, and a host
+`cargo zigbuild` producing 3 binaries — then the whole run passed **38 / 0 / 17**
+(guest build still runs this increment). The live run surfaced a fail-open the
+unit tests missed: Apple LLVM `objdump -T` parenthesises the version
+(`(GLIBC_2.17) …`), so the token-prefix parser found no symbols and the floor
+check silently passed; fixed (substring match, both GNU + LLVM formats,
+e41267b0). Run host-cross with the pinned 1.88.0 toolchain PATH — the
+aarch64-linux cross target lives there, not on Homebrew.
+
 **Refined recommendation:** increment 1 = macOS cross-clone (biggest, every-run
 win, zero toolchain risk). Increment 2 = Linux zigbuild **targeted at the COLD/x86
 cases** (fresh nodes + emulated x86 guests), NOT the steady warm aarch64 UTM guests
