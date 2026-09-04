@@ -257,7 +257,15 @@ pub fn install_daemon_from_workdir(
     // protects against a future refactor producing an invalid utun name.
     validate_utun_name(&utun_name_for_node_id(&node_id))?;
 
-    let env_content = build_bootstrap_env(&node_id, &role, ctx)?;
+    // host-cross-binary: same as install_daemon — ship prebuilts + flag the
+    // bootstrap to skip the build. This is the path macOS nodes with a configured
+    // workdir (rustynet_src_dir) actually take.
+    let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
+        .map_err(|message| AdapterError::Protocol { message })?;
+    let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
+    if prebuilt_binaries.is_some() {
+        env_content.push_str("\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR=/tmp/rn_prebuilt\n");
+    }
     let env_tmp = write_temp_file("rn_macos_env_", ".env", env_content.as_bytes())?;
     let script_tmp = write_temp_file("rn_macos_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
     let install_tmp = write_temp_file(
@@ -288,6 +296,33 @@ pub fn install_daemon_from_workdir(
     let _ = std::fs::remove_file(&env_tmp);
     let _ = std::fs::remove_file(&script_tmp);
     let _ = std::fs::remove_file(&install_tmp);
+
+    // host-cross: ship the host-built binaries so the bootstrap stages them and
+    // skips the guest build (the workdir path macOS nodes take).
+    if let Some(binaries) = &prebuilt_binaries {
+        ssh::run_remote(conn, "mkdir -p /tmp/rn_prebuilt", SHORT_TIMEOUT)?;
+        for bin in binaries {
+            let name =
+                bin.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| AdapterError::Protocol {
+                        message: format!(
+                            "host-cross: prebuilt binary path has no filename: {}",
+                            bin.display()
+                        ),
+                    })?;
+            ssh::scp_to(
+                conn,
+                bin.as_path(),
+                &format!("/tmp/rn_prebuilt/{name}"),
+                BUILD_TIMEOUT,
+            )?;
+        }
+        eprintln!(
+            "[host-cross] {alias}: shipped {} prebuilt binaries to /tmp/rn_prebuilt",
+            binaries.len()
+        );
+    }
 
     // Pre-warm the relay cargo dep cache on the guest before running the
     // bootstrap. The bootstrap builds rustynet-relay in addition to
