@@ -50,6 +50,7 @@ pub mod exit_handoff;
 pub mod exit_nat_lifecycle_validation;
 pub mod final_cleanup;
 pub mod gossip_convergence_validation;
+pub mod host_cross_build;
 pub mod install;
 pub mod ipv6_leak_validation;
 pub mod key_custody_validation;
