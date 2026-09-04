@@ -251,9 +251,11 @@ pub fn validate_root_managed_shared_runtime_socket(
 mod tests {
     use super::{
         SocketSecurityFacts, validate_owner_only_socket, validate_owner_only_socket_facts,
+        validate_root_managed_shared_runtime_socket,
         validate_root_managed_shared_runtime_socket_facts,
     };
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::net::UnixListener;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -532,5 +534,339 @@ mod tests {
         facts.parent_mode = 0o770; // group-writable parent
         facts.parent_gid = 99; // not the expected gid
         assert_shared_runtime_rejects(facts, "parent directory group mismatch");
+    }
+
+    // ---- owner-only validator: path-level fail-closed coverage ----
+
+    #[test]
+    fn socket_validator_rejects_relative_path() {
+        let err =
+            validate_owner_only_socket(Path::new("relative.sock"), "daemon socket", &[501], &[501])
+                .expect_err("relative path must fail closed");
+        assert!(err.contains("must be absolute"), "got: {err}");
+    }
+
+    #[test]
+    fn owner_only_socket_validator_rejects_missing_socket_path() {
+        let err = validate_owner_only_socket(
+            Path::new("/tmp/rn-local-sec-does-not-exist.sock"),
+            "daemon socket",
+            &[501],
+            &[501],
+        )
+        .expect_err("missing socket path must fail closed");
+        assert!(err.contains("inspect daemon socket failed"), "got: {err}");
+    }
+
+    #[test]
+    fn owner_only_socket_validator_rejects_symlinked_parent_directory() {
+        let dir = unique_dir("rn-local-sec-link-parent");
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let socket = dir.join("rustynetd.sock");
+        let _listener = UnixListener::bind(&socket).expect("socket should bind");
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+            .expect("socket permissions should be owner-only");
+        let link = dir.join("parent-link");
+        symlink(&dir, &link).expect("symlink should be created");
+
+        let err = validate_owner_only_socket(
+            &link.join("rustynetd.sock"),
+            "daemon socket",
+            &[501],
+            &[501],
+        )
+        .expect_err("symlinked parent directory must fail closed");
+        assert!(
+            err.contains("parent directory must be a non-symlink directory"),
+            "got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- owner-only validator: allowlist + precedence (pure, no IO) ----
+
+    #[test]
+    fn owner_only_socket_facts_deny_empty_allowed_owner_lists() {
+        let path = Path::new("/tmp/rustynetd.sock");
+        let err = validate_owner_only_socket_facts(
+            path,
+            "daemon socket",
+            owner_only_valid_facts(),
+            &[],
+            &[],
+        )
+        .expect_err("empty allowlist must deny");
+        assert!(err.contains("owner uid mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn owner_only_socket_facts_reject_broad_mode_before_owner_mismatch() {
+        let path = Path::new("/tmp/rustynetd.sock");
+        let mut facts = owner_only_valid_facts();
+        facts.socket_mode = 0o666;
+        facts.socket_uid = 1000;
+        let err = validate_owner_only_socket_facts(path, "daemon socket", facts, &[501], &[501])
+            .expect_err("broad mode with foreign owner must fail");
+        assert!(
+            err.contains("permissions too broad") && !err.contains("owner uid mismatch"),
+            "mode check must precede owner check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn owner_only_socket_facts_reject_socket_owner_before_parent_owner() {
+        let path = Path::new("/tmp/rustynetd.sock");
+        let mut facts = owner_only_valid_facts();
+        facts.socket_uid = 1000;
+        facts.parent_uid = 1000;
+        let err = validate_owner_only_socket_facts(path, "daemon socket", facts, &[501], &[501])
+            .expect_err("foreign socket and parent owner must fail");
+        assert!(
+            err.contains("owner uid mismatch")
+                && !err.contains("parent directory owner uid mismatch"),
+            "socket owner check must precede parent owner check, got: {err}"
+        );
+    }
+
+    #[test]
+    fn owner_only_socket_facts_reject_world_writable_parent() {
+        let path = Path::new("/tmp/rustynetd.sock");
+        let mut facts = owner_only_valid_facts();
+        facts.parent_mode = 0o702; // world-writable parent
+        let err = validate_owner_only_socket_facts(path, "daemon socket", facts, &[501], &[501])
+            .expect_err("world-writable parent must fail");
+        assert!(
+            err.contains("parent directory has insecure permissions"),
+            "got: {err}"
+        );
+    }
+
+    // ---- shared-runtime validator: allowlist + bypass strictness ----
+
+    #[test]
+    fn shared_runtime_socket_facts_deny_empty_allowed_owner_lists_for_non_root_socket() {
+        let path = Path::new("/run/rustynet/helper.sock");
+        let err = validate_root_managed_shared_runtime_socket_facts(
+            path,
+            "privileged helper socket",
+            shared_runtime_valid_facts(),
+            &[],
+            &[],
+            20,
+        )
+        .expect_err("empty allowlist must deny a non-root socket");
+        assert!(err.contains("owner uid mismatch"), "got: {err}");
+    }
+
+    // NOTE: the root-managed bypass ignores the allowed-owner lists entirely —
+    // an exact uid=0/gid/mode match is the gate. This pins the current design.
+    #[test]
+    fn shared_runtime_root_managed_bypass_accepts_with_empty_allowed_lists() {
+        let path = Path::new("/run/rustynet/helper.sock");
+        let facts = SocketSecurityFacts {
+            socket_mode: 0o660,
+            socket_uid: 0,
+            socket_gid: 998,
+            parent_mode: 0o770,
+            parent_uid: 0,
+            parent_gid: 998,
+        };
+        let result = validate_root_managed_shared_runtime_socket_facts(
+            path,
+            "privileged helper socket",
+            facts,
+            &[],
+            &[],
+            998,
+        );
+        assert!(
+            result.is_ok(),
+            "root-managed facts should bypass allowlists, got: {result:?}"
+        );
+    }
+
+    // NOTE: a root-owned socket with the correct group but mode 0o600 is
+    // REJECTED — the bypass requires exactly 0o660 and uid 0 is outside the
+    // allowlist. This is stricter than strictly necessary (fail-closed), so the
+    // current behavior is pinned rather than treated as a defect.
+    #[test]
+    fn shared_runtime_root_managed_bypass_requires_exact_socket_mode() {
+        let facts = SocketSecurityFacts {
+            socket_mode: 0o600,
+            socket_uid: 0,
+            socket_gid: 20,
+            parent_mode: 0o700,
+            parent_uid: 501,
+            parent_gid: 20,
+        };
+        assert_shared_runtime_rejects(facts, "owner uid mismatch");
+    }
+
+    #[test]
+    fn shared_runtime_root_managed_bypass_requires_exact_parent_mode() {
+        let facts = SocketSecurityFacts {
+            socket_mode: 0o600,
+            socket_uid: 501,
+            socket_gid: 20,
+            parent_mode: 0o775, // root-owned, grouped, but not exactly 0o770
+            parent_uid: 0,
+            parent_gid: 20,
+        };
+        assert_shared_runtime_rejects(facts, "parent directory owner uid mismatch");
+    }
+
+    #[test]
+    fn shared_runtime_insecure_parent_check_precedes_root_managed_allowance() {
+        // A root-owned, correctly-grouped parent must STILL be rejected if it
+        // is world-writable — the insecure-permission check runs before the
+        // root-managed bypass (defense-in-depth, fail-closed).
+        let facts = SocketSecurityFacts {
+            socket_mode: 0o600,
+            socket_uid: 501,
+            socket_gid: 20,
+            parent_mode: 0o777,
+            parent_uid: 0,
+            parent_gid: 20,
+        };
+        assert_shared_runtime_rejects(facts, "parent directory has insecure permissions");
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_reject_owner_mismatch_before_group_mismatch() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.socket_uid = 1000; // foreign owner
+        facts.socket_mode = 0o640; // group bits set...
+        facts.socket_gid = 99; // ...with the wrong gid
+        assert_shared_runtime_rejects(facts, "owner uid mismatch");
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_accept_group_readable_socket_with_expected_gid() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.socket_mode = 0o640; // group-readable, gid matches expected
+        let path = Path::new("/run/rustynet/helper.sock");
+        let result = validate_root_managed_shared_runtime_socket_facts(
+            path,
+            "privileged helper socket",
+            facts,
+            &[501],
+            &[501],
+            20,
+        );
+        assert!(
+            result.is_ok(),
+            "group-readable socket with expected gid should validate, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn shared_runtime_parent_facts_accept_group_writable_parent_with_expected_gid() {
+        let mut facts = shared_runtime_valid_facts();
+        facts.parent_mode = 0o750; // group-writable parent, gid matches expected
+        let path = Path::new("/run/rustynet/helper.sock");
+        let result = validate_root_managed_shared_runtime_socket_facts(
+            path,
+            "privileged helper socket",
+            facts,
+            &[501],
+            &[501],
+            20,
+        );
+        assert!(
+            result.is_ok(),
+            "group-writable parent with expected gid should validate, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn shared_runtime_socket_facts_accept_multi_uid_allowlists() {
+        let path = Path::new("/run/rustynet/helper.sock");
+        let mut facts = shared_runtime_valid_facts();
+        facts.socket_uid = 1002; // second member of the socket allowlist
+        facts.parent_uid = 1000; // first member of the parent allowlist
+        let result = validate_root_managed_shared_runtime_socket_facts(
+            path,
+            "privileged helper socket",
+            facts,
+            &[1000, 1002],
+            &[1000, 1002],
+            20,
+        );
+        assert!(
+            result.is_ok(),
+            "any allowlisted uid should validate, got: {result:?}"
+        );
+    }
+
+    // ---- full public validators against a REAL Unix socket (end-to-end) ----
+
+    fn current_uid() -> u32 {
+        let probe = unique_dir("rn-local-sec-uid");
+        std::fs::create_dir_all(&probe).expect("uid probe dir should exist");
+        let uid = std::fs::metadata(&probe)
+            .expect("uid probe dir should stat")
+            .uid();
+        let _ = std::fs::remove_dir_all(&probe);
+        uid
+    }
+
+    #[test]
+    fn owner_only_socket_validator_accepts_real_owner_only_socket() {
+        let dir = unique_dir("rn-local-sec-e2e-ok");
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let path = dir.join("rustynetd.sock");
+        let _listener = UnixListener::bind(&path).expect("socket should bind");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("socket permissions should be owner-only");
+        let uid = std::fs::metadata(&path).expect("socket should stat").uid();
+
+        validate_owner_only_socket(&path, "daemon socket", &[uid], &[uid])
+            .expect("real owner-only socket should validate");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn owner_only_socket_validator_rejects_group_accessible_real_socket() {
+        let dir = unique_dir("rn-local-sec-e2e-broad");
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let path = dir.join("rustynetd.sock");
+        let _listener = UnixListener::bind(&path).expect("socket should bind");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
+            .expect("socket permissions should be group-accessible");
+        let uid = std::fs::metadata(&path).expect("socket should stat").uid();
+
+        let err = validate_owner_only_socket(&path, "daemon socket", &[uid], &[uid])
+            .expect_err("group-accessible socket must fail closed");
+        assert!(err.contains("permissions too broad"), "got: {err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn shared_runtime_socket_validator_accepts_real_socket_with_matching_gid() {
+        let dir = unique_dir("rn-local-sec-e2e-shared");
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        let path = dir.join("helper.sock");
+        let _listener = UnixListener::bind(&path).expect("socket should bind");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("socket permissions should be owner-only");
+        let metadata = std::fs::metadata(&path).expect("socket should stat");
+
+        validate_root_managed_shared_runtime_socket(
+            &path,
+            "privileged helper socket",
+            &[metadata.uid()],
+            &[metadata.uid()],
+            metadata.gid(),
+        )
+        .expect("real socket with matching gid should validate under shared-runtime policy");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
