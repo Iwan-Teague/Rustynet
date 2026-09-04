@@ -603,6 +603,26 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
 /// reviewed contract in rustynetd `phase10` (`WINDOWS_KS_RULE_*` /
 /// `WINDOWS_DNS_RULE_*`); the NRPT match targets the DNS fail-closed rule that
 /// points the root namespace at the loopback resolver (`windows_dns_failclosed`).
+/// Wait (bounded) for the RustyNet daemon + relay services to reach Stopped, so
+/// [`cleanup_runtime_state`] can reset the killswitch without the still-live
+/// daemon re-applying the default-deny outbound policy afterward. Read-only
+/// polling -- mutates nothing. `WINDOWS_SERVICE_NAME` / `WINDOWS_RELAY_SERVICE_NAME`
+/// are compile-time constants (no untrusted value), keeping the command
+/// argv-only-safe.
+fn windows_wait_services_stopped_script() -> String {
+    format!(
+        "$ErrorActionPreference = 'SilentlyContinue'; \
+         for ($i = 0; $i -lt 20; $i++) {{ \
+             $svc = Get-Service -Name '{WINDOWS_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
+             $relay = Get-Service -Name '{WINDOWS_RELAY_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
+             $svcDown = ($null -eq $svc) -or ($svc.Status -eq 'Stopped'); \
+             $relayDown = ($null -eq $relay) -or ($relay.Status -eq 'Stopped'); \
+             if ($svcDown -and $relayDown) {{ break }}; \
+             Start-Sleep -Seconds 1 \
+         }}"
+    )
+}
+
 fn windows_dataplane_reset_script() -> String {
     const RUSTYNET_FIREWALL_RULES: [&str; 6] = [
         "RustyNetKS-AllowLoopback",
@@ -714,6 +734,17 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
         ],
     )?;
     let _ = run_remote_ps(conn, stop_relay_script.as_str(), SHORT_TIMEOUT);
+
+    // Wait for the daemon (and relay) service to reach Stopped BEFORE resetting
+    // the dataplane below. The Stop-Service calls above only INITIATE the stop;
+    // if the killswitch reset ran while the daemon were still up, its reconcile
+    // loop would re-apply the default-deny outbound policy right after we
+    // cleared it -- the race that left the node "still dirty" (service running +
+    // outbound blocking) and failed the next run's cleanup_hosts, bricking the
+    // guest. Live-lab evidence: run-2026-09-04-windows-6. Best-effort + bounded
+    // (<= ~20s, well inside SHORT_TIMEOUT); a clean/absent service breaks out at
+    // once.
+    let _ = run_remote_ps(conn, &windows_wait_services_stopped_script(), SHORT_TIMEOUT);
 
     // Best-effort reset of leftover RustyNet dataplane artifacts (killswitch
     // firewall rules + default-deny outbound policy, the DNS fail-closed NRPT
