@@ -912,6 +912,7 @@ mod tests {
         parse_dns_zone_verifying_key, parse_signed_dns_zone_bundle_wire,
         render_signed_dns_zone_bundle_wire, verify_signed_dns_zone_bundle,
     };
+    use crate::DnsZoneError;
     use ed25519_dalek::SigningKey;
 
     fn build_bundle_with_expected_ip(
@@ -958,6 +959,56 @@ mod tests {
                 aliases: vec![],
             }],
         )
+    }
+
+    /// Test-input factory mirroring the fixed baseline record used throughout
+    /// this module: an `A` / `mesh_ipv4` record for `node-{label}` at a 60 s TTL,
+    /// with the caller's chosen aliases.
+    fn record_input(label: &str, expected_ip: &str, aliases: &[&str]) -> DnsZoneRecordInput {
+        DnsZoneRecordInput {
+            label: label.to_owned(),
+            target_node_id: format!("node-{label}"),
+            rr_type: DnsRecordType::A,
+            target_addr_kind: DnsTargetAddrKind::MeshIpv4,
+            expected_ip: expected_ip.to_owned(),
+            ttl_secs: 60,
+            aliases: aliases.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Assert the error is `InvalidFormat` and its reason carries `needle`,
+    /// failing with `context` prepended so loop-driven cases name the input.
+    fn assert_invalid_format_contains_ctx(err: &super::DnsZoneError, needle: &str, context: &str) {
+        match err {
+            super::DnsZoneError::InvalidFormat(reason) => assert!(
+                reason.contains(needle),
+                "{context}: expected reason containing {needle:?}, got {reason:?}"
+            ),
+            other => panic!("{context}: expected InvalidFormat, got {other:?}"),
+        }
+    }
+
+    /// Single-shot form of [`assert_invalid_format_contains_ctx`].
+    fn assert_invalid_format_contains(err: &super::DnsZoneError, needle: &str) {
+        assert_invalid_format_contains_ctx(err, needle, "assertion");
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Insert `key=value` as an extra top-level line just above the final
+    /// signature line of a rendered wire bundle.
+    fn inject_wire_field(wire: &str, key: &str, value: &str) -> String {
+        let mut out = String::new();
+        for line in wire.lines() {
+            if line.starts_with("signature=") {
+                out.push_str(&format!("{key}={value}\n"));
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 
     #[test]
@@ -1660,5 +1711,699 @@ mod tests {
             }
             let _ = parse_signed_dns_zone_bundle_wire(&s);
         }
+    }
+
+    // canonicalize_dns_zone_name had no direct coverage at all. Verify the
+    // normalization success paths (trim, case, trailing dot) and the zone-name
+    // maximum length boundary, which is distinct from the relative-name 253 cap.
+    #[test]
+    fn zone_name_normalizes_case_trims_whitespace_and_trailing_dot() {
+        let canonicalized = super::canonicalize_dns_zone_name("  RUSTYNET.  ")
+            .expect("uppercase, whitespace, and trailing dot must normalize");
+        assert_eq!(canonicalized, "rustynet");
+    }
+
+    #[test]
+    fn zone_name_accepts_exactly_max_length() {
+        // 64 bytes is the documented zone-name ceiling; "zone" contributes the
+        // final 5 bytes so the label itself stays within the 63-byte limit.
+        let name = format!("{}.zone", "a".repeat(59));
+        super::canonicalize_dns_zone_name(&name)
+            .expect("64-byte zone name must be accepted at the boundary");
+    }
+
+    #[test]
+    fn zone_name_rejects_over_max_length() {
+        let name = format!("{}.zone", "a".repeat(60));
+        let err = super::canonicalize_dns_zone_name(&name)
+            .expect_err("65-byte zone name must be rejected");
+        match err {
+            DnsZoneError::InvalidFormat(message) => {
+                assert_eq!(message, "dns zone name exceeds max length");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    // canonicalize_dns_relative_name previously had loop-asserted rejection only;
+    // these pin the individual fail-closed messages so a message regression
+    // (which operators see in diagnostics) is caught per-path.
+    #[test]
+    fn relative_name_rejects_empty_and_whitespace_only() {
+        let empty =
+            super::canonicalize_dns_relative_name("").expect_err("empty name must be rejected");
+        let whitespace = super::canonicalize_dns_relative_name("   ")
+            .expect_err("whitespace-only name must be rejected");
+        for err in [empty, whitespace] {
+            match err {
+                DnsZoneError::InvalidFormat(message) => {
+                    assert_eq!(message, "dns name must not be empty");
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relative_name_rejects_leading_dot_and_wildcard() {
+        for bad in [".rustynet", "na*s"] {
+            let err = super::canonicalize_dns_relative_name(bad)
+                .expect_err("forbidden-character names must be rejected");
+            match err {
+                DnsZoneError::InvalidFormat(message) => {
+                    assert_eq!(message, "dns name contains forbidden characters");
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relative_name_rejects_empty_inner_label() {
+        let err = super::canonicalize_dns_relative_name("a..rustynet")
+            .expect_err("empty inner label must be rejected");
+        match err {
+            DnsZoneError::InvalidFormat(message) => {
+                assert_eq!(message, "dns name contains an empty label");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_name_rejects_hyphen_at_label_edges() {
+        for (bad, edge) in [("-nas", "start"), ("nas-", "end")] {
+            let err = super::canonicalize_dns_relative_name(bad)
+                .expect_err("edge hyphen must be rejected");
+            match err {
+                DnsZoneError::InvalidFormat(message) => {
+                    assert_eq!(
+                        message, "dns label must not start or end with '-'",
+                        "edge case: {edge}"
+                    );
+                }
+                other => panic!("unexpected error variant: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn relative_name_rejects_invalid_label_characters() {
+        let err =
+            super::canonicalize_dns_relative_name("na_s").expect_err("underscore must be rejected");
+        match err {
+            DnsZoneError::InvalidFormat(message) => {
+                assert_eq!(message, "dns label contains invalid characters");
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relative_name_normalizes_case_and_trailing_dot() {
+        let canonicalized = super::canonicalize_dns_relative_name("  NAS.Rustynet. ")
+            .expect("mixed case with trailing dot must normalize");
+        assert_eq!(canonicalized, "nas.rustynet");
+    }
+
+    // DnsRecordType / DnsTargetAddrKind string round-trips had no coverage.
+    #[test]
+    fn record_type_and_addr_kind_round_trip_through_strings() {
+        assert_eq!(DnsRecordType::A.as_str(), "A");
+        assert_eq!(
+            "A".parse::<DnsRecordType>(),
+            Ok(DnsRecordType::A),
+            "record type must round-trip from its canonical string"
+        );
+        assert_eq!(DnsTargetAddrKind::MeshIpv4.as_str(), "mesh_ipv4");
+        assert_eq!(
+            "mesh_ipv4".parse::<DnsTargetAddrKind>(),
+            Ok(DnsTargetAddrKind::MeshIpv4),
+            "address kind must round-trip from its canonical string"
+        );
+    }
+
+    #[test]
+    fn record_type_and_addr_kind_reject_unknown_strings() {
+        assert!("CNAME".parse::<DnsRecordType>().is_err());
+        assert!("AAAA".parse::<DnsRecordType>().is_err());
+        assert!("mesh_ipv6".parse::<DnsTargetAddrKind>().is_err());
+        assert!("".parse::<DnsRecordType>().is_err());
+        assert!("".parse::<DnsTargetAddrKind>().is_err());
+    }
+
+    // Error Display strings are the operator-facing surface; pin them.
+    #[test]
+    fn error_display_strings_are_stable() {
+        let invalid = DnsZoneError::InvalidFormat("boom".to_string());
+        assert_eq!(invalid.to_string(), "boom");
+        assert_eq!(
+            DnsZoneError::KeyInvalid.to_string(),
+            "dns zone verifier key is invalid"
+        );
+        assert_eq!(
+            DnsZoneError::SignatureInvalid.to_string(),
+            "dns zone signature verification failed"
+        );
+    }
+
+    #[test]
+    fn error_implements_std_error_trait() {
+        fn assert_std_error<E: std::error::Error>(_: &E) {}
+        assert_std_error(&DnsZoneError::InvalidFormat("x".to_string()));
+        assert_std_error(&DnsZoneError::KeyInvalid);
+        assert_std_error(&DnsZoneError::SignatureInvalid);
+    }
+
+    // dns_zone_watermark_ordering previously only asserted the Equal case;
+    // generated_at is the primary key and nonce the tiebreaker, and the digest
+    // must never influence the comparison.
+    #[test]
+    fn watermark_ordering_primary_key_is_generated_at() {
+        let older = DnsZoneWatermark {
+            version: 1,
+            generated_at_unix: 1_000,
+            nonce: 999,
+            payload_digest: [1u8; 32],
+        };
+        let newer = DnsZoneWatermark {
+            version: 1,
+            generated_at_unix: 2_000,
+            nonce: 1,
+            payload_digest: [2u8; 32],
+        };
+        assert_eq!(
+            dns_zone_watermark_ordering(&newer, &older),
+            std::cmp::Ordering::Greater,
+            "newer watermark sorts Greater even with a smaller nonce"
+        );
+        assert_eq!(
+            dns_zone_watermark_ordering(&older, &newer),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn watermark_ordering_breaks_ties_on_nonce() {
+        let watermark = DnsZoneWatermark {
+            version: 1,
+            generated_at_unix: 1_000,
+            nonce: 7,
+            payload_digest: [0u8; 32],
+        };
+        let mut higher_nonce = watermark.clone();
+        higher_nonce.nonce = 8;
+        assert_eq!(
+            dns_zone_watermark_ordering(&higher_nonce, &watermark),
+            std::cmp::Ordering::Greater
+        );
+        // Different digest and version must not affect ordering at equal
+        // generated_at and nonce.
+        let mut different_digest = watermark.clone();
+        different_digest.payload_digest = [9u8; 32];
+        different_digest.version = 2;
+        assert_eq!(
+            dns_zone_watermark_ordering(&different_digest, &watermark),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    // Builder input-validation edges not covered by the ttl/range tests.
+    #[test]
+    fn builder_rejects_generated_at_unix_zero() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let err = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            0,
+            60,
+            42,
+            &vec![record_input("nas", "100.64.0.5", &[])],
+        )
+        .expect_err("generated_at_unix of zero must be rejected");
+        assert_invalid_format_contains(&err, "generated_at_unix must be greater than zero");
+    }
+
+    #[test]
+    fn builder_rejects_empty_records() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let err = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![],
+        )
+        .expect_err("empty record list must be rejected");
+        assert_invalid_format_contains(&err, "dns zone requires at least one record");
+    }
+
+    #[test]
+    fn builder_rejects_record_count_over_maximum() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let records: Vec<DnsZoneRecordInput> = (0..=super::MAX_RECORD_COUNT)
+            .map(|i| record_input(&format!("node-{i}"), "100.64.0.5", &[]))
+            .collect();
+        assert_eq!(records.len(), super::MAX_RECORD_COUNT + 1);
+        let err = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &records,
+        )
+        .expect_err("record count above the maximum must be rejected");
+        assert_invalid_format_contains(&err, "dns zone exceeds max record count (1024)");
+    }
+
+    #[test]
+    fn builder_trims_subject_node_id_and_rejects_blank() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "  client-1  ",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input("nas", "100.64.0.5", &[])],
+        )
+        .expect("surrounding whitespace on subject must be trimmed away");
+        assert_eq!(bundle.subject_node_id, "client-1");
+
+        let err = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "   ",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input("nas", "100.64.0.5", &[])],
+        )
+        .expect_err("whitespace-only subject must be rejected");
+        assert_invalid_format_contains(&err, "subject_node_id must not be empty");
+    }
+
+    #[test]
+    fn builder_accepts_nonce_zero_and_round_trips() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            0,
+            &vec![record_input("nas", "100.64.0.5", &[])],
+        )
+        .expect("nonce zero is a legal watermark value");
+        assert_eq!(bundle.nonce, 0);
+        let wire = render_signed_dns_zone_bundle_wire(&bundle);
+        let parsed =
+            parse_signed_dns_zone_bundle_wire(&wire).expect("nonce-zero bundle must round-trip");
+        assert_eq!(parsed.nonce, 0);
+    }
+
+    #[test]
+    fn builder_rejects_duplicate_record_fqdn() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let err = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![
+                record_input("nas", "100.64.0.5", &[]),
+                record_input("NAS", "100.64.0.6", &[]),
+            ],
+        )
+        .expect_err("case-folded duplicate record names must be rejected");
+        assert_invalid_format_contains(&err, "duplicate dns record name");
+    }
+
+    // Alias handling: sort/dedup on build, per-alias cap, whitespace tolerance,
+    // and alias-vs-record-name collision.
+    #[test]
+    fn builder_sorts_and_dedups_aliases() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input(
+                "nas",
+                "100.64.0.5",
+                &["zeta.rustynet", "alpha.rustynet", "ZETA.rustynet"],
+            )],
+        )
+        .expect("unsorted, duplicated aliases must be canonicalized");
+        assert_eq!(
+            bundle.records[0].aliases,
+            vec!["alpha.rustynet".to_string(), "zeta.rustynet".to_string()],
+            "aliases must be sorted and deduplicated after case folding"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_more_than_max_aliases() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let aliases: Vec<String> = (0..=super::MAX_ALIAS_COUNT)
+            .map(|i| format!("alias-{i}.rustynet"))
+            .collect();
+        let err = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input(
+                "nas",
+                "100.64.0.5",
+                &aliases.iter().map(String::as_str).collect::<Vec<_>>(),
+            )],
+        )
+        .expect_err("alias count above the maximum must be rejected");
+        assert_invalid_format_contains(&err, "dns record exceeds maximum alias count (8)");
+    }
+
+    // The builder canonicalizes each alias individually, so a blank entry is
+    // rejected outright; duplicated-but-valid aliases are folded by the
+    // sort+dedup step. Documents current builder behavior.
+    #[test]
+    fn builder_folds_duplicate_aliases_and_rejects_blank_entries() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input(
+                "nas",
+                "100.64.0.5",
+                &["  home.rustynet  ", "home.rustynet"],
+            )],
+        )
+        .expect("duplicated aliases must fold to one canonical entry");
+        assert_eq!(bundle.records[0].aliases, vec!["home.rustynet".to_string()]);
+
+        let err = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input("nas", "100.64.0.5", &["home.rustynet", ""])],
+        )
+        .expect_err("a blank alias entry must be rejected by name canonicalization");
+        assert_invalid_format_contains(&err, "dns name must not be empty");
+    }
+
+    // An alias equal to the record's OWN fqdn is accepted by the builder; the
+    // collision check only fires against names seen on OTHER records (covered
+    // by the pre-existing collision test). Documents current behavior.
+    #[test]
+    fn builder_allows_alias_equal_to_own_record_fqdn() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input("nas", "100.64.0.5", &["nas.rustynet"])],
+        )
+        .expect("an alias equal to the record's own fqdn is currently accepted");
+        assert_eq!(bundle.records[0].aliases, vec!["nas.rustynet".to_string()]);
+    }
+
+    #[test]
+    fn aliases_survive_wire_round_trip_in_canonical_order() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input(
+                "nas",
+                "100.64.0.5",
+                &["gamma.rustynet", "beta.rustynet"],
+            )],
+        )
+        .expect("aliases must build");
+        let wire = render_signed_dns_zone_bundle_wire(&bundle);
+        let parsed =
+            parse_signed_dns_zone_bundle_wire(&wire).expect("bundle with aliases must round-trip");
+        assert_eq!(
+            parsed.records[0].aliases,
+            vec!["beta.rustynet".to_string(), "gamma.rustynet".to_string()]
+        );
+    }
+
+    // expected_ip classification edges beyond the loopback/link-local/doc-range
+    // cases already covered: unspecified, multicast, broadcast, and non-IPv4.
+    #[test]
+    fn builder_rejects_unspecified_multicast_and_broadcast_ips() {
+        for ip in ["0.0.0.0", "224.0.0.1", "255.255.255.255"] {
+            let err = build_bundle_with_expected_ip(ip)
+                .expect_err("non-unicast addresses must be rejected");
+            assert_invalid_format_contains_ctx(
+                &err,
+                "must be a unicast ipv4 address",
+                &format!("ip {ip}"),
+            );
+        }
+    }
+
+    #[test]
+    fn builder_rejects_non_ipv4_expected_ip() {
+        let err = build_bundle_with_expected_ip("not-an-ip")
+            .expect_err("non-IPv4 strings must be rejected");
+        assert_invalid_format_contains(&err, "must be ipv4");
+    }
+
+    // parse_dns_zone_verifying_key input handling (length/char/format), distinct
+    // from cryptographic verification correctness which has its own coverage.
+    #[test]
+    fn verifying_key_parser_requires_first_line_of_exact_length() {
+        let err = parse_dns_zone_verifying_key("").expect_err("empty contents must be rejected");
+        assert_invalid_format_contains(&err, "missing dns zone verifier key");
+
+        let short = "a".repeat(62);
+        let err =
+            parse_dns_zone_verifying_key(&short).expect_err("31-byte hex key must be rejected");
+        assert_invalid_format_contains(&err, "hex value has invalid length");
+
+        let mut bad_char = "g".to_string();
+        bad_char.push_str(&"a".repeat(63));
+        let err = parse_dns_zone_verifying_key(&bad_char)
+            .expect_err("non-hex characters must be rejected");
+        assert_invalid_format_contains(&err, "hex value contains invalid character");
+    }
+
+    #[test]
+    fn verifying_key_parser_takes_first_non_empty_line() {
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let hex = hex_encode(key.verifying_key().as_bytes());
+        let contents = format!("\n  \n{hex}\ntrailing junk that is not a key\n");
+        let parsed = parse_dns_zone_verifying_key(&contents)
+            .expect("first non-empty line must be selected and parse");
+        assert_eq!(parsed.as_bytes(), key.verifying_key().as_bytes());
+    }
+
+    // verify_signed_dns_zone_bundle structural checks (hex decoding + timestamp
+    // ordering) asserted without exercising signature verification itself.
+    #[test]
+    fn verify_rejects_malformed_signature_hex_without_touching_crypto() {
+        let mut bundle = build_bundle_with_expected_ip("100.64.0.5").expect("bundle must build");
+        bundle.signature_hex = "zz".repeat(64);
+        let err = verify_signed_dns_zone_bundle(
+            &bundle,
+            &SigningKey::from_bytes(&[42u8; 32]).verifying_key(),
+        )
+        .expect_err("invalid hex characters in the signature must be rejected before verification");
+        assert_invalid_format_contains(&err, "hex value contains invalid character");
+
+        bundle.signature_hex = "ab".repeat(31);
+        let err = verify_signed_dns_zone_bundle(
+            &bundle,
+            &SigningKey::from_bytes(&[42u8; 32]).verifying_key(),
+        )
+        .expect_err("short signature hex must be rejected");
+        assert_invalid_format_contains(&err, "hex value has invalid length");
+    }
+
+    #[test]
+    fn verify_rejects_expires_at_or_before_generated_at() {
+        let mut bundle = build_bundle_with_expected_ip("100.64.0.5").expect("bundle must build");
+        bundle.expires_at_unix = bundle.generated_at_unix;
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let err = verify_signed_dns_zone_bundle(&bundle, &key.verifying_key())
+            .expect_err("expires_at equal to generated_at must be rejected as expired");
+        assert_invalid_format_contains(&err, "invalid generated/expires ordering");
+    }
+
+    // Wire-parser structural edges: unsupported fields, exact field-count
+    // enforcement, and duplicate names across records on the wire.
+    #[test]
+    fn wire_rejects_unknown_top_level_and_indexed_fields() {
+        let wire = valid_wire_bundle();
+        let with_top = inject_wire_field(&wire, "notes", "hello");
+        let err = parse_signed_dns_zone_bundle_wire(&with_top)
+            .expect_err("unknown top-level field must be rejected");
+        assert_invalid_format_contains(&err, "unsupported dns zone field: notes");
+
+        let wire = valid_wire_bundle();
+        let with_indexed = inject_wire_field(&wire, "record.0.notes", "hello");
+        let err = parse_signed_dns_zone_bundle_wire(&with_indexed)
+            .expect_err("unknown per-record field must be rejected");
+        assert_invalid_format_contains(&err, "unsupported dns zone field: record.0.notes");
+    }
+
+    #[test]
+    fn wire_rejects_field_count_mismatch_with_exact_counts() {
+        // Bumping record_count without adding record.1 lines leaves every
+        // required field readable but short 8 lines, so the exact count check
+        // fires (top-level field reads happen first: dropping a required line
+        // like nonce reports "missing nonce" instead).
+        let wire = valid_wire_bundle();
+        let inflated = wire.replace("record_count=1", "record_count=2");
+        assert_ne!(
+            inflated, wire,
+            "fixture must contain the expected record_count line"
+        );
+        let err = parse_signed_dns_zone_bundle_wire(&inflated)
+            .expect_err("a short record block must trip the exact field-count check");
+        match err {
+            DnsZoneError::InvalidFormat(message) => {
+                assert!(
+                    message.starts_with("dns zone field count mismatch: expected 24, found 16"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wire_rejects_duplicate_record_names_across_records() {
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let bundle = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input("nas", "100.68.1.10", &[])],
+        )
+        .expect("bundle must build");
+        let wire = render_signed_dns_zone_bundle_wire(&bundle);
+        // Duplicate every record.<i>.* line under the next index; the field
+        // count stays consistent but the name appears twice.
+        let mut duplicated: Vec<String> = Vec::new();
+        for line in wire.lines() {
+            duplicated.push(line.to_string());
+            if let Some(rest) = line.strip_prefix("record.0.") {
+                duplicated.push(format!("record.1.{rest}"));
+            }
+        }
+        duplicated.retain(|line| !line.starts_with("record_count="));
+        duplicated.insert(0, "record_count=2".to_string());
+        let wire = format!("{}\n", duplicated.join("\n"));
+        let err = parse_signed_dns_zone_bundle_wire(&wire)
+            .expect_err("two records claiming one name must be rejected");
+        assert_invalid_format_contains(&err, "duplicate dns record name");
+    }
+
+    #[test]
+    fn wire_rejects_record_fqdn_that_disagrees_with_label_and_zone() {
+        let wire = valid_wire_bundle();
+        let rewritten = wire.replace("fqdn=nas.rustynet", "fqdn=other.rustynet");
+        assert_ne!(
+            rewritten, wire,
+            "fixture must contain the expected fqdn line"
+        );
+        let err = parse_signed_dns_zone_bundle_wire(&rewritten)
+            .expect_err("fqdn must equal label + '.' + zone_name");
+        match err {
+            DnsZoneError::InvalidFormat(_) => {}
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    // dns_zone_payload_digest must change whenever any payload-bearing field
+    // changes; the equality baseline is covered by the stability test above.
+    // The payload string is fixed at build time, so two bundles must be built
+    // with different inputs — mutating a field on an existing bundle does not
+    // re-serialize the payload.
+    #[test]
+    fn payload_digest_differs_when_payload_changes() {
+        let key = SigningKey::from_bytes(&[42u8; 32]);
+        let base = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            42,
+            &vec![record_input("nas", "100.64.0.5", &[])],
+        )
+        .expect("base bundle must build");
+        let tweaked = build_signed_dns_zone_bundle(
+            &key,
+            "rustynet",
+            "client-1",
+            1_773_000_000,
+            60,
+            43,
+            &vec![record_input("nas", "100.64.0.5", &[])],
+        )
+        .expect("tweaked bundle must build");
+        assert_ne!(
+            dns_zone_payload_digest(&base),
+            dns_zone_payload_digest(&tweaked),
+            "a nonce change must alter the payload digest"
+        );
+    }
+
+    // render_signed_dns_zone_bundle_wire shape: payload preserved verbatim and a
+    // single trailing signature line of 128 lowercase hex chars.
+    #[test]
+    fn render_appends_single_signature_line_to_payload() {
+        let bundle = build_bundle_with_expected_ip("100.64.0.5").expect("bundle must build");
+        let wire = render_signed_dns_zone_bundle_wire(&bundle);
+        assert!(
+            wire.starts_with(&bundle.payload),
+            "wire must begin with the payload verbatim"
+        );
+        let lines: Vec<&str> = wire.lines().collect();
+        let signature_line = lines.last().expect("wire must end with a signature line");
+        let hex = signature_line
+            .strip_prefix("signature=")
+            .expect("final line must be the signature");
+        assert_eq!(hex.len(), 128, "ed25519 signature is 64 bytes of hex");
+        assert!(
+            hex.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "signature hex must be lowercase"
+        );
     }
 }
