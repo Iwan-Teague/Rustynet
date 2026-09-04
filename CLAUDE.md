@@ -1115,9 +1115,12 @@ gates.
 and the matching `prompt` on every agent in `.opencode/opencode.json` force
 terse, high-density prose: no greetings, no meta-commentary, code-first, over 30
 words of prose means cut it in half. It applies to the grounded agent, both edit
-agents, and both sub-agents — denying the built-in sub-agents by name (above) is
-part of what makes "every spawned agent" true rather than aspirational, since we
-do not control their prompts.
+agents, both sub-agents, AND the read-only proxies (`ai_read`/`ai_write`/
+`ai_read_write`) — the proxy `call()` helper prepends `CAVEMAN_STYLE_DIRECTIVE`
+at the single choke point all three share, so a proxy answer on any provider (GLM
+included) is as terse as an agent's. Denying the built-in sub-agents by name
+(above) is part of what makes "every spawned agent" true rather than
+aspirational, since we do not control their prompts.
 
 The style is **prose only**. Anything written *into* the repo — commit messages,
 code, code comments, documentation — stays normal complete prose, because it is

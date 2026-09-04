@@ -971,6 +971,12 @@ impl AiAgentServer {
     }
 
     fn call(&self, system: &str, user: &str, model: &str) -> Result<String, String> {
+        // Every proxy call (ai_read / ai_write / ai_read_write) inherits the
+        // house terse style automatically, exactly as the grounded agent does —
+        // so a GLM (or any provider) proxy answer stays as terse as an agent's,
+        // with the same repo-artifact / security exemptions baked into the
+        // directive. This is the single choke point for all proxy LLM calls.
+        let system = format!("{system}\n\n{CAVEMAN_STYLE_DIRECTIVE}");
         let messages = json!([
             {"role": "system", "content": system},
             {"role": "user",   "content": user},
