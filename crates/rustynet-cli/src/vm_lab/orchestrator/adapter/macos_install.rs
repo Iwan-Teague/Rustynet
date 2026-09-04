@@ -158,7 +158,15 @@ pub fn install_daemon(
     // rustynet-cli / rustynet-relay), matching Bootstrap-RustyNetMacos.sh's
     // RN_PREBUILT_DIR staging.
     if let Some(binaries) = &prebuilt_binaries {
-        ssh::run_remote(conn, "mkdir -p /tmp/rn_prebuilt", SHORT_TIMEOUT)?;
+        let mkdir = ssh::RemoteCommand::from_args(
+            "host-cross prebuilt dir",
+            &[
+                ValidatedArg::cli_token("mkdir")?,
+                ValidatedArg::cli_token("-p")?,
+                ValidatedArg::path("/tmp/rn_prebuilt")?,
+            ],
+        )?;
+        ssh::run_remote(conn, mkdir.as_str(), SHORT_TIMEOUT)?;
         for bin in binaries {
             let name =
                 bin.file_name()
@@ -300,7 +308,15 @@ pub fn install_daemon_from_workdir(
     // host-cross: ship the host-built binaries so the bootstrap stages them and
     // skips the guest build (the workdir path macOS nodes take).
     if let Some(binaries) = &prebuilt_binaries {
-        ssh::run_remote(conn, "mkdir -p /tmp/rn_prebuilt", SHORT_TIMEOUT)?;
+        let mkdir = ssh::RemoteCommand::from_args(
+            "host-cross prebuilt dir",
+            &[
+                ValidatedArg::cli_token("mkdir")?,
+                ValidatedArg::cli_token("-p")?,
+                ValidatedArg::path("/tmp/rn_prebuilt")?,
+            ],
+        )?;
+        ssh::run_remote(conn, mkdir.as_str(), SHORT_TIMEOUT)?;
         for bin in binaries {
             let name =
                 bin.file_name()
