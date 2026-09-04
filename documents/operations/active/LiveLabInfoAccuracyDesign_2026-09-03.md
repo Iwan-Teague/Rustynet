@@ -6,6 +6,20 @@
 
 ---
 
+## Errata + warnings applied 2026-09-04 (per adversarial review)
+
+Per `LiveLabInfoAccuracyDesign_AdversarialReview_2026-09-04.md` (all errata re-verified by git/grep at HEAD before this edit):
+
+1. **LANDED — Item 2 (§5.2)** landed in commit `1abc7d68`: `validator_report_ok` now returns `ValidatorVerdict { ok, reports }` (`ssh.rs:879`), and reports persist to `logs/<stage>.validator-evidence.json` (`validate_runtime.rs:255`). §5.2 marked DONE below.
+2. **LANDED — Item 4 core (§5.4)** landed in commit `2c10f9d9`: `merge_rustynet_anchor_names` (`macos_dns_failclosed.rs:491`) + nested-aware `read_pf_dns_block_floor` (`:511`). §5.4 marked DONE below (the gate/tripwire part is NOT landed — see warning).
+3. **PARTLY LANDED — Item 9 prune half**: `prune_owned_tables` (`phase10.rs:4847`) is generation-aware and nested-enumerating. The `orphaned_pf_anchors` drift dimension is NOT landed — Item 9 stays open for that.
+4. **STAT FIX (F4)** — the QH-37 `live_two_hop_validation` figures cited in §5.8/§8 were stale. Current genuine tally from `documents/operations/live_lab_node_stage_results.csv` (stage == `live_two_hop_validation`, re-derived 2026-09-04): **134 pass / 121 fail / 559 skip** (814 rows). Do NOT use the `linux_stage_two_hop` run-matrix COLUMN — it is contaminated (AGENTS.md §12.3: traffic_test_matrix rows mislabeled as two_hop); the per-stage CSV is the evidence.
+5. **SHA FIX (F5)** — §8 cited `864918d9`, which is not a valid object; the real commit is `864919d9`. Corrected below.
+
+> **WARNING — do NOT implement §5.9's flush-current-generation post-condition or §5.4's single-filter tripwire as written.** Per adversarial review (F2/F3), these two proposals would weaken landed fail-closed controls: the landed `prune_owned_tables` preserves the current (and immediately-previous) generation *deliberately* — flushing it would strand the node in a pin-without-floor half state — and the two-filter design (broad nested-enumeration merge in `macos_dns_failclosed.rs` vs the narrow `owned_anchor_names_from_output` prefix policy in `phase10.rs:4091-4098`) is intentional; a single-filter tripwire would force unifying them and widen the generation sweep to anchors that must stay out of it. See the review, findings F2/F3. Flagged, not fixed.
+
+---
+
 ## 1. Executive summary
 
 A 16-tick macOS `DnsFailclosed` investigation (see §2) converged on one conclusion: **most of the wasted effort was spent reconstructing facts the system already knew but did not surface, or reconstructing them through code that disagreed with the code that rendered the verdict.**
@@ -20,20 +34,20 @@ Five concrete information failures were identified, each with a specific fix in 
 
 The unifying design rule, stated once and applied nine times: **capture the evidence, not just the verdict; and every diagnostic observation must reuse the exact code path that produced the verdict.**
 
-The top two highest-leverage items (§6): **Item 4** (shared-probe-code contract + divergence gate — permanently eliminates the false-evidence class) and **Item 2** (structured drift into the stage result — nearly free, converts every future failure from a terse string into evidence).
+The top two highest-leverage items (§6): **Item 4** (shared-probe-code contract + divergence gate — permanently eliminates the false-evidence class) and **Item 2** (structured drift into the stage result — nearly free, converts every future failure from a terse string into evidence). **[2026-09-04 update: both are now LANDED — Item 2 in `1abc7d68`, Item 4's core in `2c10f9d9`; see the errata block above and §6 for the remaining ranked work.]**
 
 ---
 
 ## 2. The motivating case: tick-46 macOS `DnsFailclosed`
 
-The observed failure: `validate_baseline_runtime` failed on `macos-utm-1` with the stage error `macos-utm-1/DnsFailclosed: validation not passed` (`orchestrator/stage/validate_runtime.rs:158` formats exactly this string when a validator returns `Ok(false)`).
+The observed failure: `validate_baseline_runtime` failed on `macos-utm-1` with the stage error `macos-utm-1/DnsFailclosed: validation not passed` (rendered by `orchestrator/stage/validate_runtime.rs`; at HEAD the failure strings live at `:229` — now carrying the drift reason, post-`1abc7d68` — and `:231` bare fallback).
 
 The investigation, and where each tick's effort actually went:
 
 - **The scene was already destroyed.** By the time the failure was diagnosed, the run's cleanup contract had torn down the pf floor and DNS pins on the guest (`orchestrator/native.rs:174` documents the "always-run cleanup contract"; `FinalCleanupStage::new` at `native.rs:846`). Guest inspection showed a plain, untouched system — indistinguishable from "never applied."
 - **A hand-rolled probe lied.** A manual probe issued `pfctl -a com.apple/com.apple/rustynet_gN -s rules`, double-prefixing the anchor path (the anchor name already contains the `com.apple/` scope prefix). It returned nothing, producing several cycles of false "the floor was never applied" hypotheses.
-- **Structured evidence existed and was discarded.** The daemon check (`rustynetd macos-dns-failclosed-check --no-fail-on-drift`) had emitted a full report: `overall_ok:false` plus specific `drift_reasons[]`. The orchestrator adapter (`orchestrator/adapter/ssh.rs:884-927`, `validator_report_ok`) parses that JSON, evaluates `overall_ok`, and returns a **bool** — the drift reasons are parsed and thrown away in the same function.
-- **The root cause was observer divergence, not a missing floor.** Tick 46's corrected sampler proved the floor **was present**: the daemon's own verifier (`crates/rustynetd/src/phase10.rs:4770-4792`, `verify_live_pf_dns_floor`) reads its in-memory anchor name and issues `pfctl -a <anchor> -s rules` directly — a nested-anchor read that succeeds. The check that failed (`read_pf_dns_block_floor`, `crates/rustynetd/src/macos_dns_failclosed.rs:492-507`) enumerates anchors with `pfctl -s Anchors` and parses the output with `parse_pf_anchor_names` (`macos_dns_failclosed.rs:328`); on macOS that top-level enumeration does **not** list nested anchors such as `com.apple/rustynet_g{N}`, so the check scans zero rustynet anchors and reports the floor missing. One control, two observers, contradictory verdicts — the verdict of record came from the blind one.
+- **Structured evidence existed and was discarded.** The daemon check (`rustynetd macos-dns-failclosed-check --no-fail-on-drift`) had emitted a full report: `overall_ok:false` plus specific `drift_reasons[]`. The orchestrator adapter (`orchestrator/adapter/ssh.rs`, `validator_report_ok`) parses that JSON, evaluates `overall_ok`, and — at this doc's base `427f3c85` — returned a **bool**, discarding the drift reasons. **[2026-09-04: no longer true — `1abc7d68` landed `ValidatorVerdict { ok, reports }` (`ssh.rs:879`, fn `:912`) and the reports now persist to `logs/<stage>.validator-evidence.json`; §5.2 is DONE.]**
+- **The root cause was observer divergence, not a missing floor.** Tick 46's corrected sampler proved the floor **was present**: the daemon's own verifier (`crates/rustynetd/src/phase10.rs`, `verify_live_pf_dns_floor`, at HEAD `:4800`) reads its in-memory anchor name and issues `pfctl -a <anchor> -s rules` directly — a nested-anchor read that succeeds. The check that failed (`read_pf_dns_block_floor`, `crates/rustynetd/src/macos_dns_failclosed.rs`, at HEAD `:511`) enumerated anchors with `pfctl -s Anchors` and parsed the output with `parse_pf_anchor_names` (`macos_dns_failclosed.rs:328`); on macOS that top-level enumeration does **not** list nested anchors such as `com.apple/rustynet_g{N}`, so the check scanned zero rustynet anchors and reported the floor missing. One control, two observers, contradictory verdicts — the verdict of record came from the blind one. **[2026-09-04: the check side is fixed — `2c10f9d9` landed nested-aware enumeration via `merge_rustynet_anchor_names` (`:491`), so the check now sees nested anchors and agrees with the daemon's verifier; §5.4's core is DONE. The description above is accurate for base `427f3c85`.]**
 
 Every item in this document is a direct answer to one of those failures, generalized so the next investigation does not repeat it.
 
@@ -62,12 +76,12 @@ Key symbols referenced throughout (all paths repo-relative; commit `427f3c85`):
 | `DaemonProbeOp` | `crates/rustynet-cli/src/vm_lab/mod.rs:10139` | Enum of the six validator probes (`RuntimeAcls`, `ServiceHardening`, `KeyCustody`, `Authenticode`, `MeshStatus`, `DnsFailclosed`), `as_str()` at :10156. |
 | `DaemonProbe` trait | `vm_lab/mod.rs:10173` | `build_argv` / `build_argv_with_extra_args` (:10191, validates each extra arg as a single shell-safe token `[alnum -_.:/]`); per-platform impls `LinuxDaemonProbe` :10221, `WindowsDaemonProbe` :10257, `MacosDaemonProbe` :10284; `daemon_probe_for()` dispatch :10350. |
 | `remote_exec_for()` | `vm_lab/mod.rs:10115` | Platform SSH adapter dispatch (`PosixRemoteExec`/`WindowsRemoteExec`/`UnsupportedRemoteExec`). |
-| `validator_report_ok` | `orchestrator/adapter/ssh.rs:884-927` | Parses daemon check JSON typed and fail-closed; returns **bool only**; `json_object_candidates` scanner at :930-975. The evidence-discard point. |
+| `validator_report_ok` | `orchestrator/adapter/ssh.rs:884-927` | Parses daemon check JSON typed and fail-closed; returns **bool only**; `json_object_candidates` scanner at :930-975. The evidence-discard point. **[2026-09-04: LANDED — returns `ValidatorVerdict { ok, reports }` (`ssh.rs:879`, fn `:912`); line numbers stale at HEAD.]** |
 | `validate_runtime` stage | `orchestrator/stage/validate_runtime.rs` | OPS list :93-98; `ValidatorResult{op, passed, summary}` :139-155; terse failure strings :158-159; best-effort `validator_results.json` (bools+summaries only) :163-168; `probe_expectations` :60-67 (only MeshStatus gets extra args). |
-| `verify_live_pf_dns_floor` | `crates/rustynetd/src/phase10.rs:4770-4792` | Daemon's floor verifier: direct nested-anchor read via its own in-memory anchor name; fails with `DnsApplyFailed` if UDP or TCP/53 block rule missing. |
+| `verify_live_pf_dns_floor` | `crates/rustynetd/src/phase10.rs:4770-4792` (HEAD `:4800`) | Daemon's floor verifier: direct nested-anchor read via its own in-memory anchor name; fails with `DnsApplyFailed` if UDP or TCP/53 block rule missing. |
 | `list_owned_anchors` / `owned_anchor_names_from_output` | `phase10.rs:4100` / `:4091-4098` | Top-level `pfctl -s Anchors` enumeration, filtered to the `com.apple/rustynet_g` prefix. |
-| `read_pf_dns_block_floor` / `parse_pf_anchor_names` | `macos_dns_failclosed.rs:492-507` / `:328` | Check-side floor read: blind top-level enumeration (root cause A). |
-| `prune_owned_tables` | `phase10.rs:4817-4843` | Flushes every `list_owned_anchors()` result — same blind enumeration (§5.9). |
+| `read_pf_dns_block_floor` / `parse_pf_anchor_names` | `macos_dns_failclosed.rs:492-507` (HEAD `:511`) / `:328` | Check-side floor read: blind top-level enumeration (root cause A). **[2026-09-04: LANDED as nested-aware — `2c10f9d9` added `merge_rustynet_anchor_names` (HEAD `:491`).]** |
+| `prune_owned_tables` | `phase10.rs:4817-4843` (HEAD `:4847`) | Flushes every `list_owned_anchors()` result — same blind enumeration (§5.9). **[2026-09-04: LANDED as generation-aware + nested-enumerating; preserves the current/previous generation deliberately.]** |
 | `collect_macos_dns_failclosed_snapshot` | `macos_dns_failclosed.rs:540-554` | Snapshot builder: resolv.conf, scutil, pf, networksetup, scoped-resolver presence. |
 | `build_macos_dns_failclosed_report_for_posture` | `macos_dns_failclosed.rs:570-583` | `MacosDnsFailclosedReport { schema_version: 2, posture, overall_ok, snapshot, drift_reasons }`; posture threaded by caller, never inferred (tautology note :565-569). |
 | `macos_dns_posture` | `phase10.rs:801` | Derivation: `FullTunnel` → `FullyProtected`; `Off` + `serve_exit_node` → `FullyProtected`; else `ScopedResolverOnly`. Threaded at `daemon.rs:8895` and `daemon.rs:10635`. |
@@ -127,6 +141,8 @@ Linux/Windows equivalents mirror the per-OS collect functions (`linux_dns_failcl
 ---
 
 ### 5.2 Item 2 — Structured drift in the stage result
+
+> **[2026-09-04: DONE — landed in commit `1abc7d68`.** `validator_report_ok` returns `ValidatorVerdict { ok: bool, reports: Vec<serde_json::Value> }` (`ssh.rs:879`, fn `:912`), reports thread into validator results and persist to `logs/validate_baseline_runtime.validator-evidence.json` (`validate_runtime.rs:255`, schema comment `:89`), and the failure string carries the drift reason (`validate_runtime.rs:229`). Verdict rules unchanged. Text below retained as the original design rationale.**]**
 
 **Problem.** `validator_report_ok` (`orchestrator/adapter/ssh.rs:884-927`) parses the daemon's typed check JSON — including `drift_reasons` — and returns only a bool (`validate_runtime.rs:158` then renders `"{alias}/{op:?}: validation not passed"`). The evidence the daemon already produced is discarded at the one place the orchestrator holds it.
 
@@ -189,6 +205,8 @@ Valid `probe` values (from `DaemonProbeOp::as_str()`, `vm_lab/mod.rs:10156`): `r
 
 ### 5.4 Item 4 — Shared-probe-code contract + divergence gate
 
+> **[2026-09-04: core DONE — landed in commit `2c10f9d9`.** `merge_rustynet_anchor_names(top_output, nested_output)` (`macos_dns_failclosed.rs:491`) unions `pfctl -s Anchors` with `pfctl -a com.apple -s Anchors` and `read_pf_dns_block_floor` (`:511`) scans each anchor's rules, still fail-closed. The check now sees nested anchors — §5.4's worked example is shipped behavior, not a proposal. **NOT landed:** the §5.4.2 divergence gate/tripwire — see the warning below; do NOT implement it as written.**]**
+
 **Problem.** The controlling defect of §2: `verify_live_pf_dns_floor` (`phase10.rs:4770-4792`) observes the floor via the daemon's own anchor name (nested read, correct); `read_pf_dns_block_floor` (`macos_dns_failclosed.rs:492-507`) observes it by enumerating top-level anchors via `parse_pf_anchor_names` (`:328`) — blind to nested anchors on macOS. The check false-fails while the floor is live. `prune_owned_tables` (`phase10.rs:4817-4843`) shares the same blind enumeration (see §5.9).
 
 **Interface — refactor + gate.**
@@ -200,6 +218,8 @@ Valid `probe` values (from `DaemonProbeOp::as_str()`, `vm_lab/mod.rs:10156`): `r
    Note `verify_live_pf_dns_floor` (:4770-4792) intentionally does *not* enumerate — it reads the daemon's own anchor by name, which is strictly more precise; the shared function's contract is "what an outside observer can see," and the divergence gate below keeps the two honest against each other.
 2. **Divergence gate.** A `rustynetd` unit test + a `scripts/ci/` gate check asserting: for a fixture `pfctl -s Anchors` + `pfctl -a com.apple -s Anchors` output pair, (a) the shared enumeration returns the nested rustynet anchors, (b) `read_pf_dns_block_floor`'s anchor set == the shared enumeration's, and (c) a fixture where the floor exists in a nested anchor evaluates `overall_ok: true`. The gate fails if any consumer re-implements anchor parsing (a grep tripwire over `rustynetd` sources for a second `starts_with("com.apple/rustynet_g")`-style filter outside the shared module — same tripwire pattern as the existing boundary-leakage gates).
 3. **Contract statement** (for the docs this design feeds): *a validator OS-observation and the daemon's self-observation of the same control must both route through one shared function; a new check that re-implements an existing observation fails the gate* (P2, mechanized).
+
+> **WARNING (2026-09-04, per adversarial review F3): the §5.4.2 single-filter grep tripwire must NOT be implemented as written.** The landed tree intentionally has **two** filters: the check uses the broader `parse_pf_anchor_names` filter via `merge_rustynet_anchor_names` (`macos_dns_failclosed.rs:491`), while `phase10.rs:4091-4098` keeps the narrower `owned_anchor_names_from_output` **by design** (its comment at `:4112-4126`: the narrow filter keeps the fixed-name `com.rustynet/nat` exit-NAT anchor and `com.rustynet/blind_exit` out of the generation sweep). Unifying the filters to satisfy a single-filter tripwire would widen the flush/generation sweep to anchors that must stay out of it. Any gate must encode the two-filter contract (one shared *nested-enumeration merge* per consumer family, distinct prefix policies), not a single-filter tripwire.
 
 **Grounding / reuse.** All cited above; no new privileged commands — the nested enumeration level is one additional existing `pfctl` invocation (`pfctl -a com.apple -s Anchors`) using the same fixed-path `run_capture(PrivilegedCommandProgram::Pfctl)` path as `list_owned_anchors` (`phase10.rs:4101`).
 
@@ -285,7 +305,7 @@ returns: { "alias": "macos-utm-1", "run_id": "livelab-…",
 
 ### 5.8 Item 8 — `get_stage_result` MCP tool (artifact-first, never the CSV column)
 
-**Problem.** The run-matrix CSV pass column has lied before (QH-07: comma-naive parsing produced confidently wrong conclusions; QH-37 family: a column reporting pass for a stage whose lifetime record contains zero passes — `live_two_hop_validation`'s documented 222 skip / 81 fail / 0 pass). Programmatic consumers need a tool that structurally cannot inherit a column lie.
+**Problem.** The run-matrix CSV pass column has lied before (QH-07: comma-naive parsing produced confidently wrong conclusions; QH-37 family: a column reporting pass for a stage whose lifetime record contains zero passes — `live_two_hop_validation`, whose genuine per-stage tally is **134 pass / 121 fail / 559 skip** in `documents/operations/live_lab_node_stage_results.csv` as of 2026-09-04). Programmatic consumers need a tool that structurally cannot inherit a column lie.
 
 **Interface — new MCP tool in `rustynet-mcp-lab-state`:**
 
@@ -316,6 +336,8 @@ returns: { "run_id": "…", "stage": "…",
 
 ### 5.9 Item 9 — Anchor/generation hygiene (orphaned-anchor drift)
 
+> **[2026-09-04: PARTLY LANDED.** The prune half is done: `prune_owned_tables` (`phase10.rs:4847`) is generation-aware (preserves the current + immediately-previous generation, skips the blind-exit anchor; per `MacosPruneNestedAnchorHygieneReview_2026-09-03`) and `list_owned_anchors` (`:4100`) unions the nested `com.apple` sub-anchor set. The `orphaned_pf_anchors` drift dimension is NOT landed — Item 9 remains open for it. **WARNING: §5.9.3's flush-current-generation post-condition must NOT be implemented as written — see below.****]**
+
 **Problem.** macOS pf anchors are per-generation (`com.apple/rustynet_g{N}`), and generation churn (re-apply loops, daemon restarts, cleanup/re-apply cycles — exactly what an investigation *causes*) can strand old generations. `prune_owned_tables` (`phase10.rs:4817-4843`) flushes every `list_owned_anchors()` result, but that enumeration is top-level-blind (§5.4) — so the anchors the enumeration cannot see are precisely the ones that accumulate. Nothing currently reports "you own pf anchors your enumeration cannot see."
 
 **Interface — drift dimension + shared enumeration.**
@@ -323,6 +345,8 @@ returns: { "run_id": "…", "stage": "…",
 1. Prerequisite: item 4's shared nested-aware enumeration — prune's blind spot and the check's blind spot are the same bug; fix once.
 2. Add an `orphaned_pf_anchors` drift dimension to the macOS failclosed check (`evaluate_macos_dns_failclosed_snapshot_for_posture`, `macos_dns_failclosed.rs:611-651`): the snapshot's pf section gains `owned_anchor_names: Vec<String>` (from the shared enumeration) and `current_anchor_name: Option<String>` (the daemon's own in-memory anchor, same source `verify_live_pf_dns_floor` reads at `phase10.rs:4771-4773`); any owned anchor ≠ current is a drift reason `orphaned_pf_anchors: ["com.apple/rustynet_g1", …]` (warning-grade for the floor-bearing generation, error-grade if a *stale* anchor still carries DNS block rules — a stranded floor is a live default-deny mutation on a non-exit path).
 3. Prune verification: `prune_owned_tables`' post-condition test — after flush, the shared enumeration returns zero `com.apple/rustynet_g*` anchors (except the protected blind-exit anchor, `flush_anchor` skip at `:4115-4126`, which stays out of both enumeration-driven flush and drift).
+
+> **WARNING (2026-09-04, per adversarial review F2): the §5.9.3 post-condition must NOT be implemented as written.** The landed `prune_owned_tables` (`phase10.rs:4847`) deliberately **preserves the current generation** (and the immediately-previous one) — flushing it would strand the node in a pin-without-floor half state. The post-condition as written ("zero `com.apple/rustynet_g*` anchors after flush") would flush the live floor-bearing anchor and weaken a landed fail-closed control. Any verification must exclude the current and previous generations, matching the landed guard and its test `prune_owned_tables_preserves_active_and_target_generation_tables` (`phase10.rs`, test module).
 
 **Grounding / reuse.** Shared enumeration (item 4); the drift-reason plumbing (item 2) carries the new dimension to the stage artifact with no additional orchestrator work; flush machinery already exists (`pfctl -a <a> -F all`, `phase10.rs:4818-4823`) and the D2 re-render note (:4825-4841 — flush drops the floor, re-renders if live loopback pins exist) is preserved.
 
@@ -363,7 +387,7 @@ Ordered by (evidence-class eliminated) × (effort), with dependency-aware groupi
 | 9 | **5.6 Hold-on-failure** | M | Highest risk of the set (mutation-lifetime extension); item 1 removes most of its need, so it ships last and stays default-off. |
 | 10 | **5.10 batched extras** | S each | Pull items opportunistically; 10.1 (posture trace) rides along with any item-2 work. |
 
-**Top two picks (if only two are built):** **Item 4** and **Item 2**. Together they eliminate the two failure classes that cost the most in the motivating investigation — contradictory observers (4) and discarded evidence (2) — at the lowest combined effort, and they are the prerequisites that make items 1, 3, and 9 correct rather than cosmetic.
+**Top two picks (if only two are built):** **Item 4** and **Item 2**. **[2026-09-04: both are DONE — Item 2 in `1abc7d68`, Item 4's core in `2c10f9d9`; Item 9's prune half partly landed. The highest-leverage REMAINING work is Item 1, Item 3, Item 5, Item 7, Item 8, Item 9's `orphaned_pf_anchors` drift dimension, and Item 10 (Item 4's gate, corrected per the F3 warning, is also open).]** Together they eliminate the two failure classes that cost the most in the motivating investigation — contradictory observers (4) and discarded evidence (2) — at the lowest combined effort, and they are the prerequisites that make items 1, 3, and 9 correct rather than cosmetic.
 
 ---
 
@@ -385,7 +409,7 @@ Each item ships with its verification named up front (per AGENTS.md §4's enforc
 
 ## 8. Cross-references
 
-- Motivating investigation record: commit `427f3c85` ("Log tick 46 addendum: corrected sampler proves floor IS present but check enumeration is blind (root cause A)"), preceded by `864918d9`-family tick logs and the launch-gate remedy record `78a8b513` for `validate_baseline_runtime` pf-floor persistence.
+- Motivating investigation record: commit `427f3c85` ("Log tick 46 addendum: corrected sampler proves floor IS present but check enumeration is blind (root cause A)"), preceded by `864919d9`-family tick logs and the launch-gate remedy record `78a8b513` for `validate_baseline_runtime` pf-floor persistence. *(2026-09-04: the previously cited `864918d9` is not a valid object — the real tick-log commit is `864919d9`.)*
 - Ledger hygiene context: QH-07 (quote-aware CSV parsing), QH-37 (column-vs-artifact), QH-39 (mesh-status zero-assertion probes — `build_argv_with_extra_args` comment, `vm_lab/mod.rs:10191` region) in `documents/operations/active/QualityHardeningTodo_2026-07-25.md`.
 - Engine context: `documents/operations/active/CrossPlatformRoleParityRefresh_2026-07-23.md` (the Rust `--node` orchestrator is the engine of record; all orchestrator citations here are that engine's code).
 - Stage triage ledger: `documents/operations/live_lab_stage_triage.jsonl` and the `ops live-lab-record-stage-patch` surface (`live_lab_stage_triage.rs`).
