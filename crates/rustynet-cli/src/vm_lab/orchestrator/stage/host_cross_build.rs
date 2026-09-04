@@ -246,6 +246,145 @@ pub fn check_glibc_floor(
     }
 }
 
+/// The verified result of a successful host build for one triple.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostBuildArtifact {
+    pub triple: String,
+    /// Absolute paths to the built node binaries, in [`NODE_BINARY_NAMES`] order.
+    pub binaries: Vec<PathBuf>,
+    /// The highest glibc version any binary requires (linux only; `None` for a
+    /// darwin/windows triple or a binary with no versioned glibc symbols).
+    pub glibc_max: Option<GlibcVersion>,
+}
+
+/// Run every planned host build and verify each artifact — fail-closed.
+///
+/// The three effects are injected so the orchestration (per-task build, glibc
+/// enforcement, artifact collection, fail-closed) is unit-testable without a
+/// real multi-minute cargo build:
+/// - `run_build(argv, target_root)` runs `cargo <argv>` with
+///   `CARGO_TARGET_DIR=target_root`.
+/// - `binary_exists(path)` reports whether an expected artifact was produced.
+/// - `objdump_dynamic(path)` returns the binary's `objdump -T` output.
+///
+/// For a linux task carrying a floor, every binary's required glibc must be
+/// within that floor ([`check_glibc_floor`]) or the whole run fails: a host
+/// cross-build that would fault on a guest must never reach the deploy step.
+pub fn execute_host_builds<B, E, D>(
+    target_root: &Path,
+    tasks: &[HostBuildTask],
+    run_build: B,
+    binary_exists: E,
+    objdump_dynamic: D,
+) -> Result<Vec<HostBuildArtifact>, String>
+where
+    B: Fn(&[String], &Path) -> Result<(), String>,
+    E: Fn(&Path) -> bool,
+    D: Fn(&Path) -> Result<String, String>,
+{
+    let mut artifacts = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let argv = host_build_argv(&task.triple, task.glibc_floor.as_deref())?;
+        run_build(&argv, target_root)
+            .map_err(|e| format!("host build failed for {}: {e}", task.triple))?;
+
+        let rel = host_build_release_dir(target_root, &task.triple);
+        let is_linux = task.triple.contains("-linux-");
+        let mut binaries = Vec::with_capacity(NODE_BINARY_NAMES.len());
+        let mut glibc_max: Option<GlibcVersion> = None;
+
+        for name in NODE_BINARY_NAMES {
+            let bin = rel.join(name);
+            if !binary_exists(&bin) {
+                return Err(format!(
+                    "host build for {} produced no {name} at {} (fail closed)",
+                    task.triple,
+                    bin.display()
+                ));
+            }
+            if is_linux {
+                let dump = objdump_dynamic(&bin)
+                    .map_err(|e| format!("objdump {} failed: {e}", bin.display()))?;
+                // With a floor, enforce it (error propagates on violation); without
+                // one, still record the max for provenance.
+                let this_max = match task.glibc_floor.as_deref() {
+                    Some(floor) => check_glibc_floor(&dump, floor)
+                        .map_err(|e| format!("{} {name}: {e}", task.triple))?,
+                    None => parse_max_glibc_version(&dump),
+                };
+                if let Some(m) = this_max {
+                    glibc_max = Some(match glibc_max {
+                        Some(existing) => existing.max(m),
+                        None => m,
+                    });
+                }
+            }
+            binaries.push(bin);
+        }
+
+        artifacts.push(HostBuildArtifact {
+            triple: task.triple.clone(),
+            binaries,
+            glibc_max,
+        });
+    }
+    Ok(artifacts)
+}
+
+/// Production entry point: run the planned host builds with real `cargo` /
+/// `cargo zigbuild` + `objdump` invocations, in `repo_dir`, writing artifacts
+/// under `target_root` (a run-local `CARGO_TARGET_DIR`). Thin wrapper over
+/// [`execute_host_builds`] — the orchestration + fail-closed logic is what the
+/// unit tests cover; these two closures are the only untested surface and are
+/// exactly the `cargo`/`objdump` commands validated by the §6 measurements.
+pub fn run_planned_host_builds(
+    repo_dir: &Path,
+    target_root: &Path,
+    tasks: &[HostBuildTask],
+) -> Result<Vec<HostBuildArtifact>, String> {
+    execute_host_builds(
+        target_root,
+        tasks,
+        |argv, tr| run_host_cargo(repo_dir, argv, tr),
+        |bin| bin.is_file(),
+        objdump_dynamic_symbols,
+    )
+}
+
+/// Spawn `cargo <argv>` (argv[0] is `build` or `zigbuild`) in `repo_dir` with
+/// `CARGO_TARGET_DIR=target_root`. Inherits the caller's stdio so build output
+/// is visible in the run log. Fail-closed on spawn failure or a non-zero exit.
+fn run_host_cargo(repo_dir: &Path, argv: &[String], target_root: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("cargo")
+        .args(argv)
+        .current_dir(repo_dir)
+        .env("CARGO_TARGET_DIR", target_root)
+        .status()
+        .map_err(|e| format!("spawn cargo failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo {} exited with {status}",
+            argv.first().map_or("", |s| s.as_str())
+        ))
+    }
+}
+
+/// Run `objdump -T <bin>` and return its stdout (the dynamic symbol table the
+/// glibc-floor scan parses).
+fn objdump_dynamic_symbols(bin: &Path) -> Result<String, String> {
+    let out = std::process::Command::new("objdump")
+        .arg("-T")
+        .arg(bin)
+        .output()
+        .map_err(|e| format!("spawn objdump failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("objdump exited with {}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +532,93 @@ mod tests {
     fn release_dir_is_target_triple_release() {
         let dir = host_build_release_dir(Path::new("/tmp/xc"), "aarch64-unknown-linux-gnu");
         assert_eq!(dir, Path::new("/tmp/xc/aarch64-unknown-linux-gnu/release"));
+    }
+
+    fn linux_task() -> Vec<HostBuildTask> {
+        vec![HostBuildTask {
+            triple: "aarch64-unknown-linux-gnu".to_owned(),
+            glibc_floor: Some("2.31".to_owned()),
+        }]
+    }
+
+    #[test]
+    fn executor_happy_path_collects_binaries_and_glibc_max() {
+        let root = Path::new("/tmp/xc-happy");
+        let out = execute_host_builds(
+            root,
+            &linux_task(),
+            |argv, tr| {
+                assert_eq!(argv[0], "zigbuild");
+                assert_eq!(tr, root);
+                Ok(())
+            },
+            |_bin| true,
+            |_bin| Ok("GLIBC_2.17 clock_gettime\nGLIBC_2.29 pow\n".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].binaries.len(), NODE_BINARY_NAMES.len());
+        assert_eq!(out[0].glibc_max.as_ref().unwrap().to_string(), "2.29");
+        assert!(out[0].binaries[0].ends_with("aarch64-unknown-linux-gnu/release/rustynetd"));
+    }
+
+    #[test]
+    fn executor_fails_closed_when_build_fails() {
+        let err = execute_host_builds(
+            Path::new("/tmp/x"),
+            &linux_task(),
+            |_argv, _tr| Err("linker exploded".to_owned()),
+            |_bin| true,
+            |_bin| Ok(String::new()),
+        )
+        .unwrap_err();
+        assert!(err.contains("host build failed"));
+    }
+
+    #[test]
+    fn executor_fails_closed_on_glibc_floor_violation() {
+        let err = execute_host_builds(
+            Path::new("/tmp/x"),
+            &linux_task(),
+            |_argv, _tr| Ok(()),
+            |_bin| true,
+            // 2.40 exceeds the 2.31 floor — must abort, never ship.
+            |_bin| Ok("GLIBC_2.40 some_new_symbol\n".to_owned()),
+        )
+        .unwrap_err();
+        assert!(err.contains("exceeds the declared floor"));
+    }
+
+    #[test]
+    fn executor_fails_closed_on_missing_binary() {
+        let err = execute_host_builds(
+            Path::new("/tmp/x"),
+            &linux_task(),
+            |_argv, _tr| Ok(()),
+            |_bin| false,
+            |_bin| Ok(String::new()),
+        )
+        .unwrap_err();
+        assert!(err.contains("produced no"));
+    }
+
+    #[test]
+    fn executor_skips_glibc_scan_for_darwin() {
+        let task = vec![HostBuildTask {
+            triple: "aarch64-apple-darwin".to_owned(),
+            glibc_floor: None,
+        }];
+        let out = execute_host_builds(
+            Path::new("/tmp/x"),
+            &task,
+            |argv, _tr| {
+                assert_eq!(argv[0], "build");
+                Ok(())
+            },
+            |_bin| true,
+            |_bin| panic!("objdump must not be called for a darwin triple"),
+        )
+        .unwrap();
+        assert_eq!(out[0].glibc_max, None);
     }
 }
