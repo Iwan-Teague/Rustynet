@@ -255,6 +255,11 @@ targets `x86_64/aarch64-unknown-linux-gnu` on pinned 1.88.0 (already present).
 - **Host Linux cross-build** (`x86_64-unknown-linux-gnu.2.31`, COLD, same set
   `-p rustynetd -p rustynet-cli --features rustynet-cli/vm-lab`): **2m26s** (rc 0).
   Binaries: rustynetd 6.9M, rustynet-cli 16M.
+- **Host Linux cross-build** (`aarch64-unknown-linux-gnu.2.31`, COLD — the actual
+  reachable UTM Linux guest triple, measured tick 92): **2m10s** (rc 0), glibc
+  floor max **2.29** (clean). Both Linux triples cross-build in ~2min on the host
+  with a clean floor, so the aarch64 UTM guests (the fleet that is actually up)
+  are covered, not just the down x86 guests.
 - **glibc floor clean:** `objdump -T` shows max **GLIBC_2.29** (under the 2.31 pin;
   runs on any distro ≥ 2.29 — Debian 13 trixie ships 2.41). The §4.2 glibc-skew
   risk does NOT materialize with the zig floor pin — the single biggest correctness
