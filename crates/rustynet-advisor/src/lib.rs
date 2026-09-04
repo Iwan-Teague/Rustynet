@@ -596,7 +596,7 @@ mod tests {
         let viable = full_observation("viable");
 
         // Alone: ranked, but at score zero with both flags set.
-        let alone = recommend_role_placement(RoleType::Relay, &[starved.clone()]);
+        let alone = recommend_role_placement(RoleType::Relay, std::slice::from_ref(&starved));
         assert_eq!(alone.candidates.len(), 1);
         assert_eq!(alone.candidates[0].score, 0.0);
         assert!(alone.candidates[0].data_starved);
