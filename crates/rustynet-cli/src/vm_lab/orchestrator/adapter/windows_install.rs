@@ -875,8 +875,14 @@ fn windows_tunnel_ip_readiness_fragment() -> Result<String, AdapterError> {
 /// 1. SCM reports the service as `Running`.
 /// 2. The reviewed env-file (`rustynetd.env`) is present — written by the
 ///    orchestrator before service start.
-/// 3. The `WireGuard` public-key file (`wireguard.pub`) is present — generated
-///    during the e2e bootstrap key step.
+/// 3. The `WireGuard` public-key file (`wireguard.pub`) is present AND
+///    non-empty — generated during the e2e bootstrap key step. Presence alone
+///    is insufficient: the daemon creates the file and writes the key
+///    asynchronously at startup, so a presence-only check passes while the
+///    file is still empty. The downstream `collect_pubkeys` stage (which does
+///    not retry) then reads that empty key and fails base64 decode with
+///    "empty base64 input". Requiring non-empty content makes bootstrap-ready
+///    mean the pubkey is actually available to every downstream consumer.
 ///
 /// These three conditions together confirm the daemon completed its startup
 /// handshake and is running with reviewed configuration.
@@ -890,7 +896,7 @@ fn windows_daemon_status_readiness_fragment(service_name: &str) -> Result<String
              $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
              if ($null -ne $svc -and $svc.Status -eq 'Running') {{ \
                  $envOk = Test-Path -LiteralPath {env_path_q} -PathType Leaf; \
-                 $keyOk = Test-Path -LiteralPath {pub_key_path_q} -PathType Leaf; \
+                 $keyOk = (Test-Path -LiteralPath {pub_key_path_q} -PathType Leaf) -and (-not [string]::IsNullOrWhiteSpace((Get-Content -LiteralPath {pub_key_path_q} -Raw -ErrorAction SilentlyContinue))); \
                  if ($envOk -and $keyOk) {{ \
                      $statusReady = $true; \
                      break \
@@ -900,7 +906,7 @@ fn windows_daemon_status_readiness_fragment(service_name: &str) -> Result<String
          }}; \
          if (-not $statusReady) {{ \
              $scQuery = (& sc.exe queryex {svc_q} 2>&1) -join ' | '; \
-             throw ('RustyNet daemon did not reach readiness after 60s (SCM Running + env-file + wireguard.pub); sc=[' + $scQuery + ']') \
+             throw ('RustyNet daemon did not reach readiness after 60s (SCM Running + env-file + non-empty wireguard.pub); sc=[' + $scQuery + ']') \
          }}",
     ))
 }
@@ -2250,6 +2256,11 @@ mod tests {
         assert!(
             script.contains("wireguard.pub"),
             "readiness probe must check wireguard.pub presence: {script}"
+        );
+        assert!(
+            script.contains("IsNullOrWhiteSpace"),
+            "readiness probe must require wireguard.pub be non-empty, not just \
+             present, or collect_pubkeys races the daemon's async key write: {script}"
         );
         // Must include SCM queryex on failure.
         assert!(
