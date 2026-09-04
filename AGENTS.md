@@ -566,8 +566,13 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
   `documents/operations/live_lab_node_run_matrix.csv` (§2, §10.9) — **but the row on
   its own is NOT proof that a stage passed.** Re-counted at commit `9cdd660f`:
   `linux_stage_two_hop=pass` on **35 of 94** rows is `traffic_test_matrix`
-  (pass 185 lifetime) masking `live_two_hop_validation`, whose lifetime record is
-  222 skip / 81 fail / **0 pass — it has never passed**. The alias that caused this
+  (pass 185 lifetime) masking `live_two_hop_validation`, whose lifetime record was
+  222 skip / 81 fail / **0 pass at that commit — two_hop had never passed on the
+  `--node` engine then**. (Updated 2026-09-04: it has since passed — the firewalld
+  root-cause fix `dda439a2` (2026-08-14) took the genuine `live_two_hop_validation`
+  tally to **134 pass / 121 fail / 559 skip**, read from the per-stage
+  `documents/operations/live_lab_node_stage_results.csv`, never the still-contaminated
+  `linux_stage_two_hop` column of the run-matrix.) The alias that caused this
   was removed on 2026-07-27 at the production source of truth, the `logical` field
   on the `traffic_test_matrix` spec in `live_lab_stage_registry.rs`; the two ids that
   still map to `two_hop` are genuine chained-exit proofs. **The 35 contaminated rows
