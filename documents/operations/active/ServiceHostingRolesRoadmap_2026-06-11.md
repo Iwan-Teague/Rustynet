@@ -4,6 +4,12 @@
 - Status: active (top-level roadmap for the NAS + LLM node-role program)
 - Owner: Rustynet
 - Purpose: a single front-door that sequences **all** the work to ship the two new service-hosting roles and points at the document that owns each piece. Read this first; follow the links for detail. This roadmap references every document in the program and is the place to track "where are we."
+- Errata applied 2026-09-04 (per adversarial review [`ServiceHostingRolesRoadmap_AdversarialReview_2026-09-04.md`](./ServiceHostingRolesRoadmap_AdversarialReview_2026-09-04.md); plan and structure unchanged, factual corrections only):
+  - **Preset count 8 → 9 (F1):** the role taxonomy now has nine presets including `blind_relay` (landed 2026-08-29); `ROLE_PRESET_TABLE` is `[RolePresetComposition; 9]` (`crates/rustynet-control/src/role_presets.rs:309`) and `RolePreset::all()` returns nine. "Eight-role/eight presets" wording below corrected to nine.
+  - **File cite corrected (F2):** `evaluate_service_access` lives in `crates/rustynetd/src/service_exposure.rs` (L257; test `evaluate_service_access_default_denies_and_honours_explicit_allow` at L957 in the same file), **not** `service_access_state.rs`. `derive_service_access_snapshot` remains in `service_access_state.rs` (L83).
+  - **§5 M5 ledger pointer corrected (F3):** the gate row cited `live_lab_run_matrix.csv` — the frozen bash-orchestrator archive that must never receive rows. Corrected to the live `--node` ledger `../live_lab_node_run_matrix.csv`, matching §7's 2026-08-29 correction.
+  - **Shipped-vs-evidence split made explicit (F4):** `rustynet-nas` and `rustynet-llm-gateway` crates are shipped in-tree (binaries, tests, gate scripts); the remaining open half of M5 is live-lab evidence — and the live `--node` ledger has no nas/llm stage columns yet, so an orchestrator stage + ledger schema must exist before the M5 run.
+  - **xtask gate order corrected (F6):** `cargo run -p rustynet-xtask -- gates` runs fmt → clippy → test; the standalone check stage exists only via `--with-check` (`crates/rustynet-xtask/src/main.rs`).
 
 ---
 
@@ -11,7 +17,7 @@
 
 | Document | Layer | Owns |
 |---|---|---|
-| [`NodeRoleTaxonomyExtension_2026-06-11.md`](./NodeRoleTaxonomyExtension_2026-06-11.md) | Design — category | The service-hosting role *category*: new capabilities, eight-role taxonomy, transition matrix, secure-exposure model (§5), security controls (§8 → SecurityMinimumBar §6.E), platform eligibility. Parent of the two role docs. |
+| [`NodeRoleTaxonomyExtension_2026-06-11.md`](./NodeRoleTaxonomyExtension_2026-06-11.md) | Design — category | The service-hosting role *category*: new capabilities, nine-role taxonomy (eight when this doc set was written 2026-06-11; ninth preset `blind_relay` landed 2026-08-29), transition matrix, secure-exposure model (§5), security controls (§8 → SecurityMinimumBar §6.E), platform eligibility. Parent of the two role docs. |
 | [`NasNodeRoleDesign_2026-06-11.md`](./NasNodeRoleDesign_2026-06-11.md) | Design — role | The `nas` role deep dive: `rustynet-nas` service, tunnel-only storage exposure, per-peer namespace, at-rest crypto, **RustyBackup** node-side contract, per-platform, controls, slices. |
 | [`LlmNodeRoleDesign_2026-06-11.md`](./LlmNodeRoleDesign_2026-06-11.md) | Design — role | The `llm` role deep dive: `rustynet-llm-gateway`, identity-from-tunnel (no API key), gRPC/HTTP-2 streaming in-tunnel, exit-node coexistence, admin access governance, **RustyAI** node-side contract, industry survey, controls, slices. |
 | [`ServiceHostingRolesDeltaPlan_2026-06-11.md`](./ServiceHostingRolesDeltaPlan_2026-06-11.md) | Delta — execution | Current-state vs target gaps, ordered slices D13.a–e, defect carry-overs, gate plan, live-lab readiness, delta-level DoD. The "what's missing and in what order" ledger. |
@@ -56,7 +62,7 @@ The capability/preset/transition extension and the shared secure-exposure plumbi
 `rustynet-llm-gateway` + daemon integration + exit-route exception + admin access verbs + `llm` preset + Linux install. Owner: [`LlmNodeRoleDesign_2026-06-11.md`](./LlmNodeRoleDesign_2026-06-11.md) §10 / delta plan D13.d. Parallel with M2. Carries the extra exit-coexistence and identity-from-tunnel work.
 
 ### M4 — Surface + security closeout (D13.e)
-Eight-role wizard, platform matrix rows, SecurityMinimumBar §6.E, Requirements §6.1, hardening + redaction sections, the new gate scripts, transition-audit extension. Owner: delta plan D13.e. After M2 and M3.
+Nine-role wizard, platform matrix rows, SecurityMinimumBar §6.E, Requirements §6.1, hardening + redaction sections, the new gate scripts, transition-audit extension. Owner: delta plan D13.e. After M2 and M3.
 
 ### M5 — Live-lab evidence
 Linux evidence rows for both roles (deploy → authorise → use → revoke-severance → undeploy); promote `PlatformSupportMatrix.md` from `⛔` to `✅` only on green. macOS/Windows tracked honestly. Owner: delta plan §5.
@@ -93,13 +99,13 @@ Every milestone runs the standard workspace gates (CLAUDE.md §7): `cargo fmt`, 
 
 | Milestone | Adds these gates |
 |---|---|
-| M1 | extended `role_taxonomy_gates.sh` (8 presets); foundation truth-table + fail-closed-bind tests |
+| M1 | extended `role_taxonomy_gates.sh` (9 presets); foundation truth-table + fail-closed-bind tests |
 | M2 | `nas_default_deny_gates.sh` |
 | M3 | `llm_default_deny_gates.sh`, `llm_exit_coexistence_gates.sh` |
 | M4 | `service_hosting_role_gates.sh`, extended `role_transition_audit_gates.sh` |
-| M5 | live-lab evidence rows appended + verified in `live_lab_run_matrix.csv` |
+| M5 | live-lab evidence rows appended + verified in `../live_lab_node_run_matrix.csv` (the live `--node` ledger; the bash-archive `live_lab_run_matrix.csv` must never receive rows — pointer corrected 2026-09-04, review F3) |
 
-Fast local iteration: `cargo run -p rustynet-xtask -- gates` (fmt → check → clippy → test, fail-fast).
+Fast local iteration: `cargo run -p rustynet-xtask -- gates` (fmt → clippy → test, fail-fast; `--with-check` restores the standalone check stage — order corrected 2026-09-04 per review F6).
 
 ---
 
@@ -130,8 +136,8 @@ Fast local iteration: `cargo run -p rustynet-xtask -- gates` (fmt → check → 
 | M1 D13.a/b | ✅ complete 2026-06-11 (D13.a + D13.b incl. daemon access-state materialisation `de02cc2`) | delta plan §3 + `scripts/ci/role_taxonomy_gates.sh` |
 | M2 D13.c (nas) | ✅ crate+bin+installer+tests landed 2026-06-11 (daemon access-state materialisation ✅ `de02cc2`; live evidence open) | delta plan D13.c status + `scripts/ci/nas_default_deny_gates.sh` |
 | M3 D13.d (llm) | ✅ crate+bin+verbs+coexistence guard+tests landed 2026-06-11 (daemon access-state materialisation ✅ `de02cc2`; live evidence open) | delta plan D13.d status + `scripts/ci/llm_default_deny_gates.sh` + `llm_exit_coexistence_gates.sh` |
-| M4 D13.e surface | ✅ docs+gates landed 2026-06-11 (SecurityMinimumBar §6.E, Requirements §6.1, platform matrix ⛔ rows, hardening + redaction sections, `service_hosting_role_gates.sh`, `role_transition_audit_gates.sh`); wizard already lists eight presets via `RolePreset::all()` | this commit |
-| M5 live-lab rows | ☐ open — next step; blocked 2026-06-11 on the in-flight vm-lab simulator stream | `../live_lab_node_run_matrix.csv` (the live `--node` ledger; `../live_lab_run_matrix.csv` is the frozen bash-orchestrator archive — pointer corrected 2026-08-29) |
+| M4 D13.e surface | ✅ docs+gates landed 2026-06-11 (SecurityMinimumBar §6.E, Requirements §6.1, platform matrix ⛔ rows, hardening + redaction sections, `service_hosting_role_gates.sh`, `role_transition_audit_gates.sh`); wizard already lists nine presets via `RolePreset::all()` (eight when launched; ninth `blind_relay` added 2026-08-29) | this commit |
+| M5 live-lab rows | ☐ open — next step; blocked 2026-06-11 on the in-flight vm-lab simulator stream. Code half is landed: `rustynet-nas`/`rustynet-llm-gateway` crates, binaries, tests, and gate scripts shipped in-tree (re-verified 2026-09-04); only the live-lab evidence remains. Also flagged 2026-09-04 (review F4): the live `--node` ledger has no nas/llm stage columns yet — the orchestrator stage registry needs a service-hosting stage + ledger schema before the M5 run can record evidence | `../live_lab_node_run_matrix.csv` (the live `--node` ledger; `../live_lab_run_matrix.csv` is the frozen bash-orchestrator archive — pointer corrected 2026-08-29) |
 | M6 RustyBackup / RustyAI | ☐ future | separate program |
 | Phase-1 control-plane verification | ✅ re-verified in-tree 2026-08-29 — audit-only pass; every phase-1 control already has enforcement + verification in-tree, so no code was added (see §7.1) | §7.1 evidence map below |
 | Phase-2 design (enforcement wiring) | ✅ written 2026-08-29 — doc-only design making M2–M3 runtime wiring buildable: exists-vs-needed primitive map, three fail-closed enforcement layers, controller-drive task breakdown (P2-M1/M2/M3 → M5), owner-gated decisions flagged (§5 there: OG-1 grant-without-scope posture, OG-2 nas scope type, OG-3 wire-format gate) | [`ServiceHostingPhase2Design_2026-08-29.md`](./ServiceHostingPhase2Design_2026-08-29.md) |
@@ -172,8 +178,10 @@ this commit):
   Tunnel-only bind enforced by `validate_tunnel_only_bind` (tests L657–710).
 - **Signed service-access policy (default-deny, empty ⇒ deny)**:
   `crates/rustynetd/src/service_access_state.rs` — `derive_service_access_snapshot`
-  + `evaluate_service_access` (test
-  `evaluate_service_access_default_denies_and_honours_explicit_allow`, L957);
+  (L83); `evaluate_service_access` (L257) and its default-deny test
+  `evaluate_service_access_default_denies_and_honours_explicit_allow` (L957)
+  live in `crates/rustynetd/src/service_exposure.rs`, not
+  `service_access_state.rs` — file cite corrected 2026-09-04 (review F2);
   an empty grant set is written explicitly as deny-all; `force_deny_all` is the
   fail-closed fallback when a refresh write fails.
 - **Daemon-side recognition + materialisation**: `crates/rustynetd/src/daemon.rs`
