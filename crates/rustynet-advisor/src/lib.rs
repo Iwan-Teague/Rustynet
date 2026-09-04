@@ -262,7 +262,7 @@ pub fn render_recommendation(recommendation: &RoleRecommendation) -> String {
 mod tests {
     use super::{
         BandwidthHeadroom, CandidateObservation, NatClassCode, RoleType, WEIGHTS,
-        compute_role_score, recommend_role_placement,
+        compute_role_score, recommend_role_placement, render_recommendation,
     };
 
     fn full_observation(node_id: &str) -> CandidateObservation {
@@ -367,5 +367,218 @@ mod tests {
         let recommendation = recommend_role_placement(RoleType::Anchor, &[first, second]);
         assert_eq!(recommendation.candidates[0].node_id, "node-a");
         assert_eq!(recommendation.candidates[1].node_id, "node-b");
+    }
+
+    #[test]
+    fn role_type_as_str_covers_every_variant() {
+        assert_eq!(RoleType::Anchor.as_str(), "anchor");
+        assert_eq!(RoleType::Relay.as_str(), "relay");
+        assert_eq!(RoleType::Exit.as_str(), "exit");
+    }
+
+    /// Pins the exact NAT-normalization spreads documented in
+    /// `nat_class_normalized`: anchors/relays use the full cone→symmetric
+    /// spread (1.0 / 0.6 / 0.1), exits compress it (1.0 / 0.8 / 0.5).
+    #[test]
+    fn exact_nat_normalization_spreads_per_role() {
+        let with_nat = |nat: NatClassCode| {
+            let mut observation = full_observation("node");
+            observation.nat_class = nat;
+            observation
+        };
+        for role in [RoleType::Anchor, RoleType::Relay] {
+            for (nat, expected) in [
+                (NatClassCode::ConeNatLikely, 1.0),
+                (NatClassCode::PortRestrictedLikely, 0.6),
+                (NatClassCode::SymmetricLikely, 0.1),
+            ] {
+                let (_, breakdown, _) = compute_role_score(&with_nat(nat), role);
+                assert!(
+                    (breakdown.nat_class - expected * 0.20).abs() < 1e-12,
+                    "{nat:?} under {role:?}: {}",
+                    breakdown.nat_class
+                );
+            }
+        }
+        for (nat, expected) in [
+            (NatClassCode::ConeNatLikely, 1.0),
+            (NatClassCode::PortRestrictedLikely, 0.8),
+            (NatClassCode::SymmetricLikely, 0.5),
+        ] {
+            let (_, breakdown, _) = compute_role_score(&with_nat(nat), RoleType::Exit);
+            assert!(
+                (breakdown.nat_class - expected * 0.20).abs() < 1e-12,
+                "{nat:?} under Exit: {}",
+                breakdown.nat_class
+            );
+        }
+    }
+
+    /// Pins the exact bandwidth normalizations (High 1.0, Medium 0.6,
+    /// Low 0.2) through the weighted component.
+    #[test]
+    fn exact_bandwidth_normalization_values() {
+        for (headroom, expected) in [
+            (BandwidthHeadroom::High, 1.0),
+            (BandwidthHeadroom::Medium, 0.6),
+            (BandwidthHeadroom::Low, 0.2),
+        ] {
+            let mut observation = full_observation("node");
+            observation.bandwidth_headroom = headroom;
+            let (_, breakdown, starved) = compute_role_score(&observation, RoleType::Relay);
+            assert!(!starved);
+            assert!(
+                (breakdown.bandwidth_headroom - expected * 0.15).abs() < 1e-12,
+                "{headroom:?}: {}",
+                breakdown.bandwidth_headroom
+            );
+        }
+    }
+
+    /// Worst fully-present observation scores the exact floor
+    /// 0.1*0.20 + 0.2*0.15 = 0.05 and is NOT data-starved: present-but-
+    /// zero evidence is honest data, not missing data.
+    #[test]
+    fn all_worst_present_observation_scores_exact_floor_without_starvation() {
+        let observation = CandidateObservation {
+            node_id: "floor".to_owned(),
+            uptime_ratio_ewma: Some(0),
+            nat_class: NatClassCode::SymmetricLikely,
+            handshake_success_ewma: Some(0),
+            bandwidth_headroom: BandwidthHeadroom::Low,
+            centrality: Some(0),
+            observed_at_unix: 1_000,
+        };
+        let (score, breakdown, starved) = compute_role_score(&observation, RoleType::Anchor);
+        assert!(!starved);
+        assert_eq!(breakdown.uptime, 0.0);
+        assert_eq!(breakdown.reachability_stability, 0.0);
+        assert_eq!(breakdown.centrality, 0.0);
+        assert!((score - 0.05).abs() < 1e-9, "score: {score}");
+    }
+
+    /// Each criterion, missing alone, starves the candidate and zeroes
+    /// exactly its own weighted component — no criterion's absence can
+    /// mask or borrow from another's contribution.
+    #[test]
+    fn each_missing_criterion_alone_starves_and_zeroes_only_its_component() {
+        type Mutator = fn(&mut CandidateObservation);
+        let cases: [(Mutator, usize); 5] = [
+            (|o| o.uptime_ratio_ewma = None, 0),
+            (|o| o.handshake_success_ewma = None, 1),
+            (|o| o.nat_class = NatClassCode::InsufficientData, 2),
+            (|o| o.bandwidth_headroom = BandwidthHeadroom::Unknown, 3),
+            (|o| o.centrality = None, 4),
+        ];
+        for (mutate, axis) in cases {
+            let mut observation = full_observation("node");
+            mutate(&mut observation);
+            let (score, breakdown, starved) = compute_role_score(&observation, RoleType::Relay);
+            assert!(starved, "axis {axis}");
+            let components = [
+                breakdown.uptime,
+                breakdown.reachability_stability,
+                breakdown.nat_class,
+                breakdown.bandwidth_headroom,
+                breakdown.centrality,
+            ];
+            assert_eq!(components[axis], 0.0, "axis {axis} must score zero");
+            for (index, component) in components.iter().enumerate() {
+                if index != axis {
+                    assert!(
+                        *component > 0.0,
+                        "axis {index} must keep its contribution when only axis {axis} is missing"
+                    );
+                }
+            }
+            assert!(score > 0.0, "the four observed criteria still contribute");
+        }
+    }
+
+    /// Documented phase-1 behavior: the scorer never reads
+    /// `observed_at_unix` — observations differing only in timestamp are
+    /// bitwise-identical in score, breakdown, and flags.
+    #[test]
+    fn observed_at_timestamp_does_not_affect_scoring() {
+        let mut early = full_observation("node");
+        early.observed_at_unix = 0;
+        let mut late = full_observation("node");
+        late.observed_at_unix = u64::MAX;
+        let (early_score, early_breakdown, early_starved) =
+            compute_role_score(&early, RoleType::Exit);
+        let (late_score, late_breakdown, late_starved) = compute_role_score(&late, RoleType::Exit);
+        assert_eq!(early_score.to_bits(), late_score.to_bits());
+        assert_eq!(early_breakdown, late_breakdown);
+        assert_eq!(early_starved, late_starved);
+    }
+
+    /// Documented behavior: the scorer neither dedupes nor rejects
+    /// duplicate node ids — both entries are scored and ranked.
+    #[test]
+    fn duplicate_node_ids_are_scored_and_ranked_without_deduplication() {
+        let strong = full_observation("dup");
+        let mut weak = full_observation("dup");
+        weak.uptime_ratio_ewma = Some(100);
+        let recommendation = recommend_role_placement(RoleType::Relay, &[weak, strong]);
+        assert_eq!(recommendation.candidates.len(), 2);
+        assert_eq!(recommendation.candidates[0].node_id, "dup");
+        assert_eq!(recommendation.candidates[1].node_id, "dup");
+        assert!(
+            recommendation.candidates[0].score > recommendation.candidates[1].score,
+            "identical ids rank by score; neither entry is dropped"
+        );
+
+        // Same id, identical observation: both entries survive (stable).
+        let twin = full_observation("twin");
+        let twins = recommend_role_placement(RoleType::Relay, &[twin.clone(), twin]);
+        assert_eq!(twins.candidates.len(), 2);
+        assert_eq!(
+            twins.candidates[0].score.to_bits(),
+            twins.candidates[1].score.to_bits()
+        );
+    }
+
+    /// The node-id tie-break is a plain ascending string compare, so an
+    /// empty id sorts ahead of any named id at an equal score.
+    #[test]
+    fn empty_node_id_ties_break_first() {
+        let anonymous = full_observation("");
+        let named = full_observation("a");
+        let recommendation = recommend_role_placement(RoleType::Anchor, &[named, anonymous]);
+        assert_eq!(recommendation.candidates[0].node_id, "");
+        assert_eq!(recommendation.candidates[1].node_id, "a");
+        assert_eq!(
+            recommendation.candidates[0].score.to_bits(),
+            recommendation.candidates[1].score.to_bits()
+        );
+    }
+
+    /// Pins the exact operator-facing render for a known ranking: header
+    /// carries the role, ranks are 1-based, scores and components print
+    /// at 3-decimal fixed precision, and a fully-backed recommendation
+    /// carries neither ADVISORY nor per-candidate tags.
+    #[test]
+    fn render_recommendation_exact_format_for_known_ranking() {
+        let strong = full_observation("node-strong");
+        let mut weak = full_observation("node-weak");
+        weak.uptime_ratio_ewma = Some(400);
+        weak.bandwidth_headroom = BandwidthHeadroom::Low;
+        let recommendation = recommend_role_placement(RoleType::Relay, &[weak, strong]);
+        let text = render_recommendation(&recommendation);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(
+            lines[0], "role placement recommendation: role=relay",
+            "fully-backed output carries no ADVISORY marker"
+        );
+        assert_eq!(
+            lines[1],
+            "  #1 node-strong score=0.934 (uptime 0.297 + stability 0.237 + nat 0.200 + bandwidth 0.150 + centrality 0.050)"
+        );
+        assert_eq!(
+            lines[2],
+            "  #2 node-weak score=0.638 (uptime 0.120 + stability 0.237 + nat 0.200 + bandwidth 0.030 + centrality 0.050)"
+        );
+        assert!(!text.contains("[data-starved]"));
     }
 }
