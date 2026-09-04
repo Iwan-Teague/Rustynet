@@ -8532,4 +8532,20 @@ UnknownState                  9
             assert!(check.issues.iter().any(|i| i == "world/group readable"));
         }
     }
+
+    // Regression guard for the E0425 Windows compile break (2026-09-04):
+    // apparmor is a Linux-only LSM, so `apparmor_profile_status_internal` must
+    // have a non-Linux arm (macOS + Windows) or the unconditional call in
+    // `apparmor_profile_status` fails to compile off Linux. A missing arm shows
+    // up first as a compile error; this test additionally pins the
+    // empty-on-non-Linux contract so the fallback cannot silently start
+    // reporting phantom profiles.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn apparmor_profile_status_is_empty_on_non_linux() {
+        assert!(
+            super::apparmor_profile_status().is_empty(),
+            "AppArmor has no non-Linux equivalent; the fallback must report no profiles"
+        );
+    }
 }
