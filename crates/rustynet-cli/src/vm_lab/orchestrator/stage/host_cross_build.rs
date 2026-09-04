@@ -16,7 +16,61 @@
 //! guest.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
 use crate::vm_lab::VmGuestPlatform;
+
+/// The three node binaries a host build produces, by their cargo binary name
+/// (as they appear under `target/<triple>/release/`). Single-sourced with
+/// [`BUILD_PACKAGES`]; `rustynet-cli`'s binary keeps its crate name here (the
+/// install step may rename it on the guest — that is the adapter's concern).
+pub const NODE_BINARY_NAMES: &[&str] = &["rustynetd", "rustynet-cli", "rustynet-relay"];
+
+/// The release output directory for `triple` under a per-run
+/// `CARGO_TARGET_DIR`. Cargo writes cross-target artifacts to
+/// `<target_dir>/<triple>/release/`.
+pub fn host_build_release_dir(target_dir: &Path, triple: &str) -> PathBuf {
+    target_dir.join(triple).join("release")
+}
+
+/// A distinct host build to run: one target triple, built once and shared by
+/// every node that maps to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostBuildTask {
+    pub triple: String,
+    /// glibc floor for a linux-gnu triple; always `None` for darwin/windows.
+    pub glibc_floor: Option<String>,
+}
+
+/// Collapse a set of node `(platform, arch)` pairs into the distinct set of
+/// host builds to run — deduplicated by triple, so N nodes sharing a triple
+/// cost one build. Order follows first appearance for determinism.
+///
+/// Fail-closed: a node whose `(platform, arch)` has no host-cross triple aborts
+/// the WHOLE plan rather than being dropped — a silently short plan would leave
+/// that node with no binary and fall through to some other path.
+pub fn plan_host_builds(
+    nodes: &[(VmGuestPlatform, String)],
+    linux_glibc_floor: Option<&str>,
+) -> Result<Vec<HostBuildTask>, String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut tasks = Vec::new();
+    for (platform, arch) in nodes {
+        let triple = target_triple(*platform, arch)?;
+        if seen.insert(triple.clone()) {
+            let glibc_floor = triple
+                .contains("-linux-")
+                .then(|| linux_glibc_floor.map(str::to_owned))
+                .flatten();
+            tasks.push(HostBuildTask {
+                triple,
+                glibc_floor,
+            });
+        }
+    }
+    Ok(tasks)
+}
 
 /// The package + feature set every node build produces, single-sourced so the
 /// host-cross argv cannot drift from the on-guest bootstrap build
@@ -299,5 +353,45 @@ mod tests {
         assert!(parse_max_glibc_version("nothing versioned here").is_none());
         assert_eq!(check_glibc_floor("no glibc symbols", "2.31").unwrap(), None);
         assert!(check_glibc_floor("GLIBC_2.29 x", "not-a-version").is_err());
+    }
+
+    #[test]
+    fn plan_dedups_shared_triples_and_scopes_floor_to_linux() {
+        let nodes = vec![
+            (VmGuestPlatform::Linux, "aarch64".to_owned()),
+            (VmGuestPlatform::Linux, "aarch64".to_owned()), // same triple → deduped
+            (VmGuestPlatform::Macos, "arm64".to_owned()),
+        ];
+        let tasks = plan_host_builds(&nodes, Some("2.31")).unwrap();
+        assert_eq!(tasks.len(), 2, "two distinct triples");
+        let linux = tasks
+            .iter()
+            .find(|t| t.triple == "aarch64-unknown-linux-gnu")
+            .unwrap();
+        assert_eq!(linux.glibc_floor.as_deref(), Some("2.31"));
+        let macos = tasks
+            .iter()
+            .find(|t| t.triple == "aarch64-apple-darwin")
+            .unwrap();
+        // Floors are linux-only — a darwin task must never carry one.
+        assert_eq!(macos.glibc_floor, None);
+    }
+
+    #[test]
+    fn plan_fails_closed_on_any_unmappable_node() {
+        // One bad node aborts the whole plan — never a silently short list.
+        let nodes = vec![
+            (VmGuestPlatform::Linux, "aarch64".to_owned()),
+            (VmGuestPlatform::Linux, "riscv64".to_owned()),
+        ];
+        assert!(plan_host_builds(&nodes, None).is_err());
+        // iOS/Android nodes have no host-cross path either.
+        assert!(plan_host_builds(&[(VmGuestPlatform::Ios, "aarch64".to_owned())], None).is_err());
+    }
+
+    #[test]
+    fn release_dir_is_target_triple_release() {
+        let dir = host_build_release_dir(Path::new("/tmp/xc"), "aarch64-unknown-linux-gnu");
+        assert_eq!(dir, Path::new("/tmp/xc/aarch64-unknown-linux-gnu/release"));
     }
 }
