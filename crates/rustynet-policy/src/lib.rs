@@ -3191,4 +3191,317 @@ mod tests {
             Decision::Allow
         );
     }
+
+    /// Precedence edge: `PolicySet`/`ContextualPolicySet` are FIRST-MATCH
+    /// engines — rule ORDER decides, rule SPECIFICITY does not. A broad
+    /// wildcard ALLOW placed before a narrower DENY for the same tuple
+    /// admits the traffic; the narrower deny later in the list never gets
+    /// to speak. Reversing the order denies.
+    //
+    // NOTE: the Allow verdict here is the engine's documented by-design
+    // first-match semantics (see `policy_respects_first_match`), not a
+    // fail-open: the operator ordering contract is that deny rules must be
+    // listed before the broader allows they are meant to constrain. This
+    // test pins that contract so a future change to specificity-based
+    // resolution cannot happen silently.
+    #[test]
+    fn first_match_ordering_outranks_specificity_in_both_engines() {
+        // Plain engine: wildcard Allow FIRST, specific Deny SECOND.
+        let allow_first = PolicySet {
+            rules: vec![
+                PolicyRule {
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                },
+                PolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Deny,
+                },
+            ],
+        };
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            allow_first.evaluate(&request),
+            Decision::Allow,
+            "the first matching rule decides; the later narrower deny is shadowed"
+        );
+
+        // Same rules, deny listed first: deny wins.
+        let deny_first = PolicySet {
+            rules: allow_first.rules.iter().rev().cloned().collect(),
+        };
+        assert_eq!(deny_first.evaluate(&request), Decision::Deny);
+
+        // Contextual engine: same ordering precedence.
+        let contextual_allow_first = ContextualPolicySet {
+            rules: vec![
+                ContextualPolicyRule {
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                    contexts: vec![TrafficContext::Mesh],
+                },
+                ContextualPolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Deny,
+                    contexts: vec![TrafficContext::Mesh],
+                },
+            ],
+        };
+        let contextual_request = ContextualAccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::Mesh,
+        };
+        assert_eq!(
+            contextual_allow_first.evaluate(&contextual_request),
+            Decision::Allow,
+            "contextual engine is also first-match, not most-specific-match"
+        );
+        let contextual_deny_first = ContextualPolicySet {
+            rules: contextual_allow_first.rules.iter().rev().cloned().collect(),
+        };
+        assert_eq!(
+            contextual_deny_first.evaluate(&contextual_request),
+            Decision::Deny
+        );
+    }
+
+    /// Default-deny edge: a request carrying `Protocol::Any` is NEVER
+    /// admitted by a protocol-scoped ALLOW rule, even with an exact
+    /// selector match — `rule.protocol != Any && rule.protocol !=
+    /// request.protocol` fails the protocol gate for both sides. An
+    /// under-specified request cannot ride a narrow allow.
+    #[test]
+    fn any_protocol_request_is_never_admitted_by_a_protocol_scoped_allow_rule() {
+        let set = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:a".to_owned(),
+                dst: "node:b".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("node-a", MembershipStatus::Active);
+        membership.set_node_status("node-b", MembershipStatus::Active);
+
+        let underspecified = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Any,
+        };
+        assert_eq!(
+            set.evaluate(&underspecified),
+            Decision::Deny,
+            "an Any-protocol request must not match a Tcp-only allow rule"
+        );
+        assert_eq!(
+            set.evaluate_with_membership(&underspecified, &membership),
+            Decision::Deny,
+            "the protocol gate must hold under the membership engine too"
+        );
+
+        // Same edge in the contextual engine.
+        let contextual_set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "node:a".to_owned(),
+                dst: "node:b".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::Mesh],
+            }],
+        };
+        let contextual_request = ContextualAccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Any,
+            context: TrafficContext::Mesh,
+        };
+        assert_eq!(
+            contextual_set.evaluate(&contextual_request),
+            Decision::Deny,
+            "an Any-protocol request must not match a Tcp-only contextual allow"
+        );
+    }
+
+    /// Precedence edge: a protocol-scoped DENY rule does not shadow a
+    /// request carrying `Protocol::Any` — exact protocol matching means
+    /// the deny is skipped and a later protocol-unrestricted allow
+    /// decides.
+    //
+    // NOTE: the Allow verdict is the engine's documented exact-match
+    // protocol semantics, not a fail-open: the deny rule only ever applied
+    // to Tcp, and the request is not provably Tcp. Pinning the actual
+    // behaviour so the interaction between protocol scoping and
+    // first-match ordering cannot drift silently.
+    #[test]
+    fn protocol_scoped_deny_rule_does_not_shadow_an_any_protocol_request() {
+        let set = PolicySet {
+            rules: vec![
+                PolicyRule {
+                    src: "node:a".to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Deny,
+                },
+                PolicyRule {
+                    src: "*".to_owned(),
+                    dst: "*".to_owned(),
+                    protocol: Protocol::Any,
+                    action: RuleAction::Allow,
+                },
+            ],
+        };
+        let any_protocol_request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Any,
+        };
+        assert_eq!(
+            set.evaluate(&any_protocol_request),
+            Decision::Allow,
+            "the Tcp-scoped deny must not match an Any-protocol request; \
+             the unrestricted allow that follows decides"
+        );
+
+        // Control: the same Tcp request IS stopped by the scoped deny.
+        let tcp_request = AccessRequest {
+            protocol: Protocol::Tcp,
+            ..any_protocol_request.clone()
+        };
+        assert_eq!(set.evaluate(&tcp_request), Decision::Deny);
+    }
+
+    /// Default-deny edge: a rule whose selector is MALFORMED — a `node:`
+    /// prefix with an empty body, or a non-canonical casing an operator
+    /// mistyped — is INERT. The plain engine's equality match never
+    /// fires, and the membership engine's gate refuses to resolve the
+    /// selector, so the rule is skipped entirely instead of widening.
+    #[test]
+    fn malformed_rule_selectors_are_inert_in_both_engines() {
+        let malformed_variants = ["node:", "NODE:a", " svc:a"];
+        for selector in malformed_variants {
+            let set = PolicySet {
+                rules: vec![PolicyRule {
+                    src: selector.to_owned(),
+                    dst: "node:b".to_owned(),
+                    protocol: Protocol::Tcp,
+                    action: RuleAction::Allow,
+                }],
+            };
+            let mut membership = MembershipDirectory::default();
+            membership.set_node_status("node-a", MembershipStatus::Active);
+            membership.set_node_status("node-b", MembershipStatus::Active);
+
+            let request = AccessRequest {
+                src: "node:a".to_owned(),
+                dst: "node:b".to_owned(),
+                protocol: Protocol::Tcp,
+            };
+            assert_eq!(
+                set.evaluate(&request),
+                Decision::Deny,
+                "malformed rule selector {selector:?} must never match a real identity"
+            );
+            assert_eq!(
+                set.evaluate_with_membership(&request, &membership),
+                Decision::Deny,
+                "the membership gate must skip a rule with unresolvable selector {selector:?} \
+                 even for a fully-active pair"
+            );
+        }
+
+        // Control: the canonical spelling of the same grant works.
+        let canonical = PolicySet {
+            rules: vec![PolicyRule {
+                src: "node:a".to_owned(),
+                dst: "node:b".to_owned(),
+                protocol: Protocol::Tcp,
+                action: RuleAction::Allow,
+            }],
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("a", MembershipStatus::Active);
+        membership.set_node_status("b", MembershipStatus::Active);
+        let request = AccessRequest {
+            src: "node:a".to_owned(),
+            dst: "node:b".to_owned(),
+            protocol: Protocol::Tcp,
+        };
+        assert_eq!(
+            canonical.evaluate_with_membership(&request, &membership),
+            Decision::Allow,
+            "the canonical selector must still resolve, proving the deny is selector-specific"
+        );
+    }
+
+    /// Default-deny edge: a rule that names exactly one context admits
+    /// ONLY that context. Every OTHER `TrafficContext` variant — the two
+    /// dataplane contexts it does not list, and BOTH service-hosting
+    /// contexts — stays denied, in the plain and membership engines.
+    #[test]
+    fn unlisted_context_variants_stay_denied_when_rule_names_one_context() {
+        let set = ContextualPolicySet {
+            rules: vec![ContextualPolicyRule {
+                src: "*".to_owned(),
+                dst: "node:host".to_owned(),
+                protocol: Protocol::Any,
+                action: RuleAction::Allow,
+                contexts: vec![TrafficContext::SharedExit],
+            }],
+        };
+        let mut membership = MembershipDirectory::default();
+        membership.set_node_status("host", MembershipStatus::Active);
+        membership.set_node_status("peer", MembershipStatus::Active);
+
+        for context in [
+            TrafficContext::Mesh,
+            TrafficContext::SharedSubnetRouter,
+            TrafficContext::NasService,
+            TrafficContext::LlmService,
+        ] {
+            let request = ContextualAccessRequest {
+                src: "node:peer".to_owned(),
+                dst: "node:host".to_owned(),
+                protocol: Protocol::Tcp,
+                context,
+            };
+            assert_eq!(
+                set.evaluate(&request),
+                Decision::Deny,
+                "{context:?} is not listed by the rule and must stay denied"
+            );
+            assert_eq!(
+                set.evaluate_with_membership(&request, &membership),
+                Decision::Deny,
+                "{context:?} must stay denied under the membership engine too"
+            );
+        }
+
+        // Control: the listed context is admitted for the active pair.
+        let listed = ContextualAccessRequest {
+            src: "node:peer".to_owned(),
+            dst: "node:host".to_owned(),
+            protocol: Protocol::Tcp,
+            context: TrafficContext::SharedExit,
+        };
+        assert_eq!(set.evaluate(&listed), Decision::Allow);
+        assert_eq!(
+            set.evaluate_with_membership(&listed, &membership),
+            Decision::Allow
+        );
+    }
 }
