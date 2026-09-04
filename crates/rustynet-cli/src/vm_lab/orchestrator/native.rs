@@ -601,7 +601,8 @@ pub(crate) fn execute_rust_native_orchestration(
         // point vs the guest's always-cold rebuild). Outside the repo tree.
         let target_root = std::env::temp_dir().join("rustynet-host-cross-target");
 
-        let mut nodes_pa: Vec<(VmGuestPlatform, String)> = Vec::with_capacity(node_entries.len());
+        let mut node_aa: Vec<(String, VmGuestPlatform, String)> =
+            Vec::with_capacity(node_entries.len());
         for (entry, assignment) in &node_entries {
             let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
             let host = entry
@@ -633,11 +634,13 @@ pub(crate) fn execute_rust_native_orchestration(
                 .trim()
                 .to_owned();
             eprintln!("[host-cross] {} -> {platform:?}/{arch}", assignment.alias);
-            nodes_pa.push((platform, arch));
+            node_aa.push((assignment.alias.clone(), platform, arch));
         }
 
         // 2.31 floor: every reachable lab guest ships glibc >= 2.31, so a binary
         // capped at 2.31 runs on all of them. (Configurable in a later increment.)
+        let nodes_pa: Vec<(VmGuestPlatform, String)> =
+            node_aa.iter().map(|(_, p, a)| (*p, a.clone())).collect();
         let tasks = host_cross_build::plan_host_builds(&nodes_pa, Some("2.31"))?;
         eprintln!(
             "[host-cross] building {} host triple(s) -> {}",
@@ -653,6 +656,31 @@ pub(crate) fn execute_rust_native_orchestration(
                 a.glibc_max.as_ref().map(std::string::ToString::to_string)
             );
         }
+
+        // Map each node's alias to the binaries of its triple, and write the
+        // manifest the install adapter reads to ship prebuilts + skip the guest
+        // build (increment 4). Fail closed: a node whose triple has no artifact
+        // is a bug in the plan/build coupling, so abort rather than silently
+        // letting that node fall through to a guest build.
+        let mut alias_to_binaries: std::collections::BTreeMap<String, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
+        for (alias, platform, arch) in &node_aa {
+            let triple = host_cross_build::target_triple(*platform, arch)?;
+            let artifact = artifacts
+                .iter()
+                .find(|a| a.triple == triple)
+                .ok_or_else(|| {
+                    format!("host-cross: no built artifact for '{alias}' triple {triple}")
+                })?;
+            alias_to_binaries.insert(alias.clone(), artifact.binaries.clone());
+        }
+        let manifest =
+            host_cross_build::write_host_cross_manifest(&report_dir, &alias_to_binaries)?;
+        eprintln!(
+            "[host-cross] wrote prebuilt-binary manifest for {} node(s): {}",
+            alias_to_binaries.len(),
+            manifest.display()
+        );
     }
 
     // Collect per-node OS version strings for nodes.tsv evidence. This must be a

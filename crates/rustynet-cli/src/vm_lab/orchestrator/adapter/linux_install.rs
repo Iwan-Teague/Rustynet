@@ -10,6 +10,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+use crate::vm_lab::orchestrator::stage::host_cross_build;
 
 /// Canonical path of `rustynetd` on Linux targets.
 pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
@@ -67,8 +68,18 @@ pub fn install_daemon(
     // Write bootstrap script to a temp file.
     let script_tmp = write_temp_file("rn_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
 
-    // Write env file.
-    let env_content = build_bootstrap_env(&node_id, &role, ctx)?;
+    // host-cross-binary: if the orchestrator wrote a prebuilt-binary manifest
+    // for this node (host_cross_build increment 3c/4), ship those binaries and
+    // tell the bootstrap to install them instead of building. Absent manifest =
+    // normal build-on-guest run, unchanged.
+    let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
+        .map_err(|message| AdapterError::Protocol { message })?;
+
+    // Write env file (append the host-cross flags when shipping prebuilts).
+    let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
+    if prebuilt_binaries.is_some() {
+        env_content.push_str("\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR=/tmp/rn_prebuilt\n");
+    }
     let env_tmp = write_temp_file("rn_bootstrap_env_", ".env", env_content.as_bytes())?;
 
     let short_timeout = Duration::from_secs(30);
@@ -99,6 +110,34 @@ pub fn install_daemon(
         "/tmp/rn_source.tar.gz",
         archive_timeout,
     )?;
+
+    // host-cross: ship the host-built binaries so the bootstrap installs them and
+    // skips the guest build. Names are preserved (rustynetd / rustynet-cli /
+    // rustynet-relay), matching the bootstrap's RN_PREBUILT_DIR install loop.
+    if let Some(binaries) = &prebuilt_binaries {
+        ssh::run_remote(conn, "mkdir -p /tmp/rn_prebuilt", short_timeout)?;
+        for bin in binaries {
+            let name =
+                bin.file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| AdapterError::Protocol {
+                        message: format!(
+                            "host-cross: prebuilt binary path has no filename: {}",
+                            bin.display()
+                        ),
+                    })?;
+            ssh::scp_to(
+                conn,
+                bin.as_path(),
+                &format!("/tmp/rn_prebuilt/{name}"),
+                archive_timeout,
+            )?;
+        }
+        eprintln!(
+            "[host-cross] {alias}: shipped {} prebuilt binaries to /tmp/rn_prebuilt",
+            binaries.len()
+        );
+    }
 
     // Cleanup temp files (best-effort; ignore errors).
     let _ = std::fs::remove_file(&script_tmp);
