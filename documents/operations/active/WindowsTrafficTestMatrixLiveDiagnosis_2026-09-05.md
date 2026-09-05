@@ -599,3 +599,89 @@ believes is a clean state.
   (§ live-guest inspection, this session).
 - Shutdown rollback failures as prior evidence of slow/erroring shutdown: daemon
   log lines captured earlier this session (§2; `run-2026-09-04-windows-8`).
+
+## 14. ROOT CAUSE CONFIRMED AND FIXED (2026-09-05) — supersedes §13's orphan-process hypothesis
+
+§13's orphan-from-the-previous-run hypothesis was never confirmed, and the
+process-level check named in §13.4 turned out to disprove it rather than confirm
+it: a decisive live re-run (`run-2026-09-05-windows-22-orphancheck`, then
+`run-23-orphancheck`) with continuous `Get-Process -Name rustynetd` /
+`Get-CimInstance Win32_Service -Filter "Name='RustyNet'"` polling (3s interval,
+spanning the whole `bootstrap_hosts` → `validate_baseline_runtime` window) found
+**no `rustynetd.exe` process of any kind on `windows-x86-1` for the first ~13
+minutes of `bootstrap_hosts`** — i.e. nothing survived from before this run, ruling
+out an orphan from a *previous* run's cleanup as the mechanism. The real
+mechanism is a **within-this-run double key-init**, entirely independent of
+cleanup:
+
+1. `install_daemon` (`windows_install.rs`) runs `Install-RustyNetWindowsService.ps1`
+   (`install_script`, called before `run_windows_e2e_bootstrap`). That script:
+   - runs its own `rustynetd key init --force` under the service's runtime
+     identity (`Install-RustyNetWindowsService.ps1:1293-1318`, step
+     `rekey-wireguard-under-runtime-identity` — writes keypair **A** to disk),
+   - then (`:1534-1550`, step `start-runtime-service`) **starts the RustyNet
+     service itself**, non-enforcing mode. This process derives and caches
+     keypair A. This is the process later runs saw as `rustynetd.exe` pid 4984
+     (run-23) / pid 5984 (run-22) — a **fresh daemon this run created for
+     itself**, not a survivor of anything.
+2. `install_daemon` then calls `run_windows_e2e_bootstrap`
+   (`windows_install.rs:1033-1097`), which runs a **second, independently
+   security-hardened** `rustynetd key init --force` (the "Phase 27 reviewer
+   fold-in": statistically independent WG/signing passphrases, atomic
+   DPAPI-protected write — added later than the `.ps1`'s own rekey step, for
+   good reasons unrelated to this bug: BLOCKER 1/HIGH 1 in the code comments).
+   This **overwrites the on-disk key with keypair B** — but the daemon started
+   in step 1 is still running and never reloads; it keeps keypair A cached in
+   memory.
+3. `collect_pubkeys` queries that already-running daemon's status over its
+   named pipe (not the key file) and captures **keypair A** — stale from the
+   moment key-init #2 ran.
+4. `enforce_baseline_runtime` later calls `enforce_daemon`, which
+   stop/starts the daemon for the `auto_tunnel_enforce` flip. This fresh start
+   reads the **current** on-disk key — keypair B — which is what `wg.exe show`
+   and the daemon's own startup log report from then on.
+
+Peers hold keypair A (via the bundle `distribute_assignments` built from
+`collect_pubkeys`'s value); the guest's WireGuard-NT tunnel runs keypair B.
+Every incoming handshake initiation computed against keypair A fails MAC
+validation against the real running key B — exactly the "Invalid MAC of
+handshake, dropping packet" from §11.
+
+**Decisive live confirmation (`run-23-orphancheck`, `--setup-only`, mesh left up
+since `validate_baseline_runtime` passed and cleanup is skipped on a passing
+`--setup-only` run):**
+
+| Source | Value (base64) |
+| --- | --- |
+| `collect_pubkeys` capture (→ `distribute_assignments`, all 3 bundle kinds) | `PTEkYqSTEkcId8M9LZrIhCUcEG4EMsG5hbF40BFH61w=` (hex `3d312462a49312470877c33d2d9ac884251c106e0432c1b985b178d01147eb5c`) |
+| Guest's own `bootstrap-native-output.log`, run-23's key-init (unix 1788593495, ~18s before `collect_pubkeys` finished) | `yo8GmFTCuI7MZMsxlGM1MgX5RyuYEFhNXuGkFc/fiWc=` |
+| Live `wg.exe show all dump` on the guest (mesh still up) | `yo8GmFTCuI7MZMsxlGM1MgX5RyuYEFhNXuGkFc/fiWc=` |
+| Daemon's own startup log (`rustynetd startup: local wireguard public key = ...`) | `yo8GmFTCuI7MZMsxlGM1MgX5RyuYEFhNXuGkFc/fiWc=` |
+
+`collect_pubkeys`'s value matches **none** of the three key-init entries logged
+for this guest across the last two runs — it is genuinely a different-generation
+daemon's cached value, not a decode or file-timing artifact (both already ruled
+out in §12).
+
+**Fix landed:** `5c74a65c` (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/windows_install.rs`).
+After `run_windows_e2e_bootstrap` completes, `install_daemon` now checks whether
+the `RustyNet` service is running (`windows_daemon_is_running`, new) and — if so —
+restarts it with the same `stop_daemon`/`start_daemon` pair `enforce_daemon`
+already uses for its own later restart. This makes whichever key-init ran last
+authoritative for every reader downstream, `collect_pubkeys` included. A gated
+(`-NoDaemonStart`) install never starts the daemon in step 1, so the check is a
+no-op there. Unit-tested (`windows_daemon_status_query_reports_absent_and_running_distinctly`,
+`windows_daemon_status_running_parse_is_exact_match`); `cargo fmt --check`,
+`cargo clippy -p rustynet-cli --features vm-lab --all-targets -- -D warnings`,
+and the crate's test suite all verified clean before landing. **Not yet
+re-proven live end-to-end through `traffic_test_matrix`** — the two runs that
+produced the decisive evidence above both used `--setup-only` (by design, to
+allow live guest inspection) and never reached that stage; the next live-lab run
+against this commit should drop `--setup-only` and confirm `traffic_test_matrix`
+passes for `windows-x86-1`.
+
+All temporary diagnostic instrumentation added this session (`collect_pubkeys.rs`,
+`distribute_assignments.rs`, `daemon.rs`, `key_material.rs`, and the
+`windows_install.rs` `bootstrap-native-output.log` addition) remains in place —
+it is exactly what produced the confirmation table above and should stay until
+the fix is live-proven, then be removed as its own comments say.
