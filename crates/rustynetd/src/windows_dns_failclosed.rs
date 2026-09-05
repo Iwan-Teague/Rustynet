@@ -379,7 +379,14 @@ pub fn evaluate_router_advertisement_suppression(
     reasons
 }
 
-fn nrpt_rules_cover_root_namespace(rules: &[WindowsNrptRule]) -> bool {
+/// `true` iff at least one NRPT rule covers the `.` root namespace and
+/// forwards exclusively to loopback name servers. Used both by the
+/// evaluator above and by `apply_dns_loopback`'s verify-then-retry loop
+/// (`phase10.rs`) to confirm a freshly-added NRPT rule actually took effect
+/// before returning `Ok` — `Get-DnsClientNrptRule` is WMI-backed and can lag
+/// a `reg.exe add` by a beat, the same class of apply/read race already
+/// found and fixed for the tunnel adapter's IPv6 DNS server.
+pub fn nrpt_rules_cover_root_namespace(rules: &[WindowsNrptRule]) -> bool {
     rules.iter().any(|rule| {
         rule.namespace
             .iter()
