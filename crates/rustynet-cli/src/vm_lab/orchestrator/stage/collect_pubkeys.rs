@@ -86,6 +86,21 @@ impl OrchestrationStage for CollectPubkeysStage {
         for d in data {
             match d.pubkey {
                 Ok(pk) => {
+                    // WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md §11.3:
+                    // temporary diagnostic to pin down where a stale Windows
+                    // public key enters the distributed assignment bundle.
+                    // Logs the exact value + wall-clock time this stage itself
+                    // captured, so it can be diffed against distribute_assignments'
+                    // own NODES_SPEC value and the guest's actual runtime key.
+                    // Remove once the mechanism is confirmed and fixed.
+                    let now_unix = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    eprintln!(
+                        "collect_pubkeys: {} pubkey_hex={} at unix={now_unix}",
+                        d.alias, pk.0
+                    );
                     ctx.collected_pubkeys.insert(d.alias.clone(), pk);
                 }
                 Err(e) => errors.push(format!("{}: pubkey: {e}", d.alias)),

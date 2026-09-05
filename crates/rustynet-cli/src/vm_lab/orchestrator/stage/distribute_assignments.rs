@@ -82,6 +82,15 @@ pub(crate) fn build_bundle_env(
             .unwrap_or(crate::vm_lab::VmGuestPlatform::Linux);
         let capabilities = a.role.product_capabilities_for_platform(&platform)?;
         let caps_csv = role_capability_csv(&capabilities);
+        // WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md §11.3: temporary
+        // diagnostic, paired with the one in collect_pubkeys.rs, to compare
+        // exactly what value this stage reads from ctx.collected_pubkeys
+        // against what collect_pubkeys itself inserted. Remove once the
+        // stale-key mechanism is confirmed and fixed.
+        eprintln!(
+            "distribute_assignments: {} ({node_id}) pubkey_hex={} kind={kind:?}",
+            a.alias, pubkey.0
+        );
         nodes_parts.push(format!("{node_id}|{endpoint}|{}|{caps_csv}", pubkey.0));
     }
     let nodes_spec = nodes_parts.join(";");
