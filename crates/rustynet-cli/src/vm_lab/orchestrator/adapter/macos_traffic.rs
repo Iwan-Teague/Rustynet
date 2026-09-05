@@ -373,11 +373,22 @@ pub fn collect_stun_candidates(conn: &NodeConnection) -> Result<Option<Vec<Strin
     let netcheck = netcheck_command()?;
     loop {
         match ssh::run_remote(conn, netcheck.as_str(), SHORT_TIMEOUT) {
-            Ok(netcheck) => match ssh::parse_netcheck_stun_candidates(&netcheck) {
-                Some(candidates) if !candidates.is_empty() => return Ok(Some(candidates)),
+            Ok(netcheck) => match ssh::classify_netcheck_stun_gather(&netcheck) {
+                ssh::NetcheckStunGather::Candidates(candidates) => return Ok(Some(candidates)),
+                // The daemon can NEVER gather on this backend: fail closed
+                // now with its own reason (see the Linux adapter).
+                ssh::NetcheckStunGather::Blocked { state, error } => {
+                    return Err(AdapterError::Protocol {
+                        message: format!(
+                            "authoritative STUN gather is impossible on this node: \
+                             transport_socket_identity_state={state} \
+                             transport_socket_identity_error={error}"
+                        ),
+                    });
+                }
                 // Observed but empty — keep polling; clearing last_err marks
                 // the gather as observed-empty rather than transport-failed.
-                _ => last_err = None,
+                ssh::NetcheckStunGather::Empty => last_err = None,
             },
             Err(e) => last_err = Some(e),
         }

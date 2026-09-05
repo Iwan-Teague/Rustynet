@@ -374,6 +374,7 @@ mod tests {
             endpoints: std::collections::HashMap::new(),
             reflexive_endpoints: std::collections::HashMap::new(),
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,

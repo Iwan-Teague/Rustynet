@@ -196,6 +196,7 @@ mod tests {
             endpoints: HashMap::new(),
             reflexive_endpoints: HashMap::new(),
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
