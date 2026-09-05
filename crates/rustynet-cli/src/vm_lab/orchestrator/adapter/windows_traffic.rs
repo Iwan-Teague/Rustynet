@@ -17,6 +17,20 @@ use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEv
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Attempts `collect_wireguard_public_key` makes before giving up. Each
+/// attempt is one status query, `WINDOWS_COLLECT_PUBKEY_RETRY_INTERVAL`
+/// apart. Measured live (`run-2026-09-05-windows-26-both-fixes-proof`): the
+/// daemon's own log showed a ~15s gap between "daemon runtime constructed"
+/// (in-memory pubkey derived, near-instant) and "control pipe server
+/// spawned" (status queries start succeeding) — the previous budget of 8
+/// attempts × 1s (~7-8s of coverage) was tight against that and exhausted
+/// mid-startup in that run, failing `collect_pubkeys` outright rather than
+/// waiting the daemon out. 30 attempts gives ~2x headroom over the observed
+/// gap while still failing closed (not an unbounded wait) if the pipe never
+/// comes up at all.
+const WINDOWS_COLLECT_PUBKEY_RETRY_ATTEMPTS: u32 = 30;
+const WINDOWS_COLLECT_PUBKEY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
 /// A complete, valid zip archive containing nothing: the 22-byte
 /// end-of-central-directory record, `PK\x05\x06` followed by 18 zero bytes
 /// (disk numbers, entry counts, central-directory size and offset, comment
@@ -63,7 +77,7 @@ fn empty_artifact_archive_ps_literal() -> String {
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
     let script = live_identity_status_script()?;
     let mut last_err = "local_wg_public_key not present in daemon status".to_owned();
-    for attempt in 0..8 {
+    for attempt in 0..WINDOWS_COLLECT_PUBKEY_RETRY_ATTEMPTS {
         let status = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
         match ssh::parse_status_wireguard_public_key(&status) {
             Some(raw) if raw != "none" => match decode_wireguard_pubkey_to_hex(raw.trim()) {
@@ -77,8 +91,8 @@ pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, Ada
                 last_err = "local_wg_public_key not present in daemon status".to_owned();
             }
         }
-        if attempt < 7 {
-            std::thread::sleep(Duration::from_secs(1));
+        if attempt < WINDOWS_COLLECT_PUBKEY_RETRY_ATTEMPTS - 1 {
+            std::thread::sleep(WINDOWS_COLLECT_PUBKEY_RETRY_INTERVAL);
         }
     }
     Err(AdapterError::Protocol { message: last_err })
