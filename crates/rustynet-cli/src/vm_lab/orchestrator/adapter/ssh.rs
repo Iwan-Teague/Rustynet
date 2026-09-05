@@ -867,6 +867,13 @@ pub fn parse_status_node_id(status_text: &str) -> Option<String> {
     parse_status_field(status_text, "node_id")
 }
 
+/// Parse the `local_wg_public_key=<value>` field from a `rustynet status`
+/// output line (base64 WireGuard public key, or the literal `none` when the
+/// backend has none). See [`parse_status_node_id`] for the format.
+pub fn parse_status_wireguard_public_key(status_text: &str) -> Option<String> {
+    parse_status_field(status_text, "local_wg_public_key")
+}
+
 /// Verdict plus verbatim evidence from [`validator_report_ok`].
 ///
 /// Named distinctly from the adapter's `ValidatorReport`
@@ -1030,7 +1037,8 @@ fn teardown_control_master(teardown: ControlMasterTeardown) {
 mod tests {
     use super::{
         ControlMasterTeardown, SHARED_HARDENING_O_FLAGS, base_scp_command, base_ssh_command,
-        parse_status_field, parse_status_node_id, run_remote_retrying, validator_report_ok,
+        parse_status_field, parse_status_node_id, parse_status_wireguard_public_key,
+        run_remote_retrying, validator_report_ok,
     };
     use crate::vm_lab::orchestrator::connection::NodeConnection;
     use crate::vm_lab::orchestrator::error::AdapterError;
@@ -1212,6 +1220,23 @@ mod tests {
         assert_eq!(parse_status_node_id("role=admin"), None);
         // A field whose name merely ends with node_id must not match.
         assert_eq!(parse_status_node_id("parent_node_id=zzz"), None);
+    }
+
+    #[test]
+    fn parse_status_wireguard_public_key_preserves_base64_padding() {
+        // The base64 alphabet includes '=' padding, which must survive intact
+        // since the field parser only splits the status line on whitespace —
+        // a naive split on '=' would truncate the value at the first byte.
+        let status = "node_id=win-1 local_wg_public_key=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= state=Running";
+        assert_eq!(
+            parse_status_wireguard_public_key(status),
+            Some("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=".to_owned())
+        );
+        assert_eq!(
+            parse_status_wireguard_public_key("node_id=win-1 local_wg_public_key=none"),
+            Some("none".to_owned())
+        );
+        assert_eq!(parse_status_wireguard_public_key("node_id=win-1"), None);
     }
 
     #[test]

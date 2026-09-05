@@ -1559,7 +1559,7 @@ fn validate_binary_path(raw_path: &str, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, String> {
+pub(crate) fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, String> {
     let wg_binary = resolve_wireguard_binary_path()?;
     let mut child = Command::new(&wg_binary)
         .arg("pubkey")

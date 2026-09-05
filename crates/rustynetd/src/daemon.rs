@@ -27,8 +27,8 @@ use crate::ipc::{
 #[cfg(target_os = "macos")]
 use crate::key_material::read_passphrase_file;
 use crate::key_material::{
-    apply_interface_private_key, decrypt_private_key, encrypt_private_key,
-    generate_wireguard_keypair, remove_file_if_present, set_interface_down,
+    apply_interface_private_key, decrypt_private_key, derive_public_key_from_private_key,
+    encrypt_private_key, generate_wireguard_keypair, remove_file_if_present, set_interface_down,
     tighten_public_key_permissions, write_public_key, write_runtime_private_key,
 };
 use crate::key_rotation::{
@@ -4664,6 +4664,14 @@ struct DaemonRuntime {
     wg_encrypted_private_key_path: Option<PathBuf>,
     wg_key_passphrase_path: Option<PathBuf>,
     wg_public_key_path: Option<PathBuf>,
+    /// The local node's WireGuard public key, derived directly from the
+    /// decrypted private key at startup (never from a `wireguard.pub` file
+    /// read). Cached once here and served verbatim by the `Status` IPC
+    /// surface so a caller never depends on a disk read of the public-key
+    /// file racing a fresh key-init write (see
+    /// `WindowsCollectPubkeysEmptyReadAnalysis_2026-09-04.md`). `None` only
+    /// when the backend does not use runtime WireGuard key material at all.
+    local_wireguard_public_key: Option<String>,
     relay_client: Option<RelayClient>,
     relay_session_token_ttl_secs: u64,
     relay_session_refresh_margin_secs: u64,
@@ -5125,6 +5133,11 @@ impl DaemonRuntime {
     fn new(config: &DaemonConfig) -> Result<Self, DaemonError> {
         NodeId::new(config.node_id.clone())
             .map_err(|err| DaemonError::InvalidConfig(format!("invalid node id: {err}")))?;
+        let local_wireguard_public_key = derive_local_wireguard_public_key(
+            config.backend_mode,
+            config.wg_encrypted_private_key_path.as_deref(),
+            config.wg_key_passphrase_path.as_deref(),
+        )?;
         let policy = ContextualPolicySet {
             rules: vec![ContextualPolicyRule {
                 src: "user:local".to_owned(),
@@ -5193,6 +5206,7 @@ impl DaemonRuntime {
             wg_encrypted_private_key_path: config.wg_encrypted_private_key_path.clone(),
             wg_key_passphrase_path: config.wg_key_passphrase_path.clone(),
             wg_public_key_path: config.wg_public_key_path.clone(),
+            local_wireguard_public_key,
             relay_client,
             relay_session_token_ttl_secs: config.relay_session_token_ttl_secs.get(),
             relay_session_refresh_margin_secs: config.relay_session_refresh_margin_secs.get(),
@@ -9239,8 +9253,10 @@ impl DaemonRuntime {
                 // alive) but its Magic DNS is down — this field must exist so
                 // a silently-absent scoped file never reads as healthy.
                 let dns_scoped_apply_degraded = self.dns_scoped_apply_degraded;
+                let local_wireguard_public_key =
+                    self.local_wireguard_public_key.as_deref().unwrap_or("none");
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={} dns_scoped_apply_degraded={dns_scoped_apply_degraded}{gossip_suffix}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={} dns_scoped_apply_degraded={dns_scoped_apply_degraded} local_wg_public_key={local_wireguard_public_key}{gossip_suffix}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -12959,6 +12975,41 @@ fn prepare_runtime_wireguard_key(config: &DaemonConfig) -> Result<(), DaemonErro
     }
 
     Ok(())
+}
+
+/// Derive the local node's WireGuard public key straight from the decrypted
+/// private key, without reading `wireguard.pub` from disk at all.
+/// [`prepare_runtime_wireguard_key`] already proves the encrypted key +
+/// passphrase are valid moments before `DaemonRuntime::new` calls this; a
+/// second small decrypt here (mirroring the backend adapter's own later
+/// re-decrypt when it hands the key to the driver) keeps that proof and this
+/// derivation independent of any file the daemon itself does not control the
+/// timing of. Returns `Ok(None)` when the backend does not use runtime
+/// WireGuard key material, or when no encrypted key store is configured (the
+/// plaintext-runtime-key fallback — not used by Windows, which always
+/// configures encrypted-at-rest custody).
+fn derive_local_wireguard_public_key(
+    backend_mode: DaemonBackendMode,
+    encrypted_private_key_path: Option<&Path>,
+    passphrase_path: Option<&Path>,
+) -> Result<Option<String>, DaemonError> {
+    if !backend_mode.requires_runtime_wireguard_key_material() {
+        return Ok(None);
+    }
+    let Some(encrypted_path) = encrypted_private_key_path.filter(|path| path.exists()) else {
+        return Ok(None);
+    };
+    let passphrase_path = passphrase_path.ok_or_else(|| {
+        DaemonError::InvalidConfig(
+            "wg key passphrase path is required when encrypted key path is configured".to_owned(),
+        )
+    })?;
+    let mut decrypted = decrypt_private_key(encrypted_path, passphrase_path)
+        .map_err(|err| DaemonError::InvalidConfig(format!("wg key decrypt failed: {err}")))?;
+    let public_key = derive_public_key_from_private_key(&decrypted)
+        .map_err(|err| DaemonError::InvalidConfig(format!("wg pubkey derive failed: {err}")));
+    decrypted.fill(0);
+    Ok(Some(public_key?))
 }
 
 fn prepare_runtime_wireguard_key_material(
@@ -32093,16 +32144,23 @@ mod tests {
             "gossip fields must form an unbroken suffix, not be interleaved"
         );
         // M3 appended `dns_scoped_apply_degraded` after the previous last
-        // field; the gossip block must still be the unbroken suffix after it.
+        // field, then the Windows collect_pubkeys fix appended
+        // `local_wg_public_key` after that; the gossip block must still be
+        // the unbroken suffix after both.
         assert_eq!(
-            keys[first_gossip - 2],
+            keys[first_gossip - 3],
             "membership_active_nodes",
             "the previously last field must not move"
         );
         assert_eq!(
-            keys[first_gossip - 1],
+            keys[first_gossip - 2],
             "dns_scoped_apply_degraded",
-            "the M3 degraded flag must sit between membership_active_nodes and the gossip block"
+            "the M3 degraded flag must sit between membership_active_nodes and local_wg_public_key"
+        );
+        assert_eq!(
+            keys[first_gossip - 1],
+            "local_wg_public_key",
+            "the local WireGuard public key must sit between dns_scoped_apply_degraded and the gossip block"
         );
         assert_eq!(keys[0], "node_id", "the first field must not move");
         assert_eq!(
