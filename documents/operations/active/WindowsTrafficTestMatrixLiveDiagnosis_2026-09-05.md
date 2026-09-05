@@ -1,10 +1,17 @@
 # Windows `traffic_test_matrix` — live diagnosis of the WireGuard handshake failure
 
-- Status: **ACTIVE investigation, root cause NOT yet confirmed.** This is live-lab
-  evidence gathered by direct guest inspection during `run-2026-09-05-windows-16-setuponly`
-  (commit `89596acd78a6d74d290e34d4496c80961292c770`), not a static code trace. No code
-  was changed. Several plausible causes have been ruled out with hard evidence; the
-  actual mechanism is still open.
+- Status: **ROOT CAUSE CLASS CONFIRMED (exact mechanism not yet pinned).** This is
+  live-lab evidence gathered by direct guest inspection during
+  `run-2026-09-05-windows-16-setuponly` (commit `89596acd78a6d74d290e34d4496c80961292c770`),
+  not a static code trace. No code was changed. §11 (added after §1-10 below were
+  first written) confirms the failure is a **stale WireGuard public key** distributed
+  to peers: WireGuard-NT's own diagnostic log shows "Invalid MAC of handshake" — a
+  cryptographic MAC1 rejection that occurs exactly when the sender computed the
+  handshake MAC against a public key that does not match the responder's actual
+  current key — and direct comparison confirms Windows' real running public key does
+  NOT match what Linux's signed assignment bundle has on file for it. What is not yet
+  pinned down is the *exact* code path that lets a stale key reach the bundle; §11
+  lays out the strongest hypothesis and the concrete next check.
 - Date: 2026-09-05
 - Topology: `linux-x86-client-1` (client), `linux-x86-exit-1` (exit),
   `windows-x86-1` (client) — all on one libvirt LAN, `192.168.121.0/24`, on
@@ -144,37 +151,44 @@ though HNS/nested-virt remains circumstantially suspicious as *a* contributing
 factor in this specific guest's networking stack, given no other Windows guest has
 ever reached this test before today.
 
-## 7) What is NOT yet known
+## 7) What is NOT yet known (superseded — see §11 for the confirmed mechanism class)
 
-- Whether a non-Hyper-V-enabled Windows guest (no nested virtualization, no HNS)
-  would reproduce the same symptom — this would be the single most decisive next
-  experiment, since it would confirm or fully rule out "nested-virt/HNS guest
-  environment" as the root cause versus a genuine WireGuard-NT/rustynet defect that
-  would reproduce anywhere.
-- Whether the packets pktmon captured as "arriving" are byte-for-byte identical to
-  what Linux sent (not confirmed — only the UDP 5-tuple and length were inspected,
-  not decrypted/parsed payload content).
-- Whether WireGuard-NT's own internal driver-level logging (accessible via
-  `Get-WinEvent` against the `WireGuard` ETW provider, or the `wireguard.exe /log`
-  facility from the official WireGuard for Windows client, if installed) would show
-  a specific rejection reason (bad MAC, cookie-reply-only due to rate limiting,
-  timestamp/replay rejection, wrong interface index, etc.) — not yet queried.
+**§11 (added after this section was written) confirms the root cause class**: a
+stale public key reached the distributed assignment bundle. The items below were the
+open questions *before* that check; kept for the investigation record, but do not
+start from here — start from §11.3's "concrete next check."
+
+- ~~Whether a non-Hyper-V-enabled Windows guest ... would reproduce the same
+  symptom~~ — likely moot: §11 gives a mechanism (stale key distribution) that has
+  nothing to do with Hyper-V/HNS. Not worth spending the reboot-and-rebuild cost on
+  this experiment until §11.3's check rules the stale-key mechanism back out.
+- ~~Whether the packets pktmon captured are byte-for-byte identical to what Linux
+  sent~~ — moot: §11.1 explains the 148-byte-both-directions observation without
+  needing payload comparison (every packet is a fresh Initiation because no MAC ever
+  validates).
+- ~~Whether WireGuard-NT's own internal driver-level logging ... would show a
+  specific rejection reason~~ — **answered in §11.1**: "Invalid MAC of handshake."
 - Whether the problem is symmetric (does `linux-x86-client-1` also show tx>0/rx=0
-  specifically for its Windows peer, matching Windows' zero-live-peer report) — not
-  directly measurable from Linux, since its userspace-shared boringtun backend has
-  no UAPI control socket for `wg show` to query (`wg show all dump` exits 0 with
-  no output on that backend). Would need the daemon's own per-peer status detail
-  (not currently exposed by the `Status` IPC beyond the aggregate `path_live_*`
-  counters) or a `tcpdump`/packet capture on the Linux side for the same 5-tuple.
+  specifically for its Windows peer) — **still open**, and less important now that
+  §11.2 found the mismatch directly (comparing the bundle's recorded key against
+  Windows' actual key, rather than needing Linux's own tx/rx counters).
 
-## 8) Ranked hypotheses for the next investigation session
+## 8) Ranked hypotheses (historical — see §11.3 for the current best-supported hypotheses)
 
-Checked first and ruled out while writing this document: `wg show <iface> dump`'s
-interface line format is `<iface> <private-key> <public-key> <listen-port> <fwmark>`
-(per `wg(8)`) — so of the two 44-char base64 values on that line in §3
+This section predates §11's discovery of the actual "Invalid MAC" log line and the
+confirmed key mismatch; kept for the investigation record. **Use §11.3's two
+candidates instead of the list below when picking up this investigation.**
+
+Checked first and ruled out while writing this document (still valid — this is a
+narrower, different check than §11.2's cross-artifact comparison): `wg show <iface>
+dump`'s interface line format is `<iface> <private-key> <public-key> <listen-port>
+<fwmark>` (per `wg(8)`) — so of the two 44-char base64 values on that line in §3
 (`GLO5r6ukZq/...` then `TamZKyk5/...`), the **second** is the public key. It matches
 `rustynet status`'s `local_wg_public_key=TamZKyk5/RkKERQ3ipZXJ/fnjQC3yjCKXa+paclhUxk=`
-exactly. **No local-key mismatch** — that lead is closed, not open.
+exactly — i.e. `wg show`'s own two fields are internally consistent with each other
+and with the daemon's self-report. **The mismatch §11.2 later found is a different
+comparison**: that self-consistent key against what Linux's *bundle* has on file,
+which is a genuinely different (older) value.
 
 1. **Guest-specific nested-virtualization/HNS networking-stack interaction**
    (highest remaining suspicion, though the specific `ms_l2bridge` mechanism is now
@@ -234,3 +248,116 @@ touched; this was pure guest-side read/diagnostic work between two orchestrator 
 - Companion docs: `WindowsCollectPubkeysEmptyReadAnalysis_2026-09-04.md`,
   `WindowsMembershipInitPostPubkeysAnalysis_2026-09-05.md`,
   `WindowsPostEnforceRuntimeLiveStagesAnalysis_2026-09-05.md`.
+
+## 11) BREAKTHROUGH — the actual WireGuard-NT driver log confirms a stale distributed public key
+
+Everything in §1-10 above was written believing the mechanism was still open. Two
+further live-guest checks (both non-destructive, read-only) resolved it almost
+completely.
+
+### 11.1 `wireguard.exe /dumplog` — the official WireGuard client binary's own ring-buffer log
+
+Windows' WireGuard-NT tunnel is actually run as a **separate Windows service**
+(confirmed via `Get-WinEvent` System log, event ID 7045: "Service Name: WireGuard
+Tunnel: rustynet0", "Service File Name: \"C:\Program Files\WireGuard\wireguard.exe\"
+/tunnelservice C:\ProgramData\RustyNet\config\rustynet0.conf.dpapi"). The same
+`wireguard.exe` binary supports `/dumplog`, which dumps its internal diagnostic ring
+buffer — not exposed anywhere in `rustynetd`'s own logs or IPC status, and not tried
+until this check:
+
+```
+2026-09-05 04:23:26.170384: [TUN] [rustynet0] Invalid MAC of handshake, dropping packet from 192.168.121.137:51820
+2026-09-05 04:23:26.893294: [TUN] [rustynet0] Invalid MAC of handshake, dropping packet from 192.168.121.137:51820
+2026-09-05 04:23:27.534264: [TUN] [rustynet0] Handshake for peer 1 (192.168.121.137:51820) did not complete after 5 seconds, retrying (try 5)
+2026-09-05 04:23:27.534264: [TUN] [rustynet0] Sending handshake initiation to peer 1 (192.168.121.137:51820)
+... (repeats for peer 2, 192.168.121.26:51820, identically)
+```
+
+**"Invalid MAC of handshake" is a cryptographic verdict, not a networking one.**
+WireGuard's `mac1` field on every handshake message is computed by the *sender* as
+`MAC(HASH(LABEL_MAC1 || responder's-static-public-key), message)`. The responder
+recomputes the same MAC using *its own* static public key and rejects the packet if
+they disagree. **This specific rejection reason only occurs when the sender's copy
+of the responder's public key does not match the responder's actual key** — every
+other failure mode (firewall drop, NAT, wrong endpoint, network partition) would
+produce a *different* observable (no packet at all, a different rejection, or no log
+line whatsoever), not this one. This also fully explains §5's observation that every
+captured packet was 148 bytes (an Initiation): since Windows never validates any
+incoming packet as a legitimate Response, it can never advance past retransmitting
+its own Initiations — there is no protocol-level round-trip ambiguity left to
+consider.
+
+### 11.2 Direct key comparison — confirmed mismatch, both peers, not a display artifact
+
+Compared byte-for-byte (via a Python one-liner, not eyeballing base64):
+
+- Windows' **actual, currently-loaded** public key, from `wg.exe show all dump`'s
+  interface line (`<iface> <private-key> <public-key> <port> <fwmark>` per `wg(8)` —
+  the **third** field, verified against `rustynet status`'s `local_wg_public_key`,
+  which agrees exactly): base64 `TamZKyk5/RkKERQ3ipZXJ/fnjQC3yjCKXa+paclhUxk=` = hex
+  `4da9992b2939fd190a1114378a965727f7e78d00b7ca308a5dafa969c9615319`... — 32 bytes,
+  64 hex chars, confirmed via `len()`.
+- **What `linux-x86-client-1`'s own signed assignment bundle has on file** for
+  `windows-x86-1-bootstrap` (`sudo cat /var/lib/rustynet/rustynetd.assignment` on the
+  live guest, same run): `peer.1.public_key_hex=`
+  `70ccfa5870a9b4ed95f071515ec7e4184e6dc39a9921460f9ac1f19504b99961`.
+- **These do not match.** Confirmed programmatically (`==` on the two hex strings),
+  not a copy/paste or field-order error.
+- Ruled out as a trivial swap: `70ccfa58...` does not match `linux-x86-client-1`'s own
+  key (`8iYQMU7bXMQ9cDOEJ+5LtJ5//km0atZdn26IPlKeQyk=`) or `linux-x86-exit-1`'s own key
+  (`Wb9I+uSl0czaZVQwGDhxhwk7xBM7bXB6oZ4j14LLTkI=`) either — it is not a simple
+  cross-node index mixup within the same bundle.
+
+### 11.3 The timing anomaly that points at the mechanism
+
+`/var/lib/rustynet/rustynetd.assignment` on `linux-x86-client-1` has mtime
+`1788579921` (2026-09-05 03:45:21 UTC). `windows-x86-1`'s `rustynetd.log` contains
+exactly **one** `"rustynetd startup: run_daemon entered"` line, at `1788579952375`ms
+(03:45:52.375 UTC) — **31 seconds AFTER** the assignment bundle was already written
+to disk on Linux. The bundle that names Windows' peer key was finalized *before* the
+(only observed) daemon session whose key it is supposed to describe had even started.
+
+This is inconsistent with a simple "collect-then-distribute, once, in order" model —
+`CollectPubkeysStage::execute` (`collect_pubkeys.rs:47-92`) was read in full and is
+**provably sequential with no concurrency** (`aliases.iter().map(...).collect()`,
+then a second synchronous loop that inserts each node's own collected value under its
+own `d.alias` — no closure-capture or interleaving is possible here), so a race
+*inside* that one stage invocation is ruled out.
+
+The consistent explanation across all directly-observed evidence: **this run
+distributed the Windows public key from an earlier point in the pipeline than the
+one whose daemon is now actually running the tunnel** — i.e. something between
+`collect_pubkeys`/`distribute_assignments` and the currently-live daemon instance let
+the key regenerate (or let a second daemon session start with different key material)
+*without* the already-issued bundle being refreshed. Two concrete candidates, neither
+yet confirmed:
+
+1. **A repeat/stability mechanism re-runs bootstrap** (the run-matrix for this run
+   lists `preflight` → `cleanup` three times; whether that is three per-node fanout
+   sequences or three full-topology repeats was not settled in this investigation)
+   and Windows' `rustynetd key init --force` (unconditional regeneration,
+   `windows_install.rs:1063` per the companion membership-init doc) runs again on a
+   later repeat, while the earlier repeat's already-distributed bundle on Linux is
+   never refreshed — e.g. because the Linux-side bundle **install** step is
+   idempotent-skip (mirroring the exact pattern the membership-init doc already found
+   for the Windows log-header case, `distribute_membership.rs` §4: "initializes the
+   log header `version=1` **if the log is missing or zero-length**" — the same
+   "only if not already present" shape, applied to the wrong artifact, would exactly
+   produce this symptom).
+2. Something re-runs `key init` (or an equivalent regeneration) specifically around
+   the `enforce_baseline_runtime` daemon-(re)start step, after `collect_pubkeys` /
+   `distribute_assignments` already ran and captured the pre-restart key.
+
+**The concrete next check** (not yet performed): re-run with per-stage wall-clock
+logging of exactly when `collect_pubkeys` captured windows-x86-1's key (a specific
+timestamp + hex value written to the stage log — the log format seen in this
+investigation was pass/fail only, no captured value) versus exactly when
+`rustynetd key init --force` last ran on the Windows guest (the daemon's own log or
+the bootstrap script's own transcript should carry this) versus when
+`distribute_assignments` actually wrote the bundle to Linux. Whichever of the two
+candidates above is confirmed, the fix is the same shape either way: **the pipeline
+must guarantee the bundled public key always matches the key the *currently running*
+daemon instance will use**, either by moving key generation strictly before the one
+collection point that feeds distribution, or by re-collecting and re-distributing
+whenever the key can change afterward — not by chasing this specific repeat/restart
+interaction as a one-off.
