@@ -1297,22 +1297,31 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     //    hardcoded path (mode 0644 — a public key). scp the bytes (no shell data
     //    interpolation), then install with a constant command. `mkdir -p` keeps
     //    the existing rustynetd-owned state-root mode (no chmod of an existing
-    //    dir) while fail-closing if the state root is somehow absent.
+    //    dir) while fail-closing if the state root is somehow absent. The
+    //    /tmp drop path carries a per-run unpredictable suffix (adversarial
+    //    review 2026-09-05): a fixed name in the world-writable sticky /tmp
+    //    could be pre-planted as a symlink (scp follows it and clobbers a
+    //    victim file) or pre-created attacker-owned and swapped before the
+    //    root read — an attacker-chosen verifier key would make the relay
+    //    trust attacker-signed assignment state.
     let tmp = write_temp_file("rn_relay_verifier_", ".pub", &verifier_bytes)?;
-    let ship = ssh::scp_to(
-        conn,
-        tmp.as_path(),
-        "/tmp/rn-relay-verifier.pub",
-        short_timeout,
+    let verifier_drop = format!(
+        "/tmp/rn-relay-verifier-{}.pub",
+        crate::vm_lab::unique_suffix()
     );
+    let ship = ssh::scp_to(conn, tmp.as_path(), &verifier_drop, short_timeout);
     let _ = std::fs::remove_file(&tmp);
     ship?;
     ssh::run_remote(
         conn,
+        // rc-capture shape (not an `&&` chain) so the drop file is removed
+        // even when `install` fails — a stale pubkey must not linger in /tmp
+        // (adversarial-review hardening 2026-09-05; the key is public, this
+        // is hygiene).
         &format!(
             "sudo -n sh -c 'mkdir -p {MACOS_STATE_ROOT} && \
-             install -m 0644 /tmp/rn-relay-verifier.pub {MACOS_STATE_ROOT}/relay-verifier.pub && \
-             rm -f /tmp/rn-relay-verifier.pub'"
+             install -m 0644 {verifier_drop} {MACOS_STATE_ROOT}/relay-verifier.pub; rc=$?; \
+             rm -f {verifier_drop}; exit $rc'"
         ),
         short_timeout,
     )?;
@@ -1327,26 +1336,42 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     //    orchestrator's workspace and run the installer from a temp staging
     //    cwd — the same proven shape as the quarantined
     //    `exercise_macos_relay_lifecycle_live` (vm_lab/mod.rs). The executed
-    //    shell body is a compile-time constant; only fixed /tmp paths appear
-    //    in it, and the absolute CLI path keeps the install independent of
-    //    sudo's PATH inside the root `sh -c`.
+    //    shell body interpolates only the Rust-generated /tmp drop path (a
+    //    literal `/tmp/rn-relay-reviewed-<suffix>.plist`; the suffix is a
+    //    numeric pid/time value, never guest- or operator-controlled text),
+    //    and the absolute CLI path keeps the install independent of sudo's
+    //    PATH inside the root `sh -c`.
     let plist_bytes = reviewed_relay_plist_bytes(&crate::vm_lab::workspace_root_path())?;
     let plist_tmp = write_temp_file("rn_relay_plist_", ".plist", &plist_bytes)?;
-    let ship_plist = ssh::scp_to(
-        conn,
-        plist_tmp.as_path(),
-        "/tmp/rn-relay-reviewed.plist",
-        short_timeout,
+    // Per-run unpredictable drop path (adversarial review 2026-09-05): a
+    // fixed /tmp name could be symlink-planted (scp clobbers the victim) or
+    // swapped before the root cp, planting an unreviewed launchd plist. The
+    // suffix never enters a shell string — it is interpolated into the scp
+    // destination argument by Rust, and the root script only references the
+    // resulting literal path.
+    let plist_drop = format!(
+        "/tmp/rn-relay-reviewed-{}.plist",
+        crate::vm_lab::unique_suffix()
     );
+    let ship_plist = ssh::scp_to(conn, plist_tmp.as_path(), &plist_drop, short_timeout);
     let _ = std::fs::remove_file(&plist_tmp);
     ship_plist?;
+    // The staging script is fail-closed by construction: every use of $T
+    // except the final `rm -rf "$T"` sits inside the `&&` chain, so a failed
+    // `mktemp -d` (empty T) aborts the chain before any path is built, and
+    // `rm -rf ""` is a harmless no-op error. `cp` failing aborts before
+    // install-macos-relay can run, so no fallback path is reachable; the
+    // installer itself has no embedded-default plist (read_source_plist
+    // errors on a missing file outside dry-run).
     ssh::run_remote(
         conn,
-        "sudo -n sh -c 'T=\"$(mktemp -d /tmp/rn-relay.XXXXXX)\" && \
-         mkdir -p \"$T/scripts/launchd\" && \
-         cp /tmp/rn-relay-reviewed.plist \"$T/scripts/launchd/com.rustynet.relay.plist\" && \
-         cd \"$T\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay; rc=$?; \
-         rm -rf \"$T\"; rm -f /tmp/rn-relay-reviewed.plist; exit $rc'",
+        &format!(
+            "sudo -n sh -c 'T=\"$(mktemp -d /tmp/rn-relay.XXXXXX)\" && \
+             mkdir -p \"$T/scripts/launchd\" && \
+             cp {plist_drop} \"$T/scripts/launchd/com.rustynet.relay.plist\" && \
+             cd \"$T\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay; rc=$?; \
+             rm -rf \"$T\"; rm -f {plist_drop}; exit $rc'",
+        ),
         Duration::from_secs(120),
     )?;
     Ok(())

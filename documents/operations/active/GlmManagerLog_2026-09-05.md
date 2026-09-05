@@ -323,3 +323,50 @@ shape as the quarantined `exercise_macos_relay_lifecycle_live`). This
 manager verifies/completes it (compile, unit tests, scoped gates,
 binary rebuild) before relaunching attempt 3.
 
+## 23:30 — deploy fix completed + glm-5.3 adversarial review APPROVE
+
+Completed the checkpoint's WIP fix on this branch (commit `98664b0e` +
+hardening follow-up):
+
+1. Extracted `reviewed_relay_plist_bytes(ws_root)` — fail-closed read
+   of the reviewed plist from the orchestrator workspace (missing →
+   Err, never a fallback). Unit tests:
+   `reviewed_relay_plist_fails_closed_when_missing`,
+   `reviewed_relay_plist_returns_exact_workspace_bytes`.
+2. `deploy_relay_service(conn)` (workdir param dropped): scp the
+   reviewed plist to a per-run /tmp drop path, root script stages it in
+   a `mktemp -d` tree and runs `ops install-macos-relay` from there;
+   `rc=$?; cleanup; exit $rc`. `install-macos-relay`'s
+   `read_source_plist` verified to have NO embedded fallback (Err on
+   missing file outside dry-run).
+3. Adversarial review (ai_read, glm-5.3, two rounds): round 1 caught
+   real design issues at the fixed `/tmp` drop names — symlink
+   pre-planting (scp follows a planted symlink and clobbers a victim),
+   pre-created-attacker-file swap before the root read (arbitrary
+   launchd plist = root persistence; attacker-chosen verifier key =
+   relay trusts attacker-signed assignment state), concurrent
+   collision, and the empty-`$T` rm concern. Fix: BOTH drop paths
+   (verifier key and plist) now carry a per-run `unique_suffix()`
+   (u128 pid+counter+time) formatted by Rust into the scp destination
+   and interpolated as a literal — never a shell-active string.
+   Round-2 verdict on the actual diff: **APPROVE**, angles (a)–(f) all
+   resolved: same-uid swap remains structurally possible but is moot
+   under passwordless `sudo -n` (same-uid compromise = root; nothing
+   left to defend); `rc=$?` captures the whole `&&` chain; scp rc
+   gated in Rust; empty-$T unreachable past the first `&&`; no new
+   secret handling. One non-blocking hardening applied: verifier-drop
+   cleanup moved to the rc-capture shape so a failed `install` still
+   removes the drop file. Remaining optional (NOT applied): hash-pin
+   the reviewed plist at review time; pipe bytes over stdin instead of
+   /tmp. Scoped gates: fmt clean, clippy `-D warnings --locked` clean,
+   `macos_install` tests 84/84, `deploy_relay` tests 9/9.
+
+Ledger note: the 36 empty-patch triage stubs in
+`live_lab_stage_triage.jsonl` predate this series (latest 2026-07-25)
+with no surviving run artifacts to ground patches — left for the
+owner, not fabricated.
+
+Next: rebuild the vm-lab binary, relaunch relay attempt 3 from this
+worktree (`--source-mode local-head` on the new commit).
+
+
