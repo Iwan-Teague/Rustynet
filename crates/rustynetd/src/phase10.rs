@@ -22,15 +22,24 @@ const WINDOWS_HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 /// Bound on `apply_dns_loopback`'s set+verify loop for the tunnel adapter's
 /// IPv6 DNS server. Windows can re-source a freshly-created adapter's IPv6
 /// DNS to its own auto-assigned placeholder shortly after bring-up; this many
-/// attempts (with `WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_INTERVAL` between them)
-/// gives that race a bounded number of chances to settle before the daemon
-/// fails closed instead of silently returning `Ok` on an unverified set.
+/// attempts (with `WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL` between them) gives
+/// that race a bounded number of chances to settle before the daemon fails
+/// closed instead of silently returning `Ok` on an unverified set.
 #[cfg_attr(not(windows), allow(dead_code))]
 const WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS: u32 = 5;
 
-/// Delay between `apply_dns_loopback`'s IPv6 set+verify attempts.
+/// Bound on `apply_dns_loopback`'s add+verify loop for the NRPT root-namespace
+/// rule. `Get-DnsClientNrptRule` is WMI-backed and can lag a `reg.exe add` by
+/// a beat — the same class of apply/read race found (and fixed) for the
+/// tunnel adapter's IPv6 DNS server, first observed live in
+/// `run-2026-09-05-windows-27-three-fixes-proof` immediately after that fix
+/// cleared the way past the IPv6 check.
 #[cfg_attr(not(windows), allow(dead_code))]
-const WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_INTERVAL: Duration = Duration::from_millis(400);
+const WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS: u32 = 5;
+
+/// Delay between `apply_dns_loopback`'s IPv6 and NRPT set/add+verify attempts.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL: Duration = Duration::from_millis(400);
 
 /// Run `command`, capturing its output, but never block longer than `timeout`.
 /// If the child does not exit in time it is killed and reaped and a timeout
@@ -5924,13 +5933,39 @@ impl WindowsCommandSystem {
                     self.interface_name
                 )));
             }
-            std::thread::sleep(WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_INTERVAL);
+            std::thread::sleep(WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL);
         }
 
-        for arg_set in windows_nrpt_reg_add_arg_sets() {
-            self.run_reg_success(&arg_set).map_err(|err| {
-                SystemError::DnsApplyFailed(format!("add loopback NRPT root rule: {err}"))
-            })?;
+        for attempt in 1..=WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS {
+            for arg_set in windows_nrpt_reg_add_arg_sets() {
+                self.run_reg_success(&arg_set).map_err(|err| {
+                    SystemError::DnsApplyFailed(format!("add loopback NRPT root rule: {err}"))
+                })?;
+            }
+            let snapshot =
+                crate::windows_dns_failclosed::collect_windows_dns_failclosed_snapshot()
+                    .map_err(|err| {
+                        SystemError::DnsApplyFailed(format!(
+                            "verify loopback NRPT root rule (attempt {attempt}/{WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS}): {err}"
+                        ))
+                    })?;
+            if crate::windows_dns_failclosed::nrpt_rules_cover_root_namespace(&snapshot.nrpt_rules)
+            {
+                if attempt > 1 {
+                    log::info!(
+                        "windows dns loopback apply: tunnel interface='{}' NRPT root rule settled on attempt {attempt}/{WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS}",
+                        self.interface_name,
+                    );
+                }
+                return Ok(());
+            }
+            if attempt == WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "NRPT root rule still missing/non-loopback after \
+                     {WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS} add+verify attempts"
+                )));
+            }
+            std::thread::sleep(WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL);
         }
         Ok(())
     }
