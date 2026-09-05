@@ -336,3 +336,51 @@ point toward a settle-time retry on the VALIDATOR side
 (`crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/dns_failclosed.rs:72-85`,
 mirroring the existing `windows_tunnel_ip_readiness_fragment` pattern) rather
 than another apply-side precondition.
+
+## 11. The tighter diagnostic's answer — a SECOND rebind, not (only) recurring reassertion; seventh fix landed (`238a2edb`)
+
+`run-2026-09-05-windows-31-dns-race-diagnostic-tight` (1s-resolution polling
+of `rustynet0`'s IPv6 DNS, IPv4 address, AND `Get-NetConnectionProfile`
+category/connectivity) answered §10's open question directly: the mesh IP
+address **changes a second time within the same bootstrap sequence**.
+
+- Early non-enforcing daemon (from `Install-RustyNetWindowsService.ps1`'s own
+  start): interface gets `100.64.0.1`, placeholder DNS + `Public/NoTraffic`
+  category all appear together, daemon corrects to `::1` ~10s later.
+- A second daemon cycle (this session's own `5c74a65c` restart-if-running
+  fix, inside `install_daemon`): same address, same lockstep pattern,
+  corrected again ~8s later.
+- **`enforce_baseline_runtime`'s own restart** (patch config for
+  `auto_tunnel_enforce=true` → `stop_daemon` → `start_daemon`): the interface
+  comes back with a **DIFFERENT** address, `100.75.108.185` — not `100.64.0.1`
+  — with the placeholder DNS again. The orchestrator's `enforce_baseline_runtime
+  pass` and `validate_baseline_runtime started` log lines land in the SAME
+  SECOND (`11:06:10`), and the validator's failure follows 7 seconds later
+  (`11:06:17`) — squarely inside the window where this third rebind's
+  placeholder had not yet been corrected.
+
+So both `e50235f9` and `923f2f9b` were each verifying compliance against only
+the FIRST IP-address bind they observed, and declaring victory on a single
+clean read. A later, independent rebind (this run's evidence: the daemon's
+own `auto_tunnel_enforce` restart triggers its own address assignment,
+distinct from the earlier non-enforcing one) can re-trigger Windows' write
+after that single check already returned `Ok`. Whether Windows ALSO does
+genuinely periodic reassertion independent of any rebind (§10 theory 1)
+remains unconfirmed either way — this evidence explains the failures without
+needing that theory, though it doesn't rule it out.
+
+**Fix landed:** `238a2edb`. Both `apply_dns_loopback` verify loops (IPv6 and
+NRPT) now require `WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS` /
+`WINDOWS_DNS_NRPT_SUSTAIN_READS` (3) **consecutive** clean reads, not one,
+before returning `Ok` — reset to zero on any drift, with the `netsh`/`reg`
+set still reapplied unconditionally every iteration so a delayed rebind's
+placeholder gets corrected on the very next iteration rather than waiting for
+a fresh drift-triggered reapply. Attempt budgets raised 5→12 to give the
+sustain requirement room. Unit tests, fmt/clippy/Windows-cross-compile/full
+test suite all verified clean. **Not yet live-re-proven.**
+
+If this ALSO reproduces, that would be strong evidence FOR §10's recurring-
+reassertion theory (since 3 consecutive reads spanning several seconds is a
+meaningfully wider window than a single read) — at that point, stop adding
+apply-side persistence and implement the validator-side settle-time retry
+instead, per §10's closing recommendation.
