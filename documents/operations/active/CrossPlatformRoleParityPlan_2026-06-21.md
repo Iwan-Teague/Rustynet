@@ -65,6 +65,24 @@ validator only (no live runtime) · ❌ untested / not implemented · 🔒 block
 | relay (live session forwarding) | ✅ | ✅ **lifecycle LIVE-PROVEN 2026-06-27** (orchestrate stage, run `livelab-1782571161`, commit `cd6a834`, `--relay-platform macos`): `validate_macos_relay_service_lifecycle` PASS — install/bootstrap → active (`/healthz` ok, `127.0.0.1:4501` bound) → stop/release (released after stop). The loopback `/healthz` wedge that blocked this was fixed by `574eaac` (the macOS PF killswitch now emits `pass quick on lo0 all` — previously it wedged loopback TCP, SYN_RCVD on `127.0.0.1:4501` → empty `/healthz`; verified in the live render path `render_macos_killswitch_pf_rules` phase10.rs, scoped to lo0 before the terminal `block drop out quick all`, at parity with the Linux killswitch's `oifname "lo" accept`). Earlier focused-proof on .210 2026-06-22 (`356f8a3`): `install-macos-relay` → relay `state=running`, `127.0.0.1:4501` bound, `/healthz={"status":"ok",...}` → `--uninstall` → released. Live cell `exercise_macos_relay_lifecycle_live` fixed (upload the static reviewed `com.rustynet.relay.plist` + run from a temp cwd since the bootstrap build dir is ephemeral; derive `--verifier-key` from the distributed trust verifier `trust-evidence.pub` written root-owned via `tee`, since `assignment.pub` is not distributed to macOS). **Live session forwarding remains HP-3-gated** (no live forwarding proven on ANY OS yet — the same cross-OS gate as the Linux ✅; macOS relay is now at lifecycle parity with Linux). | 🟠 SCM lifecycle **contract** only (`validate_windows_relay_service_lifecycle_contract`, "without guest mutation") — no live forwarding |
 | live role transitions (cross-OS) | ✅ (`role_switch_matrix`) | ✅ **LIVE-PROVEN 2026-07-04** (`livelab-1783135864-2fda3979d599`, commit `2fda397`): `validate_macos_role_transition` (`--role-switch-platform macos`) drove a real `LocalOnly` client->admin flip on `macos-utm-1` via `rustynet role set` + launchd bootout/bootstrap, asserted the new role via `role status`, ran `state refresh`, and asserted mesh peers did not regress across the flip (0 before/after, expected for a `--skip-linux-live-suite` run). `SignedMembership`-kind transitions (capability changes) are a separate follow-up. | ✅ **LIVE-PROVEN 2026-07-04** (`livelab-1783174602-844175f5ad2a`, commit `5516711`): `validate_windows_role_transition` drove a real `LocalOnly` client->admin flip on `windows-utm-1` via `rustynet role set` + `Stop-Service`/`Start-Service`, verified via `role status`, ran `state refresh`, and asserted mesh peers did not regress (0 before/after). The capability gap that blocked the first live run (`livelab-1783142381-8816bf73333b` FAIL — the installed Windows CLI had no daemon IPC client, and `update_node_role_env_file` didn't parse the `RUSTYNETD_DAEMON_ARGS_JSON` array format) was closed by `c51f00a`. See `CrossOsRoleSwitchPlan_2026-06-24.md` status header for the full history. |
 
+**Decree recorded 2026-09-05 — the macOS `exit` row above is an INTENDED per-OS
+divergence, and it does not cover the product's admin-posture macOS exit.** The macOS
+lab `Exit` runs the `blind_exit` daemon role (`role.rs` `daemon_node_role_for_platform`,
+macOS arm; origin `e3f55b7e`, formalized `dbb41c87`), not `admin` as the same lab role
+does on Linux/Windows, and its own signed membership record is narrowed post-genesis
+to exactly `{blind_exit, exit_server}` by the macOS membership adapter's owner-signed
+capability rewrite (`MacosExitMembershipRoleFixDesign_2026-08-31.md` §1.2, §4.1–§4.3;
+interim fix, F1 owner-key limitation disclosed, QH-66 Option D is the target). Rationale:
+macOS has no kernel-WireGuard/nft NAT path; the pf blind-exit machinery is the macOS
+egress-enforcement substrate; reversing the mapping would grant the lab exit `admin`
+IPC authority. Consequence for THIS matrix: the ✅ in the macOS `exit` cell is
+**blind_exit-posture evidence only**. The product's admin-posture macOS `Exit` preset
+(`role_presets.rs` `PrimaryRole::Admin`, installer `ops_install_macos_exit.rs`) is a
+different code path the lab never exercises — treat it as **N/A-by-decree / open**, not
+inherited-green. `Requirements.md` §4 ("no OS may limit which role a node can take") is
+therefore satisfied for the *lab* exit role by decree, and still OPEN for the admin-posture
+preset until it is proven on its own. See the Refresh §6 for the drift-rule statement.
+
 ### 3.1 The Windows exit blocker is HARDWARE-SOLVED — the cell is unrun, not blocked (2026-08-04)
 
 The 🔒 on the Windows exit row reflects `windows-utm-1`, the Apple-Silicon UTM

@@ -173,6 +173,27 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         peers: &[NodeMembershipPeer],
     ) -> Result<MembershipSnapshot, AdapterError>;
 
+    /// Whether the membership OWNER SIGNING KEY file is present on this node's
+    /// disk right now — a recorded fact, not a verdict.
+    ///
+    /// The macOS exit membership fix leaves the sole mesh signing key on the
+    /// blind_exit host as a disclosed interim limitation (F1,
+    /// `MacosExitMembershipRoleFixDesign_2026-08-31.md` §1.3.1). Its proving
+    /// runs must therefore record `owner_signing_key_present=` in the
+    /// `membership_init` stage log (§5.3) so the limitation stays visible in
+    /// evidence, and the same line flipping to `false` is the closure proof
+    /// once the Option D target lands. The default fails closed: a platform
+    /// that has not implemented the probe cannot silently report "absent" (or
+    /// "present") — the stage that needs the fact fails instead.
+    fn probe_membership_owner_signing_key_present(&self) -> Result<bool, AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message: "owner signing key presence probe is not implemented for this \
+                      platform; refusing to guess whether the mesh signing key is on disk"
+                .to_owned(),
+        })
+    }
+
     // ── Per-node identity + key collection ────────────────────────
 
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError>;

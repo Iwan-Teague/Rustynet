@@ -1,9 +1,14 @@
 #![allow(dead_code)]
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_OWNER_SIGNING_KEY_PATH;
+use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{GossipIdentity, NodeMembershipPeer, StageOutcome};
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+use rustynet_control::membership::snapshot_bytes_node_capabilities;
+use rustynet_control::roles::{canonicalize_role_capabilities, role_capability_csv};
 
 pub struct MembershipInitStage;
 
@@ -41,7 +46,7 @@ impl OrchestrationStage for MembershipInitStage {
             Err(err) => return StageOutcome::Failed(err),
         };
 
-        let (owner_key_r, snapshot_r) = {
+        let (owner_key_r, snapshot_r, macos_owner_probe) = {
             let adapter = match ctx.adapters.get(exit_alias.as_str()) {
                 Some(a) => a,
                 None => return StageOutcome::Failed(format!("no adapter for exit '{exit_alias}'")),
@@ -57,7 +62,24 @@ impl OrchestrationStage for MembershipInitStage {
                 ),
                 Err(_) => None,
             };
-            (owner_key, snapshot)
+            // macOS exit owner: record the F1 fact (is the owner signing key on
+            // the blind_exit host?). Probed only after `init_membership_snapshot`
+            // returned Ok — the macOS adapter runs genesis → capability rewrite →
+            // peer adds synchronously inside that call, so the fact describes
+            // the provisioned state the run leaves behind. A probe failure is a
+            // stage failure below.
+            let macos_owner_probe = if adapter.platform() == VmGuestPlatform::Macos
+                && matches!(&snapshot, Some(Ok(_)))
+            {
+                Some(
+                    adapter
+                        .probe_membership_owner_signing_key_present()
+                        .map_err(|e| e.to_string()),
+                )
+            } else {
+                None
+            };
+            (owner_key, snapshot, macos_owner_probe)
         };
 
         match (owner_key_r, snapshot_r) {
@@ -67,11 +89,107 @@ impl OrchestrationStage for MembershipInitStage {
             ),
             (_, Some(Err(e))) => StageOutcome::Failed(format!("init_membership_snapshot: {e}")),
             (_, Some(Ok(snap))) => {
+                if let Some(probe) = macos_owner_probe {
+                    // FAIL-LOUD assertion (design §5.1 step 4 / §5.2 stage
+                    // layer): the macOS exit's OWN signed record must be exactly
+                    // the product grant. This is the live analogue of the
+                    // daemon's own blind_exit+anchor rejection, one stage
+                    // earlier — no skip-as-pass.
+                    let exit_node_id = match ctx.node_ids.get(exit_alias.as_str()) {
+                        Some(id) if !id.trim().is_empty() => id.trim().to_owned(),
+                        _ => {
+                            return StageOutcome::Failed(format!(
+                                "no membership node id recorded for macOS exit '{exit_alias}'; \
+                                 cannot assert its signed capability set"
+                            ));
+                        }
+                    };
+                    // The node id is written verbatim into the evidence line
+                    // below; it must satisfy the seam's node-id class so a
+                    // value that ever came from guest output cannot forge or
+                    // split an evidence line (no whitespace, no control bytes).
+                    if let Err(err) = ValidatedArg::node_id(&exit_node_id) {
+                        return StageOutcome::Failed(format!(
+                            "membership node id for macOS exit '{exit_alias}' is not a valid \
+                             node id ({err}); refusing to record evidence with it"
+                        ));
+                    }
+                    if let Err(err) =
+                        assert_macos_exit_membership(&snap.data, &exit_alias, &exit_node_id)
+                    {
+                        return StageOutcome::Failed(err);
+                    }
+                    // REQUIRED evidence (design §5.3): the owner-key presence
+                    // fact travels with the verdict in this stage's own log.
+                    let present = match probe {
+                        Ok(present) => present,
+                        Err(err) => {
+                            return StageOutcome::Failed(format!(
+                                "owner signing key presence probe failed on macOS exit \
+                                 '{exit_alias}': {err}"
+                            ));
+                        }
+                    };
+                    let line = owner_key_evidence_line(present, &exit_node_id);
+                    if let Err(err) =
+                        append_stage_evidence_line(&ctx.report_dir, "membership_init", &line)
+                    {
+                        return StageOutcome::Failed(format!(
+                            "could not record required F1 evidence for macOS exit \
+                             '{exit_alias}' ({line}): {err}"
+                        ));
+                    }
+                    eprintln!("[stage:membership_init] {line}");
+                }
                 ctx.membership_snapshot = Some(snap.data);
                 StageOutcome::Passed
             }
         }
     }
+}
+
+/// The exact-set assertion for a macOS exit's own signed membership record.
+///
+/// Expected set: the product grant for a macOS Exit
+/// (`NodeRole::product_capabilities_for_platform`, macOS arm), canonicalized
+/// — the same single source the adapter's rewrite derives its CSV from.
+/// Actual set: read from the snapshot bytes the adapter returned (the state
+/// `DistributeMembership` will ship). Any difference names both sets.
+pub(crate) fn assert_macos_exit_membership(
+    snapshot: &[u8],
+    exit_alias: &str,
+    exit_node_id: &str,
+) -> Result<(), String> {
+    let expected = canonicalize_role_capabilities(
+        NodeRole::Exit
+            .product_capabilities_for_platform(&VmGuestPlatform::Macos)
+            .map_err(|err| format!("macOS exit product capability grant unavailable: {err}"))?,
+    );
+    let actual = snapshot_bytes_node_capabilities(snapshot, exit_node_id).ok_or_else(|| {
+        format!(
+            "macOS exit '{exit_alias}' (node_id={exit_node_id}) is missing, inactive, or \
+             unreadable in the membership snapshot; refusing to distribute a record that \
+             cannot be asserted"
+        )
+    })?;
+    if actual != expected {
+        return Err(format!(
+            "macOS exit '{exit_alias}' (node_id={exit_node_id}) signed membership carries \
+             {{{}}} but must be exactly {{{}}} (blind_exit alignment, \
+             MacosExitMembershipRoleFixDesign_2026-08-31.md §5.1 step 4)",
+            role_capability_csv(&actual),
+            role_capability_csv(&expected)
+        ));
+    }
+    Ok(())
+}
+
+/// The F1 evidence line (design §5.3), machine-greppable and single-line.
+pub(crate) fn owner_key_evidence_line(present: bool, exit_node_id: &str) -> String {
+    format!(
+        "owner_signing_key_present={present} path={MACOS_OWNER_SIGNING_KEY_PATH} \
+         node_id={exit_node_id}"
+    )
 }
 
 pub(crate) fn build_membership_peers(
@@ -357,5 +475,139 @@ mod tests {
             WireguardPublicKey("not-hex".to_owned()),
         );
         assert!(build_membership_peers(&ctx).is_err());
+    }
+
+    // ── Design §5.2 stage layer: the macOS exit's own signed record must be
+    //    EXACTLY the product grant, asserted on the bytes that will be
+    //    distributed — the live analogue of the daemon's rejection, one stage
+    //    earlier. Snapshots are encoded through the real persist path so the
+    //    assertion is exercised against the exact bytes the runtime reads.
+
+    fn snapshot_bytes_with_exit_caps(
+        tag: &str,
+        capabilities: Vec<rustynet_control::roles::RoleCapability>,
+    ) -> Vec<u8> {
+        use rustynet_control::membership::{
+            MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+            MembershipApproverStatus, MembershipNode, MembershipNodeStatus, MembershipState,
+            render_membership_snapshot_body,
+        };
+        let state = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "lab-net".to_owned(),
+            epoch: 2,
+            nodes: vec![MembershipNode {
+                node_id: "macos-exit-node".to_owned(),
+                node_pubkey_hex: "5".repeat(64),
+                owner: "macos-exit-node".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec![],
+                capabilities,
+                joined_at_unix: 100,
+                updated_at_unix: 120,
+            }],
+            approver_set: vec![MembershipApprover {
+                approver_id: "macos-exit-node-owner".to_owned(),
+                approver_pubkey_hex: "7".repeat(64),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        // The exact bytes `persist_membership_snapshot` writes, rendered in
+        // memory (the persist path chmods its parent directory, which the
+        // test temp dir refuses; the encoding is what matters here).
+        let _ = tag;
+        render_membership_snapshot_body(&state, None)
+            .expect("render snapshot")
+            .into_bytes()
+    }
+
+    #[test]
+    fn macos_exit_assertion_accepts_exactly_the_blind_exit_pair() {
+        use rustynet_control::roles::RoleCapability;
+        // Order on disk is irrelevant: the compare is canonical.
+        let bytes = snapshot_bytes_with_exit_caps(
+            "ok",
+            vec![RoleCapability::ExitServer, RoleCapability::BlindExit],
+        );
+        assert_macos_exit_membership(&bytes, "macos-utm-1", "macos-exit-node")
+            .expect("exact blind_exit pair must pass");
+    }
+
+    #[test]
+    fn macos_exit_assertion_fails_loud_on_the_anchor_genesis_set_naming_both_sets() {
+        use rustynet_control::roles::RoleCapability;
+        // The pre-fix defect: the exit's record still carries genesis anchor.
+        let bytes = snapshot_bytes_with_exit_caps(
+            "anchor",
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::AnchorBundlePull,
+                RoleCapability::Client,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost,
+            ],
+        );
+        let err = assert_macos_exit_membership(&bytes, "macos-utm-1", "macos-exit-node")
+            .expect_err("anchor-carrying record must fail the stage");
+        assert!(err.contains("anchor"), "must name the offending set: {err}");
+        let expected_csv =
+            role_capability_csv(&[RoleCapability::BlindExit, RoleCapability::ExitServer]);
+        assert!(
+            err.contains(&format!("must be exactly {{{expected_csv}}}")),
+            "must name the expected set: {err}"
+        );
+        assert!(err.contains("macos-exit-node"));
+    }
+
+    #[test]
+    fn macos_exit_assertion_rejects_a_superset_that_still_contains_the_pair() {
+        use rustynet_control::roles::RoleCapability;
+        // QH-65 shape: a contains-check would pass this; the exact-set must not.
+        let bytes = snapshot_bytes_with_exit_caps(
+            "superset",
+            vec![
+                RoleCapability::BlindExit,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost,
+            ],
+        );
+        let err = assert_macos_exit_membership(&bytes, "macos-utm-1", "macos-exit-node")
+            .expect_err("superset must fail");
+        assert!(err.contains("relay_host"), "{err}");
+    }
+
+    #[test]
+    fn macos_exit_assertion_fails_closed_when_the_exit_entry_is_missing_or_unreadable() {
+        use rustynet_control::roles::RoleCapability;
+        let bytes = snapshot_bytes_with_exit_caps(
+            "missing",
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+        );
+        let err = assert_macos_exit_membership(&bytes, "macos-utm-1", "some-other-node")
+            .expect_err("unknown node id must fail");
+        assert!(err.contains("missing, inactive, or unreadable"), "{err}");
+        let err = assert_macos_exit_membership(b"garbage", "macos-utm-1", "macos-exit-node")
+            .expect_err("garbage must fail");
+        assert!(err.contains("missing, inactive, or unreadable"), "{err}");
+    }
+
+    #[test]
+    fn owner_key_evidence_line_is_single_line_greppable_and_names_the_path() {
+        let line = owner_key_evidence_line(true, "macos-exit-node");
+        assert_eq!(
+            line,
+            format!(
+                "owner_signing_key_present=true path={MACOS_OWNER_SIGNING_KEY_PATH} \
+                 node_id=macos-exit-node"
+            )
+        );
+        assert!(!line.contains('\n'));
+        assert!(
+            owner_key_evidence_line(false, "x").starts_with("owner_signing_key_present=false ")
+        );
     }
 }

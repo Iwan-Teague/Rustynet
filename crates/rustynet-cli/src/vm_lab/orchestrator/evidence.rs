@@ -181,6 +181,51 @@ fn rust_native_stage_log_path(report_dir: &Path, stage: &str) -> PathBuf {
     report_dir.join("logs").join(format!("{stage}.log"))
 }
 
+/// Append one evidence line to a Rust-native stage's OWN per-stage log
+/// (`<report_dir>/logs/<stage>.log`) while the stage is running.
+///
+/// A Rust stage runs in-process, so until now its log held only the terminal
+/// verdict the recorder writes at finish. Some facts must travel WITH the
+/// verdict rather than be inferred from it — the first user is the macOS exit
+/// membership fix's disclosed F1 limitation, whose proving runs must record
+/// `owner_signing_key_present=…` so the limitation stays visible in evidence
+/// instead of hiding under a green status
+/// (`MacosExitMembershipRoleFixDesign_2026-08-31.md` §5.3). The recorder
+/// truncates the log at `stage_started` and APPENDS the terminal block at
+/// `stage_finished`, so lines written here sit above the verdict.
+///
+/// Fail-closed shape: a line carrying a newline is refused (it would forge a
+/// second line in an evidence file), and any I/O failure is returned so the
+/// calling stage can fail rather than pass with the evidence silently missing.
+pub(crate) fn append_stage_evidence_line(
+    report_dir: &Path,
+    stage: &str,
+    line: &str,
+) -> Result<(), String> {
+    use std::io::Write;
+    let line = line.trim_end();
+    if line.is_empty() {
+        return Err(format!("stage '{stage}' evidence line must not be empty"));
+    }
+    if line.contains('\n') || line.contains('\r') {
+        return Err(format!(
+            "stage '{stage}' evidence line must be a single line (embedded newline refused)"
+        ));
+    }
+    let path = rust_native_stage_log_path(report_dir, stage);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create stage log dir {}: {err}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(|err| format!("open stage log {} for append: {err}", path.display()))?;
+    writeln!(file, "{line}")
+        .map_err(|err| format!("append evidence line to {}: {err}", path.display()))
+}
+
 const RUST_NATIVE_REUSE_SEAL_RELATIVE_PATH: &str = "state/reuse_evidence.sha256";
 
 fn rust_native_reuse_evidence_digest(report_dir: &Path) -> Result<String, String> {
@@ -458,6 +503,29 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
             .borrow_mut()
             .insert(name.to_owned(), now.clone());
         let log_path = self.stage_log_path(name);
+        // Truncate the per-stage log at START so evidence lines a stage appends
+        // while running (`append_stage_evidence_line`) land in a fresh file and
+        // the terminal block appended at finish sits beneath them. A re-run of
+        // the same stage in the same report dir therefore never accumulates a
+        // previous run's lines. Best-effort like the terminal write below.
+        if let Some(parent) = log_path.parent()
+            && let Err(err) = fs::create_dir_all(parent)
+        {
+            self.record_error("create log directory", name, err);
+        }
+        if let Err(err) = fs::write(&log_path, "") {
+            // Could not truncate: remove the stale file outright so the
+            // append at finish can never preserve a previous run's lines. If
+            // even that fails the error is recorded, and recorder errors fail
+            // evidence finalization (see the struct doc) — stale content can
+            // then only survive inside a run whose evidence is already void.
+            self.record_error("truncate stage log at start", name, err);
+            if let Err(err) = fs::remove_file(&log_path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                self.record_error("remove stale stage log at start", name, err);
+            }
+        }
         // record_stage_start's positional args are (.., log_path, summary, ..)
         // -- these two used to be swapped here, so every `running` row wrote
         // an empty log_path and put the log path itself into the summary
@@ -541,7 +609,25 @@ impl orchestrator::runner::StageObserver for RustNativeStageRecorder<'_> {
         } else {
             format!("[stage:{name}] {status} (rust --node engine)\n{summary}\n")
         };
-        if let Err(err) = fs::write(&log_path, log_body) {
+        // APPEND when this recorder started the stage (the start truncated the
+        // file, and the stage may have appended evidence lines since — they
+        // must survive beneath the verdict). A finish with no matching start
+        // here (a reuse/skip decision the runner reports without starting the
+        // stage) falls back to the plain write so stale content is replaced.
+        let started_here = self.started_at.borrow().contains_key(name);
+        let write_result = if started_here {
+            fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&log_path)
+                .and_then(|mut file| {
+                    use std::io::Write;
+                    file.write_all(log_body.as_bytes())
+                })
+        } else {
+            fs::write(&log_path, log_body)
+        };
+        if let Err(err) = write_result {
             self.record_error("write terminal log", name, err);
         }
         if let Err(err) = crate::live_lab_stage_recorder::record_stage_finish(
@@ -1330,6 +1416,85 @@ where
     }
 
     finalized
+}
+
+#[cfg(test)]
+mod stage_evidence_line_tests {
+    use super::*;
+    use crate::vm_lab::orchestrator::error::StageOutcome;
+    use crate::vm_lab::orchestrator::runner::StageObserver;
+    use crate::vm_lab::orchestrator::stage::StageId;
+
+    /// Evidence lines a stage appends while running must survive beneath the
+    /// terminal verdict, and a re-run must start from a fresh file — the
+    /// contract `membership_init`'s F1 `owner_signing_key_present=` line
+    /// depends on.
+    #[test]
+    fn stage_evidence_lines_survive_beneath_the_terminal_verdict_and_reruns_truncate() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-stage-evidence-{}.dir",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).expect("tmp dir");
+        let log = tmp.join("logs/membership_init.log");
+        // Stale content from a "previous run" of the same report dir.
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, "STALE LINE FROM A PREVIOUS RUN\n").unwrap();
+
+        let rec = RustNativeStageRecorder {
+            report_dir: &tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+            errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
+        };
+        rec.stage_started(&StageId::MembershipInit);
+        append_stage_evidence_line(
+            &tmp,
+            "membership_init",
+            "owner_signing_key_present=true path=/x node_id=n",
+        )
+        .expect("append");
+        rec.stage_finished(&StageId::MembershipInit, &StageOutcome::Passed);
+
+        let body = fs::read_to_string(&log).expect("log");
+        assert!(
+            !body.contains("STALE LINE"),
+            "start must truncate the previous run's content: {body}"
+        );
+        let evidence_at = body
+            .find("owner_signing_key_present=true")
+            .expect("evidence line kept");
+        let verdict_at = body
+            .find("[stage:membership_init] pass")
+            .expect("terminal verdict appended");
+        assert!(
+            evidence_at < verdict_at,
+            "evidence must sit above the verdict: {body}"
+        );
+        assert!(rec.take_errors().is_empty());
+
+        // A finish WITHOUT a matching start (runner-reported skip/reuse)
+        // still replaces stale content rather than appending to it.
+        let rec2 = RustNativeStageRecorder {
+            report_dir: &tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+            errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
+        };
+        rec2.stage_finished(
+            &StageId::MembershipInit,
+            &StageOutcome::Skipped("no exit".to_owned()),
+        );
+        let body = fs::read_to_string(&log).expect("log");
+        assert!(!body.contains("owner_signing_key_present"), "{body}");
+        assert!(body.contains("skipped"), "{body}");
+
+        // Multi-line evidence is refused: it would forge a second line.
+        assert!(append_stage_evidence_line(&tmp, "membership_init", "a\nb").is_err());
+        assert!(append_stage_evidence_line(&tmp, "membership_init", "   ").is_err());
+        let _ = fs::remove_dir_all(&tmp);
+    }
 }
 
 #[cfg(test)]

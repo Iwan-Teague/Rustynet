@@ -2,6 +2,12 @@
 
 Status: investigation complete; verdict is an orchestrator membership/role-mapping
 integration defect, not a DNS-enforcement gap and not a validator-expectation bug.
+**Update 2026-09-05:** the fix is designed (`MacosExitMembershipRoleFixDesign_2026-08-31.md`,
+owner-approved as an INTERIM fix after independent review, F1 limitation disclosed,
+Option D ledgered as QH-66) and IMPLEMENTED in the macOS membership adapter +
+`membership_init` stage (post-genesis owner-signed capability rewrite to exactly
+`{blind_exit, exit_server}`, fail-loud stage assertion, `owner_signing_key_present=`
+evidence line). Live re-proof of the exit cell on the landing commit is pending.
 Every claim below cites file:line from the tree at investigation time.
 
 ## a) Run evidence and the role split

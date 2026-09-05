@@ -135,6 +135,29 @@ but a needless epoch bump. The read-back helper
 base64'd snapshot; reuse it (or read the genesis snapshot once, decide, then
 read back again after the rewrite).
 
+**CORRECTION 2026-09-05 (found by the implementation's in-process test, missed
+by both reviews):** "needless epoch bump" understates it. The membership
+reducer REFUSES any `SetNodeCapabilities` whose target node already carries
+`blind_exit` — `reduce_membership_state`
+(`crates/rustynet-control/src/membership.rs`, SetNodeCapabilities arm: "blind_exit
+is immutable; factory reset and fresh enrollment are required to change
+capabilities", the RT-2 / SecMinBar §6.D.2 immutability gate). So on a re-used
+guest whose record is already canonical, re-issuing the rewrite would not bump
+the epoch — it would HARD-FAIL `membership_init` at propose time. The
+read-and-skip guard is therefore a correctness requirement, not an
+optimisation. Two further consequences: (1) the rewrite is one-way at the
+membership layer — once the exit's record carries `blind_exit`, no signed
+`SetNodeCapabilities` can ever change it again (only `RemoveNode` +
+`AddNode` under a fresh identity, i.e. factory reset), which is exactly the
+§2.4 one-way-door property, now confirmed to hold at the trust boundary and
+not only in the CLI planner; (2) the §3c/QH-65 exploit is reachable only by
+ENTERING blind_exit with an over-wide set (an `AddNode` carrying
+`{blind_exit, exit_server, relay_host}`, or one `SetNodeCapabilities` from a
+non-blind record straight to that set) — not by widening an existing
+blind_exit record. Pinned by
+`owner_signed_set_capabilities_narrows_anchor_genesis_to_blind_exit_pair_at_epoch_two`
+in `membership.rs`.
+
 ### 1.3 Why THIS layer (and not the alternatives)
 
 Three candidate layers were weighed (Investigation §e sketches two of them):

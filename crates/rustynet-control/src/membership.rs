@@ -1095,6 +1095,20 @@ pub fn persist_membership_snapshot_with_attestation(
     state: &MembershipState,
     attestation: Option<&MembershipHeadAttestation>,
 ) -> Result<(), MembershipError> {
+    let body = render_membership_snapshot_body(state, attestation)?;
+    atomic_write(path.as_ref(), body.as_bytes(), 0o600)
+}
+
+/// Render the exact on-disk snapshot body `persist_membership_snapshot*`
+/// writes — `version=`/`state_hex=`/`digest=` plus the optional head
+/// attestation block — WITHOUT touching the filesystem. Pure: the same
+/// state and attestation always render to the same bytes, which is what lets
+/// read-side tests (and the orchestrator's exact-set assertions) exercise the
+/// real snapshot encoding without a privileged, permission-mangling write.
+pub fn render_membership_snapshot_body(
+    state: &MembershipState,
+    attestation: Option<&MembershipHeadAttestation>,
+) -> Result<String, MembershipError> {
     use std::fmt::Write as _;
     let state_payload = state.canonical_payload()?;
     let state_hex = hex_encode(state_payload.as_bytes());
@@ -1162,7 +1176,7 @@ pub fn persist_membership_snapshot_with_attestation(
             );
         }
     }
-    atomic_write(path.as_ref(), body.as_bytes(), 0o600)
+    Ok(body)
 }
 
 pub fn load_membership_snapshot(
@@ -1243,6 +1257,35 @@ pub fn snapshot_bytes_have_capability(
 /// Does not perform file-security checks — caller owns the source trust.
 pub fn snapshot_bytes_have_bundle_pull_capability(bytes: &[u8], node_id: &str) -> bool {
     snapshot_bytes_have_capability(bytes, node_id, RoleCapability::AnchorBundlePull)
+}
+
+/// Return the CANONICAL (sorted, de-duplicated) signed capability set of the
+/// **Active** node `node_id` in the given snapshot bytes, or `None`.
+///
+/// This is the read-side primitive for exact-set assertions ("this node's
+/// signed record must be exactly `{a, b}`"), which a single-capability
+/// membership test (`snapshot_bytes_have_capability`) cannot express: a
+/// forbidden-values or contains-check reads a record that carries an extra
+/// capability as acceptable. Fails closed — `None` — on every failure mode
+/// (non-utf8 bytes, an oversized snapshot, a digest mismatch, a malformed or
+/// invalid state, an unknown `node_id`, a node that is not `Active`), so a
+/// caller comparing against an expected set can never accidentally treat an
+/// unreadable snapshot as a matching one. Does not perform file-security
+/// checks (symlink/permission); the caller owns the source trust.
+pub fn snapshot_bytes_node_capabilities(
+    bytes: &[u8],
+    node_id: &str,
+) -> Option<Vec<RoleCapability>> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    if content.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return None;
+    }
+    let state = parse_snapshot_content(content).ok()?;
+    let node = state.nodes.into_iter().find(|n| n.node_id == node_id)?;
+    if node.status != MembershipNodeStatus::Active {
+        return None;
+    }
+    Some(canonicalize_role_capabilities(node.capabilities))
 }
 
 /// FIS-0020: (epoch, state_root_hex) identity of a membership snapshot's
@@ -3023,6 +3066,292 @@ mod tests {
             "anchor-a",
             RoleCapability::AnchorBundlePull
         ));
+    }
+
+    // ── `snapshot_bytes_node_capabilities`: the exact-set read primitive the
+    // macOS exit membership alignment assertion is built on. A contains-check
+    // cannot say "exactly these two", so every extra-capability case below must
+    // surface as a DIFFERENT set, and every failure mode as `None`.
+
+    #[test]
+    fn snapshot_bytes_node_capabilities_returns_the_canonical_set_of_an_active_node() {
+        // Deliberately unsorted and duplicated on input: the accessor must
+        // canonicalize so an exact compare is order- and duplicate-insensitive.
+        let bytes = snapshot_with_node_caps(
+            "mac-exit",
+            MembershipNodeStatus::Active,
+            vec![
+                RoleCapability::ExitServer,
+                RoleCapability::BlindExit,
+                RoleCapability::ExitServer,
+            ],
+        );
+        let caps = super::snapshot_bytes_node_capabilities(&bytes, "mac-exit")
+            .expect("active node must be readable");
+        assert_eq!(
+            caps,
+            crate::roles::canonicalize_role_capabilities([
+                RoleCapability::BlindExit,
+                RoleCapability::ExitServer
+            ])
+        );
+        assert_eq!(caps.len(), 2, "canonicalization must de-duplicate");
+    }
+
+    #[test]
+    fn snapshot_bytes_node_capabilities_surfaces_an_extra_capability_as_a_different_set() {
+        // The anchor-carrying genesis set a macOS exit inherits today must NOT
+        // compare equal to the blind_exit pair — this is the defect the
+        // orchestrator assertion exists to catch.
+        let bytes = snapshot_with_node_caps(
+            "mac-exit",
+            MembershipNodeStatus::Active,
+            vec![
+                RoleCapability::Anchor,
+                RoleCapability::Client,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost,
+            ],
+        );
+        let caps = super::snapshot_bytes_node_capabilities(&bytes, "mac-exit")
+            .expect("active node must be readable");
+        let target = crate::roles::canonicalize_role_capabilities([
+            RoleCapability::BlindExit,
+            RoleCapability::ExitServer,
+        ]);
+        assert_ne!(caps, target);
+        assert!(caps.contains(&RoleCapability::Anchor));
+    }
+
+    #[test]
+    fn snapshot_bytes_node_capabilities_fails_closed_on_unknown_revoked_or_garbage() {
+        let bytes = snapshot_with_node_caps(
+            "mac-exit",
+            MembershipNodeStatus::Revoked,
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+        );
+        // Revoked node: its row still lists capabilities, but it is not Active.
+        assert!(super::snapshot_bytes_node_capabilities(&bytes, "mac-exit").is_none());
+        // Unknown node id.
+        let bytes = snapshot_with_node_caps(
+            "mac-exit",
+            MembershipNodeStatus::Active,
+            vec![RoleCapability::BlindExit, RoleCapability::ExitServer],
+        );
+        assert!(super::snapshot_bytes_node_capabilities(&bytes, "someone-else").is_none());
+        // Garbage / tampered bytes never read as a matching set.
+        assert!(super::snapshot_bytes_node_capabilities(b"not a snapshot", "mac-exit").is_none());
+        let mut tampered = bytes.clone();
+        if let Some(pos) = tampered.iter().position(|b| *b == b'0') {
+            tampered[pos] = b'1';
+        }
+        assert!(
+            super::snapshot_bytes_node_capabilities(&tampered, "mac-exit").is_none(),
+            "a digest mismatch must fail closed"
+        );
+        assert!(super::snapshot_bytes_node_capabilities(&[0xff, 0xfe], "mac-exit").is_none());
+    }
+
+    /// The exact signed-update sequence the macOS exit membership fix relies
+    /// on, run in-process against the real propose/sign/apply pipeline: an
+    /// anchor-carrying genesis (single owner, quorum 1 — the shape
+    /// `rustynetd membership init` mints) narrowed by ONE owner-signed
+    /// `SetNodeCapabilities` lands at exactly epoch 2 with exactly
+    /// `{blind_exit, exit_server}`; the same signed update cannot be replayed;
+    /// and ANY further `SetNodeCapabilities` on the now-blind_exit record —
+    /// even a same-content one — is refused by the reducer's immutability
+    /// gate. That refusal is why the orchestrator's idempotency guard must
+    /// skip the rewrite when the record is already canonical: re-issuing it
+    /// would hard-fail at propose, not merely bump the epoch (design §1.2
+    /// correction of 2026-09-05, §5.1 step 3).
+    #[test]
+    fn owner_signed_set_capabilities_narrows_anchor_genesis_to_blind_exit_pair_at_epoch_two() {
+        let owner_key = SigningKey::from_bytes(&[7; 32]);
+        let genesis = MembershipState {
+            schema_version: MEMBERSHIP_SCHEMA_VERSION,
+            network_id: "lab-net".to_owned(),
+            epoch: 1,
+            nodes: vec![MembershipNode {
+                node_id: "mac-exit".to_owned(),
+                node_pubkey_hex: hex_encode(&[5; 32]),
+                owner: "mac-exit".to_owned(),
+                status: MembershipNodeStatus::Active,
+                roles: vec![],
+                capabilities: vec![
+                    RoleCapability::Anchor,
+                    RoleCapability::AnchorGossipSeed,
+                    RoleCapability::AnchorBundlePull,
+                    RoleCapability::AnchorEnrollmentEndpoint,
+                    RoleCapability::AnchorRelayColocation,
+                    RoleCapability::AnchorPortMappingAuthoritative,
+                    RoleCapability::Client,
+                    RoleCapability::ExitServer,
+                    RoleCapability::RelayHost,
+                ],
+                joined_at_unix: 100,
+                updated_at_unix: 100,
+            }],
+            approver_set: vec![MembershipApprover {
+                approver_id: "mac-exit-owner".to_owned(),
+                approver_pubkey_hex: hex_encode(owner_key.verifying_key().as_bytes()),
+                role: MembershipApproverRole::Owner,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            }],
+            quorum_threshold: 1,
+            metadata_hash: None,
+        };
+        genesis.validate().expect("genesis validates");
+        let target = crate::roles::canonicalize_role_capabilities([
+            RoleCapability::BlindExit,
+            RoleCapability::ExitServer,
+        ]);
+
+        let sign = |state: &MembershipState, update_id: &str| -> SignedMembershipUpdate {
+            let operation = MembershipOperation::SetNodeCapabilities {
+                node_id: "mac-exit".to_owned(),
+                capabilities: target.clone(),
+            };
+            let next = preview_next_state(state, &operation, 120).expect("preview");
+            let record = MembershipUpdateRecord {
+                network_id: state.network_id.clone(),
+                update_id: update_id.to_owned(),
+                operation,
+                target: "mac-exit".to_owned(),
+                prev_state_root: state.state_root_hex().expect("root"),
+                new_state_root: next.state_root_hex().expect("root"),
+                epoch_prev: state.epoch,
+                epoch_new: state.epoch + 1,
+                created_at_unix: 120,
+                expires_at_unix: 600,
+                reason_code: "macos_exit_blind_exit_alignment".to_owned(),
+                policy_context: None,
+            };
+            let signature =
+                sign_update_record(&record, "mac-exit-owner", &owner_key).expect("sign");
+            SignedMembershipUpdate {
+                record,
+                approver_signatures: vec![signature],
+            }
+        };
+
+        let mut replay_cache = MembershipReplayCache::default();
+        let signed = sign(&genesis, "rewrite-1");
+        let narrowed =
+            apply_signed_update(&genesis, &signed, 130, &mut replay_cache).expect("apply");
+        assert_eq!(narrowed.epoch, 2, "genesis (1) + exactly one signed update");
+        let record = narrowed
+            .nodes
+            .iter()
+            .find(|n| n.node_id == "mac-exit")
+            .expect("exit entry");
+        assert_eq!(
+            crate::roles::canonicalize_role_capabilities(record.capabilities.iter().copied()),
+            target
+        );
+        assert!(!record.capabilities.contains(&RoleCapability::Anchor));
+        // The read-side accessor the orchestrator asserts with agrees with the
+        // applied state, byte-for-byte through the snapshot encoding.
+        let bytes = snapshot_bytes_for(&narrowed);
+        assert_eq!(
+            super::snapshot_bytes_node_capabilities(&bytes, "mac-exit"),
+            Some(target.clone())
+        );
+        assert_eq!(
+            super::snapshot_bytes_state_identity(&bytes).map(|(e, _)| e),
+            Some(2)
+        );
+
+        // Replaying the very same signed update against the narrowed state is
+        // refused (state root / update id already observed).
+        assert!(
+            apply_signed_update(&narrowed, &signed, 131, &mut replay_cache).is_err(),
+            "the identical signed update must not apply twice"
+        );
+
+        // The rewrite is ONE-WAY at the trust boundary: once the record
+        // carries blind_exit, the reducer refuses every further
+        // SetNodeCapabilities on it (RT-2 / SecMinBar §6.D.2 immutability) —
+        // even a same-content one. This is why the orchestrator's
+        // read-and-skip guard is a correctness requirement: re-issuing the
+        // rewrite on an already-canonical record would hard-fail at propose,
+        // not merely bump the epoch.
+        let same_again = MembershipOperation::SetNodeCapabilities {
+            node_id: "mac-exit".to_owned(),
+            capabilities: target.clone(),
+        };
+        let err = preview_next_state(&narrowed, &same_again, 140)
+            .expect_err("a blind_exit record must refuse any further capability update");
+        assert!(
+            format!("{err}").contains("blind_exit is immutable"),
+            "unexpected refusal: {err}"
+        );
+        // And widening it (the QH-65 shape) is refused for the same reason —
+        // the over-wide set is reachable only on ENTRY, never by widening.
+        let widen = MembershipOperation::SetNodeCapabilities {
+            node_id: "mac-exit".to_owned(),
+            capabilities: vec![
+                RoleCapability::BlindExit,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost,
+            ],
+        };
+        assert!(preview_next_state(&narrowed, &widen, 141).is_err());
+    }
+
+    /// `render_membership_snapshot_body` was extracted from the persist path;
+    /// this pins that the extraction changed no bytes — what persist writes
+    /// to disk is exactly what render returns (with and without a head
+    /// attestation), so read-side consumers rendering in memory exercise the
+    /// real on-disk encoding.
+    #[cfg(unix)]
+    #[test]
+    fn render_membership_snapshot_body_is_byte_identical_to_the_persisted_file() {
+        let unique = format!(
+            "membership-snapshot-render-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let temp_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&temp_dir).expect("temp dir creation");
+        let state = base_state();
+
+        let plain = temp_dir.join("plain.snapshot");
+        persist_membership_snapshot(&plain, &state).expect("snapshot should persist");
+        let on_disk = std::fs::read(&plain).expect("read persisted snapshot");
+        let rendered = super::render_membership_snapshot_body(&state, None).expect("render");
+        assert_eq!(on_disk, rendered.into_bytes());
+
+        // With a head attestation the extra block must match too.
+        let owner_key = SigningKey::from_bytes(&[1; 32]);
+        let attestation = MembershipHeadAttestation {
+            network_id: state.network_id.clone(),
+            epoch: state.epoch,
+            state_root_hex: state.state_root_hex().expect("root"),
+            attested_at_unix: 150,
+            approver_signatures: vec![
+                super::sign_head_attestation(
+                    &state.network_id,
+                    state.epoch,
+                    &state.state_root_hex().expect("root"),
+                    150,
+                    "owner-1",
+                    &owner_key,
+                )
+                .expect("attestation signature"),
+            ],
+        };
+        let attested = temp_dir.join("attested.snapshot");
+        super::persist_membership_snapshot_with_attestation(&attested, &state, Some(&attestation))
+            .expect("attested snapshot should persist");
+        let on_disk = std::fs::read(&attested).expect("read persisted snapshot");
+        let rendered = super::render_membership_snapshot_body(&state, Some(&attestation))
+            .expect("render with attestation");
+        assert_eq!(on_disk, rendered.into_bytes());
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

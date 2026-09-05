@@ -2,6 +2,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_install::{
     MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH, MACOS_MEMBERSHIP_SNAPSHOT_PATH,
     MACOS_OWNER_SIGNING_KEY_PATH, MACOS_RUSTYNET_PATH, MACOS_STATE_ROOT,
@@ -14,8 +15,12 @@ use crate::vm_lab::orchestrator::error::{
     NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
-use rustynet_control::membership::MEMBERSHIP_SCHEMA_VERSION;
-use rustynet_control::roles::role_capability_csv;
+use rustynet_control::membership::{
+    MEMBERSHIP_SCHEMA_VERSION, snapshot_bytes_node_capabilities, snapshot_bytes_state_identity,
+};
+use rustynet_control::roles::{
+    RoleCapability, canonicalize_role_capabilities, role_capability_csv,
+};
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 const MEDIUM_TIMEOUT: Duration = Duration::from_secs(120);
@@ -171,6 +176,36 @@ fn membership_init_script(exit_node_id: &str) -> Result<ssh::RemoteCommand, Adap
         ValidatedArg::cli_token("sudo")?,
         ValidatedArg::cli_token("-n")?,
         ValidatedArg::cli_token("env")?,
+        // DELIBERATE, DISCLOSED LIE — do NOT "fix" this to `blind_exit`.
+        //
+        // This node will actually run daemon role `blind_exit` (role.rs maps
+        // the macOS lab Exit there). It is declared `admin` to
+        // `ops init-membership` because declaring the real role triggers
+        // `maybe_remove_blind_exit_owner_signing_key`
+        // (`crates/rustynet-cli/src/main.rs`, called on BOTH the fresh-init and
+        // the already-present short-circuit paths), which deletes the owner
+        // signing key — the key this very provisioning flow needs on disk
+        // moments later to sign its own follow-up capability rewrite
+        // (`exit_capability_rewrite_script`) and every per-peer
+        // `e2e-membership-add`. Change this token and the whole
+        // `membership_init` stage fails at the first signed update.
+        //
+        // Consequence (F1, `MacosExitMembershipRoleFixDesign_2026-08-31.md`
+        // §1.3.1/§2.3): after provisioning, the exit's SIGNED record is
+        // narrowed to exactly `{blind_exit, exit_server}`, but its disk still
+        // holds the sole mesh owner signing key (`quorum_threshold: 1`), so a
+        // compromised exit host retains the physical ability to re-mint any
+        // capability for any node — the escalation class blind_exit exists to
+        // prevent. This is a DISCLOSED interim limitation, recorded in every
+        // proving run as `owner_signing_key_present=true` (§5.3,
+        // `probe_owner_signing_key_present`), and closed only by the Option D
+        // target (§1.3.2, QH-66): never make a blind_exit node the membership
+        // owner in the first place. Crash window, for completeness: an abort
+        // between genesis and the rewrite leaves an anchor-carrying signed
+        // record plus this key on disk; the daemon fail-closes on
+        // blind_exit+anchor, and the next provisioning run's read-and-skip
+        // guard sees a non-canonical record and issues the rewrite cleanly
+        // (the reducer's immutability bar only bites once blind_exit is set).
         ValidatedArg::cli_token("RUSTYNET_NODE_ROLE=admin")?,
         node_id_env,
         keychain_account_env,
@@ -262,52 +297,198 @@ fn membership_snapshot_readback_script() -> String {
     )
 }
 
-pub fn init_membership_snapshot(
-    conn: &NodeConnection,
-    _owner_key: &MembershipOwnerKey,
-    peers: &[NodeMembershipPeer],
-) -> Result<MembershipSnapshot, AdapterError> {
-    // 1. Run ops init-membership (idempotent). RUSTYNET_NODE_ID is required
-    //    by init-membership; sourced from the exit peer, fail-loud if absent.
-    let exit_node_id = exit_node_id_from_peers(peers)?;
-    let init_script = membership_init_script(exit_node_id)?;
-    ssh::run_remote(conn, init_script.as_str(), MEDIUM_TIMEOUT)?;
+/// The exact signed capability set a macOS exit's OWN membership record must
+/// carry — derived from the product grant (`role.rs`
+/// `product_capabilities_for_platform`, macOS Exit arm), canonicalized. Never a
+/// hand-typed CSV: the provisioning grant and the product grant cannot drift
+/// if there is only one source (`MacosExitMembershipRoleFixDesign_2026-08-31.md`
+/// §1.2, §5.1 step 2).
+pub(crate) fn macos_exit_target_capabilities() -> Result<Vec<RoleCapability>, AdapterError> {
+    let grant = NodeRole::Exit
+        .product_capabilities_for_platform(&VmGuestPlatform::Macos)
+        .map_err(|err| AdapterError::Protocol {
+            message: format!("macOS exit product capability grant unavailable: {err}"),
+        })?;
+    let canonical = canonicalize_role_capabilities(grant);
+    if canonical.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: "macOS exit product capability grant is empty; refusing to sign an \
+                      empty capability set"
+                .to_owned(),
+        });
+    }
+    Ok(canonical)
+}
 
-    // 2. Add each non-exit peer.
+/// `true` when the exit's CURRENT signed set differs from the target set
+/// (canonical, order- and duplicate-insensitive compare). Drives the
+/// idempotency branch: a fresh anchor-carrying genesis needs the rewrite; a
+/// re-used guest whose record is already `{blind_exit, exit_server}` must NOT
+/// re-apply it. This guard is a CORRECTNESS requirement, not an optimisation:
+/// the membership reducer refuses any `SetNodeCapabilities` on a record that
+/// already carries `blind_exit` ("blind_exit is immutable; factory reset and
+/// fresh enrollment are required", `rustynet_control::membership`
+/// `reduce_membership_state`, SecMinBar §6.D.2), so re-issuing the rewrite on
+/// a re-used guest would hard-fail `membership_init` at propose time. Pinned
+/// in-process by
+/// `owner_signed_set_capabilities_narrows_anchor_genesis_to_blind_exit_pair_at_epoch_two`.
+pub(crate) fn exit_needs_capability_rewrite(
+    current: &[RoleCapability],
+    target: &[RoleCapability],
+) -> bool {
+    canonicalize_role_capabilities(current.iter().copied())
+        != canonicalize_role_capabilities(target.iter().copied())
+}
+
+/// Build the remote `ops e2e-membership-set-capabilities` command that
+/// narrows the exit's OWN signed record to `capabilities` — the post-genesis,
+/// owner-signed capability rewrite (design §1.2).
+///
+/// Same MAC-D11 keychain-account env plumbing and MAC-D6 derived approver id
+/// as `peer_add_script`; argv-shaped through the validated seam. The verb it
+/// invokes is the existing hardened signed-update pipeline
+/// (`ops_e2e.rs::execute_ops_e2e_membership_set_capabilities`: stage
+/// permissions → `propose-set-capabilities` → `sign-update` with the owner key
+/// → `apply-update` with epoch/replay checks → audit entry), so nothing here
+/// mutates membership outside a signed, owner-approved update.
+fn exit_capability_rewrite_script(
+    exit_node_id: &str,
+    capabilities: &[RoleCapability],
+) -> Result<ssh::RemoteCommand, AdapterError> {
+    ValidatedArg::node_id(exit_node_id)?;
+    let owner_approver_id_arg = ValidatedArg::node_id(&format!("{exit_node_id}-owner"))?;
+    let keychain_account_env = ValidatedArg::cli_token(&format!(
+        "RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-{exit_node_id}"
+    ))?;
+    let args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        keychain_account_env,
+        ValidatedArg::path(MACOS_RUSTYNET_PATH)?,
+        ValidatedArg::cli_token("ops")?,
+        ValidatedArg::cli_token("e2e-membership-set-capabilities")?,
+        ValidatedArg::cli_token("--node-id")?,
+        ValidatedArg::node_id(exit_node_id)?,
+        ValidatedArg::cli_token("--capabilities")?,
+        ValidatedArg::capability_csv(&role_capability_csv(capabilities))?,
+        ValidatedArg::cli_token("--owner-approver-id")?,
+        owner_approver_id_arg,
+    ];
+    ssh::RemoteCommand::from_args("macos e2e-membership-set-capabilities", &args)
+}
+
+/// Build the `e2e-membership-add` command for one non-exit peer.
+fn peer_add_command(
+    exit_node_id: &str,
+    peer: &NodeMembershipPeer,
+) -> Result<ssh::RemoteCommand, AdapterError> {
+    // Branch on the SUBJECT peer, not on this producer's platform. This
+    // function runs on a macOS exit node but writes membership for EVERY
+    // peer in the topology, including Linux ones that DO have a real gossip
+    // identity. Publishing `public_key_hex` unconditionally here would
+    // republish those nodes' WireGuard keys under a flag named
+    // `unaligned-wireguard` — silently reinstating the exact defect this
+    // change exists to remove, on any `--exit-platform macos` run.
+    let (pubkey_flag, pubkey_arg) = match &peer.gossip_identity {
+        GossipIdentity::Published(gossip_hex) => {
+            ("--client-gossip-pubkey-hex", hex_32_safe_arg(gossip_hex)?)
+        }
+        GossipIdentity::DeferredPlatform => (
+            "--client-pubkey-hex-unaligned-wireguard",
+            hex_32_safe_arg(&peer.public_key_hex)?,
+        ),
+    };
+    peer_add_script(
+        exit_node_id,
+        &peer.node_id,
+        pubkey_flag,
+        &pubkey_arg,
+        &role_capability_csv(&peer.capabilities),
+    )
+}
+
+/// What one provisioning step IS, independent of its position. The executor
+/// keys its "the rewrite landed exactly once" check on this tag — never on a
+/// positional index, which would silently check the wrong command if anything
+/// were ever prepended to the plan (adversarial review finding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlanStepKind {
+    /// `ops init-membership` (genesis) — present only in the combined plan.
+    Genesis,
+    /// The owner-signed rewrite of the exit's OWN capability record.
+    ExitCapabilityRewrite,
+    /// `e2e-membership-add` for one non-exit peer.
+    PeerAdd,
+}
+
+/// One step of the provisioning plan: its kind plus the validated command.
+pub(crate) struct PlanStep {
+    pub(crate) kind: PlanStepKind,
+    pub(crate) command: ssh::RemoteCommand,
+}
+
+/// The PURE, ORDERED plan of signed mutations that follow genesis — the
+/// capability rewrite for the exit (only when its post-genesis record differs
+/// from the target) FIRST, then every non-exit peer add in `peers` order.
+///
+/// Pure so the negative test in design §5.2 can bite at unit level: reverting
+/// to the pre-fix behaviour (skip the exit peer entirely) removes the rewrite
+/// entry, and the plan-ordering tests fail. `init_membership_snapshot`
+/// executes exactly this plan; the two cannot drift because there is no
+/// second command builder.
+pub(crate) fn post_genesis_commands(
+    exit_node_id: &str,
+    peers: &[NodeMembershipPeer],
+    exit_caps_after_genesis: &[RoleCapability],
+) -> Result<Vec<PlanStep>, AdapterError> {
+    let target = macos_exit_target_capabilities()?;
+    let mut plan = Vec::new();
+    if exit_needs_capability_rewrite(exit_caps_after_genesis, &target) {
+        plan.push(PlanStep {
+            kind: PlanStepKind::ExitCapabilityRewrite,
+            command: exit_capability_rewrite_script(exit_node_id, &target)?,
+        });
+    }
     for peer in peers {
         if peer.role == NodeRole::Exit {
             continue;
         }
-        // Branch on the SUBJECT peer, not on this producer's platform. This
-        // function runs on a macOS exit node but writes membership for EVERY
-        // peer in the topology, including Linux ones that DO have a real gossip
-        // identity. Publishing `public_key_hex` unconditionally here would
-        // republish those nodes' WireGuard keys under a flag named
-        // `unaligned-wireguard` — silently reinstating the exact defect this
-        // change exists to remove, on any `--exit-platform macos` run.
-        let (pubkey_flag, pubkey_arg) = match &peer.gossip_identity {
-            GossipIdentity::Published(gossip_hex) => {
-                ("--client-gossip-pubkey-hex", hex_32_safe_arg(gossip_hex)?)
-            }
-            GossipIdentity::DeferredPlatform => (
-                "--client-pubkey-hex-unaligned-wireguard",
-                hex_32_safe_arg(&peer.public_key_hex)?,
-            ),
-        };
-        let script = peer_add_script(
-            exit_node_id,
-            &peer.node_id,
-            pubkey_flag,
-            &pubkey_arg,
-            &role_capability_csv(&peer.capabilities),
-        )?;
-        ssh::run_remote(conn, script.as_str(), MEDIUM_TIMEOUT)?;
+        plan.push(PlanStep {
+            kind: PlanStepKind::PeerAdd,
+            command: peer_add_command(exit_node_id, peer)?,
+        });
     }
+    Ok(plan)
+}
 
-    // 3. Read snapshot back as base64. The probe fails LOUDLY (own stderr
-    //    message + exit 1, naming the path) when the snapshot is missing or
-    //    empty — a vanished genesis must surface as a named failure, never
-    //    as a silent empty read (MAC-D10).
+/// The full ordered provisioning plan — genesis init, then
+/// [`post_genesis_commands`]. `init_membership_snapshot` runs the genesis
+/// entry, reads the snapshot back (the rewrite decision needs the post-genesis
+/// record), then runs the rest; this combined form exists so the ordering
+/// invariant "genesis → rewrite → adds" is pinned by one test.
+pub(crate) fn init_membership_commands(
+    exit_node_id: &str,
+    peers: &[NodeMembershipPeer],
+    exit_caps_after_genesis: &[RoleCapability],
+) -> Result<Vec<PlanStep>, AdapterError> {
+    let mut plan = vec![PlanStep {
+        kind: PlanStepKind::Genesis,
+        command: membership_init_script(exit_node_id)?,
+    }];
+    plan.extend(post_genesis_commands(
+        exit_node_id,
+        peers,
+        exit_caps_after_genesis,
+    )?);
+    Ok(plan)
+}
+
+/// Read the membership snapshot back from the remote as raw bytes. The probe
+/// fails LOUDLY (own stderr message + exit 1, naming the path) when the
+/// snapshot is missing or empty — a vanished genesis must surface as a named
+/// failure, never as a silent empty read (MAC-D10).
+fn read_back_snapshot(conn: &NodeConnection) -> Result<Vec<u8>, AdapterError> {
     let snapshot_b64 =
         ssh::run_remote(conn, &membership_snapshot_readback_script(), SHORT_TIMEOUT)?;
     let data = base64_decode(snapshot_b64.trim())?;
@@ -318,7 +499,202 @@ pub fn init_membership_snapshot(
                 .to_owned(),
         });
     }
+    Ok(data)
+}
+
+/// The exit's canonical signed capability set in `snapshot`, fail-closed:
+/// an unreadable snapshot or an absent/inactive exit entry is an error, never
+/// an empty set (an empty set would compare unequal to the target and trigger
+/// a rewrite against a record that does not exist).
+fn exit_capabilities_in_snapshot(
+    snapshot: &[u8],
+    exit_node_id: &str,
+) -> Result<Vec<RoleCapability>, AdapterError> {
+    snapshot_bytes_node_capabilities(snapshot, exit_node_id).ok_or_else(|| AdapterError::Protocol {
+        message: format!(
+            "exit node '{exit_node_id}' is missing, inactive, or unreadable in the \
+                 membership snapshot read back from the remote; refusing to reason \
+                 about its capability set"
+        ),
+    })
+}
+
+fn snapshot_epoch(snapshot: &[u8]) -> Result<u64, AdapterError> {
+    snapshot_bytes_state_identity(snapshot)
+        .map(|(epoch, _root)| epoch)
+        .ok_or_else(|| AdapterError::Protocol {
+            message: "membership snapshot read back from the remote is unreadable or \
+                      invalid; refusing to reason about its epoch"
+                .to_owned(),
+        })
+}
+
+/// Initialize the membership snapshot on a macOS exit node and return its
+/// bytes.
+///
+/// Order (design §1.2/§1.4): genesis `ops init-membership` (idempotent) →
+/// read back → if the exit's own signed record is not exactly the macOS exit
+/// product grant, issue ONE owner-signed `e2e-membership-set-capabilities`
+/// narrowing it (and assert it landed exactly once: epoch +1, record == target)
+/// → per-peer `e2e-membership-add` → final read-back, asserting the exit's
+/// record still equals the target. The rewrite therefore precedes every
+/// distribution and the returned snapshot is the state every peer receives.
+pub fn init_membership_snapshot(
+    conn: &NodeConnection,
+    _owner_key: &MembershipOwnerKey,
+    peers: &[NodeMembershipPeer],
+) -> Result<MembershipSnapshot, AdapterError> {
+    // 1. Genesis (idempotent). RUSTYNET_NODE_ID is required by
+    //    init-membership; sourced from the exit peer, fail-loud if absent.
+    let exit_node_id = exit_node_id_from_peers(peers)?;
+    let init_script = membership_init_script(exit_node_id)?;
+    ssh::run_remote(conn, init_script.as_str(), MEDIUM_TIMEOUT)?;
+
+    // 2. Read the post-genesis record: the rewrite decision is made against
+    //    what is actually signed on disk, not against an assumption.
+    let genesis = read_back_snapshot(conn)?;
+    let genesis_caps = exit_capabilities_in_snapshot(&genesis, exit_node_id)?;
+    let genesis_epoch = snapshot_epoch(&genesis)?;
+    let target = macos_exit_target_capabilities()?;
+    let needs_rewrite = exit_needs_capability_rewrite(&genesis_caps, &target);
+
+    // 3. Execute the pure plan: [rewrite?] then peer adds. The plan is the
+    //    single source of truth; the predicate is re-derived here only to
+    //    cross-check that the plan carries exactly the rewrite steps the
+    //    predicate demands (zero or one) — any drift fails before execution.
+    let plan = post_genesis_commands(exit_node_id, peers, &genesis_caps)?;
+    let rewrite_steps = plan
+        .iter()
+        .filter(|step| step.kind == PlanStepKind::ExitCapabilityRewrite)
+        .count();
+    if rewrite_steps != usize::from(needs_rewrite) {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "provisioning plan carries {rewrite_steps} capability-rewrite step(s) but the \
+                 post-genesis record requires {}; refusing to execute a drifted plan",
+                usize::from(needs_rewrite)
+            ),
+        });
+    }
+    for step in &plan {
+        let command = &step.command;
+        ssh::run_remote(conn, command.as_str(), MEDIUM_TIMEOUT)?;
+        if step.kind == PlanStepKind::ExitCapabilityRewrite {
+            // The rewrite must land EXACTLY once: one signed update, one
+            // epoch bump, record == target. Anything else (a double apply, a
+            // partial apply, a verb that silently did nothing) fails here
+            // before any peer add or distribution can build on it.
+            let after = read_back_snapshot(conn)?;
+            let epoch = snapshot_epoch(&after)?;
+            if epoch != genesis_epoch.saturating_add(1) {
+                return Err(AdapterError::Protocol {
+                    message: format!(
+                        "macOS exit capability rewrite did not land exactly once: epoch \
+                         {genesis_epoch} -> {epoch} (expected {})",
+                        genesis_epoch.saturating_add(1)
+                    ),
+                });
+            }
+            let caps = exit_capabilities_in_snapshot(&after, exit_node_id)?;
+            if exit_needs_capability_rewrite(&caps, &target) {
+                return Err(AdapterError::Protocol {
+                    message: format!(
+                        "macOS exit '{exit_node_id}' signed record after the capability \
+                         rewrite is {{{}}}, expected exactly {{{}}}",
+                        role_capability_csv(&caps),
+                        role_capability_csv(&target)
+                    ),
+                });
+            }
+        }
+    }
+
+    // 4. Final read-back + exact-set assertion on the state that will be
+    //    distributed (the adapter-level half of design §5.2; the stage
+    //    re-asserts it independently).
+    let data = read_back_snapshot(conn)?;
+    let final_caps = exit_capabilities_in_snapshot(&data, exit_node_id)?;
+    if exit_needs_capability_rewrite(&final_caps, &target) {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "macOS exit '{exit_node_id}' signed record before distribution is {{{}}}, \
+                 expected exactly {{{}}} (blind_exit alignment)",
+                role_capability_csv(&final_caps),
+                role_capability_csv(&target)
+            ),
+        });
+    }
     Ok(MembershipSnapshot { data })
+}
+
+/// `sudo -n true` — proves passwordless sudo works on the remote BEFORE the
+/// presence test runs, so that a later non-zero exit from `test -e` can only
+/// mean "absent", never "could not look" (fail-closed ordering). Argv-shaped
+/// through the validated seam; no shell string.
+fn owner_signing_key_sudo_probe_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("true")?,
+    ];
+    ssh::RemoteCommand::from_args("macos owner-key sudo probe", &args)
+}
+
+/// `sudo -n test -e <path>` — exit 0 when the owner signing key file exists,
+/// exit 1 when it does not. The path crosses the seam as a validated `path`
+/// argument (the only caller passes the compile-time constant; the seam is
+/// what makes a future non-constant caller safe).
+fn owner_signing_key_presence_command(path: &str) -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("test")?,
+        ValidatedArg::cli_token("-e")?,
+        ValidatedArg::path(path)?,
+    ];
+    ssh::RemoteCommand::from_args("macos owner-key presence", &args)
+}
+
+/// Map the presence command's outcome to a recorded fact. ONLY exit 0
+/// ("present") and exit 1 ("absent") are answers; every other exit status and
+/// every transport failure is an error, because the fact must be RECORDED,
+/// never guessed from an unexpected failure.
+fn interpret_owner_key_presence(
+    result: Result<String, AdapterError>,
+) -> Result<bool, AdapterError> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(AdapterError::Command {
+            exit_code: Some(1), ..
+        }) => Ok(false),
+        Err(AdapterError::Command { exit_code, stderr }) => Err(AdapterError::Protocol {
+            message: format!(
+                "owner signing key presence probe exited with unexpected status {exit_code:?} \
+                 (only 0=present / 1=absent are answers); refusing to guess: {stderr}"
+            ),
+        }),
+        Err(other) => Err(other),
+    }
+}
+
+/// Is the membership owner signing key file present on this macOS node?
+///
+/// Records the F1 fact (design §1.3.1/§5.3): under the interim fix the
+/// expected answer on the macOS exit is `true`. Absent/unreadable are
+/// distinguished and both fail loud; the answer is a fact for the stage log,
+/// not a verdict.
+pub fn probe_owner_signing_key_present(conn: &NodeConnection) -> Result<bool, AdapterError> {
+    let sudo_probe = owner_signing_key_sudo_probe_command()?;
+    ssh::run_remote(conn, sudo_probe.as_str(), SHORT_TIMEOUT).map_err(|err| {
+        AdapterError::Protocol {
+            message: format!(
+                "cannot probe owner signing key presence: passwordless sudo unavailable on \
+                 remote ({err})"
+            ),
+        }
+    })?;
+    let presence = owner_signing_key_presence_command(MACOS_OWNER_SIGNING_KEY_PATH)?;
+    interpret_owner_key_presence(ssh::run_remote(conn, presence.as_str(), SHORT_TIMEOUT))
 }
 
 /// Distribute a signed bundle to a macOS client node.
@@ -937,6 +1313,326 @@ mod tests {
         let approver = format!("{0}-owner", "node-exit-1");
         assert!(ValidatedArg::node_id(&approver).is_ok());
         assert!(script.as_str().contains("'node-exit-1-owner'"));
+    }
+}
+
+#[cfg(test)]
+mod exit_capability_rewrite_tests {
+    //! Design §5.2 unit layer: "macOS exit membership carries exactly
+    //! {blind_exit, exit_server}, never anchor" — pinned on the provisioning
+    //! command plan, so reverting to the pre-fix skip-the-exit behaviour fails
+    //! here, not only in the lab.
+    use super::*;
+    use rustynet_control::roles::parse_role_capability_csv;
+
+    fn peer(role: NodeRole, node_id: &str) -> NodeMembershipPeer {
+        NodeMembershipPeer {
+            alias: node_id.to_owned(),
+            role,
+            capabilities: vec![RoleCapability::Client],
+            node_id: node_id.to_owned(),
+            public_key_hex: "a".repeat(64),
+            gossip_identity: GossipIdentity::DeferredPlatform,
+        }
+    }
+
+    /// The anchor-carrying genesis set `rustynetd membership init` mints.
+    fn anchor_genesis_caps() -> Vec<RoleCapability> {
+        vec![
+            RoleCapability::Anchor,
+            RoleCapability::AnchorGossipSeed,
+            RoleCapability::AnchorBundlePull,
+            RoleCapability::AnchorEnrollmentEndpoint,
+            RoleCapability::AnchorRelayColocation,
+            RoleCapability::AnchorPortMappingAuthoritative,
+            RoleCapability::Client,
+            RoleCapability::ExitServer,
+            RoleCapability::RelayHost,
+        ]
+    }
+
+    #[test]
+    fn target_set_is_exactly_the_blind_exit_pair_from_the_product_grant() {
+        let target = macos_exit_target_capabilities().expect("grant");
+        assert_eq!(
+            target,
+            canonicalize_role_capabilities([RoleCapability::BlindExit, RoleCapability::ExitServer])
+        );
+        assert_eq!(target.len(), 2);
+        // It is DERIVED from role.rs, so it must match the product grant verbatim.
+        let grant = NodeRole::Exit
+            .product_capabilities_for_platform(&VmGuestPlatform::Macos)
+            .expect("macOS exit grant");
+        assert_eq!(canonicalize_role_capabilities(grant), target);
+    }
+
+    #[test]
+    fn exit_capability_rewrite_script_carries_exact_blind_exit_set() {
+        let target = macos_exit_target_capabilities().expect("grant");
+        let script = exit_capability_rewrite_script("node-exit-1", &target).expect("render");
+        // The CSV is rendered in the crate's CANONICAL capability order (the
+        // same `role_capability_csv` the daemon and every other signer use),
+        // not alphabetical — derive the expectation from it rather than
+        // hand-typing an order.
+        let canonical_csv = role_capability_csv(&target);
+        assert_eq!(
+            script.as_str(),
+            format!(
+                "'sudo' '-n' 'env' \
+                 'RUSTYNET_SIGNING_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT=trust-passphrase-node-exit-1' \
+                 '/usr/local/bin/rustynet' 'ops' 'e2e-membership-set-capabilities' \
+                 '--node-id' 'node-exit-1' '--capabilities' '{canonical_csv}' \
+                 '--owner-approver-id' 'node-exit-1-owner'"
+            )
+        );
+        // Parse the CSV back: exactly two capabilities, order-insensitive.
+        let csv = script
+            .as_str()
+            .split("'--capabilities' '")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .expect("capabilities csv present");
+        let parsed =
+            canonicalize_role_capabilities(parse_role_capability_csv(csv).expect("csv parses"));
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed, target);
+        // The string `anchor` appears NOWHERE in the rewrite: no anchor
+        // capability, no anchor sub-capability, no anchor verb.
+        assert!(
+            !script.as_str().contains("anchor"),
+            "rewrite must never mention anchor: {script:?}"
+        );
+        // Exactly one capability-affecting verb.
+        assert_eq!(script.as_str().matches("'ops'").count(), 1);
+        assert!(!script.as_str().contains("e2e-membership-add"));
+        assert!(!script.as_str().contains("init-membership"));
+    }
+
+    #[test]
+    fn rewrite_script_rejects_a_metacharacter_exit_id_at_the_seam() {
+        let target = macos_exit_target_capabilities().expect("grant");
+        let err =
+            exit_capability_rewrite_script("exit-1; rm -rf /", &target).expect_err("must reject");
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn needs_rewrite_is_a_canonical_exact_set_compare() {
+        let target = macos_exit_target_capabilities().expect("grant");
+        // Anchor-carrying genesis → rewrite.
+        assert!(exit_needs_capability_rewrite(
+            &anchor_genesis_caps(),
+            &target
+        ));
+        // Already canonical, in any order, with duplicates → no rewrite.
+        assert!(!exit_needs_capability_rewrite(
+            &[
+                RoleCapability::ExitServer,
+                RoleCapability::BlindExit,
+                RoleCapability::ExitServer
+            ],
+            &target
+        ));
+        // A superset that still contains the pair is NOT canonical → rewrite.
+        // (This is the QH-65 shape: blind_exit + exit_server + relay_host.)
+        assert!(exit_needs_capability_rewrite(
+            &[
+                RoleCapability::BlindExit,
+                RoleCapability::ExitServer,
+                RoleCapability::RelayHost
+            ],
+            &target
+        ));
+        // A subset → rewrite.
+        assert!(exit_needs_capability_rewrite(
+            &[RoleCapability::ExitServer],
+            &target
+        ));
+        assert!(exit_needs_capability_rewrite(&[], &target));
+    }
+
+    #[test]
+    fn fresh_anchor_genesis_plan_is_init_then_rewrite_then_peer_adds_in_order() {
+        let peers = vec![
+            peer(NodeRole::Client, "node-client-1"),
+            peer(NodeRole::Exit, "node-exit-1"),
+            peer(NodeRole::Client, "node-client-2"),
+        ];
+        let plan =
+            init_membership_commands("node-exit-1", &peers, &anchor_genesis_caps()).expect("plan");
+        // The plan is typed by KIND, and the executor keys on the kind — pin
+        // the kinds first, then the rendered commands.
+        let kinds: Vec<PlanStepKind> = plan.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PlanStepKind::Genesis,
+                PlanStepKind::ExitCapabilityRewrite,
+                PlanStepKind::PeerAdd,
+                PlanStepKind::PeerAdd,
+            ]
+        );
+        let rendered: Vec<&str> = plan.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(rendered.len(), 4, "init + rewrite + 2 adds: {rendered:#?}");
+        assert!(
+            rendered[0].contains("'ops' 'init-membership'"),
+            "{}",
+            rendered[0]
+        );
+        let canonical_csv = role_capability_csv(&macos_exit_target_capabilities().expect("grant"));
+        assert!(
+            rendered[1].contains("'ops' 'e2e-membership-set-capabilities'")
+                && rendered[1].contains("'--node-id' 'node-exit-1'")
+                && rendered[1].contains(&format!("'--capabilities' '{canonical_csv}'")),
+            "the rewrite must sit between genesis and the first add: {}",
+            rendered[1]
+        );
+        assert!(
+            rendered[2].contains("'ops' 'e2e-membership-add'")
+                && rendered[2].contains("'--client-node-id' 'node-client-1'"),
+            "{}",
+            rendered[2]
+        );
+        assert!(
+            rendered[3].contains("'--client-node-id' 'node-client-2'"),
+            "{}",
+            rendered[3]
+        );
+        // The exit peer itself is never added as a client.
+        assert!(
+            !rendered
+                .iter()
+                .any(|c| c.contains("'--client-node-id' 'node-exit-1'")),
+            "{rendered:#?}"
+        );
+        // Mutation guard (design §5.2): the pre-fix plan had NO
+        // set-capabilities entry at all.
+        assert_eq!(
+            rendered
+                .iter()
+                .filter(|c| c.contains("e2e-membership-set-capabilities"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn already_canonical_genesis_plan_omits_the_rewrite_and_keeps_the_adds() {
+        // Idempotency branch: a re-used guest whose record is already
+        // {blind_exit, exit_server} must not get a needless epoch bump.
+        let peers = vec![
+            peer(NodeRole::Exit, "node-exit-1"),
+            peer(NodeRole::Client, "node-client-1"),
+        ];
+        let target = macos_exit_target_capabilities().expect("grant");
+        let plan = init_membership_commands("node-exit-1", &peers, &target).expect("plan");
+        let kinds: Vec<PlanStepKind> = plan.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, vec![PlanStepKind::Genesis, PlanStepKind::PeerAdd]);
+        let rendered: Vec<&str> = plan.iter().map(|s| s.command.as_str()).collect();
+        assert_eq!(rendered.len(), 2, "init + 1 add: {rendered:#?}");
+        assert!(rendered[0].contains("'ops' 'init-membership'"));
+        assert!(rendered[1].contains("'ops' 'e2e-membership-add'"));
+        assert!(
+            !rendered.iter().any(|c| c.contains("set-capabilities")),
+            "no rewrite on an already-canonical record: {rendered:#?}"
+        );
+        // And the post-genesis half alone agrees (it is what the executor runs).
+        let post = post_genesis_commands("node-exit-1", &peers, &target).expect("plan");
+        assert_eq!(post.len(), 1);
+    }
+
+    #[test]
+    fn post_genesis_plan_puts_the_rewrite_before_every_add() {
+        let peers = vec![
+            peer(NodeRole::Client, "node-client-1"),
+            peer(NodeRole::Exit, "node-exit-1"),
+        ];
+        let post =
+            post_genesis_commands("node-exit-1", &peers, &anchor_genesis_caps()).expect("plan");
+        assert_eq!(post.len(), 2);
+        assert_eq!(post[0].kind, PlanStepKind::ExitCapabilityRewrite);
+        assert!(
+            post[0]
+                .command
+                .as_str()
+                .contains("e2e-membership-set-capabilities")
+        );
+        assert_eq!(post[1].kind, PlanStepKind::PeerAdd);
+        assert!(post[1].command.as_str().contains("e2e-membership-add"));
+        // Exactly one rewrite step, ever.
+        assert_eq!(
+            post.iter()
+                .filter(|s| s.kind == PlanStepKind::ExitCapabilityRewrite)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn presence_probe_commands_are_argv_only_sudo_n_and_name_the_key_path() {
+        let sudo = owner_signing_key_sudo_probe_command().expect("render");
+        assert_eq!(sudo.as_str(), "'sudo' '-n' 'true'");
+        let presence =
+            owner_signing_key_presence_command(MACOS_OWNER_SIGNING_KEY_PATH).expect("render");
+        assert_eq!(
+            presence.as_str(),
+            format!("'sudo' '-n' 'test' '-e' '{MACOS_OWNER_SIGNING_KEY_PATH}'")
+        );
+        // The path crosses the seam's `path` class (absolute, no newline/NUL,
+        // no `..` segment); the seam's own quoting handles the rest. A
+        // relative, empty, traversal, or newline-bearing path is refused
+        // before it can reach a root shell.
+        assert!(owner_signing_key_presence_command("relative/key").is_err());
+        assert!(owner_signing_key_presence_command("").is_err());
+        assert!(owner_signing_key_presence_command("/usr/local/../etc/key").is_err());
+        assert!(owner_signing_key_presence_command("/usr/local/etc/key\nrm -rf /").is_err());
+    }
+
+    #[test]
+    fn presence_probe_answers_are_exit_0_and_1_only_and_everything_else_is_loud() {
+        // exit 0 → present.
+        assert!(interpret_owner_key_presence(Ok(String::new())).expect("present"));
+        // exit 1 → absent (test -e false), and ONLY after sudo was proven to
+        // work by the preceding `sudo -n true` step in the probe.
+        assert!(
+            !interpret_owner_key_presence(Err(AdapterError::Command {
+                exit_code: Some(1),
+                stderr: String::new(),
+            }))
+            .expect("absent")
+        );
+        // Any other exit status is not an answer.
+        let err = interpret_owner_key_presence(Err(AdapterError::Command {
+            exit_code: Some(2),
+            stderr: "test: usage".to_owned(),
+        }))
+        .expect_err("exit 2 must not read as absent");
+        assert!(err.to_string().contains("unexpected status"), "{err}");
+        assert!(
+            interpret_owner_key_presence(Err(AdapterError::Command {
+                exit_code: None,
+                stderr: "killed".to_owned(),
+            }))
+            .is_err()
+        );
+        // Transport failures propagate as themselves.
+        let err = interpret_owner_key_presence(Err(AdapterError::Ssh {
+            message: "connection reset".to_owned(),
+        }))
+        .expect_err("transport failure must not read as an answer");
+        assert!(err.to_string().contains("connection reset"), "{err}");
+    }
+
+    #[test]
+    fn the_genesis_call_site_still_declares_admin_deliberately() {
+        // F1 guard: the disclosed lie must stay until Option D lands; a change
+        // here silently breaks the rewrite this module depends on.
+        let init = membership_init_script("node-exit-1").expect("render");
+        assert!(
+            init.as_str().contains("'RUSTYNET_NODE_ROLE=admin'"),
+            "{init:?}"
+        );
+        assert!(!init.as_str().contains("RUSTYNET_NODE_ROLE=blind_exit"));
     }
 }
 
