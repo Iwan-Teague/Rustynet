@@ -19,6 +19,19 @@ use std::time::{Duration, Instant};
 /// recovered instead of stalling the daemon.
 const WINDOWS_HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Bound on `apply_dns_loopback`'s set+verify loop for the tunnel adapter's
+/// IPv6 DNS server. Windows can re-source a freshly-created adapter's IPv6
+/// DNS to its own auto-assigned placeholder shortly after bring-up; this many
+/// attempts (with `WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_INTERVAL` between them)
+/// gives that race a bounded number of chances to settle before the daemon
+/// fails closed instead of silently returning `Ok` on an unverified set.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS: u32 = 5;
+
+/// Delay between `apply_dns_loopback`'s IPv6 set+verify attempts.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_INTERVAL: Duration = Duration::from_millis(400);
+
 /// Run `command`, capturing its output, but never block longer than `timeout`.
 /// If the child does not exit in time it is killed and reaped and a timeout
 /// error is returned, so a hung helper cannot stall the daemon or leak a
@@ -5852,6 +5865,17 @@ impl WindowsCommandSystem {
     /// only. This is the Windows parity for the Linux nft redirect / macOS
     /// resolv.conf ownership; the firewall :53 LAN-block is the egress
     /// defense-in-depth. Does not touch `dns_protected` — the caller owns it.
+    ///
+    /// The IPv6 half verifies-then-retries (`WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS`):
+    /// Windows can re-source a newly-created tunnel adapter's IPv6 DNS server
+    /// back to its own auto-assigned site-local placeholder
+    /// (`fec0:0:0:ffff::1..3`) shortly after interface bring-up, independent of
+    /// anything this daemon does. A one-shot `netsh` set observed this race
+    /// live: `validate_baseline_runtime` immediately re-queries the interface
+    /// and intermittently (~40-50% of runs) saw the placeholder win the race.
+    /// Re-reading the live state after the set and re-applying on a drift
+    /// closes that window instead of returning `Ok` on a value that may not
+    /// hold.
     fn apply_dns_loopback(&mut self) -> Result<(), SystemError> {
         validate_windows_dns_bind_addr(self.dns_resolver_bind_addr)?;
         log::info!(
@@ -5866,12 +5890,43 @@ impl WindowsCommandSystem {
         .map_err(|err| {
             SystemError::DnsApplyFailed(format!("set tunnel IPv4 DNS loopback: {err}"))
         })?;
-        self.run_netsh_success(&windows_dns_set_ipv6_loopback_args(
-            self.interface_name.as_str(),
-        ))
-        .map_err(|err| {
-            SystemError::DnsApplyFailed(format!("set tunnel IPv6 DNS loopback: {err}"))
-        })?;
+
+        for attempt in 1..=WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS {
+            self.run_netsh_success(&windows_dns_set_ipv6_loopback_args(
+                self.interface_name.as_str(),
+            ))
+            .map_err(|err| {
+                SystemError::DnsApplyFailed(format!("set tunnel IPv6 DNS loopback: {err}"))
+            })?;
+            let snapshot =
+                crate::windows_dns_failclosed::collect_windows_dns_failclosed_snapshot()
+                    .map_err(|err| {
+                        SystemError::DnsApplyFailed(format!(
+                            "verify tunnel IPv6 DNS loopback (attempt {attempt}/{WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS}): {err}"
+                        ))
+                    })?;
+            if crate::windows_dns_failclosed::interface_ipv6_dns_is_loopback_only(
+                &snapshot,
+                self.interface_name.as_str(),
+            ) {
+                if attempt > 1 {
+                    log::info!(
+                        "windows dns loopback apply: tunnel interface='{}' IPv6 loopback settled on attempt {attempt}/{WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS}",
+                        self.interface_name,
+                    );
+                }
+                break;
+            }
+            if attempt == WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "tunnel interface '{}' IPv6 DNS still drifted off-loopback after \
+                     {WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS} set+verify attempts",
+                    self.interface_name
+                )));
+            }
+            std::thread::sleep(WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_INTERVAL);
+        }
+
         for arg_set in windows_nrpt_reg_add_arg_sets() {
             self.run_reg_success(&arg_set).map_err(|err| {
                 SystemError::DnsApplyFailed(format!("add loopback NRPT root rule: {err}"))
