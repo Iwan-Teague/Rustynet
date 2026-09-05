@@ -130,3 +130,40 @@ dropped/added naming unchanged.
 
 Next: commit, rebuild the vm-lab binary, relaunch the re-proof with a
 fresh report dir so the matrix row actually lands.
+
+## 19:00–19:35 — anchor re-proof run 2: GREEN, row recorded
+
+Relaunched after the verifier fix (same recipe, fresh report dir
+`state/live-lab-macos-anchor-portmap2-20260905-190047`, pid 94413,
+deploying branch HEAD `1eb6e800` via `--source-mode local-head`).
+
+Verdict (stages.tsv + stage logs + matrix row cross-check):
+`livelab-1788635706-1eb6e800c4cf`, commit `1eb6e800`, clean —
+**20 pass / 0 fail / 2 skip** (admin_issue, blind_exit: role-absence
+skips). All four anchor stages pass; QH-68 re-proof target
+`validate_macos_anchor_port_mapping_authority` passes against the
+daemon-reported identity `macos-utm-1-bootstrap`. Run-matrix row appended
+IN THE WORKTREE ledger (run launched from the worktree):
+`macos_anchor=pass`, `macos_stage_anchor=pass`,
+`macos_anchor_node_id=macos-utm-1-bootstrap`,
+`overall_result=partial` — partial is the fast-path semantic (stages
+outside the elected cell are `not_run` by design under
+`--skip-linux-live-suite`), not a failure.
+
+The plan-integrity fix is thereby live-proven too: finalization succeeded
+and the row landed.
+
+Third attempt at the glm-5.3 adversarial review of the verifier fix also
+timed out (MCP -32001) — provider unavailable this hour; standing note
+above stands (own analysis recorded; no invariant weakened).
+
+macOS cell status after this run: client 🟡 (CP-1 owner-deferred), admin 🟢,
+relay lifecycle 🟢, **anchor 🟢**, exit 🟢 (blind_exit posture; F1 owner),
+blind_exit 🟢, relay frame-forwarding ⬛ (opt-in, never run live).
+
+Next: relay frame-forwarding opt-in cell (QH-64-aware:
+`--node macos-utm-1:relay --node debian-headless-4:exit
+--node debian-headless-2:client --enable-relay-forwarding-validation
+--skip-linux-live-suite` + common flags). Disruptive by design; if
+`gossip_accepted_total=0` / `restrict_permanent` symptoms appear, that is
+QH-64 evidence, not a new defect.
