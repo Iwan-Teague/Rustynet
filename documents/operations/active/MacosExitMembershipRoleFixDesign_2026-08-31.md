@@ -182,6 +182,106 @@ non-exit node fails its `validate_node_role_membership_alignment` preflight at
 first boot (exit 65)") and breaks live_anchor's reliance on the genesis
 sub-caps (:4455-4458). Largest blast radius, no offsetting benefit.
 
+### 1.3.1 Independent review correction (2026-09-05) — §1.3's rationale is wrong in two places, and the mechanism has an undisclosed dependency
+
+An independent security review (Fable 5.1, grounded against the tree at
+`a272b896`) found that §1.3-B's rejection rationale rests on two claims that do
+not hold on this tree, and that the CHOSEN mechanism (§1.3-A) has a real,
+previously undisclosed dependency. **Approved as an INTERIM fix with the
+corrections below; the review's Option D (§1.3.2) is the ledgered target.**
+
+**Correction 1 — the "role-agnostic bootstrap" property §1.3-B invokes to
+reject genesis changes is already false.** `main.rs:4498-4501`'s own comment
+says genesis grants the anchor set "so the daemon can start with any role
+mapping" — but `daemon.rs:2397-2398` hard-rejects `blind_exit` on exactly that
+genesis. **The bug this design fixes IS that property failing for
+`blind_exit`.** §1.3-B's rejection of a genesis-aware alternative because it
+would "weaken" this property is circular: the property is already broken for
+the one role this design is about.
+
+**Correction 2 — §1.3-B calls the admin/blind_exit missing-caps asymmetry
+"load-bearing."** The project has already adjudicated the analogous
+warn-and-continue exception the opposite way: `daemon.rs:2410-2412` states
+plainly that exception "is not precedent." §1.3-B's rationale leans on a
+pattern the codebase's own comments flag for eventual removal (see §3c's
+revision below).
+
+**Undisclosed dependency (F1) — the fix only works because the adapter lies
+about the node's role during provisioning, and that lie has a real security
+consequence.** `macos_membership.rs` passes `RUSTYNET_NODE_ROLE=admin` to
+`ops init-membership` for this node (a node that will actually run daemon role
+`blind_exit`). This is necessary: `ops init-membership` deletes the owner
+signing key from any node correctly declared `blind_exit` at provisioning time
+(`maybe_remove_blind_exit_owner_signing_key`, `main.rs:13941-13962`, called at
+`:13851`/`:13901`), and the capability-rewrite mechanism in §1.2 REQUIRES that
+key still be present on disk to sign its own follow-up update
+(`ops_e2e.rs:2672, 2708-2711` sign with `paths.owner_signing_key`) — as do the
+existing per-peer `e2e-membership-add` calls. Declaring `admin` instead of
+`blind_exit` at provisioning time is what keeps the key from being deleted.
+
+**Consequence, stated plainly:** after this fix runs, the macOS exit's SIGNED
+RECORD correctly says `{blind_exit, exit_server}` with no anchor authority —
+but the node's disk still holds the one signing key that can mint ANY
+capability for ANY node in this mesh (genesis makes this node the sole
+approver, `quorum_threshold: 1`, `main.rs:4533-4540`). **§2.3's "strictly
+narrowing" claim is true of the signed record and false of the node's actual
+capability** — a compromised exit host under this scheme retains the physical
+ability to re-mint itself (or any node) full anchor authority, which is
+exactly the class of escalation `blind_exit` exists to make structurally
+impossible. This must be treated as a known, disclosed limitation of the
+INTERIM fix, not silently accepted as "strictly narrowing" without
+qualification — see §2.3's revision below.
+
+**Also found, present-tense not future-tense (revises §3c):** the blind_exit
+exact-set validator gap §3c defers as a hypothetical future risk is
+exploitable TODAY — `{blind_exit, exit_server, relay_host}` (or `+ client`)
+passes both the membership-format layer (`membership.rs:2668-2757` has no
+blind_exit⊕relay_host or ⊕client rule) and the daemon
+(`daemon.rs:2372-2399` rejects only `Anchor`) right now, with no future
+capability addition required. See §3c's revision.
+
+**Also found (revises §4):** the lab's macOS `Exit` role does not test the
+product's actual macOS exit preset. The product's `Exit` preset uses
+`primary: PrimaryRole::Admin` (`role_presets.rs:321-323`) and has its own
+installer path (`ops_install_macos_exit.rs`); the lab maps macOS `Exit` to
+daemon role `blind_exit` instead (`role.rs:160`). `Requirements.md` treats
+`exit` and `blind_exit` as distinct roles and states no OS may be limited in
+which role it can take. A green Refresh exit-row cell on `blind_exit` evidence
+does not validate the admin-posture macOS exit preset at all. See §4's
+revision.
+
+### 1.3.2 Ledgered target fix (Option D) — not implemented this round
+
+The review identifies a cleaner foundational alternative the original design
+never considered: **the mesh's membership owner must never be a `blind_exit`
+node.** Mint genesis on a different (non-blind) node in the topology, and add
+the macOS exit as an ordinary NON-OWNER peer via the same
+`e2e-membership-add --capabilities blind_exit,exit_server` path the Linux
+`blind_exit` lab role already uses (`macos_membership.rs:297-304`,
+`membership_init.rs:108-111`). This eliminates the F1 dependency entirely — no
+identity lie at provisioning time, the owner signing key never touches a
+blind_exit host, and blind_exit provisioning becomes one hardened path across
+every OS instead of a macOS-specific second signed update.
+
+**Why this is the target, not this round's fix:** `membership_init.rs`
+currently hard-wires the membership owner to be the topology's `Exit` alias
+(`:21, :28-35`), and the macOS-exit lab topology as currently constructed has
+no separate anchor/admin node to serve as owner instead — making Option D an
+orchestrator-topology change, not a drop-in replacement for §1.2's rewrite.
+**Tracked as a follow-up with no committed date yet** — ledger entry to be
+added to `QualityHardeningTodo_2026-07-25.md` alongside the §3c reclassification
+below when this fix lands.
+
+The related product-level gap §1.3-B's Alternative B already surfaced
+(`ops init-membership` accepts `blind_exit` today but mints anchor genesis
+caps regardless, producing a dead-on-arrival node for any real non-lab
+operator) is NOT fixed by either this round's rewrite or by Option D on its
+own — Option D only fixes the LAB's provisioning path. The honest product fix,
+per the review, is likely that `ops init-membership` should REFUSE `blind_exit`
+outright (a blind-exit node can never be a mesh founder) rather than making
+genesis role-aware for it. This is recorded here as a known open product gap,
+not scheduled by this design.
+
 ### 1.4 Ordering constraints
 
 - Rewrite runs **before** `DistributeMembership` distributes the snapshot, so
@@ -234,11 +334,26 @@ All handled by the existing apply path, not by this design:
 ### 2.3 Direction of the change
 
 The rewrite REMOVES capabilities from the signed record (`Anchor`, the five
-anchor sub-caps, `Client`, `RelayHost`) and ADDS `BlindExit`. Net effect on
-the node's authority is strictly narrowing: it loses control-plane anchor
-surface and gains the hardened minimal-surface final-hop posture. This is the
-fail-closed direction; the reverse edit (adding anchor onto a blind_exit node)
-remains forbidden at two independent layers (§3c).
+anchor sub-caps, `Client`, `RelayHost`) and ADDS `BlindExit`. This is
+strictly narrowing **of the signed record.** The reverse edit (adding anchor
+onto a blind_exit node's record) remains forbidden at two independent layers
+(§3c).
+
+**Qualification, required by §1.3.1's F1 finding:** the record narrows; the
+node's ACTUAL capability does not. Because provisioning declared this node
+`admin` rather than `blind_exit` (§1.3.1) to prevent the owner signing key's
+deletion, the node's disk retains that key — the sole mesh-wide signing
+authority (`quorum_threshold: 1`) — for the life of the interim fix. A
+compromised exit host under this scheme could still re-sign its own (or any
+node's) membership record with full anchor capabilities, because it physically
+holds the key that can do so, regardless of what its current signed record
+says. **This is a disclosed limitation of the interim fix, not a property that
+holds.** It is closed only by the Option D target (§1.3.2), which never
+places the owner key on a blind_exit host in the first place. Also note:
+`blind_exit` is an irreversible role marker once assigned
+(`role_presets.rs` taxonomy; §2.4 below) — installing it here via a signed
+update is a one-way door for this node, same as installing it at genesis
+would be.
 
 ### 2.4 Interaction with blind_exit irreversibility (AGENTS.md §10.7,
 SecurityMinimumBar §6.D.2)
@@ -364,18 +479,28 @@ Verdict: withstood; one explicit live-verification watch-item added.
   apply block regardless of membership contents (comment :2279-2282), so the
   degradation is a posture warning, not a privilege gain; and the stage-level
   exact-set assertion fails the run before it matters.
-- Structural note (recorded, out of scope): blind_exit's validator uses a
-  forbidden-values pattern while blind_relay uses an exact canonical-set
-  compare (`daemon.rs:2305-2332`, whose own comment explains the
-  reject-future anti-pattern, F5). A future capability added to the schema
-  could ride along on a blind_exit record. Migrating blind_exit to the exact-set
-  form is a daemon trust-invariant change requiring its own review; this
-  design's stage-level EXACT-set assertion pins provisioning correctness
-  without it.
+- **Structural note — RECLASSIFIED 2026-09-05, no longer "out of scope."**
+  blind_exit's validator uses a forbidden-values pattern while blind_relay
+  uses an exact canonical-set compare (`daemon.rs:2305-2332`, whose own
+  comment explains the reject-future anti-pattern, F5, and states the
+  warn-and-continue exception "is not precedent"). Independent review found
+  this is exploitable TODAY, not merely a future risk: `{blind_exit,
+  exit_server, relay_host}` (or `+ client`) is accepted right now by both the
+  membership-format layer (`membership.rs:2668-2757` has no blind_exit⊕
+  relay_host or ⊕client rule) and the daemon (`daemon.rs:2372-2399` rejects
+  only `Anchor`). This design's stage-level exact-set assertion (§5.2) pins
+  *this fix's own* provisioning correctness, but does nothing for any other
+  path that could sign a blind_exit+relay_host record.
+  **Tracked as a fail-closed/default-deny violation (AGENTS.md/CLAUDE.md §3),
+  not a deferred nice-to-have** — ledger entry to be added to
+  `QualityHardeningTodo_2026-07-25.md` with this fix's landing commit, to be
+  closed by migrating blind_exit's validator to the exact-set form (removing
+  the warn-and-continue exception in the same change) immediately after this
+  fix lands, not on an open-ended "someday."
 
-Verdict: withstood; two independent format/daemon layers plus the stage
-assertion remain intact, and the known structural gap is recorded rather than
-expanded.
+Verdict: the mechanism withstands the game scenarios tested; the structural
+gap identified above is real and present-tense, now tracked rather than
+deferred — see the ledger note above.
 
 **(d) Existing deployed macOS exit whose signed membership already carries
 anchor — migration or re-provisioning?**
@@ -467,6 +592,31 @@ with no epoch surgery and no factory reset.
    (Investigation §e: do not remap "without a posture review"). This section is
    that review's conclusion: the mapping stands; the membership was wrong.
 
+### 4.3 Where the decree lives, and what it does NOT prove — CORRECTED 2026-09-05
+
+§4.2 concludes macOS `Exit` stays `blind_exit` in the lab. Independent review
+found this conclusion right but the RECORDING plan (§5.1 step 6, a code
+comment at `role.rs:159-160`) insufficient: this decree effectively assigns
+macOS a DIFFERENT daemon role than Linux/Windows for the same lab `Exit`
+role, and `Requirements.md` treats `exit` and `blind_exit` as distinct roles,
+stating no OS may be limited in which role it can take. A source comment does
+not surface that divergence to anyone reading the parity ledgers.
+
+**Required, in addition to §5.1 step 6's comment:**
+- Record the divergence explicitly in `CrossPlatformRoleParityRefresh_2026-07-23.md`
+  and `CrossPlatformRoleParityPlan_2026-06-21.md` as an intended per-OS
+  divergence (same treatment already given to the macOS pf-vs-Linux-nft NAT
+  mechanism split) — not silently implied by a passing test.
+- **The Refresh's macOS `exit` cell must NOT be marked green on `blind_exit`
+  evidence alone.** `blind_exit` evidence does not exercise the product's
+  actual macOS `Exit` preset, which runs `PrimaryRole::Admin`
+  (`role_presets.rs:321-323`) with its own installer
+  (`ops_install_macos_exit.rs`). Mark the admin-posture macOS exit cell
+  explicitly `N/A-by-decree` or `open` — whichever the owner prefers — rather
+  than inheriting a green from this fix's `blind_exit` proof. This fix
+  unblocks the LAB's `blind_exit`-mapped exit cell; it says nothing about
+  whether the admin-posture macOS exit preset works.
+
 ## 5) Implementation plan + mandatory negative test
 
 ### 5.1 Ordered checklist for the eventual code task
@@ -477,6 +627,17 @@ with no epoch surgery and no factory reset.
    `shell_safe_arg` on every interpolated value, MAC-D11 keychain env prefix
    (:198), `ops e2e-membership-set-capabilities --node-id <exit>
    --capabilities <csv-from-product-grant> --owner-approver-id <exit>-owner`.
+1a. **REQUIRED (§1.3.1 F1):** at the existing genesis-init call site that
+    passes `RUSTYNET_NODE_ROLE=admin` for this node (the site the review found
+    at `:174`), add an explicit comment stating WHY `admin` is declared
+    instead of the node's real eventual role `blind_exit`: declaring
+    `blind_exit` here would trigger `maybe_remove_blind_exit_owner_signing_key`
+    (`main.rs:13941-13962`) and delete the owner signing key this very
+    provisioning flow needs on disk to sign its own follow-up capability
+    rewrite (step 2) and the per-peer adds. State plainly that this is a
+    disclosed interim workaround (§1.3.1/§2.3), closed only by the Option D
+    target (§1.3.2) — so a future reader does not "fix" this call site to say
+    `blind_exit` and silently break the rewrite this design depends on.
 2. Same file, `init_membership_snapshot` (:232-...): after the genesis init
    (:241-245), resolve the exit peer (today skipped at :249-251), derive the
    capability CSV via
@@ -487,7 +648,13 @@ with no epoch surgery and no factory reset.
    `MEDIUM_TIMEOUT`. Keep the per-peer loop and final read-back unchanged.
 3. Same file, `mod tests` (:488-...): add tests pinning the rewrite script's
    exact shape (see §5.2) in the style of the existing `peer_add_script_*`
-   tests (:731, :835, :854).
+   tests (:731, :835, :854). **REQUIRED additions (review item 5):**
+   idempotency-branch tests — a fresh anchor-carrying genesis triggers the
+   rewrite (plan contains the set-capabilities command); an already-canonical
+   `{blind_exit, exit_server}` snapshot does NOT re-trigger it (plan omits the
+   command, no needless epoch bump); and an assertion that a fresh genesis
+   ends at exactly `epoch == 2` after the rewrite (epoch 1 genesis + one
+   signed update), to catch a future double-apply regression.
 4. `crates/rustynet-cli/src/vm_lab/orchestrator/stage/membership_init.rs`: after
    `ctx.membership_snapshot` is set (:70), add a fail-loud assertion: when the
    membership-owner peer is `NodeRole::Exit` on `VmGuestPlatform::Macos`, the
@@ -501,8 +668,13 @@ with no epoch surgery and no factory reset.
    keeps anchor genesis), `crates/rustynet-control/src/membership.rs`.
 6. Docs at implementation time (same change): add the missing rationale
    comment at `role.rs:159-160` (§4.1 finding); update the Refresh §3 exit row
-   and the Investigation doc's status line; add the index entry to
-   `documents/operations/active/README.md`.
+   **as an explicit intended per-OS divergence, marking the admin-posture
+   macOS exit cell N/A-by-decree/open rather than inheriting green from
+   blind_exit evidence (§4.3, REQUIRED)**; update the Investigation doc's
+   status line; add the index entry to `documents/operations/active/README.md`
+   (this design doc is itself missing from the index today — add it in the
+   same change); add the QH-ledger entries for the §3c reclassification and
+   the §1.3.2 Option D follow-up.
 7. Gates: `cargo fmt --all -- --check`; scoped
    `cargo check -p rustynet-cli --all-targets --all-features` /
    `cargo test -p rustynet-cli --all-targets --all-features` (the flags are
@@ -531,10 +703,12 @@ Requirement (Investigation §e): pin **"macOS exit membership carries exactly
     executed by a thin loop) so a test can assert the plan for a macOS exit
     peer list CONTAINS the set-capabilities command between the init command
     and the peer adds. The mutation removes the plan entry → the ordering/
-    presence test fails. (If the pure-plan refactor is judged too invasive,
-    the stage assertion below is the backstop and the unit test above still
-    pins the script content; the plan fn is preferred because it makes the
-    mutation unit-visible rather than lab-visible.)
+    presence test fails. **The pure-plan refactor is MANDATORY, not optional
+    (review item 5 correction — the original text's "if judged too invasive,
+    the stage assertion is the backstop" escape hatch is removed):** without
+    it, the mutation is only lab-visible, and this design's own §1.3.1/§2.3
+    disclosure of the F1 owner-key dependency means the provisioning path
+    deserves the tighter, unit-level guarantee.
 - **Stage (live provisioning layer)** — the `membership_init` fail-loud
   assertion of §5.1 step 4: with the mutation applied, the read-back snapshot
   still carries the anchor genesis set on the macOS exit → the stage fails
@@ -575,17 +749,79 @@ Requirement (Investigation §e): pin **"macOS exit membership carries exactly
   `documents/operations/live_lab_node_run_matrix.csv` and take the pass/fail
   claim from the stage's own report artifact, never the column alone
   (AGENTS.md §12.3).
+- **REQUIRED (§1.3.1 F1) — owner-signing-key presence on the exit host is
+  recorded as an explicit fact, never inferred from a green stage.** The
+  `membership_init` stage must probe, AFTER the genesis init + capability
+  rewrite + peer adds have completed, whether `MACOS_OWNER_SIGNING_KEY_PATH`
+  (`/usr/local/etc/rustynet/membership.owner.key`) exists on the macOS exit
+  host, and must write the result as a named line into its own stage log
+  (`logs/membership_init.log` in the run's report directory) in the form
+  `owner_signing_key_present=<true|false> path=<path> node_id=<exit node id>`
+  — the same file the report artifact's data block is read from, so the
+  fact travels with the stage verdict. Under the INTERIM fix the expected
+  and disclosed value is `true`: that is F1 itself, made visible. A run
+  whose `membership_init` log does not carry this line does NOT satisfy
+  this design's proof criteria, regardless of stage status, because the
+  disclosed limitation would then be invisible in evidence — exactly the
+  "swept under a green checkmark" outcome the review forbade. A value of
+  `false` on the interim fix is itself a defect signal (the rewrite could
+  not have signed its own update without the key; something deleted it
+  after signing) and must be investigated, not celebrated. When the
+  Option D target (§1.3.2) lands, the expected value flips to `false` and
+  this same line becomes the closure evidence for F1; the probe is
+  therefore permanent, not a temporary diagnostic.
+- Sign-off evidence must quote the actual `owner_signing_key_present=`
+  line from the proving run alongside the stage status — quoting only the
+  status is incomplete.
 
 ## 6) Sign-off checklist (for the human reviewer)
 
-- [ ] §1.2 layer decision (adapter-level signed rewrite; product code
-      untouched) approved.
-- [ ] §2.3 privilege-narrowing direction accepted; §3a enrollment-endpoint
-      limitation on macOS exits accepted as a known posture consequence.
-- [ ] §3c structural blind_exit exact-set gap acknowledged as out-of-scope
-      follow-up.
-- [ ] §4 posture review conclusion accepted: macOS exit stays `blind_exit`;
-      the mapping's missing written rationale is acknowledged and will be
-      added at implementation (§5.1 step 6).
-- [ ] §5.2 negative tests + §5.3 live proof plan accepted as the completion
+Updated 2026-09-05 to reflect the independent review's corrections
+(§1.3.1, §1.3.2, §2.3, §3c, §4.3, §5.1–§5.3). The owner approved the
+review's MODIFIED recommendation — interim fix WITH F1 disclosed, mandatory
+corrections applied, Option D ledgered as the target — not the original
+"approve all as-is". Items marked ★ are the review's mandatory additions.
+
+- [x] §1.2 layer decision (adapter-level signed rewrite; product code
+      untouched) approved — **as an INTERIM fix only** (§1.3.1), with the
+      Option D target (§1.3.2) ledgered as the committed follow-up.
+- [x] ★ §1.3.1 F1 accepted as a DISCLOSED KNOWN LIMITATION of the interim
+      fix: the exit host keeps the sole mesh owner signing key
+      (`quorum_threshold: 1`) for the life of the interim fix. Accepted on
+      the explicit condition that it is recorded in evidence on every
+      proving run (§5.3 `owner_signing_key_present=` line) and closed by
+      Option D, not by a later "we forgot" default.
+- [x] §2.3 privilege-narrowing direction accepted **with the F1
+      qualification**: narrowing holds for the signed record only, not for
+      the node's physical capability. §3a enrollment-endpoint limitation on
+      macOS exits accepted as a known posture consequence.
+- [x] ★ §3c reclassified: the blind_exit forbidden-values validator gap is
+      a PRESENT-TENSE default-deny violation (`{blind_exit, exit_server,
+      relay_host}` / `+ client` accepted today at both layers), tracked in
+      `QualityHardeningTodo_2026-07-25.md` as a §3 violation to be closed
+      by migrating to the exact-set form immediately after this fix lands —
+      NOT "out-of-scope follow-up".
+- [x] §4 posture review conclusion accepted: macOS lab exit stays
+      `blind_exit`; the mapping's missing written rationale is acknowledged
+      and will be added at implementation (§5.1 step 6).
+- [x] ★ §4.3 decree-vs-proof accepted: the divergence is recorded
+      explicitly in the Refresh and the ParityPlan as an intended per-OS
+      divergence, and the admin-posture macOS `Exit` preset
+      (`PrimaryRole::Admin`, `ops_install_macos_exit.rs`) is marked
+      N/A-by-decree/open — it does NOT inherit green from blind_exit
       evidence.
+- [x] ★ §5.1 step 1a: the `RUSTYNET_NODE_ROLE=admin` call site carries an
+      explanatory comment naming F1 and Option D, so nobody "fixes" it to
+      `blind_exit` and silently breaks the rewrite.
+- [x] ★ §5.2 pure-plan refactor (`init_membership_commands`) is MANDATORY;
+      the former "stage assertion is the backstop" escape hatch is removed.
+      Idempotency-branch tests + the `epoch == 2` assertion are required.
+- [x] ★ §5.3 live proof must record `owner_signing_key_present=` as an
+      explicit evidence line; sign-off quotes it next to the stage status.
+- [ ] Implementation landed on `main` with the §5.1 checklist complete,
+      gates green, and an adversarial review of the ACTUAL diff (not the
+      design) recorded before landing.
+- [ ] §5.3 live proof run recorded: run-matrix row attributed to the
+      landing commit, `membership_init` artifact status quoted, and the
+      `owner_signing_key_present=true` line quoted from the run's
+      `membership_init` log.
