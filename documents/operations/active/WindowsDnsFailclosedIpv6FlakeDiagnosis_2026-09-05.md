@@ -1,8 +1,10 @@
 # Windows `validate_baseline_runtime` DnsFailclosed IPv6 flake — diagnosis
 
-Status: **TWO instances of the same apply/verify race found and FIXED**
-(IPv6 DNS server, commit `e50235f9`; NRPT root rule, commit `9e40999e` — §6)
-— not yet live-re-proven together. Root cause
+Status: **`e50235f9`'s IPv6 fix is INSUFFICIENT — reproduced live in
+`run-2026-09-05-windows-28-four-fixes-proof` despite the fix being in place.**
+The NRPT fix (`9e40999e`, §6) held (no NRPT drift in that run's failure). See
+§7 for the live evidence and the open theory — under active investigation, do
+NOT treat §5/§6 as closed. Root cause
 identified by direct code reading (§2-4 below), reproduced 6 times across
 recent live-lab runs (including twice while re-proving the separate
 `traffic_test_matrix` fix, which blocked getting an official pass on that
@@ -165,7 +167,7 @@ This is security/DNS-fail-closed-posture-relevant code (§4 of `CLAUDE.md`/`AGEN
 non-negotiable constraints), so any actual fix here must be self-implemented and
 gated (unit test + live-lab re-proof), not handed to an external model to write.
 
-## 6. Evidence trail
+## 7. Evidence trail
 
 - `documents/operations/live_lab_stage_triage.jsonl` — 4+ `validate_baseline_runtime`
   entries for `windows-x86-1` carrying this exact error text, each recorded with
@@ -173,3 +175,69 @@ gated (unit test + live-lab re-proof), not handed to an external model to write.
 - Investigated read-only 2026-09-05 (this session) via a background research
   agent grounded against the live repo tree at commit `ece47110` (post the
   `traffic_test_matrix` fix); no code changes made as part of this pass.
+
+## 8. `e50235f9`'s fix reproduced live as INSUFFICIENT — open investigation
+
+`run-2026-09-05-windows-28-four-fixes-proof` (commit `5933f37a`, includes all
+four fixes landed this session including `e50235f9` and `9e40999e`) failed
+`validate_baseline_runtime` with the EXACT §1 symptom again:
+`interface rustynet0 (Ipv6) has non-loopback DNS server fec0:0:0:ffff::1`.
+The NRPT fix held — this run's failure carried no NRPT drift, unlike
+run-27's — so §6 is not implicated here.
+
+**What the daemon's own log shows for this run:**
+
+```
+1788602595718 [INFO] rustynetd::phase10: windows dns loopback apply: tunnel interface='rustynet0' resolver=127.0.0.1:53
+1788602605054 [INFO] rustynetd::daemon: rustynetd startup: control + privileged pipe servers spawned; entering reconcile loop
+```
+
+No `"IPv6 loopback settled on attempt N/5"` line appears — meaning either the
+verify-then-retry loop's FIRST attempt already read back as loopback-compliant
+(so nothing logged, since that log line only fires when `attempt > 1`), or
+the ~9.3s gap between these two lines is entirely `apply_dns_loopback`'s own
+work (IPv4 set, IPv6 set+verify, NRPT add+verify, each involving a
+`powershell.exe` collector invocation) with no retries needed on either loop.
+No `DnsApplyFailed` error appears either, so `apply_dns_loopback` returned
+`Ok` — the daemon's OWN check, at the time it ran, found the interface
+compliant. **Yet `validate_baseline_runtime`, running some seconds later
+(after `enforce_daemon`'s `windows_tunnel_ip_readiness_fragment` — up to 90s,
+usually fast — resolves and the orchestrator's own SSH round-trip completes),
+found it drifted again.**
+
+Two open theories, not yet distinguished by direct evidence:
+
+1. **Vacuous-pass bug in the verify helper itself.** `interface_ipv6_dns_is_loopback_only`
+   returns `true` when the snapshot has **no entry at all** for the interface
+   (deliberately, for interfaces the collector has never heard of — see its
+   own test `interface_ipv6_dns_is_loopback_only_accepts_unknown_interface`).
+   If, at the exact moment `apply_dns_loopback`'s verify snapshot is taken,
+   `rustynet0` genuinely has **zero** DNS-server entries recorded yet (neither
+   our `::1` set nor Windows' placeholder have been picked up by
+   `Get-DnsClientServerAddress` at that instant), the helper would report
+   "compliant" on a state that is really "undetermined", declaring victory
+   before the actual race has resolved either way.
+2. **A later Windows-triggered event re-populates the placeholder.** The
+   `apply_dns_loopback` call runs early, right after `backend.start()` creates
+   the tunnel adapter (per the `apply_dns_protection` trait doc, §2) — but the
+   adapter may not yet have its mesh IP address bound at that point (`enforce_daemon`
+   separately polls for that via `windows_tunnel_ip_readiness_fragment`, up to
+   90s, AFTER `start_daemon` returns). If Windows re-runs its own
+   network-location/interface-classification logic specifically when an
+   interface transitions from "up, no address" to "up, has address" — and that
+   logic is what (re-)writes the legacy IPv6 DNS placeholder — then the
+   verify-then-retry loop's window is simply too early to ever observe the
+   real triggering event, no matter how many attempts it budgets.
+
+**Both theories point the same direction:** a single verify pass immediately
+after `apply_dns_loopback`'s own `netsh` calls cannot close this race if the
+thing that re-introduces drift happens **later**, driven by tunnel-IP
+assignment rather than interface creation. The next step needing DIRECT live
+evidence (not yet done): re-run with continuous polling of `rustynet0`'s IPv6
+DNS state (2-3s interval) spanning the whole `enforce_baseline_runtime` →
+`validate_baseline_runtime` window, correlated against the moment the tunnel
+adapter actually receives its mesh IP, to see whether the placeholder
+reappears (a) immediately (vacuous-pass theory) or (b) specifically at/after
+IP assignment (later-trigger theory) or (c) something else. Do not attempt a
+fifth fix before that evidence exists — the last four fixes in this session
+were each landed on solid direct evidence; this one should be too.
