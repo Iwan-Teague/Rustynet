@@ -41,6 +41,30 @@ const WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS: u32 = 5;
 #[cfg_attr(not(windows), allow(dead_code))]
 const WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL: Duration = Duration::from_millis(400);
 
+/// Bound on `apply_dns_loopback`'s wait for the tunnel adapter's mesh IPv4
+/// address to appear before it begins the DNS-loopback set/verify loops.
+///
+/// `backend.start()`'s own readiness wait (`wait_for_tunnel_ready`,
+/// `rustynet-backend-wireguard/src/windows_command.rs:163-188`) only confirms
+/// `wg show <tunnel>` returns non-empty — i.e. the WireGuard-NT adapter exists
+/// and is attached — NOT that the OS has finished binding the adapter's IP
+/// address from the tunnel config. That gap is real and already handled once,
+/// but only on the LAB ORCHESTRATOR side (`windows_tunnel_ip_readiness_fragment`,
+/// up to 90s, waits for `Get-NetIPAddress` AFTER `enforce_daemon` returns) —
+/// meaning a real end-user install has no equivalent wait inside the daemon
+/// itself. Live evidence (`run-2026-09-05-windows-28-four-fixes-proof`):
+/// `apply_dns_loopback`'s own IPv6 verify-then-retry loop found the interface
+/// DNS-compliant immediately, yet `validate_baseline_runtime` found it
+/// drifted back to Windows' placeholder seconds later — consistent with
+/// Windows re-writing the interface's default DNS as a side effect of the
+/// SAME IP-address-bind event this wait now waits out first.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_TUNNEL_IP_READY_ATTEMPTS: u32 = 30;
+
+/// Delay between `apply_dns_loopback`'s tunnel-IP-readiness poll attempts.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_TUNNEL_IP_READY_INTERVAL: Duration = Duration::from_millis(500);
+
 /// Run `command`, capturing its output, but never block longer than `timeout`.
 /// If the child does not exit in time it is killed and reaped and a timeout
 /// error is returned, so a hung helper cannot stall the daemon or leak a
@@ -5866,6 +5890,46 @@ impl WindowsCommandSystem {
         )))
     }
 
+    /// Block until the tunnel adapter has a bound IPv4 address, up to
+    /// `WINDOWS_TUNNEL_IP_READY_ATTEMPTS` × `WINDOWS_TUNNEL_IP_READY_INTERVAL`.
+    ///
+    /// `backend.start()`'s own readiness wait only confirms the WireGuard-NT
+    /// adapter is attached (`wg show` non-empty) — not that the OS has
+    /// finished binding its IP address from the tunnel config. Called by
+    /// `apply_dns_loopback` before it touches DNS, on the evidence that
+    /// Windows re-writes the interface's own default DNS as a side effect of
+    /// that SAME address-bind event (see the const doc above); doing the DNS
+    /// set/verify loops before this settles just gets overwritten again once
+    /// Windows finishes configuring the interface.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn wait_for_tunnel_ip_address(&self) -> Result<(), SystemError> {
+        for attempt in 1..=WINDOWS_TUNNEL_IP_READY_ATTEMPTS {
+            let stdout = self.run_powershell_stdout(
+                WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS,
+                std::slice::from_ref(&self.interface_name),
+            )?;
+            if !stdout.trim().is_empty() {
+                if attempt > 1 {
+                    log::info!(
+                        "windows dns loopback apply: tunnel interface='{}' IPv4 address bound on attempt {attempt}/{WINDOWS_TUNNEL_IP_READY_ATTEMPTS}",
+                        self.interface_name,
+                    );
+                }
+                return Ok(());
+            }
+            if attempt == WINDOWS_TUNNEL_IP_READY_ATTEMPTS {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "tunnel interface '{}' did not receive an IPv4 address within {:?}; \
+                     refusing to apply DNS loopback against an unconfigured interface",
+                    self.interface_name,
+                    WINDOWS_TUNNEL_IP_READY_INTERVAL * WINDOWS_TUNNEL_IP_READY_ATTEMPTS
+                )));
+            }
+            std::thread::sleep(WINDOWS_TUNNEL_IP_READY_INTERVAL);
+        }
+        Ok(())
+    }
+
     #[allow(dead_code)]
     /// Own the resolver path so the `windows-dns-failclosed` verifier passes:
     /// point the tunnel adapter's IPv4 + IPv6 DNS at loopback (replacing
@@ -5887,6 +5951,7 @@ impl WindowsCommandSystem {
     /// hold.
     fn apply_dns_loopback(&mut self) -> Result<(), SystemError> {
         validate_windows_dns_bind_addr(self.dns_resolver_bind_addr)?;
+        self.wait_for_tunnel_ip_address()?;
         log::info!(
             "windows dns loopback apply: tunnel interface='{}' resolver={}",
             self.interface_name,
@@ -6192,6 +6257,10 @@ fn windows_exit_nat_residue_plan(
     ]
 }
 
+/// Used by `apply_dns_loopback`'s tunnel-IP-readiness wait. `SilentlyContinue`
+/// (not `Stop`) so a not-yet-bound address is an empty string, not a thrown
+/// error the caller would have to parse out of stderr.
+const WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPAddress -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress }";
 const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
 const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
 const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
@@ -14845,6 +14914,24 @@ mod tests {
             WINDOWS_PS_REMOVE_NAT.contains("Remove-NetNat -Confirm:$false -ErrorAction Stop"),
             "Remove-NetNat must use -Confirm:$false -ErrorAction Stop on the actual remove"
         );
+    }
+
+    #[test]
+    fn windows_ps_get_tunnel_ipv4_address_binds_alias_and_tolerates_absence() {
+        // Bound via param(), not string interpolation (argv-only discipline).
+        assert!(WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("param($Alias)"));
+        assert!(
+            WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("-InterfaceAlias $Alias"),
+            "must query the SAME interface the caller names, not a hardcoded alias"
+        );
+        // Deliberately SilentlyContinue, not Stop: a not-yet-bound address must
+        // read back as an empty string for wait_for_tunnel_ip_address's retry
+        // loop to poll on, not as a thrown PowerShell error to parse out of stderr.
+        assert!(
+            WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("-ErrorAction SilentlyContinue"),
+            "must tolerate a not-yet-bound address as empty output, not an error"
+        );
+        assert!(!WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("Ethernet"));
     }
 
     #[test]
