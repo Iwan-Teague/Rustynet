@@ -475,14 +475,16 @@ pub fn install_daemon(
 
 /// Build the PowerShell that prints the `RustyNet` SCM service's current
 /// `Status` (or `Absent` if the service does not exist).
-fn windows_daemon_status_query_script(service_name: &str) -> Result<String, AdapterError> {
-    let svc_q = ps_quote(service_name)?;
-    Ok(format!(
-        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
-         $ProgressPreference = 'SilentlyContinue'; \
-         $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
-         if ($svc) {{ $svc.Status.ToString() }} else {{ 'Absent' }}",
-    ))
+fn windows_daemon_status_query_script(
+    service_name: &str,
+) -> Result<PowerShellScript, AdapterError> {
+    // Rendered by the typed script-template seam (the service name crosses as
+    // a `PowerShellLiteral`), so the sink receives a `PowerShellScript`, not a
+    // hand-assembled string — the raw-sink ratchet counts anything else.
+    let rendered =
+        crate::vm_lab::script_template::render_windows_service_status_query_script(service_name)
+            .map_err(|message| AdapterError::Protocol { message })?;
+    Ok(PowerShellScript::from_rendered(rendered))
 }
 
 /// `true` iff the queried status text is exactly `Running` (after trimming
@@ -498,7 +500,7 @@ fn parse_windows_daemon_status_running(status_text: &str) -> bool {
 /// key-init rewrites the on-disk WireGuard key material out from under it.
 fn windows_daemon_is_running(conn: &NodeConnection) -> Result<bool, AdapterError> {
     let script = windows_daemon_status_query_script(WINDOWS_SERVICE_NAME)?;
-    let status = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
+    let status = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
     Ok(parse_windows_daemon_status_running(&status))
 }
 
@@ -2244,8 +2246,21 @@ mod tests {
         let script = windows_daemon_status_query_script("RustyNet")
             .expect("status query script should render");
 
-        assert!(script.contains("Get-Service -Name 'RustyNet'"));
-        assert!(script.contains("if ($svc) { $svc.Status.ToString() } else { 'Absent' }"));
+        assert!(script.as_str().contains("Get-Service -Name 'RustyNet'"));
+        assert!(
+            script
+                .as_str()
+                .contains("if ($svc) { $svc.Status.ToString() } else { 'Absent' }")
+        );
+        // A service name with a quote is spelled inertly by the PowerShell
+        // quoting seam, never as syntax.
+        let hostile = windows_daemon_status_query_script("Rusty'Net")
+            .expect("hostile name still renders as data");
+        assert!(
+            hostile.as_str().contains("-Name 'Rusty''Net'"),
+            "{}",
+            hostile.as_str()
+        );
     }
 
     #[test]

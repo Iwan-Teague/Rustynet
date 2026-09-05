@@ -1519,6 +1519,35 @@ networkctl reconfigure __RN_IFACE__
 "#,
 );
 
+/// Windows SCM service status query: prints the service's current `Status`
+/// (or `Absent` when the service does not exist). PowerShell; the service
+/// name is spelled by `powershell_quote` via [`Binding::PowerShellLiteral`].
+const WINDOWS_SERVICE_STATUS_QUERY_SCRIPT: ScriptTemplate = ScriptTemplate(
+    "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
+     $ProgressPreference = 'SilentlyContinue'; \
+     $svc = Get-Service -Name __SVC__ -ErrorAction SilentlyContinue; \
+     if ($svc) { $svc.Status.ToString() } else { 'Absent' }",
+);
+
+/// Windows stop-and-wait for the daemon and relay SCM services: `sc.exe stop`
+/// both (the SCM-level stop that reliably takes effect where
+/// `Stop-Service -Force` did not, run-2026-09-04-windows-7), then wait,
+/// bounded (~20 s), for both to reach `Stopped` or be absent. Both names are
+/// spelled by `powershell_quote` via [`Binding::PowerShellLiteral`].
+const WINDOWS_STOP_AND_WAIT_SERVICES_SCRIPT: ScriptTemplate = ScriptTemplate(
+    "$ErrorActionPreference = 'SilentlyContinue'; \
+     & sc.exe stop __SVC__ 2>&1 | Out-Null; \
+     & sc.exe stop __RELAY__ 2>&1 | Out-Null; \
+     for ($i = 0; $i -lt 20; $i++) { \
+         $svc = Get-Service -Name __SVC__ -ErrorAction SilentlyContinue; \
+         $relay = Get-Service -Name __RELAY__ -ErrorAction SilentlyContinue; \
+         $svcDown = ($null -eq $svc) -or ($svc.Status -eq 'Stopped'); \
+         $relayDown = ($null -eq $relay) -or ($relay.Status -eq 'Stopped'); \
+         if ($svcDown -and $relayDown) { break }; \
+         Start-Sleep -Seconds 1 \
+     }",
+);
+
 /// Windows Exit evidence capture. PowerShell, not bash: its values are spelled
 /// by `powershell_quote` via [`Binding::PowerShellLiteral`].
 const WINDOWS_EXIT_EVIDENCE_CAPTURE_SCRIPT: ScriptTemplate = ScriptTemplate(
@@ -2091,6 +2120,31 @@ pub(crate) fn render_windows_exit_evidence_capture_script(
     )
 }
 
+/// Render the Windows SCM service status query for `service_name`.
+pub(crate) fn render_windows_service_status_query_script(
+    service_name: &str,
+) -> Result<RenderedScript, String> {
+    render_script_template(
+        WINDOWS_SERVICE_STATUS_QUERY_SCRIPT,
+        &[("__SVC__", Binding::PowerShellLiteral(service_name))],
+    )
+}
+
+/// Render the Windows stop-and-wait script for the daemon service
+/// `service_name` and its relay sibling `relay_service_name`.
+pub(crate) fn render_windows_stop_and_wait_services_script(
+    service_name: &str,
+    relay_service_name: &str,
+) -> Result<RenderedScript, String> {
+    render_script_template(
+        WINDOWS_STOP_AND_WAIT_SERVICES_SCRIPT,
+        &[
+            ("__SVC__", Binding::PowerShellLiteral(service_name)),
+            ("__RELAY__", Binding::PowerShellLiteral(relay_service_name)),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2305,6 +2359,19 @@ mod tests {
                     ("__ROOT__", "PowerShellLiteral"),
                     ("__DAEMON__", "PowerShellLiteral"),
                     ("__MARKER__", "PowerShellLiteral"),
+                ],
+            },
+            TemplateRow {
+                name: "WINDOWS_SERVICE_STATUS_QUERY_SCRIPT",
+                template: WINDOWS_SERVICE_STATUS_QUERY_SCRIPT,
+                bindings: &[("__SVC__", "PowerShellLiteral")],
+            },
+            TemplateRow {
+                name: "WINDOWS_STOP_AND_WAIT_SERVICES_SCRIPT",
+                template: WINDOWS_STOP_AND_WAIT_SERVICES_SCRIPT,
+                bindings: &[
+                    ("__SVC__", "PowerShellLiteral"),
+                    ("__RELAY__", "PowerShellLiteral"),
                 ],
             },
         ]

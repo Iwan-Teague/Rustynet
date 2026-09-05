@@ -1948,16 +1948,9 @@ mod tests {
     #[test]
     fn builder_rejects_empty_records() {
         let key = SigningKey::from_bytes(&[42u8; 32]);
-        let err = build_signed_dns_zone_bundle(
-            &key,
-            "rustynet",
-            "client-1",
-            1_773_000_000,
-            60,
-            42,
-            &[],
-        )
-        .expect_err("empty record list must be rejected");
+        let err =
+            build_signed_dns_zone_bundle(&key, "rustynet", "client-1", 1_773_000_000, 60, 42, &[])
+                .expect_err("empty record list must be rejected");
         assert_invalid_format_contains(&err, "dns zone requires at least one record");
     }
 

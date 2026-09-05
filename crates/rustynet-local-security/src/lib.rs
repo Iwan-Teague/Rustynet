@@ -802,16 +802,6 @@ mod tests {
 
     // ---- full public validators against a REAL Unix socket (end-to-end) ----
 
-    fn current_uid() -> u32 {
-        let probe = unique_dir("rn-local-sec-uid");
-        std::fs::create_dir_all(&probe).expect("uid probe dir should exist");
-        let uid = std::fs::metadata(&probe)
-            .expect("uid probe dir should stat")
-            .uid();
-        let _ = std::fs::remove_dir_all(&probe);
-        uid
-    }
-
     #[test]
     fn owner_only_socket_validator_accepts_real_owner_only_socket() {
         let dir = unique_dir("rn-local-sec-e2e-ok");

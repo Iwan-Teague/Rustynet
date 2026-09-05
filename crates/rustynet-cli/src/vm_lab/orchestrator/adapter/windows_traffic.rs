@@ -649,20 +649,16 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
 /// `sc.exe stop` stopped the same daemon in ~4s, so `sc.exe stop` is used here
 /// for that reliability. The two service names are compile-time constants (no
 /// untrusted value), keeping the command argv-only-safe.
-fn windows_stop_and_wait_services_script() -> String {
-    format!(
-        "$ErrorActionPreference = 'SilentlyContinue'; \
-         & sc.exe stop '{WINDOWS_SERVICE_NAME}' 2>&1 | Out-Null; \
-         & sc.exe stop '{WINDOWS_RELAY_SERVICE_NAME}' 2>&1 | Out-Null; \
-         for ($i = 0; $i -lt 20; $i++) {{ \
-             $svc = Get-Service -Name '{WINDOWS_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
-             $relay = Get-Service -Name '{WINDOWS_RELAY_SERVICE_NAME}' -ErrorAction SilentlyContinue; \
-             $svcDown = ($null -eq $svc) -or ($svc.Status -eq 'Stopped'); \
-             $relayDown = ($null -eq $relay) -or ($relay.Status -eq 'Stopped'); \
-             if ($svcDown -and $relayDown) {{ break }}; \
-             Start-Sleep -Seconds 1 \
-         }}"
+fn windows_stop_and_wait_services_script() -> Result<PowerShellScript, AdapterError> {
+    // Rendered by the typed script-template seam (both names cross as
+    // `PowerShellLiteral`s), so the sink receives a `PowerShellScript` rather
+    // than a hand-assembled string — the raw-sink ratchet counts anything else.
+    crate::vm_lab::script_template::render_windows_stop_and_wait_services_script(
+        WINDOWS_SERVICE_NAME,
+        WINDOWS_RELAY_SERVICE_NAME,
     )
+    .map(PowerShellScript::from_rendered)
+    .map_err(|message| AdapterError::Protocol { message })
 }
 
 fn windows_dataplane_reset_script() -> String {
@@ -786,11 +782,8 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // outbound policy); a manual `sc.exe stop` stopped the same daemon in ~4s.
     // Best-effort + bounded (<= ~20s, well inside SHORT_TIMEOUT); a clean/absent
     // service breaks out at once.
-    let _ = run_remote_ps(
-        conn,
-        &windows_stop_and_wait_services_script(),
-        SHORT_TIMEOUT,
-    );
+    let stop_wait = windows_stop_and_wait_services_script()?;
+    let _ = run_remote_ps(conn, stop_wait.as_str(), SHORT_TIMEOUT);
 
     // Best-effort reset of leftover RustyNet dataplane artifacts (killswitch
     // firewall rules + default-deny outbound policy, the DNS fail-closed NRPT
