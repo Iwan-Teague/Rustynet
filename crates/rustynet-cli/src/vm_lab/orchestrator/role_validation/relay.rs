@@ -93,6 +93,17 @@ const RELAY_HEALTH_PATH: &str = "/healthz";
 /// listener sockets before the after-stop capture.
 const STOP_SETTLE: Duration = Duration::from_secs(3);
 
+/// Readiness-wait budget: how long after a start verb (or a deploy stage's
+/// kickstart) to keep polling for a fully-serving snapshot before handing
+/// the (possibly still-not-ready) snapshot to the formal assertions. The
+/// live measurement behind this budget is ~3 s from `launchctl kickstart`
+/// to "UDP :4500 bound + TCP :4501 LISTEN + /healthz ok" on macos-utm-1
+/// (2026-09-05, run rust-1788649523 triage); 30 s leaves headroom for a
+/// cold SCM/systemd start without masking a genuinely-dead service.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll interval for [`wait_until_ready`].
+const READINESS_POLL: Duration = Duration::from_secs(1);
+
 /// Cross-OS relay lifecycle observation. Mirrors the shared snapshot the
 /// `live_linux_relay_test` bin captures on every platform: the
 /// active/inactive service word, whether the datapath + health listeners
@@ -149,7 +160,19 @@ pub fn validate_relay_lifecycle(
 ) -> Result<(), String> {
     let (datapath_port, health_port) = relay_ports(platform);
 
-    let during = capture_snapshot(shell, platform)
+    // Bounded readiness wait before the formal during-run capture: the start
+    // verbs (launchd kickstart, systemctl start, SCM start) return as soon as
+    // the service manager ACCEPTS the job, not when the process has exec'd and
+    // bound its sockets. Proven live 2026-09-05 (run rust-1788649523,
+    // macos-utm-1): `relay_validation` captured its during-run snapshot in the
+    // same second as `deploy_relay_service`'s kickstart and failed all three
+    // listener/healthz assertions while the relay reached full readiness
+    // (UDP :4500 bound, TCP :4501 LISTEN, /healthz ok) about three seconds
+    // later. The wait is not an assertion — after it (or after its budget is
+    // exhausted, in which case the formal assertions below fail with their
+    // existing messages) the snapshot is captured and asserted exactly as
+    // before, so a genuinely-down relay still fails identically.
+    let during = wait_until_ready(shell, platform)
         .map_err(|err| format!("during-run capture failed: {err}"))?;
 
     stop_relay_service(shell, platform)?;
@@ -161,8 +184,12 @@ pub fn validate_relay_lifecycle(
     // Restart so later stages inherit a serving relay. A restart failure
     // is part of the lifecycle contract: the orchestrator hands the host
     // back to subsequent stages, so a silent restart failure must surface
-    // as a failed result rather than hide under a pass.
-    let restart_status = start_relay_service(shell, platform);
+    // as a failed result rather than hide under a pass. The same readiness
+    // budget applies: a restart verb whose process never reaches a serving
+    // state would otherwise hand the next stage (relay frame-forwarding)
+    // the identical startup race this validator just tripped on.
+    let restart_status = start_relay_service(shell, platform)
+        .and_then(|()| wait_until_ready(shell, platform).map(|_| ()));
 
     let mut failures: Vec<String> = Vec::new();
 
@@ -237,6 +264,44 @@ fn relay_ports(platform: VmGuestPlatform) -> (u16, u16) {
             REVIEWED_WINDOWS_RELAY_HEALTH_PORT,
         ),
         _ => (RELAY_BIND_PORT, RELAY_HEALTH_PORT),
+    }
+}
+
+/// Whether a snapshot represents a fully-serving relay: active unit, both
+/// listeners bound, `/healthz` ok. Mirrors the during-run invariant set in
+/// [`validate_relay_lifecycle`] — kept as a predicate so the readiness loop
+/// and the formal assertions cannot drift apart.
+fn snapshot_is_ready(snapshot: &RelayLifecycleSnapshot) -> bool {
+    snapshot.unit_state.eq_ignore_ascii_case("active")
+        && snapshot.listener_bound_datapath
+        && snapshot.listener_bound_health
+        && snapshot.health_status.eq_ignore_ascii_case("ok")
+}
+
+/// Poll [`capture_snapshot`] until it reports a fully-serving relay or
+/// [`READINESS_TIMEOUT`] is exhausted, then return the LAST snapshot either
+/// way. Readiness success short-circuits the loop; exhaustion is not an
+/// error — the caller's formal assertions (unchanged) decide pass/fail from
+/// the snapshot's own evidence, so a genuinely-down relay still fails with
+/// the exact messages the triage ledger already knows. A capture transport
+/// error propagates immediately, exactly as a direct [`capture_snapshot`]
+/// call would.
+fn wait_until_ready(
+    shell: &dyn RemoteShellHost,
+    platform: VmGuestPlatform,
+) -> Result<RelayLifecycleSnapshot, String> {
+    let deadline = std::time::Instant::now()
+        .checked_add(READINESS_TIMEOUT)
+        .unwrap_or_else(|| std::time::Instant::now());
+    loop {
+        let snapshot = capture_snapshot(shell, platform)?;
+        if snapshot_is_ready(&snapshot) {
+            return Ok(snapshot);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(snapshot);
+        }
+        sleep(READINESS_POLL);
     }
 }
 
@@ -779,6 +844,42 @@ fn first_token(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap(
+        unit_state: &str,
+        datapath: bool,
+        health: bool,
+        health_status: &str,
+    ) -> RelayLifecycleSnapshot {
+        RelayLifecycleSnapshot {
+            unit_state: unit_state.to_owned(),
+            listener_bound_datapath: datapath,
+            listener_bound_health: health,
+            health_status: health_status.to_owned(),
+        }
+    }
+
+    #[test]
+    fn snapshot_is_ready_requires_every_invariant() {
+        // Fully serving: the only ready combination.
+        assert!(snapshot_is_ready(&snap("active", true, true, "ok")));
+        // Each single missing invariant must block readiness — the startup
+        // race proven on macos-utm-1 (run rust-1788649523) showed exactly
+        // this shape: launchd "active" with no bound sockets yet.
+        assert!(!snapshot_is_ready(&snap("active", false, true, "ok")));
+        assert!(!snapshot_is_ready(&snap("active", true, false, "ok")));
+        assert!(!snapshot_is_ready(&snap(
+            "active",
+            true,
+            true,
+            "unreachable"
+        )));
+        assert!(!snapshot_is_ready(&snap("inactive", true, true, "ok")));
+        // Case-insensitivity of the state and health words (parsers
+        // normalize, but the predicate must not care).
+        assert!(snapshot_is_ready(&snap("Active", true, true, "OK")));
+    }
+    use super::*;
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
     fn ok(stdout: &str) -> RemoteExitStatus {
@@ -1068,33 +1169,40 @@ mod tests {
         }
     }
 
-    /// Program a Linux mock shell with a during-run + after-stop phase
-    /// and the stop/start exit codes. The mock keys responses by exact
-    /// argv, FIFO, so we push two responses per repeated probe (during,
-    /// then after).
+    /// Program a Linux mock shell with a during-run + after-stop +
+    /// post-restart phase and the stop/start exit codes. The mock keys
+    /// responses by exact argv, FIFO, so we push three responses per
+    /// repeated probe: during-readiness (polled by `wait_until_ready`),
+    /// after-stop, and post-restart readiness (the restart path also
+    /// waits for readiness before handing the host to later stages).
     fn program_linux_lifecycle(
         mock: &MockShellHost,
         during: &LinuxPhase,
         after: &LinuxPhase,
+        restarted: &LinuxPhase,
         stop_ok: bool,
         start_ok: bool,
     ) {
         let is_active = ["systemctl", "is-active", SYSTEMD_RELAY_UNIT];
         mock.program_run_response(&is_active, ok(during.state));
         mock.program_run_response(&is_active, ok(after.state));
+        mock.program_run_response(&is_active, ok(restarted.state));
 
         let ss_udp = ["ss", "-ulnp"];
         mock.program_run_response(&ss_udp, ok(during.udp));
         mock.program_run_response(&ss_udp, ok(after.udp));
+        mock.program_run_response(&ss_udp, ok(restarted.udp));
 
         let ss_tcp = ["ss", "-tlnp"];
         mock.program_run_response(&ss_tcp, ok(during.tcp));
         mock.program_run_response(&ss_tcp, ok(after.tcp));
+        mock.program_run_response(&ss_tcp, ok(restarted.tcp));
 
         let health_url = format!("http://127.0.0.1:{RELAY_HEALTH_PORT}{RELAY_HEALTH_PATH}");
         let curl = ["curl", "--silent", "--max-time", "5", health_url.as_str()];
         mock.program_run_response(&curl, ok(during.health));
         mock.program_run_response(&curl, ok(after.health));
+        mock.program_run_response(&curl, ok(restarted.health));
 
         let stop = ["systemctl", "stop", SYSTEMD_RELAY_UNIT];
         mock.program_run_response(
@@ -1123,6 +1231,7 @@ mod tests {
             &mock,
             &LinuxPhase::serving(),
             &LinuxPhase::torn_down(),
+            &LinuxPhase::serving(),
             true,
             true,
         );
@@ -1139,6 +1248,7 @@ mod tests {
             &mock,
             &LinuxPhase::serving(),
             &LinuxPhase::serving(),
+            &LinuxPhase::serving(),
             true,
             true,
         );
@@ -1149,11 +1259,13 @@ mod tests {
 
     #[test]
     fn validate_linux_lifecycle_fails_when_during_run_not_serving() {
-        // Service inactive + ports unbound during the run → the
-        // during-run invariants must fail closed.
+        // Service inactive + ports unbound during the run → the readiness
+        // wait exhausts the programmed phases and the formal during-run
+        // invariants fail closed.
         let mock = MockShellHost::new();
         program_linux_lifecycle(
             &mock,
+            &LinuxPhase::torn_down(),
             &LinuxPhase::torn_down(),
             &LinuxPhase::torn_down(),
             true,
@@ -1173,6 +1285,7 @@ mod tests {
             &mock,
             &LinuxPhase::serving(),
             &LinuxPhase::torn_down(),
+            &LinuxPhase::serving(),
             true,
             false,
         );
