@@ -1335,6 +1335,36 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// hostnames and bare IPs at parse time (fail closed, never DNS). Empty
     /// (the default) leaves the gateway-derived behavior byte-identical.
     pub lab_stun_servers: Vec<std::net::SocketAddr>,
+    /// `--linux-backend <mode>`: pin the daemon backend on EVERY Linux guest
+    /// of this run (forwarded as `RUSTYNET_BACKEND` in the Linux bootstrap
+    /// env; `rn_bootstrap.sh` passes it to `ops install-systemd`). Without it
+    /// the install keeps whatever `RUSTYNET_BACKEND` a guest's
+    /// `/etc/default/rustynetd` already carries — guest history, not a run
+    /// decision — which is how a kernel `linux-wireguard` client (no
+    /// authoritative transport identity, so no STUN worker) ended up in a
+    /// `--lab-stun-servers` proof run beside a userspace-shared exit.
+    /// Allow-listed by [`parse_linux_backend`]; macOS/Windows guests are
+    /// unaffected. `None` (the default) leaves the env byte-identical.
+    pub linux_backend: Option<String>,
+}
+
+/// The Linux daemon backends `--linux-backend` may pin: the daemon's own
+/// Linux `--backend` vocabulary, nothing else.
+pub const LINUX_BACKEND_MODES: &[&str] = &["linux-wireguard", "linux-wireguard-userspace-shared"];
+
+/// Parse `--linux-backend <mode>` against [`LINUX_BACKEND_MODES`]. Fail closed
+/// at parse time: the value is written verbatim into a sourced bootstrap env
+/// file, so only the exact allow-listed literals are accepted (no trimming
+/// beyond surrounding whitespace, no case folding, no prefixes).
+pub fn parse_linux_backend(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if LINUX_BACKEND_MODES.contains(&trimmed) {
+        return Ok(trimmed.to_owned());
+    }
+    Err(format!(
+        "--linux-backend: unsupported value {trimmed:?}; expected one of {}",
+        LINUX_BACKEND_MODES.join(", ")
+    ))
 }
 
 /// Parse `--lab-stun-servers <ip:port[,ip:port...]>` into validated numeric
@@ -12655,12 +12685,20 @@ fn run_macos_orchestration_stages(
             vec![],
         )
     } else {
-        match exercise_macos_anchor_port_mapping_authority_live(
-            macos_alias,
-            inventory_path,
-            ssh_identity_file,
-            known_hosts_path,
-        ) {
+        // W5.7-quarantined bash-era sequencer with no live caller and no
+        // orchestration context: it cannot know the daemon-reported membership
+        // node id, so it FAILS CLOSED rather than guessing `<alias>-bootstrap`
+        // (a guessed id could pass a node that holds the capability under an
+        // identity it no longer runs as — adversarial review, 2026-09-05).
+        // The live `--node` stage
+        // (`stage::macos_anchor_port_mapping_authority_validation`) passes
+        // `ctx.node_ids[alias]` and cross-checks it against the daemon at
+        // validation time.
+        let legacy_result: Result<String, String> = Err(format!(
+            "legacy sequencer has no daemon-reported membership node id for {macos_alias}; \
+             port-mapping authority is validated only by the --node engine"
+        ));
+        match legacy_result {
             Ok(summary) => {
                 let _ = std::fs::write(&macos_anchor_port_mapping_log_path, summary.as_str());
                 stage_outcome(
@@ -15350,7 +15388,17 @@ fn macos_mesh_peer_count(
 /// (`build_linux_daemon_check_invocation`), so the daemon subcommand's own
 /// exit code is never authoritative here — this evaluator makes the actual
 /// call, exactly like `evaluate_macos_mesh_status_report`.
-#[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
+///
+/// Identity-binding limit: `self_holds_capability` answers "does the id the
+/// check was TOLD (`--self-node-id`) hold the grant in the signed snapshot".
+/// The report cannot by itself prove that id is the one the daemon runs as;
+/// the caller must supply the daemon-reported id and cross-check it at
+/// validation time (the `--node` stage does both). Until the daemon derives
+/// its self-id from persisted identity, a pass here is only as good as that
+/// binding.
+// Live under the `--node` engine: reached from
+// `stage::macos_anchor_port_mapping_authority_validation` via
+// `exercise_macos_anchor_port_mapping_authority_live` (MAC-D3).
 fn evaluate_anchor_port_mapping_status_report(
     macos_alias: &str,
     raw_json: &str,
@@ -15401,8 +15449,16 @@ fn evaluate_anchor_port_mapping_status_report(
 /// new `anchor-port-mapping-status-check` daemon subcommand. Requires
 /// `anchor.port_mapping_authoritative` in the elected anchor's membership
 /// grant (`macos_membership_capabilities`).
+///
+/// `membership_node_id` MUST be the id the guest's daemon runs as and the
+/// signed membership snapshot is keyed by (the `--node` engine's
+/// `ctx.node_ids[alias]`, daemon-reported in `collect_pubkeys`) — NOT the
+/// inventory `node_id`, which is a lab label. Passing the label made the
+/// daemon look up a node that is not in the snapshot and report a false
+/// "does not hold the capability" (`labrun-1788266019601-1574-3`).
 pub(crate) fn exercise_macos_anchor_port_mapping_authority_live(
     macos_alias: &str,
+    membership_node_id: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
@@ -15419,14 +15475,9 @@ pub(crate) fn exercise_macos_anchor_port_mapping_authority_live(
             macos_entry.platform_profile().platform.as_str()
         ));
     }
-    let node_id = macos_entry
-        .node_id
-        .as_deref()
-        .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?
-        .to_owned();
-    validate_mesh_node_id(node_id.as_str())?;
+    validate_mesh_node_id(membership_node_id)?;
 
-    let extra_args = vec!["--self-node-id".to_owned(), node_id.clone()];
+    let extra_args = vec!["--self-node-id".to_owned(), membership_node_id.to_owned()];
     let raw_json = run_macos_daemon_check_remote(
         macos_alias,
         inventory_path,
@@ -50940,6 +50991,29 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             skip_linux_live_suite: false,
             allow_dirty: false,
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
+        }
+    }
+
+    #[test]
+    fn parse_linux_backend_accepts_only_the_allow_listed_modes() {
+        assert_eq!(
+            super::parse_linux_backend("linux-wireguard-userspace-shared").expect("allowed"),
+            "linux-wireguard-userspace-shared"
+        );
+        assert_eq!(
+            super::parse_linux_backend(" linux-wireguard ").expect("surrounding whitespace only"),
+            "linux-wireguard"
+        );
+        for bad in [
+            "",
+            "macos-wireguard",
+            "Linux-WireGuard",
+            "linux-wireguard-userspace-shared\nRUSTYNET_NODE_ROLE=admin",
+            "linux-wireguard; true",
+        ] {
+            let err = super::parse_linux_backend(bad).expect_err("must be rejected");
+            assert!(err.contains("--linux-backend"), "{err}");
         }
     }
 

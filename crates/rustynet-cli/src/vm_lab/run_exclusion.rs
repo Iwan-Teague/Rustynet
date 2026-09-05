@@ -422,6 +422,7 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         stage_timeout_secs: _,
         skip_linux_live_suite: _,
         lab_stun_servers: _,
+        linux_backend: _,
     } = config;
 
     if *dry_run {

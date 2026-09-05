@@ -243,6 +243,13 @@ pub(crate) fn execute_rust_native_orchestration(
     if !config.lab_stun_servers.is_empty() {
         ctx.lab_stun_servers = config.lab_stun_servers.clone();
     }
+    // Linux backend pin: run-local for the same reason. Absent, the Linux
+    // install keeps whatever `RUSTYNET_BACKEND` each guest's
+    // /etc/default/rustynetd already carries (guest history), which is how a
+    // kernel-backend client silently ended up in a STUN proof run.
+    if let Some(mode) = config.linux_backend.as_deref() {
+        ctx.linux_backend = Some(mode.to_owned());
+    }
 
     // Augment node_assignments from platform selectors (--exit-platform,
     // --relay-platform, etc.) so a mac/win role cell runs live even when the

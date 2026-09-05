@@ -1013,6 +1013,51 @@ pub fn parse_status_field(status_text: &str, key: &str) -> Option<String> {
     })
 }
 
+/// The `transport_socket_identity_state` value `rustynet netcheck` reports
+/// when the active backend exposes no authoritative packet-I/O handle
+/// (`Backend::transport_socket_identity_blocker` is `Some`). The daemon then
+/// never starts its STUN worker (`poll_stun_results` returns before
+/// gathering), so `stun_candidates=none` on such a node is permanent, not
+/// "not yet".
+pub const NETCHECK_TRANSPORT_IDENTITY_BLOCKED_STATE: &str = "blocked_backend_opaque_socket";
+
+/// Classification of one `rustynet netcheck` STUN gather observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NetcheckStunGather {
+    /// One or more `stun_candidates=` entries were reported.
+    Candidates(Vec<String>),
+    /// The gather is empty (`none` / blank) and the backend CAN gather —
+    /// a fresh daemon has simply not completed a STUN round yet.
+    Empty,
+    /// The daemon reports it can never gather on this backend
+    /// (`transport_socket_identity_state=blocked_backend_opaque_socket`,
+    /// e.g. the kernel `linux-wireguard` command adapter). Carries the
+    /// daemon's own `state` and `transport_socket_identity_error` tokens so
+    /// the stage names the real cause instead of "empty after retry".
+    Blocked { state: String, error: String },
+}
+
+/// Classify a `rustynet netcheck` line for the collect_pubkeys STUN gather.
+/// A present candidate list wins outright; an empty list is `Blocked` only
+/// when the daemon itself says the transport identity is blocked, and
+/// `Empty` otherwise (including on a malformed line with neither field, which
+/// the bounded retry in the adapters then times out on as an absence).
+pub fn classify_netcheck_stun_gather(netcheck_text: &str) -> NetcheckStunGather {
+    if let Some(candidates) = parse_netcheck_stun_candidates(netcheck_text)
+        && !candidates.is_empty()
+    {
+        return NetcheckStunGather::Candidates(candidates);
+    }
+    match parse_status_field(netcheck_text, "transport_socket_identity_state") {
+        Some(state) if state == NETCHECK_TRANSPORT_IDENTITY_BLOCKED_STATE => {
+            let error = parse_status_field(netcheck_text, "transport_socket_identity_error")
+                .unwrap_or_else(|| "none".to_owned());
+            NetcheckStunGather::Blocked { state, error }
+        }
+        _ => NetcheckStunGather::Empty,
+    }
+}
+
 /// Parse the `stun_candidates=<ip:port[,ip:port...]>` field from a
 /// `rustynet netcheck` output line. The daemon renders the candidate list as
 /// comma-joined socket addresses, or the literal `none` when the async STUN
@@ -1262,6 +1307,60 @@ mod tests {
             Some("none".to_owned())
         );
         assert_eq!(parse_status_wireguard_public_key("node_id=win-1"), None);
+    }
+
+    #[test]
+    fn classify_netcheck_stun_gather_separates_blocked_backends_from_not_yet() {
+        use super::{
+            NETCHECK_TRANSPORT_IDENTITY_BLOCKED_STATE, NetcheckStunGather,
+            classify_netcheck_stun_gather,
+        };
+        // A userspace-shared node that has not completed a STUN round yet:
+        // an ABSENCE the adapters keep polling on.
+        let pending = "netcheck: transport_socket_identity_state=authoritative_backend_shared_transport \
+                       transport_socket_identity_error=none stun_candidates=none";
+        assert_eq!(
+            classify_netcheck_stun_gather(pending),
+            NetcheckStunGather::Empty
+        );
+
+        // The kernel `linux-wireguard` adapter: the daemon says it can NEVER
+        // gather, so this must NOT be reported as "empty after retry".
+        let blocked = "netcheck: transport_socket_identity_state=blocked_backend_opaque_socket \
+                       transport_socket_identity_error=linux_wireguard_backend_is_a_command_only_adapter \
+                       stun_candidates=none";
+        assert_eq!(
+            classify_netcheck_stun_gather(blocked),
+            NetcheckStunGather::Blocked {
+                state: NETCHECK_TRANSPORT_IDENTITY_BLOCKED_STATE.to_owned(),
+                error: "linux_wireguard_backend_is_a_command_only_adapter".to_owned(),
+            }
+        );
+
+        // A blocked state without the error field still classifies as
+        // blocked (the error token is informational).
+        let blocked_no_error = "netcheck: transport_socket_identity_state=blocked_backend_opaque_socket stun_candidates=none";
+        assert!(matches!(
+            classify_netcheck_stun_gather(blocked_no_error),
+            NetcheckStunGather::Blocked { ref error, .. } if error == "none"
+        ));
+
+        // Present candidates always win, whatever the identity state says.
+        let present = "netcheck: transport_socket_identity_state=blocked_backend_opaque_socket \
+                       stun_candidates=203.0.113.9:62051,203.0.113.9:62052";
+        assert_eq!(
+            classify_netcheck_stun_gather(present),
+            NetcheckStunGather::Candidates(vec![
+                "203.0.113.9:62051".to_owned(),
+                "203.0.113.9:62052".to_owned(),
+            ])
+        );
+
+        // Neither field at all (malformed line): an absence, not a blocker.
+        assert_eq!(
+            classify_netcheck_stun_gather("garbage"),
+            NetcheckStunGather::Empty
+        );
     }
 
     #[test]

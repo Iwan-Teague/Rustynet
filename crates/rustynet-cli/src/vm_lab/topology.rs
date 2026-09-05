@@ -934,6 +934,7 @@ mod tests {
             skip_linux_live_suite: false,
             allow_dirty: false,
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
         }
     }
 

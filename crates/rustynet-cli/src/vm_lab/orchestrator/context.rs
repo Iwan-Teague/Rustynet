@@ -225,6 +225,11 @@ pub struct OrchestrationContext {
     /// context reloads an empty vec — the fail-closed direction (no
     /// candidate-collection requirement without the flag re-supplied).
     pub lab_stun_servers: Vec<std::net::SocketAddr>,
+    /// `--linux-backend` pin forwarded as `RUSTYNET_BACKEND` in every Linux
+    /// guest's bootstrap env. Run-local like `lab_stun_servers`: `None` on a
+    /// resumed context, which leaves the install's existing-value behavior
+    /// untouched (bootstrap has already happened by then anyway).
+    pub linux_backend: Option<String>,
     /// Orchestrator engine that produced this run (set before stage execution).
     pub orchestrator_dialect: Option<OrchestratorDialect>,
     /// Live topology-level substrate handle (overlay/underlay IPs + created
@@ -295,6 +300,7 @@ impl OrchestrationContext {
             endpoints: HashMap::new(),
             reflexive_endpoints: HashMap::new(),
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -427,6 +433,7 @@ impl OrchestrationContext {
             // (candidate collection is only required when the flag is
             // re-supplied on the resuming invocation).
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
             orchestrator_dialect: snapshot.orchestrator_dialect,
             substrate: None,
             substrate_record: snapshot.substrate_record,

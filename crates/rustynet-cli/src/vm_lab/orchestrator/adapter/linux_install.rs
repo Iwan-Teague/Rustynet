@@ -543,8 +543,27 @@ fn build_bootstrap_env(
                 .join(",")
         )
     };
+    // --linux-backend pin: rn_bootstrap.sh forwards RUSTYNET_BACKEND to
+    // `ops install-systemd`, which otherwise keeps whatever value the guest's
+    // /etc/default/rustynetd already carries (guest history), so the line is
+    // only emitted when the operator pinned a backend. The value is one of
+    // the allow-listed literals from `parse_linux_backend` — the env file is
+    // sourced by the bootstrap shell, so nothing else may reach it.
+    let linux_backend_line = match ctx.linux_backend.as_deref() {
+        Some(mode) if crate::vm_lab::LINUX_BACKEND_MODES.contains(&mode) => {
+            format!("RUSTYNET_BACKEND={mode}\n")
+        }
+        Some(other) => {
+            return Err(AdapterError::Protocol {
+                message: format!(
+                    "refusing to write non-allow-listed RUSTYNET_BACKEND value {other:?} into the bootstrap env"
+                ),
+            });
+        }
+        None => String::new(),
+    };
     Ok(format!(
-        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n{lab_stun_line}"
+        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n{lab_stun_line}{linux_backend_line}"
     ))
 }
 
@@ -590,6 +609,7 @@ mod tests {
             endpoints: HashMap::new(),
             reflexive_endpoints: HashMap::new(),
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -643,6 +663,7 @@ mod tests {
                 "1.2.3.4:19302".parse().expect("socket addr"),
                 "5.6.7.8:3478".parse().expect("socket addr"),
             ],
+            linux_backend: None,
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -655,6 +676,55 @@ mod tests {
         assert!(
             env.contains("RUSTYNET_LAB_STUN_SERVERS=1.2.3.4:19302,5.6.7.8:3478\n"),
             "configured --lab-stun-servers must override the gateway default as a CSV line: {env}"
+        );
+        assert!(
+            !env.contains("RUSTYNET_BACKEND"),
+            "no --linux-backend pin must leave the backend to the install's existing-value logic: {env}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_env_threads_the_linux_backend_pin_and_refuses_anything_else() {
+        use std::collections::HashMap;
+        let mut ctx = OrchestrationContext {
+            assignments: vec![],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: "/tmp".into(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
+            linux_backend: Some("linux-wireguard-userspace-shared".to_owned()),
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+        };
+        let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
+        assert!(
+            env.ends_with("RUSTYNET_BACKEND=linux-wireguard-userspace-shared\n"),
+            "pinned --linux-backend must reach the guest as RUSTYNET_BACKEND: {env}"
+        );
+
+        // Defense in depth below the CLI parser: a value that is not one of
+        // the allow-listed literals never reaches a sourced env file.
+        ctx.linux_backend = Some("linux-wireguard\nRUSTYNET_NODE_ROLE=admin".to_owned());
+        let err = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect_err("must refuse");
+        assert!(
+            err.to_string()
+                .contains("non-allow-listed RUSTYNET_BACKEND"),
+            "{err}"
         );
     }
 
@@ -694,6 +764,7 @@ mod tests {
             endpoints: HashMap::new(),
             reflexive_endpoints: HashMap::new(),
             lab_stun_servers: Vec::new(),
+            linux_backend: None,
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
