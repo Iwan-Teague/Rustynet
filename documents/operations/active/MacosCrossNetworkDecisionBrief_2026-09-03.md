@@ -2,13 +2,47 @@
 
 **Scope:** docs-only. Turns the three fix directions in `MacosCrossNetworkTrafficBlocker_2026-09-03.md` §6 into an executable owner decision. No code executed or changed. **UNTRUSTED** — every step and citation below must be re-verified by the owner/manager before acting; where this brief CORRECTS the blocker doc, the correction is flagged in place.
 
+> **CORRECTION (2026-09-05): Option 1 is CONFIRMED structurally unachievable, not a
+> risk to watch for.** §2.4 below already cites QH-41 as a possible failure mode, but
+> understates it: `QualityHardeningTodo_2026-07-25.md` QH-41 already measured and
+> recorded (2026-08-12, three weeks before this brief) that the 64.x/65.x split is a
+> **UTM backend property** — `macos-utm-1` runs on the `Apple` (Virtualization.framework)
+> backend, every Linux/QEMU guest runs on the `QEMU` backend, and each backend gets its
+> own vmnet "Shared" segment. Re-verified directly on this tree (`plutil -p` on both
+> `config.plist`s, 2026-09-05): still `Backend = "Apple"` / `Backend = "QEMU"`
+> respectively. No network-mode change merges them, and a macOS guest cannot run under
+> QEMU on Apple Silicon at all, so there is no way to move it to the other backend. **Do
+> not attempt the Option 1 UTM-network re-pin — it is a known no-op**, confirmed twice
+> now (QH-41's own correction, and this session's re-verification of the same
+> `config.plist` fields on 2026-09-05).
+>
+> The actually-open path, per QH-41's own record: `macos-utm-1` has full internet
+> egress through its vmnet NAT gateway (measured: real external reachability, not just
+> LAN) — it is a NAT'd node like any real-world deployment target, and cross-network
+> mesh via STUN/ICE hole-punching through two independent NATs is **already proven**
+> for two real physical LANs (2026-07-29 cross-network harvest). The open question this
+> brief did not test is whether the SAME mechanism works when both NAT'd segments
+> happen to share one physical uplink (the Mac's own network connection) — untested
+> with the actual macOS guest as of this correction.
+
 **The failure being decided on:** run `livelab-1788433705-bf4b1b1187c8` (2026-09-03, 3 nodes: `macos-utm-1` client + `debian-headless-4` exit + `debian-headless-2`), `traffic_test_matrix` = 100% ICMP loss on every cross-vmnet pair, both directions. Cause: the three harvest guests sit on **two isolated UTM vmnet shared networks** (`macos-utm-1` on `192.168.64.0/24`; both debians on `192.168.65.0/24`), the run launched **without a cross-network substrate**, so every cross-vmnet WireGuard peer endpoint in the assignment bundle is an underlay address on the *other* vmnet's private prefix — unroutable, no handshake possible (`MacosCrossNetworkTrafficBlocker_2026-09-03.md` §3, live-measured 2026-09-03).
 
 ---
 
 ## 0) Decision in one line
 
-**RECOMMENDATION: Option 1 — re-pin the whole UTM fleet onto the single `192.168.64.0/24` shared network.** It is the only option whose critical path ends in a macOS `traffic_test_matrix` verdict: Option 2 structurally excludes macOS (the vxlan substrate fails closed on any non-Linux participant, `substrate.rs:2082-2099`), and Option 3 does not touch the failing path at all (the traffic matrix proves *direct* full-mesh pings over the endpoints in `NODES_SPEC`, `distribute_assignments.rs:60-87`; a relay on one vmnet is exactly as unroutable from the other vmnet as a peer is). Option 1 is also zero-code and restores the historical single-L2 lab shape every prior pass assumed. Owner hands-on: the UTM network re-attachment of four guests. Manager/CLI: inventory refresh, label fix, re-prove run.
+**SUPERSEDED 2026-09-05 (see the correction banner above): Option 1 does not work — do
+not re-pin the fleet.** The original recommendation below is kept for the historical
+record; it was reached without weighing QH-41's already-recorded finding that the
+64.x/65.x split is a fixed UTM backend property, not a repairable network-mode choice.
+The live path forward is: prove `traffic_test_matrix` as a genuine cross-network
+scenario (STUN/ICE traversal across the two NAT'd vmnet segments), the same mechanism
+already proven between two real physical LANs — not Option 2 (vxlan, which excludes
+macOS by design) and not Option 3 (relay, which doesn't touch the unroutable path
+either). See `documents/operations/active/README.md` for whichever live-lab evidence
+doc supersedes this one once that path is tested.
+
+~~**RECOMMENDATION: Option 1 — re-pin the whole UTM fleet onto the single `192.168.64.0/24` shared network.** It is the only option whose critical path ends in a macOS `traffic_test_matrix` verdict: Option 2 structurally excludes macOS (the vxlan substrate fails closed on any non-Linux participant, `substrate.rs:2082-2099`), and Option 3 does not touch the failing path at all (the traffic matrix proves *direct* full-mesh pings over the endpoints in `NODES_SPEC`, `distribute_assignments.rs:60-87`; a relay on one vmnet is exactly as unroutable from the other vmnet as a peer is). Option 1 is also zero-code and restores the historical single-L2 lab shape every prior pass assumed. Owner hands-on: the UTM network re-attachment of four guests. Manager/CLI: inventory refresh, label fix, re-prove run.~~
 
 ---
 
