@@ -685,3 +685,38 @@ All temporary diagnostic instrumentation added this session (`collect_pubkeys.rs
 `windows_install.rs` `bootstrap-native-output.log` addition) remains in place —
 it is exactly what produced the confirmation table above and should stay until
 the fix is live-proven, then be removed as its own comments say.
+
+### 14.1 Cross-platform check: macOS/Linux do not share this bug class
+
+Checked directly (file:line) rather than assumed, since this defect class
+(a redundant rekey after a daemon has already started) is exactly the kind of
+thing that could recur on another platform's install path:
+
+- **Linux** (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/linux_install.rs`):
+  no `key init` (or any rekey/regenerate-keypair) call anywhere in the
+  orchestrator's install path at all — grepped for `key`/`rekey`/`genkey` across
+  the whole file, the only hits are the (public) assignment-authority
+  *verifier* key handling for the relay unit, unrelated to WireGuard identity
+  keys. Whatever produces the Linux node's WireGuard keypair happens entirely
+  inside the daemon's own first-start self-init, a single code path with no
+  orchestrator-driven second call to overwrite it.
+- **macOS** (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`
+  plus its two embedded scripts, `scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh`
+  and `scripts/bootstrap/macos/Install-RustyNetMacosService.sh`): `key init` is
+  called exactly **once**, at `Bootstrap-RustyNetMacos.sh:1107`, and that same
+  script's own final step is what loads the launchd plist (starts the daemon;
+  `macos_install.rs:404` comment). `Install-RustyNetMacosService.sh` never calls
+  `key init` (confirmed by grep — it only does `launchctl bootstrap`/keychain
+  work), and there is no separate e2e-bootstrap script with its own rekey
+  (`scripts/e2e/rn_bootstrap_macos.sh` has zero `key init` hits). So the one
+  rekey always precedes the one daemon start, in the same script execution —
+  structurally incapable of leaving a stale-keyed daemon running the way
+  Windows' two-separate-scripts arrangement did.
+
+Windows is architecturally the odd one out here: it is the only platform whose
+orchestrator-driven install path runs `key init` from **two different, separately
+maintained scripts** (`Install-RustyNetWindowsService.ps1`'s own rekey step, added
+for DPAPI-runtime-identity alignment, and `run_windows_e2e_bootstrap`'s later,
+independently-hardened rekey, added for the Phase 27 passphrase-separation fix) —
+neither script's author had full visibility into the other having already started
+a daemon. No further cross-platform action needed; this is closed.
