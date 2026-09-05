@@ -608,6 +608,25 @@ pub trait DataplaneSystem {
     fn apply_routes(&mut self, routes: &[Route]) -> Result<(), SystemError>;
     fn rollback_routes(&mut self) -> Result<(), SystemError>;
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError>;
+    /// Grant the tunnel interface itself outbound permission through the
+    /// host firewall. Runs AFTER `backend.start()` — unconditionally, for
+    /// every role, since every node's own mesh/exit traffic flows through
+    /// its own tunnel interface, not just a forwarding role's — because
+    /// Windows scopes its permit to the interface's LUID:
+    /// `ConvertInterfaceAliasToLuid` fails with ERROR_INVALID_PARAMETER
+    /// before the WireGuard-NT adapter exists, so it cannot run inside the
+    /// pre-start `apply_firewall_killswitch` the way the base
+    /// block/loopback/egress rules do (this is the same class of ordering
+    /// bug QH-53 fixed for the Linux firewalld zone bind, one layer deeper:
+    /// nft/pf accept an interface NAME that does not exist yet, but Windows'
+    /// WFP filter needs the interface's LUID, which does not).
+    ///
+    /// Deliberately NOT defaulted, for the same reason as
+    /// `admit_host_firewall_forwarding`: a defaulted no-op would let a
+    /// missing dispatch arm silently leave a real Windows node with no
+    /// outbound path through its own tunnel while every DryRun-driven test
+    /// stayed green.
+    fn apply_tunnel_interface_admit(&mut self) -> Result<(), SystemError>;
     /// QH-53: ask the host firewall (firewalld, when present) to admit
     /// forwarded tunnel traffic for a node serving a forwarding role. Runs
     /// AFTER backend start (the tunnel interface must exist for the zone
@@ -1054,6 +1073,13 @@ impl DataplaneSystem for DryRunSystem {
 
     fn apply_firewall_killswitch(&mut self) -> Result<(), SystemError> {
         self.step("apply_firewall_killswitch")
+    }
+
+    fn apply_tunnel_interface_admit(&mut self) -> Result<(), SystemError> {
+        // Through step() on purpose: fail_operation-driven tests must be able
+        // to fail this stage and prove the controller propagates it, and to
+        // observe its ordering relative to BackendStarted in DryRun op logs.
+        self.step("apply_tunnel_interface_admit")
     }
 
     fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
@@ -3116,6 +3142,16 @@ impl DataplaneSystem for LinuxCommandSystem {
     // lives in admit_host_firewall_forwarding, called by the controller
     // after backend start.
 
+    fn apply_tunnel_interface_admit(&mut self) -> Result<(), SystemError> {
+        // Nothing to do: the tunnel-allow rule is already programmed by
+        // apply_firewall_killswitch above, matched by nft's `oifname
+        // "rustynet0"` — an interface NAME nft accepts even before the
+        // interface exists, unlike Windows' WFP filter which resolves the
+        // name to a LUID at apply time and needs the interface already
+        // created.
+        Ok(())
+    }
+
     fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
         // Role gating (serve_exit_node) lives at the controller call site so
         // the stage is visible in DryRun op ordering; when called, always
@@ -5008,6 +5044,15 @@ impl DataplaneSystem for MacosCommandSystem {
         self.apply_pf_rules(false)
     }
 
+    fn apply_tunnel_interface_admit(&mut self) -> Result<(), SystemError> {
+        // Nothing to do: pf, like nft, matches the tunnel-allow rule by
+        // interface NAME (`on rustynet0`) inside apply_firewall_killswitch
+        // above, which pf accepts even before the interface exists — unlike
+        // Windows' WFP filter, which resolves the name to a LUID at apply
+        // time and needs the interface already created.
+        Ok(())
+    }
+
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
         if self.blind_exit_pf_config.is_some() {
             return Ok(());
@@ -6249,17 +6294,15 @@ impl DataplaneSystem for WindowsCommandSystem {
         .map_err(|err| {
             SystemError::FirewallApplyFailed(format!("allow loopback rule failed: {err}"))
         })?;
-        // Allow outbound through the WireGuard tunnel interface (mesh + exit traffic)
-        // via a native WFP permit filter keyed on the tunnel interface LUID. This
-        // replaces the prior `New-NetFirewallRule -InterfaceAlias` cmdlet: wintun
-        // adapters (MediaType=IP/Virtual) are not scopable by netsh interfacetype,
-        // and a PowerShell/CIM cmdlet on the dataplane-apply path can hang on a
-        // wedged WMI provider. The native filter uses no CIM and cannot hang.
-        rustynet_windows_native::apply_wfp_tunnel_permit(&self.interface_name).map_err(|err| {
-            SystemError::FirewallApplyFailed(format!(
-                "allow tunnel interface WFP filter failed: {err}"
-            ))
-        })?;
+        // The WireGuard tunnel interface's own outbound permit (mesh + exit
+        // traffic) is NOT applied here — see apply_tunnel_interface_admit
+        // below. It needs the tunnel interface to already exist (its WFP
+        // filter is keyed on the interface's LUID), and this method runs
+        // before backend.start() creates it; applying it here made every
+        // cold Windows bootstrap fail `ConvertInterfaceAliasToLuid` with
+        // ERROR_INVALID_PARAMETER, the same class of ordering bug QH-53 fixed
+        // for the Linux firewalld zone bind.
+        //
         // Allow the SCOPED egress essentials on the underlay (RN-06): management
         // SSH to the reviewed CIDRs (so an inbound-administered session survives
         // the global outbound block), the WireGuard handshake/data UDP from the
@@ -6269,6 +6312,25 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.apply_windows_scoped_egress_allows()?;
         self.firewall_applied = true;
         Ok(())
+    }
+
+    fn apply_tunnel_interface_admit(&mut self) -> Result<(), SystemError> {
+        // Allow outbound through the WireGuard tunnel interface (mesh + exit
+        // traffic) via a native WFP permit filter keyed on the tunnel
+        // interface LUID. This replaces the prior
+        // `New-NetFirewallRule -InterfaceAlias` cmdlet: wintun adapters
+        // (MediaType=IP/Virtual) are not scopable by netsh interfacetype, and
+        // a PowerShell/CIM cmdlet on the dataplane-apply path can hang on a
+        // wedged WMI provider. The native filter uses no CIM and cannot hang.
+        //
+        // Runs AFTER backend.start(): `ConvertInterfaceAliasToLuid` needs the
+        // interface to already exist, which apply_firewall_killswitch (called
+        // before backend.start()) cannot guarantee.
+        rustynet_windows_native::apply_wfp_tunnel_permit(&self.interface_name).map_err(|err| {
+            SystemError::FirewallApplyFailed(format!(
+                "allow tunnel interface WFP filter failed: {err}"
+            ))
+        })
     }
 
     fn rollback_firewall(&mut self) -> Result<(), SystemError> {
@@ -6780,6 +6842,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn apply_tunnel_interface_admit(&mut self) -> Result<(), SystemError> {
+        match self {
+            RuntimeSystem::DryRun(system) => system.apply_tunnel_interface_admit(),
+            RuntimeSystem::Linux(system) => system.apply_tunnel_interface_admit(),
+            RuntimeSystem::Macos(system) => system.apply_tunnel_interface_admit(),
+            RuntimeSystem::Windows(system) => system.apply_tunnel_interface_admit(),
+        }
+    }
+
     fn admit_host_firewall_forwarding(&mut self) -> Result<(), SystemError> {
         match self {
             RuntimeSystem::DryRun(system) => system.admit_host_firewall_forwarding(),
@@ -7211,6 +7282,26 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
                 self.force_fail_closed("backend_start_failed")?;
                 return Err(err.into());
             }
+        }
+
+        // The tunnel interface's own outbound firewall permit needs the
+        // interface to exist (Windows resolves it to a LUID), so it runs
+        // here — right after backend start, unconditionally for every role,
+        // since every node's own mesh/exit traffic flows through its own
+        // tunnel interface, not just a forwarding role's. Rollback on failure
+        // is already covered by StageMarker::FirewallApplied (rollback_firewall
+        // best-effort removes the permit regardless of whether this step ever
+        // ran), so no new marker is needed here.
+        if let Err(err) = self.system.apply_tunnel_interface_admit() {
+            let rollback_result =
+                self.rollback_generation_best_effort(applied_stages, RollbackIntent::FailClosed);
+            let fail_closed_result = self.force_fail_closed("tunnel_interface_admit_failed");
+            if let Err(rollback_err) = rollback_result {
+                let _ = fail_closed_result;
+                return Err(rollback_err);
+            }
+            fail_closed_result?;
+            return Err(err.into());
         }
 
         // QH-53: the firewalld zone bind needs the tunnel interface to exist
@@ -9715,10 +9806,29 @@ mod tests {
             "the host-firewall admit must run AFTER backend start — the zone \
              bind needs the tunnel interface backend start creates (QH-53)"
         );
+        // The tunnel interface's own outbound admit (apply_tunnel_interface_admit)
+        // legitimately sits between backend start and the host-firewall
+        // (forwarding) admit — both need the interface backend start creates,
+        // and Windows' WFP tunnel-permit filter has the exact same
+        // interface-must-exist requirement QH-53 fixed here for firewalld.
+        let tunnel_admit_at = code
+            .find("self.system.apply_tunnel_interface_admit()")
+            .expect("the controller must apply the tunnel interface's own firewall admit");
         assert!(
-            call_at - start_at < 1600,
-            "the admit call must sit directly after the backend-start match, \
-             not merely somewhere later in the apply"
+            start_at < tunnel_admit_at && tunnel_admit_at < call_at,
+            "the tunnel-interface admit must run between backend start and \
+             the host-firewall (forwarding) admit — both need the interface \
+             backend start creates"
+        );
+        assert!(
+            tunnel_admit_at - start_at < 1200,
+            "the tunnel-interface admit must sit directly after the \
+             backend-start match, not merely somewhere later in the apply"
+        );
+        assert!(
+            call_at - tunnel_admit_at < 1700,
+            "the host-firewall admit must sit directly after the \
+             tunnel-interface admit, not merely somewhere later in the apply"
         );
         assert!(
             call_at < preflight_at,
