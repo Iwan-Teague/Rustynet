@@ -710,7 +710,29 @@ All temporary diagnostic instrumentation added this session (`collect_pubkeys.rs
 it is exactly what produced the confirmation table above and should stay until
 the fix is live-proven, then be removed as its own comments say.
 
-### 14.1 Cross-platform check: macOS/Linux do not share this bug class
+### 14.1 A second, downstream latent race surfaced by the fix — also fixed (`d1503a38`)
+
+`run-2026-09-05-windows-26-both-fixes-proof` (which included both the §14 key-init
+fix and the separate DnsFailclosed fix, `e50235f9` —
+`WindowsDnsFailclosedIpv6FlakeDiagnosis_2026-09-05.md`) got past the DNS flake but hit a
+NEW failure at `collect_pubkeys` itself: `windows-x86-1: pubkey: protocol error:
+local_wg_public_key not present in daemon status`. The daemon's own log for that
+run showed a ~15s gap between `rustynetd startup: daemon runtime constructed`
+(the in-memory pubkey is derived here, near-instant) and `rustynetd startup:
+control + privileged pipe servers spawned` (status queries start succeeding) —
+`collect_wireguard_public_key`'s retry budget (`windows_traffic.rs`, 8 attempts
+× 1s ≈ 7-8s) was tight against that gap even before this session's changes, and
+the §14 fix's extra restart cycle (`install_daemon` now stops+starts the daemon
+a second time) shifts collect_pubkeys' query closer to a fresh daemon's own
+startup window, making this pre-existing tightness bite more often. Not a new
+bug the §14 fix introduced — a latent one it made easier to hit.
+
+**Fix landed:** `d1503a38`. Raises `collect_wireguard_public_key`'s retry budget
+from 8×1s to 30×1s (~30s, ~2x headroom over the observed 15s gap), still failing
+closed if the pipe never comes up at all. fmt/clippy/test-suite verified clean.
+Not yet live-re-proven.
+
+### 14.2 Cross-platform check: macOS/Linux do not share this bug class
 
 Checked directly (file:line) rather than assumed, since this defect class
 (a redundant rekey after a daemon has already started) is exactly the kind of
