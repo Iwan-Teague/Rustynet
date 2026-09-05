@@ -43,35 +43,39 @@ fn empty_artifact_archive_ps_literal() -> String {
     format!("[byte[]]@({bytes})")
 }
 
-/// Read the `WireGuard` public key from `C:\ProgramData\RustyNet\keys\wireguard.pub`.
+/// Read the local `WireGuard` public key from the daemon's own live status,
+/// not from `C:\ProgramData\RustyNet\keys\wireguard.pub` on disk.
 /// Returns the base64-encoded key decoded to hex (32-byte key → 64-char hex).
+///
+/// A prior version of this collector read the file directly and intermittently
+/// got an empty read even after the bootstrap readiness probe had confirmed
+/// the file present and non-empty moments earlier (run-2026-09-04-windows-7,
+/// where the key was a valid 45-char value on the guest immediately after).
+/// A full code-trace (`WindowsCollectPubkeysEmptyReadAnalysis_2026-09-04.md`)
+/// found every writer of that file to be atomic (temp file + `fs::rename`) and
+/// ruled out any daemon-side truncate/rewrite on the fresh-bootstrap timeline —
+/// the likely cause is a transient read-side lock on a freshly created
+/// `ProgramData` file (e.g. Defender's first-scan), which a longer file-read
+/// retry does not reliably outlast. The daemon derives its public key directly
+/// from the decrypted private key at startup (`DaemonRuntime::new`) and caches
+/// it in memory, so querying the daemon's own `status` response has no file
+/// read and no such lock window at all.
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
-    let key_path = format!(r"{WINDOWS_STATE_ROOT}\keys\wireguard.pub");
-    // QH-01 Step 4b: the single-cmdlet script is rendered through the validated
-    // seam, so the path is windows-path-validated and ps-quoted before any
-    // command string exists.
-    let argv = [
-        ValidatedArg::cli_token("Get-Content")?,
-        ValidatedArg::cli_token("-LiteralPath")?,
-        ValidatedArg::windows_path(&key_path)?,
-        ValidatedArg::cli_token("-Encoding")?,
-        ValidatedArg::cli_token("utf8")?,
-        ValidatedArg::cli_token("-Raw")?,
-    ];
-    let script = PowerShellScript::from_call_argv("windows read wireguard public key", &argv)?;
-    // The daemon writes wireguard.pub non-atomically (truncate then write) as it
-    // (re)derives the key at startup/reconcile, so a single read can catch it
-    // mid-write and come back empty even though the bootstrap readiness probe
-    // confirmed it non-empty moments earlier (run-2026-09-04-windows-7, where the
-    // pubkey was a valid 45-char key on the guest immediately after). Retry the
-    // read a few times -- the Linux collector does the same -- and only fail
-    // closed once every attempt came back empty/undecodable.
-    let mut last_err = "empty base64 input".to_owned();
+    let script = live_identity_status_script()?;
+    let mut last_err = "local_wg_public_key not present in daemon status".to_owned();
     for attempt in 0..8 {
-        let raw = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
-        match decode_wireguard_pubkey_to_hex(raw.trim()) {
-            Ok(hex) => return Ok(hex),
-            Err(err) => last_err = err,
+        let status = run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)?;
+        match ssh::parse_status_wireguard_public_key(&status) {
+            Some(raw) if raw != "none" => match decode_wireguard_pubkey_to_hex(raw.trim()) {
+                Ok(hex) => return Ok(hex),
+                Err(err) => last_err = err,
+            },
+            Some(_none) => {
+                last_err = "daemon status reports local_wg_public_key=none".to_owned();
+            }
+            None => {
+                last_err = "local_wg_public_key not present in daemon status".to_owned();
+            }
         }
         if attempt < 7 {
             std::thread::sleep(Duration::from_secs(1));
@@ -1913,24 +1917,31 @@ mod tests {
 
     // ── QH-01 Step 4b: seam-rendered argv-shaped sites ────────────────────────
 
+    /// `collect_wireguard_public_key` now sources the key from the daemon's
+    /// own live status (see its doc comment for why the file read it used to
+    /// do was dropped), reusing the same status script
+    /// `live_identity_script_invokes_trust_cli_status` already pins. This
+    /// test locks the parse+decode half: a status line carrying a real
+    /// `local_wg_public_key=` value decodes to the expected hex, the `none`
+    /// sentinel is distinguished from a real key rather than being handed to
+    /// the base64 decoder, and a status line missing the field entirely is
+    /// treated the same as `none` (fail closed, never a silent default).
     #[test]
-    fn wireguard_public_key_script_renders_get_content_argv() {
-        let argv = [
-            ValidatedArg::cli_token("Get-Content").expect("token"),
-            ValidatedArg::cli_token("-LiteralPath").expect("token"),
-            ValidatedArg::windows_path(r"C:\ProgramData\RustyNet\keys\wireguard.pub")
-                .expect("path"),
-            ValidatedArg::cli_token("-Encoding").expect("token"),
-            ValidatedArg::cli_token("utf8").expect("token"),
-            ValidatedArg::cli_token("-Raw").expect("token"),
-        ];
-        let script = PowerShellScript::from_call_argv("windows read wireguard public key", &argv)
-            .expect("ok");
+    fn wireguard_public_key_field_decodes_from_daemon_status() {
+        let status = "node_id=win-1 local_wg_public_key=BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= state=Running";
+        let raw = ssh::parse_status_wireguard_public_key(status).expect("field present");
+        assert_ne!(raw, "none");
+        let hex = super::decode_wireguard_pubkey_to_hex(&raw).expect("valid 32-byte key decodes");
+        assert_eq!(hex, "07".repeat(32));
+
+        let not_yet = "node_id=win-1 local_wg_public_key=none state=Running";
         assert_eq!(
-            script.as_str(),
-            "$out = & 'Get-Content' '-LiteralPath' 'C:\\ProgramData\\RustyNet\\keys\\wireguard.pub' \
-             '-Encoding' 'utf8' '-Raw' 2>&1; Write-Output $out"
+            ssh::parse_status_wireguard_public_key(not_yet),
+            Some("none".to_owned())
         );
+
+        let missing = "node_id=win-1 state=Running";
+        assert_eq!(ssh::parse_status_wireguard_public_key(missing), None);
     }
 
     #[test]
