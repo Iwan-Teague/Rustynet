@@ -167,3 +167,5 @@ Expected shakedown order: substrate setup provisions `rustynet-vx0` (`provisione
 1. Row appended to `documents/operations/live_lab_node_run_matrix.csv`, attributed to this commit (quote-aware parse — QH-07).
 2. Pass/fail taken from the stage's own report artifact (status + data block), never the CSV column (§12.3).
 3. For Option 1 success, explicitly record: macOS `traffic_test_matrix` = pass — there is **no prior row** in the `--node` ledger where a macOS node ever passed it (blocker §3.3).
+
+**Status 2026-09-05:** the open question in the correction banner ("does the same mechanism work when both NAT'd segments share one physical uplink") is answered YES by a hand probe (393/393 and 392/393 punched packets through the router+vmnet double NAT) — see `MacosCrossNetworkTrafficBlocker_2026-09-03.md` §7 — and the orchestrator can now drive it (`--lab-stun-servers`, `c15d6590`). The daemon-driven `--node` proof is the next run.

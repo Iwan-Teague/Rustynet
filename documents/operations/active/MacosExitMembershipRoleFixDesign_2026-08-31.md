@@ -856,7 +856,12 @@ corrections applied, Option D ledgered as the target — not the original
       all `distribute_*` + `enforce_baseline_runtime` pass; no daemon failure
       marker on any node (the `blind_exit role cannot use membership carrying
       anchor capability` rejection is gone).
-- [ ] §5.3 live proof — baseline half: `validate_baseline_runtime` FAILED on
+- [x] §5.3 live proof — baseline half: CLOSED by proof run #3 `livelab-1788628164-40e7409ff2a4` (commit
+      `40e7409f`, clean): `validate_baseline_runtime` PASS on macos-utm-1 (all six
+      ops incl. DnsFailclosed) once the validator's blind spot for the
+      `com.rustynet/blind_exit` anchor was fixed (QH-67). History of the
+      intermediate failure kept below for the record.
+- [x] (superseded) §5.3 live proof — baseline half: `validate_baseline_runtime` FAILED on
       the pre-declared next blocker (`macos-utm-1/DnsFailclosed: pf DNS block
       floor not verified ... anchors scanned: [com.apple/rustynet_g0,
       com.apple/rustynet_g1]`) with daemon markers CLEAN — i.e. the distinct

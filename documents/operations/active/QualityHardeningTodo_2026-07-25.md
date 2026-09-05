@@ -16,7 +16,7 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **66** (QH-01 through QH-66, contiguous;
+> then claimed; it has since grown to **67** (QH-01 through QH-67, contiguous;
 > re-counted 2026-09-05 — QH-65/66 were filed from the macOS exit membership
 > role-fix design's independent review).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
@@ -6364,3 +6364,44 @@ at genesis (a blind exit can never be a mesh founder). Recorded here as open;
 not scheduled by this entry.
 
 **Disposition: OPEN, not fixed. No committed date.** Sequence after QH-65.
+
+### QH-67 — FIXED: the macOS `DnsFailclosed` baseline check could not see the blind-exit pf anchor, so a macOS exit with a live, daemon-verified DNS floor false-failed `validate_baseline_runtime`
+**Severity: medium (validator false negative on a security control's evidence — fail-closed direction, but it blocked the macOS exit cell and misdirected triage toward a posture gap that did not exist). Confidence: VERIFIED — two live runs (`livelab-1788625551`, `livelab-1788626748`, 2026-09-05) plus a code trace; fixed in `40e7409f`.**
+
+`crates/rustynetd/src/macos_dns_failclosed.rs::read_pf_dns_block_floor` requires
+some rustynet-owned pf anchor (prefixes `com.apple/rustynet_g`, `com.rustynet/`)
+to carry both labeled DNS block rules. Because `pfctl -s Anchors` lists only
+top-level anchors, it additionally enumerated `com.apple`'s sub-anchors (the
+generation-scoped killswitch floor) — but never `com.rustynet`'s. The macOS
+blind-exit posture loads its rules, which carry the same two labels once DNS
+protection is on, into `com.rustynet/blind_exit`
+(`macos_blind_exit::DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR`, selected by
+`phase10::current_anchor_name` while a blind-exit config is active and read by
+the daemon's own A5 `verify_live_pf_dns_floor` after every DNS apply). The
+first macOS exit run to get past the membership/role alignment fix therefore
+reported `pf DNS block floor not verified ... anchors scanned:
+["com.apple/rustynet_g0", "com.apple/rustynet_g1"]` while the daemon had
+verified the floor live in the unscanned anchor and logged no reconcile
+failure; the two scanned anchors were stale pre-blind generations.
+
+**Why it stayed hidden:** every earlier macOS `DnsFailclosed` proof ran on a
+client or an anchor (killswitch floor under `com.apple`), or on a blind_exit
+lab role that was NOT the mesh exit (`ScopedResolverOnly` posture, no pf floor
+required). The exit-as-blind_exit posture — `serve_exit_node=true` ⇒
+`FullyProtected` ⇒ floor required — was unreachable until the membership fix
+(`50460501`) landed the same day.
+
+**Fix (`40e7409f`):** the scan also runs `pfctl -a com.rustynet -s Anchors`
+and unions the result; the acceptance predicate is unchanged (both labeled
+block rules in an owned anchor, per-anchor reads still fail closed). Per the
+adversarial review, a parent the top-level dump lists whose sub-anchor listing
+cannot be read now makes the observation UNVERIFIABLE (`None` → "pfctl
+unreadable") instead of "rules absent". Regression tests pin both.
+
+**Residual (not a defect, recorded so nobody "fixes" it):** the standalone
+check deliberately does NOT ask the daemon which anchor it verified — that
+would be self-attestation; prefix-anchored enumeration over the fixed owned
+allowlist keeps the stage independent of the daemon's own claim.
+
+**Disposition: FIXED in code; live re-proof pending run #3 of the macOS exit
+cell (launched immediately after landing).**
