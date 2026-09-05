@@ -16,7 +16,9 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **43** (QH-01 through QH-43, contiguous).
+> then claimed; it has since grown to **66** (QH-01 through QH-66, contiguous;
+> re-counted 2026-09-05 — QH-65/66 were filed from the macOS exit membership
+> role-fix design's independent review).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
 > live run — one macOS false-green (mesh-status) plus one dead assertion (DNS),
 > a rollback-ordering fail-open, and the lab-network drift that blocks every
@@ -6262,3 +6264,93 @@ Live-lab run `labrun-1788118517051-33199-0` (Linux-only, `debian-headless-2` + `
 (The `ubuntu-utm-1` run did fail later, at `exit_dns_failclosed_validation` — but for an unrelated reason, a missing `dig` binary on that guest, tracked separately, not folded into this finding.)
 
 **Update 2026-08-31 — design investigation (no code).** A repo-reading pass advanced all three open questions; full findings + proposed fix direction in `QH64GossipTrustRaceDesignInvestigation_2026-08-31.md`. Corrections to this section's record: (1) `RestrictionMode::Permanent` **does self-heal in-process if the underlying failure clears** — the reconcile success tail (`daemon.rs:10557-10559`) resets it unconditionally, and the apply block is reachable under Permanent because the FailClosed dataplane state the failures themselves set satisfies the apply predicate (`daemon.rs:10348-10352`); `:6015` can never fire under Permanent (QH-55 guard), `:8843` is bootstrap-path-only. (2) The gossip accept path has **no** RestrictionMode check (zero matches in `gossip_runtime.rs`; accept path `:660-716` checks revocation + per-origin budget only) — the real `gossip_accepted_total=0` mechanism is upstream: the trust failure's early return (`daemon.rs:10261-10267`) means membership never loads, `sync_gossip_data_plane` early-returns on `membership_state == None` (`daemon.rs:6464-6467`), so the restarted daemon never binds its gossip transport or registers peers at all (also matching the absence of `gossip_reject_*` lines). (3) The trust evidence write path is atomic (`main.rs:9550-9573`, temp+publish, old file preserved on failure) and no mid-run code path deletes the file (only teardown `uninstall_daemon`, `linux_install.rs:364-371`) — but `load_trust_evidence`'s `!path.exists()` (`daemon.rs:13697`) maps EACCES to `Missing`, so "file missing" may actually be "not readable by the `rustynetd` service user" (`rustynetd.service:116-117`); plus unit drift on that guest as candidate 2. The lenovo-exit-1 cause is narrowed to three candidates with decisive live probes listed in the new doc §3.4; also flagged: the enforce pass (`ops e2e-enforce-host` → `install-systemd` only, `ops_e2e.rs:838-843`) does **not** re-seed trust evidence despite the comment at `linux_install.rs:150`. Recommended direction: orchestrator pre-restart trust precondition + errno disambiguation + unit preflight hardening, rely on the existing `:10557` self-heal, and reject any timer-based Permanent auto-downgrade (fail-open); a narrowly-scoped Missing-only grace before `promote_to_permanent_if_over_limit` is conditional on the live probes and the full adversarial cycle. **Disposition remains OPEN, not fixed.**
+
+### QH-65 — `blind_exit` signed-membership validation is a forbidden-values list, not an exact-set compare: `{blind_exit, exit_server, relay_host}` and `{blind_exit, exit_server, client}` are accepted TODAY at both layers
+**Severity: high (default-deny violation, AGENTS.md/CLAUDE.md §3 — a hardened minimal-surface role accepts capabilities its posture was designed to exclude). Confidence: VERIFIED against `main` at `2a43792c` (2026-09-05) by reading both validators; no live exploit run.**
+
+Filed from `MacosExitMembershipRoleFixDesign_2026-08-31.md` §1.3.1/§3c, where an independent review reclassified this from "future risk" to "exploitable now". The two enforcement points for a `blind_exit` node's signed capability set:
+
+- **Membership-format layer** — `validate_membership_node_capabilities`
+  (`crates/rustynet-control/src/membership.rs:2668`). For `blind_exit` it rejects
+  exactly three things: missing `exit_server` (`:2677-2684`), any anchor
+  capability or anchor sub-capability (`:2693-2701`), and any service-hosting
+  capability (`:2723-2733`). **There is no rule against `blind_exit` + `relay_host`
+  and none against `blind_exit` + `client`.** Contrast the `blind_relay` arm
+  immediately below it (`:2736-2757`), which compares the FULL canonical set
+  against `{relay_host, blind_relay}` and says in its own comment why: "Comparing
+  the full canonical set against the allowlist (not a forbidden-values list) fails
+  closed: any capability added in the future is refused here".
+- **Daemon layer** — `validate_node_role_membership_alignment`
+  (`crates/rustynetd/src/daemon.rs:2357`). For `NodeRole::BlindExit` it rejects only
+  a membership carrying `Anchor` (`:2397-2399`); a MISSING required capability on a
+  blind_exit node is warn-and-continue (`:2373-2385`), and the `blind_relay` arm
+  (`:2411-2430`) again does the exact-set compare, with the comment at `:2412`
+  stating the blind_exit warn-and-continue "exception is not precedent".
+
+So a signed update granting a `blind_exit` node `relay_host` (making the
+hardened terminal-hop exit a relay co-host) or `client` passes propose, sign,
+apply, AND daemon bootstrap replay today. The product preset table never produces
+these combinations (`role.rs:186-189` grants exactly `{blind_exit, exit_server}`
+on macOS; `role_presets.rs` has no blind_exit+relay preset), so the gap is
+reachable only through the raw `membership propose-set-capabilities` /
+`ops e2e-membership-set-capabilities` surface with the owner signing key — which
+is precisely the surface the interim macOS exit fix uses, and precisely the key
+that fix leaves on the blind_exit host (QH-66 / design §1.3.1 F1). The
+design's stage-level exact-set assertion pins only the lab's own provisioning;
+it does nothing for any other signer.
+
+**Fix (scoped, do not widen):** migrate the `blind_exit` arm at BOTH layers to
+the `blind_relay` exact-set form — canonical set must equal `{blind_exit,
+exit_server}` — and remove the daemon's warn-and-continue exception in the
+same change (its own comment already disclaims it as precedent). Negative tests
+required at both layers for `+relay_host`, `+client`, `+anchor.bundle_pull`,
+and a missing `exit_server`. This is trust-state validation code: full
+adversarial review before landing, per this register's QH-60/QH-64 convention.
+Schedule: immediately after the interim macOS exit fix lands, because that fix
+is the first in-tree path that signs a blind_exit capability rewrite.
+
+**Disposition: OPEN, not fixed.**
+
+### QH-66 — Option D follow-up: the mesh membership owner must never be a `blind_exit` node (closes the interim macOS-exit fix's F1 limitation)
+**Severity: high (a compromised blind_exit host holds the sole mesh signing authority; the interim fix DISCLOSES this rather than closing it). Confidence: VERIFIED mechanism against `main` at `2a43792c` (2026-09-05); the fix itself is a design-level topology change, not yet designed in detail.**
+
+Ledgered from `MacosExitMembershipRoleFixDesign_2026-08-31.md` §1.3.1–§1.3.2.
+The interim macOS exit fix provisions the macOS exit as the membership OWNER
+(genesis node) while it runs daemon role `blind_exit`. To keep the owner signing
+key on disk long enough to sign its own capability rewrite and the per-peer
+adds, the adapter declares `RUSTYNET_NODE_ROLE=admin` to `ops init-membership`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_membership.rs`,
+`membership_init_script`), because declaring the real role would trigger
+`maybe_remove_blind_exit_owner_signing_key` (`crates/rustynet-cli/src/main.rs:13941`,
+called from both the short-circuit and post-init paths of
+`execute_ops_init_membership`). Consequence (F1): the node whose signed record
+correctly narrows to `{blind_exit, exit_server}` still physically holds the one
+key that can mint ANY capability for ANY node in the mesh — genesis makes it the
+sole approver at `quorum_threshold: 1`. `blind_exit` exists to make exactly that
+escalation structurally impossible.
+
+**Target (Option D):** never let a `blind_exit` node be the membership owner.
+Mint genesis on a non-blind node in the topology and add the macOS exit as an
+ordinary NON-OWNER peer via the same `e2e-membership-add --capabilities
+blind_exit,exit_server` path the Linux `blind_exit` lab role already uses. That
+removes the identity lie at provisioning time, keeps the owner key off every
+blind_exit host, and collapses blind_exit provisioning to one hardened path on
+every OS. Blocker: `MembershipInitStage` hard-wires the owner to the topology's
+`Exit` alias (`crates/rustynet-cli/src/vm_lab/orchestrator/stage/membership_init.rs:21,31`),
+and the macOS-exit lab topology has no separate anchor/admin node to serve as
+owner — so this is an orchestrator-topology design change (owner election
+decoupled from the `Exit` role), not a drop-in edit.
+
+**Evidence obligation until closed:** every live proof of the interim fix must
+record `owner_signing_key_present=true` for the macOS exit host in its
+`membership_init` stage log (design §5.3), so F1 stays visible in evidence; when
+Option D lands, the same line flipping to `false` is the closure proof.
+
+**Related product gap, NOT fixed by Option D either:** `ops init-membership`
+accepts `blind_exit` (`main.rs:13791-13800`) but always mints anchor-carrying
+genesis, so a real non-lab operator provisioning a blind_exit founder gets a
+dead-on-arrival daemon; the honest product fix is likely to REFUSE `blind_exit`
+at genesis (a blind exit can never be a mesh founder). Recorded here as open;
+not scheduled by this entry.
+
+**Disposition: OPEN, not fixed. No committed date.** Sequence after QH-65.
