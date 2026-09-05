@@ -25,17 +25,45 @@ const WINDOWS_HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 /// attempts (with `WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL` between them) gives
 /// that race a bounded number of chances to settle before the daemon fails
 /// closed instead of silently returning `Ok` on an unverified set.
+///
+/// A single clean read is NOT sufficient to declare victory — see
+/// `WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS` below. Live evidence
+/// (`run-2026-09-05-windows-31-dns-race-diagnostic-tight`): the tunnel
+/// adapter's mesh IP address changed a SECOND time within the same bootstrap
+/// (100.64.0.1 during the early non-enforcing daemon, then a different
+/// address after `enforce_baseline_runtime`'s own restart for the
+/// auto-tunnel-enforce flip), each rebind independently able to re-trigger
+/// Windows' placeholder write — so a wait/verify pass keyed to the FIRST
+/// address bind can pass cleanly and still lose to a SECOND one moments
+/// later.
 #[cfg_attr(not(windows), allow(dead_code))]
-const WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS: u32 = 5;
+const WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS: u32 = 12;
+
+/// Consecutive clean reads `apply_dns_loopback`'s IPv6 loop requires before
+/// returning `Ok` — a single clean read only proves the state was compliant
+/// at that instant, not that it stays compliant across a later rebind. Reset
+/// to zero on any drift observation (which also re-applies the `netsh` set
+/// unconditionally every iteration, clean or not, so a delayed second
+/// rebind's placeholder is corrected on the very next iteration rather than
+/// waiting for a fresh drift-triggered re-apply).
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS: u32 = 3;
 
 /// Bound on `apply_dns_loopback`'s add+verify loop for the NRPT root-namespace
 /// rule. `Get-DnsClientNrptRule` is WMI-backed and can lag a `reg.exe add` by
 /// a beat — the same class of apply/read race found (and fixed) for the
 /// tunnel adapter's IPv6 DNS server, first observed live in
 /// `run-2026-09-05-windows-27-three-fixes-proof` immediately after that fix
-/// cleared the way past the IPv6 check.
+/// cleared the way past the IPv6 check. Same sustained-reads treatment as
+/// the IPv6 loop — see `WINDOWS_DNS_NRPT_SUSTAIN_READS`.
 #[cfg_attr(not(windows), allow(dead_code))]
-const WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS: u32 = 5;
+const WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS: u32 = 12;
+
+/// Consecutive clean reads `apply_dns_loopback`'s NRPT loop requires before
+/// returning `Ok`. See `WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS` for why a
+/// single clean read is not trusted.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_DNS_NRPT_SUSTAIN_READS: u32 = 3;
 
 /// Delay between `apply_dns_loopback`'s IPv6 and NRPT set/add+verify attempts.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -5965,6 +5993,7 @@ impl WindowsCommandSystem {
             SystemError::DnsApplyFailed(format!("set tunnel IPv4 DNS loopback: {err}"))
         })?;
 
+        let mut ipv6_consecutive_clean: u32 = 0;
         for attempt in 1..=WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS {
             self.run_netsh_success(&windows_dns_set_ipv6_loopback_args(
                 self.interface_name.as_str(),
@@ -5983,24 +6012,30 @@ impl WindowsCommandSystem {
                 &snapshot,
                 self.interface_name.as_str(),
             ) {
-                if attempt > 1 {
-                    log::info!(
-                        "windows dns loopback apply: tunnel interface='{}' IPv6 loopback settled on attempt {attempt}/{WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS}",
-                        self.interface_name,
-                    );
+                ipv6_consecutive_clean += 1;
+                if ipv6_consecutive_clean >= WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS {
+                    if attempt > WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS {
+                        log::info!(
+                            "windows dns loopback apply: tunnel interface='{}' IPv6 loopback settled on attempt {attempt}/{WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS} ({WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS} consecutive clean reads)",
+                            self.interface_name,
+                        );
+                    }
+                    break;
                 }
-                break;
+            } else {
+                ipv6_consecutive_clean = 0;
             }
             if attempt == WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS {
                 return Err(SystemError::DnsApplyFailed(format!(
-                    "tunnel interface '{}' IPv6 DNS still drifted off-loopback after \
-                     {WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS} set+verify attempts",
+                    "tunnel interface '{}' IPv6 DNS did not sustain {WINDOWS_DNS_IPV6_LOOPBACK_SUSTAIN_READS} \
+                     consecutive clean reads within {WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS} set+verify attempts",
                     self.interface_name
                 )));
             }
             std::thread::sleep(WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL);
         }
 
+        let mut nrpt_consecutive_clean: u32 = 0;
         for attempt in 1..=WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS {
             for arg_set in windows_nrpt_reg_add_arg_sets() {
                 self.run_reg_success(&arg_set).map_err(|err| {
@@ -6016,18 +6051,23 @@ impl WindowsCommandSystem {
                     })?;
             if crate::windows_dns_failclosed::nrpt_rules_cover_root_namespace(&snapshot.nrpt_rules)
             {
-                if attempt > 1 {
-                    log::info!(
-                        "windows dns loopback apply: tunnel interface='{}' NRPT root rule settled on attempt {attempt}/{WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS}",
-                        self.interface_name,
-                    );
+                nrpt_consecutive_clean += 1;
+                if nrpt_consecutive_clean >= WINDOWS_DNS_NRPT_SUSTAIN_READS {
+                    if attempt > WINDOWS_DNS_NRPT_SUSTAIN_READS {
+                        log::info!(
+                            "windows dns loopback apply: tunnel interface='{}' NRPT root rule settled on attempt {attempt}/{WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS} ({WINDOWS_DNS_NRPT_SUSTAIN_READS} consecutive clean reads)",
+                            self.interface_name,
+                        );
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+            } else {
+                nrpt_consecutive_clean = 0;
             }
             if attempt == WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS {
                 return Err(SystemError::DnsApplyFailed(format!(
-                    "NRPT root rule still missing/non-loopback after \
-                     {WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS} add+verify attempts"
+                    "NRPT root rule did not sustain {WINDOWS_DNS_NRPT_SUSTAIN_READS} consecutive \
+                     clean reads within {WINDOWS_DNS_NRPT_VERIFY_ATTEMPTS} add+verify attempts"
                 )));
             }
             std::thread::sleep(WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL);
