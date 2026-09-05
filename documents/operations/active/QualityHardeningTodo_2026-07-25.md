@@ -6433,8 +6433,18 @@ from persisted daemon identity (or refuse a `--self-node-id` that differs),
 so the orchestrator cannot choose the queried identity at all. Until then a
 pass is only as strong as the stage's validation-time cross-check.
 
-**Disposition: FIXED in code; live re-proof pending the next macOS anchor
-cell run (`--anchor-platform macos`, `--skip-linux-live-suite`).**
+**Disposition: FIXED in code; LIVE RE-PROOF PASSED 2026-09-05**
+(`livelab-1788635706-1eb6e800c4cf`, commit `1eb6e800`, clean, report
+`state/live-lab-macos-anchor-portmap2-20260905-190047`, topology
+macos-utm-1:anchor / debian-headless-4:exit / debian-headless-2:client,
+`--skip-linux-live-suite --linux-backend
+linux-wireguard-userspace-shared`): 20 pass / 0 fail / 2 skip
+(admin_issue, blind_exit — role-absence skips), with
+`validate_macos_anchor_port_mapping_authority` **pass** against the
+daemon-reported identity `macos-utm-1-bootstrap` (matrix row records
+`macos_anchor_node_id=macos-utm-1-bootstrap`,
+`macos_stage_anchor=pass`). The residual above (guest check answers for
+the id it is told) still stands as the G2 hard-path item.
 
 ### QH-69 — FIXED (flag) / OPEN (default): the `--node` engine left each Linux guest's WireGuard backend to guest history, which put a kernel-backend client into a STUN proof run
 **Severity: medium (nondeterministic lab topology — the same command produced a userspace-shared exit and a kernel-backend client because the two guests' `/etc/default/rustynetd` files carried different `RUSTYNET_BACKEND` values from earlier profile-driven runs). Confidence: VERIFIED on both guests during `livelab-1788628792` (file mtimes = that run's install; values = history); flag landed in `874a9aaa`.**
