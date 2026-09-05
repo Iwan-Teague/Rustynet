@@ -93,7 +93,7 @@ Every cell here is "as proven on `--node`," independent of the bash archive.
 
 | Role | macOS (`--node`) | Windows (`--node`) |
 |---|---|---|
-| **client** | 🟡 **DNS release-blocker CLOSED 2026-09-03; baseline chain now green** (`livelab-1788433705-bf4b1b1187c8`, commit `bf4b1b1187c8`, clean): macos-utm-1 as a full-tunnel client (`build_bundle_env` assigns every non-exit node the run's exit → `exit_mode=FullTunnel` → `FullyProtected`) now passes `validate_baseline_runtime`, `dns_failclosed_validation`, `security_audit_validation`, `runtime_acls_validation`, and `mesh_status_validation` — the first time a macOS client run advances through the full baseline+DNS+security+ACL+mesh validator chain on `--node`. Two fixes closed the 16-tick `DnsFailclosed` blocker: the daemon-side check now enumerates the nested `com.apple/rustynet_g{N}` pf DNS-block floor it was blind to (`2c10f9d9`, `macos_dns_failclosed.rs` — top-level `pfctl -s Anchors` never saw the nested anchor the daemon installs+verifies, so the check false-failed while the floor was present), and `dns_failclosed_validation` now derives the expected posture from the run topology instead of a role-based scoped guess (`e36a2295`). Neither weakened a control. **Still NOT overall-green:** `traffic_test_matrix` fails — now root-caused (CP-1 below) as a host/lab-topology gap (the UTM fleet is split across two isolated vmnet nets with no cross-vmnet underlay path), NOT a rustynet defect; the fix needs a host change (deferred, owner). | ⬛ bootstrap never green |
+| **client** | 🟡 **DNS release-blocker CLOSED 2026-09-03; baseline chain now green** (`livelab-1788433705-bf4b1b1187c8`, commit `bf4b1b1187c8`, clean): macos-utm-1 as a full-tunnel client (`build_bundle_env` assigns every non-exit node the run's exit → `exit_mode=FullTunnel` → `FullyProtected`) now passes `validate_baseline_runtime`, `dns_failclosed_validation`, `security_audit_validation`, `runtime_acls_validation`, and `mesh_status_validation` — the first time a macOS client run advances through the full baseline+DNS+security+ACL+mesh validator chain on `--node`. Two fixes closed the 16-tick `DnsFailclosed` blocker: the daemon-side check now enumerates the nested `com.apple/rustynet_g{N}` pf DNS-block floor it was blind to (`2c10f9d9`, `macos_dns_failclosed.rs` — top-level `pfctl -s Anchors` never saw the nested anchor the daemon installs+verifies, so the check false-failed while the floor was present), and `dns_failclosed_validation` now derives the expected posture from the run topology instead of a role-based scoped guess (`e36a2295`). Neither weakened a control. **Still NOT overall-green:** `traffic_test_matrix` fails — now root-caused (CP-1 below) as a host/lab-topology gap (the UTM fleet is split across two isolated vmnet nets with no cross-vmnet underlay path), NOT a rustynet defect; the fix needs a host change (deferred, owner). | 🟡 **bootstrap + dataplane-apply PROVEN 2026-09-05** (`run-2026-09-05-windows-11`, commit `9d55ac7bafc8`, clean, 46 pass/0 fail): first Windows `--node` run with zero failures — `bootstrap_hosts`, `collect_pubkeys`, all four `distribute_*` stages, `enforce_baseline_runtime`, `validate_baseline_runtime` all pass on `windows-x86-1`. Two same-day fixes: `collect_pubkeys` now reads the daemon's own status instead of a racy `wireguard.pub` file read (`70e16a63`); `enforce_baseline_runtime`'s WFP tunnel-permit filter was resolving the interface to a LUID *before* `backend.start()` created it (error 87 on every cold bootstrap) — fixed by deferring it to a new post-backend-start step (`3f7fc8d3`). Run used `--skip-linux-live-suite`, so mesh-traffic reachability (the actual client-cell bar) is **not yet proven** — see CP-4 update above. |
 | **admin** | 🟢 `macos_admin=pass` (`livelab-1784501586`, commit `537e1901`, clean) — run overall failed on `two_hop` | ⬛ bootstrap blocker |
 | **relay** (lifecycle) | 🟢 `macos_stage_relay_service_lifecycle=pass` (`livelab-1784497253`, `11620a6`, clean) | ⬛ / 🟠 SCM contract only |
 | **relay** (frame-forwarding) | 🟠 **provable on demand, opt-in** (HP-3 wiring landed 2026-09-01: `relay_forwards_frame_validation` stage, `--enable-relay-forwarding-validation`; disrupts the mesh — nft blocks + two peer daemon restarts, QH-64 — so it is OUT of the default plan; first live pass still pending) | 🔒 HP-3 (same opt-in stage; not yet elected on Windows) |
@@ -212,6 +212,32 @@ hardware; a fourth (Windows bootstrap) must be triaged.
   [WindowsNodeBootstrapTriageVerdict_2026-08-28.md](./WindowsNodeBootstrapTriageVerdict_2026-08-28.md).
   Verdict: BOTH, code primary.** Still zero `pass`, so CP-4 still gates **all**
   Windows `--node` cells, but the root cause is no longer unverified.
+
+  **2026-09-05 update — SUPERSEDED, no longer the operative blocker.** The
+  narrative below (winget Configuration, `windows-utm-1`) describes a retired
+  UTM-based Windows path; see
+  [CrossPlatformRoleParityRefresh_AdversarialReview_2026-09-05.md](./CrossPlatformRoleParityRefresh_AdversarialReview_2026-09-05.md)
+  §1.2/§1.4 for the full correction. The operative Windows guest is now
+  `windows-x86-1` (libvirt on `ubuntu-kvm-1`). Three fixes landed and are now
+  **live-proven** on that guest: apparmor build arm (`f454cbd8`), Windows
+  key-custody SDDL (`77262024`), `collect_pubkeys` reading the daemon's own
+  status instead of a racy file read (`70e16a63`), and — landed *today* —
+  `enforce_baseline_runtime`'s tunnel-interface WFP permit was applied before
+  `backend.start()` created the interface (`ConvertInterfaceAliasToLuid`
+  failing with error 87 on every cold bootstrap), fixed in `3f7fc8d3` by
+  deferring it to a new `apply_tunnel_interface_admit` step called right after
+  backend start. Run `run-2026-09-05-windows-11`
+  (commit `9d55ac7bafc822e498ad84a9833c1d012c6ddb51`) is the **first Windows
+  `--node` run with zero failures**: `bootstrap_hosts`, `collect_pubkeys`,
+  `distribute_membership`/`distribute_assignments`/`distribute_traversal`/
+  `distribute_dns_zone`, `enforce_baseline_runtime`, and
+  `validate_baseline_runtime` all `pass`. That run used
+  `--skip-linux-live-suite`, so it does **not** yet prove actual Windows↔Linux
+  mesh traffic reachability — a fuller run without that flag
+  (`run-2026-09-05-windows-12-full`) is in flight to attempt that proof. The
+  Windows client cell should be read as **bootstrap/dataplane-apply PROVEN,
+  mesh-traffic proof PENDING** — not yet the full client-cell green this
+  document's matrix requires.
 
   **Named failing step:** `Ensure-WingetConfigurationDependencies` →
   `& winget configure --file RustyNetBootstrap.winget.yml …` at
