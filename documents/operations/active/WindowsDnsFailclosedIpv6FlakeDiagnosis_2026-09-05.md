@@ -1,10 +1,35 @@
 # Windows `validate_baseline_runtime` DnsFailclosed IPv6 flake — diagnosis
 
-Status: **root cause hypothesis well-supported by direct code reading; not yet
-live-confirmed; not yet fixed.** Separate from, and unrelated to, the
-`traffic_test_matrix` "Invalid MAC" bug fixed in
-`WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md` — different stage,
-different mechanism.
+Status: **FIXED, commit `e50235f9` — not yet live-re-proven.** Root cause
+identified by direct code reading (§2-4 below), reproduced 6 times across
+recent live-lab runs (including twice while re-proving the separate
+`traffic_test_matrix` fix, which blocked getting an official pass on that
+stage). Separate from, and unrelated to, the `traffic_test_matrix` "Invalid
+MAC" bug fixed in `WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md` —
+different stage, different mechanism.
+
+**Fix landed:** `apply_dns_loopback` (`crates/rustynetd/src/phase10.rs:5855`)
+now verifies the tunnel adapter's live IPv6 DNS state after each `netsh` set
+(reusing the collector `validate_baseline_runtime` itself uses) and retries on
+drift, up to `WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_ATTEMPTS` (5) attempts
+`WINDOWS_DNS_IPV6_LOOPBACK_VERIFY_INTERVAL` (400ms) apart, before failing
+closed with a clear error if it never settles — this is exactly the §5.1
+"primary" fix proposed below. §5.2 (defense-in-depth: extend the egress
+IPv6-disable helper to the tunnel adapter) was NOT implemented; the §5.1 fix
+alone closes the race by construction (whichever side wins, the daemon
+observes and corrects it within the retry window) so §5.2 was judged
+unnecessary additional surface for now. Adds
+`interface_ipv6_dns_is_loopback_only` (`windows_dns_failclosed.rs`) as a
+separately-testable pure helper, with 5 unit tests. Verified: `cargo fmt
+--check`, `cargo clippy -p rustynetd --all-targets -- -D warnings`, `cargo
+check -p rustynetd --all-targets --target x86_64-pc-windows-gnu`, and `cargo
+test -p rustynetd --all-targets --all-features` (2407 passed; the one
+failure, `port_mapper::pcp_request_udp_mapping_round_trip_against_fake_gateway`,
+is an unrelated port-contention flake that passes clean in isolation) all
+clean before landing. **Not yet re-proven live** — the next live-lab run
+against this commit should confirm `validate_baseline_runtime` passes for
+`windows-x86-1` without hitting this error, ideally also reaching the
+official `traffic_test_matrix` pass this fix was blocking.
 
 ## 1. Symptom
 
