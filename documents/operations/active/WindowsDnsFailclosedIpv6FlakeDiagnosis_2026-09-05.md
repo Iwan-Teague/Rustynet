@@ -1,6 +1,8 @@
 # Windows `validate_baseline_runtime` DnsFailclosed IPv6 flake — diagnosis
 
-Status: **FIXED, commit `e50235f9` — not yet live-re-proven.** Root cause
+Status: **TWO instances of the same apply/verify race found and FIXED**
+(IPv6 DNS server, commit `e50235f9`; NRPT root rule, commit `9e40999e` — §6)
+— not yet live-re-proven together. Root cause
 identified by direct code reading (§2-4 below), reproduced 6 times across
 recent live-lab runs (including twice while re-proving the separate
 `traffic_test_matrix` fix, which blocked getting an official pass on that
@@ -121,6 +123,43 @@ pass or fail, which is consistent with the observed ~40-50% flip rate.
    only detects the drift and fails closed on a missing observation
    (`main.rs:2726-2730`); wiring it without the retry/suppression above would
    just relabel the same race as a different failure mode.
+
+## 6. A second instance of the same race, on the NRPT rule — also fixed (`9e40999e`)
+
+`run-2026-09-05-windows-27-three-fixes-proof` was the FIRST run ever to get
+past the §1 IPv6 symptom (thanks to `e50235f9`) — and the very next run hit a
+**different** `DnsFailclosed` drift on the same stage:
+
+```
+windows-x86-1/DnsFailclosed: validation not passed — drift: no NRPT rule
+covers the . root namespace with loopback name servers; unqualified lookups
+would resolve via the host's default DNS path
+```
+
+This confirms the two symptoms were never masking each other (the orchestrator
+joins ALL `drift_reasons` with `"; "` —
+`crates/rustynet-cli/src/vm_lab/mod.rs:20228` — so if both had ever coexisted,
+both would have appeared in one message) — this is a genuinely separate
+occurrence of the identical mechanism: `apply_dns_loopback`'s NRPT step
+(`phase10.rs:5930-5934` at the time) added the root-namespace rule via a
+single fire-and-forget `reg.exe add`, with no read-back, and
+`Get-DnsClientNrptRule` (WMI-backed, per `windows_dns_failclosed.rs:498`) can
+lag a registry write by a beat just as `Get-DnsClientServerAddress` could lag
+a `netsh` set.
+
+**Fix landed:** `9e40999e`. Applied the exact same verify-then-retry pattern
+to the NRPT step: re-read the live NRPT rule set after each `reg.exe add`
+(reusing `nrpt_rules_cover_root_namespace`, newly made `pub` in
+`windows_dns_failclosed.rs`) and retry on drift, up to 5×400ms, before failing
+closed. fmt/clippy/Windows-cross-compile/full test suite all verified clean.
+Not yet live-re-proven.
+
+**How to apply if a THIRD instance of this pattern turns up:** `apply_dns_loopback`
+now has two verify-then-retry loops (IPv6, NRPT) sharing
+`WINDOWS_DNS_LOOPBACK_VERIFY_INTERVAL`; if another `DnsFailclosed` drift
+category starts appearing after these two are exhausted, look for the same
+shape first — an `apply_*`/`run_reg_success`/`run_netsh_success` call in this
+function with no corresponding read-back — before assuming a new mechanism.
 
 This is security/DNS-fail-closed-posture-relevant code (§4 of `CLAUDE.md`/`AGENTS.md`
 non-negotiable constraints), so any actual fix here must be self-implemented and
