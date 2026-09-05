@@ -16,7 +16,7 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **67** (QH-01 through QH-67, contiguous;
+> then claimed; it has since grown to **69** (QH-01 through QH-69, contiguous;
 > re-counted 2026-09-05 — QH-65/66 were filed from the macOS exit membership
 > role-fix design's independent review).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
@@ -6405,3 +6405,57 @@ allowlist keeps the stage independent of the daemon's own claim.
 
 **Disposition: FIXED in code; live re-proof pending run #3 of the macOS exit
 cell (launched immediately after landing).**
+
+### QH-68 — FIXED: `validate_macos_anchor_port_mapping_authority` asked the guest about the inventory label, not the daemon's membership id, so the macOS anchor false-failed its port-mapping-authority check
+**Severity: medium (validator false negative, fail-closed direction — but it was read as "the macOS anchor's signed membership lacks the capability" and folded into the exit-cell membership design as a same-family defect, which it was not). Confidence: VERIFIED — `labrun-1788266019601-1574-3` reports `node_id=macos-client-1` while every membership id in that run is `<alias>-bootstrap` (`authority=debian-headless-4-bootstrap`); fixed in `874a9aaa`.**
+
+`exercise_macos_anchor_port_mapping_authority_live` passed the inventory
+entry's `node_id` (a lab label) as `--self-node-id` to the guest's standalone
+`anchor-port-mapping-status-check`, which looks that id up in the signed
+membership snapshot. The snapshot is keyed by the id the daemon runs as
+(`ctx.node_ids[alias]`, daemon-reported in `collect_pubkeys`), so the lookup
+missed and `self_holds_capability=false` came back for a node that held the
+grant. The evaluator's message ("does not hold … in its membership entry")
+made it look like a capability gap.
+
+**Fix (`874a9aaa`):** the stage takes the daemon-reported id from
+`ctx.node_ids`, fails closed when the context has none, re-reads the daemon's
+node id at validation time and refuses to validate on any mismatch (the
+same-run TOCTOU the adversarial review called out), and never guesses a
+fallback; the W5.7-quarantined bash-era caller now fails closed instead of
+guessing `<alias>-bootstrap`. Unit tests pin the no-guess and mismatch
+refusals.
+
+**Residual (the hard path, not taken here):** the guest check still answers
+for whatever id it is TOLD; it cannot bind that id to the running daemon. The
+G2 re-wire should make `anchor-port-mapping-status-check` derive its self-id
+from persisted daemon identity (or refuse a `--self-node-id` that differs),
+so the orchestrator cannot choose the queried identity at all. Until then a
+pass is only as strong as the stage's validation-time cross-check.
+
+**Disposition: FIXED in code; live re-proof pending the next macOS anchor
+cell run (`--anchor-platform macos`, `--skip-linux-live-suite`).**
+
+### QH-69 — FIXED (flag) / OPEN (default): the `--node` engine left each Linux guest's WireGuard backend to guest history, which put a kernel-backend client into a STUN proof run
+**Severity: medium (nondeterministic lab topology — the same command produced a userspace-shared exit and a kernel-backend client because the two guests' `/etc/default/rustynetd` files carried different `RUSTYNET_BACKEND` values from earlier profile-driven runs). Confidence: VERIFIED on both guests during `livelab-1788628792` (file mtimes = that run's install; values = history); flag landed in `874a9aaa`.**
+
+The Linux bootstrap env forwarded only `RUSTYNET_LAB_STUN_SERVERS`;
+`ops install-systemd` resolves `RUSTYNET_BACKEND` as env → existing file →
+`linux-wireguard`, so a guest that once ran under a generated profile (all of
+which pin `linux-wireguard-userspace-shared`) keeps that forever, and one that
+never did stays on the kernel adapter. The kernel adapter has no
+authoritative transport identity, so `rustynetd` never runs its STUN worker
+there — `collect_pubkeys` then hard-failed the whole run with a message that
+named the node but not the reason.
+
+**Fix (`874a9aaa`):** `--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>`
+pins every Linux guest of a run (forwarded as `RUSTYNET_BACKEND`, allow-listed
+at the parser and again at the env writer because the env file is sourced);
+`collect_stun_candidates` reports `transport_socket_identity_state=blocked_backend_opaque_socket`
+as an immediate fail-closed error carrying the daemon's own reason.
+
+**Open (owner decision):** without the flag the backend is STILL guest
+history. Either the `--node` engine should default to the mission-canonical
+userspace-shared backend on Linux, or the run-matrix row should record each
+node's backend so a mixed topology is at least visible in evidence. Not
+decided here; the flag makes the choice explicit per run.
