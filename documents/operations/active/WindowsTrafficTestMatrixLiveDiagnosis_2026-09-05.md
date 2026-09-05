@@ -361,3 +361,107 @@ daemon instance will use**, either by moving key generation strictly before the 
 collection point that feeds distribution, or by re-collecting and re-distributing
 whenever the key can change afterward — not by chasing this specific repeat/restart
 interaction as a one-off.
+
+## 12) §11.3's two candidate mechanisms both ruled out; the real one narrowed further via targeted instrumentation
+
+Three follow-up live-lab runs (`run-2026-09-05-windows-17-diag2` through `-20-diag5`)
+added targeted logging and reproduced the mismatch two more times (5 total data
+points across this investigation, all showing the same shape). No code fix landed
+yet — this section records what the instrumentation ruled out and narrowed.
+
+### 12.1 §11.3 candidate 1 (repeat/stability mechanism) — RULED OUT
+
+`BootstrapHostsStage::fanout()` (`orchestrator/stage/install.rs:59-61`) is
+`StageFanout::PerNode`, confirmed by direct read. The "3 repeated `preflight` →
+`cleanup` blocks" in the run-matrix are the 3 nodes' own per-node sequences, not a
+stability/soak repeat of the whole topology. `key init --force` therefore runs
+exactly once per node per run — there is no repeat mechanism regenerating it.
+
+### 12.2 The `collect_pubkeys` ↔ `distribute_assignments` hand-off — confirmed clean
+
+New logging in both stages (`collect_pubkeys.rs`, `distribute_assignments.rs`,
+commit `f6fdf3a0`) shows, across two further runs, that `distribute_assignments`
+always reads back **exactly** the value `collect_pubkeys` inserted into
+`ctx.collected_pubkeys` — for all three bundle kinds (Assignment/Traversal/DnsZone),
+every time. The corruption is not in this hand-off, and not a decoder bug (the
+hand-rolled `base64_decode_simple` was independently verified byte-for-byte against
+Python's stdlib on a real captured value in §8 and reproduced correct here too).
+
+### 12.3 Clock skew between the orchestrator host and the Windows guest — checked, negligible
+
+Measured directly (`date +%s` on `ubuntu-kvm-1` vs `[DateTimeOffset]::UtcNow` on
+`windows-x86-1`): 2 seconds apart. Not an explanation for the ~31-41 second gaps
+observed between `collect_pubkeys`' captured timestamp and the only
+`"run_daemon entered"` line visible in `rustynetd.log` afterward.
+
+### 12.4 The real mechanism: `rustynetd.log` is truncated on every daemon restart, and even the SURVIVING session's own logged key doesn't match what `collect_pubkeys` captured
+
+Two decisive checks, in order:
+
+1. **`init_daemon_logging` (`main.rs:500-533`) opens the log file with
+   `.truncate(true)` (`:523-527`) on every call** — i.e. every time the Windows
+   service (re)starts. This structurally confirms that if the daemon restarts even
+   once during a run, an earlier session's log entries are gone by the time a
+   post-run inspection happens. This resolves the apparent paradox of
+   `collect_pubkeys` succeeding (which requires a live, pipe-listening daemon)
+   *before* the only "run_daemon entered" line visible afterward: there was an
+   earlier session, and its logs were overwritten.
+2. **New daemon-side logging** (`daemon.rs`, commit `7402c894`: logs the derived
+   public key — never the private key — immediately after every
+   `DaemonRuntime::new()`) shows something sharper than "there were two sessions":
+   in `run-2026-09-05-windows-19-diag4`, there is (as always) exactly **one**
+   `"run_daemon entered"` / `"local wireguard public key"` pair, and **that
+   session's own logged key does not match what `collect_pubkeys` captured via
+   `rustynet status` in the same run** (`04298782...` logged by the daemon vs
+   `2c659cf6...` captured by `collect_pubkeys` — compared programmatically, not by
+   eye). Combined with (1), the only consistent picture is: **an earlier daemon
+   session (never directly observed — its logs are gone) is what `collect_pubkeys`
+   talked to, and it held a different key than the session that survives to the end
+   of the run** (almost certainly the one `enforce_baseline_runtime`'s documented
+   `stop_daemon`-then-`start_daemon` cycle, `windows_install.rs:521-560`, produces).
+
+This reopens a question this investigation had provisionally treated as settled:
+§9's confirmed reading of `windows_install.rs:994-999` says "the service is NOT
+started" during bootstrap — but `collect_pubkeys` requires a live, IPC-reachable
+daemon to succeed, and it does succeed, before the one daemon start whose logs
+survive. Either that comment/reading no longer describes an accurate sequence (a
+service start exists somewhere in the bootstrap/install path that was not found),
+or `collect_pubkeys`'s successful query is being served by something other than a
+literal `run_daemon()` instance. This was NOT resolved this session.
+
+### 12.5 Newest instrumentation, not yet observed: `write_public_key` call logging
+
+Commit `7f084cea` adds `eprintln!` logging (chosen over `log::`, since some
+callers — e.g. the one-shot `rustynetd key init` CLI invocation — may run before
+any logger is initialized) to `write_public_key` in `key_material.rs:1011`, the
+single chokepoint every writer of the on-disk public-key file funnels through
+(`key init`, rotation prepare-swap, `restore_key_backups` — rotation itself stays
+hard-guarded off Windows, per the original `collect_pubkeys` analysis). This will
+show directly whether the on-disk key file is written more than once in a single
+run. `run-2026-09-05-windows-20-diag5` is the first run carrying this
+instrumentation; its result was not yet read when this section was written.
+
+### 12.6 Updated next steps
+
+1. **Read `run-2026-09-05-windows-20-diag5`'s guest-side output for
+   `write_public_key` lines** (the launch log on `ubuntu-kvm-1`, and/or
+   `C:\ProgramData\RustyNet\logs\rustynetd.log` / the bootstrap script's own
+   captured PowerShell output, since a `key init` one-shot invocation's stdout may
+   not land in `rustynetd.log` at all). If it fires more than once, that pins the
+   mechanism (something re-runs key generation) and the fix is to make that
+   re-run also re-collect/re-distribute, or to prevent it. If it fires exactly
+   once, the mystery deepens further and points at either (a) a genuinely earlier,
+   undiscovered service-start path in the bootstrap/install script, or (b) a
+   `rustynet.exe status` response being served from something other than the
+   `run_daemon()` instance's live in-memory state (the existing "no fallback to
+   the config env-file" doc comment on `query_live_identity` covers the
+   live-identity challenge path specifically — worth checking whether an
+   analogous fallback exists for the plain `status` verb `collect_pubkeys` uses).
+2. Once the mechanism is confirmed: the fix must guarantee the bundled public key
+   always matches whichever daemon session is running when peers actually try to
+   handshake — not necessarily "collect earlier," possibly "collect later, after
+   whatever produces the final session."
+3. All instrumentation added this pass (`collect_pubkeys.rs`, `distribute_assignments.rs`,
+   `daemon.rs`, `key_material.rs`) is explicitly marked TEMPORARY in its own code
+   comments and should be removed once the mechanism is confirmed and a real fix
+   lands.
