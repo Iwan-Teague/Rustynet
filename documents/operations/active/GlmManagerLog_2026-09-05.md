@@ -369,4 +369,27 @@ owner, not fabricated.
 Next: rebuild the vm-lab binary, relaunch relay attempt 3 from this
 worktree (`--source-mode local-head` on the new commit).
 
+## 00:05 — relay attempt 3 launched (fix deployed)
+
+Rebuilt `rustynet-cli` (vm-lab binary, target-pinned debug, contains
+the staged-plist deploy path — verified by `rn-relay-reviewed-` string
+present in the binary). All three nodes verified UP+reachable first
+(macos-utm-1 192.168.65.101, debian-headless-4 192.168.64.10,
+debian-headless-2 192.168.64.4, TCP/22 open).
+
+Launched attempt 3: `--node macos-utm-1:relay --node
+debian-headless-4:exit --node debian-headless-2:client
+--enable-relay-forwarding-validation --skip-soak --linux-backend
+linux-wireguard-userspace-shared --source-mode local-head
+--trust-inventory-ready --ssh-identity-file ~/.ssh/id_ed25519
+--known-hosts-file ~/.ssh/known_hosts`, report
+`state/live-lab-macos-relay-fwd3-20260906-000522`, pid 31921,
+deploying branch HEAD `6e3bb383`. (First try exited bad_args 64 —
+`--ssh-identity-file` is required; relaunched with it.) Resolved plan
+verified from `state/resolved_plan.json`: 66 stages,
+`deploy_relay_service` AND `relay_forwards_frame_validation` both
+planned, selectors `relay_forwarding_validation:true`,
+`skip_linux_live_suite:false`, `soak_suite:false`. QH-64 watch active.
+
+
 
