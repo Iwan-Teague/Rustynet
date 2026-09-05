@@ -41,13 +41,18 @@ impl OrchestrationStage for CollectPubkeysStage {
             node_id: Result<String, String>,
             mesh_ip: Option<String>,
             endpoint: String,
+            // STUN server-reflexive candidates from `rustynet netcheck`
+            // (--lab-stun-servers feature). `Err` = adapter transport failure;
+            // `Ok(None)` = observed-but-empty after the bounded retry. The
+            // mutate pass classifies fatality against ctx.lab_stun_servers.
+            stun_candidates: Result<Option<Vec<String>>, String>,
         }
 
         // Collect pass: no ctx mutation
         let data: Vec<NodeData> = aliases
             .iter()
             .map(|alias| {
-                let (pubkey, gossip, node_id, mesh_ip, endpoint) =
+                let (pubkey, gossip, node_id, mesh_ip, endpoint, stun_candidates) =
                     match ctx.adapters.get(alias.as_str()) {
                         Some(adapter) => {
                             let pk = adapter
@@ -60,7 +65,8 @@ impl OrchestrationStage for CollectPubkeysStage {
                                 .map_err(|e| e.to_string());
                             let mip = adapter.collect_mesh_ip().ok();
                             let ep = adapter.endpoint();
-                            (pk, gk, nid, mip, ep)
+                            let stun = adapter.collect_stun_candidates().map_err(|e| e.to_string());
+                            (pk, gk, nid, mip, ep, stun)
                         }
                         None => (
                             Err(format!("no adapter for '{alias}'")),
@@ -68,6 +74,7 @@ impl OrchestrationStage for CollectPubkeysStage {
                             Err(format!("no adapter for '{alias}'")),
                             None,
                             "0.0.0.0:51820".to_owned(),
+                            Ok(None),
                         ),
                     };
                 NodeData {
@@ -77,6 +84,7 @@ impl OrchestrationStage for CollectPubkeysStage {
                     node_id,
                     mesh_ip,
                     endpoint,
+                    stun_candidates,
                 }
             })
             .collect();
@@ -156,6 +164,52 @@ impl OrchestrationStage for CollectPubkeysStage {
                 None => d.endpoint,
             };
             ctx.endpoints.insert(d.alias.clone(), endpoint);
+
+            // STUN reflexive endpoints (--lab-stun-servers, cross-NAT):
+            // record the FIRST daemon-reported candidate per alias into
+            // ctx.reflexive_endpoints for the traversal bundle's SRFLX_SPEC.
+            //
+            // Fail-closed rules:
+            //  * servers CONFIGURED + no candidate (empty gather after the
+            //    adapter's bounded retry, or a transport error) = HARD stage
+            //    failure naming the node — no silent host-only fallback,
+            //    because the operator explicitly asked for cross-NAT STUN.
+            //  * servers UNSET (feature off) = recording is OPTIONAL: an
+            //    absent candidate or even an adapter error is ignored, keeping
+            //    the flag-off path byte-identical to the pre-feature stage.
+            //  * A present candidate that does not parse as a SocketAddr is a
+            //    HARD failure in BOTH modes (a malformed reflexive endpoint
+            //    must never reach a signed bundle).
+            let stun_configured = !ctx.lab_stun_servers.is_empty();
+            match d.stun_candidates {
+                Ok(Some(candidates)) if !candidates.is_empty() => {
+                    let first = &candidates[0];
+                    match first.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => {
+                            ctx.reflexive_endpoints
+                                .insert(d.alias.clone(), addr.to_string());
+                        }
+                        Err(_) => errors.push(format!(
+                            "{}: stun candidate '{first}' is not a valid ip:port address",
+                            d.alias
+                        )),
+                    }
+                }
+                Ok(_) => {
+                    if stun_configured {
+                        errors.push(format!(
+                            "{}: no stun_candidates after bounded retry \
+                             (--lab-stun-servers configured; refusing silent host-only fallback)",
+                            d.alias
+                        ));
+                    }
+                }
+                Err(e) => {
+                    if stun_configured {
+                        errors.push(format!("{}: stun_candidates: {e}", d.alias));
+                    }
+                }
+            }
         }
 
         if errors.is_empty() {
@@ -201,6 +255,8 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -231,6 +287,10 @@ mod tests {
     struct FakeCollectAdapter {
         alias: String,
         endpoint: String,
+        /// What `collect_stun_candidates` answers: `None` = the trait's
+        /// fail-closed default (unimplemented platform); `Some(Ok(..))` = an
+        /// observed gather; `Some(Err(msg))` = a transport failure.
+        stun_candidates: Option<Result<Option<Vec<String>>, String>>,
     }
 
     impl NodeAdapter for FakeCollectAdapter {
@@ -256,6 +316,18 @@ mod tests {
         }
         fn endpoint(&self) -> String {
             self.endpoint.clone()
+        }
+        fn collect_stun_candidates(&self) -> Result<Option<Vec<String>>, AdapterError> {
+            match &self.stun_candidates {
+                None => Err(AdapterError::UnsupportedPlatform {
+                    platform: self.platform(),
+                    message: "fake adapter: STUN collection not implemented".to_owned(),
+                }),
+                Some(Ok(observed)) => Ok(observed.clone()),
+                Some(Err(message)) => Err(AdapterError::Ssh {
+                    message: message.clone(),
+                }),
+            }
         }
         fn install_daemon(
             &self,
@@ -353,10 +425,110 @@ mod tests {
                 Box::new(FakeCollectAdapter {
                     alias: (*alias).to_owned(),
                     endpoint: (*endpoint).to_owned(),
+                    stun_candidates: None,
                 }),
             );
         }
         ctx
+    }
+
+    // ── STUN reflexive collection (--lab-stun-servers) ──────────────────────
+
+    fn ctx_with_stun_node(
+        stun: Option<Result<Option<Vec<String>>, String>>,
+        servers_configured: bool,
+    ) -> OrchestrationContext {
+        let mut ctx = OrchestrationContext::new(
+            vec![NodeRoleAssignment {
+                alias: "utm-1".to_owned(),
+                role: NodeRole::Client,
+            }],
+            std::env::temp_dir(),
+            "net".to_owned(),
+        );
+        ctx.adapters.insert(
+            "utm-1".to_owned(),
+            Box::new(FakeCollectAdapter {
+                alias: "utm-1".to_owned(),
+                endpoint: "192.168.64.10:51820".to_owned(),
+                stun_candidates: stun,
+            }),
+        );
+        if servers_configured {
+            ctx.lab_stun_servers = vec!["74.125.250.129:19302".parse().expect("socket addr")];
+        }
+        ctx
+    }
+
+    /// Flag off: absence, and even an adapter that cannot collect at all, are
+    /// ignored — the pre-feature stage behaviour is byte-identical.
+    #[test]
+    fn stun_feature_off_ignores_absent_candidates_and_unimplemented_adapters() {
+        for stun in [None, Some(Ok(None)), Some(Err("boom".to_owned()))] {
+            let mut ctx = ctx_with_stun_node(stun, false);
+            assert_eq!(CollectPubkeysStage.execute(&mut ctx), StageOutcome::Passed);
+            assert!(ctx.reflexive_endpoints.is_empty());
+        }
+    }
+
+    /// Flag on: the FIRST daemon-reported candidate is recorded, normalized
+    /// through SocketAddr.
+    #[test]
+    fn stun_configured_records_the_first_candidate() {
+        let mut ctx = ctx_with_stun_node(
+            Some(Ok(Some(vec![
+                "203.0.113.7:41338".to_owned(),
+                "198.51.100.3:15782".to_owned(),
+            ]))),
+            true,
+        );
+        assert_eq!(CollectPubkeysStage.execute(&mut ctx), StageOutcome::Passed);
+        assert_eq!(
+            ctx.reflexive_endpoints.get("utm-1").map(String::as_str),
+            Some("203.0.113.7:41338")
+        );
+    }
+
+    /// Flag on: no candidate after the bounded retry, or a transport failure,
+    /// or an adapter that never implemented the probe — every one is a HARD
+    /// failure naming the node. No silent host-only fallback.
+    #[test]
+    fn stun_configured_hard_fails_on_absence_transport_error_or_unimplemented() {
+        for (stun, needle) in [
+            (Some(Ok(None)), "no stun_candidates"),
+            (Some(Err("ssh reset".to_owned())), "ssh reset"),
+            (None, "not implemented"),
+        ] {
+            let mut ctx = ctx_with_stun_node(stun, true);
+            match CollectPubkeysStage.execute(&mut ctx) {
+                StageOutcome::Failed(err) => {
+                    assert!(err.contains("utm-1"), "must name the node: {err}");
+                    assert!(
+                        err.contains(needle),
+                        "must name the cause ({needle}): {err}"
+                    );
+                }
+                other => panic!("expected Failed, got {other:?}"),
+            }
+            assert!(ctx.reflexive_endpoints.is_empty());
+        }
+    }
+
+    /// A candidate that does not parse as ip:port is a hard failure in BOTH
+    /// modes — a malformed reflexive endpoint must never reach a signed bundle.
+    #[test]
+    fn malformed_stun_candidate_fails_closed_regardless_of_the_flag() {
+        for configured in [false, true] {
+            let mut ctx =
+                ctx_with_stun_node(Some(Ok(Some(vec!["not-an-addr".to_owned()]))), configured);
+            match CollectPubkeysStage.execute(&mut ctx) {
+                StageOutcome::Failed(err) => {
+                    assert!(err.contains("not-an-addr"), "{err}");
+                }
+                other => panic!("expected Failed (configured={configured}), got {other:?}"),
+            }
+            assert!(ctx.reflexive_endpoints.is_empty());
+        }
     }
 
     fn overlay_handle(pairs: &[(&str, &str)]) -> SubstrateHandle {

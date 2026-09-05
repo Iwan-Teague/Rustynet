@@ -372,6 +372,8 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: std::collections::HashMap::new(),
             endpoints: std::collections::HashMap::new(),
+            reflexive_endpoints: std::collections::HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,

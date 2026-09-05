@@ -914,6 +914,12 @@ pub fn restart_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
 /// as --wg-interface, which is threaded explicitly). Detection failure passes
 /// no flag, preserving the pre-C-STUN plist.
 ///
+/// `lab_stun_csv` (--lab-stun-servers): when `Some(csv)`, the validated
+/// numeric ip:port CSV REPLACES the gateway detection — the STUN flags are set
+/// to the literal override (each entry validated as a SocketAddr upstream, so
+/// the interpolation carries only numeric characters, dots, colons, and
+/// commas). `None` preserves the C-STUN gateway detection byte-identically.
+///
 /// Split out of `enforce_daemon` so the generated command is unit-testable
 /// without a live `NodeConnection`. This is the fail-closed enforcement path:
 /// until it runs, the daemon is in non-enforcing mode
@@ -931,13 +937,24 @@ fn build_auto_tunnel_enforce_install_script(
     wg_interface: &str,
     ssh_allow_flag: &str,
     ssh_allow_cidrs_arg: &str,
+    lab_stun_csv: Option<&str>,
 ) -> String {
+    let stun_prelude = match lab_stun_csv {
+        Some(csv) => format!(
+            "RN_STUN_FLAG='--traversal-stun-servers' ; RN_STUN_VAL='{csv}' ;"
+        ),
+        // Plain string literal, NOT a format! template: the braces are literal
+        // awk / regex syntax here (a `{{` escape would ship a broken program
+        // and an IPv4 guard that never matches).
+        None => "RN_LAB_GW=\"$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')\" ; \
+                 RN_STUN_FLAG='' ; RN_STUN_VAL='' ; \
+                 if echo \"$RN_LAB_GW\" | grep -Eq '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$'; then \
+                   RN_STUN_FLAG='--traversal-stun-servers' ; RN_STUN_VAL=\"$RN_LAB_GW:3478\" ; fi ;"
+            .to_owned(),
+    };
     format!(
         "chmod 700 /tmp/Install-RustyNetMacosService.sh && \
-         RN_LAB_GW=\"$(route -n get default 2>/dev/null | awk '/gateway:/{{print $2; exit}}')\" ; \
-         RN_STUN_FLAG='' ; RN_STUN_VAL='' ; \
-         if echo \"$RN_LAB_GW\" | grep -Eq '^[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}$'; then \
-           RN_STUN_FLAG='--traversal-stun-servers' ; RN_STUN_VAL=\"$RN_LAB_GW:3478\" ; fi ; \
+         {stun_prelude} \
          sudo -n /tmp/Install-RustyNetMacosService.sh \
            --rustynetd-bin {MACOS_RUSTYNETD_PATH} \
            --state-root {MACOS_STATE_ROOT} \
@@ -1086,7 +1103,19 @@ pub fn enforce_daemon(
 
     // Build the re-install command via the extracted builder (QH-24): same
     // params as bootstrap but with auto-tunnel-enforce=true and extended
-    // max-age windows.
+    // max-age windows. --lab-stun-servers override (validated numeric CSV)
+    // replaces the gateway detection when configured.
+    let lab_stun_csv: Option<String> = if ctx.lab_stun_servers.is_empty() {
+        None
+    } else {
+        Some(
+            ctx.lab_stun_servers
+                .iter()
+                .map(std::net::SocketAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
     let script = build_auto_tunnel_enforce_install_script(
         daemon_node_role,
         &node_id_arg,
@@ -1094,6 +1123,7 @@ pub fn enforce_daemon(
         &wg_interface,
         ssh_allow_flag,
         &ssh_allow_cidrs_arg,
+        lab_stun_csv.as_deref(),
     );
     ssh::run_remote(conn, &script, Duration::from_secs(60))?;
     // The install script reloads the launchd plist, which bounces the daemon.
@@ -1182,9 +1212,25 @@ fn build_bootstrap_env(
     // utun9 would collide. Computing it here keeps the value identical in
     // both code paths and avoids re-deriving it in shell.
     let wg_interface = utun_name_for_node_id(node_id);
+    // --lab-stun-servers override: Bootstrap-RustyNetMacos.sh reads
+    // RUSTYNET_LAB_STUN_SERVERS and falls back to the guest's default gateway
+    // on 3478 when it is unset, so the line is only emitted when the operator
+    // configured servers (byte-identical env when unset).
+    let lab_stun_line = if ctx.lab_stun_servers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "RUSTYNET_LAB_STUN_SERVERS={}\n",
+            ctx.lab_stun_servers
+                .iter()
+                .map(std::net::SocketAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
     Ok(format!(
         "ROLE={role_str}\nDAEMON_NODE_ROLE={daemon_node_role}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\n\
-         SSH_ALLOW_CIDRS={cidrs}\nWG_INTERFACE={wg_interface}\n",
+         SSH_ALLOW_CIDRS={cidrs}\nWG_INTERFACE={wg_interface}\n{lab_stun_line}",
         network_id = ctx.network_id,
         cidrs = ctx.ssh_allow_cidrs,
     ))
@@ -1457,6 +1503,8 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -1475,6 +1523,24 @@ mod tests {
         assert!(env.contains("DAEMON_NODE_ROLE=blind_exit"));
         assert!(env.contains("NODE_ID=mac-node-1"));
         assert!(env.contains("NETWORK_ID=test-net"));
+        assert!(
+            !env.contains("RUSTYNET_LAB_STUN_SERVERS="),
+            "unset --lab-stun-servers must leave the env byte-identical: {env}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_env_threads_lab_stun_servers_when_configured() {
+        let mut ctx = make_ctx(NodeRole::Client);
+        ctx.lab_stun_servers = vec![
+            "1.2.3.4:19302".parse().expect("socket addr"),
+            "5.6.7.8:3478".parse().expect("socket addr"),
+        ];
+        let env = build_bootstrap_env("mac-node-1", &NodeRole::Client, &ctx).expect("env");
+        assert!(
+            env.contains("RUSTYNET_LAB_STUN_SERVERS=1.2.3.4:19302,5.6.7.8:3478\n"),
+            "configured --lab-stun-servers must override the gateway default as a CSV line: {env}"
+        );
     }
 
     #[test]
@@ -2240,6 +2306,7 @@ mod tests {
             &expected_iface,
             "false",
             "",
+            None,
         );
         assert!(
             script.contains(&format!("--wg-interface '{expected_iface}'")),
@@ -2274,6 +2341,7 @@ mod tests {
             "utun1234",
             "true",
             "192.168.64.0/24",
+            None,
         );
 
         // The whole point of the enforce path: enforcement ON, explicitly.
@@ -2325,6 +2393,40 @@ mod tests {
         assert!(script.contains("--wg-interface 'utun1234'"), "{script}");
     }
 
+    /// --lab-stun-servers: the enforce script must REPLACE the gateway
+    /// detection with the literal validated CSV (cross-NAT runs point at a
+    /// real STUN responder, not the same-LAN gateway).
+    #[test]
+    fn auto_tunnel_enforce_install_script_lab_stun_override_replaces_gateway_detection() {
+        let script = build_auto_tunnel_enforce_install_script(
+            "client",
+            "client-1",
+            "lab-net",
+            "utun10",
+            "false",
+            "",
+            Some("1.2.3.4:19302,5.6.7.8:3478"),
+        );
+        assert!(
+            script.contains(
+                "RN_STUN_FLAG='--traversal-stun-servers' ; RN_STUN_VAL='1.2.3.4:19302,5.6.7.8:3478'"
+            ),
+            "override must set the STUN flags to the literal CSV: {script}"
+        );
+        assert!(
+            !script.contains("RN_LAB_GW"),
+            "override must not run gateway detection: {script}"
+        );
+        assert!(
+            !script.contains("$RN_LAB_GW:3478"),
+            "gateway fallback value must be absent under override: {script}"
+        );
+        assert!(
+            script.contains("$RN_STUN_FLAG $RN_STUN_VAL"),
+            "the flags must still flow onto the install invocation: {script}"
+        );
+    }
+
     /// Single-quote escaping parity: values interpolated into single-quoted
     /// shell args must arrive escaped (`'\''`), or a crafted value could
     /// break out of the quoting. The builder takes pre-escaped values; this
@@ -2341,6 +2443,7 @@ mod tests {
             "utun10",
             "false",
             "",
+            None,
         );
         assert!(
             script.contains("--node-id 'node'\\''x'"),

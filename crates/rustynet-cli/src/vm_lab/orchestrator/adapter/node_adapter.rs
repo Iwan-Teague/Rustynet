@@ -464,6 +464,27 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
 
     fn collect_mesh_ip(&self) -> Result<String, AdapterError>;
 
+    // ── STUN reflexive endpoint collection ────────────────────────
+
+    /// Collect this node's daemon-reported STUN server-reflexive candidates
+    /// (`stun_candidates=` from `rustynet netcheck`), with a bounded retry in
+    /// the platform impls (daemon gathers STUN asynchronously at start).
+    /// `Ok(None)` = no candidate observed within the retry window (recorded
+    /// as absent; `collect_pubkeys` decides whether that is fatal based on
+    /// whether `--lab-stun-servers` was configured). The default FAILS CLOSED
+    /// (unsupported platform) rather than answering `Ok(None)`: an adapter
+    /// that never implemented the probe must not read as "observed empty" —
+    /// `collect_pubkeys` ignores the error when no STUN servers are
+    /// configured and fails the node, naming the real cause, when they are.
+    fn collect_stun_candidates(&self) -> Result<Option<Vec<String>>, AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message: "STUN reflexive-candidate collection is not implemented for this \
+                      platform; refusing to report an empty gather it never observed"
+                .to_owned(),
+        })
+    }
+
     // ── Bundle issuance (exit node only) ──────────────────────────
 
     fn issue_bundles_to_dir(

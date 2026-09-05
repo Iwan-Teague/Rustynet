@@ -236,6 +236,13 @@ pub(crate) fn execute_rust_native_orchestration(
             ctx.ssh_allow_cidrs = trimmed.to_owned();
         }
     }
+    // Cross-NAT STUN override: run-local like ssh_allow_cidrs above — a
+    // --run-only invocation re-derives it from the flag rather than the
+    // persisted envelope, and an absent flag leaves the gateway-derived
+    // default (and collect_pubkeys' optional stun recording) untouched.
+    if !config.lab_stun_servers.is_empty() {
+        ctx.lab_stun_servers = config.lab_stun_servers.clone();
+    }
 
     // Augment node_assignments from platform selectors (--exit-platform,
     // --relay-platform, etc.) so a mac/win role cell runs live even when the

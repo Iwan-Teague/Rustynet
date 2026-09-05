@@ -933,6 +933,7 @@ mod tests {
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,
+            lab_stun_servers: Vec::new(),
         }
     }
 

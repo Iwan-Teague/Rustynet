@@ -179,6 +179,49 @@ fn live_identity_from_status(status: &str) -> Result<IdentityEvidence, AdapterEr
     }
 }
 
+/// Collect the daemon-reported STUN server-reflexive candidates via the
+/// trust CLI's `netcheck` verb (same validated-argv seam as
+/// [`live_identity_status_script`]). Mirrors the Linux/macOS adapters: retry
+/// every 5 s up to a 60 s deadline (the daemon gathers STUN asynchronously at
+/// start); an observed-but-empty gather (`stun_candidates=none`) past the
+/// deadline is `Ok(None)` (an ABSENCE the stage classifies against
+/// `--lab-stun-servers`), while a persistent transport-level failure
+/// propagates as `Err` (fail closed).
+pub fn collect_stun_candidates(conn: &NodeConnection) -> Result<Option<Vec<String>>, AdapterError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_err: Option<AdapterError>;
+    let netcheck = netcheck_script()?;
+    loop {
+        match run_remote_ps(conn, netcheck.as_str(), SHORT_TIMEOUT) {
+            Ok(netcheck) => match ssh::parse_netcheck_stun_candidates(&netcheck) {
+                Some(candidates) if !candidates.is_empty() => return Ok(Some(candidates)),
+                // Observed but empty — keep polling; clearing last_err marks
+                // the gather as observed-empty rather than transport-failed.
+                _ => last_err = None,
+            },
+            Err(e) => last_err = Some(e),
+        }
+        if std::time::Instant::now() >= deadline {
+            return match last_err {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// Build the PowerShell script [`collect_stun_candidates`] runs: invoke the
+/// trust CLI's `netcheck` verb (validated argv; the only dynamic part is the
+/// reviewed install path, same as the status verb).
+fn netcheck_script() -> Result<PowerShellScript, AdapterError> {
+    let argv = [
+        ValidatedArg::windows_path(WINDOWS_RUSTYNET_PATH)?,
+        ValidatedArg::cli_token("netcheck")?,
+    ];
+    PowerShellScript::from_call_argv("windows stun candidates netcheck", &argv)
+}
+
 /// Ping `peer_mesh_ip` 3 times via `Test-Connection`. Returns `Reachable` on success.
 ///
 /// Uses explicit `exit 0`/`exit 1` because `Test-Connection -Quiet` always

@@ -529,6 +529,13 @@ fn windows_daemon_is_running(conn: &NodeConnection) -> Result<bool, AdapterError
 /// it anywhere. Gateway detection failure adds no flag (prior behaviour);
 /// a live responder is optional (gathering fails soft on a bounded timeout).
 ///
+/// `stun_csv` (--lab-stun-servers): when `Some(csv)`, the validated numeric
+/// ip:port CSV REPLACES the gateway detection — the flag value is set to the
+/// literal override (each entry validated as a SocketAddr upstream, so the
+/// single-quoted PS literal carries only numeric characters, dots, colons,
+/// and commas; `ps_quote` still applies the quoting seam). `None` preserves
+/// the C-STUN gateway detection byte-identically.
+///
 /// Split out of `enforce_daemon` so the generated script is unit-testable
 /// without a live `NodeConnection`. This is the fail-closed enforcement path:
 /// until this patch runs the daemon is in non-enforcing mode
@@ -537,8 +544,39 @@ fn windows_daemon_is_running(conn: &NodeConnection) -> Result<bool, AdapterError
 /// `true` back toward `false` — leaves the node bootstrapped but never
 /// enforcing. Pinned by
 /// `auto_tunnel_enforce_patch_script_flips_enforce_and_threads_max_ages`.
-fn build_auto_tunnel_enforce_patch_script(env_path: &str) -> Result<String, AdapterError> {
+fn build_auto_tunnel_enforce_patch_script(
+    env_path: &str,
+    stun_csv: Option<&str>,
+) -> Result<String, AdapterError> {
     let env_path_q = ps_quote(env_path)?;
+    let stun_block = match stun_csv {
+        Some(csv) => {
+            let csv_q = ps_quote(csv)?;
+            format!(
+                "$stunIdx = [array]::IndexOf([string[]]$arr, '--traversal-stun-servers'); \
+                 if ($stunIdx -lt 0) {{ \
+                     $null = $arr.Add('--traversal-stun-servers'); \
+                     $null = $arr.Add({csv_q}) \
+                 }} elseif (($stunIdx + 1) -lt $arr.Count) {{ \
+                     $arr[$stunIdx + 1] = {csv_q} \
+                 }}; "
+            )
+        }
+        // Plain string literal, NOT a format! template: the braces are literal
+        // PowerShell / regex syntax here (a `{{` escape would ship a broken
+        // script and an IPv4 guard that never matches).
+        None => "$gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop; \
+                 if ($gw -match '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$') { \
+                     $stunIdx = [array]::IndexOf([string[]]$arr, '--traversal-stun-servers'); \
+                     if ($stunIdx -lt 0) { \
+                         $null = $arr.Add('--traversal-stun-servers'); \
+                         $null = $arr.Add(($gw + ':3478')) \
+                     } elseif (($stunIdx + 1) -lt $arr.Count) { \
+                         $arr[$stunIdx + 1] = ($gw + ':3478') \
+                     } \
+                 }; "
+            .to_owned(),
+    };
     Ok(format!(
         "Set-StrictMode -Version Latest; \
          $ErrorActionPreference = 'Stop'; \
@@ -567,16 +605,7 @@ fn build_auto_tunnel_enforce_patch_script(env_path: &str) -> Result<String, Adap
                  }} elseif (($dnsAgeIdx + 1) -lt $arr.Count) {{ \
                      $arr[$dnsAgeIdx + 1] = '86400' \
                  }}; \
-                 $gw = (Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop; \
-                 if ($gw -match '^[0-9]{{1,3}}(\\.[0-9]{{1,3}}){{3}}$') {{ \
-                     $stunIdx = [array]::IndexOf([string[]]$arr, '--traversal-stun-servers'); \
-                     if ($stunIdx -lt 0) {{ \
-                         $null = $arr.Add('--traversal-stun-servers'); \
-                         $null = $arr.Add(($gw + ':3478')) \
-                     }} elseif (($stunIdx + 1) -lt $arr.Count) {{ \
-                         $arr[$stunIdx + 1] = ($gw + ':3478') \
-                     }} \
-                 }}; \
+                 {stun_block}\
                  'RUSTYNETD_DAEMON_ARGS_JSON=' + ($arr.ToArray() | ConvertTo-Json -Compress) \
              }} else {{ $_ }} \
          }}; \
@@ -587,11 +616,25 @@ fn build_auto_tunnel_enforce_patch_script(env_path: &str) -> Result<String, Adap
 pub fn enforce_daemon(
     conn: &NodeConnection,
     _alias: &str,
-    _ctx: &OrchestrationContext,
+    ctx: &OrchestrationContext,
 ) -> Result<(), AdapterError> {
     let env_path = format!(r"{WINDOWS_STATE_ROOT}\config\rustynetd.env");
+    // --lab-stun-servers override: the validated numeric CSV replaces the
+    // gateway-derived default when configured (cross-NAT runs point at a real
+    // STUN responder instead of the same-LAN gateway).
+    let stun_csv: Option<String> = if ctx.lab_stun_servers.is_empty() {
+        None
+    } else {
+        Some(
+            ctx.lab_stun_servers
+                .iter()
+                .map(std::net::SocketAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
     // Patch --auto-tunnel-enforce in the RUSTYNETD_DAEMON_ARGS_JSON line.
-    let patch_script = build_auto_tunnel_enforce_patch_script(&env_path)?;
+    let patch_script = build_auto_tunnel_enforce_patch_script(&env_path, stun_csv.as_deref())?;
     run_remote_ps(conn, &patch_script, SHORT_TIMEOUT)?;
     // The daemon was started during bootstrap with --auto-tunnel-enforce false and
     // is still running. sc.exe start no-ops on an already-running service (exit
@@ -1532,9 +1575,11 @@ mod tests {
     /// downstream stage believes it is enforcing.
     #[test]
     fn auto_tunnel_enforce_patch_script_flips_enforce_and_threads_max_ages() {
-        let script =
-            build_auto_tunnel_enforce_patch_script(r"C:\ProgramData\RustyNet\config\rustynetd.env")
-                .expect("patch script should render");
+        let script = build_auto_tunnel_enforce_patch_script(
+            r"C:\ProgramData\RustyNet\config\rustynetd.env",
+            None,
+        )
+        .expect("patch script should render");
 
         // Strict mode + Stop: a silent partial failure must terminate.
         assert!(
@@ -1585,6 +1630,34 @@ mod tests {
         assert!(
             script.contains(&ps_quote(r"C:\ProgramData\RustyNet\config\rustynetd.env").unwrap()),
             "the rendered script must target the quoted env path: {script}"
+        );
+    }
+
+    /// --lab-stun-servers: the patch must REPLACE the gateway detection with
+    /// the literal validated CSV (cross-NAT runs point at a real STUN
+    /// responder, not the same-LAN gateway).
+    #[test]
+    fn auto_tunnel_enforce_patch_script_lab_stun_override_replaces_gateway_detection() {
+        let script = build_auto_tunnel_enforce_patch_script(
+            r"C:\ProgramData\RustyNet\config\rustynetd.env",
+            Some("1.2.3.4:19302,5.6.7.8:3478"),
+        )
+        .expect("patch script should render");
+        assert!(
+            script.contains(&ps_quote("1.2.3.4:19302,5.6.7.8:3478").unwrap()),
+            "override must set the STUN flag value to the quoted literal CSV: {script}"
+        );
+        assert!(
+            !script.contains("Get-NetRoute"),
+            "override must not run gateway detection: {script}"
+        );
+        assert!(
+            !script.contains("':3478'"),
+            "gateway fallback value must be absent under override: {script}"
+        );
+        assert!(
+            script.contains("'--traversal-stun-servers'"),
+            "the flag token must still be threaded: {script}"
         );
     }
 

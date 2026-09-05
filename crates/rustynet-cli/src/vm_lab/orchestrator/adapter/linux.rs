@@ -318,6 +318,10 @@ impl NodeAdapter for LinuxNodeAdapter {
         linux_traffic::collect_mesh_ip(&self.conn)
     }
 
+    fn collect_stun_candidates(&self) -> Result<Option<Vec<String>>, AdapterError> {
+        linux_traffic::collect_stun_candidates(&self.conn)
+    }
+
     fn issue_bundles_to_dir(
         &self,
         kind: BundleKind,

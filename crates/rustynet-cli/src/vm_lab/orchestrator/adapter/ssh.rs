@@ -1013,6 +1013,31 @@ pub fn parse_status_field(status_text: &str, key: &str) -> Option<String> {
     })
 }
 
+/// Parse the `stun_candidates=<ip:port[,ip:port...]>` field from a
+/// `rustynet netcheck` output line. The daemon renders the candidate list as
+/// comma-joined socket addresses, or the literal `none` when the async STUN
+/// gather has produced no candidate yet (and an absent field entirely on
+/// malformed output) — both map to `None` here; the caller (collect_pubkeys)
+/// decides whether an absent candidate is fatal based on whether
+/// `--lab-stun-servers` was configured. Values are NOT re-validated here;
+/// the stage hard-fails on any candidate that does not parse as a
+/// `SocketAddr`.
+pub fn parse_netcheck_stun_candidates(netcheck_text: &str) -> Option<Vec<String>> {
+    let raw = parse_status_field(netcheck_text, "stun_candidates")?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "none" {
+        return None;
+    }
+    Some(
+        trimmed
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
 fn teardown_control_master(teardown: ControlMasterTeardown) {
     let mut cmd = teardown.into_exit_command();
     if let Ok(mut child) = cmd.spawn() {
@@ -1237,6 +1262,36 @@ mod tests {
             Some("none".to_owned())
         );
         assert_eq!(parse_status_wireguard_public_key("node_id=win-1"), None);
+    }
+
+    #[test]
+    fn parse_netcheck_stun_candidates_handles_present_none_and_multi() {
+        use super::parse_netcheck_stun_candidates;
+        // Single candidate (mirrors the daemon test fixture).
+        let line = "node_id=abc stun_candidates=198.51.100.24:62000 local_host_candidates=none";
+        assert_eq!(
+            parse_netcheck_stun_candidates(line),
+            Some(vec!["198.51.100.24:62000".to_owned()])
+        );
+        // Multiple comma-joined candidates.
+        let multi = "stun_candidates=203.0.113.7:41338,198.51.100.3:15782";
+        assert_eq!(
+            parse_netcheck_stun_candidates(multi),
+            Some(vec![
+                "203.0.113.7:41338".to_owned(),
+                "198.51.100.3:15782".to_owned()
+            ])
+        );
+        // Daemon renders the empty gather as the literal `none` → absent.
+        assert_eq!(parse_netcheck_stun_candidates("stun_candidates=none"), None);
+        // Field entirely absent → None.
+        assert_eq!(parse_netcheck_stun_candidates("node_id=abc"), None);
+        // Malformed value is NOT validated here — passed through for the
+        // stage to hard-fail on SocketAddr parse.
+        assert_eq!(
+            parse_netcheck_stun_candidates("stun_candidates=not-an-addr"),
+            Some(vec!["not-an-addr".to_owned()])
+        );
     }
 
     #[test]
