@@ -421,6 +421,7 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         enable_relay_forwarding_validation: _,
         stage_timeout_secs: _,
         skip_linux_live_suite: _,
+        lab_stun_servers: _,
     } = config;
 
     if *dry_run {

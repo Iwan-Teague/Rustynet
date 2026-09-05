@@ -17,7 +17,13 @@ use serde::{Deserialize, Serialize};
 // A v4 snapshot predates the substrate seam; rejecting it as stale is the
 // fail-closed choice (re-run setup rather than resume with unknown overlay
 // provenance).
-pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 5;
+// v6: added `reflexive_endpoints` (per-alias server-reflexive STUN endpoints
+// collected during `CollectPubkeys` and consumed by traversal bundle
+// emission). A v5 snapshot predates cross-NAT STUN threading; rejecting it as
+// stale is the fail-closed choice (re-run setup so reflexive endpoints are
+// actually collected under the configured STUN servers rather than resumed
+// without them).
+pub const ORCHESTRATION_CONTEXT_SCHEMA_VERSION: u64 = 6;
 
 pub const ENV_ORCHESTRATOR_DIALECT: &str = "RUSTYNET_ORCHESTRATOR_DIALECT";
 
@@ -50,6 +56,11 @@ struct PersistedOrchestrationContext {
     ssh_allow_cidrs: String,
     #[serde(default)]
     orchestrator_dialect: Option<OrchestratorDialect>,
+    /// Server-reflexive STUN endpoint (`ip:port`) per node alias, collected
+    /// during `CollectPubkeys` when the daemon reports `stun_candidates`.
+    /// Consumed by traversal bundle emission (`SRFLX_SPEC`).
+    #[serde(default)]
+    reflexive_endpoints: BTreeMap<String, String>,
     /// Topology-level cross-network substrate provenance (id + topology
     /// digest). The live handle is NEVER serialized; this record is what a
     /// resumed run checks the requested substrate against, failing closed on
@@ -203,6 +214,17 @@ pub struct OrchestrationContext {
     pub mesh_ips: HashMap<String, String>,
     /// `WireGuard` endpoint (host:port) per alias, collected during `CollectPubkeys`.
     pub endpoints: HashMap<String, String>,
+    /// Server-reflexive STUN endpoint (`ip:port`) per alias, collected during
+    /// `CollectPubkeys` from the daemon netcheck `stun_candidates` field.
+    /// Persisted in the context envelope so a resumed run can emit
+    /// `SRFLX_SPEC` for traversal bundles without re-collecting.
+    pub reflexive_endpoints: HashMap<String, String>,
+    /// Cross-NAT STUN servers (`ip:port`) configured via
+    /// `--lab-stun-servers`, replacing the default-gateway STUN default on
+    /// every install path. Run-local only (never serialized): a resumed
+    /// context reloads an empty vec — the fail-closed direction (no
+    /// candidate-collection requirement without the flag re-supplied).
+    pub lab_stun_servers: Vec<std::net::SocketAddr>,
     /// Orchestrator engine that produced this run (set before stage execution).
     pub orchestrator_dialect: Option<OrchestratorDialect>,
     /// Live topology-level substrate handle (overlay/underlay IPs + created
@@ -271,6 +293,8 @@ impl OrchestrationContext {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -313,6 +337,7 @@ impl OrchestrationContext {
             network_id: self.network_id.clone(),
             ssh_allow_cidrs: self.ssh_allow_cidrs.clone(),
             orchestrator_dialect: self.orchestrator_dialect,
+            reflexive_endpoints: self.reflexive_endpoints.clone().into_iter().collect(),
             substrate_record: self.substrate_record.clone(),
         };
         let envelope = PersistedOrchestrationContextEnvelope {
@@ -396,6 +421,12 @@ impl OrchestrationContext {
             membership_snapshot: snapshot.membership_snapshot,
             mesh_ips: snapshot.mesh_ips.into_iter().collect(),
             endpoints: snapshot.endpoints.into_iter().collect(),
+            reflexive_endpoints: snapshot.reflexive_endpoints.into_iter().collect(),
+            // Run-local STUN configuration is never persisted; a resumed
+            // context reloads an empty vec — the fail-closed direction
+            // (candidate collection is only required when the flag is
+            // re-supplied on the resuming invocation).
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: snapshot.orchestrator_dialect,
             substrate: None,
             substrate_record: snapshot.substrate_record,
@@ -443,6 +474,8 @@ mod tests {
             .insert("exit".to_owned(), "100.64.0.1".to_owned());
         ctx.endpoints
             .insert("exit".to_owned(), "192.0.2.10:51820".to_owned());
+        ctx.reflexive_endpoints
+            .insert("exit".to_owned(), "203.0.113.7:41338".to_owned());
         ctx.ssh_allow_cidrs = "192.0.2.0/24".to_owned();
         ctx.set_dialect(OrchestratorDialect::RustNative);
         ctx.substrate_record = Some(
@@ -472,6 +505,11 @@ mod tests {
         assert_eq!(loaded.membership_snapshot, ctx.membership_snapshot);
         assert_eq!(loaded.mesh_ips, ctx.mesh_ips);
         assert_eq!(loaded.endpoints, ctx.endpoints);
+        assert_eq!(loaded.reflexive_endpoints, ctx.reflexive_endpoints);
+        assert!(
+            loaded.lab_stun_servers.is_empty(),
+            "lab_stun_servers is run-local and must not survive persistence"
+        );
         assert_eq!(loaded.network_id, ctx.network_id);
         assert_eq!(loaded.ssh_allow_cidrs, ctx.ssh_allow_cidrs);
         assert_eq!(

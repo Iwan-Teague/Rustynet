@@ -1326,6 +1326,44 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// always identifiable in evidence instead of silently masquerading as a
     /// clean-commit run.
     pub allow_dirty: bool,
+    /// `--lab-stun-servers <ip:port[,ip:port...]>`: cross-NAT STUN override.
+    /// When non-empty, this numeric `ip:port` CSV REPLACES the per-guest
+    /// default-gateway:3478 STUN default in every daemon install/enforce path
+    /// (Linux/macOS/Windows), and `collect_pubkeys` HARD-fails any node whose
+    /// daemon reports no `stun_candidates` after a bounded retry — no silent
+    /// host-only fallback. Parsed by [`parse_lab_stun_servers`], which rejects
+    /// hostnames and bare IPs at parse time (fail closed, never DNS). Empty
+    /// (the default) leaves the gateway-derived behavior byte-identical.
+    pub lab_stun_servers: Vec<std::net::SocketAddr>,
+}
+
+/// Parse `--lab-stun-servers <ip:port[,ip:port...]>` into validated numeric
+/// socket addresses. Fail closed at parse time: every entry must parse as a
+/// `SocketAddr` (numeric IP + port). Hostnames (e.g. `stun.example.com:3478`),
+/// bare IPs without a port (e.g. `1.2.3.4`), and empty entries between commas
+/// are hard errors naming the offending entry — the orchestrator never
+/// resolves DNS for a lab STUN server.
+pub fn parse_lab_stun_servers(raw: &str) -> Result<Vec<std::net::SocketAddr>, String> {
+    let mut servers = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err(format!(
+                "--lab-stun-servers: empty entry in '{raw}' (expected ip:port[,ip:port...])"
+            ));
+        }
+        let parsed: std::net::SocketAddr = entry.parse().map_err(|_| {
+            format!(
+                "--lab-stun-servers: entry '{entry}' is not a numeric ip:port address \
+                 (hostnames and bare IPs are rejected; never resolved via DNS)"
+            )
+        })?;
+        servers.push(parsed);
+    }
+    if servers.is_empty() {
+        return Err("--lab-stun-servers: no entries provided".to_owned());
+    }
+    Ok(servers)
 }
 
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
@@ -50901,7 +50939,42 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,
+            lab_stun_servers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn parse_lab_stun_servers_accepts_numeric_csv() {
+        let parsed =
+            super::parse_lab_stun_servers("1.2.3.4:19302,5.6.7.8:3478").expect("numeric csv");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].to_string(), "1.2.3.4:19302");
+        assert_eq!(parsed[1].to_string(), "5.6.7.8:3478");
+    }
+
+    #[test]
+    fn parse_lab_stun_servers_rejects_hostname() {
+        let err = super::parse_lab_stun_servers("stun.example.com:3478")
+            .expect_err("hostname must be rejected");
+        assert!(err.contains("stun.example.com:3478"), "names entry: {err}");
+    }
+
+    #[test]
+    fn parse_lab_stun_servers_rejects_bare_ip_without_port() {
+        let err = super::parse_lab_stun_servers("1.2.3.4").expect_err("bare ip must be rejected");
+        assert!(err.contains("1.2.3.4"), "names entry: {err}");
+    }
+
+    #[test]
+    fn parse_lab_stun_servers_rejects_empty_entry() {
+        let err = super::parse_lab_stun_servers("1.2.3.4:3478,,5.6.7.8:3478")
+            .expect_err("empty entry must be rejected");
+        assert!(err.contains("empty entry"), "names the failure: {err}");
+    }
+
+    #[test]
+    fn parse_lab_stun_servers_rejects_empty_input() {
+        assert!(super::parse_lab_stun_servers("").is_err());
     }
 
     /// QH-18. The collection functions had NO tests at all, which is how they

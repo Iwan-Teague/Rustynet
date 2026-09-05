@@ -259,7 +259,30 @@ pub fn enforce_daemon(
     // causes dns_alarm_state=error once the bundle ages past 5 minutes, which
     // can block traffic validation in longer pipeline runs.
     //
-    let script = build_enforce_script(role_str, &node_id, &src_dir, &ssh_allow_cidrs);
+    // --lab-stun-servers override: when configured, the validated numeric CSV
+    // REPLACES the gateway-derived default (cross-NAT runs point at a real
+    // STUN responder instead of the same-LAN gateway). Each entry already
+    // parsed as a SocketAddr at flag-parse time — SocketAddr Display is
+    // numeric-only, so rendering it into the script is the typed path (no
+    // untrusted interpolation).
+    let lab_stun_csv: Option<String> = if ctx.lab_stun_servers.is_empty() {
+        None
+    } else {
+        Some(
+            ctx.lab_stun_servers
+                .iter()
+                .map(std::net::SocketAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+    let script = build_enforce_script(
+        role_str,
+        &node_id,
+        &src_dir,
+        &ssh_allow_cidrs,
+        lab_stun_csv.as_deref(),
+    );
     ssh::run_remote(conn, &script, Duration::from_secs(120))?;
     Ok(())
 }
@@ -277,16 +300,30 @@ pub fn enforce_daemon(
 /// var unset, preserving the pre-C-STUN behaviour. This mirrors the identical
 /// threading in rn_bootstrap.sh — the enforce pass rewrites the systemd unit,
 /// so without it the bootstrap-time value would be silently dropped here.
+///
+/// `lab_stun_servers` (--lab-stun-servers): when `Some(csv)`, the numeric
+/// ip:port CSV REPLACES the gateway detection entirely — the env var is set
+/// to the literal override (each entry validated as a SocketAddr upstream, so
+/// the interpolation carries only numeric characters, dots, colons, and
+/// commas). `None` preserves the C-STUN gateway detection byte-identically.
 fn build_enforce_script(
     role_str: &str,
     node_id: &str,
     src_dir: &str,
     ssh_allow_cidrs: &str,
+    lab_stun_servers: Option<&str>,
 ) -> String {
+    let stun_prelude = match lab_stun_servers {
+        Some(csv) => format!("RN_STUN_ENV=\"RUSTYNET_TRAVERSAL_STUN_SERVERS={csv}\";"),
+        // Plain string literal, NOT a format! template: braces are literal
+        // awk syntax here (a `{{` escape would ship a broken awk program).
+        None => "RN_LAB_GW=\"$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')\"; \
+                 RN_STUN_ENV=''; \
+                 if [ -n \"$RN_LAB_GW\" ]; then RN_STUN_ENV=\"RUSTYNET_TRAVERSAL_STUN_SERVERS=$RN_LAB_GW:3478\"; fi;"
+            .to_owned(),
+    };
     format!(
-        "RN_LAB_GW=\"$(ip -4 route show default 2>/dev/null | awk '{{print $3; exit}}')\"; \
-         RN_STUN_ENV=''; \
-         if [ -n \"$RN_LAB_GW\" ]; then RN_STUN_ENV=\"RUSTYNET_TRAVERSAL_STUN_SERVERS=$RN_LAB_GW:3478\"; fi; \
+        "{stun_prelude} \
          sudo -n env \
          PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin \
          RUSTYNET_INSTALL_SOURCE_ROOT={src_dir} \
@@ -490,8 +527,24 @@ fn build_bootstrap_env(
         .map_err(|message| AdapterError::Protocol { message })?;
     let ssh_allow_cidrs = &ctx.ssh_allow_cidrs;
     let network_id = &ctx.network_id;
+    // --lab-stun-servers override: rn_bootstrap.sh reads
+    // RUSTYNET_LAB_STUN_SERVERS and falls back to the guest's default gateway
+    // on 3478 when it is unset, so the line is only emitted when the operator
+    // configured servers (byte-identical env when unset).
+    let lab_stun_line = if ctx.lab_stun_servers.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "RUSTYNET_LAB_STUN_SERVERS={}\n",
+            ctx.lab_stun_servers
+                .iter()
+                .map(std::net::SocketAddr::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
     Ok(format!(
-        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n"
+        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n{lab_stun_line}"
     ))
 }
 
@@ -535,6 +588,8 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -559,6 +614,47 @@ mod tests {
         assert!(
             env.contains("RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2"),
             "Rust-native lab bootstrap should reach offline fallback quickly on no-egress guests: {env}"
+        );
+        assert!(
+            !env.contains("RUSTYNET_LAB_STUN_SERVERS="),
+            "unset --lab-stun-servers must leave the env byte-identical: {env}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_env_threads_lab_stun_servers_when_configured() {
+        use std::collections::HashMap;
+        let ctx = OrchestrationContext {
+            assignments: vec![],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: "/tmp".into(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: vec![
+                "1.2.3.4:19302".parse().expect("socket addr"),
+                "5.6.7.8:3478".parse().expect("socket addr"),
+            ],
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+        };
+        let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
+        assert!(
+            env.contains("RUSTYNET_LAB_STUN_SERVERS=1.2.3.4:19302,5.6.7.8:3478\n"),
+            "configured --lab-stun-servers must override the gateway default as a CSV line: {env}"
         );
     }
 
@@ -596,6 +692,8 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -688,8 +786,13 @@ mod tests {
 
     #[test]
     fn enforce_script_threads_lab_stun_servers() {
-        let script =
-            build_enforce_script("client", "node-1", "/home/lab/Rustynet", "192.168.64.0/24");
+        let script = build_enforce_script(
+            "client",
+            "node-1",
+            "/home/lab/Rustynet",
+            "192.168.64.0/24",
+            None,
+        );
         assert!(
             script.contains("RUSTYNET_TRAVERSAL_STUN_SERVERS=$RN_LAB_GW:3478"),
             "enforce must thread the guest-gateway STUN endpoint: {script}"
@@ -701,6 +804,34 @@ mod tests {
         assert!(
             script.contains("ops e2e-enforce-host"),
             "must still invoke e2e-enforce-host: {script}"
+        );
+    }
+
+    /// --lab-stun-servers: the enforce script must REPLACE the gateway
+    /// detection with the literal validated CSV (cross-NAT runs point at a
+    /// real STUN responder, not the same-LAN gateway).
+    #[test]
+    fn enforce_script_lab_stun_servers_override_replaces_gateway_detection() {
+        let script = build_enforce_script(
+            "client",
+            "node-1",
+            "/home/lab/Rustynet",
+            "192.168.64.0/24",
+            Some("1.2.3.4:19302,5.6.7.8:3478"),
+        );
+        assert!(
+            script.contains(
+                "RN_STUN_ENV=\"RUSTYNET_TRAVERSAL_STUN_SERVERS=1.2.3.4:19302,5.6.7.8:3478\""
+            ),
+            "override must set the env var to the literal CSV: {script}"
+        );
+        assert!(
+            !script.contains("RN_LAB_GW"),
+            "override must not run gateway detection: {script}"
+        );
+        assert!(
+            !script.contains(":3478\"; fi"),
+            "gateway fallback must be absent under override: {script}"
         );
     }
 

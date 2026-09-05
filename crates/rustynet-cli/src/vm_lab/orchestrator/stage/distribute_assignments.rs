@@ -125,6 +125,37 @@ pub(crate) fn build_bundle_env(
         // the full pipeline and the reconcile loop.  Production nodes receive fresh
         // traversal bundles from the assignment-refresh timer; the lab distributes once.
         lines.push("TRAVERSAL_TTL_SECS=86400".to_owned());
+
+        // SRFLX_SPEC (cross-NAT, --lab-stun-servers): the server-reflexive
+        // endpoint `collect_pubkeys` recorded per node becomes a second,
+        // lower-priority candidate in the signed traversal bundle
+        // (`ops_e2e.rs` parses `node_id|ip:port;...`). Emitted ONLY for the
+        // traversal bundle, ONLY for nodes that reported one, and never when a
+        // node's reflexive equals its host endpoint (the issuer drops such
+        // duplicates; skipping them here keeps the spec honest). Absent
+        // entirely when no node has a reflexive endpoint, so the flag-off path
+        // is byte-identical to the pre-feature env.
+        let mut srflx_parts = Vec::new();
+        for a in &ctx.assignments {
+            let Some(reflexive) = ctx.reflexive_endpoints.get(&a.alias) else {
+                continue;
+            };
+            if ctx
+                .endpoints
+                .get(&a.alias)
+                .is_some_and(|host_endpoint| host_endpoint == reflexive)
+            {
+                continue;
+            }
+            let node_id = ctx
+                .node_ids
+                .get(&a.alias)
+                .ok_or_else(|| format!("no node_id for '{}'", a.alias))?;
+            srflx_parts.push(format!("{node_id}|{reflexive}"));
+        }
+        if !srflx_parts.is_empty() {
+            lines.push(format!("SRFLX_SPEC={}", srflx_parts.join(";")));
+        }
     }
 
     if matches!(kind, BundleKind::Assignment) {
@@ -344,6 +375,8 @@ mod tests {
             membership_snapshot: Some(vec![1, 2, 3]),
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,
@@ -387,6 +420,75 @@ mod tests {
         );
     }
 
+    // ── SRFLX_SPEC (cross-NAT, --lab-stun-servers) ─────────────────────────
+
+    #[test]
+    fn traversal_env_emits_srflx_spec_only_for_nodes_with_a_reflexive_endpoint() {
+        let mut ctx = make_two_node_ctx();
+        ctx.reflexive_endpoints
+            .insert("client-1".to_owned(), "203.0.113.7:41338".to_owned());
+        let env = build_bundle_env(&ctx, &BundleKind::Traversal).unwrap();
+        let line = env
+            .lines()
+            .find(|l| l.starts_with("SRFLX_SPEC="))
+            .expect("traversal env must carry SRFLX_SPEC when a node has a reflexive");
+        assert_eq!(line, "SRFLX_SPEC=client-node-id-xyz|203.0.113.7:41338");
+        // The exit (no reflexive) is absent from the spec, and the host
+        // endpoints in NODES_SPEC are untouched.
+        assert!(!line.contains("exit-node-id-abc"));
+        assert!(env.contains("exit-node-id-abc|10.0.0.1:51820|"));
+    }
+
+    #[test]
+    fn traversal_env_joins_multiple_srflx_entries_in_assignment_order() {
+        let mut ctx = make_two_node_ctx();
+        ctx.reflexive_endpoints
+            .insert("exit-1".to_owned(), "198.51.100.3:15782".to_owned());
+        ctx.reflexive_endpoints
+            .insert("client-1".to_owned(), "203.0.113.7:41338".to_owned());
+        let env = build_bundle_env(&ctx, &BundleKind::Traversal).unwrap();
+        let line = env
+            .lines()
+            .find(|l| l.starts_with("SRFLX_SPEC="))
+            .expect("SRFLX_SPEC present");
+        assert_eq!(
+            line,
+            "SRFLX_SPEC=exit-node-id-abc|198.51.100.3:15782;client-node-id-xyz|203.0.113.7:41338"
+        );
+    }
+
+    #[test]
+    fn traversal_env_skips_a_reflexive_equal_to_the_host_endpoint_and_omits_an_empty_spec() {
+        let mut ctx = make_two_node_ctx();
+        // Same-LAN node: its "reflexive" is just its host endpoint — the
+        // issuer would drop the duplicate anyway; the spec stays honest.
+        ctx.reflexive_endpoints
+            .insert("client-1".to_owned(), "10.0.0.2:51820".to_owned());
+        let env = build_bundle_env(&ctx, &BundleKind::Traversal).unwrap();
+        assert!(
+            !env.contains("SRFLX_SPEC="),
+            "a reflexive equal to the host endpoint must not produce a spec: {env}"
+        );
+        // Flag-off path: no reflexive endpoints at all → byte-identical env.
+        let ctx = make_two_node_ctx();
+        let env = build_bundle_env(&ctx, &BundleKind::Traversal).unwrap();
+        assert!(!env.contains("SRFLX_SPEC="), "{env}");
+    }
+
+    #[test]
+    fn only_the_traversal_bundle_carries_srflx_spec() {
+        let mut ctx = make_two_node_ctx();
+        ctx.reflexive_endpoints
+            .insert("client-1".to_owned(), "203.0.113.7:41338".to_owned());
+        for kind in [BundleKind::Assignment, BundleKind::DnsZone] {
+            let env = build_bundle_env(&ctx, &kind).unwrap();
+            assert!(
+                !env.contains("SRFLX_SPEC="),
+                "{kind:?} must never carry SRFLX_SPEC: {env}"
+            );
+        }
+    }
+
     #[test]
     fn build_bundle_env_traversal_has_no_assignments_spec() {
         let ctx = make_two_node_ctx();
@@ -413,6 +515,8 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,

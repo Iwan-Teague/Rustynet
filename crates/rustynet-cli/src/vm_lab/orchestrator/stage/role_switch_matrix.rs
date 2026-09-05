@@ -94,6 +94,8 @@ mod tests {
             membership_snapshot: None,
             mesh_ips: HashMap::new(),
             endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
             orchestrator_dialect: None,
             substrate: None,
             substrate_record: None,

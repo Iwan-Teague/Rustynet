@@ -289,6 +289,10 @@ impl NodeAdapter for WindowsNodeAdapter {
         windows_traffic::collect_mesh_ip(&self.conn)
     }
 
+    fn collect_stun_candidates(&self) -> Result<Option<Vec<String>>, AdapterError> {
+        windows_traffic::collect_stun_candidates(&self.conn)
+    }
+
     fn issue_bundles_to_dir(
         &self,
         kind: BundleKind,

@@ -408,6 +408,59 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
     }
 }
 
+/// Collect the daemon-reported STUN server-reflexive candidates via
+/// `rustynet netcheck`. The daemon gathers STUN asynchronously at start, so a
+/// fresh boot legitimately reports `stun_candidates=none` for a while — retry
+/// every 5 s up to a 60 s deadline, and return `Ok(None)` when the window
+/// expires with no candidate. A persistent SSH/command error is an `Err`
+/// (fail closed on transport problems; only an observed-but-empty gather is
+/// `Ok(None)`, letting the caller decide fatality from
+/// `--lab-stun-servers`).
+pub fn collect_stun_candidates(conn: &NodeConnection) -> Result<Option<Vec<String>>, AdapterError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_err: Option<AdapterError>;
+    let netcheck = netcheck_command()?;
+    loop {
+        match ssh::run_remote(conn, netcheck.as_str(), SHORT_TIMEOUT) {
+            Ok(netcheck) => match ssh::parse_netcheck_stun_candidates(&netcheck) {
+                Some(candidates) if !candidates.is_empty() => return Ok(Some(candidates)),
+                // Observed but empty (`none` / blank) — keep polling until the
+                // deadline, then report absence. Clearing last_err records
+                // that the transport path works and the gather is merely
+                // empty (an ABSENCE, not a failure).
+                _ => last_err = None,
+            },
+            Err(e) => last_err = Some(e),
+        }
+        if std::time::Instant::now() >= deadline {
+            // Deadline expired. An observed-but-empty gather is an ABSENCE
+            // (Ok(None)) the stage classifies against --lab-stun-servers; a
+            // persistent transport-level failure propagates as Err
+            // (fail closed).
+            return match last_err {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// `sudo -n env RUSTYNET_DAEMON_SOCKET=<sock> /usr/local/bin/rustynet netcheck`,
+/// argv-shaped through the validated seam (every token is a compile-time
+/// constant; the seam is what keeps this off the raw-sink ratchet).
+fn netcheck_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = [
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        ValidatedArg::cli_token(&format!("RUSTYNET_DAEMON_SOCKET={LINUX_DAEMON_SOCKET}"))?,
+        ValidatedArg::path("/usr/local/bin/rustynet")?,
+        ValidatedArg::cli_token("netcheck")?,
+    ];
+    ssh::RemoteCommand::from_args("linux stun candidates netcheck", &args)
+}
+
 /// Positive connectivity: ping `peer_mesh_ip` 3 times via the tunnel.
 /// Returns `TrafficTestResult::Reachable` on success.
 /// On failure, captures the full ping stdout/stderr so the stage log

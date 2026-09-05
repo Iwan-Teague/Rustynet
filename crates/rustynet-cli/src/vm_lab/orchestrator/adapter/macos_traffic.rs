@@ -360,6 +360,52 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
     }
 }
 
+/// Collect the daemon-reported STUN server-reflexive candidates via
+/// `rustynet netcheck`. Mirrors the Linux adapter: the daemon gathers STUN
+/// asynchronously at start, so retry every 5 s up to a 60 s deadline; an
+/// observed-but-empty gather (`stun_candidates=none`) past the deadline is
+/// `Ok(None)` (an ABSENCE the stage classifies against `--lab-stun-servers`),
+/// while a persistent transport-level failure propagates as `Err` (fail
+/// closed).
+pub fn collect_stun_candidates(conn: &NodeConnection) -> Result<Option<Vec<String>>, AdapterError> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let mut last_err: Option<AdapterError>;
+    let netcheck = netcheck_command()?;
+    loop {
+        match ssh::run_remote(conn, netcheck.as_str(), SHORT_TIMEOUT) {
+            Ok(netcheck) => match ssh::parse_netcheck_stun_candidates(&netcheck) {
+                Some(candidates) if !candidates.is_empty() => return Ok(Some(candidates)),
+                // Observed but empty — keep polling; clearing last_err marks
+                // the gather as observed-empty rather than transport-failed.
+                _ => last_err = None,
+            },
+            Err(e) => last_err = Some(e),
+        }
+        if std::time::Instant::now() >= deadline {
+            return match last_err {
+                Some(e) => Err(e),
+                None => Ok(None),
+            };
+        }
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
+/// `sudo -n env RUSTYNET_DAEMON_SOCKET=<sock> /usr/local/bin/rustynet netcheck`,
+/// argv-shaped through the validated seam (every token is a compile-time
+/// constant; the seam is what keeps this off the raw-sink ratchet).
+fn netcheck_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = [
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("env")?,
+        ValidatedArg::cli_token("RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock")?,
+        ValidatedArg::path("/usr/local/bin/rustynet")?,
+        ValidatedArg::cli_token("netcheck")?,
+    ];
+    ssh::RemoteCommand::from_args("macos stun candidates netcheck", &args)
+}
+
 /// Ping `peer_mesh_ip` 3 times. Returns `Reachable` on success.
 /// On failure, captures the full ping stdout/stderr so the stage log
 /// carries diagnostic detail instead of a bare "ping to X failed".
