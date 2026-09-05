@@ -391,5 +391,67 @@ verified from `state/resolved_plan.json`: 66 stages,
 planned, selectors `relay_forwarding_validation:true`,
 `skip_linux_live_suite:false`, `soak_suite:false`. QH-64 watch active.
 
+## Successor session (2026-09-06, worktree edit-1788651195477-40131-0)
+
+This session continues the chain from checkpoint `f094cc1b` (which
+carried the attempt-3 evidence rows, both filled triage stubs, and the
+readiness-wait fix into this branch).
+
+### Attempt 3 verdict (recorded from stage artifacts)
+
+Run `livelab-1788650472-ef1c5ed0ec20` (report
+`state/live-lab-macos-relay-fwd3-20260906-000522` in the predecessor
+worktree, source archive commit `6e3bb383`, clean): 66 stages, 24 pass /
+2 fail / 40 skip, overall fail, first_failed_stage `relay_validation`.
+
+- `deploy_relay_service` PASS on macos-utm-1 — FIRST time on macOS. The
+  staged-plist deploy fix (98664b0e + 6e3bb383) works.
+- `relay_validation` FAIL: during-run UDP :4500 not bound, TCP :4501 not
+  bound, `/healthz` unreachable. Triage (stub already filled on this
+  branch, independently reconfirmed): startup race — validation captured
+  its snapshot in the same second the deploy kickstart returned;
+  post-run guest state proves the service healthy (launchd running,
+  UDP 127.0.0.1:4500 + TCP 127.0.0.1:4501 LISTEN, `/healthz` ok). Remedy
+  `wait_until_ready` (30s/1s poll) is in `role_validation/relay.rs` on
+  this branch; 126 scoped relay tests green under pinned 1.88.0.
+- `relay_forwards_frame_validation` SKIPPED (failed dependency).
+- `traffic_test_matrix` FAIL: CP-1 cross-vmnet 100% loss, unchanged
+  (stub filled). Skip-cascade took role_switch/two_hop/etc., as in
+  attempt 2.
+
+### CP-1 elevated to a structural blocker for the frame-forwarding cell
+
+New evidence gathered live this session: from debian-headless-2
+(192.168.64.4), the macOS guest 192.168.65.101 is unreachable at the
+LAN level entirely — ICMP 100% loss AND TCP/22 connection timeout. This
+is not a mesh/WireGuard symptom: no Linux peer can send any packet to
+the macOS guest's LAN address. Since the HP-3 frame-forwarding proof
+requires two Linux peers to direct UDP frames at the relay's LAN bind
+(provisioned as `<relay_lan_ip>:4500`), `relay_forwards_frame_validation`
+with a macOS relay is structurally impossible under the current lab
+topology. Additionally the stage carries an explicit fail-closed
+`adapter.platform() != Linux` gate (`relay_forwards_frame_validation.rs`,
+"probe is Linux-only (nft + systemd unit restarts)"), and
+`select_relay_forward_test_topology` elects only Linux relay_capable
+nodes — a macOS-relay port of the probe would be moot until CP-1 is
+resolved anyway. Porting the probe to macOS is therefore NOT attempted;
+CP-1 (bridged-NIC/host topology change) stays the owner decision it has
+been recorded as since attempt 2, now with LAN-level evidence.
+
+Note for honesty: `linux_relay_forwards_frame` has itself never passed
+on any OS (matrix tally: 313 not_run / 1 skip), so the forwarding stage
+is unproven even where it is implementable.
+
+### Attempt 4 (relay_validation goal) — plan
+
+To launch from THIS worktree with the same correct recipe (no
+`--skip-linux-live-suite`, `--skip-soak`,
+`--enable-relay-forwarding-validation`) so `relay_validation` can prove
+green under the readiness fix. Expected honest outcomes:
+`relay_validation` PASS; `relay_forwards_frame_validation` FAIL-closed
+(macOS relay, Linux-only probe — durable in-ledger evidence of the
+CP-1-blocked cell); `traffic_test_matrix` FAIL (CP-1, owner-deferred).
+Outcome recorded below after the run.
+
 
 
