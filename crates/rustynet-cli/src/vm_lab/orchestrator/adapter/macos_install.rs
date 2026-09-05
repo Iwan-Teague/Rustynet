@@ -1259,15 +1259,15 @@ fn build_bootstrap_env(
 ///   2. The installed + bootstrapped `com.rustynet.relay` launchd service, via
 ///      the shared `ops install-macos-relay` helper — the one hardened relay-
 ///      install path. It copies the reviewed plist from
-///      `scripts/launchd/com.rustynet.relay.plist` relative to the source root,
-///      so it runs from that cwd (the configured workdir, else `$HOME/Rustynet`).
+///      `scripts/launchd/com.rustynet.relay.plist` relative to its cwd; the
+///      guest has no persistent source root, so the orchestrator uploads the
+///      reviewed plist from its own workspace and runs the installer from a
+///      temp staging cwd (see step 4 below).
 ///
-/// Fail-closed throughout: a missing assignment key, a malformed key, or a
-/// failed install all surface as `Err`.
-pub fn deploy_relay_service(
-    conn: &NodeConnection,
-    workdir: Option<&str>,
-) -> Result<(), AdapterError> {
+/// Fail-closed throughout: a missing assignment key, a malformed key, a
+/// missing reviewed plist on the orchestrator host, or a failed install all
+/// surface as `Err`.
+pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     let short_timeout = Duration::from_secs(30);
 
     // 1. Read the already-distributed assignment authority pubkey (hex). On
@@ -1317,32 +1317,50 @@ pub fn deploy_relay_service(
         short_timeout,
     )?;
 
-    // 4. Install + bootstrap com.rustynet.relay via the shared helper. It reads
-    //    scripts/launchd/com.rustynet.relay.plist relative to cwd, so run from
-    //    the source root (the configured workdir, else $HOME/Rustynet). The
-    //    source dir is passed only inside a single-quoted env assignment; the
-    //    executed shell body is a compile-time constant. Absolute CLI path so
-    //    the install never depends on sudo's PATH inside the root `sh -c`.
-    let src_dir = match workdir {
-        Some(w) if !w.trim().is_empty() => w.trim().to_owned(),
-        _ => {
-            let home = ssh::run_remote(conn, "echo $HOME", Duration::from_secs(10))?
-                .trim()
-                .to_owned();
-            if home.is_empty() {
-                return Err(AdapterError::Protocol {
-                    message: "could not determine $HOME on remote for install-macos-relay"
-                        .to_owned(),
-                });
-            }
-            format!("{home}/Rustynet")
-        }
-    };
-    let src_dir_esc = src_dir.replace('\'', "'\\''");
-    let install_cmd = format!(
-        "sudo -n env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay'"
+    // 4. Install + bootstrap com.rustynet.relay via the shared helper. The
+    //    helper reads `scripts/launchd/com.rustynet.relay.plist` cwd-relative,
+    //    and the guest has no persistent source root (bootstrap installs from
+    //    the shipped archive; the inventory's `rustynet_src_dir` is never
+    //    materialized on the fast path — proven live 2026-09-05 by
+    //    `deploy_relay_service` failing with `cd: /Users/mac/Rustynet: No such
+    //    file or directory`), so upload the reviewed plist from the
+    //    orchestrator's workspace and run the installer from a temp staging
+    //    cwd — the same proven shape as the quarantined
+    //    `exercise_macos_relay_lifecycle_live` (vm_lab/mod.rs). The executed
+    //    shell body is a compile-time constant; only fixed /tmp paths appear
+    //    in it, and the absolute CLI path keeps the install independent of
+    //    sudo's PATH inside the root `sh -c`.
+    let host_plist =
+        crate::vm_lab::workspace_root_path().join("scripts/launchd/com.rustynet.relay.plist");
+    if !host_plist.is_file() {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "reviewed relay plist missing at {} on the orchestrator host",
+                host_plist.display()
+            ),
+        });
+    }
+    let plist_bytes = std::fs::read(&host_plist).map_err(|e| AdapterError::Protocol {
+        message: format!("read reviewed relay plist {}: {e}", host_plist.display()),
+    })?;
+    let plist_tmp = write_temp_file("rn_relay_plist_", ".plist", &plist_bytes)?;
+    let ship_plist = ssh::scp_to(
+        conn,
+        plist_tmp.as_path(),
+        "/tmp/rn-relay-reviewed.plist",
+        short_timeout,
     );
-    ssh::run_remote(conn, &install_cmd, Duration::from_secs(120))?;
+    let _ = std::fs::remove_file(&plist_tmp);
+    ship_plist?;
+    ssh::run_remote(
+        conn,
+        "sudo -n sh -c 'T=\"$(mktemp -d /tmp/rn-relay.XXXXXX)\" && \
+         mkdir -p \"$T/scripts/launchd\" && \
+         cp /tmp/rn-relay-reviewed.plist \"$T/scripts/launchd/com.rustynet.relay.plist\" && \
+         cd \"$T\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay; rc=$?; \
+         rm -rf \"$T\"; rm -f /tmp/rn-relay-reviewed.plist; exit $rc'",
+        Duration::from_secs(120),
+    )?;
     Ok(())
 }
 
