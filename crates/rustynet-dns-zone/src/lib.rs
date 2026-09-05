@@ -1911,7 +1911,7 @@ mod tests {
             nonce: 7,
             payload_digest: [0u8; 32],
         };
-        let mut higher_nonce = watermark.clone();
+        let mut higher_nonce = watermark;
         higher_nonce.nonce = 8;
         assert_eq!(
             dns_zone_watermark_ordering(&higher_nonce, &watermark),
@@ -1919,7 +1919,7 @@ mod tests {
         );
         // Different digest and version must not affect ordering at equal
         // generated_at and nonce.
-        let mut different_digest = watermark.clone();
+        let mut different_digest = watermark;
         different_digest.payload_digest = [9u8; 32];
         different_digest.version = 2;
         assert_eq!(
@@ -1939,7 +1939,7 @@ mod tests {
             0,
             60,
             42,
-            &vec![record_input("nas", "100.64.0.5", &[])],
+            &[record_input("nas", "100.64.0.5", &[])],
         )
         .expect_err("generated_at_unix of zero must be rejected");
         assert_invalid_format_contains(&err, "generated_at_unix must be greater than zero");
@@ -1955,7 +1955,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![],
+            &[],
         )
         .expect_err("empty record list must be rejected");
         assert_invalid_format_contains(&err, "dns zone requires at least one record");
@@ -1991,7 +1991,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input("nas", "100.64.0.5", &[])],
+            &[record_input("nas", "100.64.0.5", &[])],
         )
         .expect("surrounding whitespace on subject must be trimmed away");
         assert_eq!(bundle.subject_node_id, "client-1");
@@ -2003,7 +2003,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input("nas", "100.64.0.5", &[])],
+            &[record_input("nas", "100.64.0.5", &[])],
         )
         .expect_err("whitespace-only subject must be rejected");
         assert_invalid_format_contains(&err, "subject_node_id must not be empty");
@@ -2019,7 +2019,7 @@ mod tests {
             1_773_000_000,
             60,
             0,
-            &vec![record_input("nas", "100.64.0.5", &[])],
+            &[record_input("nas", "100.64.0.5", &[])],
         )
         .expect("nonce zero is a legal watermark value");
         assert_eq!(bundle.nonce, 0);
@@ -2060,7 +2060,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input(
+            &[record_input(
                 "nas",
                 "100.64.0.5",
                 &["zeta.rustynet", "alpha.rustynet", "ZETA.rustynet"],
@@ -2087,7 +2087,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input(
+            &[record_input(
                 "nas",
                 "100.64.0.5",
                 &aliases.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2110,7 +2110,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input(
+            &[record_input(
                 "nas",
                 "100.64.0.5",
                 &["  home.rustynet  ", "home.rustynet"],
@@ -2126,7 +2126,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input("nas", "100.64.0.5", &["home.rustynet", ""])],
+            &[record_input("nas", "100.64.0.5", &["home.rustynet", ""])],
         )
         .expect_err("a blank alias entry must be rejected by name canonicalization");
         assert_invalid_format_contains(&err, "dns name must not be empty");
@@ -2145,7 +2145,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input("nas", "100.64.0.5", &["nas.rustynet"])],
+            &[record_input("nas", "100.64.0.5", &["nas.rustynet"])],
         )
         .expect("an alias equal to the record's own fqdn is currently accepted");
         assert_eq!(bundle.records[0].aliases, vec!["nas.rustynet".to_string()]);
@@ -2161,7 +2161,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input(
+            &[record_input(
                 "nas",
                 "100.64.0.5",
                 &["gamma.rustynet", "beta.rustynet"],
@@ -2312,7 +2312,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input("nas", "100.68.1.10", &[])],
+            &[record_input("nas", "100.68.1.10", &[])],
         )
         .expect("bundle must build");
         let wire = render_signed_dns_zone_bundle_wire(&bundle);
@@ -2364,7 +2364,7 @@ mod tests {
             1_773_000_000,
             60,
             42,
-            &vec![record_input("nas", "100.64.0.5", &[])],
+            &[record_input("nas", "100.64.0.5", &[])],
         )
         .expect("base bundle must build");
         let tweaked = build_signed_dns_zone_bundle(
@@ -2374,7 +2374,7 @@ mod tests {
             1_773_000_000,
             60,
             43,
-            &vec![record_input("nas", "100.64.0.5", &[])],
+            &[record_input("nas", "100.64.0.5", &[])],
         )
         .expect("tweaked bundle must build");
         assert_ne!(
