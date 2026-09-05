@@ -11946,6 +11946,22 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         }
     };
     log::info!("rustynetd startup: daemon runtime constructed");
+    // TEMPORARY diagnostic (WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md
+    // §11.3): a Windows guest's collect_pubkeys captured value has twice
+    // diverged from the WireGuard-NT driver's actual runtime public key later
+    // in the same run. Logging the derived value (public, not secret) at
+    // every DaemonRuntime construction pins down whether a single process
+    // ever holds two different values, or whether the divergence happens
+    // elsewhere (a second process construction, or the WireGuard-NT tunnel
+    // service loading a different key independently). Remove once the
+    // mechanism is confirmed and fixed.
+    log::info!(
+        "rustynetd startup: local wireguard public key = {}",
+        runtime
+            .local_wireguard_public_key
+            .as_deref()
+            .unwrap_or("none")
+    );
     // M1 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3): bind
     // the DNS resolver socket BEFORE `bootstrap()` and service the
     // bootstrap-time protected-DNS probe from it. The probe
