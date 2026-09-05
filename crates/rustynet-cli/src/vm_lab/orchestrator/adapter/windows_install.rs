@@ -1061,6 +1061,7 @@ fn run_windows_e2e_bootstrap(
              [System.IO.File]::WriteAllText($wgPlaintextPath, $wgPp, $utf8NoBom); \
              [System.IO.File]::WriteAllText($signingPlaintextPath, $signingPp, $utf8NoBom); \
              $keyInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} key init --passphrase-file $wgPlaintextPath --force }}; \
+             try {{ Add-Content -LiteralPath '{WINDOWS_STATE_ROOT}\\logs\\bootstrap-native-output.log' -Value ('key init: ' + $keyInit.Output) -ErrorAction SilentlyContinue }} catch {{}}; \
              if ($keyInit.ExitCode -ne 0) {{ throw ('rustynetd key init failed: ' + $keyInit.Output) }}; \
              $mbInit = Invoke-RustyNetBootstrapNative {{ & {rustynetd_q} membership init \
                  --snapshot {membership_snapshot_q} \
