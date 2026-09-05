@@ -384,3 +384,74 @@ reassertion theory (since 3 consecutive reads spanning several seconds is a
 meaningfully wider window than a single read) — at that point, stop adding
 apply-side persistence and implement the validator-side settle-time retry
 instead, per §10's closing recommendation.
+
+## 12. It reproduced anyway — the recurring-reassertion theory is now the
+strongest explanation, and the daemon has NO continuous self-heal
+
+`run-2026-09-05-windows-32-sustained-reads-proof` (commit `c1de02db`,
+includes `238a2edb`) hit the exact IPv6 symptom an EIGHTH time. The daemon
+log confirms the sustain logic ran as designed and found nothing to correct:
+`apply_dns_loopback`'s entry log is followed ~16s later by `runtime bootstrap
+complete` with **no** `settled on attempt N/12` line (meaning both the IPv6
+and NRPT loops reached their 3-consecutive-clean-read requirement on
+attempts 1-3, i.e. the minimum, with zero drift observed across that ~16s
+window) and no `DnsApplyFailed` error. Yet `validate_baseline_runtime`,
+querying a few seconds after that, found the placeholder back again.
+
+This is meaningfully stronger evidence than §10's: three independent clean
+reads spanning a real multi-second window is a much wider net than a single
+read, and it still didn't catch whatever writes the placeholder back. That
+points away from "one more discrete rebind we haven't accounted for" and
+toward §10's theory 1: a genuinely recurring Windows background process
+(NLA / NCSI / Network List Service are still unconfirmed candidates)
+rewriting the interface's default DNS on some cadence independent of this
+daemon's own actions.
+
+**Architectural finding that changes the shape of the fix:** `assert_dns_protection`
+(`phase10.rs:7784`) — the only post-apply DNS check in the codebase — is
+called exactly ONCE, immediately after `apply_dns_protection_for_posture`,
+inside `apply_dataplane_generation`. It is never called again until the
+NEXT generation apply (i.e., only on a future config change or restart).
+Confirmed by reading `daemon.rs`'s `reconcile()` (the periodic tick, default
+every `reconcile_interval_ms` = 1000ms per the systemd/service unit args):
+it only invokes `apply_dataplane_generation` when `assignment_changed ||
+membership_changed`, and never runs a lighter, unconditional DNS-posture
+recheck on every tick. **The daemon has no continuous self-healing for DNS
+drift after initial apply, on any platform** — once `apply_dns_loopback`
+returns `Ok`, nothing checks the DNS state again for the life of that
+process, no matter how long it keeps running. For a fail-closed enforcement
+mechanism this is a real gap independent of the live-lab timing question:
+if Windows (or anything else) can silently un-set the loopback DNS hours
+into a real deployment, nothing in this daemon would ever notice or correct
+it.
+
+**Two candidate fixes, genuinely different in scope and risk from anything
+tried so far:**
+
+1. **Validator-side settle-time retry** (smaller, lower-risk, lab-scoped):
+   make `validate_windows_dns_failclosed`
+   (`crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/dns_failclosed.rs:72-85`)
+   retry over a longer window before declaring failure, mirroring
+   `windows_tunnel_ip_readiness_fragment`. Cheap to implement and test, but
+   only papers over the underlying gap for THIS validator — it does nothing
+   for a real deployment where nothing is checking DNS state ever again.
+2. **Continuous DNS-posture self-heal in the daemon's reconcile loop**
+   (larger, touches `reconcile()` in `daemon.rs`, shared by every platform):
+   add a lightweight, unconditional DNS-state check-and-correct on some
+   bounded cadence (not necessarily every tick — a PowerShell round-trip per
+   tick could itself be expensive/slow and risks the reconcile loop falling
+   behind on Windows specifically) so a real deployment self-heals drift for
+   the life of the process, not just at generation-apply time. This is the
+   architecturally correct fix for the actual security posture, not just the
+   lab symptom, but is a materially bigger, riskier change to a hot,
+   shared-across-platforms path — it deserves deliberate design (check
+   cadence, whether other platforms' `assert_dns_protection` implementations
+   have the same gap, whether periodic checks should be capped to a settling
+   window after apply rather than running forever) rather than a fast patch
+   inside a live-lab iteration loop.
+
+**Not yet implemented — this needs an explicit decision on which of the two
+(or both) to pursue before more code changes land here.** Eight reproductions
+and three fix attempts on the apply side is enough evidence to justify
+pausing before a ninth; the remaining fix is architecturally bigger than
+anything tried so far in this investigation.
