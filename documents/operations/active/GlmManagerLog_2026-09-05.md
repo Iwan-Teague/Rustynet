@@ -167,3 +167,84 @@ Next: relay frame-forwarding opt-in cell (QH-64-aware:
 --skip-linux-live-suite` + common flags). Disruptive by design; if
 `gossip_accepted_total=0` / `restrict_permanent` symptoms appear, that is
 QH-64 evidence, not a new defect.
+
+## 19:20–20:10 — successor manager (edit-1788642144227-82735-2): relay attempt 1 = setup-only (HP-3 skip-trap); glm-5.3 adversarial review APPROVE
+
+Handover processing. The predecessor's relay launch
+(`state/live-lab-macos-relay-fwd-20260905-191701` in the OLD worktree,
+pid 591) had already exited cleanly by the time this manager read the log:
+`orchestration/orchestrate_result.json` exists, run
+`livelab-1788636568-2a7cbf6ac22e`, commit `2a7cbf6a` (the predecessor's
+timed-out checkpoint HEAD, an ancestor of this branch), clean.
+
+Verdict (from `state/stages.tsv` + stage logs + the appended ledger row,
+never the CSV column alone): **setup-only — 16 pass / 0 fail / 3 skip**
+(anchor_validation, admin_issue, blind_exit: role-absence skips),
+`overall_result=partial` (fast-path `not_run` semantics). **The relay
+frame-forwarding stage was never planned.** Root cause, read from code:
+the stage is `StageSuite::Disruptive` and the plan gate is
+`!skip_live_suite && enable_relay_forwarding_validation`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/plan.rs:372`, with the
+regression test `skip_live_suite_drops_relay_forwarding_validation_too`
+at plan.rs:845), and `native.rs:743` records the selector as
+`enable_relay_forwarding_validation && !skip_live_suite` — the launch
+recipe combined `--enable-relay-forwarding-validation` with
+`--skip-linux-live-suite`, so the opt-in was dropped BY DESIGN (same
+contract as chaos/negative-control; the recorded manifest confirms
+`relay_forwarding_validation:false`). Not a defect; a launch-recipe
+trap. QH-64 symptoms therefore never came into play (no restarts
+happened).
+
+Ledger carry: the run-matrix row (line 314) and the 46 stage-results
+rows (lines 43295–43340) were appended uncommitted in the OLD worktree;
+copied line-exact into this branch's
+`documents/operations/live_lab_node_run_matrix.csv` /
+`live_lab_node_stage_results.csv` via python (all 47 lines verified to
+reference the report dir before appending). No triage stub was created
+for this run (grep of the old worktree's `live_lab_stage_triage.jsonl`
+for the report dir: zero matches), so there is no stub to fill.
+
+glm-5.3 adversarial review of the verifier fix `1eb6e800` — RETRY
+SUCCEEDED via the stdio driver
+(`scripts/mcp/drive_ai_agent.py --tool ai_agent`, provider glm, model
+glm-5.3, grounding itself with its own git/read tools after four MCP
+-32001/-style failures): **VERDICT APPROVE.** All five attack attempts
+fail: (a) anti-shrink bypass — the election disjunction only ever
+ENLARGES the expected plan; the pre-fix runner could already shrink via
+the raw selector, so the trust boundary is unmoved and the dangerous
+direction is strictly reduced; (b) no self-election path — the manifest
+platform field is copied from the operator-controlled inventory at
+write time (`native.rs:320-336`), unknown alias is a hard error;
+(c) degenerate inputs all bend strict (unparseable role →
+`NodeRole::Custom` ≠ `Anchor` → no election; unparseable/absent
+platform → `None`/`""` → parse fails → no election); (d) the digest
+gate `verify_recorded_matches_expected` (`resolved_plan.rs:274-308`) is
+untouched by the commit; (e) `""` vs `"linux"` both converge on the
+identical no-election plan. Two OPTIONAL non-blocking hardening notes:
+reject duplicate aliases in `ManifestNodeAssignment` at manifest-write
+time (kills the last-wins HashMap ambiguity), and pin
+`VmGuestPlatform::parse("") → Err` in a unit test. Reviewer's stated
+limits: did not run cargo, did not read the `parse` sources directly
+(enum-inequality inferred from the committed regression tests).
+Operational consequence noted by the reviewer: legacy pre-fix manifests
+with legitimately-elected anchors now fail verification loudly —
+intended fail-closed direction. Disposition: APPROVE recorded; the two
+optional hardenings are lab-tooling-only and queued behind the relay
+cell (they harden, they do not fix a defect).
+
+Docs updated on this branch: Refresh §1 relay (frame-forwarding) row
+now records attempt 1 with run id, the skip-trap root cause with
+file:line, and the corrected launch recipe (NO
+`--skip-linux-live-suite`).
+
+macOS cell status unchanged otherwise: client 🟡 (CP-1 owner-deferred),
+admin 🟢, relay lifecycle 🟢, anchor 🟢, exit 🟢, blind_exit 🟢, relay
+frame-forwarding ⬛→ attempt-1 evidence recorded, still never run.
+
+Next: relaunch the relay cell from THIS worktree without
+`--skip-linux-live-suite` (`--node macos-utm-1:relay --node
+debian-headless-4:exit --node debian-headless-2:client
+--enable-relay-forwarding-validation --linux-backend
+linux-wireguard-userspace-shared --source-mode local-head`), expect the
+full Live suite to run (longer), QH-64-aware monitoring, fill any triage
+stub before the next launch.
