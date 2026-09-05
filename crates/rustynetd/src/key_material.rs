@@ -1012,6 +1012,25 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
     if public_key.trim().is_empty() {
         return Err("public key must not be empty".to_owned());
     }
+    // TEMPORARY diagnostic (WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md
+    // section 11.3): eprintln! rather than log::, because this is the single
+    // chokepoint every writer of the public-key file funnels through
+    // (key init, rotation prepare-swap, restore_key_backups) and some of
+    // those run as one-shot CLI invocations that may not have the `log`
+    // facade initialized -- eprintln! is captured either way. Public key
+    // only, never the private key. Remove once the stale-key mechanism
+    // (collect_pubkeys' captured value diverging from the daemon's own
+    // derived key within the same process, reproduced 3x) is confirmed and
+    // fixed.
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    eprintln!(
+        "write_public_key: path={} value={} at unix={now_unix}",
+        path.display(),
+        public_key.trim()
+    );
     let value = format!("{}\n", public_key.trim());
     // 0o640 (owner rw, group r, no world): the reviewed key-custody posture for
     // the WireGuard public key (linux_key_custody expects 0o640). World-read is
