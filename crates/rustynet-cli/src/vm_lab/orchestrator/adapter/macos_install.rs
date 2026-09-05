@@ -1330,19 +1330,7 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     //    shell body is a compile-time constant; only fixed /tmp paths appear
     //    in it, and the absolute CLI path keeps the install independent of
     //    sudo's PATH inside the root `sh -c`.
-    let host_plist =
-        crate::vm_lab::workspace_root_path().join("scripts/launchd/com.rustynet.relay.plist");
-    if !host_plist.is_file() {
-        return Err(AdapterError::Protocol {
-            message: format!(
-                "reviewed relay plist missing at {} on the orchestrator host",
-                host_plist.display()
-            ),
-        });
-    }
-    let plist_bytes = std::fs::read(&host_plist).map_err(|e| AdapterError::Protocol {
-        message: format!("read reviewed relay plist {}: {e}", host_plist.display()),
-    })?;
+    let plist_bytes = reviewed_relay_plist_bytes(&crate::vm_lab::workspace_root_path())?;
     let plist_tmp = write_temp_file("rn_relay_plist_", ".plist", &plist_bytes)?;
     let ship_plist = ssh::scp_to(
         conn,
@@ -1495,6 +1483,26 @@ fn write_temp_file(
     content: &[u8],
 ) -> Result<std::path::PathBuf, AdapterError> {
     super::write_secure_temp_file(prefix, suffix, content)
+}
+
+/// Read the reviewed `com.rustynet.relay` launchd plist from the
+/// orchestrator's own workspace (`scripts/launchd/com.rustynet.relay.plist`
+/// under `ws_root`). Fail-closed: absent or unreadable surfaces as `Err` —
+/// `deploy_relay_service` must never fall back to a guest-local copy or a
+/// synthesized plist, because the reviewed file IS the artifact under test.
+fn reviewed_relay_plist_bytes(ws_root: &std::path::Path) -> Result<Vec<u8>, AdapterError> {
+    let host_plist = ws_root.join("scripts/launchd/com.rustynet.relay.plist");
+    if !host_plist.is_file() {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "reviewed relay plist missing at {} on the orchestrator host",
+                host_plist.display()
+            ),
+        });
+    }
+    std::fs::read(&host_plist).map_err(|e| AdapterError::Protocol {
+        message: format!("read reviewed relay plist {}: {e}", host_plist.display()),
+    })
 }
 
 #[cfg(test)]
@@ -3782,5 +3790,41 @@ mod tests {
         .expect_err("refresh failure must fail the enforce");
         assert_eq!(*log.borrow(), vec!["wait", "refresh"]);
         assert!(err.to_string().contains("state refresh failed"));
+    }
+
+    #[test]
+    fn reviewed_relay_plist_fails_closed_when_missing() {
+        let ws = std::env::temp_dir().join(format!(
+            "rn-ws-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Deliberately do NOT create the workspace: the lookup must fail
+        // closed rather than fall back to any default location.
+        let err = reviewed_relay_plist_bytes(&ws).expect_err("missing plist must Err");
+        assert!(
+            err.to_string().contains("reviewed relay plist missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reviewed_relay_plist_returns_exact_workspace_bytes() {
+        let ws = std::env::temp_dir().join(format!(
+            "rn-ws-plist-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(1)
+        ));
+        let dir = ws.join("scripts/launchd");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let body = b"<?xml version=\"1.0\"?>\n<!-- reviewed relay plist probe -->\n";
+        std::fs::write(dir.join("com.rustynet.relay.plist"), body).expect("write plist");
+        let got = reviewed_relay_plist_bytes(&ws).expect("plist bytes");
+        assert_eq!(got, body.to_vec());
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

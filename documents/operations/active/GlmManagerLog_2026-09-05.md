@@ -266,3 +266,60 @@ time. `--skip-soak` keeps the Soak suite out (StageSuite::Soak would
 otherwise run for hours); the full Live suite runs, so expect
 role-switch/two-hop/managed-dns/relay-lifecycle stages alongside the
 Disruptive relay-forwarding stage. QH-64 watch active.
+
+## 22:30 — successor manager (edit-1788646982493-23815-0): attempt 2 verdict — relay cell STILL not exercised; macOS deploy-adapter defect identified; checkpoint fix in progress
+
+Handover processing. Attempt 2 ended at 21:50 UTC (15m 33s) in the
+PREDECESSOR's worktree (read-only for this manager): run
+`rust-1788644094`, commit `0a118d10`, clean, report
+`state/live-lab-macos-relay-fwd2-20260905-213253` (absolute:
+`/Users/iwan/Desktop/Rustynet/state/edit-worktrees/edit-1788642144227-82735-2/state/live-lab-macos-relay-fwd2-20260905-213253`).
+
+Verdict from `run_summary.json` + `failure_digest.md` + stage logs:
+**66 planned, 23 pass / 2 fail / 41 skip, overall fail.** The relay
+frame-forwarding stage WAS planned (selectors
+`relay_forwarding_validation:true`) but NEVER RAN:
+
+1. `deploy_relay_service` **FAIL** on macos-utm-1: `remote command
+   failed (exit Some(1)): sh: line 0: cd: /Users/mac/Rustynet: No such
+   file or directory`. Root cause (read from code,
+   `macos_install.rs:1270` pre-fix): the macOS adapter built
+   `sudo -n env RN_SRC=… sh -c 'cd "$RN_SRC" && rustynet ops
+   install-macos-relay'` with `RN_SRC` = configured workdir else
+   `$HOME/Rustynet` — assuming a source checkout on the guest that a
+   `--node` bootstrap never materializes (bootstrap installs from the
+   shipped archive; the inventory `rustynet_src_dir` is not a live
+   checkout). Lab-tooling defect, NOT a rustynet daemon defect. The
+   earlier relay-lifecycle green row (`livelab-1784497253`) predates
+   the `--node` engine. `relay_validation` and
+   `relay_forwards_frame_validation` skipped as failed-dependency — the
+   cell is still ⬛.
+2. `traffic_test_matrix` **FAIL** — same CP-1 cross-vmnet 100% loss
+   pattern as run #5 (all four mac↔Linux legs, default-deny
+   INCONCLUSIVE failing closed). Owner-deferred; not chased. Its
+   cascade skips (role_switch → … → live_two_hop → cross_network_*)
+   account for most of the 41 skips.
+
+Ledger state, verified with quote-aware greps of BOTH worktrees' CSVs
+and the triage jsonl: **NO run-matrix row, NO stage-results rows, NO
+triage stub exist for `rust-1788644094` anywhere** — evidence
+finalization itself failed (job wrapper reported transient_failure 70),
+so nothing was appended to port. Recorded here; nothing fabricated. The
+handover's assumption that rows landed uncommitted in the predecessor
+worktree was checked and is FALSE (clean tree, zero grep matches for
+the run id and report dir).
+
+macOS cell status: client 🟡 (CP-1 owner-deferred), admin 🟢, relay
+lifecycle 🟢, anchor 🟢, exit 🟢, blind_exit 🟢, relay frame-forwarding
+⬛ (two attempts, both pre-exercise).
+
+Fix in flight: the automatic checkpoint `25e885d9` (from the timed-out
+predecessor, already on this branch) carries a WIP fix —
+`deploy_relay_service` drops the `workdir` param, uploads the reviewed
+`scripts/launchd/com.rustynet.relay.plist` from the orchestrator's
+workspace to `/tmp`, and runs `ops install-macos-relay` from a
+`mktemp -d` staging cwd so no guest source root is needed (same proven
+shape as the quarantined `exercise_macos_relay_lifecycle_live`). This
+manager verifies/completes it (compile, unit tests, scoped gates,
+binary rebuild) before relaunching attempt 3.
+
