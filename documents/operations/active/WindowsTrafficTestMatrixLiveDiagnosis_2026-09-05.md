@@ -1,17 +1,23 @@
 # Windows `traffic_test_matrix` — live diagnosis of the WireGuard handshake failure
 
-- Status: **ROOT CAUSE CLASS CONFIRMED (exact mechanism not yet pinned).** This is
-  live-lab evidence gathered by direct guest inspection during
-  `run-2026-09-05-windows-16-setuponly` (commit `89596acd78a6d74d290e34d4496c80961292c770`),
-  not a static code trace. No code was changed. §11 (added after §1-10 below were
-  first written) confirms the failure is a **stale WireGuard public key** distributed
-  to peers: WireGuard-NT's own diagnostic log shows "Invalid MAC of handshake" — a
-  cryptographic MAC1 rejection that occurs exactly when the sender computed the
-  handshake MAC against a public key that does not match the responder's actual
-  current key — and direct comparison confirms Windows' real running public key does
-  NOT match what Linux's signed assignment bundle has on file for it. What is not yet
-  pinned down is the *exact* code path that lets a stale key reach the bundle; §11
-  lays out the strongest hypothesis and the concrete next check.
+- Status: **ROOT CAUSE CLASS CONFIRMED; a specific, well-supported mechanism
+  identified in §13 (not yet fixed).** This is live-lab evidence gathered by direct
+  guest inspection across 7 runs (`run-2026-09-05-windows-16-setuponly` through
+  `-21-diag6`), not a static code trace. No production behavior was changed — only
+  temporary diagnostic logging (§11.3, §12.5, §13.1), all clearly marked for
+  removal once a real fix lands. The failure is a **stale WireGuard public key**
+  distributed to peers: WireGuard-NT's own diagnostic log shows "Invalid MAC of
+  handshake" — a cryptographic MAC1 rejection that occurs exactly when the sender
+  computed the handshake MAC against a public key that does not match the
+  responder's actual current key. §13 traces this to a **known-weak verification
+  point**: the cleanup stage that runs before every fresh bootstrap only confirms
+  the Windows service *registration* reports `Stopped`, never that the underlying
+  daemon *process* has actually exited — and this project's own prior live-lab
+  evidence already shows the daemon's shutdown path can do slow, failing rollback
+  work after reporting itself stopped. This is assessed as the most likely
+  mechanism, not yet independently reproduced by directly observing the
+  hypothesized orphaned process (see §13.4 for the exact verification a future
+  session should run first, before implementing a fix).
 - Date: 2026-09-05
 - Topology: `linux-x86-client-1` (client), `linux-x86-exit-1` (exit),
   `windows-x86-1` (client) — all on one libvirt LAN, `192.168.121.0/24`, on
@@ -465,3 +471,131 @@ instrumentation; its result was not yet read when this section was written.
    `daemon.rs`, `key_material.rs`) is explicitly marked TEMPORARY in its own code
    comments and should be removed once the mechanism is confirmed and a real fix
    lands.
+
+## 13) The decisive run: `write_public_key` fires exactly once, and everything except `collect_pubkeys` agrees
+
+`run-2026-09-05-windows-20-diag5` (commit `24d65839`) added one more diagnostic
+(`f9395dac`: the bootstrap script now unconditionally appends `key init`'s captured
+stdout/stderr to `C:\ProgramData\RustyNet\logs\bootstrap-native-output.log`, since
+`Invoke-RustyNetBootstrapNative`'s captured `$keyInit.Output` was silently discarded
+on success — the reason the `write_public_key` logging added in `7f084cea` never
+appeared anywhere: that log line runs inside the one-shot `rustynetd key init`
+process, which never opens `rustynetd.log` at all — only the persistent service
+process does, via `init_daemon_logging`). `run-2026-09-05-windows-21-diag6`
+(commit `24d65839` also, no further code changes needed) is the run this section is
+built from.
+
+### 13.1 Four independent sources, one run, compared directly
+
+| Source | Value (base64) |
+| --- | --- |
+| `write_public_key` (the ONE call this entire run, from `key init`) | `2aBaTNcnAs3/iEBjaOslb9iyN4iTvPRAmvhHHBIhPXQ=` |
+| Daemon's own logged key at `DaemonRuntime::new()` (`daemon.rs`, `7402c894`) | `2aBaTNcnAs3/iEBjaOslb9iyN4iTvPRAmvhHHBIhPXQ=` |
+| `wg.exe show all dump`, live guest, third field of the interface line | `2aBaTNcnAs3/iEBjaOslb9iyN4iTvPRAmvhHHBIhPXQ=` |
+| `collect_pubkeys` (via `rustynet status`, `2b3422d3`-era fix) | *different value* |
+
+**The first three agree exactly** (verified programmatically, not by eye). Only
+`collect_pubkeys`' value differs. This is the single clean result across the whole
+investigation and it overturns the working theory from §12.4: it is **not** that
+two daemon sessions each derive a different key from the same file — the on-disk
+key file is written exactly once, and every consumer of it (the daemon's own
+in-memory cache, and the actual running WireGuard-NT driver) agrees. The
+divergence is entirely on `collect_pubkeys`' side of the query.
+
+### 13.2 `collect_pubkeys`' timestamp is ~40s before the only daemon start, again — and the trust CLI has no fallback path
+
+Re-confirmed the pattern from §12.4 in this run too: `collect_pubkeys` captured its
+(wrong) value at `unix=1788590920`; the only `"run_daemon entered"` line is at
+`1788590960.719` — ~40 seconds later. Read `rustynet-windows-trust-cli.rs`
+directly (not trusting the earlier GLM trace's characterization a second time):
+`execute_status()` (`:480-486`) calls `send_command(IpcCommand::Status)` and
+returns `Err` on any non-`ok` response; `send_command` (`:443-453`) does a real
+named-pipe RPC via `call_windows_daemon_control_raw` with **no fallback path at
+all** — if the pipe is unreachable, this must fail closed with a connection error,
+not return a plausible key. Yet `collect_pubkeys` reported success with a
+well-formed, 32-byte key. **Something must be answering that pipe 40 seconds before
+the daemon service this run's `key init` and `enforce_baseline_runtime` produced
+ever started** — and it cannot be reading stale data from a file (the file was
+written exactly once, by this run's `key init`, and its value matches the *later*
+sessions, not `collect_pubkeys`' value).
+
+### 13.3 Most likely mechanism: an orphaned daemon process from the *previous* run, still bound to the same named pipe
+
+The cleanup stage that runs before every fresh bootstrap (`cleanup_hosts`, deps
+`[VerifySshReachability]`, before `bootstrap_hosts`) calls
+`windows_traffic::cleanup_runtime_state` →
+`windows_stop_and_wait_services_script()` (`windows_traffic.rs:638-652`):
+
+```
+& sc.exe stop 'RustyNet' 2>&1 | Out-Null;
+& sc.exe stop 'RustyNetRelay' 2>&1 | Out-Null;
+for ($i = 0; $i -lt 20; $i++) {
+    $svc = Get-Service -Name 'RustyNet' -ErrorAction SilentlyContinue;
+    ...
+    $svcDown = ($null -eq $svc) -or ($svc.Status -eq 'Stopped');
+    ...
+    if ($svcDown -and $relayDown) { break };
+    Start-Sleep -Seconds 1
+}
+```
+
+**This polls only the Service Control Manager's registered status for the service
+name — never whether the underlying `rustynetd.exe` process has actually exited.**
+`assert_node_clean` (`:955-958`, probe at `:827-849`) has the same blind spot: its
+`service=<running|stopped|absent>` token also comes from `Get-Service`, not
+`Get-Process`. Both pass as long as SCM reports "Stopped", which for a service that
+calls `SetServiceStatus(SERVICE_STOPPED)` before its own process has finished
+tearing down (rather than strictly after) can happen while the process is still
+alive for some further interval.
+
+This project's own prior live-lab evidence already shows the daemon's shutdown path
+does exactly this kind of slow, sometimes-failing post-stop work: the
+`shutdown_rollback_residue_detected` / `shutdown rollback failed` log lines
+observed repeatedly this session (e.g. §2 of this document, and independently in
+`run-2026-09-04-windows-8`'s captured `rustynetd.log`) are the daemon reporting a
+failure from *inside* its own shutdown handling, after the stop was triggered.
+
+Every observation is consistent with: **a daemon process from the previous run's
+bootstrap, left running past `cleanup_hosts`' SCM-status-only check because its own
+shutdown rollback is slow/erroring, still holds `\\.\pipe\RustyNet\rustynetd` open
+with its (old, different) key when `collect_pubkeys` queries status early in the
+*next* run — 40 seconds before that next run's own `key init` → service (re)install
+→ `enforce_baseline_runtime` start sequence produces the real, correct daemon that
+every other observation in §13.1 agrees on.** The fresh `sc.exe create` on every run
+(§1's five 7045 "service was installed" events, one per run, confirmed in the
+System event log) would leave such an orphan with no SCM registration at all once
+the old registration is replaced — invisible to `Get-Service`, `assert_node_clean`,
+and `windows_node_clean_assert_script` alike, all of which query by service name,
+never by process.
+
+### 13.4 The verification this hypothesis still needs (not yet done — requires a live run, deliberately not run this session per the wrap-up commitment above)
+
+Immediately after a `cleanup_hosts` pass and before the next `bootstrap_hosts`
+begins, check for a `rustynetd.exe` process on the guest that is **not** associated
+with the current `RustyNet` service registration:
+
+```powershell
+Get-Process -Name rustynetd -ErrorAction SilentlyContinue | Select-Object Id, StartTime
+Get-CimInstance Win32_Service -Filter "Name='RustyNet'" | Select-Object ProcessId, State
+```
+
+If a `rustynetd.exe` PID exists that does **not** match the current service's
+`ProcessId` (or exists while the service `State` is not yet `Running`), that
+confirms the orphan directly. The fix, once confirmed, is straightforward: make
+`windows_stop_and_wait_services_script`/`assert_node_clean` also verify at the
+**process** level (e.g. resolve the service's `ProcessId` before stopping it, then
+poll `Get-Process -Id <pid>` for absence, not just `Get-Service ... Status`), so a
+slow/failing shutdown rollback cannot leave a process alive past what cleanup
+believes is a clean state.
+
+### 13.5 Updated evidence index
+
+- Trust CLI status path (no fallback, confirmed clean): `rustynet-windows-trust-cli.rs:443-453, 480-486`.
+- Cleanup's SCM-only verification: `windows_traffic.rs:638-652` (`windows_stop_and_wait_services_script`),
+  `:827-849` (`windows_node_clean_assert_script`), `:862+` (`parse_windows_node_clean_probe`),
+  `stage/cleanup.rs:39-86` (`CleanupHostsStage::execute`, `cleanup_runtime_state` +
+  `assert_node_clean` call sites).
+- Fresh service (re)install every run: System event log, 7045 events, one per run
+  (§ live-guest inspection, this session).
+- Shutdown rollback failures as prior evidence of slow/erroring shutdown: daemon
+  log lines captured earlier this session (§2; `run-2026-09-04-windows-8`).
