@@ -60,3 +60,73 @@ Decisions deferred to owner (unchanged, do not take):
 Next: commit docs, then macOS anchor re-proof from this worktree
 (`--source-mode local-head` deploys branch HEAD, hence commit first),
 then relay frame-forwarding opt-in cell (QH-64).
+
+## 18:20–18:55 — anchor re-proof run 1: all stages pass, finalization blocked by verifier bug; fixed
+
+Launched the QH-68 re-proof from this worktree (commit `fb61cf9d`'s tree):
+report `state/live-lab-macos-anchor-portmap-20260905-181715`, topology
+macos-utm-1:anchor / debian-headless-4:exit / debian-headless-2:client,
+`--skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared`,
+pid 84428.
+
+Stage verdicts (stages.tsv + stage logs): **20 pass / 0 fail / 2 skip**
+(admin_issue, blind_exit — both legitimate role-absence skips). In
+particular all four anchor stages pass:
+`deploy_macos_anchor_profile`, `validate_macos_anchor_bundle_pull`,
+`anchor_validation`, and — the QH-68 re-proof target —
+`validate_macos_anchor_port_mapping_authority` **PASS**. The fix in
+`874a9aaa` is now live-proven.
+
+BUT evidence finalization failed, so no run-matrix row was appended:
+`Rust --node evidence finalization failed: recorded plan integrity check
+failed: recorded plan does not match the independently-derived expected
+plan ... unexpected added stages: [deploy_macos_anchor_profile,
+validate_macos_anchor_bundle_pull,
+validate_macos_anchor_port_mapping_authority]`.
+
+Root cause (read from code, not guessed): the anti-shrink verifier
+`verify_recorded_plan_not_shrunk` (resolved_plan.rs) rebuilt the expected
+plan with `.with_anchor_platform_macos(selectors.anchor_platform ==
+"macos")` — the raw flag only. On `--node` runs the recorded selector is
+ALWAYS empty (native.rs records `anchor_platform: String::new()`; "bash-only
+platform election selectors remain inactive"), while the runner's election
+is OR(flag, Anchor-assigned-to-macOS-entry) via
+`anchor_platform_macos_elected` (native.rs:1196, added by `451f9730`).
+Every faithful `--node <mac>:anchor` fast-path run therefore under-derives
+the expected plan and is rejected as having "added" the three anchor
+stages.
+
+Fix applied (lab tooling, rustynet-cli — no verdict/trust code):
+
+1. `ManifestNodeAssignment` gains `#[serde(default)] platform: String`
+   (live_lab_stage_manifest.rs), filled at manifest-write time from the
+   inventory entry (native.rs now maps over `node_entries`, which carries
+   the platform). Empty/absent platform reads as not-macos.
+2. `verify_recorded_plan_not_shrunk` re-derives the election by calling the
+   SAME `anchor_platform_macos_elected` fn the runner used (now `pub(crate)`,
+   body unchanged), over the manifest's recorded node assignments;
+   unparseable role → `NodeRole::Custom` (never Anchor → no election);
+   unparseable platform → None (no election). Every failure path bends
+   toward the stricter no-election plan.
+3. Tests: `verify_honors_a_node_assigned_macos_anchor_on_the_fast_path`
+   (the regression — passes now, failed pre-fix),
+   `verify_fails_closed_for_a_platform_less_legacy_anchor_assignment`
+   (legacy platform-less manifest must NOT elect; mismatch names "added" +
+   "macos_anchor"), `verify_rejects_a_fabricated_anchor_election_without_an_assignment`.
+   Existing anti-shrink tests unchanged and green. Scoped gates: fmt,
+   clippy -D warnings, resolved_plan tests 17/17.
+
+Security review: the mandatory adversarial review (ai_read, glm-5.3) was
+attempted TWICE with the full diff; both calls timed out (MCP -32001).
+Recorded here per the max-2-retries rule; will retry when the provider
+answers. My own adversarial analysis in the interim: the change does not
+move the trust boundary in kind — the manifest already records raw CLI
+selectors authored by the runner, and the gate's purpose is to catch
+selection↔recording divergence, not to authenticate inputs; a runner that
+falsely wanted the anchor stages in its expected plan could always have
+claimed `--anchor-platform macos` pre-fix. No new growth power, all
+degenerate inputs fail toward no-election, full-digest comparison and
+dropped/added naming unchanged.
+
+Next: commit, rebuild the vm-lab binary, relaunch the re-proof with a
+fresh report dir so the matrix row actually lands.

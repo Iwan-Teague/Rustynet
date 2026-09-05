@@ -826,12 +826,18 @@ pub(crate) fn execute_rust_native_orchestration(
     // monitor) render live roles from the current run instead of inferring them
     // from the previous finalized matrix row (emit-don't-infer).
     let manifest_node_assignments: Vec<crate::live_lab_stage_manifest::ManifestNodeAssignment> =
-        ctx.assignments
+        node_entries
             .iter()
-            .map(|a| crate::live_lab_stage_manifest::ManifestNodeAssignment {
-                alias: a.alias.clone(),
-                role: a.role.as_str().to_owned(),
-            })
+            .map(
+                |(entry, a)| crate::live_lab_stage_manifest::ManifestNodeAssignment {
+                    alias: a.alias.clone(),
+                    role: a.role.as_str().to_owned(),
+                    platform: entry
+                        .platform
+                        .map(|p| p.as_str().to_owned())
+                        .unwrap_or_default(),
+                },
+            )
             .collect();
     crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
         report_dir.as_path(),
@@ -1193,7 +1199,7 @@ fn augment_assignments_from_platform_selectors(
 /// AnchorPlatformSelectorPropagationInvestigation_2026-08-31.md §4).
 /// `platform_of_alias` resolves an assignment alias to its inventory platform
 /// (`None` when the alias is absent, which never counts as macOS).
-fn anchor_platform_macos_elected(
+pub(crate) fn anchor_platform_macos_elected(
     anchor_platform: Option<&str>,
     assignments: &[orchestrator::role_assignment::NodeRoleAssignment],
     platform_of_alias: &dyn Fn(&str) -> Option<VmGuestPlatform>,

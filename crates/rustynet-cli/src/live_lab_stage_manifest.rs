@@ -89,12 +89,18 @@ pub const NATIVE_EXECUTION_DIALECT: &str = "native_node_v1";
 
 /// One `<alias>:<role>` assignment from a Rust `--node` run, recorded in the
 /// manifest so consumers render the current run's topology (emit-don't-infer).
-/// Platform is intentionally absent — a consumer already knows each alias's OS
-/// from the inventory; the run only adds the role.
+/// `platform` is the inventory platform string for the alias (empty on legacy
+/// manifests, which read back as not-macos) — the anti-shrink verifier needs it
+/// to re-derive the MAC-D1 anchor election from `--node <alias>:anchor`
+/// assignments, because the raw `--anchor-platform` selector is always empty on
+/// the `--node` path and the election cannot be reconstructed from selectors
+/// alone.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestNodeAssignment {
     pub alias: String,
     pub role: String,
+    #[serde(default)]
+    pub platform: String,
 }
 
 /// Snapshot of the selectors the plan was resolved from — recorded so a
