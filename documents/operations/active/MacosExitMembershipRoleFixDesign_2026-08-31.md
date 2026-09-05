@@ -841,10 +841,25 @@ corrections applied, Option D ledgered as the target — not the original
       Idempotency-branch tests + the `epoch == 2` assertion are required.
 - [x] ★ §5.3 live proof must record `owner_signing_key_present=` as an
       explicit evidence line; sign-off quotes it next to the stage status.
-- [ ] Implementation landed on `main` with the §5.1 checklist complete,
-      gates green, and an adversarial review of the ACTUAL diff (not the
-      design) recorded before landing.
-- [ ] §5.3 live proof run recorded: run-matrix row attributed to the
-      landing commit, `membership_init` artifact status quoted, and the
-      `owner_signing_key_present=true` line quoted from the run's
-      `membership_init` log.
+- [x] Implementation landed on `main` (`50460501`, 2026-09-05) with the
+      §5.1 checklist complete, the full pinned §7 gate chain green, and three
+      glm-5.3 adversarial reviews of the ACTUAL diff (all LAND-WITH-FIXES;
+      every fix applied before landing — typed plan steps, argv-only
+      presence probe, node-id seam validation before the evidence line,
+      recorder truncate-failure hardening, renderer byte-identity test).
+- [x] §5.3 live proof run recorded — membership half: run
+      `livelab-1788625551-504605015758` (commit `50460501`, clean, report
+      `state/live-lab-macos-exit-fix-20260905-171614`), run-matrix row
+      appended and attributed; `membership_init` artifact status `pass`;
+      the evidence line quoted verbatim from `logs/membership_init.log`:
+      `owner_signing_key_present=true path=/usr/local/etc/rustynet/membership.owner.key node_id=macos-utm-1-bootstrap`;
+      all `distribute_*` + `enforce_baseline_runtime` pass; no daemon failure
+      marker on any node (the `blind_exit role cannot use membership carrying
+      anchor capability` rejection is gone).
+- [ ] §5.3 live proof — baseline half: `validate_baseline_runtime` FAILED on
+      the pre-declared next blocker (`macos-utm-1/DnsFailclosed: pf DNS block
+      floor not verified ... anchors scanned: [com.apple/rustynet_g0,
+      com.apple/rustynet_g1]`) with daemon markers CLEAN — i.e. the distinct
+      blind_exit-posture DNS-floor question, not a regression of this fix.
+      Open until that is diagnosed (triage stub
+      `livelab-1788625551-504605015758::validate_baseline_runtime`).
