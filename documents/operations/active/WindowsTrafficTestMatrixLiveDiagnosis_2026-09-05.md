@@ -673,12 +673,36 @@ authoritative for every reader downstream, `collect_pubkeys` included. A gated
 no-op there. Unit-tested (`windows_daemon_status_query_reports_absent_and_running_distinctly`,
 `windows_daemon_status_running_parse_is_exact_match`); `cargo fmt --check`,
 `cargo clippy -p rustynet-cli --features vm-lab --all-targets -- -D warnings`,
-and the crate's test suite all verified clean before landing. **Not yet
-re-proven live end-to-end through `traffic_test_matrix`** — the two runs that
-produced the decisive evidence above both used `--setup-only` (by design, to
-allow live guest inspection) and never reached that stage; the next live-lab run
-against this commit should drop `--setup-only` and confirm `traffic_test_matrix`
-passes for `windows-x86-1`.
+and the crate's test suite all verified clean before landing.
+
+**Independently confirmed live, without `--setup-only`, in `run-2026-09-05-windows-24-keyinit-fix-proof`
+(commit `73a0b2ec`, includes the fix).** This run dropped `--setup-only` to
+reach `traffic_test_matrix` directly, but hit the separate, already-documented
+DnsFailclosed IPv6 flake (`WindowsDnsFailclosedIpv6FlakeDiagnosis_2026-09-05.md`)
+at `validate_baseline_runtime` first, which blocks every later stage including
+`traffic_test_matrix` by dependency. Before that failure, a manual `wg.exe show
+all dump` taken immediately after `enforce_baseline_runtime` passed showed:
+
+- `windows-x86-1`'s live daemon public key
+  (`2v/TfHMdnAaXYhBk7NJzAloDRTBr1G7yxeCWfVYJNmc=`) **exactly matched** what
+  `collect_pubkeys` captured (`daffd37c...93667` hex, same base64) and what
+  `distribute_assignments` sent to both Linux peers — the mismatch this fix
+  targets is gone.
+- Both peer entries in the dump showed **real, non-zero** `latest_handshake_time`
+  (`1788596755`, a genuine Unix timestamp) and non-zero `rx_bytes`/`tx_bytes`
+  (`180`/`25` and `948`/`25`) — actual successful WireGuard handshakes and
+  actual data flow, something that never happened in any pre-fix run (every
+  one of which stayed at zero handshakes / zero bytes with "Invalid MAC of
+  handshake, dropping packet").
+
+This is direct proof the underlying defect this section describes is fixed;
+what remains open is only the **official `traffic_test_matrix` stage verdict**,
+which needs a run that gets past the unrelated DnsFailclosed flake first. A
+follow-up run (`run-2026-09-05-windows-25-keyinit-fix-proof`) was launched
+immediately after to obtain that official pass — check
+`documents/operations/live_lab_stage_triage.jsonl` /
+`documents/operations/live_lab_node_stage_results.csv` for its outcome before
+citing `traffic_test_matrix` itself as green.
 
 All temporary diagnostic instrumentation added this session (`collect_pubkeys.rs`,
 `distribute_assignments.rs`, `daemon.rs`, `key_material.rs`, and the
