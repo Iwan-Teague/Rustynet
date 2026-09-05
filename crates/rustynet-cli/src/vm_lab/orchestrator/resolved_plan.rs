@@ -347,12 +347,52 @@ pub fn verify_recorded_plan_not_shrunk(report_dir: &Path) -> Result<(), String> 
         enable_suite: selectors.cross_network_suite,
         ..Default::default()
     };
+    // MAC-D1: reconstruct the anchor election the SAME way the runner did —
+    // the raw `--anchor-platform macos` flag OR an Anchor role assigned to a
+    // macOS inventory entry. On the `--node` path the selector is always
+    // empty and the election lives entirely in the node assignments, so
+    // reading the selector alone (the pre-fix behavior) under-derived the
+    // expected plan and the verifier rejected every faithful `--node
+    // <mac-alias>:anchor` run at finalization ("unexpected added stages").
+    // Legacy manifests without assignment platforms parse as empty (not
+    // macos), which fails toward the stricter no-election plan — a recorded
+    // plan that legitimately elected then mismatches loudly rather than
+    // verifying silently.
+    let manifest_assignments: Vec<
+        crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment,
+    > = manifest
+        .node_assignments
+        .iter()
+        .map(
+            |a| crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment {
+                alias: a.alias.clone(),
+                role: crate::vm_lab::orchestrator::role::NodeRole::parse(&a.role).unwrap_or_else(
+                    |_| crate::vm_lab::orchestrator::role::NodeRole::Custom(a.role.clone()),
+                ),
+            },
+        )
+        .collect();
+    let assignment_platforms: std::collections::HashMap<&str, &str> = manifest
+        .node_assignments
+        .iter()
+        .map(|a| (a.alias.as_str(), a.platform.as_str()))
+        .collect();
+    let platform_of_alias = |alias: &str| -> Option<crate::vm_lab::VmGuestPlatform> {
+        assignment_platforms
+            .get(alias)
+            .and_then(|p| crate::vm_lab::VmGuestPlatform::parse(p).ok())
+    };
+    let anchor_platform_macos = crate::vm_lab::orchestrator::native::anchor_platform_macos_elected(
+        Some(selectors.anchor_platform.as_str()).filter(|s| !s.is_empty()),
+        &manifest_assignments,
+        &platform_of_alias,
+    );
     let expected_stages = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
         .with_skip_live_suite(selectors.skip_linux_live_suite)
         // MAC-D3: the reconstruction must reproduce the exact membership the
         // runner built — a fast-path run that elected a macOS anchor recorded
         // the three validator stages even with the live suite skipped.
-        .with_anchor_platform_macos(selectors.anchor_platform == "macos")
+        .with_anchor_platform_macos(anchor_platform_macos)
         .with_enable_chaos_suite(selectors.chaos_suite)
         .with_enable_negative_control(selectors.negative_control_suite)
         .with_enable_relay_forwarding_validation(selectors.relay_forwarding_validation)
@@ -919,6 +959,119 @@ mod tests {
         // No manifest at all → nothing to verify.
         let tmp3 = tempfile::tempdir().expect("tempdir");
         verify_recorded_plan_not_shrunk(tmp3.path()).expect("absent manifest no-ops");
+    }
+
+    // ---- MAC-D1 reconstruction: the anchor election must honor --node
+    // assignments, because the anchor_platform selector is always empty on
+    // the --node path (regression: every faithful `--node <mac>:anchor`
+    // fast-path run was rejected at finalization as "unexpected added
+    // stages"). ----
+
+    fn fast_path_selectors() -> crate::live_lab_stage_registry::TargetSelectors {
+        crate::live_lab_stage_registry::TargetSelectors {
+            skip_linux_live_suite: true,
+            chaos_suite: false,
+            cross_network_suite: false,
+            soak_suite: false,
+            negative_control_suite: false,
+            relay_forwarding_validation: false,
+            local_gate_suite: false,
+            ..Default::default()
+        }
+    }
+
+    fn anchor_fast_path_plan(anchor_macos_elected: bool) -> ResolvedPlan {
+        let stages = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
+            .with_skip_live_suite(true)
+            .with_anchor_platform_macos(anchor_macos_elected)
+            .build();
+        let graph = StageGraph::from_stages(&stages);
+        let selection = PlanSelection::Standard {
+            stages: stages.iter().map(|stage| stage.id()).collect(),
+        };
+        resolve(&graph, &selection, &[]).expect("resolve")
+    }
+
+    fn write_fast_path_manifest(
+        dir: &Path,
+        assignments: &[crate::live_lab_stage_manifest::ManifestNodeAssignment],
+    ) {
+        let native = crate::live_lab_stage_manifest::NativeRunManifest {
+            execution_dialect: crate::live_lab_stage_manifest::NATIVE_EXECUTION_DIALECT.to_owned(),
+            run_instance_id: "run-1".to_owned(),
+            plan_kind: "standard".to_owned(),
+            resolved_plan_digest: "d".to_owned(),
+            required_cleanup_stage_ids: vec![],
+        };
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
+            dir,
+            "vm-lab-orchestrate-live-lab",
+            "full",
+            &fast_path_selectors(),
+            &empty,
+            assignments,
+            Some(native),
+        )
+        .expect("write manifest");
+    }
+
+    fn macos_anchor_assignment(
+        platform: &str,
+    ) -> crate::live_lab_stage_manifest::ManifestNodeAssignment {
+        crate::live_lab_stage_manifest::ManifestNodeAssignment {
+            alias: "macos-utm-1".to_owned(),
+            role: "anchor".to_owned(),
+            platform: platform.to_owned(),
+        }
+    }
+
+    #[test]
+    fn verify_honors_a_node_assigned_macos_anchor_on_the_fast_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // anchor_platform selector empty (always, on --node) + Anchor on a
+        // macOS entry → the three MacosAnchor* stages are expected.
+        write_fast_path_manifest(dir, &[macos_anchor_assignment("macos")]);
+        let plan = anchor_fast_path_plan(true);
+        write_resolved_plan(dir, &plan).expect("write plan");
+        verify_recorded_plan_not_shrunk(dir)
+            .expect("a faithful --node <mac>:anchor fast-path run must verify");
+    }
+
+    #[test]
+    fn verify_fails_closed_for_a_platform_less_legacy_anchor_assignment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // Legacy manifest shape: no platform recorded. The reconstruction must
+        // NOT elect (empty platform parses as not-macos), so a recorded plan
+        // that carries the three anchor stages mismatches loudly.
+        write_fast_path_manifest(dir, &[macos_anchor_assignment("")]);
+        let plan = anchor_fast_path_plan(true);
+        write_resolved_plan(dir, &plan).expect("write plan");
+        let err = verify_recorded_plan_not_shrunk(dir)
+            .expect_err("a platform-less assignment must not elect the anchor set");
+        assert!(
+            err.contains("added") && err.contains("macos_anchor"),
+            "the rejection must name the added anchor stages: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_fabricated_anchor_election_without_an_assignment() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // No assignment at all, selector empty → the recorded plan must NOT
+        // carry the anchor stages; one that does is an unexpected addition.
+        write_fast_path_manifest(dir, &[]);
+        let plan = anchor_fast_path_plan(true);
+        write_resolved_plan(dir, &plan).expect("write plan");
+        let err = verify_recorded_plan_not_shrunk(dir)
+            .expect_err("no election input may not verify an anchor- carrying plan");
+        assert!(
+            err.contains("added"),
+            "the rejection must name the divergence: {err}"
+        );
     }
 
     #[test]
