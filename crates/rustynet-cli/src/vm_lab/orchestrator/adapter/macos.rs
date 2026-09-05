@@ -176,6 +176,10 @@ impl NodeAdapter for MacosNodeAdapter {
         macos_membership::init_membership_snapshot(&self.conn, owner_key, peers)
     }
 
+    fn probe_membership_owner_signing_key_present(&self) -> Result<bool, AdapterError> {
+        macos_membership::probe_owner_signing_key_present(&self.conn)
+    }
+
     // ── Per-node identity + key collection ────────────────────────────────────
 
     fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {

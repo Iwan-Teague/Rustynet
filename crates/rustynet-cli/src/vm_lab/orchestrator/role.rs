@@ -157,6 +157,27 @@ impl NodeRole {
                 )),
             },
             VmGuestPlatform::Macos => match self {
+                // DECREE (recorded 2026-09-05; origin `e3f55b7e` 2026-05-22,
+                // formalized `dbb41c87`; rationale reconstructed in
+                // `MacosExitMembershipRoleFixDesign_2026-08-31.md` §4.1-§4.3):
+                // the macOS lab `Exit` runs the `blind_exit` daemon posture,
+                // NOT `admin` as on Linux/Windows. macOS has no kernel
+                // WireGuard / nft NAT path; the pf-based blind-exit machinery
+                // (`macos_blind_exit.rs`: pf anchor, local-origin egress
+                // tunnel-only, forwarded egress mesh-CIDR-only) is the macOS
+                // egress-enforcement substrate, and `blind_exit` is the one
+                // macOS exit posture with standing live proof. Reversing the
+                // mapping would grant the lab exit the full-IPC `admin`
+                // authority blind_exit deliberately withholds. Consequences:
+                // (1) the exit's SIGNED membership must carry exactly
+                // `{blind_exit, exit_server}` (see `product_capabilities_for_platform`
+                // below and the macOS membership adapter's post-genesis
+                // rewrite); (2) this is an INTENDED per-OS divergence recorded
+                // in the parity ledgers; (3) blind_exit evidence does NOT
+                // validate the product's admin-posture macOS `Exit` preset
+                // (`role_presets.rs` `PrimaryRole::Admin`,
+                // `ops_install_macos_exit.rs`), which is a different code
+                // path and stays open/N-A-by-decree until proven on its own.
                 NodeRole::Exit | NodeRole::BlindExit => Ok("blind_exit"),
                 // Admin / Anchor = admin (holds the `anchor` capability).
                 NodeRole::Admin | NodeRole::Anchor => Ok("admin"),

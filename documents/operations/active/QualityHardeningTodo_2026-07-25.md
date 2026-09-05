@@ -6289,7 +6289,17 @@ Filed from `MacosExitMembershipRoleFixDesign_2026-08-31.md` §1.3.1/§3c, where 
 
 So a signed update granting a `blind_exit` node `relay_host` (making the
 hardened terminal-hop exit a relay co-host) or `client` passes propose, sign,
-apply, AND daemon bootstrap replay today. The product preset table never produces
+apply, AND daemon bootstrap replay today. **Reachability, corrected 2026-09-05
+by an in-process test:** the reducer's blind_exit immutability gate
+(`reduce_membership_state`, SetNodeCapabilities arm) refuses ANY
+`SetNodeCapabilities` on a record that ALREADY carries `blind_exit`, so an
+existing blind_exit record cannot be widened. The over-wide set is reachable
+only on ENTRY: an `AddNode` carrying `{blind_exit, exit_server, relay_host}`
+(the path every non-owner blind_exit peer is provisioned through), or a single
+`SetNodeCapabilities` from a non-blind record straight to that set (the path
+the interim macOS exit fix uses, with the correct pair). The fix below still
+applies unchanged — the exact-set compare belongs in the format validator and
+the daemon, where it catches both entry paths. The product preset table never produces
 these combinations (`role.rs:186-189` grants exactly `{blind_exit, exit_server}`
 on macOS; `role_presets.rs` has no blind_exit+relay preset), so the gap is
 reachable only through the raw `membership propose-set-capabilities` /
