@@ -241,3 +241,54 @@ reappears (a) immediately (vacuous-pass theory) or (b) specifically at/after
 IP assignment (later-trigger theory) or (c) something else. Do not attempt a
 fifth fix before that evidence exists — the last four fixes in this session
 were each landed on solid direct evidence; this one should be too.
+
+## 9. Theory B confirmed — root cause found, fifth fix landed (`923f2f9b`)
+
+The evidence came in from two directions at once:
+
+**Code reading.** `backend.start()`'s own readiness wait
+(`wait_for_tunnel_ready`, `rustynet-backend-wireguard/src/windows_command.rs:163-188`)
+only confirms `wg show <tunnel>` returns non-empty — the adapter is attached
+and queryable — and its own doc comment explicitly says the adapter "may
+still be initialising." It does **not** wait for an IP address to bind. The
+only place that DOES wait for the address (`windows_tunnel_ip_readiness_fragment`,
+`windows_install.rs:912`, up to 90s) lives on the **lab orchestrator side**,
+called from `enforce_daemon` well AFTER `apply_dns_loopback` already ran
+inside the daemon's own `apply_dataplane_generation`. A real end-user install
+never runs that orchestrator wait at all — meaning this gap is a live
+daemon-side defect, not a lab-timing artifact.
+
+**Live evidence, twice in one run.** The tightly-instrumented diagnostic run
+(`run-2026-09-05-windows-29-dns-race-diagnostic`) polled `rustynet0`'s IPv6
+DNS servers and IPv4 address every 2s and caught the mechanism directly,
+TWICE:
+
+```
+[10:23:40] DNS6=fec0:0:0:ffff::1,...  IP4=100.64.0.1     <- same poll cycle
+[10:23:44] DNS6=::1                                       <- daemon corrects it
+...
+[10:23:57] DNS6=fec0:0:0:ffff::1,...  IP4=100.64.0.1     <- same poll cycle, again
+[10:24:07] DNS6=::1                                       <- daemon corrects it again
+```
+
+The placeholder appears in the **same poll cycle** as the mesh IP —
+confirming Windows re-writes the interface's default IPv6 DNS as a side
+effect of the address-bind event itself, which happens strictly AFTER
+`apply_dns_loopback`'s own verify-then-retry loop already ran and returned
+`Ok` (that loop runs immediately after `backend.start()`, before the address
+exists). This is why §5's fix could "succeed" on its own terms and still lose
+the race: it was verifying a state that had not yet been perturbed by the
+event that perturbs it.
+
+**Fix landed:** `923f2f9b`. `apply_dns_loopback` now calls a new
+`wait_for_tunnel_ip_address` FIRST, before touching DNS at all — polling
+`Get-NetIPAddress` (via a new `WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS` constant,
+deliberately `SilentlyContinue` so an unbound address reads as empty rather
+than throwing) for up to 30 attempts × 500ms (15s), failing closed with a
+clear error if the address never appears. This makes the daemon's own DNS
+set happen strictly AFTER Windows' address-triggered rewrite, closing the
+race by construction instead of trying to out-retry it. Unit-tested
+(script-shape assertion), fmt/clippy/Windows-cross-compile/full test suite
+all verified clean. **Not yet live-re-proven** (the diagnostic run that
+produced this evidence used the PRE-fix code, as intended — it needed to
+observe the unfixed mechanism).
