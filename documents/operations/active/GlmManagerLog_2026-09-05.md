@@ -248,3 +248,21 @@ debian-headless-4:exit --node debian-headless-2:client
 linux-wireguard-userspace-shared --source-mode local-head`), expect the
 full Live suite to run (longer), QH-64-aware monitoring, fill any triage
 stub before the next launch.
+
+## 21:33 — relay attempt 2 launched from THIS worktree (correct recipe)
+
+Relaunched the relay frame-forwarding cell without the trap flag:
+`--node macos-utm-1:relay --node debian-headless-4:exit --node
+debian-headless-2:client --enable-relay-forwarding-validation
+--skip-soak --linux-backend linux-wireguard-userspace-shared
+--source-mode local-head --trust-inventory-ready --known-hosts-file
+~/.ssh/known_hosts`, report `state/live-lab-macos-relay-fwd2-20260905-213253`,
+pid 12879, deploying branch HEAD `0a118d10` (docs-only on top of
+`2a7cbf6a`). First launch died immediately on a missing required flag
+(`--known-hosts-file is required when --node flags are present`) —
+relaunched with it; report dir wiped and reused. The recorded manifest
+now shows `relay_forwarding_validation:true` — the stage IS planned this
+time. `--skip-soak` keeps the Soak suite out (StageSuite::Soak would
+otherwise run for hours); the full Live suite runs, so expect
+role-switch/two-hop/managed-dns/relay-lifecycle stages alongside the
+Disruptive relay-forwarding stage. QH-64 watch active.
