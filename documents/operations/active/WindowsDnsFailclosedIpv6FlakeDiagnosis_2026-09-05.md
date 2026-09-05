@@ -292,3 +292,47 @@ race by construction instead of trying to out-retry it. Unit-tested
 all verified clean. **Not yet live-re-proven** (the diagnostic run that
 produced this evidence used the PRE-fix code, as intended — it needed to
 observe the unfixed mechanism).
+
+## 10. `923f2f9b` reproduced live as INSUFFICIENT too — the race is later/looser than modeled
+
+`run-2026-09-05-windows-30-six-fixes-proof` (commit `f6be7858`, includes
+`923f2f9b`) failed `validate_baseline_runtime` with the exact same IPv6
+symptom again. This is a genuinely new data point, not a repeat of §8/§9's
+evidence: the daemon's own log shows the ENTIRE `apply_dns_loopback` call —
+the new tunnel-IP wait, the IPv4 set, the IPv6 verify-retry loop, the NRPT
+add-verify loop — completed with **no retry-attempt log lines at all**,
+meaning every single check inside it passed on its first read. The ~8.85s
+gap between `apply_dns_loopback`'s entry log and `runtime bootstrap complete`
+is consistent with that many sequential `powershell.exe` collector
+invocations succeeding cleanly, not with anything retrying.
+
+So: by the time `apply_dns_loopback` returns `Ok`, the interface's IP was
+already bound (my wait's first check found it), AND the DNS state was
+already loopback-compliant. Yet `validate_baseline_runtime` — which, from the
+daemon-log/orchestrator-log timing, queries within roughly 1-3 seconds of
+`control + privileged pipe servers spawned` — found it drifted again. This
+narrows the remaining possibilities:
+
+1. **Recurring reassertion**, not a one-time event tied to the first IP bind
+   — some Windows background process (Network Location Awareness / NCSI /
+   Network List Service are candidates, not yet confirmed) periodically
+   re-checks and re-writes a "connected" interface's default DNS, independent
+   of whether it was already correct. If so, no single wait-then-set
+   sequence can ever fully close this window — only a validator that also
+   tolerates settle time, or a daemon that keeps re-asserting on an interval
+   at least as tight as Windows', would work.
+2. A **second, distinct trigger** close to (but after) IP-bind that this
+   session hasn't identified yet (e.g. network-category classification
+   settling from "Identifying" to "Public"/"Private", which can lag the raw
+   IP bind by a few seconds on some Windows builds).
+
+**Do not attempt a seventh fix without distinguishing these.** The next
+diagnostic needs 1s-or-tighter polling specifically covering the last
+10-15s before the validator's query (not just around the initial IP bind,
+which §9's run already covered well) — if the placeholder reappears more
+than once, or without any interface-state transition immediately preceding
+it, that's strong evidence for theory 1 (recurring reassertion), which would
+point toward a settle-time retry on the VALIDATOR side
+(`crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/dns_failclosed.rs:72-85`,
+mirroring the existing `windows_tunnel_ip_readiness_fragment` pattern) rather
+than another apply-side precondition.
