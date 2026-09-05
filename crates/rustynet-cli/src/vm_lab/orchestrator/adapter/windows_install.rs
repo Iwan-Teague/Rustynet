@@ -429,13 +429,77 @@ pub fn install_daemon(
     run_remote_ps(conn, &verify_script, SHORT_TIMEOUT)?;
 
     // Run the e2e bootstrap sequence to generate WireGuard keys, membership
-    // state, and trust evidence. The service starts AFTER bootstrap completes.
+    // state, and trust evidence.
+    //
+    // NOTE this comment used to read "the service starts AFTER bootstrap
+    // completes" — that was never true. `install_script` above
+    // (Install-RustyNetWindowsService.ps1) already ran its OWN
+    // `rustynetd key init --force` under the service's runtime identity and
+    // started the daemon itself (non-enforcing mode, 'start-runtime-service'
+    // step) so the service can serve local queries before any mesh
+    // assignment bundle exists. `run_windows_e2e_bootstrap` below performs a
+    // SEPARATE, independently-hardened key init (the "Phase 27 reviewer
+    // fold-in": statistically independent WG/signing passphrases, atomic
+    // DPAPI-protected write) that overwrites the same on-disk WireGuard key
+    // material a second time.
     run_windows_e2e_bootstrap(conn, alias, ctx)?;
+
+    // The daemon install_script started above is still running the FIRST
+    // keypair it derived at its own startup; the rekey that
+    // run_windows_e2e_bootstrap just performed changed what's on disk without
+    // that already-running process reloading anything. Left uncorrected,
+    // `collect_pubkeys` (which queries this daemon's live status over its
+    // named pipe, not the key file) captures the STALE first keypair and
+    // distributes it to peers — while `enforce_baseline_runtime` later
+    // restarts this same daemon for the auto-tunnel-enforce flip, at which
+    // point it picks up the SECOND (current) keypair. Peers end up holding a
+    // public key this node's WireGuard-NT tunnel never actually uses, which
+    // surfaces as a WireGuard "Invalid MAC of handshake" failure in
+    // `traffic_test_matrix` (root-caused live,
+    // WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md §14). Restart now,
+    // immediately after the key material reaches its final state, so every
+    // reader downstream of this point — collect_pubkeys included — observes
+    // the same key the daemon will actually run with for the rest of this
+    // node's lifetime in this bootstrap. A gated install (-NoDaemonStart)
+    // never starts the daemon in the first place, so this is a no-op there.
+    if windows_daemon_is_running(conn)? {
+        stop_daemon(conn)?;
+        start_daemon(conn)?;
+    }
 
     Ok(InstallReport {
         daemon_path: WINDOWS_RUSTYNETD_PATH.into(),
         service_name: WINDOWS_SERVICE_NAME.to_owned(),
     })
+}
+
+/// Build the PowerShell that prints the `RustyNet` SCM service's current
+/// `Status` (or `Absent` if the service does not exist).
+fn windows_daemon_status_query_script(service_name: &str) -> Result<String, AdapterError> {
+    let svc_q = ps_quote(service_name)?;
+    Ok(format!(
+        "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
+         $ProgressPreference = 'SilentlyContinue'; \
+         $svc = Get-Service -Name {svc_q} -ErrorAction SilentlyContinue; \
+         if ($svc) {{ $svc.Status.ToString() }} else {{ 'Absent' }}",
+    ))
+}
+
+/// `true` iff the queried status text is exactly `Running` (after trimming
+/// the whitespace `run_remote_ps` leaves around trimmed stdout).
+fn parse_windows_daemon_status_running(status_text: &str) -> bool {
+    status_text.trim() == "Running"
+}
+
+/// Query whether the `RustyNet` SCM service currently reports `Running`.
+///
+/// Used by `install_daemon` to decide whether the daemon install script's own
+/// early (non-enforcing) service start needs to be restarted after a later
+/// key-init rewrites the on-disk WireGuard key material out from under it.
+fn windows_daemon_is_running(conn: &NodeConnection) -> Result<bool, AdapterError> {
+    let script = windows_daemon_status_query_script(WINDOWS_SERVICE_NAME)?;
+    let status = run_remote_ps(conn, &script, SHORT_TIMEOUT)?;
+    Ok(parse_windows_daemon_status_running(&status))
 }
 
 /// Enforce baseline runtime on Windows: update daemon args to enable
@@ -2173,6 +2237,25 @@ mod tests {
             !script.contains("Start-Service"),
             "service smoke path must not block on Start-Service"
         );
+    }
+
+    #[test]
+    fn windows_daemon_status_query_reports_absent_and_running_distinctly() {
+        let script = windows_daemon_status_query_script("RustyNet")
+            .expect("status query script should render");
+
+        assert!(script.contains("Get-Service -Name 'RustyNet'"));
+        assert!(script.contains("if ($svc) { $svc.Status.ToString() } else { 'Absent' }"));
+    }
+
+    #[test]
+    fn windows_daemon_status_running_parse_is_exact_match() {
+        assert!(parse_windows_daemon_status_running("Running"));
+        assert!(parse_windows_daemon_status_running("  Running\n"));
+        assert!(!parse_windows_daemon_status_running("StopPending"));
+        assert!(!parse_windows_daemon_status_running("Stopped"));
+        assert!(!parse_windows_daemon_status_running("Absent"));
+        assert!(!parse_windows_daemon_status_running(""));
     }
 
     #[test]
