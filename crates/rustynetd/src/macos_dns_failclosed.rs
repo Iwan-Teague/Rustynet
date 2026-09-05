@@ -488,9 +488,19 @@ fn read_networksetup(args: &[&str]) -> Option<String> {
 /// omits (they are sub-anchors of Apple's `com.apple` parent). Both dumps are
 /// filtered through `parse_pf_anchor_names`, so only prefix-matched, structurally
 /// valid rustynet-owned anchors survive.
-pub fn merge_rustynet_anchor_names(top_output: &str, nested_output: Option<&str>) -> Vec<String> {
+/// True when a `pfctl -s Anchors` dump lists `parent` as a top-level anchor
+/// (exact trimmed-line match). Decides whether a parent's sub-anchor listing
+/// is REQUIRED for the floor scan to be verifiable.
+pub fn top_level_anchor_listed(top_output: &str, parent: &str) -> bool {
+    top_output.lines().any(|line| line.trim() == parent)
+}
+
+pub fn merge_rustynet_anchor_names(
+    top_output: &str,
+    nested_outputs: &[Option<&str>],
+) -> Vec<String> {
     let mut anchors = parse_pf_anchor_names(top_output);
-    if let Some(nested_output) = nested_output {
+    for nested_output in nested_outputs.iter().flatten() {
         for anchor in parse_pf_anchor_names(nested_output) {
             if !anchors.contains(&anchor) {
                 anchors.push(anchor);
@@ -514,9 +524,11 @@ pub fn read_pf_dns_block_floor() -> Option<PfDnsBlockFloorObservation> {
     // TOP-LEVEL anchor names (e.g. `com.apple`, `com.rustynet`), so the nested
     // floor anchor is invisible to it; the daemon loads and verifies that anchor
     // by its full path (`pfctl -a com.apple/rustynet_g{N} -s rules`, see
-    // phase10::verify_live_pf_dns_floor). Enumerate BOTH the top-level set (which
-    // still catches the top-level `com.rustynet/` family) AND `com.apple`'s
-    // sub-anchors, so this check observes the same floor the daemon installed.
+    // phase10::verify_live_pf_dns_floor). Enumerate the top-level set AND the
+    // sub-anchors of BOTH rustynet-owned parents — `com.apple` (the
+    // generation-scoped killswitch floor) and `com.rustynet` (the blind-exit
+    // anchor family) — so this check observes the same floor the daemon
+    // installed, whichever posture installed it.
     //
     // Fail-closed is preserved: a failed top-level query still returns `None`
     // (unverifiable); the nested query is best-effort because an UNFOUND floor
@@ -524,8 +536,35 @@ pub fn read_pf_dns_block_floor() -> Option<PfDnsBlockFloorObservation> {
     // nested query can therefore never make the check PASS, only limit which
     // anchors are scanned; and every per-anchor rule read stays `?`-fail-closed.
     let top_output = read_pfctl(&["-s", "Anchors"])?;
-    let nested_output = read_pfctl(&["-a", "com.apple", "-s", "Anchors"]);
-    let anchors = merge_rustynet_anchor_names(&top_output, nested_output.as_deref());
+    // A parent the top-level dump PROVES is present whose sub-anchor listing
+    // cannot be read is UNVERIFIABLE, not "floor absent": return `None` so the
+    // report says `pfctl unreadable` (the truthful cause) rather than a false
+    // "rules absent" — the stage fails closed either way, but the ledger must
+    // not misdirect triage. A parent that is simply not listed needs no nested
+    // query, and its absent dump can only hide anchors, never satisfy the
+    // floor predicate.
+    let nested_apple = read_pfctl(&["-a", "com.apple", "-s", "Anchors"]);
+    if top_level_anchor_listed(&top_output, "com.apple") && nested_apple.is_none() {
+        return None;
+    }
+    // The blind-exit posture loads its rules — which carry the same two
+    // labeled DNS block rules — into `com.rustynet/blind_exit`
+    // (`macos_blind_exit::DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR`, the anchor
+    // `phase10::current_anchor_name` selects while a blind-exit config is
+    // active, and the anchor the daemon's own A5 `verify_live_pf_dns_floor`
+    // reads). It is a SUB-anchor of the top-level `com.rustynet` parent, so
+    // like the `com.apple` floor it is invisible to `pfctl -s Anchors`;
+    // enumerate that family too. Live-lab run livelab-1788625551 (2026-09-05)
+    // false-failed a macOS blind exit whose floor the daemon had verified,
+    // because only `com.apple`'s sub-anchors were scanned.
+    let nested_rustynet = read_pfctl(&["-a", "com.rustynet", "-s", "Anchors"]);
+    if top_level_anchor_listed(&top_output, "com.rustynet") && nested_rustynet.is_none() {
+        return None;
+    }
+    let anchors = merge_rustynet_anchor_names(
+        &top_output,
+        &[nested_apple.as_deref(), nested_rustynet.as_deref()],
+    );
     let mut anchors_scanned = Vec::new();
     let mut block_rules_present = false;
     for anchor in anchors {
@@ -1297,7 +1336,7 @@ com.rustynet
         let nested = "com.apple/rustynet_g5
 com.apple/250.ApplicationFirewall
 ";
-        let anchors = merge_rustynet_anchor_names(top, Some(nested));
+        let anchors = merge_rustynet_anchor_names(top, &[Some(nested)]);
         assert!(
             anchors.contains(&"com.apple/rustynet_g5".to_owned()),
             "the nested com.apple/rustynet_g floor anchor must be scanned; got {anchors:?}"
@@ -1312,19 +1351,79 @@ com.apple/250.ApplicationFirewall
         let top_only = merge_rustynet_anchor_names(
             "com.rustynet/blind_exit
 ",
-            None,
+            &[],
         );
         assert_eq!(top_only, vec!["com.rustynet/blind_exit".to_owned()]);
         // Dedup: an anchor present in both dumps appears once.
         let deduped = merge_rustynet_anchor_names(
             "com.apple/rustynet_g5
 ",
-            Some(
+            &[Some(
                 "com.apple/rustynet_g5
 ",
-            ),
+            )],
         );
         assert_eq!(deduped, vec!["com.apple/rustynet_g5".to_owned()]);
+    }
+
+    /// The blind-exit posture's floor lives at `com.rustynet/blind_exit`, a
+    /// sub-anchor of the top-level `com.rustynet` parent — invisible to both
+    /// `pfctl -s Anchors` and `pfctl -a com.apple -s Anchors`. Live run
+    /// livelab-1788625551 (2026-09-05) false-failed a macOS blind exit whose
+    /// floor the daemon had verified live in exactly that anchor, because the
+    /// scan only unioned `com.apple`'s sub-anchors. The `com.rustynet` nested
+    /// dump must be unioned too; an absent nested dump (`None`) cannot make
+    /// the floor appear present.
+    #[test]
+    fn floor_scan_unions_the_nested_com_rustynet_blind_exit_anchor() {
+        let top = "com.apple
+com.rustynet
+";
+        let nested_apple = "com.apple/rustynet_g0
+com.apple/rustynet_g1
+";
+        let nested_rustynet = "com.rustynet/blind_exit
+com.rustynet/nat
+";
+        let anchors =
+            merge_rustynet_anchor_names(top, &[Some(nested_apple), Some(nested_rustynet)]);
+        assert!(
+            anchors.contains(&"com.rustynet/blind_exit".to_owned()),
+            "the blind-exit floor anchor must be scanned; got {anchors:?}"
+        );
+        assert!(anchors.contains(&"com.apple/rustynet_g0".to_owned()));
+        assert!(anchors.contains(&"com.apple/rustynet_g1".to_owned()));
+        assert!(
+            !anchors
+                .iter()
+                .any(|a| a == "com.apple" || a == "com.rustynet")
+        );
+        // Without the com.rustynet nested dump the blind-exit anchor stays
+        // invisible — the exact false-negative the live run hit — and nothing
+        // else in the scan can stand in for it.
+        let without = merge_rustynet_anchor_names(top, &[Some(nested_apple), None]);
+        assert!(!without.iter().any(|a| a == "com.rustynet/blind_exit"));
+        assert_eq!(without.len(), 2);
+    }
+
+    /// A parent listed at the top level whose sub-anchor dump cannot be read
+    /// makes the floor UNVERIFIABLE (the scan returns `None` → `pfctl
+    /// unreadable`), not "absent". The decision is keyed on an exact
+    /// top-level line, so a nested-looking name or a prefix never counts.
+    #[test]
+    fn nested_dump_is_required_only_for_a_parent_the_top_level_dump_lists() {
+        let top = "com.apple
+com.rustynet
+";
+        assert!(top_level_anchor_listed(top, "com.apple"));
+        assert!(top_level_anchor_listed(top, "com.rustynet"));
+        assert!(!top_level_anchor_listed(top, "com.rustynet/blind_exit"));
+        assert!(!top_level_anchor_listed(top, "com.rust"));
+        assert!(!top_level_anchor_listed(
+            "com.apple/rustynet_g0\n",
+            "com.apple"
+        ));
+        assert!(!top_level_anchor_listed("", "com.rustynet"));
     }
 
     #[test]
