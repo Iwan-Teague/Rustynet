@@ -418,6 +418,34 @@ fn is_loopback_address(addr: &IpAddr) -> bool {
     }
 }
 
+/// `true` iff every IPv6 DNS server address the snapshot reports for
+/// `interface_alias` is loopback (or the interface has no IPv6 entry, or
+/// its server list is empty). Used by `apply_dns_loopback`'s
+/// verify-then-retry loop (`phase10.rs`) to confirm the `netsh` set it just
+/// issued actually stuck, rather than trusting a fire-and-forget command
+/// exit code against a Windows host that can reassert its own IPv6 DNS
+/// placeholder shortly after interface bring-up.
+pub fn interface_ipv6_dns_is_loopback_only(
+    snapshot: &WindowsDnsFailclosedSnapshot,
+    interface_alias: &str,
+) -> bool {
+    snapshot
+        .interfaces
+        .iter()
+        .filter(|entry| {
+            entry.interface_alias == interface_alias
+                && entry.address_family == WindowsDnsAddressFamily::Ipv6
+        })
+        .all(|entry| {
+            entry.server_addresses.iter().all(|raw| {
+                let trimmed = raw.trim();
+                trimmed.is_empty()
+                    || parse_dns_address(trimmed, WindowsDnsAddressFamily::Ipv6)
+                        .is_ok_and(|addr| is_loopback_address(&addr))
+            })
+        })
+}
+
 /// Convenience wrapper used by the daemon subcommand: evaluate the
 /// snapshot and fold the result into a `WindowsDnsFailclosedReport`.
 pub fn build_windows_dns_failclosed_report(
@@ -604,6 +632,50 @@ mod tests {
         snapshot.interfaces[1].server_addresses.clear();
         evaluate_windows_dns_failclosed_snapshot(&snapshot)
             .expect("empty interface DNS lists are acceptable when an NRPT rule covers root");
+    }
+
+    #[test]
+    fn interface_ipv6_dns_is_loopback_only_accepts_reviewed_snapshot() {
+        let snapshot = reviewed_snapshot();
+        assert!(interface_ipv6_dns_is_loopback_only(&snapshot, "Ethernet"));
+    }
+
+    #[test]
+    fn interface_ipv6_dns_is_loopback_only_accepts_empty_server_list() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[1].server_addresses.clear();
+        assert!(interface_ipv6_dns_is_loopback_only(&snapshot, "Ethernet"));
+    }
+
+    #[test]
+    fn interface_ipv6_dns_is_loopback_only_accepts_unknown_interface() {
+        // No entry for this interface at all — vacuously true, not a drift.
+        let snapshot = reviewed_snapshot();
+        assert!(interface_ipv6_dns_is_loopback_only(
+            &snapshot,
+            "rustynet0-does-not-exist"
+        ));
+    }
+
+    #[test]
+    fn interface_ipv6_dns_is_loopback_only_rejects_windows_ipv6_placeholder() {
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces[1].server_addresses = vec!["fec0:0:0:ffff::1".to_owned()];
+        assert!(!interface_ipv6_dns_is_loopback_only(&snapshot, "Ethernet"));
+    }
+
+    #[test]
+    fn interface_ipv6_dns_is_loopback_only_ignores_other_interfaces_drift() {
+        // A non-loopback IPv6 DNS server on a DIFFERENT interface must not
+        // fail the check for the interface actually being verified.
+        let mut snapshot = reviewed_snapshot();
+        snapshot.interfaces.push(WindowsInterfaceDnsEntry {
+            interface_alias: "Wi-Fi".to_owned(),
+            interface_index: 20,
+            address_family: WindowsDnsAddressFamily::Ipv6,
+            server_addresses: vec!["fec0:0:0:ffff::1".to_owned()],
+        });
+        assert!(interface_ipv6_dns_is_loopback_only(&snapshot, "Ethernet"));
     }
 
     #[test]
