@@ -711,3 +711,39 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
 - Preflight SSH: debian@192.168.64.10=dh4 OK, debian@192.168.64.4=dh2 OK, fedora@192.168.64.103=fedora-utm-1 OK (inventory ssh_target 192.168.65.10 and live_ip 192.168.64.20 both stale/dead; 64.103 live).
 - First launch attempt died instantly: worktree had no state/ dir → zsh redirect failure. mkdir state, relaunched.
 - RD=state/live-lab-linux-relay-fwd3-20260906-112215 pid 65322, flags: --node dh4:relay dh2:client fedora-utm-1:client --enable-relay-forwarding-validation --skip-soak --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --collect-artifacts-on-failure. Log: state/live-lab-linux-relay-fwd3-20260906-112215.log
+
+## 2026-09-06 runs fwd3–fwd5b (relay-forward proof, commit 975d9bbb)
+- fwd3 (state/live-lab-linux-relay-fwd3-20260906-112215, pid 65322) DIED early:
+  fedora-utm-1 OS-version probe degraded to 'linux' placeholder after 3 SSH
+  retries (evidence.rs validate_collected_os_version fails loud, exit 70
+  transient_failure). Manual probe with identical key/known-hosts works
+  ("Fedora Linux 44 (Server Edition) (aarch64)") — transient, no defect.
+- fwd4 (state/live-lab-linux-relay-fwd4-20260906-112854, pid 66518) ran further,
+  FAILED preflight: "lab requires exactly 1 Exit node, found 0" — the retry
+  recipe in the session-3 section was written against the inventory-driven
+  election era and never included an Exit; preflight invariant applies to every
+  --node run (preflight.rs:377-385 counts role assignments, not capability
+  flags). All other stages cascade-skipped; run-matrix row + 166 stage rows +
+  triage stub appended by the finalizer (uncommitted).
+- All inventory exit nodes unreachable from this Mac (libvirt 121.x tailnet
+  ACL-blocked — SSH to fedora-x86-1 192.168.121.227 times out; lenovo 0.x
+  unrouted). Local UTM 64.x candidates: rocky-utm-1 (linux, 192.168.64.105,
+  key-auth OK, Rocky 10.2).
+- Commit 1a59ab6f: rocky-utm-1 exit_capable true + fedora-utm-1 live-IP refresh
+  (sanctioned --update-inventory-live-ips; my first python edit mangled
+  em-dashes to \u2014 — redone with ensure_ascii=False, then restored the
+  sanctioned fedora refresh the git checkout had reverted). exit_capable flag
+  ALSO excludes rocky from relay-forward peer election (aux rank 0 would
+  otherwise elect the exit node as sender — select_relay_forward_test_topology_
+  for_run filters exit_capable==Some(true)).
+- fwd5 (113905) refused at launch gate: fwd4's preflight stub had no recorded
+  remedy (enforce_launch_gate, no bypass by design). Recorded remedy via
+  `ops live-lab-record-stage-patch --stub-id livelab-1788694287-8edbc55259c3::
+  preflight` (topology fix, commit 1a59ab6f).
+- fwd5b LAUNCHED 11:41:47Z: RD=state/live-lab-linux-relay-fwd5b-20260906-114147
+  pid 69402, 4 nodes dh4:relay dh2:client fedora-utm-1:client rocky-utm-1:exit,
+  same flags + --enable-relay-forwarding-validation. Election expectation:
+  sender=debian-headless-2, receiver=fedora-utm-utm-1... precisely:
+  sender=dh2 (client→rank2, alias order), receiver=fedora-utm-1. QH-64 watch
+  active. Polling; verdict from logs/relay_forwards_frame_validation.log +
+  stages.tsv only.
