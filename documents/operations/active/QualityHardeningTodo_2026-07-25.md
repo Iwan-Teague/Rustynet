@@ -16,7 +16,7 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **69** (QH-01 through QH-69, contiguous;
+> then claimed; it has since grown to **73** (QH-01 through QH-73, contiguous;
 > re-counted 2026-09-05 — QH-65/66 were filed from the macOS exit membership
 > role-fix design's independent review).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
@@ -6469,3 +6469,96 @@ history. Either the `--node` engine should default to the mission-canonical
 userspace-shared backend on Linux, or the run-matrix row should record each
 node's backend so a mixed topology is at least visible in evidence. Not
 decided here; the flag makes the choice explicit per run.
+
+### QH-70 — OPEN: `mesh_status_validation` is a false-green — it checks configured peers, not live tunnels, so it PASSED run 130201 with all four tunnel legs dead
+**Severity: high (validator false-positive: a dataplane-dead mesh read as healthy evidence). Confidence: VERIFIED — run `130201` records `mesh_status_validation=pass` for macos-utm-1 while the same run's per-leg evidence shows all four tunnel legs without handshake/traffic.**
+
+The stage derives its verdict from the daemon's configured peer set (who
+*should* be connected), not from any observed handshake or traffic state, so a
+mesh whose tunnels are entirely dead still reports healthy. In run `130201`
+this co-occurred with the CP-1 cross-network block (see
+`MacosCrossNetworkTrafficBlocker_2026-09-03`): the stage green-washed exactly
+the condition that run was supposed to expose.
+
+**Direction of fix (not implemented here — the validator lives in
+rustynetd/rustynet-control territory this stream must not edit):** require at
+least one recent (`latest-handshake` within stage window) handshake or
+nonzero transfer counter per configured peer before the stage can pass, and
+fail closed when the tunnel state is unobservable. Filed from the
+GLM Manager C code-stream session (2026-09-06) as the remaining un-cloned
+member of the QH-71/72/73 family (those three are fixed in this branch).
+
+**Disposition: OPEN — needs an owner decision on which crate owns the check
+(`rustynetd` validator vs `rustynet-cli` stage reading `wg show` output), then
+implementation + live re-proof of a run with dead legs failing the stage.**
+
+### QH-71 — FIXED: the macOS failure-diagnostics collector shipped a valid but EMPTY tarball, so `--collect-artifacts-on-failure` silently produced no evidence
+**Severity: high (evidence loss at exactly the moment evidence is needed — a failed stage's diagnostics read as "collected" while containing nothing). Confidence: VERIFIED — run `130201` pulled an empty `macos-utm-1.tar.gz` through the very path meant to explain its failure.**
+
+`collect_artifacts` (macos_traffic.rs) ran one `tar -czf` over
+`/usr/local/var/rustynet` and `/usr/local/var/log/rustynet` with
+`2>/dev/null || tar -czf <tmp> --files-from /dev/null` as the fallback: when a
+listed path was missing (the log dir was), the fallback built a *valid, empty*
+archive with exit 0, scp pulled it, and the key-material verification passed —
+an artifact whose existence already read as success.
+
+**Fix (`b221cad1`):** collectors now stage launchctl/pfctl/daemon-status/
+routes/DNS/log outputs as text files first (so the archive is always
+non-empty), the remote script self-asserts member count > 0 (exit 42),
+and the adapter additionally asserts non-empty members locally after download
+(`tar -tzf`, counting non-directory entries) before accepting the artifact.
+Unit tests pin the collector set, the staging/exclusion script, and the
+empty-archive rejection.
+
+**Disposition: FIXED in branch `ai-edit/edit-1788730584891-34192-0` commit
+`b221cad1` (2026-09-06, GLM Manager C TASK 2); live re-proof with a real
+macOS failure run pending.**
+
+### QH-72 — FIXED: no cross-bridge reachability preflight — a fleet split across >1 /24 sailed through preflight into dataplane stages that then failed obscurely
+**Severity: medium (late, misleading failure instead of an early, named one — same root condition as CP-1 in `MacosCrossNetworkTrafficBlocker_2026-09-03` §9). Confidence: VERIFIED — run `130201` topology spanned two /24s with the CP-1 pf override not loaded, and no stage surfaced the split before the dataplane failures.**
+
+Preflight checked clock skew, report writability, and exit uniqueness but
+never whether the elected guests can actually reach each other's SSH plane
+across the bridge split — so cross-subnet runs burned 30-45 min of stages
+before failing inside traffic/two-hop/DNS/relay validation with symptoms far
+from the cause.
+
+**Fix (`ba3ff9a3`):** preflight now derives the subnet split from LIVE
+`ssh_connection_params` hosts (not inventory labels), probes guest-to-guest
+TCP/22 both directions per subnet pair, records
+`logs/cross_bridge_preflight.txt`, and decides via a pure function: WARN-only
+when the plan has no cross-bridge dataplane stage (macOS control-plane cells
+keep running across the split), HARD FAIL naming CP-1, the blocker doc §9,
+and `scripts/vm_lab/cross_vmnet_pf_override.pf` when the plan contains
+traffic_test_matrix / live_two_hop_validation /
+live_managed_dns_validation / relay_forwards_frame_validation.
+Unit tests cover classification, per-platform probe argv, and the decision
+matrix including all four dataplane stage ids.
+
+**Disposition: FIXED in branch `ai-edit/edit-1788730584891-34192-0` commit
+`ba3ff9a3` (2026-09-06, GLM Manager C TASK 3); live re-proof across a real
+split pending (CP-1 override intentionally not loaded this session).**
+
+### QH-73 — FIXED: macOS cleanup/uninstall left `com.rustynet/*` pf anchors behind — a surviving `com.rustynet/blind_exit` (`block drop out quick all`) outlived uninstall
+**Severity: high (residual default-deny pf state on a lab guest persists into every later run and can blackhole that guest's outbound traffic). Confidence: VERIFIED — live finding on macos-utm-1: `com.rustynet/blind_exit` with `block drop out quick all` survived uninstall; root cause read in code this session.**
+
+Two gaps compounded: (1) `uninstall_daemon` (macos_install.rs) removed
+binaries/state but never flushed pf anchors and never called
+`cleanup_runtime_state`; (2) the cleanup path's shell reset flushed
+rustynet-matching anchors best-effort with `|| true` swallowing any
+`sudo -n` denial, so a denied flush read as success.
+
+**Fix (`229ba864`):** uninstall now flushes `com.rustynet/*` anchors
+best-effort after removing files; cleanup additionally runs a strict
+argv-only Rust-side pass — enumerate via `sudo -n pfctl -s Anchors`, validate
+each name against the `^com\.rustynet/[A-Za-z0-9_.-]+$` charset in Rust
+(rejecting crafted names like `com.rustynet/x;reboot`) before building
+`sudo -n pfctl -a <anchor> -F all` as validated argv — complementing, not
+replacing, the broader shell pass that also covers `com.apple/rustynet_g<N>`
+killswitch anchors. Unit tests pin the validator (accept/reject cases), the
+list parser, the exact flush argv, and (source-pinned) that uninstall calls
+the flush.
+
+**Disposition: FIXED in branch `ai-edit/edit-1788730584891-34192-0` commit
+`229ba864` (2026-09-06, GLM Manager C TASK 4); live re-proof on macos-utm-1
+pending (rustynetd's own pf/killswitch code untouched by design).
