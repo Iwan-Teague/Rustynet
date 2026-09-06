@@ -100,3 +100,18 @@ Step 4.2 — plan:
 - Compile fix: AdapterError::Protocol is a struct variant — `Protocol { message: ... }`, not tuple form.
 - Gates: fmt --check RC=0; clippy -p rustynet-cli --all-targets --all-features -D warnings RC=0 (21.65s); `cargo test -p rustynet-cli --all-targets --all-features macos` RC=0, 0 failed everywhere (372 passed lib target incl. the 5 new tests, 328 passed second target).
 - New tests: rustynet_pf_anchor_validator_accepts_strict_names, rustynet_pf_anchor_validator_rejects_crafted_names, pfctl_anchor_list_parser_trims_and_drops_empty_lines, anchor_flush_args_reject_invalid_and_build_valid, uninstall_daemon_flushes_rustynet_pf_anchors (source pin).
+
+## TASK 5 — QH-70..73 register entries
+
+- Step 5.1 (2026-09-06): Filed QH-70..QH-73 in
+  `documents/operations/active/QualityHardeningTodo_2026-07-25.md` in the
+  existing entry format (header count 69 -> 73).
+  - QH-70 OPEN: `mesh_status_validation` false-green — PASSED run 130201 with
+    all four tunnel legs dead; checks configured peers, not handshakes or
+    traffic. Fix needs an owner decision on owning crate (rustynetd validator
+    vs rustynet-cli stage reading `wg show`); this stream may not edit those
+    crates, so direction proposed in the entry only.
+  - QH-71 FIXED-in-branch `b221cad1` (TASK 2): macOS diagnostics empty-tarball.
+  - QH-72 FIXED-in-branch `ba3ff9a3` (TASK 3): cross-bridge preflight.
+  - QH-73 FIXED-in-branch `229ba864` (TASK 4): com.rustynet/* pf anchor flush
+    on uninstall + strict argv-only validated cleanup pass.
