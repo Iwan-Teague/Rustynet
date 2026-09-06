@@ -232,6 +232,20 @@ impl OrchestrationStage for TrafficTestMatrixStage {
 /// `capture error: ...` line — capture is diagnostic only and must never
 /// change the stage outcome. Returns one summary line per node for the stage
 /// failure message.
+/// True when `alias` is safe to embed as a filename component of the capture
+/// file: no path separators and no parent-directory fragment, so a malformed
+/// topology entry cannot make `std::fs::write` escape the report dir.
+fn is_safe_capture_alias(alias: &str) -> bool {
+    !alias.is_empty() && !alias.contains(['/', '\\']) && !alias.contains("..")
+}
+
+/// Collapse newlines and carriage returns so a remote-controlled string (SSH
+/// output collected from the node under test) cannot forge additional lines
+/// in the evidence file.
+fn single_line(s: &str) -> String {
+    s.replace(['\n', '\r'], "\\n")
+}
+
 fn capture_failure_state(ctx: &OrchestrationContext) -> Vec<String> {
     let mut summaries = Vec::new();
     let logs_dir = ctx.report_dir.join("logs");
@@ -241,6 +255,13 @@ fn capture_failure_state(ctx: &OrchestrationContext) -> Vec<String> {
     }
     for assignment in &ctx.assignments {
         let alias = assignment.alias.as_str();
+        if !is_safe_capture_alias(alias) {
+            // Diagnostic-only capture: skipping an unsafe alias is fail-safe,
+            // while writing it would let a topology entry clobber a file
+            // outside the report dir.
+            eprintln!("traffic_test_matrix: failure-capture skipped unsafe alias {alias:?}");
+            continue;
+        }
         let Some(adapter) = ctx.adapters.get(alias) else {
             continue;
         };
@@ -252,23 +273,32 @@ fn capture_failure_state(ctx: &OrchestrationContext) -> Vec<String> {
         out.push_str(&format!("node: {alias}\n"));
         match &mesh_ip {
             Ok(ip) => out.push_str(&format!("mesh_ip: {ip}\n")),
-            Err(e) => out.push_str(&format!("capture error: collect_mesh_ip: {e}\n")),
+            Err(e) => out.push_str(&format!(
+                "capture error: collect_mesh_ip: {}\n",
+                single_line(&e.to_string())
+            )),
         }
         match &tunnels {
             Ok(list) => {
                 out.push_str(&format!("tunnels: {} line(s)\n", list.tunnels.len()));
                 for line in &list.tunnels {
-                    out.push_str(&format!("tunnel: {line}\n"));
+                    out.push_str(&format!("tunnel: {}\n", single_line(line)));
                 }
             }
-            Err(e) => out.push_str(&format!("capture error: collect_active_tunnels: {e}\n")),
+            Err(e) => out.push_str(&format!(
+                "capture error: collect_active_tunnels: {}\n",
+                single_line(&e.to_string())
+            )),
         }
         match &daemon_reason {
-            Ok(Some(reason)) => out.push_str(&format!("daemon_failure_reason: {reason}\n")),
+            Ok(Some(reason)) => {
+                out.push_str(&format!("daemon_failure_reason: {}\n", single_line(reason)))
+            }
             Ok(None) => out.push_str("daemon_failure_reason: (none reported)\n"),
             Err(e) => {
                 out.push_str(&format!(
-                    "capture error: collect_daemon_failure_reason: {e}\n"
+                    "capture error: collect_daemon_failure_reason: {}\n",
+                    single_line(&e.to_string())
                 ));
             }
         }
@@ -282,9 +312,15 @@ fn capture_failure_state(ctx: &OrchestrationContext) -> Vec<String> {
             Ok(None) => "none",
             Err(_) => "error",
         };
-        let tunnel_lines = tunnels.as_ref().map(|l| l.tunnels.len()).unwrap_or(0);
+        // A tunnel-collector error is NOT "no tunnels established": report it
+        // distinctly so triage does not misread an unknown state as a
+        // blocked-mesh signal.
+        let tunnel_summary = match tunnels.as_ref() {
+            Ok(list) => format!("{} tunnel line(s)", list.tunnels.len()),
+            Err(_) => "tunnels=error".to_string(),
+        };
         summaries.push(format!(
-            "[failure-capture {alias}: {tunnel_lines} tunnel line(s), daemon={daemon_summary}]"
+            "[failure-capture {alias}: {tunnel_summary}, daemon={daemon_summary}]"
         ));
     }
     summaries
@@ -543,7 +579,7 @@ mod tests {
             "original stage error masked: {message}"
         );
         assert!(
-            message.contains("[failure-capture node-a: 0 tunnel line(s), daemon=error]"),
+            message.contains("[failure-capture node-a: tunnels=error, daemon=error]"),
             "message: {message}"
         );
         let capture_path = report_dir.join("logs/traffic_test_matrix.failure_capture.node-a.txt");
@@ -551,5 +587,27 @@ mod tests {
         assert!(content.contains("capture error: collect_active_tunnels"));
         assert!(content.contains("capture error: collect_daemon_failure_reason"));
         let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn capture_alias_safety_rejects_path_fragments() {
+        assert!(is_safe_capture_alias("node-a"));
+        assert!(is_safe_capture_alias("linux.x86_exit.1"));
+        // Path separators, parent-directory fragments, and the empty alias
+        // must never become filename components of the capture file.
+        assert!(!is_safe_capture_alias("../escape"));
+        assert!(!is_safe_capture_alias("a/b"));
+        assert!(!is_safe_capture_alias("a\\b"));
+        assert!(!is_safe_capture_alias(".."));
+        assert!(!is_safe_capture_alias(""));
+    }
+
+    #[test]
+    fn single_line_collapses_newlines_from_remote_output() {
+        assert_eq!(single_line("ok"), "ok");
+        assert_eq!(
+            single_line("forged\nmesh_ip: 100.64.0.1\r\n"),
+            "forged\\nmesh_ip: 100.64.0.1\\n\\n"
+        );
     }
 }

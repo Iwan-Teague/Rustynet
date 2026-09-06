@@ -115,3 +115,47 @@ Step 4.2 — plan:
   - QH-72 FIXED-in-branch `ba3ff9a3` (TASK 3): cross-bridge preflight.
   - QH-73 FIXED-in-branch `229ba864` (TASK 4): com.rustynet/* pf anchor flush
     on uninstall + strict argv-only validated cleanup pass.
+
+## RESUME — 2026-09-06 (late)
+
+### Step R.1 — checkpoint 7fde653e inspection (decision: KEEP)
+
+`git show --stat 7fde653e`: one file, +7/−2, `macos_install.rs::uninstall_daemon`.
+The edit is COMPLETE, not half-done: it captures the rm result without `?`, runs
+the com.rustynet/* pf anchor flush regardless (so a wedged daemon that failed rm
+still gets its anchors flushed), then propagates `rm_result?` at the end. Correct
+ordering semantics, no dangling state. Verified against the surrounding code in
+the diff itself. Kept as-is; no revert. It will be covered by the end-of-run
+clippy/test gates and by the TASK 4 adversarial review context below.
+
+### Step R.2 — adversarial security review of TASK 1-4 diffs (glm-5.3)
+
+Plan: one `ai_read` (model glm-5.3) per commit — 9d25e652, b221cad1, ba3ff9a3,
+229ba864 — prompt "REFUTE this patch: find fail-open paths, unvalidated input
+reaching argv/shell, changed pass/fail semantics, panics in production paths",
+context = the commit's `git show` diff only (checkpoint 7fde653e appended to the
+TASK 4 context since it touches the same function).
+
+### Step R.2a — 9d25e652 (TASK 1 traffic_test_matrix failure capture) review
+
+glm-5.3 verdict: sound on the four axes (no fail-open, no shell/argv, no
+production panics, pass/fail semantics unchanged). Findings + disposition:
+
+- FINDING (security, low): alias used unvalidated as filename component —
+  `logs/traffic_test_matrix.failure_capture.{alias}.txt` lets a malformed
+  topology alias (`../..`, `/`) escape the report dir via std::fs::write.
+  APPLIED: `is_safe_capture_alias` gate (rejects empty / `/` / `\` / `..`)
+  + skip with eprintln; unit test `capture_alias_safety_rejects_path_fragments`.
+- FINDING (evidence integrity): remote-controlled strings (tunnel lines,
+  daemon reason, collector error text) written verbatim — embedded `\n` can
+  forge evidence lines. APPLIED: `single_line()` newline collapsing on all
+  three; unit test `single_line_collapses_newlines_from_remote_output`.
+- FINDING (diagnostics correctness): collector Err summarized as
+  `0 tunnel line(s)` — reads as "no tunnels" when state is unknown. APPLIED:
+  `tunnels=error` distinct label; test assertion updated.
+- FINDING (contract drift / style, REJECTED): appended `; [failure-capture …]`
+  segments could break downstream failure-message parsers — checked: stage
+  messages are recorded verbatim in stage logs, no parser splits on "; " in
+  this path; eprintln! consistent with surrounding orchestrator code.
+- Scoped test: `cargo test -p rustynet-cli --all-targets --all-features
+  --features vm-lab traffic_test_matrix` → 7 passed / 0 failed (lib).
