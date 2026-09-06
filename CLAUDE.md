@@ -547,6 +547,12 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
   no `vm-lab` commands — RNQ-17).
 - If a guest is stuck (SSH timeout but visible in `arp -a`):
   `scripts/vm_lab/probe_and_recover_local_utm.sh` before retrying.
+- macOS guest ↔ Linux guests show 100% loss both ways while host→guest works:
+  that is CP-1 — the host pf anchor `com.apple.internet-sharing/network_isolation`
+  blocking traffic between the two vmnet /24s (Apple backend vs QEMU backend).
+  Runtime override, owner sudo, gone on reboot:
+  `sudo pfctl -a com.apple/100.rustynet-lab -f scripts/vm_lab/cross_vmnet_pf_override.pf`
+  (details: `documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md` §9).
 - Never hand-edit `vm_lab_inventory.json` — refresh with
   `--update-inventory-live-ips`.
 - **Lab SSH passwords live OUTSIDE the inventory.** This repository is public, so
