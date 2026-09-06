@@ -704,3 +704,10 @@ Run recipe: `--node debian-headless-4:relay --node debian-headless-2:client
 fresh report dir, NO ProxyJump env (all-local topology). Per-node SSH
 preflight with the lab key immediately before launch; abort on any miss.
 QH-64 watch active (probe restarts sender+receiver daemons mid-run).
+
+## 2026-09-06 run fwd3 (retry of relay-forward proof on 975d9bbb)
+- Worktree HEAD = 975d9bbb (relay-forward role-assignment election fix), clean.
+- Rebuild: cargo build -p rustynet-cli --features vm-lab @ target-pinned, OK (1m56s).
+- Preflight SSH: debian@192.168.64.10=dh4 OK, debian@192.168.64.4=dh2 OK, fedora@192.168.64.103=fedora-utm-1 OK (inventory ssh_target 192.168.65.10 and live_ip 192.168.64.20 both stale/dead; 64.103 live).
+- First launch attempt died instantly: worktree had no state/ dir → zsh redirect failure. mkdir state, relaunched.
+- RD=state/live-lab-linux-relay-fwd3-20260906-112215 pid 65322, flags: --node dh4:relay dh2:client fedora-utm-1:client --enable-relay-forwarding-validation --skip-soak --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --collect-artifacts-on-failure. Log: state/live-lab-linux-relay-fwd3-20260906-112215.log
