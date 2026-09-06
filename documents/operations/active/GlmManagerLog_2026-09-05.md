@@ -442,16 +442,60 @@ Note for honesty: `linux_relay_forwards_frame` has itself never passed
 on any OS (matrix tally: 313 not_run / 1 skip), so the forwarding stage
 is unproven even where it is implementable.
 
-### Attempt 4 (relay_validation goal) — plan
+### Attempt 4 (relay_validation goal) — launched and concluded
 
-To launch from THIS worktree with the same correct recipe (no
-`--skip-linux-live-suite`, `--skip-soak`,
-`--enable-relay-forwarding-validation`) so `relay_validation` can prove
-green under the readiness fix. Expected honest outcomes:
-`relay_validation` PASS; `relay_forwards_frame_validation` FAIL-closed
-(macOS relay, Linux-only probe — durable in-ledger evidence of the
-CP-1-blocked cell); `traffic_test_matrix` FAIL (CP-1, owner-deferred).
-Outcome recorded below after the run.
+Launched from THIS worktree at 23:52:48Z (pid 43705, report
+`state/live-lab-macos-relay-fwd4-20260906-005210`, `--source-mode
+local-head` deploying `04c85129`, 66 planned stages verified from
+`resolved_plan.json` with `relay_forwards_frame_validation` enabled).
+Results (from stage artifacts, `state/stages.tsv` + per-stage logs):
+
+- `deploy_relay_service` PASS (00:05:05–00:05:16Z).
+- **`relay_validation` PASS (00:05:16–00:05:21Z) — the macOS relay
+  lifecycle is now proven on the `--node` engine** (run
+  `livelab-1788653310-04c85129bb4f`, commit `04c85129`, clean). The
+  readiness-wait fix is live-verified: the during-run capture now finds
+  UDP :4500 + TCP :4501 bound and `/healthz` ok, the stop/restart
+  lifecycle assertions hold, and the matrix column
+  `macos_stage_relay_service_lifecycle=pass` agrees with the stage
+  artifact.
+- `relay_forwards_frame_validation` FAIL exactly as predicted, fail-closed
+  before touching any host: "relay node macos-utm-1 is Macos; the
+  relay-frame-forwarding probe is Linux-only (nft + systemd unit
+  restarts)" (`logs/relay_forwards_frame_validation.log`). This is the
+  durable in-ledger evidence that the cell is blocked, not skipped.
+- `traffic_test_matrix` FAIL (CP-1, as in every prior run; stub filled
+  "none: owner-deferred"). Skip cascade followed; tally 26 pass /
+  2 fail / 38 skip. Ledger row + 170 stage rows appended to
+  `documents/operations/live_lab_node_run_matrix.csv` /
+  `live_lab_node_stage_results.csv` in THIS worktree and verified.
+
+## Session close (2026-09-06)
+
+Cell status after this session: macOS relay **lifecycle GREEN on the
+engine of record**; macOS relay **frame-forwarding BLOCKED** by (a) the
+HP-3 probe being Linux-only by construction and (b) CP-1 cross-vmnet
+unreachability (now evidenced at the LAN level: ICMP + TCP/22 dead
+between vmnets). A macOS probe port is moot until CP-1 lands. No
+rustynet-relay production code was modified this session; the only code
+change on this branch remains the predecessor's readiness wait in
+`role_validation/relay.rs` (lab validation harness).
+
+Owner decisions outstanding (not mine to make), with evidence pointers:
+
+- **CP-1** — re-pin lab guests to one vmnet / enable host forwarding
+  between bridge100 and the macOS vmnet. Blocks: macOS↔any cross-node
+  dataplane stage (`traffic_test_matrix`, `cross_os_*`,
+  `relay_forwards_frame_validation` with a macOS relay, two_hop).
+  Evidence: attempt-3/4 `traffic_test_matrix.log`, live LAN probe
+  (debian-headless-2 → 192.168.65.101 ICMP 100% / TCP/22 timeout),
+  `MacosCrossNetworkTrafficBlocker_2026-09-03.md`.
+- **QH-66 Option D** — owner signing-key custody (unchanged).
+- **QH-69** — `--linux-backend` default vs per-row recording
+  (unchanged).
+- Optional (queued by predecessor, not applied): hash-pin the reviewed
+  relay plist / stdin-pipe bytes; `ManifestNodeAssignment`
+  duplicate-alias rejection; `VmGuestPlatform::parse("")` pin.
 
 
 
