@@ -668,34 +668,61 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 /// wildcard so an outbound UDP socket on the same port number
 /// cannot be confused for a bound listener.
 fn linux_udp_summary_contains_port(summary: &str, port: u16) -> bool {
-    let needles = [
-        format!("127.0.0.1:{port}"),
-        format!("0.0.0.0:{port}"),
-        format!("*:{port}"),
-        format!("[::1]:{port}"),
-        format!("[::]:{port}"),
-    ];
-    summary.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("UNCONN") && needles.iter().any(|needle| trimmed.contains(needle))
-    })
+    summary
+        .lines()
+        .any(|line| linux_ss_line_binds_port(line, "UNCONN", port))
 }
 
 /// `ss -tlnp` TCP-LISTEN lines start with `LISTEN`. Require the
 /// LISTEN state so an ESTABLISHED outbound socket on the same port
 /// number cannot satisfy the check.
 fn linux_tcp_summary_contains_listen_port(summary: &str, port: u16) -> bool {
-    let needles = [
-        format!("127.0.0.1:{port}"),
-        format!("0.0.0.0:{port}"),
-        format!("*:{port}"),
-        format!("[::1]:{port}"),
-        format!("[::]:{port}"),
-    ];
-    summary.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("LISTEN") && needles.iter().any(|needle| trimmed.contains(needle))
-    })
+    summary
+        .lines()
+        .any(|line| linux_ss_line_binds_port(line, "LISTEN", port))
+}
+
+/// Column-based `ss` matcher for a BOUND local socket on `port`.
+///
+/// `ss` prints bound sockets as
+/// `UNCONN 0 0 <local>:<port> <peer> users:(("rustynet-relay",...))`
+/// (UDP; TCP uses `LISTEN`). The deploy stage deliberately binds the
+/// relay datapath to the guest's live interface IP (for example
+/// `RUSTYNET_RELAY_BIND=192.168.64.10:4500` on debian-headless-4), so a
+/// needle list of loopback/wildcard forms misses a healthy bind — this
+/// exact false negative failed `relay_validation` in run fwd6e
+/// (2026-09-06, state/live-lab-linux-relay-fwd6e-215129) while the relay
+/// was serving on 192.168.64.10:4500. Match instead on the LOCAL endpoint
+/// column (whitespace field 4, 0-indexed 3) ending in `:<port>`, and
+/// require the PEER endpoint (field 5) to be a wildcard — a bound,
+/// unconnected socket has no peer. An outbound/connected socket carries
+/// the port on the PEER side with an ephemeral local port, so it still
+/// cannot satisfy the check.
+fn linux_ss_line_binds_port(line: &str, state: &str, port: u16) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(state) {
+        return false;
+    }
+    let port_suffix = format!(":{port}");
+    let mut fields = trimmed.split_whitespace();
+    let _state = fields.next();
+    let _recv_q = fields.next();
+    let _send_q = fields.next();
+    let Some(local) = fields.next() else {
+        return false;
+    };
+    if !local.ends_with(&port_suffix) {
+        return false;
+    }
+    match fields.next() {
+        // No peer column at all (truncated `ss` output): the local
+        // endpoint match stands.
+        None => true,
+        // Bound unconnected sockets report a wildcard peer. A concrete
+        // peer address means this is a connected socket whose local port
+        // merely coincides with the requested one.
+        Some(peer) => peer == "0.0.0.0:*" || peer == "*:*" || peer == "[::]:*" || peer == "-",
+    }
 }
 
 /// Parse `launchctl print system/<label>` stdout into a state word
@@ -915,6 +942,32 @@ mod tests {
         let body = "State        Recv-Q Send-Q Local Address:Port   Peer Address:Port\n\
                     UNCONN       0      0      127.0.0.1:4500       0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=10))\n";
         assert!(linux_udp_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn linux_udp_summary_matches_interface_ip_bound_socket() {
+        // The deploy stage binds the datapath to the guest's live
+        // interface IP (live-verified on debian-headless-4, run fwd6e
+        // 2026-09-06): a needle list of loopback/wildcard forms missed
+        // this healthy bind and failed relay_validation spuriously.
+        let body = "UNCONN       0      0      192.168.64.10:4500   0.0.0.0:*           users:((\"rustynet-relay\",pid=122529,fd=9))\n";
+        assert!(linux_udp_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn linux_udp_summary_rejects_connected_socket_with_port_on_peer_side() {
+        // A socket that learnt a peer endpoint (local ephemeral, peer
+        // :4500) is an outbound association, not a bound listener.
+        let body = "UNCONN       0      0      127.0.0.1:5555       10.0.0.1:4500        users:((\"rustynetd\",pid=1234,fd=11))\n";
+        assert!(!linux_udp_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn linux_tcp_summary_matches_interface_ip_listen_socket() {
+        // Symmetric coverage for the TCP health listener: an interface-IP
+        // LISTEN must satisfy the check just like 127.0.0.1 does.
+        let body = "LISTEN       0      128    192.168.64.10:4501   0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=10))\n";
+        assert!(linux_tcp_summary_contains_listen_port(body, 4501));
     }
 
     #[test]
