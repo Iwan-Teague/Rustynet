@@ -377,7 +377,7 @@ const SHARED_HARDENING_O_FLAGS: &[&str] = &[
 ///   reachable guests through an unnecessary middlebox. Fail closed on a
 ///   PROXYJUMP without CIDRS and on any unparseable CIDR — a lab run must
 ///   not launch with half-configured jump routing.
-fn proxyjump_for_host(host: &str) -> Result<Option<String>, AdapterError> {
+pub(crate) fn proxyjump_for_host(host: &str) -> Result<Option<String>, AdapterError> {
     proxyjump_spec_for_host(
         host,
         std::env::var_os("RUSTYNET_LAB_PROXYJUMP").as_deref(),
