@@ -159,3 +159,35 @@ production panics, pass/fail semantics unchanged). Findings + disposition:
   this path; eprintln! consistent with surrounding orchestrator code.
 - Scoped test: `cargo test -p rustynet-cli --all-targets --all-features
   --features vm-lab traffic_test_matrix` → 7 passed / 0 failed (lib).
+
+### Step R.2b — b221cad1 (TASK 2 macOS diagnostics fail-loud) review
+
+glm-5.3 verdict: core fail-loud logic sound; no unvalidated input reaches the
+shell (all collector strings compile-time constants); no production panics;
+empty-archive class closed at two layers. Findings + disposition:
+
+- FINDING (operational): no per-collector timeout — `rustynet status` against
+  the wedged daemon (the exact scenario triggering collection) hangs the whole
+  script to MEDIUM_TIMEOUT, losing every collector's output. APPLIED: sh
+  watchdog per collector in build_diag_archive_script —
+  `( { cmd; } & p=$!; ( sleep 20; kill $p ) >/dev/null 2>&1 & wait $p )` —
+  macOS ships no `timeout`. Test pins `sleep 20; kill $p` in the script.
+- FINDING (security): `launchctl print` dumps each service's environment dict
+  verbatim into the archive; tar excludes are name-based and
+  verify_no_key_material_tarball reads member NAMES only (confirmed at
+  macos_traffic.rs:1086 — `tar -tzf` listing check), so a secret env var in a
+  plist would ship unfiltered. APPLIED: sed range-delete of the
+  `environment = { ... }` block on all 5 launchctl collectors + coverage test
+  asserting every launchctl_ collector carries the redaction.
+- FINDING (test quality): dir-only case re-implemented the count inline and
+  asserted on the copy — would pass if the function were wrong. APPLIED:
+  test now builds a real dir-only tarball fixture and asserts
+  `assert_tarball_non_empty(...).is_err()`.
+- FINDING (minor): exit-42 path orphaned the remote tarball in /tmp. APPLIED:
+  rm_cmd built up front; best-effort cleanup runs before propagating the
+  diag error.
+- FLAG (accepted risk): predictable /tmp/rn_diag_capture + tarball paths are
+  symlink/TOCTOU-able by a local user; single-user lab VM threat model —
+  accepted, noted here for anyone copying the pattern elsewhere.
+- Scoped test: `cargo test -p rustynet-cli ... --features vm-lab macos` →
+  372 passed / 0 failed (lib) + all other targets ok.
