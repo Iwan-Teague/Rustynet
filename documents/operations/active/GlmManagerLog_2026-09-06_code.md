@@ -260,3 +260,53 @@ verification requirement:
   indicators across runs.
 - Scoped: macos test filter 372 passed / 0 failed (lib); clippy
   -p rustynet-cli --all-targets --all-features --features vm-lab -D warnings RC=0.
+
+## Step R.3 — final gates (pinned toolchain, CARGO_TARGET_DIR=target-pinned-c)
+
+- `cargo fmt --all -- --check`: RC=1 pre-existing drift (import order in
+  macos_install.rs, wrapping in macos_traffic.rs/preflight.rs — partly from
+  earlier branch commits) → `cargo fmt --all` applied → re-check RC=0.
+- `cargo clippy -p rustynet-cli --all-targets --all-features --features vm-lab
+  -- -D warnings`: RC=0.
+- `cargo test -p rustynet-cli --all-targets --all-features --features vm-lab`:
+  RC=0 — 93 result lines all ok, 8376 tests passed, 0 failed.
+
+## STATUS 2026-09-06T23:26:53Z
+
+DONE. Resumed-session work: checkpoint 7fde653e inspected and KEPT (complete
+ordering fix, covered by TASK 4 review); mandatory glm-5.3 adversarial review
+run on all four TASK 1-4 diffs (one ai_read each, provider=glm, diffs as
+context, stdio driver via main-repo bin/ after worktree bin/ absence and a
+deepseek-402 detour); every finding verified against the code before
+disposition. Four hardening commits landed: 6e283ec0 (T1 capture alias/newline
+hardening + tunnels=error), 3b9b9c55 (T2 per-collector 20s watchdog, launchctl
+env redaction, real dir-only test, exit-42 cleanup), 13934ffb (T3 Windows
+exit-code probe, excluded-targets never pass cleanly, adapter-miss recorded,
+doc/sanitize/sampling fixes), 29855359 (T4 uninstall fails closed on surviving
+anchors, (found,flushed) signature). Rejected with reasons: T1 message-contract
+drift + eprintln style; T3 exec-error "inconclusive" downgrade (would weaken a
+fail-closed gate). Gates green (fmt/clippy/test RC=0).
+
+### MERGE NOTE (for the owner)
+
+Branch ai-edit/edit-1788734269512-30091-0 contains the full code-stream
+program: TASK 0 baseline (e130754c), TASK 1 failure-time capture (9d25e652) +
+glm hardening (6e283ec0), TASK 2 fail-loud macOS diagnostics (b221cad1) +
+hardening (3b9b9c55), TASK 3 cross-bridge preflight (ba3ff9a3) + two closed
+fail-open paths (13934ffb), TASK 4 pf-anchor flush on uninstall (229ba864) +
+fail-closed propagation (29855359), checkpoint 7fde653e (kept — completes T4
+error ordering), TASK 5 QH-70..73 register entries (bbf08572), plus this
+session's fmt pass and log. All four code diffs were adversarially reviewed by
+glm-5.3 and every accepted finding is fixed in-branch with tests; dispositions
+are in §R.2a-d. OWNER DECISIONS NEEDED: (1) QH-70 mesh_status false-green —
+owning crate is rustynetd validator or rustynet-cli stage; this stream may not
+edit either, entry proposes direction only. (2) T3 rejected finding: whether
+preflight should distinguish "tooling error" (missing nc/powershell, spawn
+failure) from "TCP blocked" — currently both hard-fail under a dataplane plan
+(conservative); weakening to inconclusive would be fail-open. (3) plan_has_
+cross_bridge_dataplane_stage list is compile-pinned against renames but a NEW
+cross-bridge StageId must be added there in the same change (doc note in
+place; a mechanical guard needs stage-registry metadata this stream should not
+add). No trust-state/validator/crypto/membership/killswitch/dataplane code was
+touched. Not live-lab-proven: host pf override CP-1 not loaded this session
+(owner decision), so the new preflight has unit tests only.
