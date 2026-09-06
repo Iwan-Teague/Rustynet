@@ -61,3 +61,42 @@ Step 3.1 (plan, written before implementation): add to `stage/preflight.rs` a cr
 - `cargo fmt --all -- --check` → RC=0.
 - `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings` → clean (fixed: StageId not Copy → .cloned(); CrossBridgeOutcome derives Debug/Clone/PartialEq/Eq; test loop uses stage.clone()).
 - `cargo test -p rustynet-cli --all-targets --all-features preflight` → 34 passed, 0 failed (8 new: classify×3, probe argv×1, decide×3 + helper; both pre-existing PreflightStage literals updated with planned_stage_ids: Vec::new()).
+
+## TASK 4 — flush com.rustynet/* pf anchors on macOS cleanup + uninstall
+
+Step 4.1 — root cause (read of adapter/macos.rs, macos_install.rs, macos_traffic.rs):
+- adapter/macos.rs:157 uninstall_daemon delegates to macos_install::uninstall_daemon; :305
+  cleanup_runtime_state delegates to macos_traffic::cleanup_runtime_state.
+- macos_install.rs:1155 uninstall_daemon stops the daemon then rm's binaries/plist/state dirs.
+  It NEVER flushes pf anchors and never calls cleanup_runtime_state — so a loaded anchor
+  (live finding: com.rustynet/blind_exit with `block drop out quick all`) survives uninstall.
+- macos_traffic.rs cleanup_runtime_state runs MACOS_RESET_COMMAND, which DOES enumerate
+  (`sudo -n pfctl -s Anchors | sed | grep -i rustynet || true`) and flush each anchor
+  (`sudo -n pfctl -a "$a" -F all 2>/dev/null || true`), but every error is swallowed by
+  `|| true` / `let _ =` — a `sudo -n` denial is indistinguishable from success.
+- The strict task regex `^com\.rustynet/[A-Za-z0-9_.-]+$` does NOT match the killswitch
+  family com.apple/rustynet_g<N>, so the broad shell pass stays; the argv-only strict pass
+  is added as defense in depth with surfaced errors.
+
+Step 4.2 — plan:
+- macos_traffic.rs: add `is_rustynet_pf_anchor(name)` (charset-validated
+  com.rustynet/<non-empty [A-Za-z0-9_.-]> suffix), `parse_pfctl_anchor_list(output)`,
+  `build_anchor_flush_args(anchor) -> Result<Vec<ValidatedArg>, AdapterError>` (Err on
+  invalid anchor), `flush_rustynet_pf_anchors_argv(conn) -> Result<usize, AdapterError>`:
+  enumerate anchors via ssh, parse, filter strict names, flush each through
+  RemoteCommand::from_args + run_remote (argv-only, per-anchor errors eprintln'd, count
+  returned). cleanup_runtime_state calls it best-effort after MACOS_RESET_COMMAND.
+- macos_install.rs: uninstall_daemon calls flush_rustynet_pf_anchors_argv best-effort
+  after the rm pass — the actual gap fix.
+- Unit tests: validator accept/reject (incl. crafted `com.rustynet/x;reboot`,
+  traversal `com.rustynet/../../etc`, space, empty, wrong prefix), parser trim/drop-empty,
+  builder Err-on-invalid + exact argv for valid, source pin that uninstall_daemon wires
+  the flush.
+
+### Step 4.3 — Results (2026-09-06)
+
+- macos_traffic.rs: 4 new pub fns (is_rustynet_pf_anchor :658, parse_pfctl_anchor_list :672, build_anchor_flush_args :684, flush_rustynet_pf_anchors_argv :708) + WIRE A (cleanup_runtime_state calls strict argv-only flush after MACOS_RESET_COMMAND, errors eprintln'd) + 5 unit tests.
+- macos_install.rs: WIRE B — uninstall_daemon now flushes com.rustynet/* pf anchors best-effort after removing binaries/state (root cause of the surviving com.rustynet/blind_exit `block drop out quick all` anchor: uninstall never touched pf at all).
+- Compile fix: AdapterError::Protocol is a struct variant — `Protocol { message: ... }`, not tuple form.
+- Gates: fmt --check RC=0; clippy -p rustynet-cli --all-targets --all-features -D warnings RC=0 (21.65s); `cargo test -p rustynet-cli --all-targets --all-features macos` RC=0, 0 failed everywhere (372 passed lib target incl. the 5 new tests, 328 passed second target).
+- New tests: rustynet_pf_anchor_validator_accepts_strict_names, rustynet_pf_anchor_validator_rejects_crafted_names, pfctl_anchor_list_parser_trims_and_drops_empty_lines, anchor_flush_args_reject_invalid_and_build_valid, uninstall_daemon_flushes_rustynet_pf_anchors (source pin).
