@@ -569,3 +569,61 @@ closing pass complete
 
 
 
+
+---
+
+## 2026-09-06 (session 2) — Linux relay frame-forwarding push (HP-3, target #1)
+
+Context: macOS role cells closed in the prior section; owner says keep
+going. Target order per handoff: (1) Linux `relay_forwards_frame_validation`
+(NEVER passed on any OS), (2) macOS role-transition, (3) macOS reboot
+recovery, (4) Windows role cells.
+
+### Topology resolution (read the code before launching)
+
+`select_relay_forward_test_topology` (`vm_lab/mod.rs:13839`) elects from
+the INVENTORY, not the run assignments: relay = the only
+`relay_capable=true` Linux entry — **fedora-x86-1** — and the stage
+(`relay_forwards_frame_validation.rs:140`) FAILS unless the assigned relay
+== the elected relay. Peers = non-relay, non-exit-capable Linux entries
+ranked by `lab_role` `aux`/`extra` then alias → sender **debian-headless-2**
+(receiver **debian-headless-4**). All three must be IN the run mesh (probe
+restarts sender+receiver daemons and asserts relay-routed status on both).
+
+Elected run topology: `fedora-x86-1:relay linux-x86-exit-1:exit
+debian-headless-2:client debian-headless-4:client`, full flag recipe per
+attempt-2 line 252-259 + `--enable-relay-forwarding-validation --skip-soak`.
+
+### Blocker found + fixed: tailnet ACL denies this Mac → 192.168.121.0/24
+
+First launches failed the OS-version probe on `linux-x86-exit-1`
+("refusing Linux-umbrella evidence"), and the failure was NOT transient:
+from this Mac, TCP to 192.168.121.26/.227:22 gets **RST** and ICMP is
+100% blackholed, while `virsh list` (all 4 KVM guests running),
+`domifaddr` (IPs correct), and host→guest SSH from ubuntu-kvm-1 itself
+all pass. `tailscale status --json` shows ubuntu-kvm-1 advertising
+`192.168.121.0/24` and the Mac holding the utun4 route — RST+blackhole
+with a working far side is the tailnet-ACL-deny signature. That is an
+OWNER-level tailnet ACL change; not mine to make.
+
+Workaround (landed on this branch, commit `caa11fdc`): the adapter SSH
+transport passes `-F /dev/null`, so `~/.ssh/config` ProxyJump can never
+apply there. Added env-gated, CIDR-scoped jump to the shared ssh/scp
+hardening: `RUSTYNET_LAB_PROXYJUMP=<user@host>` + required companion
+`RUSTYNET_LAB_PROXYJUMP_CIDRS=192.168.121.0/24` appends one
+`-o ProxyJump=` — jump hop inherits the pinned identity + known_hosts
+(verified live: lab key authorizes `ubuntu-server@100.117.1.47`, whose
+key is pinned in `known_hosts_lab`). Fail-closed on half-configured or
+malformed env; unit tests for the whole matrix; fmt+clippy clean. Also
+added a `~/.ssh/config` block for 192.168.121.* (supervisor lenovo-guest
+pattern) — that covers the legacy helper paths that DO read ssh_config.
+
+### Run 5 (Linux relay) — IN FLIGHT at writing
+
+Dry-run green: 4 nodes, 66 planned stages. Launched (pid 85569, nohup —
+note macOS has no setsid):
+`state/live-lab-linux-relay-fwd1-20260906-082801-r2`, commit `caa11fdc`
+clean, env ProxyJump pair set. QH-64 watch active (the probe restarts
+sender+receiver daemons mid-run; `RestrictionMode::Permanent` /
+`gossip_accepted_total=0` = QH-64 evidence, not new defects). Result
+append: next section.
