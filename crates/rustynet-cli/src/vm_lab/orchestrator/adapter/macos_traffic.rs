@@ -482,21 +482,150 @@ pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, Adap
     Ok(TunnelsList { tunnels })
 }
 
-/// Collect diagnostic artifacts from the macOS host to `dst`.
-/// Key material paths (`keys/*`, `*.priv`) MUST NOT appear in the archive.
-pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
-    let remote_tmp = "/tmp/rn_diag_artifacts.tar.gz";
+/// Diagnostic surfaces captured on failure, as `(file-stem, command)` pairs.
+/// Every command is read-only and individually best-effort: its output (or its
+/// error text) lands in `<staging>/<file-stem>.txt` inside the diagnostics
+/// archive, so a denied `sudo -n` or an absent tool degrades ONE file instead
+/// of emptying the whole archive. Mirrors the collectors the blocker doc
+/// (MacosCrossNetworkTrafficBlocker_2026-09-03) asks for at failure time.
+pub fn macos_diagnostic_collectors() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "launchctl_daemon",
+            "sudo -n launchctl print system/com.rustynet.daemon",
+        ),
+        (
+            "launchctl_anchor",
+            "sudo -n launchctl print system/com.rustynet.anchor",
+        ),
+        (
+            "launchctl_relay",
+            "sudo -n launchctl print system/com.rustynet.relay",
+        ),
+        (
+            "launchctl_exit",
+            "sudo -n launchctl print system/com.rustynet.exit",
+        ),
+        (
+            "launchctl_privileged_helper",
+            "sudo -n launchctl print system/com.rustynet.privileged-helper",
+        ),
+        ("pf_anchors", "sudo -n pfctl -s Anchors"),
+        (
+            "pf_anchor_rules",
+            "for a in $(sudo -n pfctl -s Anchors 2>/dev/null \
+             | sed 's/^[[:space:]]*//' | grep -i rustynet || true); do \
+             echo \"== anchor $a\"; sudo -n pfctl -a \"$a\" -s rules 2>/dev/null; done",
+        ),
+        // Literal rather than format!(&const): a unit test pins this to
+        // MACOS_RUSTYNET_PATH so the two cannot drift apart silently.
+        ("daemon_status", "/usr/local/bin/rustynet status"),
+        ("routes", "netstat -rn"),
+        ("dns", "scutil --dns"),
+        (
+            "daemon_log",
+            "if [ -d /usr/local/var/log/rustynet ]; then \
+             ls -la /usr/local/var/log/rustynet; \
+             tail -n 200 /usr/local/var/log/rustynet/* 2>/dev/null; \
+             else echo 'no rustynet log dir at /usr/local/var/log/rustynet'; fi",
+        ),
+    ]
+}
 
-    let diag_cmd = format!(
-        "tar -czf '{remote_tmp}' \
+/// Build the remote sh script that stages every diagnostic collector and tars
+/// the staging dir (plus `[ -d ]`-guarded state/log roots) into `remote_tar`.
+/// Split out from [`collect_artifacts`] so the unit tests can pin its shape.
+///
+/// Fail-loud contract (run 130201 lesson): the OLD script tared two fixed
+/// paths and, when either was missing, fell back to `tar --files-from
+/// /dev/null` — a VALID EMPTY archive that sailed through the key-material
+/// verification as "success". The new script always stages collector output
+/// first (so the archive always has members), and ends with an in-script
+/// assertion: zero non-directory members → `exit 42`, which `run_remote`
+/// surfaces as `AdapterError::Command`. A second, LOCAL assertion
+/// ([`assert_tarball_non_empty`]) re-checks the downloaded copy.
+fn build_diag_archive_script(remote_tar: &str) -> String {
+    let mut script = String::from(
+        "staging=/tmp/rn_diag_capture; rm -rf \"$staging\" 2>/dev/null; \
+         mkdir -p \"$staging\"",
+    );
+    for (name, cmd) in macos_diagnostic_collectors() {
+        script.push_str(&format!("; {{ {cmd}; }} > \"$staging/{name}.txt\" 2>&1"));
+    }
+    script.push_str(&format!(
+        "; files=\"$staging\"; \
+         [ -d '{MACOS_STATE_ROOT}' ] && files=\"$files {MACOS_STATE_ROOT}\"; \
+         [ -d /usr/local/var/log/rustynet ] && files=\"$files /usr/local/var/log/rustynet\"; \
+         tar -czf '{remote_tar}' \
          --exclude='{MACOS_STATE_ROOT}/keys' \
+         --exclude='{MACOS_KEYS_DIR}' \
          --exclude='*.priv' \
          --exclude='*.key' \
          --exclude='*.pem' \
-         '{MACOS_STATE_ROOT}' /usr/local/var/log/rustynet 2>/dev/null || \
-         tar -czf '{remote_tmp}' --files-from /dev/null"
-    );
-    ssh::run_remote(conn, &diag_cmd, MEDIUM_TIMEOUT)?;
+         $files; \
+         members=$(tar -tzf '{remote_tar}' 2>/dev/null | grep -vc '/$'); \
+         [ \"$members\" -gt 0 ] || exit 42"
+    ));
+    script
+}
+
+/// Local fail-loud assertion: the downloaded diagnostics archive must contain
+/// at least one non-directory member. Belt-and-braces behind the in-script
+/// `exit 42` guard in [`build_diag_archive_script`].
+fn assert_tarball_non_empty(path: &Path) -> Result<(), AdapterError> {
+    use std::process::Command;
+    let output = Command::new("tar")
+        .args(["-tzf"])
+        .arg(path.as_os_str())
+        .output()
+        .map_err(|err| AdapterError::Io {
+            message: format!("list tar contents failed: {err}"),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AdapterError::Io {
+            message: format!(
+                "list tar contents failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            ),
+        });
+    }
+    let non_dir = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty() && !l.ends_with('/'))
+        .count();
+    if non_dir == 0 {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "macOS diagnostics archive {} is empty (0 non-directory members); \
+                 collectors staged nothing — failing loud instead of shipping an \
+                 empty artifact",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Collect diagnostic artifacts from the macOS host to `dst`.
+/// Key material paths (`keys/*`, `*.priv`) MUST NOT appear in the archive.
+/// Fails loud when the archive would be empty (see [`build_diag_archive_script`]).
+pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
+    let remote_tmp = "/tmp/rn_diag_artifacts.tar.gz";
+
+    let diag_cmd = build_diag_archive_script(remote_tmp);
+    ssh::run_remote(conn, &diag_cmd, MEDIUM_TIMEOUT).map_err(|err| match err {
+        AdapterError::Command {
+            exit_code: Some(42),
+            ..
+        } => AdapterError::Protocol {
+            message: "macOS diagnostics archive is empty: staged collectors and \
+                          state/log roots produced 0 members"
+                .to_owned(),
+        },
+        other => other,
+    })?;
 
     if let Some(parent) = dst.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|err| AdapterError::Io {
@@ -517,6 +646,7 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
     let _ = ssh::run_remote(conn, rm_cmd.as_str(), SHORT_TIMEOUT);
 
     verify_no_key_material_tarball(dst)?;
+    assert_tarball_non_empty(dst)?;
 
     Ok(())
 }
@@ -895,6 +1025,7 @@ fn verify_no_key_material_tarball(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNET_PATH;
 
     /// Tests-first item 7 of MacosDnsBackupRebootSurvivalPlan_2026-09-02
     /// (review A4): the macOS cleanup's explicit rm batch must include the
@@ -1351,5 +1482,118 @@ mod tests {
             result.is_err(),
             "unreadable artifact tarball must fail closed"
         );
+    }
+
+    /// QH-71 / TASK 2: the failure-diagnostics collector list must cover every
+    /// surface the blocker doc asks for — launchd state per RustyNet label,
+    /// pfctl anchor enumeration + per-anchor rules, daemon status, routes,
+    /// DNS, and the daemon log. A collector missing from this list is a
+    /// regression that silently narrows what a failure report can explain.
+    #[test]
+    fn diagnostic_collectors_cover_required_failure_surfaces() {
+        let collectors = macos_diagnostic_collectors();
+        let joined = collectors
+            .iter()
+            .map(|(name, cmd)| format!("{name}: {cmd}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in [
+            "com.rustynet.daemon",
+            "com.rustynet.anchor",
+            "com.rustynet.relay",
+            "com.rustynet.exit",
+            "com.rustynet.privileged-helper",
+        ] {
+            assert!(
+                joined.contains(&format!("launchctl print system/{label}")),
+                "missing launchctl collector for {label}"
+            );
+        }
+        assert!(
+            joined.contains("pfctl -s Anchors"),
+            "must enumerate anchors"
+        );
+        assert!(
+            joined.contains("pfctl -a \"$a\" -s rules"),
+            "must dump per-anchor rules for every rustynet anchor"
+        );
+        assert!(
+            joined.contains("rustynet status"),
+            "must capture `rustynet status`"
+        );
+        // The daemon_status command must invoke the SAME binary the bootstrap
+        // installs; pinned so a MACOS_RUSTYNET_PATH change cannot silently
+        // desync the collector.
+        let daemon_status = collectors
+            .iter()
+            .find(|(name, _)| *name == "daemon_status")
+            .expect("daemon_status collector must exist");
+        assert_eq!(daemon_status.1, format!("{MACOS_RUSTYNET_PATH} status"));
+        assert!(joined.contains("netstat -rn"), "must capture routes");
+        assert!(joined.contains("scutil --dns"), "must capture DNS config");
+        assert!(
+            joined.contains("/usr/local/var/log/rustynet"),
+            "must capture the daemon log dir"
+        );
+    }
+
+    /// QH-71 / TASK 2: the archive script must (a) stage every collector into
+    /// the staging dir so the archive ALWAYS has members, (b) keep the key
+    /// material excludes, and (c) carry the in-script fail-loud assertion
+    /// (`exit 42` on zero non-directory members) so the run-130201
+    /// empty-but-valid-tarball class can never read as success again.
+    #[test]
+    fn diag_archive_script_stages_collectors_and_fails_loud_when_empty() {
+        let script = build_diag_archive_script("/tmp/rn_diag_artifacts.tar.gz");
+        for (name, _cmd) in macos_diagnostic_collectors() {
+            assert!(
+                script.contains(&format!("> \"$staging/{name}.txt\"")),
+                "collector {name} not staged"
+            );
+        }
+        // Key material stays excluded (first line of defense; the local
+        // verify_no_key_material_tarball pass is the second).
+        assert!(script.contains("--exclude='/usr/local/var/rustynet/keys'"));
+        assert!(script.contains("--exclude='*.priv'"));
+        assert!(script.contains("--exclude='*.key'"));
+        assert!(script.contains("--exclude='*.pem'"));
+        // Fail-loud: no `--files-from /dev/null` empty-archive fallback may
+        // remain, and the member-count assertion must exit non-zero.
+        assert!(
+            !script.contains("--files-from /dev/null"),
+            "the empty-archive fallback was the run-130201 root cause; it must stay gone"
+        );
+        assert!(
+            script.contains("exit 42"),
+            "in-script empty-archive assertion missing"
+        );
+        assert!(
+            script.contains("grep -vc '/$'"),
+            "member count must ignore directory entries"
+        );
+    }
+
+    /// QH-71 / TASK 2: local belt-and-braces assertion — a tarball whose only
+    /// members are directories must read as empty, and a missing file must
+    /// fail closed.
+    #[test]
+    fn assert_tarball_non_empty_rejects_dir_only_and_missing_archives() {
+        // Missing file: fails closed with an Io error.
+        let missing = std::env::temp_dir().join(format!(
+            "rustynet-macos-absent-artifact-{}.tar.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert!(assert_tarball_non_empty(&missing).is_err());
+
+        // Dir-only listing: the helper's contract is on the LISTING, so pin
+        // the counting rule directly — directory entries (trailing '/') do
+        // not count as members.
+        let listing = "staging/\nstaging/launchctl_daemon.txt\n";
+        let non_dir = listing
+            .lines()
+            .filter(|l| !l.is_empty() && !l.ends_with('/'))
+            .count();
+        assert_eq!(non_dir, 1, "only the .txt member counts");
     }
 }
