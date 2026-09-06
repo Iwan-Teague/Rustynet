@@ -376,13 +376,21 @@ impl PlanBuilder {
         // One instantiation arm per stage, compiler-enforced exhaustive: a
         // new StageId variant fails to compile here until it gets an arm, so
         // plan membership can no longer silently drift from the catalog.
-        StageId::ALL
+        // Materialize the planned set first so the preflight stage can see
+        // the full plan (it gates cross-bridge severity on whether any
+        // cross-bridge dataplane stage is planned — QH-72).
+        let planned: Vec<StageId> = StageId::ALL
             .iter()
             .filter(|id| include(id))
+            .cloned()
+            .collect();
+        planned
+            .iter()
             .map(|id| -> Box<dyn OrchestrationStage> {
                 match id {
                     StageId::Preflight => Box::new(PreflightStage {
                         clock_remediation_enabled: enable_clock_remediation,
+                        planned_stage_ids: planned.clone(),
                     }),
                     StageId::PrepareSourceArchive => {
                         Box::new(PrepareSourceArchiveStage::new(source_mode, allow_dirty))
