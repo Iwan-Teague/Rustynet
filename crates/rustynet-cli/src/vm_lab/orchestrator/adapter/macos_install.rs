@@ -1164,6 +1164,14 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
         ),
         timeout,
     )?;
+    // Flush any com.rustynet/* pf anchor the daemon loaded (e.g. blind_exit's
+    // default-deny `block drop out quick all`): uninstall previously left these
+    // behind, so the anchor outlived the installation and kept blocking traffic.
+    if let Err(e) =
+        crate::vm_lab::orchestrator::adapter::macos_traffic::flush_rustynet_pf_anchors_argv(conn)
+    {
+        eprintln!("macos uninstall: com.rustynet/* pf anchor flush failed: {e}");
+    }
     Ok(())
 }
 

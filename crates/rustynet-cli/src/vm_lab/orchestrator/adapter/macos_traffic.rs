@@ -651,6 +651,94 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
     Ok(())
 }
 
+/// Strict `com.rustynet/*` pf-anchor name check (charset-validated, no regex dep):
+/// `^com\.rustynet/[A-Za-z0-9_.-]+$`. Anything else (including the killswitch
+/// family `com.apple/rustynet_g<N>` and shell metacharacters) is rejected so a
+/// crafted anchor name can never reach an exec argv.
+pub fn is_rustynet_pf_anchor(name: &str) -> bool {
+    match name.strip_prefix("com.rustynet/") {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        }
+        None => false,
+    }
+}
+
+/// Parse `pfctl -s Anchors` output into a list of anchor names: one per line,
+/// surrounding whitespace trimmed, empty lines dropped.
+pub fn parse_pfctl_anchor_list(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Build the argv-only flush command for one `com.rustynet/*` anchor. Fails
+/// closed (never builds a command) for a name that does not pass
+/// [`is_rustynet_pf_anchor`].
+pub fn build_anchor_flush_args(anchor: &str) -> Result<Vec<ValidatedArg>, AdapterError> {
+    if !is_rustynet_pf_anchor(anchor) {
+        return Err(AdapterError::Protocol {
+            message: format!("refusing to flush pf anchor with invalid name: {anchor:?}"),
+        });
+    }
+    Ok(vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("pfctl")?,
+        ValidatedArg::cli_token("-a")?,
+        ValidatedArg::cli_token(anchor)?,
+        ValidatedArg::cli_token("-F")?,
+        ValidatedArg::cli_token("all")?,
+    ])
+}
+
+/// Enumerate pf anchors over SSH, then flush every strictly-named
+/// `com.rustynet/*` anchor through an argv-only `pfctl -a <anchor> -F all`
+/// (Rust-side name validation; no shell interpolation of remote output).
+/// Complements — does not replace — the broader shell `MACOS_RESET_COMMAND`
+/// pass, which also covers the `com.apple/rustynet_g<N>` killswitch family
+/// the strict prefix deliberately excludes. Per-anchor failures are printed
+/// and skipped; the count of successful flushes is returned.
+pub fn flush_rustynet_pf_anchors_argv(conn: &NodeConnection) -> Result<usize, AdapterError> {
+    let list_args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("pfctl")?,
+        ValidatedArg::cli_token("-s")?,
+        ValidatedArg::cli_token("Anchors")?,
+    ];
+    let list_cmd = ssh::RemoteCommand::from_args("macos list pf anchors", &list_args)?;
+    let output = ssh::run_remote(conn, list_cmd.as_str(), SHORT_TIMEOUT)?;
+
+    let mut flushed = 0usize;
+    for anchor in parse_pfctl_anchor_list(&output) {
+        if !is_rustynet_pf_anchor(&anchor) {
+            continue;
+        }
+        let flush_cmd = match ssh::RemoteCommand::from_args(
+            "macos flush rustynet pf anchor",
+            &build_anchor_flush_args(&anchor)?,
+        ) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                eprintln!("pf anchor flush: skipping {anchor:?}: {e}");
+                continue;
+            }
+        };
+        match ssh::run_remote(conn, flush_cmd.as_str(), SHORT_TIMEOUT) {
+            Ok(_) => flushed += 1,
+            Err(e) => eprintln!("pf anchor flush: {anchor}: {e}"),
+        }
+    }
+    Ok(flushed)
+}
+
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
     // Stop launchd/process surfaces first (best-effort). Wait until no
@@ -667,6 +755,14 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // carrying the mesh CIDR collides with the fresh bring-up. Best-effort and
     // idempotent — a clean node is a no-op.
     let _ = ssh::run_remote(conn, MACOS_RESET_COMMAND, Duration::from_secs(30));
+
+    // Second, argv-only pass over the strict com.rustynet/* family with
+    // Rust-side name validation: unlike the shell pass above (whose errors
+    // are swallowed by `|| true`), a `sudo -n` denial or pfctl failure here
+    // is printed, so a surviving anchor is visible instead of silent.
+    if let Err(e) = flush_rustynet_pf_anchors_argv(conn) {
+        eprintln!("macos cleanup: strict com.rustynet/* pf anchor flush failed: {e}");
+    }
 
     // Remove runtime state but keep WG keys and the installation. This now
     // includes the seed trust evidence (`rustynetd.trust`) and its anti-replay
@@ -1595,5 +1691,59 @@ mod tests {
             .filter(|l| !l.is_empty() && !l.ends_with('/'))
             .count();
         assert_eq!(non_dir, 1, "only the .txt member counts");
+    }
+    #[test]
+    fn rustynet_pf_anchor_validator_accepts_strict_names() {
+        assert!(is_rustynet_pf_anchor("com.rustynet/nat"));
+        assert!(is_rustynet_pf_anchor("com.rustynet/blind_exit"));
+        assert!(is_rustynet_pf_anchor("com.rustynet/exit_v2"));
+    }
+
+    #[test]
+    fn rustynet_pf_anchor_validator_rejects_crafted_names() {
+        assert!(!is_rustynet_pf_anchor("com.rustynet/x;reboot"));
+        assert!(!is_rustynet_pf_anchor("com.rustynet/../../etc"));
+        assert!(!is_rustynet_pf_anchor("com.rustynet/"));
+        assert!(!is_rustynet_pf_anchor("com.apple/rustynet_g4"));
+        assert!(!is_rustynet_pf_anchor("com.rustynet/a b"));
+        assert!(!is_rustynet_pf_anchor(";reboot"));
+        assert!(!is_rustynet_pf_anchor(""));
+    }
+
+    #[test]
+    fn pfctl_anchor_list_parser_trims_and_drops_empty_lines() {
+        let out = "com.rustynet/nat\n\n  com.rustynet/blind_exit  \ncom.apple/rustynet_g4\n";
+        assert_eq!(
+            parse_pfctl_anchor_list(out),
+            vec![
+                "com.rustynet/nat".to_owned(),
+                "com.rustynet/blind_exit".to_owned(),
+                "com.apple/rustynet_g4".to_owned(),
+            ]
+        );
+        assert!(parse_pfctl_anchor_list("").is_empty());
+    }
+
+    #[test]
+    fn anchor_flush_args_reject_invalid_and_build_valid() {
+        assert!(build_anchor_flush_args("com.rustynet/x;reboot").is_err());
+        let args = build_anchor_flush_args("com.rustynet/blind_exit").unwrap();
+        let cmd = ssh::RemoteCommand::from_args("macos flush rustynet pf anchor", &args).unwrap();
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' 'pfctl' '-a' 'com.rustynet/blind_exit' '-F' 'all'"
+        );
+    }
+
+    #[test]
+    fn uninstall_daemon_flushes_rustynet_pf_anchors() {
+        let src = include_str!("macos_install.rs");
+        let start = src.find("pub fn uninstall_daemon").unwrap();
+        let end = src[start..].find("\n}\n").map(|i| start + i).unwrap();
+        let body = &src[start..end];
+        assert!(
+            body.contains("flush_rustynet_pf_anchors_argv"),
+            "uninstall_daemon must flush com.rustynet/* pf anchors"
+        );
     }
 }
