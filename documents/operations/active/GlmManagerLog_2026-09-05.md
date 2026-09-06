@@ -747,3 +747,14 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
   sender=dh2 (client→rank2, alias order), receiver=fedora-utm-1. QH-64 watch
   active. Polling; verdict from logs/relay_forwards_frame_validation.log +
   stages.tsv only.
+
+## 2026-09-06 fwd5b verdict + nft syntax fix (session 4 cont.)
+
+- **fwd5b** (`state/live-lab-linux-relay-fwd5b-20260906-114147`, pid 69402, source 02cfba0c): run COMPLETED ~11:58Z. Everything passed EXCEPT two stages:
+  - `relay_forwards_frame_validation` FAIL: `debian-headless-4: expected 2 udp-drop rules on sender debian-headless-2, got: HP3_NFT_RULE_COUNT=0`. Root cause (verified live over SSH on dh2): **invalid nft syntax in stage tooling** — `build_relay_forward_test_block_script` emits `ip daddr <peer> udp drop`; a bare protocol name before `drop` is a parse error on nft (`syntax error, unexpected drop, expecting length or checksum or sport or dport`). Table+chain were created, both rules failed, count=0. Election itself WORKED: sender=debian-headless-2, receiver=fedora-utm-1, relay=debian-headless-4 as designed (975d9bbb); relay provisioned (unit active + /healthz ok) and counters parsed before the block step — the proof got further than ever before.
+  - `exit_dns_failclosed_validation` FAIL on rocky-utm-1: `dig` binary absent (fresh Rocky 10 cloud image, no bind-utils, no egress). Installed bind-utils via host reverse SOCKS tunnel (`ssh -R 1080` + `dnf --setopt=proxy=socks5h://127.0.0.1:1080 install -y bind-utils`), `/usr/bin/dig` verified. Guest gap, not code.
+- **FIX**: `build_relay_forward_test_block_script` now emits `ip daddr <peer> meta l4proto udp drop` / `ip saddr <peer> meta l4proto udp drop` (accepted + rendered with `udp drop` substring on dh2, so the HP3_NFT_RULE_COUNT grep still works). Unit test `relay_forward_test_block_script_targets_exactly_the_given_peer_ip` updated with a comment pinning the live-verified syntax error.
+- Gates (pinned toolchain): scoped `cargo test -p rustynet-cli --features vm-lab --all-targets --all-features relay_forward_test_block_script` → 93 result sets all ok (includes the named test pass); `cargo fmt --all -- --check` OK; `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings` clean; binary rebuilt.
+- Both fwd5b stubs recorded in `live_lab_stage_triage.jsonl` via `ops live-lab-record-stage-patch`.
+- Cleanup verified: NO hp3 table residue on dh2 (stage's unconditional unblock ran).
+- NEXT: relaunch fwd6 with identical flags (new commit as source).

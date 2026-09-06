@@ -14067,8 +14067,8 @@ fn build_relay_forward_test_block_script(peer_ip: &str) -> String {
         "sudo nft add table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null; \
          sudo nft add chain inet {RELAY_FORWARD_TEST_NFT_TABLE} out '{{ type filter hook output priority 0; policy accept; }}' 2>/dev/null; \
          sudo nft add chain inet {RELAY_FORWARD_TEST_NFT_TABLE} in '{{ type filter hook input priority 0; policy accept; }}' 2>/dev/null; \
-         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} out ip daddr {peer_ip} udp drop; \
-         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} in ip saddr {peer_ip} udp drop; \
+         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} out ip daddr {peer_ip} meta l4proto udp drop; \
+         sudo nft add rule inet {RELAY_FORWARD_TEST_NFT_TABLE} in ip saddr {peer_ip} meta l4proto udp drop; \
          echo \"HP3_NFT_RULE_COUNT=$(sudo nft list table inet {RELAY_FORWARD_TEST_NFT_TABLE} 2>/dev/null | grep -c 'udp drop')\""
     )
 }
@@ -47863,8 +47863,11 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     #[test]
     fn relay_forward_test_block_script_targets_exactly_the_given_peer_ip() {
         let script = super::build_relay_forward_test_block_script("192.168.0.204");
-        assert!(script.contains("ip daddr 192.168.0.204 udp drop"));
-        assert!(script.contains("ip saddr 192.168.0.204 udp drop"));
+        // `meta l4proto udp` (not bare `udp`) — a bare protocol name before
+        // `drop` is an nft syntax error ("unexpected drop, expecting length
+        // or checksum or sport or dport"), verified live on debian-headless-2.
+        assert!(script.contains("ip daddr 192.168.0.204 meta l4proto udp drop"));
+        assert!(script.contains("ip saddr 192.168.0.204 meta l4proto udp drop"));
         assert!(script.contains("hp3_relay_forward_test"));
     }
 
