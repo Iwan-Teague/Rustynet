@@ -734,9 +734,20 @@ pub fn build_anchor_flush_args(anchor: &str) -> Result<Vec<ValidatedArg>, Adapte
 /// (Rust-side name validation; no shell interpolation of remote output).
 /// Complements — does not replace — the broader shell `MACOS_RESET_COMMAND`
 /// pass, which also covers the `com.apple/rustynet_g<N>` killswitch family
-/// the strict prefix deliberately excludes. Per-anchor failures are printed
-/// and skipped; the count of successful flushes is returned.
-pub fn flush_rustynet_pf_anchors_argv(conn: &NodeConnection) -> Result<usize, AdapterError> {
+/// the strict prefix deliberately excludes.
+///
+/// Returns `(found, flushed)` — the count of strict `com.rustynet/*` anchors
+/// observed and the count successfully flushed. If ANY observed anchor fails
+/// to flush, returns `Err` naming the failures: a surviving default-deny
+/// anchor (e.g. blind_exit's `block drop out quick all`) is a live security
+/// residue, and a bare count cannot distinguish "nothing to flush" from
+/// "flush denied" — callers must not be able to mistake the two
+/// (glm-5.3 review of 229ba864). Enumeration failure propagates unchanged
+/// (`run_remote` errors on any nonzero exit, so a `sudo -n` denial during
+/// the listing cannot be parsed as an empty anchor list).
+pub fn flush_rustynet_pf_anchors_argv(
+    conn: &NodeConnection,
+) -> Result<(usize, usize), AdapterError> {
     let list_args = vec![
         ValidatedArg::cli_token("sudo")?,
         ValidatedArg::cli_token("-n")?,
@@ -747,27 +758,41 @@ pub fn flush_rustynet_pf_anchors_argv(conn: &NodeConnection) -> Result<usize, Ad
     let list_cmd = ssh::RemoteCommand::from_args("macos list pf anchors", &list_args)?;
     let output = ssh::run_remote(conn, list_cmd.as_str(), SHORT_TIMEOUT)?;
 
+    let mut found = 0usize;
     let mut flushed = 0usize;
+    let mut failures = Vec::new();
     for anchor in parse_pfctl_anchor_list(&output) {
         if !is_rustynet_pf_anchor(&anchor) {
             continue;
         }
+        found += 1;
         let flush_cmd = match ssh::RemoteCommand::from_args(
             "macos flush rustynet pf anchor",
             &build_anchor_flush_args(&anchor)?,
         ) {
             Ok(cmd) => cmd,
             Err(e) => {
-                eprintln!("pf anchor flush: skipping {anchor:?}: {e}");
+                failures.push(format!("{anchor}: {e}"));
                 continue;
             }
         };
         match ssh::run_remote(conn, flush_cmd.as_str(), SHORT_TIMEOUT) {
             Ok(_) => flushed += 1,
-            Err(e) => eprintln!("pf anchor flush: {anchor}: {e}"),
+            Err(e) => failures.push(format!("{anchor}: {e}")),
         }
     }
-    Ok(flushed)
+    if !failures.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "com.rustynet/* pf anchor flush left {} of {} anchor(s) in place \
+                 (default-deny anchors keep blocking after uninstall): {}",
+                failures.len(),
+                found,
+                failures.join("; ")
+            ),
+        });
+    }
+    Ok((found, flushed))
 }
 
 /// Remove runtime state files, leaving the installation intact.
@@ -1803,6 +1828,17 @@ mod tests {
         assert!(
             body.contains("flush_rustynet_pf_anchors_argv"),
             "uninstall_daemon must flush com.rustynet/* pf anchors"
+        );
+        // Fail-closed pin (glm-5.3 review of 229ba864): a flush failure must
+        // PROPAGATE — a best-effort eprintln would let a surviving
+        // default-deny anchor outlive an "uninstalled" machine.
+        assert!(
+            body.contains("flush_rustynet_pf_anchors_argv(conn)?"),
+            "uninstall_daemon must propagate the anchor-flush error"
+        );
+        assert!(
+            !body.contains("if let Err(e) =\n        crate::vm_lab::orchestrator::adapter::macos_traffic::flush_rustynet_pf_anchors_argv"),
+            "uninstall_daemon must not swallow the anchor-flush error"
         );
     }
 }

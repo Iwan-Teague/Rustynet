@@ -228,3 +228,35 @@ glm-5.3 verdict: NOT sound — 2 fail-open defects + 1 latent + drift hazard
   stderr control-chars sanitized (`sanitize_probe_text`); report states
   one-alias-per-/24 sampling.
 - Scoped test: cross_bridge filter → 6 passed / 0 failed.
+
+### Step R.2d — 229ba864 + 7fde653e (TASK 4 pf anchor flush on uninstall) review
+
+glm-5.3 verdict: argv-only + charset validation sound (no injection, no
+production panics, deferred rm ordering correct), but 2 real defects + 1
+verification requirement:
+
+- FINDING (fail-open): uninstall_daemon only eprintln'd the flush error and
+  returned Ok — a sudo -n denial left `com.rustynet/blind_exit`
+  `block drop out quick all` live on a "cleanly uninstalled" machine (the
+  original incident, now with a stderr note). APPLIED: uninstall propagates
+  the flush error (`flush_rustynet_pf_anchors_argv(conn)?` before
+  `rm_result?`); source-pin test extended to pin BOTH the call and the
+  propagation. cleanup_runtime_state stays best-effort by design (documented).
+- FINDING (lost signal): `Result<usize>` counted successes only — callers
+  could not distinguish "0 anchors present" from "present but flush-denied".
+  APPLIED: signature now `Result<(found, flushed), AdapterError>` and returns
+  Err naming failed anchors whenever any observed anchor survives; all anchors
+  are still attempted before erroring.
+- FINDING (conditional): "errors are surfaced" rested on run_remote exit-code
+  semantics. VERIFIED SAFE: ssh.rs run_remote_inner returns
+  Err(AdapterError::Command) on any nonzero exit (checked at :715-722), so a
+  sudo denial during anchor LISTING propagates; only the per-anchor flush
+  step had the gap (closed above).
+- MINOR (logged, no change): `com.rustynet/..` passes the charset validator —
+  harmless (argv-only exec, pfctl does not path-normalize anchor names;
+  validator is defense-in-depth); strict pass covers fewer anchors than the
+  broad shell pass by design (killswitch family excluded);
+  `pfctl -F all` leaves the anchor listed so counts are not residue
+  indicators across runs.
+- Scoped: macos test filter 372 passed / 0 failed (lib); clippy
+  -p rustynet-cli --all-targets --all-features --features vm-lab -D warnings RC=0.
