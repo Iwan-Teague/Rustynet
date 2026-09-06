@@ -191,3 +191,40 @@ empty-archive class closed at two layers. Findings + disposition:
   accepted, noted here for anyone copying the pattern elsewhere.
 - Scoped test: `cargo test -p rustynet-cli ... --features vm-lab macos` →
   372 passed / 0 failed (lib) + all other targets ok.
+
+### Step R.2c — ba3ff9a3 (TASK 3 cross-bridge preflight) review
+
+glm-5.3 verdict: NOT sound — 2 fail-open defects + 1 latent + drift hazard
+(all verified against the code before applying):
+
+- FINDING (fail-open, Windows): probe gated on stdout `contains("True")`;
+  Test-NetConnection prints `PingSucceeded : True` on ICMP-reachable hosts,
+  so TCP/22-blocked-but-pingable (the CP-1 pf shape) false-passed. APPLIED:
+  Windows argv now `if ((...).TcpTestSucceeded) { exit 0 } else { exit 1 }`,
+  exit code is the sole discriminator, stdout check deleted; new test
+  `cross_bridge_windows_probe_exits_on_tcp_result`.
+- FINDING (fail-open, gate bypass): non-IPv4 ssh hosts (IPv6/hostname) went
+  to `excluded` and never influenced the decision — split fleets carrying
+  one read as clean NoSplit/Pass. APPLIED: `decide_cross_bridge` now takes
+  `excluded`; any excluded target under a dataplane plan → Fail
+  ("unprovable"), control-plane plans → Warn (never clean Pass); new test
+  `decide_cross_bridge_excluded_targets_never_pass_cleanly`; 3 existing
+  call sites/tests updated.
+- FINDING (latent fail-open): adapter-miss pair did `continue` → zero
+  failures → Pass claiming probes that never ran. APPLIED: pushes
+  "probe skipped: adapter missing … unproven" as a probe failure
+  (fail-closed).
+- FINDING (drift hazard): hardcoded 4-StageId list. PARTIALLY APPLIED:
+  renames are compile-pinned (match arms); added doc note that ADDING a new
+  cross-bridge dataplane StageId requires extending the list in the same
+  change. A mechanical guard is impossible without stage-registry metadata
+  this stream should not add.
+- FINDING (spurious hard-fail on exec errors, REJECTED): distinguishing
+  "inconclusive" (missing nc/powershell, spawn error) from "blocked" would
+  downgrade a fail-closed gate; keeping tooling errors as failures is the
+  conservative direction. Logged for the owner.
+- MINOR APPLIED: strip_ssh_port doc corrected (IPv6 CAN end in a numeric
+  group; safety comes from the later Ipv4 parse, not the strip); probe
+  stderr control-chars sanitized (`sanitize_probe_text`); report states
+  one-alias-per-/24 sampling.
+- Scoped test: cross_bridge filter → 6 passed / 0 failed.
