@@ -13894,6 +13894,83 @@ pub(crate) fn select_relay_forward_test_topology(
     })
 }
 
+/// Run-scoped variant of [`select_relay_forward_test_topology`] for the
+/// `--node` orchestrator engine. The relay is the node the OPERATOR assigned
+/// the relay role — never an inventory-wide heuristic: the inventory-wide
+/// election wrongly picked any relay_capable entry (in entries order), even
+/// one entirely outside the run topology, and the stage then failed on the
+/// elected-vs-assigned mismatch (livelab-1788686307). The assigned relay is
+/// trusted over the `relay_capable` flag because the run has already
+/// deployed the relay service onto that node by the time this proof runs
+/// (`deploy_relay_service` is a dependency); a flag-only capability claim
+/// proves nothing the deployment has not already proven.
+///
+/// Spare peers are likewise elected ONLY from the run's own node
+/// assignments: peers outside the run were never enrolled into this run's
+/// mesh, so they could never establish the relay-routed session the proof
+/// waits for. Fails closed with a clear reason (not a silent skip) if the
+/// run cannot supply what the proof needs.
+pub(crate) fn select_relay_forward_test_topology_for_run(
+    inventory: &[VmInventoryEntry],
+    relay_alias: &str,
+    run_aliases: &[String],
+) -> Result<RelayForwardTestTopology, String> {
+    let is_linux = |e: &&VmInventoryEntry| {
+        e.platform.unwrap_or(VmGuestPlatform::Linux) == VmGuestPlatform::Linux
+    };
+
+    let relay_entry = inventory
+        .iter()
+        .filter(is_linux)
+        .find(|e| e.alias == relay_alias)
+        .ok_or_else(|| {
+            format!("assigned relay node {relay_alias} is not a Linux entry in the inventory")
+        })?;
+
+    let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
+        .iter()
+        .filter(is_linux)
+        .filter(|e| run_aliases.iter().any(|a| a == &e.alias))
+        .filter(|e| e.alias != relay_entry.alias)
+        .filter(|e| e.exit_capable != Some(true))
+        .filter(|e| e.relay_capable != Some(true))
+        .collect();
+    // Same deterministic ordering as the inventory-wide election so repeated
+    // runs of the same topology pick the same peer pair (stable evidence).
+    peer_candidates.sort_by(|a, b| {
+        relay_forward_test_peer_rank(a)
+            .cmp(&relay_forward_test_peer_rank(b))
+            .then_with(|| a.alias.cmp(&b.alias))
+    });
+
+    if peer_candidates.len() < 2 {
+        return Err(format!(
+            "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found {}",
+            peer_candidates.len()
+        ));
+    }
+    let sender = peer_candidates[0];
+    let receiver = peer_candidates[1];
+    let sender_mesh_ip = sender
+        .mesh_ip
+        .clone()
+        .ok_or_else(|| format!("peer {} has no mesh_ip recorded in inventory", sender.alias))?;
+    let receiver_mesh_ip = receiver.mesh_ip.clone().ok_or_else(|| {
+        format!(
+            "peer {} has no mesh_ip recorded in inventory",
+            receiver.alias
+        )
+    })?;
+
+    Ok(RelayForwardTestTopology {
+        relay_alias: relay_entry.alias.clone(),
+        sender_alias: sender.alias.clone(),
+        sender_mesh_ip,
+        receiver_alias: receiver.alias.clone(),
+        receiver_mesh_ip,
+    })
+}
+
 fn relay_forward_test_peer_rank(entry: &VmInventoryEntry) -> u8 {
     match entry.lab_role.as_deref() {
         Some("aux") => 0,
@@ -14148,13 +14225,18 @@ fn relay_forward_test_status_reports_relay_peer(status_line: &str) -> bool {
 /// cleanup (remove the firewall block, restart the daemons back to normal)
 /// regardless of pass/fail, so a failed run never leaves the lab stuck.
 pub(crate) fn exercise_linux_relay_forwards_frame(
-    linux_alias: &str,
+    topology: &RelayForwardTestTopology,
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
 ) -> Result<String, String> {
-    let inventory = load_inventory(inventory_path)?;
-    let topology = select_relay_forward_test_topology(&inventory)?;
+    // The caller owns topology election: the `--node` orchestrator stage
+    // elects from the run's role assignments
+    // (`select_relay_forward_test_topology_for_run`); the legacy per-node
+    // validation chain elects inventory-wide
+    // (`select_relay_forward_test_topology`). This helper never re-elects,
+    // so the two callers can never disagree about who the relay is.
+    let relay_alias = topology.relay_alias.clone();
 
     let targets = resolve_remote_targets(
         inventory_path,
@@ -14392,7 +14474,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         }
 
         Ok(format!(
-            "relay forwarding proof passed (chain invoked against {linux_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
+            "relay forwarding proof passed (chain invoked against {relay_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
             relay_target.label,
             sender_target.label,
             receiver_target.label,
@@ -25437,12 +25519,19 @@ fn run_linux_orchestration_stages_with_options(
             "validate_linux_runtime_acls",
         )
     } else {
-        match exercise_linux_relay_forwards_frame(
-            linux_alias,
-            inventory_path,
-            ssh_identity_file,
-            known_hosts_path,
-        ) {
+        // Topology election lives with the caller: this legacy per-node
+        // chain has no run assignments, so it elects inventory-wide.
+        let relay_forwards_result = (|| {
+            let inventory = load_inventory(inventory_path)?;
+            let topology = select_relay_forward_test_topology(&inventory)?;
+            exercise_linux_relay_forwards_frame(
+                &topology,
+                inventory_path,
+                ssh_identity_file,
+                known_hosts_path,
+            )
+        })();
+        match relay_forwards_result {
             Ok(summary) => stage_outcome(
                 "validate_linux_relay_forwards_frame",
                 VmLabStageStatus::Pass,
@@ -47538,6 +47627,149 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let err = super::select_relay_forward_test_topology(&inventory)
             .expect_err("missing mesh_ip on the chosen sender must fail closed");
         assert!(err.contains("mesh_ip"));
+    }
+
+    // ── run-scoped election (`select_relay_forward_test_topology_for_run`) ──
+
+    fn run_aliases(aliases: &[&str]) -> Vec<String> {
+        aliases.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn relay_forward_test_topology_for_run_pins_relay_to_assignment() {
+        // Regression pin for livelab-1788686307: the inventory ALSO holds an
+        // earlier relay_capable node (fedora-x86-1) that is NOT part of the
+        // run. The inventory-wide heuristic elected it and the stage failed
+        // on the elected-vs-assigned mismatch; the run-scoped election must
+        // elect the operator-assigned relay (even one whose relay_capable
+        // flag is false — the run already deployed the relay service onto
+        // it) and must pick peers ONLY from the run's own assignments.
+        let mut inventory = hp3_test_standard_topology();
+        inventory.push(hp3_test_inventory_entry(
+            "fedora-x86-1",
+            "fedora_client",
+            true,
+            true,
+            Some("100.64.0.9"),
+        ));
+        let run = run_aliases(&[
+            "debian-headless-4",
+            "debian-headless-2",
+            "debian-headless-5",
+        ]);
+        let topology = super::select_relay_forward_test_topology_for_run(
+            &inventory,
+            "debian-headless-4",
+            &run,
+        )
+        .expect("run-scoped election should resolve for a 3-node run with 2 spare peers");
+        assert_eq!(
+            topology.relay_alias, "debian-headless-4",
+            "the assigned relay must be elected, not an inventory-wide relay_capable pick"
+        );
+        let mut elected_peers = [
+            topology.sender_alias.clone(),
+            topology.receiver_alias.clone(),
+        ];
+        elected_peers.sort();
+        let mut expected_peers = [
+            "debian-headless-2".to_owned(),
+            "debian-headless-5".to_owned(),
+        ];
+        expected_peers.sort();
+        assert_eq!(
+            elected_peers, expected_peers,
+            "peers must come from the run's assignments, excluding the relay"
+        );
+        assert_ne!(topology.sender_alias, "fedora-x86-1");
+        assert_ne!(topology.receiver_alias, "fedora-x86-1");
+        // lab_role rank: "extra" (headless-5) sorts before plain "client"
+        // (headless-2), so sender/receiver are deterministic.
+        assert_eq!(topology.sender_alias, "debian-headless-5");
+        assert_eq!(topology.receiver_alias, "debian-headless-2");
+        assert_eq!(topology.sender_mesh_ip, "100.64.0.5");
+        assert_eq!(topology.receiver_mesh_ip, "100.64.0.2");
+    }
+
+    #[test]
+    fn relay_forward_test_topology_for_run_rejects_relay_not_in_inventory() {
+        let inventory = hp3_test_standard_topology();
+        let run = run_aliases(&[
+            "debian-headless-4",
+            "debian-headless-2",
+            "debian-headless-5",
+        ]);
+        let err = super::select_relay_forward_test_topology_for_run(&inventory, "not-a-node", &run)
+            .expect_err("an alias with no inventory entry must fail closed");
+        assert!(
+            err.contains("not-a-node"),
+            "error must name the alias: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_forward_test_topology_for_run_rejects_non_linux_relay() {
+        let mut inventory = hp3_test_standard_topology();
+        inventory[3].platform = Some(super::VmGuestPlatform::Macos);
+        let run = run_aliases(&[
+            "debian-headless-4",
+            "debian-headless-2",
+            "debian-headless-5",
+        ]);
+        let err = super::select_relay_forward_test_topology_for_run(
+            &inventory,
+            "debian-headless-4",
+            &run,
+        )
+        .expect_err("a non-Linux assigned relay must fail closed (probe is Linux-only)");
+        assert!(
+            err.contains("debian-headless-4"),
+            "error must name the alias: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_forward_test_topology_for_run_fails_closed_with_too_few_run_peers() {
+        // Inventory-wide peers exist in abundance, but the run only assigned
+        // the relay plus ONE peer: the proof needs two, and must fail rather
+        // than silently borrow a node that was never enrolled in this run's
+        // mesh.
+        let inventory = hp3_test_standard_topology();
+        let run = run_aliases(&["debian-headless-3", "debian-headless-4"]);
+        let err = super::select_relay_forward_test_topology_for_run(
+            &inventory,
+            "debian-headless-3",
+            &run,
+        )
+        .expect_err("fewer than 2 run-scoped spare peers must fail closed");
+        assert!(
+            err.contains("run's own node assignments"),
+            "error must say peers are run-scoped: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_forward_test_topology_for_run_excludes_exit_capable_run_peers() {
+        // A run peer flagged exit_capable in the inventory must not be
+        // elected as a spare peer (same exclusion as the inventory-wide
+        // election): exits route differently and would invalidate the
+        // forced relay-only path assertion.
+        let mut inventory = hp3_test_standard_topology();
+        inventory[1].exit_capable = Some(true); // debian-headless-2 becomes exit_capable
+        let run = run_aliases(&[
+            "debian-headless-3",
+            "debian-headless-2",
+            "debian-headless-4",
+            "debian-headless-5",
+        ]);
+        let topology = super::select_relay_forward_test_topology_for_run(
+            &inventory,
+            "debian-headless-3",
+            &run,
+        )
+        .expect("run still has two non-exit spare peers");
+        assert_ne!(topology.sender_alias, "debian-headless-2");
+        assert_ne!(topology.receiver_alias, "debian-headless-2");
     }
 
     #[test]

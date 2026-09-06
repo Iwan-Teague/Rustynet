@@ -13,10 +13,11 @@
 //! restarts disturb the fewest possible downstream stages.
 //!
 //! REUSE, NOT REWRITE (HP-3 spec §4.3): the probe logic is the existing,
-//! live-lab-proven `vm_lab` helper chain — `select_relay_forward_test_topology`
-//! (fails closed when fewer than two spare Linux peers exist),
-//! the `build_relay_forward_test_*` script builders, and
-//! `exercise_linux_relay_forwards_frame`, which runs the scripts over the
+//! live-lab-proven `vm_lab` helper chain — the run-scoped
+//! `select_relay_forward_test_topology_for_run` (fails closed when the run
+//! cannot supply two spare Linux peers), the `build_relay_forward_test_*`
+//! script builders, and `exercise_linux_relay_forwards_frame`, which runs
+//! the scripts over the
 //! SSH-direct helper, asserts counter deltas + ciphertext-only egress on
 //! the relay, and runs `cleanup_relay_forward_test` in all paths. This
 //! stage only resolves the orchestration-context facts (relay alias,
@@ -47,10 +48,11 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
         &[StageId::DeployRelayService, StageId::RelayValidation]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
-        // Topology-scoped: the proof runs ONCE against the relay node plus
-        // two spare Linux peers elected from the inventory
-        // (select_relay_forward_test_topology), so the role gate names the
-        // relay but the fanout is a single lab-wide execution.
+        // Topology-scoped: the proof runs ONCE against the assigned relay
+        // node plus two spare Linux peers elected from the run's own node
+        // assignments (select_relay_forward_test_topology_for_run), so the
+        // role gate names the relay but the fanout is a single lab-wide
+        // execution.
         &[NodeRole::Relay]
     }
     fn fanout(&self) -> StageFanout {
@@ -124,17 +126,26 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
             }
         };
 
-        // Topology pre-check BEFORE touching any host: the elected relay +
-        // sender + receiver must exist (two spare Linux peers, mesh IPs
-        // resolvable) and must be the assigned relay. A topology that
-        // cannot supply the proof FAILS the stage — it is never a skip,
+        // Topology pre-check BEFORE touching any host: the assigned relay
+        // plus sender + receiver must exist (two spare Linux peers FROM THE
+        // RUN'S OWN NODE ASSIGNMENTS, mesh IPs resolvable). Run-scoped
+        // election (`select_relay_forward_test_topology_for_run`) takes the
+        // assigned relay as authoritative and elects peers only from the
+        // run — an inventory-wide heuristic here previously elected a relay
+        // that was not even part of the run (livelab-1788686307). A topology
+        // that cannot supply the proof FAILS the stage — it is never a skip,
         // because the operator explicitly asked for this disruption and a
         // silent skip would read as "validated but not exercised".
         let inventory = match crate::vm_lab::load_inventory(&inventory_path) {
             Ok(inventory) => inventory,
             Err(e) => return StageOutcome::Failed(format!("inventory load failed: {e}")),
         };
-        let topology = match crate::vm_lab::select_relay_forward_test_topology(&inventory) {
+        let run_aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        let topology = match crate::vm_lab::select_relay_forward_test_topology_for_run(
+            &inventory,
+            &relay_alias,
+            &run_aliases,
+        ) {
             Ok(topology) => topology,
             Err(e) => {
                 return StageOutcome::Failed(format!(
@@ -142,12 +153,6 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
                 ));
             }
         };
-        if topology.relay_alias != relay_alias {
-            return StageOutcome::Failed(format!(
-                "relay-forward topology elected relay '{}' but role assignment says '{relay_alias}'",
-                topology.relay_alias
-            ));
-        }
 
         // Delegate the whole probe: script build → SSH run → counter-delta +
         // ciphertext-only assertions → cleanup (inside the helper, all
@@ -157,7 +162,7 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
         // payload by design — the summary would have nowhere to ride, so it
         // is logged where the run report's stage log captures it).
         match crate::vm_lab::exercise_linux_relay_forwards_frame(
-            &relay_alias,
+            &topology,
             Path::new(&inventory_path),
             &params.identity_file,
             Some(params.known_hosts.as_path()),
@@ -340,7 +345,8 @@ mod tests {
     fn topology_shortage_message_is_actionable() {
         // Pure contract check of the failure text the stage emits when the
         // inventory cannot supply two spare peers: the reason string from
-        // select_relay_forward_test_topology must be surfaced verbatim.
+        // select_relay_forward_test_topology_for_run must be surfaced
+        // verbatim.
         let reason = "need at least 2 spare Linux peers";
         let outcome =
             StageOutcome::Failed(format!("relay-forward topology cannot be formed: {reason}"));
