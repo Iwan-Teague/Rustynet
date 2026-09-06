@@ -292,7 +292,7 @@ fn wait_until_ready(
 ) -> Result<RelayLifecycleSnapshot, String> {
     let deadline = std::time::Instant::now()
         .checked_add(READINESS_TIMEOUT)
-        .unwrap_or_else(|| std::time::Instant::now());
+        .unwrap_or_else(std::time::Instant::now);
     loop {
         let snapshot = capture_snapshot(shell, platform)?;
         if snapshot_is_ready(&snapshot) {
@@ -879,7 +879,6 @@ mod tests {
         // normalize, but the predicate must not care).
         assert!(snapshot_is_ready(&snap("Active", true, true, "OK")));
     }
-    use super::*;
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
     fn ok(stdout: &str) -> RemoteExitStatus {
