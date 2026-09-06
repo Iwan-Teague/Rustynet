@@ -3550,6 +3550,7 @@ fn run_guest_script(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_lab_proxyjump(&mut command, target)?;
     let identity = ssh_identity_file
         .map(Path::to_path_buf)
         .unwrap_or_else(default_lab_ssh_identity_path);
@@ -33736,6 +33737,32 @@ fn append_ssh_transport_options(
     Ok(())
 }
 
+/// Append the operator-elected `-o ProxyJump=` escape hatch to a legacy
+/// vm_lab ssh/scp invocation. These builders pass `-F /dev/null` just like
+/// the orchestrator adapter does, so `~/.ssh/config` can never contribute a
+/// jump here either — this delegates to the SAME env-gated, CIDR-scoped
+/// decision core (`RUSTYNET_LAB_PROXYJUMP` + `RUSTYNET_LAB_PROXYJUMP_CIDRS`)
+/// the adapter transport uses, keeping one authority for the whole lab.
+/// `target` may carry a `user@` prefix or `:port` suffix; the CIDR match is
+/// against the host part only.
+fn append_lab_proxyjump(command: &mut Command, target: &str) -> Result<(), String> {
+    let host = target
+        .rsplit('@')
+        .next()
+        .unwrap_or(target)
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(target.rsplit('@').next().unwrap_or(target));
+    match crate::vm_lab::orchestrator::adapter::ssh::proxyjump_for_host(host) {
+        Ok(Some(spec)) => {
+            command.arg("-o").arg(format!("ProxyJump={spec}"));
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 fn remote_target_local_utm(target: &RemoteTarget) -> Option<(&str, &Path)> {
     match target.controller.as_ref() {
         Some(VmController::LocalUtm {
@@ -34741,6 +34768,7 @@ fn run_remote_shell_command(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_lab_proxyjump(&mut command, target)?;
     append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-l").arg(ssh_user);
@@ -34778,6 +34806,7 @@ fn capture_remote_shell_command(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_lab_proxyjump(&mut command, target)?;
     append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-l").arg(ssh_user);
@@ -34832,6 +34861,7 @@ fn scp_to_remote(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_lab_proxyjump(&mut command, target)?;
     append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-o").arg(format!("User={ssh_user}"));
@@ -34897,6 +34927,7 @@ fn scp_from_remote(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_lab_proxyjump(&mut command, target.ssh_target.as_str())?;
     append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-o").arg(format!("User={ssh_user}"));
@@ -36755,6 +36786,7 @@ fn prove_windows_ssh_access_for_target(
         "-o",
         "IdentitiesOnly=yes",
     ]);
+    append_lab_proxyjump(&mut command, ssh_target)?;
     append_ssh_transport_options(&mut command, ssh_identity_file, known_hosts_path)?;
     if let Some(ssh_user) = ssh_user {
         command.arg("-l").arg(ssh_user);
