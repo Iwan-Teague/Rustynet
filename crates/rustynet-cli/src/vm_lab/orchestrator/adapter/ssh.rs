@@ -358,19 +358,168 @@ const SHARED_HARDENING_O_FLAGS: &[&str] = &[
     "IdentitiesOnly=yes",
 ];
 
+/// Optional SSH-level jump host for lab guests that are only reachable
+/// through a lab host (e.g. libvirt guests on a remote KVM box whose guest
+/// subnet the local machine cannot route to directly — a tailnet ACL denying
+/// the subnet shows up as TCP RST + ICMP blackhole from this Mac while the
+/// KVM host itself reaches the guests fine). Because `-F /dev/null` above
+/// means `~/.ssh/config` can never contribute a ProxyJump, this is the
+/// explicit, pinned, opt-in escape hatch:
+///
+/// - `RUSTYNET_LAB_PROXYJUMP=<user@host>` — the jump spec. The jump hop
+///   inherits this module's full hardening posture (pinned identity,
+///   pinned known_hosts, `IdentitiesOnly`, `BatchMode`), so the jump host
+///   must accept the SAME pinned identity and be pinned in the SAME
+///   known_hosts file as the guests behind it.
+/// - `RUSTYNET_LAB_PROXYJUMP_CIDRS=<cidr[,cidr...]>` — the destination
+///   CIDRs the jump applies to. Required when PROXYJUMP is set: a jump that
+///   silently applied to every target would also reroute directly
+///   reachable guests through an unnecessary middlebox. Fail closed on a
+///   PROXYJUMP without CIDRS and on any unparseable CIDR — a lab run must
+///   not launch with half-configured jump routing.
+fn proxyjump_for_host(host: &str) -> Result<Option<String>, AdapterError> {
+    proxyjump_spec_for_host(
+        host,
+        std::env::var_os("RUSTYNET_LAB_PROXYJUMP").as_deref(),
+        std::env::var_os("RUSTYNET_LAB_PROXYJUMP_CIDRS").as_deref(),
+    )
+}
+
+/// Pure decision core of [`proxyjump_for_host`], split out so tests can
+/// exercise the fail-closed matrix without mutating process-global env.
+fn proxyjump_spec_for_host(
+    host: &str,
+    proxyjump_env: Option<&std::ffi::OsStr>,
+    cidrs_env: Option<&std::ffi::OsStr>,
+) -> Result<Option<String>, AdapterError> {
+    let Some(spec) = proxyjump_env else {
+        return Ok(None);
+    };
+    let Some(cidrs) = cidrs_env else {
+        return Err(AdapterError::Ssh {
+            message: "RUSTYNET_LAB_PROXYJUMP is set but RUSTYNET_LAB_PROXYJUMP_CIDRS is not; \
+                      refusing half-configured jump routing"
+                .to_owned(),
+        });
+    };
+    let spec = spec.to_string_lossy().into_owned();
+    // The spec rides inside one `-o ProxyJump=<spec>` value; OpenSSH treats a
+    // comma inside that value as a JUMP LIST separator, so commas are rejected
+    // rather than silently enabling multi-hop chains. Everything else that is
+    // not plain `[user@]host[:port]` material is rejected too.
+    if spec.is_empty()
+        || !spec
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@' | ':'))
+    {
+        return Err(AdapterError::Ssh {
+            message: format!(
+                "RUSTYNET_LAB_PROXYJUMP must be a plain [user@]host[:port] spec (no spaces, commas, or control chars): '{spec}'"
+            ),
+        });
+    }
+    let cidrs = cidrs.to_string_lossy().into_owned();
+    let mut networks = Vec::new();
+    for cidr in cidrs.split(',') {
+        let net = parse_ipv4_cidr(cidr.trim()).ok_or_else(|| AdapterError::Ssh {
+            message: format!(
+                "RUSTYNET_LAB_PROXYJUMP_CIDRS contains an unparseable IPv4 CIDR: '{cidr}'"
+            ),
+        })?;
+        networks.push(net);
+    }
+    if networks.is_empty() {
+        return Err(AdapterError::Ssh {
+            message: "RUSTYNET_LAB_PROXYJUMP_CIDRS must list at least one IPv4 CIDR".to_owned(),
+        });
+    }
+    let addr = match parse_ipv4_addr(host) {
+        Some(addr) => addr,
+        // Hostnames (and IPv6 literals) never match an IPv4 CIDR: only the
+        // explicitly listed guest-subnet IPs are jumped.
+        None => return Ok(None),
+    };
+    Ok(networks
+        .iter()
+        .any(|(net, prefix_len)| same_ipv4_network(addr, *net, *prefix_len))
+        .then_some(spec))
+}
+
+/// Parse a dotted-quad IPv4 address into a host-order `u32`.
+fn parse_ipv4_addr(s: &str) -> Option<u32> {
+    let mut octets = [0u8; 4];
+    let mut parts = s.split('.');
+    for slot in octets.iter_mut() {
+        let part = parts.next()?;
+        if part.is_empty() || part.len() > 3 || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *slot = part.parse::<u8>().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(u32::from_be_bytes(octets))
+}
+
+/// Parse an `addr/prefix-len` IPv4 CIDR into `(network, prefix_len)`.
+/// Host bits set in `addr` are an error, not silently masked — a typo like
+/// `192.168.121.1/24` must be refused rather than quietly becoming
+/// `192.168.121.0/24`.
+fn parse_ipv4_cidr(s: &str) -> Option<(u32, u32)> {
+    let (addr, prefix) = s.split_once('/')?;
+    let addr = parse_ipv4_addr(addr)?;
+    let prefix_len: u32 = prefix.parse().ok()?;
+    if prefix_len > 32 {
+        return None;
+    }
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    if addr & !mask != 0 {
+        return None;
+    }
+    Some((addr, prefix_len))
+}
+
+/// True when `addr` falls inside `network/prefix_len`.
+fn same_ipv4_network(addr: u32, network: u32, prefix_len: u32) -> bool {
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    addr & mask == network & mask
+}
+
 /// Append the shared security posture to `cmd`: `-F /dev/null` (ignore system
-/// ssh_config), the [`SHARED_HARDENING_O_FLAGS`], the pinned identity key, and
-/// the pinned known-hosts file. Protocol-level differences (ssh `-p`/`-l`/`-n`
-/// vs scp `-P`/`-o User=`/`-q`, keepalives, ControlMaster teardown) are
-/// deliberately NOT here — each builder adds those itself.
-fn attach_shared_hardening(cmd: &mut Command, identity_file: &Path, known_hosts: &Path) {
+/// ssh_config), the [`SHARED_HARDENING_O_FLAGS`], the pinned identity key, the
+/// pinned known-hosts file, and — only when `host` falls inside the
+/// operator-elected jump CIDRs — the `-o ProxyJump=` escape hatch from
+/// [`proxyjump_for_host`]. `host` is the FINAL destination host (never the
+/// jump spec), so the CIDR gate can never jump the jump host itself.
+/// Protocol-level differences (ssh `-p`/`-l`/`-n` vs scp `-P`/`-o User=`/`-q`,
+/// keepalives, ControlMaster teardown) are deliberately NOT here — each
+/// builder adds those itself.
+fn attach_shared_hardening(
+    cmd: &mut Command,
+    identity_file: &Path,
+    known_hosts: &Path,
+    host: &str,
+) -> Result<(), AdapterError> {
     cmd.args(["-F", "/dev/null"]);
     for flag in SHARED_HARDENING_O_FLAGS {
         cmd.arg("-o").arg(*flag);
     }
+    if let Some(spec) = proxyjump_for_host(host)? {
+        cmd.arg("-o").arg(format!("ProxyJump={spec}"));
+    }
     cmd.arg("-i").arg(identity_file);
     cmd.arg("-o")
         .arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    Ok(())
 }
 
 fn base_ssh_command(
@@ -379,10 +528,10 @@ fn base_ssh_command(
     user: Option<&str>,
     identity_file: &Path,
     known_hosts: &Path,
-) -> (Command, Option<ControlMasterTeardown>) {
+) -> Result<(Command, Option<ControlMasterTeardown>), AdapterError> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-n");
-    attach_shared_hardening(&mut cmd, identity_file, known_hosts);
+    attach_shared_hardening(&mut cmd, identity_file, known_hosts, host)?;
     // ssh-only: keepalives for long-lived sessions (bootstrap builds) + the
     // lowercase `-p` port flag.
     cmd.args([
@@ -403,18 +552,19 @@ fn base_ssh_command(
         cmd.arg("-l").arg(u);
     }
     cmd.arg("--").arg(host);
-    (cmd, teardown)
+    Ok((cmd, teardown))
 }
 
 fn base_scp_command(
+    host: &str,
     port: u16,
     identity_file: &Path,
     known_hosts: &Path,
     user: Option<&str>,
-) -> Command {
+) -> Result<Command, AdapterError> {
     let mut cmd = Command::new("scp");
     cmd.arg("-q");
-    attach_shared_hardening(&mut cmd, identity_file, known_hosts);
+    attach_shared_hardening(&mut cmd, identity_file, known_hosts, host)?;
     // scp-only: the uppercase `-P` port flag, and the login name via
     // `-o User=` (scp has no `-l`).
     cmd.arg("-P").arg(port.to_string());
@@ -425,7 +575,7 @@ fn base_scp_command(
     if let Some(u) = user {
         cmd.arg("-o").arg(format!("User={u}"));
     }
-    cmd
+    Ok(cmd)
 }
 
 // ── QH-01: validated remote-command newtypes ─────────────────────────────────
@@ -557,7 +707,7 @@ fn run_remote_inner(
 ) -> Result<String, AdapterError> {
     let (host, port, user, identity_file, known_hosts) = ssh_params(conn)?;
     let (mut cmd, control_master_teardown) =
-        base_ssh_command(host, port, user, identity_file, known_hosts);
+        base_ssh_command(host, port, user, identity_file, known_hosts)?;
     cmd.arg(script);
     let output = run_output_with_timeout(&mut cmd, timeout, log_sink, control_master_teardown)
         .map_err(|message| AdapterError::Ssh {
@@ -650,7 +800,7 @@ pub fn scp_to(
         if attempt > 0 {
             std::thread::sleep(Duration::from_secs(3 * u64::from(attempt)));
         }
-        let mut cmd = base_scp_command(port, identity_file, known_hosts, user);
+        let mut cmd = base_scp_command(host, port, identity_file, known_hosts, user)?;
         cmd.arg("--")
             .arg(local.as_os_str())
             .arg(format!("{host}:{remote_dst}"));
@@ -691,7 +841,7 @@ pub fn scp_from(
             message: format!("create local scp destination dir failed: {err}"),
         })?;
     }
-    let mut cmd = base_scp_command(port, identity_file, known_hosts, user);
+    let mut cmd = base_scp_command(host, port, identity_file, known_hosts, user)?;
     cmd.arg("--")
         .arg(format!("{host}:{remote_src}"))
         .arg(local_dst.as_os_str());
@@ -1107,11 +1257,13 @@ fn teardown_control_master(teardown: ControlMasterTeardown) {
 mod tests {
     use super::{
         ControlMasterTeardown, SHARED_HARDENING_O_FLAGS, base_scp_command, base_ssh_command,
-        parse_status_field, parse_status_node_id, parse_status_wireguard_public_key,
-        run_remote_retrying, validator_report_ok,
+        parse_ipv4_cidr, parse_status_field, parse_status_node_id,
+        parse_status_wireguard_public_key, proxyjump_spec_for_host, run_remote_retrying,
+        validator_report_ok,
     };
     use crate::vm_lab::orchestrator::connection::NodeConnection;
     use crate::vm_lab::orchestrator::error::AdapterError;
+    use std::ffi::OsStr;
     use std::path::Path;
     use std::process::Command;
     use std::time::Duration;
@@ -1129,8 +1281,10 @@ mod tests {
         // other — the whole reason the shared helper exists.
         let id = Path::new("/tmp/id_ed25519");
         let kh = Path::new("/tmp/known_hosts");
-        let (ssh_cmd, _teardown) = base_ssh_command("host.example", 22, Some("debian"), id, kh);
-        let scp_cmd = base_scp_command(2222, id, kh, Some("debian"));
+        let (ssh_cmd, _teardown) =
+            base_ssh_command("host.example", 22, Some("debian"), id, kh).expect("ssh build");
+        let scp_cmd =
+            base_scp_command("host.example", 2222, id, kh, Some("debian")).expect("scp build");
         for (label, args) in [("ssh", args_of(&ssh_cmd)), ("scp", args_of(&scp_cmd))] {
             assert!(
                 args.iter().any(|a| a == "/dev/null"),
@@ -1159,7 +1313,8 @@ mod tests {
         // refactor: ssh uses `-p`/`-l`, scp uses `-P`/`-o User=`.
         let id = Path::new("/tmp/id_ed25519");
         let kh = Path::new("/tmp/known_hosts");
-        let (ssh_cmd, _teardown) = base_ssh_command("host.example", 22, Some("debian"), id, kh);
+        let (ssh_cmd, _teardown) =
+            base_ssh_command("host.example", 22, Some("debian"), id, kh).expect("ssh build");
         let ssh_args = args_of(&ssh_cmd);
         assert!(
             ssh_args.iter().any(|a| a == "-p"),
@@ -1168,7 +1323,8 @@ mod tests {
         let l_idx = ssh_args.iter().position(|a| a == "-l").expect("ssh -l");
         assert_eq!(ssh_args[l_idx + 1], "debian");
 
-        let scp_cmd = base_scp_command(2222, id, kh, Some("debian"));
+        let scp_cmd =
+            base_scp_command("host.example", 2222, id, kh, Some("debian")).expect("scp build");
         let scp_args = args_of(&scp_cmd);
         assert!(
             scp_args.iter().any(|a| a == "-P"),
@@ -1178,6 +1334,103 @@ mod tests {
             scp_args.iter().any(|a| a == "User=debian"),
             "scp sets login via -o User=: {scp_args:?}"
         );
+    }
+
+    #[test]
+    fn proxyjump_off_by_default_and_fail_closed_on_half_configuration() {
+        // No envs set → never a jump (today's behavior, unchanged).
+        assert_eq!(
+            proxyjump_spec_for_host("192.168.121.26", None, None).expect("no envs"),
+            None
+        );
+        // PROXYJUMP without CIDRS → hard error, never a silent global jump.
+        let err = proxyjump_spec_for_host("192.168.121.26", Some(OsStr::new("j@h")), None)
+            .expect_err("must refuse half-configured jump routing");
+        assert!(
+            err.to_string()
+                .contains("RUSTYNET_LAB_PROXYJUMP_CIDRS is not"),
+            "wrong error: {err}"
+        );
+    }
+
+    #[test]
+    fn proxyjump_applies_only_inside_the_elected_cidrs() {
+        let jump = Some(OsStr::new("ubuntu-server@100.117.1.47"));
+        let cidrs = Some(OsStr::new("192.168.121.0/24"));
+        // Inside the CIDR → the spec is returned verbatim.
+        assert_eq!(
+            proxyjump_spec_for_host("192.168.121.227", jump, cidrs).expect("in-cidr must resolve"),
+            Some("ubuntu-server@100.117.1.47".to_owned())
+        );
+        // Outside the CIDR (the directly reachable UTM guests) → no jump.
+        assert_eq!(
+            proxyjump_spec_for_host("192.168.64.4", jump, cidrs).expect("out-of-cidr resolves"),
+            None
+        );
+        // Hostnames never match an IPv4 CIDR.
+        assert_eq!(
+            proxyjump_spec_for_host("guest.lan", jump, cidrs).expect("hostname resolves"),
+            None
+        );
+    }
+
+    #[test]
+    fn proxyjump_rejects_malformed_specs_and_cidrs() {
+        let cidrs = Some(OsStr::new("192.168.121.0/24"));
+        // Comma would ride inside the -o value as an OpenSSH JUMP LIST, and a
+        // space could smuggle a second option token. (A leading `-` is NOT
+        // rejected: the spec rides inside one `-o ProxyJump=<spec>` argv value,
+        // so ssh never parses it as a flag — it just fails to resolve as a
+        // host, which surfaces as a plain connection error.)
+        for bad in ["a@h,b@i", "with space@h", ""] {
+            assert!(
+                proxyjump_spec_for_host("192.168.121.26", Some(OsStr::new(bad)), cidrs).is_err(),
+                "spec '{bad}' must be rejected"
+            );
+        }
+        let jump = Some(OsStr::new("j@h"));
+        for bad in ["192.168.121.1/24", "192.168.121.0/33", "not-a-cidr", ""] {
+            assert!(
+                proxyjump_spec_for_host("192.168.121.26", jump, Some(OsStr::new(bad))).is_err(),
+                "cidr '{bad}' must be rejected"
+            );
+        }
+        // Empty CIDR list is a configuration error too.
+        assert!(
+            proxyjump_spec_for_host("192.168.121.26", jump, Some(OsStr::new(" , "))).is_err(),
+            "empty cidr list must be rejected"
+        );
+    }
+
+    #[test]
+    fn ipv4_cidr_parser_masks_and_rejects_host_bits() {
+        assert_eq!(parse_ipv4_cidr("192.168.121.0/24"), Some((0xC0A8_7900, 24)));
+        assert_eq!(parse_ipv4_cidr("0.0.0.0/0"), Some((0, 0)));
+        assert_eq!(parse_ipv4_cidr("10.0.0.0/8"), Some((0x0A00_0000, 8)));
+        // Host bits set → refused, not silently masked.
+        assert_eq!(parse_ipv4_cidr("192.168.121.1/24"), None);
+        assert_eq!(parse_ipv4_cidr("192.168.121.0/33"), None);
+    }
+
+    #[test]
+    fn ssh_and_scp_carry_the_proxyjump_only_for_elected_hosts() {
+        // Both transports must agree on the jump decision for the same host —
+        // the shared-helper contract extended to the ProxyJump escape hatch.
+        // (This test does NOT set the envs; it pins that with no envs the
+        // builders emit no ProxyJump at all, on any host.)
+        let id = Path::new("/tmp/id_ed25519");
+        let kh = Path::new("/tmp/known_hosts");
+        for host in ["192.168.121.227", "192.168.64.4", "host.example"] {
+            let (ssh_cmd, _teardown) =
+                base_ssh_command(host, 22, Some("debian"), id, kh).expect("ssh build");
+            let scp_cmd = base_scp_command(host, 2222, id, kh, Some("debian")).expect("scp build");
+            for (label, args) in [("ssh", args_of(&ssh_cmd)), ("scp", args_of(&scp_cmd))] {
+                assert!(
+                    !args.iter().any(|a| a.starts_with("ProxyJump=")),
+                    "{label} must not jump {host} without the env pair: {args:?}"
+                );
+            }
+        }
     }
 
     #[test]
