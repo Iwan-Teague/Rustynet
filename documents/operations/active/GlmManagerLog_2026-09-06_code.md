@@ -26,3 +26,11 @@ Step 0.2 (results @092e94cf, all green):
 - `cargo test -p rustynet-cli --all-targets --all-features` → RC=0; 93 test-result lines, all `0 failed` (53 bins with 0 tests; others pass, e.g. 60/48/22/22 per bin).
 
 Verdict: baseline merge-ready. No fmt/clippy fixes required; no trivial-fix commit needed. Proceeding to TASK 1.
+
+## TASK 1 — failure-time tunnel capture (traffic_test_matrix.rs)
+
+Step 1.1 (plan, written before implementation): insert `capture_failure_state(ctx) -> Vec<String>` called ONLY on the Failed path (before `StageOutcome::Failed(errors.join("; "))`, ~line 206-210). For each topology alias in ctx.assignments with an adapter: call existing trait methods only — collect_mesh_ip(), collect_active_tunnels(), collect_daemon_failure_reason() — and write `logs/traffic_test_matrix.failure_capture.<alias>.txt` under ctx.report_dir with labeled sections; per-collector Err recorded in-file as `capture error: {e}` (never masks the stage failure; file-write errors ignored via `let _ =`). Returns one summary line per node, appended to the failure message after errors.join. Pass path untouched → pass/fail semantics unchanged. No new trait methods; no shell_host dispatch.
+
+Step 1.2 (tests): FakeCaptureAdapter stub in the tests mod (required-methods pattern from FakeSshAdapter, rest unimplemented!()). Ok-path stub: collect_mesh_ip→"100.64.0.x" (mesh re-collect loop exits immediately), collect_active_tunnels→known lines, collect_daemon_failure_reason→Some("reason"), ping_mesh_peer→Blocked (forces Failed). Assert message contains "[failure-capture" and per-node file exists with expected lines. Err-path stub: collectors return Err(AdapterError::Ssh) → file contains "capture error:", original ping error still in message, no panic.
+
+Step 1.3 (results): implemented `capture_failure_state(ctx) -> Vec<String>` + Failed-branch wiring + FakeCaptureAdapter tests in traffic_test_matrix.rs. Gates: fmt RC=0; clippy -p rustynet-cli -D warnings RC=0 (16.19s); targeted `cargo test ... traffic_test_matrix` → 3 passed (empty_assignments_no_mesh_ips_fails unchanged, failure_capture_writes_per_node_file_on_failed_stage, failure_capture_errors_do_not_mask_stage_failure), 0 failed. Pass/fail semantics unchanged (capture only on Failed branch, early-return path untouched). Committing.
