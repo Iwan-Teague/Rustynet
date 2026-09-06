@@ -62,6 +62,33 @@ To fix it once, right now, without the daemon:
 (`scripts/vm_lab/ensure_vmnet_route.sh --dry-run` reports the state without
 changing anything, and discovers the `.65` bridge too when the macOS VM runs).
 
+## Cross-vmnet reachability: macOS guest ↔ QEMU guests (CP-1, runtime override)
+
+The macOS guest runs on UTM's Apple Virtualization backend and the Linux guests
+on QEMU; each backend gets its OWN vmnet-shared subnet (192.168.65.0/24 and
+192.168.64.0/24 — which bridgeN carries which swaps between reboots). That is a
+backend property, not drift. The host forwards and owns both gateways, but
+vmnet loads the pf anchor `com.apple.internet-sharing/network_isolation`, whose
+`block drop quick inet from <network_isolation_table_v4> to
+<network_isolation_table_v4>` covers both /24s, so every guest↔guest packet
+across the split dies on the host (symptom: 100% loss both ways, TCP/22 timeout,
+while host→guest is fine and guest routes are correct).
+
+Runtime override (owner, needs sudo; NOT persistent — gone on reboot):
+
+```sh
+sudo pfctl -a com.apple/100.rustynet-lab -f scripts/vm_lab/cross_vmnet_pf_override.pf   # load
+sudo pfctl -a com.apple/100.rustynet-lab -sr                                            # verify (4 rules)
+sudo pfctl -a com.apple/100.rustynet-lab -F all                                         # undo (not right after load)
+```
+
+It works because `/etc/pf.conf` evaluates `anchor "com.apple/*"` before the
+internet-sharing anchor and sorts wildcard sub-anchors, so `100.rustynet-lab`'s
+`pass quick` rules match first. The result is L3-routed, not same-L2: broadcast
+and mDNS do not cross. Full evidence, the first run over the open underlay, and
+the open daemon-side questions:
+`active/MacosCrossNetworkTrafficBlocker_2026-09-03.md` §9.
+
 ## Onboarding a new VM (the easy path)
 
 1. **Create the VM in UTM** with **Shared** networking. Leave the guest on

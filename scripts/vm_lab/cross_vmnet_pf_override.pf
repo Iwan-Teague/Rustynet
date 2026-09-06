@@ -1,0 +1,34 @@
+# cross_vmnet_pf_override.pf — open routed IP traffic between the two UTM
+# vmnet-shared subnets on the macOS lab host (CP-1).
+#
+# WHY: the host already forwards (net.inet.ip.forwarding=1) and owns both
+# gateways (192.168.64.1 and 192.168.65.1 on two bridgeN interfaces), but
+# vmnet loads the pf anchor com.apple.internet-sharing/network_isolation with
+#   block drop quick inet from <network_isolation_table_v4> to <network_isolation_table_v4>
+# and both lab /24s sit in that table, so every guest<->guest packet across
+# the split is dropped on the host. The macOS guest (Apple Virtualization
+# backend) lands on one subnet and the QEMU guests on the other by design
+# (VmLabNetworkStandard.md), so any macOS<->Linux data-path stage needs this.
+#
+# HOW IT WINS: /etc/pf.conf evaluates `anchor "com.apple/*"` BEFORE the
+# internet-sharing anchor, and wildcard sub-anchors run in sorted order, so a
+# `pass quick` rule loaded under com.apple/100.rustynet-lab matches first.
+# The rules are symmetric across bridge100/bridge101 because UTM swaps the
+# bridge numbering between reboots.
+#
+# RUNTIME-ONLY: the anchor is gone after a host reboot (and possibly after a
+# vmnet restart). Re-load before any macOS<->Linux cross-vmnet run:
+#   sudo pfctl -a com.apple/100.rustynet-lab -f scripts/vm_lab/cross_vmnet_pf_override.pf
+# Verify:
+#   sudo pfctl -a com.apple/100.rustynet-lab -sr
+# Undo (do NOT run this right after the load — it silently re-blocks):
+#   sudo pfctl -a com.apple/100.rustynet-lab -F all
+# The "-f ... could result in flushing of rules" warning refers to the main
+# ruleset; loading into a sub-anchor leaves it alone.
+#
+# Full write-up, evidence and caveats (L3-routed, not same-L2; broadcast/mDNS
+# does not cross): documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md §9.
+pass quick on bridge101 inet from 192.168.64.0/24 to 192.168.65.0/24 flags any keep state
+pass quick on bridge100 inet from 192.168.64.0/24 to 192.168.65.0/24 flags any keep state
+pass quick on bridge100 inet from 192.168.65.0/24 to 192.168.64.0/24 flags any keep state
+pass quick on bridge101 inet from 192.168.65.0/24 to 192.168.64.0/24 flags any keep state
