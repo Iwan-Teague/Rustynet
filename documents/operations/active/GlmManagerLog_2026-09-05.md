@@ -497,5 +497,75 @@ Owner decisions outstanding (not mine to make), with evidence pointers:
   relay plist / stdin-pipe bytes; `ManifestNodeAssignment`
   duplicate-alias rejection; `VmGuestPlatform::parse("")` pin.
 
+## Closing pass (2026-09-06, worktree edit-1788655036704-53137-0, branch ai-edit/edit-1788655036704-53137-0)
+
+No lab runs this session — closing work only.
+
+**Ledger verification (attempt-4 port, already landed in `325cbae2`).**
+Re-verified in THIS worktree with a quote-aware reader:
+`live_lab_node_run_matrix.csv` carries exactly one attempt-4 row (run
+`livelab-1788653310-04c85129bb4f`, start 2026-09-05T23:52:48Z, end
+2026-09-06T00:08:30Z, commit `04c85129bb4f4b5d3a3a00d2a91b496406e0fddb`,
+branch `ai-edit/edit-1788651195477-40131-0`, clean);
+`live_lab_node_stage_results.csv` carries the 170 attempt-4 stage rows;
+no duplicates. The three triage stubs from this series
+(`live_lab_stage_triage.jsonl` lines 213–215:
+`livelab-1788650472-ef1c5ed0ec20::relay_validation` readiness-race
+remedy, `livelab-1788650472-ef1c5ed0ec20::traffic_test_matrix` CP-1, and
+`livelab-1788653310-04c85129bb4f::traffic_test_matrix` "none: CP-1
+cross-vmnet substrate gap, owner-deferred") all carry non-empty `patch`
+text. Per the ledger's own schema
+(`crates/rustynet-cli/src/live_lab_stage_triage.rs`, lines 16–22 and
+`StageTriageRecord::is_unfilled`), a filled `patch` is the ONLY fill
+marker — there is deliberately no patch-commit field (the row's own
+commit is the patch commit) — so no `live-lab-record-stage-patch` call
+is needed or possible for them.
+
+**Docs synced this pass.**
+`CrossPlatformRoleParityRefresh_2026-07-23.md` relay rows (lifecycle +
+frame-forwarding) were already current with attempt 4 (landed in
+`325cbae2`); re-read, no further edit. QH-68 is recorded FIXED and QH-69
+FIXED(flag)/OPEN(default) in `QualityHardeningTodo_2026-07-25.md` — both
+dispositions final, no edit. Added §8 to
+`MacosCrossNetworkTrafficBlocker_2026-09-03.md` pointing at attempt 4 as
+the newest CP-1 confirming run. AGENTS.md/CLAUDE.md untouched.
+
+**Final macOS cell status (engine of record = Rust `--node`; evidence =
+stage artifacts, not matrix columns):**
+
+| Cell | Status | Proving run (commit, clean) |
+| --- | --- | --- |
+| client | 🟡 CP-1-deferred — STUN/orchestrator half proven live (run #5 `livelab-1788631948-3aedcfff9a75`, `3aedcfff`), `traffic_test_matrix` cross-vmnet legs still 100% loss | `livelab-1788631948-3aedcfff9a75` |
+| admin | 🟢 `macos_admin=pass` | `livelab-1784501586` (`537e1901`) |
+| relay (lifecycle) | 🟢 `deploy_relay_service` + `relay_validation` PASS | `livelab-1788653310-04c85129bb4f` (`04c85129`) |
+| relay (frame-forwarding) | ⬛ structurally Linux-only probe (platform gate, `relay_forwards_frame_validation.rs`) AND CP-1-blocked; durable fail-closed record in the attempt-4 ledger row | `livelab-1788653310-04c85129bb4f` (`04c85129`) |
+| anchor | 🟢 all four anchor stages incl. QH-68 re-proof | `livelab-1788635706-1eb6e800c4cf` (`1eb6e800`) |
+| exit | 🟢 baseline chain green on the blind_exit posture (QH-67 fix); admin-posture `Exit` preset stays N/A-by-decree | `livelab-1788628164-40e7409ff2a4` (`40e7409f`) |
+| blind_exit | 🟢 first election + pass | `livelab-1788172934687-17194-11` (`7bdcfe60`) |
+| role-transition | ⬛ never run on `--node` for macOS (unchanged, out of this push's scope) | — |
+
+**Owner decisions outstanding (not the manager's), with evidence
+pointers** — unchanged from the session-close section above: **CP-1**
+(re-pin to one vmnet / host forwarding between bridge100 and the macOS
+vmnet; evidence: attempt-3/4 `traffic_test_matrix.log`, LAN probe
+ICMP 100% + TCP/22 timeout, `MacosCrossNetworkTrafficBlocker_2026-09-03.md`
+§5–§8); **QH-66 Option D** (owner signing-key custody, evidenced by
+`owner_signing_key_present=true` in `logs/membership_init.log` of
+`livelab-1788625551-504605015758`); **QH-69** (`--linux-backend` default
+vs per-row backend recording; `QualityHardeningTodo_2026-07-25.md`).
+
+**Gates (pinned 1.88.0, `target-pinned`):** `cargo fmt --all
+-- --check` PASS; `cargo clippy -p rustynet-cli --all-targets
+--all-features -- -D warnings` PASS (2m12s, zero warnings) —
+`rustynet-cli` is the only crate this branch touches (readiness wait in
+`vm_lab/orchestrator/role_validation/relay.rs`).
+
+**Branch is NOT merged.** `ai-edit/edit-1788655036704-53137-0` (head
+carries this closing commit) holds the full manager-chain work; review
+and merge into `main` is the owner's step, per the delegated-edit
+contract. Nothing was pushed.
+
+closing pass complete
+
 
 
