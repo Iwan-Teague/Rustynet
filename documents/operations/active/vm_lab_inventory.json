@@ -94,7 +94,7 @@
       "node_id": "aux-1",
       "os": "Debian/Linux",
       "parent_device": "iwan's MacBook Pro",
-      "relay_capable": false,
+      "relay_capable": true,
       "rustynet_src_dir": "/home/debian/Rustynet",
       "ssh_target": "192.168.64.10",
       "ssh_user": "debian"
@@ -228,7 +228,7 @@
         "utm_name": "rocky_10"
       },
       "exit_capable": false,
-      "lab_role": "rocky_client",
+      "lab_role": "aux",
       "last_known_ip": "192.168.64.105",
       "last_known_network": "utm-shared-192.168.64.0/24",
       "live_ips": [
