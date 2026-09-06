@@ -807,12 +807,8 @@ impl PreflightStage {
             }
         }
 
-        let outcome = decide_cross_bridge(
-            &groups,
-            &excluded,
-            &probe_failures,
-            &self.planned_stage_ids,
-        );
+        let outcome =
+            decide_cross_bridge(&groups, &excluded, &probe_failures, &self.planned_stage_ids);
         let decision_line = match &outcome {
             CrossBridgeOutcome::NoSplit => "decision: no subnet split (single /24)".to_owned(),
             CrossBridgeOutcome::Pass => {
@@ -1533,10 +1529,8 @@ mod tests {
     /// would false-pass a stdout substring check.
     #[test]
     fn cross_bridge_windows_probe_exits_on_tcp_result() {
-        let windows = cross_bridge_probe_argv(
-            crate::vm_lab::VmGuestPlatform::Windows,
-            "192.168.64.9",
-        );
+        let windows =
+            cross_bridge_probe_argv(crate::vm_lab::VmGuestPlatform::Windows, "192.168.64.9");
         let script = &windows[4];
         assert!(script.contains("if ((Test-NetConnection"));
         assert!(script.contains("TcpTestSucceeded"));
