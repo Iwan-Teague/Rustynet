@@ -627,3 +627,80 @@ clean, env ProxyJump pair set. QH-64 watch active (the probe restarts
 sender+receiver daemons mid-run; `RestrictionMode::Permanent` /
 `gossip_accepted_total=0` = QH-64 evidence, not new defects). Result
 append: next section.
+
+## 2026-09-06 (session 3) — run 5 (Linux relay fwd, attempt 1) verdict + stable-topology retry
+
+Successor manager (worktree `edit-1788682024523-99861-0`, branch
+`ai-edit/edit-1788682024523-99861-0`, base = timed-out checkpoint `d731826a`
+which already carries run 5's ledger rows and the ProxyJump commits
+`caa11fdc`/`9c709139`).
+
+### Run 5 verdict (from stage artifacts, report
+`state/live-lab-linux-relay-fwd1-20260906-082801-r2` in worktree
+`edit-1788678035879-79896-0`; ledger id `livelab-1788681040-caa11fdc1fc8`,
+commit `caa11fdc`, clean, 07:29–07:50Z, 4 nodes
+debian-headless-2:client / debian-headless-4:client / fedora-x86-1:relay /
+linux-x86-exit-1:exit)
+
+- `deploy_relay_service` **pass** and `relay_validation` **pass** on
+  fedora-x86-1 — first `--node`-engine Linux relay-service lifecycle proof in
+  this series (the macOS lifecycle proof landed earlier as
+  `livelab-1788653310-04c85129bb4f`).
+- `relay_forwards_frame_validation` **fail — but NOT a probe/platform
+  failure**: `fedora-x86-1: relay provisioning on fedora-x86-1 failed: remote
+  command exited with status 255: ssh: connect to host 192.168.121.227 port 22:
+  Connection refused`. fedora-x86-1 dropped sshd mid-run (known ubuntu-kvm
+  guest flakiness); bootstrap_hosts had reached all four nodes minutes earlier
+  in the same run with the ProxyJump pair active, and the watchdog re-probe
+  shows the port answering again. The frame-forwarding probe was never
+  exercised. Triage stub amended to record this root cause (the previous patch
+  text misattributed it to the tailnet ACL, which the jump hop already
+  solves).
+- `traffic_test_matrix` **fail**: ALL 121.x↔64.x legs 100% loss both
+  directions (fedora-x86-1↔both Debians, linux-x86-exit-1↔both Debians). New
+  environment evidence: the two subnets are underlay-partitioned (121.x =
+  libvirt NAT behind ubuntu-kvm-1, tailnet-ACL-blocked from this Mac; 64.x =
+  local UTM shared net). 64.x↔64.x legs passed. Consequence for topology
+  design: relay, sender, AND receiver for the frame-forwarding probe must sit
+  on ONE mutually-reachable subnet — lenovo (192.168.0.x, bridged) cannot
+  serve: 64.x→0.x works (NAT egress) but 0.x→64.x is unrouted, and both the
+  receiver→relay UDP flow and any relay-on-lenovo forwarding direction need
+  that dead path.
+- Ledger port: the checkpoint `d731826a` already committed run 5's row + 224
+  stage rows; verified byte-identical to the report artifacts (0 field diffs)
+  and both new triage stubs are now filled (run 5's amended; the 08:03Z
+  relaunch stub `livelab-1788681822-9c709139ad16::prepare_source_archive` was
+  the clean-worktree gate tripping on the then-uncommitted rows — launch
+  hygiene, no code defect).
+
+### Retry topology (avoids fedora-x86-1 entirely; read from
+`select_relay_forward_test_topology` at `vm_lab/mod.rs:13840`)
+
+Election is inventory-driven: relay = first `relay_capable=true` Linux entry
+in entries order; peers = Linux, non-relay, non-`exit_capable=true`, ranked by
+lab_role aux(0)/extra(1)/other(2) then alias. fedora-x86-1 is currently the
+only `relay_capable` Linux entry, and the stage fails unless the assigned
+relay == the elected relay — so avoiding fedora REQUIRES an inventory change.
+Worktree-only inventory edits (never merged without owner review; documented
+here):
+
+1. `debian-headless-4.relay_capable: false → true` — elects the stable local
+   Debian as relay (entries order puts it ahead of fedora-x86-1).
+2. `debian-lan-11.exit_capable: (absent) → true` — exclusion hack only:
+   debian-lan-11 is a physical device with no mesh_ip/controller; without an
+   exclusion it sorts in as receiver and the stage fails at topology
+   formation ("peer debian-lan-11 has no mesh_ip recorded"). exit_capable is
+   the minimal lever that excludes it from peer candidates.
+3. No lab_role edits needed: with dh4 as relay, rank-2 alias order elects
+   sender=debian-headless-2 and receiver=fedora-utm-1 (a local UTM Linux
+   guest on the same utm-shared 192.168.64.0/24 — verified below before
+   launch).
+
+Run recipe: `--node debian-headless-4:relay --node debian-headless-2:client
+--node fedora-utm-1:client --enable-relay-forwarding-validation --skip-soak
+--linux-backend linux-wireguard-userspace-shared --source-mode local-head
+--trust-inventory-ready --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+--known-hosts-file ~/.ssh/known_hosts_lab --collect-artifacts-on-failure`,
+fresh report dir, NO ProxyJump env (all-local topology). Per-node SSH
+preflight with the lab key immediately before launch; abort on any miss.
+QH-64 watch active (probe restarts sender+receiver daemons mid-run).
