@@ -758,3 +758,12 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
 - Both fwd5b stubs recorded in `live_lab_stage_triage.jsonl` via `ops live-lab-record-stage-patch`.
 - Cleanup verified: NO hp3 table residue on dh2 (stage's unconditional unblock ran).
 - NEXT: relaunch fwd6 with identical flags (new commit as source).
+
+## 2026-09-06 13:02 UTC — TARGET 1 launched: macOS client traffic_test_matrix (run #5 shape)
+
+- Step (a) cross-bridge preflight PASSED: debian-headless-4 (192.168.64.4) -> 192.168.65.101 ping 2/2 0% loss; macos-utm-1 (192.168.65.101) -> 192.168.64.4 ping 2/2 0% loss. CP-1 host override (com.apple/100.rustynet-lab) confirmed loaded.
+- Stale pf anchors on macos-utm-1 flushed: com.rustynet/blind_exit and com.rustynet/nat both `-F all`'d, re-verified rule-free.
+- Step (b) pinned rebuild of rustynet-cli --features vm-lab from this worktree (HEAD 17c9c3d4 + 8e766946 nft fix): Finished dev profile in 3m 11s.
+- Step (c) FULL run launched DETACHED 13:02:01 UTC: RD=state/live-lab-macos-client-traffic-20260906-130201, PID=84497. Topology: macos-utm-1:client, debian-headless-4:exit, debian-headless-2:client. Flags: --skip-soak --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --collect-artifacts-on-failure.
+- Verdict source: $RD/logs/traffic_test_matrix.log + $RD/state/stages.tsv ONLY. Also watching: live_two_hop_validation, live_managed_dns_validation (CP-1-gated).
+- While in flight: lab-tooling follow-ups (i) cross-bridge preflight gate, (ii) macOS uninstall anchor teardown, (iii) §9 MacosCrossNetworkTrafficBlocker_2026-09-03.md.
