@@ -1155,7 +1155,11 @@ pub fn enforce_daemon(
 pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     let timeout = Duration::from_secs(60);
     let _ = stop_daemon(conn);
-    ssh::run_remote(
+    // Run the file removal first but do NOT propagate its error yet: a failed
+    // rm correlates with a wedged daemon — exactly the case where the daemon
+    // left a com.rustynet/* pf anchor behind — so the anchor flush below must
+    // run regardless, and only then do we surface the rm failure.
+    let rm_result = ssh::run_remote(
         conn,
         &format!(
             "sudo -n rm -f {MACOS_RUSTYNETD_PATH} {MACOS_RUSTYNET_PATH} \
@@ -1163,7 +1167,7 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
              sudo -n rm -rf {MACOS_STATE_ROOT} /usr/local/etc/rustynet /private/var/run/rustynet",
         ),
         timeout,
-    )?;
+    );
     // Flush any com.rustynet/* pf anchor the daemon loaded (e.g. blind_exit's
     // default-deny `block drop out quick all`): uninstall previously left these
     // behind, so the anchor outlived the installation and kept blocking traffic.
@@ -1172,6 +1176,7 @@ pub fn uninstall_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
     {
         eprintln!("macos uninstall: com.rustynet/* pf anchor flush failed: {e}");
     }
+    rm_result?;
     Ok(())
 }
 
