@@ -122,6 +122,8 @@ pub struct ManifestSelectors {
     pub blind_exit_platform: String,
     #[serde(default)]
     pub role_switch_platform: String,
+    #[serde(default)]
+    pub reboot_platform: String,
     pub skip_linux_live_suite: bool,
     pub chaos_suite: bool,
     pub cross_network_suite: bool,
@@ -150,6 +152,7 @@ impl From<&TargetSelectors> for ManifestSelectors {
             admin_platform: selectors.admin_platform.clone(),
             blind_exit_platform: selectors.blind_exit_platform.clone(),
             role_switch_platform: selectors.role_switch_platform.clone(),
+            reboot_platform: selectors.reboot_platform.clone(),
             skip_linux_live_suite: selectors.skip_linux_live_suite,
             chaos_suite: selectors.chaos_suite,
             cross_network_suite: selectors.cross_network_suite,
