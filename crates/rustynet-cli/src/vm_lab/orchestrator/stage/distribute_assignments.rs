@@ -200,6 +200,23 @@ pub(crate) fn build_bundle_env(
 }
 
 /// Shared bundle distribution logic used by Assignment, Traversal, and `DnsZone` stages.
+/// Bundle file naming, shared by EVERY caller of [`distribute_bundle_kind`].
+///
+/// The minter writes `<prefix>-<node_id>.<ext>` into the issue directory and
+/// the distributor looks the same name up, so a caller that spells either half
+/// differently gets `bundle not found` for every node. That is not
+/// hypothetical: `refresh_signed_bundles` shipped with `"dns_zone"` where the
+/// setup stage uses `"dns-zone"`, and the whole stage failed the first time it
+/// ran live (run `live-lab-linux-relay-fwd10-20260907-180632`), taking the
+/// relay forwarding proof down with it as a dependency. Neither the stage's
+/// own unit tests nor two reviews caught it, because each compared the code to
+/// its intent rather than to the sibling caller. Constants remove the class:
+/// there is now one spelling and the compiler enforces it.
+pub(crate) const TRAVERSAL_BUNDLE_FILE_PREFIX: &str = "rn-traversal";
+pub(crate) const TRAVERSAL_BUNDLE_FILE_EXT: &str = "traversal";
+pub(crate) const DNS_ZONE_BUNDLE_FILE_PREFIX: &str = "rn-dns-zone";
+pub(crate) const DNS_ZONE_BUNDLE_FILE_EXT: &str = "dns-zone";
+
 pub(crate) fn distribute_bundle_kind(
     ctx: &mut OrchestrationContext,
     kind: BundleKind,

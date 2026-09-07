@@ -39,12 +39,14 @@ impl OrchestrationStage for DistributeDnsZoneStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        use crate::vm_lab::orchestrator::stage::distribute_assignments::distribute_bundle_kind;
+        use crate::vm_lab::orchestrator::stage::distribute_assignments::{
+            DNS_ZONE_BUNDLE_FILE_EXT, DNS_ZONE_BUNDLE_FILE_PREFIX, distribute_bundle_kind,
+        };
         distribute_bundle_kind(
             ctx,
             BundleKind::DnsZone,
-            "rn-dns-zone",
-            "dns-zone",
+            DNS_ZONE_BUNDLE_FILE_PREFIX,
+            DNS_ZONE_BUNDLE_FILE_EXT,
             self.max_parallel_node_workers,
             &self.shutdown_flag,
         )
