@@ -492,6 +492,21 @@ mod tests {
     }
 
     #[test]
+    fn traversal_env_always_pins_the_traversal_ttl_explicitly() {
+        // TraversalBundleFreshnessPlan_2026-09-07: the TTL must be set
+        // explicitly on EVERY traversal mint. The local issuer
+        // (issue_traversal_bundles_locally) hard-errors when the var is
+        // absent, so this pin guarantees the orchestrator never trips it.
+        let ctx = make_two_node_ctx();
+        let env = build_bundle_env(&ctx, &BundleKind::Traversal).unwrap();
+        let line = env
+            .lines()
+            .find(|l| l.starts_with("TRAVERSAL_TTL_SECS="))
+            .expect("TRAVERSAL_TTL_SECS must be present in every traversal env");
+        assert_eq!(line, "TRAVERSAL_TTL_SECS=86400");
+    }
+
+    #[test]
     fn build_bundle_env_traversal_has_no_assignments_spec() {
         let ctx = make_two_node_ctx();
         let env = build_bundle_env(&ctx, &BundleKind::Traversal).unwrap();
