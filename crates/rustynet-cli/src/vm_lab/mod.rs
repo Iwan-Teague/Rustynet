@@ -14094,7 +14094,10 @@ fn build_relay_forward_test_daemon_restart_script() -> String {
 }
 
 fn build_relay_forward_test_status_script() -> String {
-    "/usr/local/bin/rustynet status 2>&1 || echo HP3_STATUS_UNREACHABLE".to_owned()
+    format!(
+        "{status} || echo HP3_STATUS_UNREACHABLE",
+        status = privileged_rustynet_cli_script("status")
+    )
 }
 
 /// Starts a bounded background capture on the relay's own dataplane port
@@ -54137,5 +54140,31 @@ mod qh01_real_call_path_tests {
              printf '%s\\n' '__VM_LAB_SECTION_END__'; printf '%s\\n' '__VM_LAB_SECTION__uname'; \
              { uname -a; } 2>&1 || true; printf '%s\\n' '__VM_LAB_SECTION_END__'; "
         );
+    }
+
+    /// Pins the fwd8 fix: the relay-forward test status script must query the
+    /// daemon through `privileged_rustynet_cli_script` (sudo/env form over the
+    /// root-owned socket) instead of a plain `rustynet status` invocation that
+    /// fails with EACCES on `/run/rustynet/rustynetd.sock`, and it must keep
+    /// the `HP3_STATUS_UNREACHABLE` fallback marker so a non-zero exit is
+    /// still parsed as "peer reported, daemon down" rather than a dropped
+    /// sample. Without the privileged form the stage polls plain-user status
+    /// forever and times out after 90s (fwd7c failure, 2026-09-07).
+    #[test]
+    fn relay_forward_test_status_script_uses_privileged_form() {
+        let script = super::build_relay_forward_test_status_script();
+        assert!(
+            script.contains(
+                "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock rustynet status"
+            ),
+            "status script must run the daemon query under sudo -n env so the root-owned socket is readable"
+        );
+        assert!(
+            script
+                .trim_end()
+                .ends_with("|| echo HP3_STATUS_UNREACHABLE"),
+            "unreachable-marker fallback must remain the last statement"
+        );
+        assert!(!script.contains("__"), "no placeholder shape may appear");
     }
 }

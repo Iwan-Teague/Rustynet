@@ -825,3 +825,10 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
   rebuild pinned binary, commit fix+test, record fwd7c stub remedies
   (relay_forwards_frame_validation → fix commit; cross_network_nat_classification
   → decline netns out of scope), then launch fwd8 (attempt 3/3 FINAL).
+
+--- 2026-09-07T01:00:38Z STEP 1: verify fwd7c fix (privileged status probe)
+Confirmed: single status script used for BOTH peers in wait loop (mod.rs:14166); fix uses privileged_rustynet_cli_script (sudo -n env RUSTYNET_DAEMON_SOCKET). Running gates next: fmt, scoped clippy, targeted test.
+
+--- $(date -u +%Y-%m-%dT%H:%M:%SZ) STEP 1 result: gates + glm-5.3 adversarial review
+- fmt OK; clippy -p rustynet-cli --features vm-lab --all-targets --all-features -D warnings OK (4m26s); targeted test relay_forward_test OK (lib+bin, incl. new relay_forward_test_status_script_uses_privileged_form).
+- glm-5.3 review (ai_read): VERDICT ship conditional on F1 (absolute /usr/local/bin/rustynet in helper). F1/F2 target the SHARED helper privileged_rustynet_cli_script (mod.rs:37155) — pre-existing, used by other live-passing stages, pinned by privileged_rustynet_cli_script_uses_sudo_env_when_available; DECLINED helper edit mid-loop (blast radius; fwd7c empirically proves PATH resolution works over lab SSH — the CLI ran and printed EACCES). F3 caller-safe (parses fields, never marker). F5 &'static str literal, compiler-enforced. F4/F6 noted, pre-existing patterns, not blocking. Fix ships as-is.
