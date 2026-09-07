@@ -469,6 +469,85 @@ const EDIT_WORKTREES_SUBDIR: &str = "state/edit-worktrees";
 /// OUTLIVES the job on purpose — it is the deliverable a human reviews and
 /// merges. Nothing in this server ever merges or deletes it.
 const EDIT_BRANCH_PREFIX: &str = "ai-edit";
+/// The per-worktree allowlist file `create_edit_worktree` writes at the root
+/// of every delegated-edit worktree (one rule per line). The pre-commit hook
+/// reads it POSITIONALLY via `git rev-parse --show-toplevel` — never from the
+/// environment — so an agent cannot point the guard at a different file by
+/// exporting a variable. A missing/unreadable file makes the hook refuse to
+/// commit (fail closed). It is excluded from git via the worktree's own
+/// `info/exclude` so it never pollutes status or a checkpoint.
+const EDIT_ALLOWLIST_FILENAME: &str = "allowlist.txt";
+/// The per-worktree pre-commit hook `create_edit_worktree` installs under
+/// `$GIT_COMMON_DIR/worktrees/<job>/hooks/` (linked worktrees consult their
+/// own `$GIT_DIR/hooks` when `core.hooksPath` is unset). POSIX sh. Reads the
+/// allowlist positionally, rejects any staged path outside it, and chains to
+/// the repo's own `scripts/git-hooks/pre-commit` when present so the
+/// staleness/mirror guards still run. This hook is defence in depth: the
+/// AGENT can bypass it with `commit --no-verify`, which is exactly why the
+/// programmatic `checkpoint_edit_worktree` — not this script — is the
+/// enforcement boundary.
+const EDIT_WORKTREE_PRE_COMMIT_HOOK: &str = r#"#!/bin/sh
+# Per-worktree path allowlist guard (DelegatedEditPathGuardPlan_2026-09-07).
+# Installed by rustynet-mcp-ai-agent for ONE delegated-edit job. Reads the
+# allowlist positionally from the worktree root (never the environment),
+# refuses any staged path outside it, then chains to the repo's own
+# pre-commit hook if one exists.
+set -u
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 1
+AL="$ROOT/allowlist.txt"
+if [ ! -r "$AL" ]; then
+  echo "pre-commit (path allowlist): $AL is missing or unreadable — refusing to commit (fail closed)." >&2
+  exit 1
+fi
+
+in_allowlist() {
+  path="$1"
+  case "$path" in
+    */../*|*/..|../*|..) return 1 ;;
+  esac
+  while IFS= read -r rule; do
+    [ -n "$rule" ] || continue
+    case "$rule" in
+      *"**"*)
+        prefix=${rule%%\*\*}
+        suffix=${rule#*\*\*}
+        case "$path" in
+          "$prefix"*"$suffix") return 0 ;;
+        esac
+        ;;
+      *)
+        case "$path" in
+          "$rule"|"$rule"/*) return 0 ;;
+        esac
+        ;;
+    esac
+  done < "$AL"
+  return 1
+}
+
+LIST="$(mktemp)" || exit 1
+git diff --cached --name-only -z --diff-filter=ACMRD | tr '\0' '\n' > "$LIST"
+bad=0
+while IFS= read -r p; do
+  [ -n "$p" ] || continue
+  if ! in_allowlist "$p"; then
+    echo "  $p" >&2
+    bad=1
+  fi
+done < "$LIST"
+rm -f "$LIST"
+if [ "$bad" -ne 0 ]; then
+  echo "pre-commit (path allowlist): the staged path(s) above are OUTSIDE this job's allowlist ($AL)." >&2
+  echo "Commit refused — edit only inside the allowlisted paths (DelegatedEditPathGuardPlan_2026-09-07)." >&2
+  exit 1
+fi
+
+if [ -x "$ROOT/scripts/git-hooks/pre-commit" ]; then
+  exec "$ROOT/scripts/git-hooks/pre-commit" "$@"
+fi
+exit 0
+"#;
 /// How long to wait for a spawned `opencode serve` to report its listening port.
 const OPENCODE_SERVE_BOOT_TIMEOUT_SECS: u64 = 30;
 /// Default wall-clock cap on a single delegated-edit job before it is abandoned.
@@ -2320,6 +2399,7 @@ impl AiAgentServer {
         &self,
         job_id: &str,
         base_ref: &str,
+        rules: &[String],
     ) -> Result<(PathBuf, String, String), String> {
         let dir = self.edit_worktrees_dir();
         std::fs::create_dir_all(&dir)
@@ -2364,6 +2444,61 @@ impl AiAgentServer {
                 }
             ));
         }
+        // ── Mechanical path guard (DelegatedEditPathGuardPlan_2026-09-07) ──
+        // 1. The allowlist file, positionally readable at the worktree root.
+        // 2. A per-worktree pre-commit hook that enforces it (defence in
+        //    depth; the programmatic checkpoint is the real boundary).
+        // 3. An info/exclude so allowlist.txt never enters status/checkpoints.
+        // All three are fail-closed: if any cannot be installed, the worktree
+        // setup FAILS rather than launching an unscoped job.
+        std::fs::write(
+            path.join(EDIT_ALLOWLIST_FILENAME),
+            format!("{}\n", rules.join("\n")),
+        )
+        .map_err(|e| format!("cannot write worktree allowlist file: {e}"))?;
+        let common_dir_out = run_with_timeout(
+            "git",
+            &["rev-parse", "--git-common-dir"],
+            &path,
+            &[],
+            Duration::from_secs(30),
+        )?;
+        if !common_dir_out.success || common_dir_out.stdout.trim().is_empty() {
+            return Err(format!(
+                "cannot locate the worktree's common git dir: {}",
+                common_dir_out.stderr.trim()
+            ));
+        }
+        let common_dir = PathBuf::from(common_dir_out.stdout.trim());
+        let common_dir = if common_dir.is_absolute() {
+            common_dir
+        } else {
+            path.join(common_dir)
+        };
+        let hooks_dir = common_dir.join("worktrees").join(job_id).join("hooks");
+        std::fs::create_dir_all(&hooks_dir).map_err(|e| {
+            format!(
+                "cannot create per-worktree hooks dir {}: {e}",
+                hooks_dir.display()
+            )
+        })?;
+        let hook_path = hooks_dir.join("pre-commit");
+        std::fs::write(&hook_path, EDIT_WORKTREE_PRE_COMMIT_HOOK)
+            .map_err(|e| format!("cannot write per-worktree pre-commit hook: {e}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
+                .map_err(|e| format!("cannot chmod +x per-worktree pre-commit hook: {e}"))?;
+        }
+        let exclude_dir = common_dir.join("worktrees").join(job_id).join("info");
+        std::fs::create_dir_all(&exclude_dir)
+            .map_err(|e| format!("cannot create per-worktree info dir: {e}"))?;
+        std::fs::write(
+            exclude_dir.join("exclude"),
+            format!("{EDIT_ALLOWLIST_FILENAME}\n"),
+        )
+        .map_err(|e| format!("cannot write per-worktree info/exclude: {e}"))?;
         Ok((path, branch, base_sha))
     }
 
@@ -2838,6 +2973,7 @@ impl AiAgentServer {
             &model_id,
             &base_ref,
             &task,
+            &path_allowlist,
         );
 
         let rec = self.read_job_record(&job_id);
@@ -2892,6 +3028,7 @@ impl AiAgentServer {
         model_id: &str,
         base_ref: &str,
         task: &str,
+        path_allowlist: &[String],
     ) {
         let fail = |e: String| {
             let mut rec = self
@@ -2905,10 +3042,11 @@ impl AiAgentServer {
             self.write_job_record(job_id, &rec);
         };
 
-        let (worktree, branch, base_sha) = match self.create_edit_worktree(job_id, base_ref) {
-            Ok(v) => v,
-            Err(e) => return fail(format!("worktree setup failed: {e}")),
-        };
+        let (worktree, branch, base_sha) =
+            match self.create_edit_worktree(job_id, base_ref, path_allowlist) {
+                Ok(v) => v,
+                Err(e) => return fail(format!("worktree setup failed: {e}")),
+            };
         let (serve_pid, serve_port) = match self.spawn_opencode_serve(job_id, &worktree) {
             Ok(v) => v,
             Err(e) => return fail(format!("opencode serve failed: {e}")),
