@@ -68,6 +68,8 @@ Live-lab: **no existing stage exercises `ai_edit_run`** (matrix stages are netwo
 
 DONE. All 8 plan steps implemented on branch `ai-edit/edit-1788775612865-74537-0`, one commit per step: allowlist matchers + tests (647206f6), `path_allowlist` param (213d6347), worktree allowlist + per-worktree pre-commit hook (31cf0056), scope-aware checkpoint (ce45faeb), `scope_violation` terminal state (523eb44d), opencode prompt advisory (f63be5ff), clippy fix (7e06900c), docs + plan log (3a71d68c and this commit). Gates: fmt clean; `cargo clippy -p rustynet-mcp --all-targets --all-features -- -D warnings` clean; `cargo test -p rustynet-mcp --all-targets --all-features` 282/282 pass; AGENTS/CLAUDE mirror verified. Not done (out of scope for this job, per the plan's Tests section): the scripted live `ai_edit_run` smoke (brief touching `crates/rustynet-cli/src/main.rs`, expecting `scope_violation` + attached diff, in-scope files committed) — it launches a real OpenCode serve and is left to the owner/next session; the classifier and checkpoint behaviour are unit-pinned instead and the hook was verified live in a scratch repo.
 
+- 2026-09-07 — review-fix job opened against DelegatedEditPathGuardReview_2026-09-07 (F1–F7) in worktree `edit-1788780913676-61725-0`, branch `ai-edit/edit-1788780913676-61725-0`. Step R1 next: F3 — parse status via `git status --porcelain=v1 -z` (NUL-split, `dest\0orig` renames) so quoted/non-ASCII paths classify byte-exact.
+
 ## Open questions
 
 1. Does OpenCode's config schema support path-scoped `edit` permissions (e.g. `"edit": {"docs/**": "allow", "**": "ask"}`)? Unverifiable here (`https://opencode.ai/config.json` unreachable); layer 1 does not depend on it. If supported, add `**`-deny + allowlist-allow as belt-and-braces.
