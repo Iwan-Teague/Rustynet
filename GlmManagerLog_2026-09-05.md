@@ -29,3 +29,39 @@ Verdict source: $RD/logs/validate_macos_reboot_recovery.log + $RD/state/stages.t
 - RD=state/live-lab-macos-anchor-20260907-043830 (mkdir -p before nohup). Same base flags as reboot run minus --reboot-platform, keep --skip-linux-live-suite --skip-soak --collect-artifacts-on-failure --source-mode local-head --trust-inventory-ready --linux-backend linux-wireguard-userspace-shared + full SSH/inventory flags.
 - Verdict source: logs/validate_macos_anchor_*.log (all MacosAnchor* stages) + stages.tsv only.
 - Mac guest confirmed on SSH (up 2 mins after its reboot, hostname answers).
+
+## 2026-09-07T04:52Z — STEP 4 anchor re-proof: PASS
+
+Run `livelab-1788756583-b4c3097999cd`, RD `state/live-lab-macos-anchor-20260907-043630`, PID 15067, 04:36:59→04:49:43Z. run_passed=true (report_state.json). 20 pass / 0 fail / 2 legit skips (admin_issue, blind_exit — not elected). All four anchor stages hard-pass: anchor_validation, deploy_macos_anchor_profile, validate_macos_anchor_bundle_pull, validate_macos_anchor_port_mapping_authority. 0 'evidence finalization failed'. Matrix row appended → 28885-0 provenance ledger (332nd row, macos_anchor=pass; pinned binary appends to its build-worktree CSV). Mac guest SSH OK post-run (macs-Virtual-Machine.local, up 20 min). Refresh doc anchor cell updated with re-proof entry (row already 🟢 from 2026-09-05; this re-proves on current tree).
+
+## STATUS 2026-09-07T04:52Z
+
+DONE:
+- STEP 2 macOS role-transition cell: GREEN + recorded (livelab-1788752486-6d3fea6cf2aa).
+- STEP 3 macOS reboot-recovery: 2 real attempts, both FAIL on lab-tooling, both root-caused + fixed + stub-remedied (b4c30979 BSD stat; 1ff7d04a ssh-255). Attempt 2 PROVED the Mac actually rebooted (uptime 2 min post-run) — false failure in dispatch status handling. Attempts exhausted; Refresh row stays red; fixes need a future run to prove (pinned binary must be rebuilt with 1ff7d04a first).
+- STEP 4 anchor re-proof: PASS + recorded (livelab-1788756583-b4c3097999cd).
+- CP-1 (not loaded): macOS↔Linux dataplane stages never ran this session — by instruction.
+
+NOT DONE / OPEN:
+- reboot-recovery macOS row still 🔴 (2 tooling-caused false failures; both fixes committed but unproven by a green run).
+
+### MERGE NOTE (for the owner)
+
+Commits since 092e94cf, grouped:
+
+(a) Lab-tooling fixes + proving live run:
+- 61983773 finalizer plan derivation (proved by run 032942 full pass)
+- 6d3fea6c manifest selectors snapshot (proved by run 032942)
+- b4c30979 BSD stat 600|0600 (proved by run 041909: pre-reboot capture passed)
+- 1ff7d04a ssh-255 shutdown-dispatch acceptance (run 041909 proved Mac rebooted; fix itself UNPROVEN by a green run — rebuild pinned binary + rerun when convenient)
+- (pre-092e94cf-history in ledger commits: a0b29f83 relay ss parser, 6228d1d6 privileged status probe)
+
+(b) Ledger/doc records:
+- 2498a833, 664d28ea, 981c9231, 3b1b4a38, 5ec4e99a, b2eeb5d5, 031e8f64, a134f76e, 4a71fb44, a81baad8, 4aca5d01, + this commit
+- 5a4df786, e88bbe76, 0d389d35, 774a7f7a, 01b9bdcb (earlier fwd-run rows), 160ee56c, 38470603, 9b654b13, 1778258b, d5864aae, 60ad3f9f, 82d733f9, d6a64963, a746051c, b9887739, b319b2d9, 002aabc1, a1e190ab (fwd-series logs/stubs)
+
+(c) Open owner decisions:
+- relay frame-forwarding: blocked on stale traversal/dns bundles after live_reboot_recovery (trust-state refresh — PROPOSED only, never edited; see fwd8e verdict 160ee56c / a1e190ab)
+- QH-70 (open)
+- CP-1 pf override persistence: not loaded this session → macOS↔Linux dataplane stages (traffic_test_matrix/two_hop/managed_dns/relay-through-mac) OFF
+- 28885-0 ledger divergence: pinned binary resolves stage-triage ledger + appends matrix rows to its BUILD worktree (edit-1788746785362-28885-0). Three cross-worktree stub remedies recorded there (BSD-stat, ssh-255, + earlier) and rows 331/332 landed in its CSV. Owner must reconcile ledgers/CSVs when merging this branch.
