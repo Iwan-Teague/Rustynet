@@ -3576,10 +3576,12 @@ pub(crate) fn issue_traversal_bundles_locally(
             .parse::<u64>()
             .map_err(|err| format!("invalid TRAVERSAL_TTL_SECS in traversal env: {err}"))?,
         None => {
-            return Err(
-                "TRAVERSAL_TTL_SECS missing from traversal env: the bundle TTL must be                  configured explicitly (never defaulted); the orchestrator's                  build_bundle_env sets it for every traversal mint"
-                    .to_owned(),
+            return Err(concat!(
+                "TRAVERSAL_TTL_SECS missing from traversal env: the bundle TTL must be ",
+                "configured explicitly (never defaulted); the orchestrator's ",
+                "build_bundle_env sets it for every traversal mint"
             )
+            .to_owned());
         }
     };
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;

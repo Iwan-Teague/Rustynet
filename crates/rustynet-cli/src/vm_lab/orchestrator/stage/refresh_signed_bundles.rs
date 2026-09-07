@@ -83,9 +83,10 @@ impl OrchestrationStage for RefreshSignedBundlesStage {
         if let StageOutcome::Failed(_) = dns_zone {
             return dns_zone;
         }
-        if let StageOutcome::Skipped(_) = dns_zone {
-            return dns_zone;
-        }
+        // NOTE: no Skipped arm on dns_zone (or traversal) by design —
+        // distribute_bundle_kind only ever returns Passed or Failed (a
+        // missing exit node is Failed, never Skipped), so a Skipped outcome
+        // here would be unreachable defensive code.
         traversal
     }
 }
