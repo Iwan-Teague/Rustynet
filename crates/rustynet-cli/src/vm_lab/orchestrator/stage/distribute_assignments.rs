@@ -208,6 +208,55 @@ pub(crate) fn distribute_bundle_kind(
     max_parallel_node_workers: usize,
     shutdown_flag: &std::sync::atomic::AtomicBool,
 ) -> StageOutcome {
+    distribute_bundle_kind_inner(
+        ctx,
+        kind,
+        file_prefix,
+        file_ext,
+        max_parallel_node_workers,
+        shutdown_flag,
+        None,
+    )
+}
+
+/// Scope-limited variant of [`distribute_bundle_kind`]: identical issue +
+/// verifier-key barrier + signed-bundle install, but the verifier key and the
+/// signed bundle are distributed ONLY to `scope_alias`. Used by the macOS
+/// reboot-recovery cell, which must hand the rebooted node a FRESH traversal
+/// and dns_zone generation after the daemon comes back live (the M1 startup
+/// guard restores the pre-protection DNS baseline by design, so the loopback
+/// pins only return once the daemon re-applies its generation from valid,
+/// non-expired signed state) — the other nodes already hold the setup-stage
+/// bundles and must not be disturbed mid-run.
+pub(crate) fn distribute_bundle_kind_scoped(
+    ctx: &mut OrchestrationContext,
+    kind: BundleKind,
+    file_prefix: &str,
+    file_ext: &str,
+    max_parallel_node_workers: usize,
+    shutdown_flag: &std::sync::atomic::AtomicBool,
+    scope_alias: &str,
+) -> StageOutcome {
+    distribute_bundle_kind_inner(
+        ctx,
+        kind,
+        file_prefix,
+        file_ext,
+        max_parallel_node_workers,
+        shutdown_flag,
+        Some(scope_alias),
+    )
+}
+
+fn distribute_bundle_kind_inner(
+    ctx: &mut OrchestrationContext,
+    kind: BundleKind,
+    file_prefix: &str,
+    file_ext: &str,
+    max_parallel_node_workers: usize,
+    shutdown_flag: &std::sync::atomic::AtomicBool,
+    scope_alias: Option<&str>,
+) -> StageOutcome {
     let exit_alias = match ctx.assignments.iter().find(|a| a.role == NodeRole::Exit) {
         Some(a) => a.alias.clone(),
         None => return StageOutcome::Failed("no Exit node in assignments".to_owned()),
@@ -242,16 +291,26 @@ pub(crate) fn distribute_bundle_kind(
         }
     }
 
-    // Collect alias→node_id mapping (no mutation)
+    // Collect alias→node_id mapping (no mutation). When scoped, only the
+    // target alias is distributed to — issuance still covers the full mesh
+    // (the bundle content is mesh-wide), only the install is scoped.
     let aliases: Vec<(String, String)> = ctx
         .assignments
         .iter()
+        .filter(|a| scope_alias.is_none_or(|scope| a.alias == scope))
         .filter_map(|a| {
             ctx.node_ids
                 .get(&a.alias)
                 .map(|nid| (a.alias.clone(), nid.clone()))
         })
         .collect();
+    if let Some(scope) = scope_alias {
+        if aliases.is_empty() {
+            return StageOutcome::Failed(format!(
+                "scoped bundle distribution found no node_id for scope alias '{scope}'"
+            ));
+        }
+    }
 
     // Verify and distribute the verifier key to EVERY node before ANY signed
     // bundle is installed. A daemon must never observe a new bundle without
