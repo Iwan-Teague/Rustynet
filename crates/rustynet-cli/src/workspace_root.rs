@@ -11,7 +11,13 @@
 //!    accepted ONLY if it still carries the workspace markers.
 //!
 //! A directory is a workspace root when it contains BOTH a `Cargo.toml` file
-//! and a `documents/operations` directory. Fail closed: when no candidate
+//! and a `documents/operations` directory. The winning root is canonicalized
+//! and must pass an ownership/writability check (both markers owned by the
+//! account that owns the running binary, neither group/world-writable) or
+//! resolution is REFUSED — planted or overly permissive marker dirs must not
+//! capture evidence resolution (see [`validate_accepted_root`]).
+//!
+//! Fail closed: when no candidate
 //! carries the markers this module errors — and, for the infallible
 //! [`workspace_root_path`] accessor, panics loudly — it never guesses a
 //! directory and never creates one.
@@ -19,6 +25,7 @@
 //! The design contract lives in
 //! `documents/operations/active/LedgerRuntimeRootResolutionPlan_2026-09-07.md`.
 
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -39,12 +46,87 @@ pub(crate) fn compiled_in_root() -> Result<PathBuf, String> {
         .ok_or_else(|| "compiled-in crate path has no workspace-level parent".to_owned())
 }
 
-/// Core resolution, parameterized over the compiled-in crate dir so tests can
-/// exercise every branch without depending on where this binary was built.
+/// Validate and canonicalize a marker-carrying root before it is accepted
+/// (review F3). The winning root is canonicalized so a symlinked invocation
+/// path lands on the real directory, and it is REFUSED when either marker
+/// (`Cargo.toml` or `documents/operations`) is owned by a different uid or is
+/// group/world-writable: a directory planted by another account, or writable
+/// by more than its owner, must not capture evidence resolution.
+///
+/// Reference-uid choice: the Rust standard library exposes no uid of the
+/// running process (and this crate deliberately pulls in neither `libc` nor
+/// `nix`), so the reference is the owner of the binary's own executable
+/// ([`std::env::current_exe`]). A rustynet build lives in the operator's
+/// target directory and is owned by the same account that runs it, which is
+/// exactly the local trust domain this check guards; a root whose markers are
+/// owned by anyone else is foreign. Recorded in the review disposition.
+fn validate_accepted_root(root: &Path) -> Result<PathBuf, String> {
+    let canonical = std::fs::canonicalize(root).map_err(|e| {
+        format!(
+            "workspace root `{}` cannot be canonicalized: {e}",
+            root.display()
+        )
+    })?;
+    let exe =
+        std::env::current_exe().map_err(|e| format!("current executable unavailable: {e}"))?;
+    let exe_uid = std::fs::metadata(&exe)
+        .map_err(|e| {
+            format!(
+                "current executable `{}` metadata unavailable: {e}",
+                exe.display()
+            )
+        })?
+        .uid();
+    for marker in [
+        canonical.join("Cargo.toml"),
+        canonical.join("documents/operations"),
+    ] {
+        let meta = std::fs::metadata(&marker).map_err(|e| {
+            format!(
+                "workspace root `{}` marker `{}` metadata unavailable: {e}",
+                canonical.display(),
+                marker.display()
+            )
+        })?;
+        let uid = meta.uid();
+        if uid != exe_uid {
+            return Err(format!(
+                "workspace root `{}` rejected: `{}` is owned by uid {uid} but the \
+                 running binary is owned by uid {exe_uid}; a root planted by \
+                 another account must not capture evidence resolution",
+                canonical.display(),
+                marker.display()
+            ));
+        }
+        let mode = meta.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "workspace root `{}` rejected: `{}` is group/world-writable \
+                 (mode {mode:o})",
+                canonical.display(),
+                marker.display()
+            ));
+        }
+    }
+    Ok(canonical)
+}
+
+/// Core resolution, parameterized over the compiled-in crate dir and the
+/// acceptance hook so tests can exercise every branch without depending on
+/// where this binary was built or who owns the process.
 fn resolve_workspace_root_from(
     inventory: Option<&Path>,
     cwd: &Path,
     compiled_crate_dir: &Path,
+) -> Result<PathBuf, String> {
+    resolve_workspace_root_with(inventory, cwd, compiled_crate_dir, &validate_accepted_root)
+}
+
+fn resolve_workspace_root_with(
+    inventory: Option<&Path>,
+    cwd: &Path,
+    compiled_crate_dir: &Path,
+    accept: &dyn Fn(&Path) -> Result<PathBuf, String>,
 ) -> Result<PathBuf, String> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(inv) = inventory {
@@ -53,15 +135,26 @@ fn resolve_workspace_root_from(
         } else {
             cwd.join(inv)
         };
-        if let Some(dir) = start.parent() {
-            candidates.push(dir.to_path_buf());
-        }
+        // A bare-filename inventory yields `Some("")` as its parent; that
+        // parent IS the cwd, so name it explicitly instead of probing the
+        // empty path (review F5). The start dir is canonicalized first so a
+        // symlinked inventory path walks its REAL ancestor chain (review F3).
+        let dir = match start.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => cwd.to_path_buf(),
+        };
+        candidates.push(std::fs::canonicalize(&dir).unwrap_or(dir));
     }
-    candidates.push(cwd.to_path_buf());
+    candidates.push(std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()));
     for start in &candidates {
         for dir in start.ancestors() {
             if is_workspace_root(dir) {
-                return Ok(dir.to_path_buf());
+                // Fail closed on a winner that fails the ownership or
+                // writability check (review F3): refuse the root outright
+                // rather than falling through to a lower-precedence
+                // candidate, so an invalid high-precedence root can never be
+                // traded for a different tree.
+                return accept(dir);
             }
         }
     }
@@ -70,7 +163,7 @@ fn resolve_workspace_root_from(
         .and_then(Path::parent)
         .map(Path::to_path_buf);
     match compiled {
-        Some(root) if is_workspace_root(&root) => Ok(root),
+        Some(root) if is_workspace_root(&root) => accept(&root),
         _ => Err(
             "no workspace root with Cargo.toml + documents/operations found from \
              --inventory or cwd; compiled-in root is also invalid"
@@ -97,17 +190,52 @@ pub(crate) fn resolve_workspace_root(
 static RESOLVED_ROOT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 
 /// Initialize the process-wide workspace root from the `--inventory` path the
-/// operator handed the CLI. Set-once and idempotent: the FIRST call fixes the
-/// value; later calls observe it (Ok on the stored success, Err on the stored
-/// failure). Call at verb-parse time, before any evidence path is derived.
-/// When the resolved root differs from the compiled-in root, both paths are
-/// printed once for transparency (no secrets — directory paths only).
+/// operator handed the CLI. Set-once with a divergence check: the FIRST call
+/// fixes the value; a later call is accepted ONLY when it resolves to the
+/// SAME root — a divergent re-initialization is a bug (e.g. the cell having
+/// been silently pre-initialized from cwd before `--inventory` was consulted)
+/// and is refused with an error, never absorbed as a no-op. Call at verb-parse
+/// time, before any evidence path is derived. When the resolved root differs
+/// from the compiled-in root, both paths are printed once for transparency
+/// (no secrets — directory paths only).
 pub fn init_workspace_root(inventory: Option<&Path>) -> Result<(), String> {
-    let resolved = RESOLVED_ROOT.get_or_init(|| {
-        let resolved = match std::env::current_dir() {
-            Ok(cwd) => resolve_workspace_root(inventory, &cwd),
-            Err(e) => Err(format!("current directory unavailable: {e}")),
+    match std::env::current_dir() {
+        Ok(cwd) => init_workspace_root_in(&RESOLVED_ROOT, inventory, &cwd),
+        // The cell may already hold a usable value; fail closed only when it
+        // does not.
+        Err(e) => match RESOLVED_ROOT.get() {
+            Some(existing) => existing.clone().map(|_| ()),
+            None => Err(format!("current directory unavailable: {e}")),
+        },
+    }
+}
+
+/// The init core, parameterized over the cell and cwd so tests can drive the
+/// full set-once/divergence semantics without touching the process-global
+/// [`RESOLVED_ROOT`] or the process cwd (the test runner shares one process
+/// across threads, and a cwd mutation would race unrelated tests).
+pub(crate) fn init_workspace_root_in(
+    cell: &OnceLock<Result<PathBuf, String>>,
+    inventory: Option<&Path>,
+    cwd: &Path,
+) -> Result<(), String> {
+    if let Some(existing) = cell.get() {
+        let candidate = resolve_workspace_root(inventory, cwd);
+        return match (existing, &candidate) {
+            (Ok(stored), Ok(same)) if stored == same => Ok(()),
+            (Ok(stored), Ok(other)) => Err(format!(
+                "workspace root already initialized to `{}`; refusing \
+                 divergent re-initialization to `{}`",
+                stored.display(),
+                other.display()
+            )),
+            // First call wins for every other shape: a stored failure stays
+            // the stored failure.
+            (stored, _) => stored.clone().map(|_| ()),
         };
+    }
+    let resolved = cell.get_or_init(|| {
+        let resolved = resolve_workspace_root(inventory, cwd);
         if let Ok(root) = &resolved {
             if let Ok(compiled) = compiled_in_root() {
                 if compiled != *root {
@@ -201,6 +329,13 @@ mod tests {
         inv
     }
 
+    /// Resolution returns the CANONICALIZED winning root (review F3), so
+    /// expectations are compared in canonical form too (macOS tempdirs live
+    /// behind a `/var` → `/private/var` symlink).
+    fn canon(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).expect("canonicalize expectation")
+    }
+
     #[test]
     fn marker_requires_cargo_toml_file_and_documents_operations_dir() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -243,7 +378,11 @@ mod tests {
         let resolved =
             resolve_workspace_root_from(Some(&inv), &cwd, base.join("nowhere/crate").as_path())
                 .expect("resolution must succeed");
-        assert_eq!(resolved, root_a, "inventory-side root must win");
+        assert_eq!(
+            resolved,
+            canon(&root_a),
+            "inventory-side root must win, in canonical form"
+        );
     }
 
     #[test]
@@ -262,7 +401,7 @@ mod tests {
             base.join("nowhere/crate").as_path(),
         )
         .expect("resolution must succeed");
-        assert_eq!(resolved, root);
+        assert_eq!(resolved, canon(&root));
     }
 
     #[test]
@@ -277,7 +416,7 @@ mod tests {
         let resolved =
             resolve_workspace_root_from(None, &cwd, base.join("nowhere/crate").as_path())
                 .expect("resolution must succeed");
-        assert_eq!(resolved, root);
+        assert_eq!(resolved, canon(&root));
     }
 
     #[test]
@@ -298,7 +437,7 @@ mod tests {
 
         let resolved = resolve_workspace_root_from(Some(&inv), &cwd, &compiled_crate)
             .expect("compiled fallback must validate");
-        assert_eq!(resolved, compiled_root);
+        assert_eq!(resolved, canon(&compiled_root));
     }
 
     #[test]
@@ -365,5 +504,135 @@ mod tests {
         set_workspace_root_for_tests(Some(copy.clone()));
         assert_eq!(workspace_root_path(), copy);
         set_workspace_root_for_tests(prior);
+    }
+
+    /// Review F2: `init_workspace_root` must honor the inventory-ancestor
+    /// rule against a CONFLICTING marked cwd. The init core is driven through
+    /// a fresh cell with an explicit cwd because the process `OnceLock`
+    /// cannot be reset and the test runner shares one process across threads
+    /// (mutating the process cwd would race unrelated tests); the production
+    /// `init_workspace_root` feeds `current_dir()` into this same core.
+    #[test]
+    fn init_from_inventory_ancestors_wins_over_conflicting_cwd() {
+        let _guard: MutexGuard<'_, ()> = TEST_SERIALIZER.lock().expect("serializer");
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let inventory_root = marked_root(tmp.path(), "inventory_root");
+        let inv = inventory_under(&inventory_root, "configs/inv.json");
+        let cwd_tree = marked_root(tmp.path(), "cwd_root");
+
+        let cell = OnceLock::new();
+        init_workspace_root_in(&cell, Some(&inv), &cwd_tree).expect("init must resolve");
+        let stored = cell.get().expect("cell set").clone().expect("stored value");
+        assert_eq!(
+            stored,
+            canon(&inventory_root),
+            "the inventory-ancestor root must win over a conflicting marked cwd"
+        );
+    }
+
+    /// Review F1/F2: a second init that resolves to a DIFFERENT root is a
+    /// bug and must be refused loudly, never absorbed as a no-op. Pre-seeding
+    /// the cell from the cwd-side tree reproduces the pre-fix ordering, where
+    /// an eager default evaluation fixed the root from cwd before the
+    /// operator's `--inventory` was consulted (this test fails on pre-fix
+    /// code, which silently kept the cwd-side root).
+    #[test]
+    fn divergent_second_init_is_a_hard_error_not_a_noop() {
+        let _guard: MutexGuard<'_, ()> = TEST_SERIALIZER.lock().expect("serializer");
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let inventory_root = marked_root(tmp.path(), "inventory_root");
+        let inv = inventory_under(&inventory_root, "configs/inv.json");
+        let cwd_tree = marked_root(tmp.path(), "cwd_root");
+
+        let cell = OnceLock::new();
+        cell.set(Ok(cwd_tree.clone())).expect("fresh cell");
+
+        let err = init_workspace_root_in(&cell, Some(&inv), &cwd_tree)
+            .expect_err("a divergent second init must be refused");
+        assert!(err.contains("already initialized"), "{err}");
+        assert_eq!(
+            cell.get().expect("cell").clone().expect("value"),
+            cwd_tree,
+            "the first fixed value must stay"
+        );
+    }
+
+    /// Review F3: a group/world-writable marker must refuse the root.
+    #[test]
+    fn group_writable_marker_refuses_the_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = marked_root(tmp.path(), "root");
+        let cargo = root.join("Cargo.toml");
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o664)).expect("chmod");
+
+        let err = validate_accepted_root(&root)
+            .expect_err("a group-writable marker must refuse the root");
+        assert!(err.contains("group/world-writable"), "{err}");
+    }
+
+    /// Review F3: a winner that fails ownership validation must fail the
+    /// WHOLE resolution (hard error), not fall through to a lower-precedence
+    /// candidate. Direct chown needs privileges, so the parameterized
+    /// acceptance hook models the foreign-owned case.
+    #[test]
+    fn foreign_owned_winner_is_refused_via_accept_hook() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path();
+        let root = marked_root(base, "root");
+        let cwd = root.join("deep");
+        fs::create_dir_all(&cwd).expect("cwd");
+
+        let err =
+            resolve_workspace_root_with(None, &cwd, base.join("nowhere/crate").as_path(), &|_| {
+                Err("foreign-owned root".to_owned())
+            })
+            .expect_err("a refused winner must fail the resolution");
+        assert_eq!(err, "foreign-owned root");
+    }
+
+    /// Review F3: a symlinked inventory path must resolve against the REAL
+    /// ancestor chain and return the canonical root.
+    #[test]
+    fn symlinked_inventory_start_resolves_to_canonical_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let base = tmp.path();
+
+        let real = marked_root(base, "real_root");
+        inventory_under(&real, "configs/inv.json");
+        let link = base.join("link_root");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let inv = link.join("configs/inv.json");
+        let cwd = base.join("plain_cwd");
+        fs::create_dir_all(&cwd).expect("cwd");
+
+        let resolved =
+            resolve_workspace_root_from(Some(&inv), &cwd, base.join("nowhere/crate").as_path())
+                .expect("resolution must succeed");
+        assert_eq!(
+            resolved,
+            canon(&real),
+            "the canonical (post-symlink) root must be returned"
+        );
+    }
+
+    /// Review F5: a bare-filename inventory (`Some("")` parent) must walk
+    /// from the cwd explicitly, not probe the empty path.
+    #[test]
+    fn bare_filename_inventory_walks_from_cwd_explicitly() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = marked_root(tmp.path(), "root");
+        let cwd = root.join("runner");
+        fs::create_dir_all(&cwd).expect("cwd");
+        fs::write(cwd.join("inv.json"), "{}").expect("inv");
+
+        let resolved = resolve_workspace_root_from(
+            Some(Path::new("inv.json")),
+            &cwd,
+            tmp.path().join("nowhere/crate").as_path(),
+        )
+        .expect("resolution must succeed");
+        assert_eq!(resolved, canon(&root));
     }
 }
