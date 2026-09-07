@@ -874,3 +874,7 @@ Plan (logged before execution):
 3. Poll every 120s (`tail -4 $RD/state/stages.tsv; ps -p <pid> -o etime=`).
 4. Verdict ONLY from `$RD/logs/validate_macos_role_transition.log` + stages.tsv. PASS → update macOS role-transition row in CrossPlatformRoleParityRefresh_2026-07-23.md + LiveLabRunMatrix.md, commit ledger rows. FAIL → triage (glm-5.3-flash ai_read on stage log if unclear); fix ONLY lab tooling (stage/macos_role_transition_validation.rs, vm_lab/mod.rs exercise_macos_role_transition_live); max 2 attempts.
 5. Then STEP 3 (reboot cell) and STEP 4 (anchor re-prove) if budget remains. Finish with `## STATUS <UTC>`.
+RD=state/live-lab-macos-roleswitch-20260907-023129
+
+### STEP 2 attempt-1 abort + relaunch (2026-09-07 ~02:35Z)
+Attempt 1 (pid 83171, RD=state/live-lab-macos-roleswitch-20260907-023159) refused at prepare_source_archive: worktree dirty — a stray RD=state/live-lab-macos-roleswitch-20260907-023129 line was appended to this log AFTER commit 3b1b4a38. Same failure class as fwd8c (dirty-tree refusal). Not a stage failure; lab untouched. Remedy: commit this log (incl. the stray line for the record), verify  M documents/operations/active/GlmManagerLog_2026-09-05.md empty, relaunch with fresh RD=state/live-lab-macos-roleswitch-<newts>. Relaunch = attempt 2 of max 2 for this cell.
