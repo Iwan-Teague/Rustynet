@@ -453,3 +453,8 @@ Daemon ~1.5 days (fn + wiring + unit tests), stage ~0.5 day, one live reboot run
 
 - Should re-apply also cover the Linux twin (`/run` backup volatility, plan §1.7) in the same change?
 - Confirm marker content post-reboot (add marker dump to stage evidence) to pin scenario A vs B in the run record.
+
+## Implementation log (follow-up (a) — post-reboot fresh-bundle redistribution, edit job edit-1788778485008-2108-0, 2026-09-07)
+
+- Step 0 — Scope note: the "Corrected root cause from the live daemon log" section named by the task brief is the Addendum above (post-reboot gap found live); follow-up (a) = the stage-side fix: the macOS reboot-recovery cell redistributes FRESH signed traversal + dns_zone bundles to the rebooted node after the daemon-live probe and before the pin probe, because the M1 startup guard restores the pre-protection DNS baseline by design and the pins only return when the daemon re-applies its generation, which needs valid (non-expired) signed state. Lab tooling only; rustynetd untouched.
+- Step 1 — `distribute_assignments.rs`: add `distribute_bundle_kind_scoped` (same issue + verifier-key barrier + signed-bundle install as the setup stages, distribution scoped to one alias); `distribute_bundle_kind` becomes the all-nodes wrapper.
