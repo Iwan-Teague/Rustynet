@@ -12,7 +12,7 @@ pub fn blind_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
 /// "command not found". Name it absolutely (mirrors anchor.rs). Windows uses
 /// the `.exe` on PATH; blind_exit is blocked on Windows in production, but the
 /// code path stays correct.
-fn rustynet_program(platform: VmGuestPlatform) -> &'static str {
+pub(crate) fn rustynet_program(platform: VmGuestPlatform) -> &'static str {
     match platform {
         VmGuestPlatform::Windows => "rustynet.exe",
         _ => "/usr/local/bin/rustynet",
@@ -26,7 +26,7 @@ fn rustynet_program(platform: VmGuestPlatform) -> &'static str {
 /// path that differs by OS: macOS runs the daemon under `/private/var/run`
 /// (the bare `/var/run` symlink resolves there on macOS hosts; the
 /// `/usr/local/var/rustynet` state root is a different, wrong path).
-fn daemon_socket_path(platform: VmGuestPlatform) -> &'static str {
+pub(crate) fn daemon_socket_path(platform: VmGuestPlatform) -> &'static str {
     match platform {
         VmGuestPlatform::Macos => "/private/var/run/rustynet/rustynetd.sock",
         // Linux path is the production default; Windows is unreachable here in

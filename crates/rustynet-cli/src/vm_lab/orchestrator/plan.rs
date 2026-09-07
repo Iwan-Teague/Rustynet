@@ -511,7 +511,10 @@ impl PlanBuilder {
                     // live suite is enabled, and skips-with-reason otherwise
                     // (never silently).
                     StageId::MacosRebootRecoveryValidation => {
-                        Box::new(MacosRebootRecoveryValidationStage)
+                        Box::new(MacosRebootRecoveryValidationStage::new(
+                            max_parallel_node_workers,
+                            std::sync::Arc::clone(&shutdown_flag),
+                        ))
                     }
                     StageId::LiveSecretsNotInLogsValidation => {
                         Box::new(LiveSecretsNotInLogsValidationStage)
