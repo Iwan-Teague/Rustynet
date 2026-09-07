@@ -6614,6 +6614,35 @@ copy of the tree and asserts the ledger append landed beside that copy.
 
 **Disposition: OPEN, filed at merge time 2026-09-07 from the independent review of `ai-edit/edit-1788734269512-30091-0`.**
 
+### QH-79 — a live-lab stage resolves SSH host keys from the DEFAULT `~/.ssh/known_hosts` instead of the run's `--known-hosts-file`, so a run with a pinned known-hosts file still fails closed on rotated lab addresses
+
+**Severity: medium (lab tooling; fails closed, so it costs a run rather than
+producing false evidence). Confidence: VERIFIED — run
+`live-lab-linux-relay-fwd9-20260907-172608` was launched with
+`--known-hosts-file ~/.ssh/known_hosts_lab`, which carried all four guests'
+current keys, and `live_network_flap_validation` still failed with
+`pinned known_hosts file lacks host key for rocky@192.168.65.11:22; checked
+192.168.65.11 in /Users/iwan/.ssh/known_hosts` — a path the run never named.**
+
+The orchestrator passes `--known-hosts-file` to its own SSH seams, but the
+`live_network_flap` sub-binary it shells out to resolves the default path
+instead, so the run's pin is silently not propagated. It matters here because
+the UTM guests' vmnet addresses are reassigned by VM start order, so the
+default known-hosts file goes stale between runs while the run-scoped one is
+refreshed.
+
+**Remedy taken for the blocked run (2026-09-07): environment only** — the four
+current guest keys were seeded into the default `~/.ssh/known_hosts`. Recorded
+in the stage-triage ledger against
+`livelab-1788799669-02b40a488f3f::live_network_flap_validation`.
+
+**Fix: propagate the run's `--known-hosts-file` to every sub-binary the
+orchestrator launches**, and make an unset value a hard error in those
+binaries rather than a silent fall back to the default path. Audit the other
+`live_*` sub-binaries for the same pattern before closing.
+
+**Disposition: OPEN, filed 2026-09-07.**
+
 ### QH-77 — `vm_lab::tests::local_utm_process_present_uses_wide_ps_output` fails under heavy host load (observed once, 2026-09-07)
 **Severity: low (test flake, no product bearing). Confidence: OBSERVED once during `cargo test -p rustynet-cli --lib --all-features` on the merged tree while two other cargo jobs and a secrets-hygiene gate contended for the same target dir; the same test passed 3/3 in isolation immediately afterwards (4–15 s each, i.e. slow), and the full workspace gate on the same tree had passed it minutes earlier.**
 
