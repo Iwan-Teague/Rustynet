@@ -224,3 +224,26 @@ Fail-closed preserved: missing/unparseable status → error → stage failure; e
 - 2026-09-07: step 3 — stage wiring in `stage/mesh_status_validation.rs`: after the existing validator passes per node, poll `collect_daemon_status` (120 s deadline, 10 s interval, `gossip_convergence` precedent) and require `evaluate_live_handshake_status` to pass with `expected_live_peers = assignments.len()-1` (full mesh is the run's own contract — `traffic_test_matrix` pings all pairs). Any poll/dispatch/eval error past the deadline joins the existing fail-closed `failures` path. Stage + module doc comments corrected: "pass" now means snapshot-valid AND live-handshake-proven; ledger semantics change is forward-only.
 - 2026-09-07: step 4 — gates: `cargo fmt --all -- --check`; `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings`; `cargo test -p rustynet-cli --all-targets --all-features` (mesh_status filter first — green, then full crate).
 - 2026-09-07: gates result — fmt check PASS (also normalized two pre-existing unformatted test blocks in `linux_traffic.rs`/`macos_traffic.rs`); clippy `-p rustynet-cli --all-targets --all-features -- -D warnings` PASS; `cargo test -p rustynet-cli --all-targets --all-features` PASS (8412 passed, 0 failed). One gate iteration: the new `run_remote` call sites tripped the `raw_sink_call_site_count_must_only_go_down` tripwire (130→131); fixed by passing the compile-time-constant command through the established seam-lowered shape (`let command = DAEMON_STATUS_COMMAND.to_owned(); run_remote(conn, command.as_str(), …)`), baseline left untouched — no interpolation exists at either site.
+
+## QH-70 disposition: FIXED-IN-BRANCH (2026-09-07, branch `ai-edit/edit-1788775586214-74221-0`)
+
+Implemented stage-side per the addendum, daemon untouched. Commits: `46b16bee` (evaluator +
+tests), `e8e41bd0` (`collect_daemon_status` adapter plumbing + fail-closed default + dispatch
+pins), `066477e7` (stage poll wiring + doc comments), `4f94c21d` (raw-sink tripwire kept green).
+Gates: fmt PASS, clippy `-p rustynet-cli --all-targets --all-features -- -D warnings` PASS,
+`cargo test -p rustynet-cli --all-targets --all-features` 8412 passed / 0 failed.
+
+**Live proof outstanding (required before flipping to FIXED on main):** the next full `--node`
+Live run's `mesh_status_validation` stage must agree with `traffic_test_matrix` (latest
+comparable run `3aedcfff`, 2026-09-05, failed exactly on `traffic_test_matrix`). A red
+mesh_status on that same node class is the defect closing; a green one where traffic is green is
+the parity confirming it. Until that run, this is branch-only evidence.
+
+## STATUS 2026-09-07 11:03 UTC
+
+DONE (stage-side, branch-only): evaluator + adapter plumbing + stage wiring + tests + doc
+comments, all gates green, four commits on `ai-edit/edit-1788775586214-74221-0`. NOT DONE:
+live `--node` run proof (no lab runs permitted from this edit branch — explicitly out of scope).
+NEXT: owner merges the branch, then one full `--node` run must show `mesh_status_validation`
+agreeing with `traffic_test_matrix`; record the run in `live_lab_node_run_matrix.csv` and only
+then mark QH-70 FIXED on main.
