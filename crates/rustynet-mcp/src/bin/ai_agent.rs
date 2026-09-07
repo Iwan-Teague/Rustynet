@@ -486,6 +486,114 @@ const EDIT_APPROVAL_TIMEOUT_SECS: u64 = 1800;
 /// Without this, a poll landing in the gap between `prompt_async` returning and
 /// the model actually streaming would read as "done" against an empty diff.
 const EDIT_SESSION_START_GRACE_SECS: u64 = 90;
+/// Default per-job path allowlist for delegated-edit jobs (the mechanical path
+/// guard, owner decision 7 / DelegatedEditPathGuardPlan_2026-09-07). A caller
+/// may widen scope per job via the optional `path_allowlist` argument on
+/// `ai_edit_run`; anything else FAILS CLOSED to this list. Notably the shipped
+/// CLI entry point (`crates/rustynet-cli/src/main.rs`) is deliberately absent:
+/// the 2026-09-07 incident was a timed-out auto-checkpoint carrying an
+/// unauthorised edit to exactly that file.
+const DEFAULT_EDIT_PATH_ALLOWLIST: &[&str] = &[
+    "crates/rustynet-cli/src/vm_lab/**",
+    "documents/**",
+    "scripts/vm_lab/**",
+    "scripts/mcp/**",
+];
+
+/// True when one allowlist RULE matches one repo-relative PATH.
+///
+/// Matching semantics (see DelegatedEditPathGuardPlan_2026-09-07 §Design):
+/// - a rule containing `**` matches any remainder: split at the FIRST `**`,
+///   the path must start with the prefix and end with the suffix
+///   (`crates/x/**` matches everything under `crates/x/`);
+/// - a rule without `**` is a directory-prefix rule: it matches the directory
+///   itself and everything under it (`documents` covers `documents/x.md` but
+///   NOT `documents_evil/x.md` — the `/` boundary is required);
+/// - any path containing a `..` component matches nothing, regardless of the
+///   rules — fail closed on traversal attempts;
+/// - empty rules match nothing (deny).
+///
+/// Pure and git-free so the unit tests can pin the exact contract.
+fn path_in_allowlist(rel: &str, rules: &[String]) -> bool {
+    // Fail closed on traversal: any `..` component disqualifies the path.
+    let normalized = rel.trim_start_matches("./");
+    if normalized.split('/').any(|c| c == "..") {
+        return false;
+    }
+    for rule in rules {
+        let rule = rule.trim();
+        if rule.is_empty() {
+            continue;
+        }
+        if let Some((prefix, suffix)) = rule.split_once("**") {
+            if normalized.starts_with(prefix) && normalized.ends_with(suffix) {
+                return true;
+            }
+        } else if normalized == rule
+            || (normalized.starts_with(rule) && normalized[rule.len()..].starts_with('/'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Validate one caller-supplied allowlist rule. Rules must be relative,
+/// non-empty (after trimming), and contain no `..` component — anything else
+/// is an error so the CALL is denied rather than silently narrowed or widened.
+fn validate_allowlist_rule(rule: &str) -> Result<(), String> {
+    let rule = rule.trim();
+    if rule.is_empty() {
+        return Err("rule is empty".to_string());
+    }
+    if rule.starts_with('/') {
+        return Err("rule must be relative (no leading '/')".to_string());
+    }
+    if rule.split('/').any(|c| c == "..") {
+        return Err("rule must not contain a '..' component".to_string());
+    }
+    Ok(())
+}
+
+/// Split `git status --porcelain` output into (in-scope, out-of-scope) paths
+/// under `rules`.
+///
+/// Line shapes handled: `XY PATH` and `XY ORIG -> DEST` (renames contribute
+/// BOTH paths, so a rename touching either side is checked on that side).
+/// Quoted paths (porcelain C-escapes names with special characters) have the
+/// surrounding quotes stripped; the inner name is matched as-is.
+///
+/// Pure and git-free: `checkpoint_edit_worktree` classifies real porcelain
+/// output through exactly this function, so the unit tests pin the behaviour
+/// that decides what gets committed.
+fn classify_porcelain(status: &str, rules: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut in_scope = Vec::new();
+    let mut out_scope = Vec::new();
+    for line in status.lines() {
+        if line.len() < 4 {
+            continue; // "XY P" is the shortest meaningful line
+        }
+        let path_part = &line[3..];
+        let paths: Vec<&str> = match path_part.split_once(" -> ") {
+            Some((orig, dest)) => vec![orig, dest],
+            None => vec![path_part],
+        };
+        for p in paths {
+            let p = p.trim();
+            let p = p.strip_prefix('"').unwrap_or(p);
+            let p = p.strip_suffix('"').unwrap_or(p);
+            if p.is_empty() {
+                continue;
+            }
+            if path_in_allowlist(p, rules) {
+                in_scope.push(p.to_string());
+            } else {
+                out_scope.push(p.to_string());
+            }
+        }
+    }
+    (in_scope, out_scope)
+}
 
 // ── Delegated-edit budget ceilings ───────────────────────────────────────────
 //
@@ -8223,6 +8331,95 @@ mod tests {
         let s = server();
         let r = s.call_edit_run(&json!({}));
         assert_eq!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn path_in_allowlist_matches_remainder_and_directory_prefix_rules() {
+        let rules: Vec<String> = DEFAULT_EDIT_PATH_ALLOWLIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(path_in_allowlist("documents/x.md", &rules));
+        assert!(path_in_allowlist("documents/a/b/deep.md", &rules));
+        assert!(path_in_allowlist(
+            "crates/rustynet-cli/src/vm_lab/mod.rs",
+            &rules
+        ));
+        assert!(path_in_allowlist("scripts/vm_lab/probe.sh", &rules));
+        assert!(path_in_allowlist("scripts/mcp/drive.py", &rules));
+        // The shipped CLI entry point is deliberately NOT in the default
+        // allowlist — that file was the 2026-09-07 incident.
+        assert!(!path_in_allowlist(
+            "crates/rustynet-cli/src/main.rs",
+            &rules
+        ));
+        assert!(!path_in_allowlist("crates/rustynetd/src/lib.rs", &rules));
+    }
+
+    #[test]
+    fn path_in_allowlist_requires_directory_boundary_not_bare_prefix() {
+        // `documents` must cover documents/x.md but never documents_evil/x.
+        let prefix_rules = vec!["documents".to_string()];
+        assert!(path_in_allowlist("documents", &prefix_rules));
+        assert!(path_in_allowlist("documents/x.md", &prefix_rules));
+        assert!(!path_in_allowlist("documents_evil/x", &prefix_rules));
+        assert!(!path_in_allowlist("documents_evil", &prefix_rules));
+
+        let glob_rules = vec!["documents/**".to_string()];
+        assert!(path_in_allowlist("documents/x.md", &glob_rules));
+        assert!(path_in_allowlist("documents/a/b.md", &glob_rules));
+        assert!(!path_in_allowlist("documents_evil/x", &glob_rules));
+        assert!(!path_in_allowlist("documents", &glob_rules));
+    }
+
+    #[test]
+    fn path_in_allowlist_fails_closed_on_traversal_and_empty_rules() {
+        let rules = vec!["documents/**".to_string()];
+        assert!(!path_in_allowlist("../x", &rules));
+        assert!(!path_in_allowlist("documents/../../etc/passwd", &rules));
+        assert!(!path_in_allowlist("documents/..", &rules));
+        // An empty allowlist denies EVERY path — never an implicit allow-all.
+        assert!(!path_in_allowlist("documents/x.md", &[]));
+    }
+
+    #[test]
+    fn allowlist_rule_validation_rejects_absolute_traversal_and_empty() {
+        assert!(validate_allowlist_rule("documents/**").is_ok());
+        assert!(validate_allowlist_rule("crates/rustynet-cli/src").is_ok());
+        assert!(validate_allowlist_rule("../x").is_err());
+        assert!(validate_allowlist_rule("documents/../../x").is_err());
+        assert!(validate_allowlist_rule("/etc/passwd").is_err());
+        assert!(validate_allowlist_rule("").is_err());
+        assert!(validate_allowlist_rule("   ").is_err());
+    }
+
+    #[test]
+    fn classify_porcelain_splits_in_scope_from_out_of_scope() {
+        let rules = vec!["documents/**".to_string(), "scripts/mcp/**".to_string()];
+        let status = [
+            " M documents/notes.md",
+            "?? crates/rustynet-cli/src/main.rs",
+            "M  scripts/mcp/drive.py",
+            " R old.txt -> documents/renamed.txt",
+        ]
+        .join("\n");
+        let (in_scope, out_scope) = classify_porcelain(&status, &rules);
+        assert!(in_scope.contains(&"documents/notes.md".to_string()));
+        assert!(in_scope.contains(&"scripts/mcp/drive.py".to_string()));
+        assert!(!out_scope.iter().any(|p| p.contains("documents")));
+        assert!(out_scope.contains(&"crates/rustynet-cli/src/main.rs".to_string()));
+        // A rename is checked on BOTH sides: the out-of-scope origin fails
+        // closed even when the destination is in scope.
+        assert!(out_scope.contains(&"old.txt".to_string()));
+        assert!(in_scope.contains(&"documents/renamed.txt".to_string()));
+    }
+
+    #[test]
+    fn classify_porcelain_denies_traversal_paths() {
+        let rules = vec!["documents/**".to_string()];
+        let (in_scope, out_scope) = classify_porcelain("?? ../escape.txt\n", &rules);
+        assert!(in_scope.is_empty());
+        assert!(out_scope.contains(&"../escape.txt".to_string()));
     }
 
     #[test]

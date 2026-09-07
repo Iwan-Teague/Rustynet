@@ -52,6 +52,11 @@ Live-lab: **no existing stage exercises `ai_edit_run`** (matrix stages are netwo
 
 ~1.5 days: matcher + validation (2h), hook author/install (3h), checkpoint split + states (4h), tests + smoke + docs (3h).
 
+## Implementation log
+
+- 2026-09-07 — starting implementation per this plan; worktree `edit-1788775612865-74537-0`, branch `ai-edit/edit-1788775612865-74537-0`. Step 1 next: allowlist constant + pure matchers + unit tests.
+- Step 1 done: `DEFAULT_EDIT_PATH_ALLOWLIST` + pure `path_in_allowlist`/`validate_allowlist_rule`/`classify_porcelain` in `ai_agent.rs` (after `EDIT_SESSION_START_GRACE_SECS`), 6 unit tests added; 117/117 pass, fmt clean. Deviation: none. Step 2 next.
+
 ## Open questions
 
 1. Does OpenCode's config schema support path-scoped `edit` permissions (e.g. `"edit": {"docs/**": "allow", "**": "ask"}`)? Unverifiable here (`https://opencode.ai/config.json` unreachable); layer 1 does not depend on it. If supported, add `**`-deny + allowlist-allow as belt-and-braces.
