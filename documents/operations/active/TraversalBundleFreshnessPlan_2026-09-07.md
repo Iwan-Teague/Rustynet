@@ -99,3 +99,32 @@ Applied F1–F4 from `RefreshSignedBundlesStageReview_2026-09-07.md` (authored o
 - Live proof (fwd9 relay-forwarding live-lab run, stage must pass with refresh preceding it): **NOT DONE** — owner-scheduled next relay fwd run; the stage is fail-closed (Skipped) unless `--enable-relay-forwarding-validation` is elected.
 - (b) PRODUCT: **NOT DONE** (explicitly out of scope for this worktree; trust-state owner per plan §(b)).
 - Next: merge this branch; owner-scheduled relay fwd live run proves `refresh_signed_bundles` + HP-3 on the `--node` ledger.
+
+## STATUS 2026-09-07 (end of session)
+
+**(a) LAB — landed, one live failure found and fixed, proof still owed.**
+The `refresh_signed_bundles` stage is on `main` with the structural
+`RefreshSignedBundles` dependency on `relay_forwards_frame_validation`, so a
+failed or skipped refresh cascades rather than letting a stale bundle validate
+the forwarding proof. Its FIRST live execution (run
+`live-lab-linux-relay-fwd10-20260907-180632`) failed for every node with
+`bundle not found: rn-dns-zone-<node>.dns_zone`: the stage passed the file
+extension as `dns_zone` where the minter writes `dns-zone`. Fixed by giving the
+prefix and extension of each bundle kind a single definition next to
+`distribute_bundle_kind` and pointing every caller at it, plus a test that
+fails if any distributing stage spells either half inline. **The stage has
+therefore still never completed live** — the next relay run is its first real
+exercise, and the forwarding proof depends on it.
+
+Also fixed in the same session, blocking the same track: `deploy_relay_service`
+left a previous run's `/etc/default/rustynet-relay` in place, so a guest whose
+address had changed bound a dead address (`EADDRNOTAVAIL`) and crash-looped,
+while the deploy stage still reported a pass. The deploy now clears the stale
+override before installing and fails closed with the journal tail when the unit
+is not active. `relay_validation` passed on the following run, having failed on
+the one before.
+
+**(b) PRODUCT — not started.** See the corrected grounding section above: the
+hardened daemon refuses remote state URLs, so this must be an authority re-mint
+delivered over the existing gossip transport, not a pull. Trust-state work,
+owner-implemented.
