@@ -60,6 +60,17 @@ def refuse_sandboxed_live_lab(tool: str) -> bool:
     return True
 
 
+def models_dev_reachable(timeout_s: float = 5.0) -> bool:
+    """True when https://models.dev answers within `timeout_s` (OpenCode fetches
+    its model registry from there at boot and hangs when it cannot)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("https://models.dev/api.json", timeout=timeout_s) as r:
+            return 200 <= r.status < 400
+    except Exception:
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", default="bin/rustynet-mcp-ai-agent",
@@ -72,6 +83,12 @@ def main() -> int:
     ap.add_argument("--poll-interval", type=int, default=20)
     ap.add_argument("--poll-timeout", type=int, default=2400, help="max seconds to wait for an async report")
     ap.add_argument("--no-poll", action="store_true", help="don't auto-poll AI-agent async jobs")
+    ap.add_argument("--call-timeout", type=int, default=600,
+                    help="seconds to wait for the tools/call reply (default 600). ai_edit_run "
+                    "creates a worktree and boots an OpenCode server before it answers; a "
+                    "driver that gives up early leaves a job stuck in 'launching' with a "
+                    "0-message session, so keep this generous and never wrap the launch in "
+                    "`timeout`.")
     a = ap.parse_args()
 
     binpath = a.bin if os.path.isabs(a.bin) else os.path.join(REPO, a.bin)
@@ -86,8 +103,17 @@ def main() -> int:
     if refuse_sandboxed_live_lab(a.tool):
         return 2
 
+    # OpenCode 1.18 blocks at boot on the models.dev registry fetch; when that
+    # host is unreachable every ai_edit_run hangs in 'launching' (2026-09-07).
+    # Probe it once and, if it does not answer, tell the spawned server (and
+    # the `opencode serve` it launches) to use the local models cache instead.
+    env = dict(os.environ)
+    if "OPENCODE_DISABLE_MODELS_FETCH" not in env and not models_dev_reachable():
+        print("models.dev unreachable: setting OPENCODE_DISABLE_MODELS_FETCH=1 for this call",
+              file=sys.stderr)
+        env["OPENCODE_DISABLE_MODELS_FETCH"] = "1"
     p = subprocess.Popen([binpath], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                         stderr=subprocess.DEVNULL, text=True, bufsize=1, env=env)
 
     def send(o):
         p.stdin.write(json.dumps(o) + "\n"); p.stdin.flush()
@@ -130,7 +156,7 @@ def main() -> int:
 
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
               "params": {"name": a.tool, "arguments": tool_args}})
-        m = read_id(2, 180)
+        m = read_id(2, a.call_timeout)
         text = result_text(m)
 
         job = JOB_RE.search(text or "") if text else None

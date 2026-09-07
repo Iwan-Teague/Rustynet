@@ -552,7 +552,9 @@ Authoritative gate definitions live in §7. This section is the fast-path map.
   blocking traffic between the two vmnet /24s (Apple backend vs QEMU backend).
   Runtime override, owner sudo, gone on reboot:
   `sudo pfctl -a com.apple/100.rustynet-lab -f scripts/vm_lab/cross_vmnet_pf_override.pf`
-  (details: `documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md` §9).
+  (details: `documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md` §9);
+  persistent form = the launchd keeper `scripts/launchd/com.rustynet.cross-vmnet-pf.plist`
+  + `scripts/vm_lab/ensure_cross_vmnet_pf_override.sh` (owner installs once).
 - Never hand-edit `vm_lab_inventory.json` — refresh with
   `--update-inventory-live-ips`.
 - **Lab SSH passwords live OUTSIDE the inventory.** This repository is public, so
@@ -1008,6 +1010,23 @@ before you review it) — the edit agent is prompted to COMMIT to its branch so 
 diff is durable, but clean up merged/abandoned worktrees yourself with
 `git worktree remove state/edit-worktrees/<job_id>` (the branch ref survives the
 worktree removal for later inspection).
+
+**Launch hangs (2026-09-07).** OpenCode 1.18 blocks at boot fetching the
+models.dev registry; when that host is unreachable, `ai_edit_run` sits in
+`launching` with a 0-message session and the driver reports
+`{"error": "no/!malformed response"}`. `scripts/mcp/drive_ai_agent.py` now probes
+models.dev and sets `OPENCODE_DISABLE_MODELS_FETCH=1` for the call when it does
+not answer (the server then uses `~/.cache/opencode/models.json`), and waits up
+to `--call-timeout` seconds (default 600) for the launch reply. Never wrap the
+launch in `timeout` — a killed driver leaves the half-created job behind.
+Recycle a stuck launch by killing its `opencode serve`, removing the empty
+worktree and branch, and parking its record under
+`state/deepseek-mcp-jobs/stuck/`. Every delegated-edit branch gets an
+independent review before it reaches `main` (another GLM agent is acceptable;
+the flash tier is fine) — on 2026-09-07 two such reviews found three fail-open
+defects the branch's own review had marked fixed, plus a shipped-CLI edit
+smuggled in by a timed-out auto-checkpoint; the merge recipe is in
+`documents/operations/active/OwnerDecisions_2026-09-07.md`.
 
 ### 12.7 Sub-model delegation, budget ceilings, and house style
 

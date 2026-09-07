@@ -403,3 +403,53 @@ Adversarial review: `MacosDnsBackupRebootSurvivalPlanAdversarialReview_2026-09-0
 The review's guard-vs-state-dir ordering finding (§B.4) is folded as §3 invariant 6 and resolves former §5 open question 1; its fail-closed tests list is folded verbatim as the authoritative §4 step 3 list.
 
 Status: implemented on branch 2026-09-02. §4 step 5 choice recorded per the amendment: the derived backup path (`rustynetd.state.networksetup-dns.failclosed.bak`) and the already-missed QH-40 marker were added to the existing `cleanup_runtime_state` rm batch in `macos_traffic.rs` (literal list, no new shell shape) and to `Bootstrap-RustyNetMacos.sh`'s state-file rm line; `assert_node_clean` was left probe-free. The §4 step 4 live-proof (macOS reboot-with-protection stage) remains open as the plan states — no matrix row claims it.
+
+## Addendum 2026-09-07 — post-reboot gap found live (owner decision 1: fix now in rustynetd)
+
+<!-- Drafted 2026-09-07 by a glm-5.3-flash grounded read-only agent from the live evidence of run state/live-lab-macos-reboot-20260907-050612 (validate_macos_reboot_recovery FAIL: startup_recovery_line=absent, shutdown_residue_marker=present, Ethernet not loopback-pinned); reviewed and placed by the managing Claude session. Status: PLAN — daemon change is owner/Claude-implemented, then GLM-flash-reviewed, then proven by reboot attempt 4. -->
+
+
+## Goal
+
+After `shutdown -r now`, the daemon must come back with the fail-closed loopback DNS pin **re-applied and verified** on every enabled service, and retire the QH-40 shutdown-residue marker only on that verified recovery — failing closed (loud startup refusal) if it cannot.
+
+## Existing state
+
+Run `state/edit-worktrees/edit-1788757368303-22407-0/state/live-lab-macos-reboot-20260907-050612` (`failure_digest.md`, stage `validate_macos_reboot_recovery`): pre-reboot evidence **passed** (durable backup present, mode 0600, all services pinned — `vm_lab/mod.rs:15075-15085`), so the pin and the durable backup existed pre-reboot. Post-reboot output, verbatim: `startup_recovery_line=absent`, `shutdown_residue_marker=present`, `zsh:1: no matches found: /usr/local/var/log/rustynet/*.log`, `service Ethernet is not loopback-pinned: There aren't any DNS Servers set on Ethernet.`
+
+Code facts:
+
+- Startup DNS recovery is **restore-only and residue-gated**: `decide_startup_recovery` (`macos_dns_sc_protect.rs:538`) returns `NoAction` when `!residue_evidence`; `run_startup_dns_recovery_with` (`:880-890`) only restores from backup, never re-applies. It runs pre-preflight (`daemon.rs:11917-11932`).
+- Nothing re-applies the pin at boot. `apply_dns_protection` (macOS impl `phase10.rs:5240`) is reached only through the policy/generation apply path, which the daemon does not self-trigger at startup.
+- The QH-40 marker is **never auto-retired**: startup only logs `shutdown_rollback_residue_detected` (`daemon.rs:11898-11904`); removal is operator-ack-only (`shutdown_residue.rs`, `acknowledge_marker`: "never automatically on daemon start").
+- The rollback gate (`phase10.rs:5490-5499` → `restore_networksetup_dns_from_backup` `:4652`) restores SC DNS and **retires the backup on success** (`:4685`).
+
+## Root cause
+
+During `shutdown -r now`, launchd SIGTERMs the daemon and the rollback gate runs: DNS restore succeeds (SC DNS → baseline Empty, backup retired), a later rollback step fails → `RollbackFailed` → marker recorded (`daemon.rs:11837`). Post-reboot: no loopback residue ⇒ `NoAction` ⇒ no recovery line, no re-apply; marker stays (by QH-40 design). The stage's premise — daemon restores *protection* — is unimplemented: only *un-stranding* is implemented. (Inference from the three observations; alternative: rollback failed at the DNS step leaving loopback, and the boot guard restored from backup — same end state, same fix. Not distinguishable without the daemon log/marker contents, which the stage does not capture.) The stage's `startup_recovery_line` check is additionally vacuous here: the zsh `nomatch` glob failure forces the `absent` branch (`mod.rs:15175-15178`).
+
+## Design
+
+1. `crates/rustynetd/src/shutdown_residue.rs` — amend `acknowledge_marker`'s doc: now also callable from the daemon's *verified* startup-recovery path (evidence superseded by proof of clean state, not silently erased).
+2. `crates/rustynetd/src/macos_dns_sc_protect.rs` — add:
+   - `pub const STARTUP_REAPPLY_LOG_LINE: &str = "rustynetd startup: re-applied networksetup loopback DNS pin after failed shutdown rollback (QH-40 verified recovery)";`
+   - `pub(crate) fn run_startup_reapply_after_residue_marker(backup_path, observation_injectable...) -> Result<(), String>`: (a) `scan` marker — `Present` **or** `Unreadable` counts (an undecodable marker is not a clean host, `shutdown_residue.rs` `ResidueScan`); `Clean` ⇒ `Ok(())` no-op; (b) capture current SC DNS as a **fresh durable backup before any mutation** (write-before-mutate invariant, `phase10.rs:4657-4664` ordering); (c) pin every enabled service to `127.0.0.1` via the existing helper-allowlisted `-setdnsservers <svc> <list>` argv (`validate_networksetup_args`; one hardened path — no new argv shapes); (d) post-observation: zero unpinned services; (e) on success: retire marker + `log::info!("{STARTUP_REAPPLY_LOG_LINE}")`; any failure ⇒ `Err` with an operator-actionable message (reuse the `startup_recovery_manual_restore_message` style), marker and fresh backup retained.
+3. `crates/rustynetd/src/daemon.rs` — in the `#[cfg(target_os = "macos")]` startup block (`:11917-11932`), after the existing guard: scan + decide (fs-only). Execute the re-apply **after the loopback resolver is bound** — `MacosCommandSystem::apply_dns_protection` already refuses to mutate until the resolver answers (A6 probe, `phase10.rs:5241-5244`); construct it as at `daemon.rs:11725`. Map failure to a hard `DaemonError` refusal (same channel as `:11931`). Insertion point: first generation-apply point in the run loop, pre-serve.
+
+## Security analysis
+
+Fail-closed preserved: failure to re-apply refuses startup rather than continuing unprotected; marker retirement happens only after a verified post-observation, replacing evidence with proof. New trust boundary: none — re-apply reuses the privileged-helper allowlist; the marker is a daemon-owned 0600 sibling, so its presence as "protection was active" evidence is no weaker than the existing backup-trust model. Risk: re-pinning when the failed rollback was for protection the operator has since revoked — mitigated because a clean teardown (policy change goes through rollback) removes the marker; only a *failed* teardown leaves it, and the conservative reading is "keep enforcing until a clean teardown says otherwise". A forged marker requires daemon-uid write access to the state dir — pre-existing trust position, unchanged.
+
+## Tests
+
+- Unit (`macos_dns_sc_protect.rs` tests, injected observation like `run_startup_dns_recovery_with` at `:1512`): marker present + unpinned ⇒ pin argvs to every enabled service, fresh backup written before mutation, marker retired + log line on verified success; any pin failure ⇒ `Err`, marker retained; `Unreadable` ⇒ same path; `Clean` ⇒ no argvs. Keep the M4 selector-scoped test (`:1027`) green.
+- Live: `validate_macos_reboot_recovery` proves it — fix the post script (`mod.rs:15172-15188`) to dispatch via `sh -c` (kills the zsh glob false-negative) and accept either recovery line (`grep -hF -e '<restore line>' -e '<reapply line>'`); existing gates stay: marker-absent (`:15208`), `LOOPBACK_PIN_CHECK` (`:15043-15053`), typed `macos-dns-failclosed-check` (`:15218`), boottime change (`:15200`).
+
+## Effort
+
+Daemon ~1.5 days (fn + wiring + unit tests), stage ~0.5 day, one live reboot run to evidence.
+
+## Open questions
+
+- Should re-apply also cover the Linux twin (`/run` backup volatility, plan §1.7) in the same change?
+- Confirm marker content post-reboot (add marker dump to stage evidence) to pin scenario A vs B in the run record.

@@ -30,7 +30,7 @@
 //!   IP-list mechanism; the residual is documented and owned by an
 //!   SNI-inspection follow-up, not left open by choice.
 //!
-//! No I/O, no backend/WireGuard types: the Linux nft renderer consumes the
+//! No I/O, no tunnel-backend types: the Linux nft renderer consumes the
 //! returned spec (`crates/rustynetd/src/linux_tandem_dns_redirect.rs`).
 //! macOS pf and Windows WFP dataplanes are flagged follow-ups (design
 //! §9.2/§9.3); this module is the single source of the decision.

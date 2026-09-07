@@ -327,7 +327,7 @@ fn profile_id_list_wire(profiles: &[String]) -> String {
 /// Signed blind-relay leg token v2 (design §7.3; selection §1.3).
 ///
 /// One leg of a two-leg circuit authorization. The token deliberately carries
-/// **no** endpoint identity: no node id, no peer node id, no WireGuard key, no
+/// **no** endpoint identity: no node id, no peer node id, no tunnel public key, no
 /// membership index — that is the disclosure the `blind_relay` role exists to
 /// remove. `audience_relay_id` is the zero-padded 16-byte relay identifier
 /// (the v1 relay id shape); every other binary field is fixed-width CSPRNG

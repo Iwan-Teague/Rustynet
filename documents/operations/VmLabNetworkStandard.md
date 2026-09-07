@@ -82,6 +82,17 @@ sudo pfctl -a com.apple/100.rustynet-lab -sr                                    
 sudo pfctl -a com.apple/100.rustynet-lab -F all                                         # undo (not right after load)
 ```
 
+Persistent form (owner decision 4, 2026-09-07): install the keeper once and it
+re-asserts the anchor at boot and every 30 s, loading nothing unless both lab
+bridges exist (install/uninstall lines are in the plist header):
+
+```sh
+sudo install -m 0755 scripts/vm_lab/ensure_cross_vmnet_pf_override.sh /usr/local/lib/rustynet/
+sudo install -m 0644 scripts/vm_lab/cross_vmnet_pf_override.pf /usr/local/lib/rustynet/
+sudo install -m 0644 scripts/launchd/com.rustynet.cross-vmnet-pf.plist /Library/LaunchDaemons/
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.cross-vmnet-pf.plist
+```
+
 It works because `/etc/pf.conf` evaluates `anchor "com.apple/*"` before the
 internet-sharing anchor and sorts wildcard sub-anchors, so `100.rustynet-lab`'s
 `pass quick` rules match first. The result is L3-routed, not same-L2: broadcast
