@@ -114,7 +114,8 @@ const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.r
 /// - `com.rustynet/blind_exit` — the blind-exit filter anchor
 ///   (`macos_blind_exit::DEFAULT_MACOS_BLIND_EXIT_PF_ANCHOR`).
 ///
-/// Anchors are ENUMERATED from `pfctl -s Anchors` and matched on the substring
+/// Anchors are ENUMERATED from `pfctl -s Anchors` plus the nested `com.apple`
+/// and `com.rustynet` listings (the top-level dump hides sub-anchors) and matched on the substring
 /// `rustynet` (covers every family, including an unanticipated future
 /// generation), then flushed with `pfctl -a <anchor> -F all` — never a fixed
 /// name, so an unexpected anchor cannot be left loaded. `-F all` only flushes
@@ -130,9 +131,9 @@ const MACOS_LAUNCHD_STOP_COMMAND: &str = "sudo -n launchctl bootout system/com.r
 /// (iCloud Private Relay / corporate VPNs also use `utun`). Best-effort and
 /// idempotent at every privileged step; runs AFTER the daemon is stopped so
 /// nothing re-creates the anchor or device mid-delete.
-const MACOS_RESET_COMMAND: &str = "rn_anchors=$(sudo -n pfctl -s Anchors 2>/dev/null \
-         | sed 's/^[[:space:]]*//' | grep -i rustynet || true); \
-     for a in $rn_anchors; do sudo -n pfctl -a \"$a\" -F all 2>/dev/null || true; done; \
+const MACOS_RESET_COMMAND: &str = "for a in $( { sudo -n pfctl -s Anchors; sudo -n pfctl -a com.apple -s Anchors; sudo -n pfctl -a com.rustynet -s Anchors; } 2>/dev/null \
+         | sed 's/^[[:space:]]*//' | grep -i rustynet | sort -u ); do \
+         sudo -n pfctl -a \"$a\" -F all 2>/dev/null || true; done; \
      for dev in $(ifconfig -l 2>/dev/null | tr ' ' '\\n' | grep '^utun'); do \
          if ifconfig \"$dev\" 2>/dev/null | grep -Eq 'inet 100\\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\\.'; then \
              sudo -n ifconfig \"$dev\" destroy 2>/dev/null || true; \
@@ -157,8 +158,8 @@ const MACOS_RESET_COMMAND: &str = "rn_anchors=$(sudo -n pfctl -s Anchors 2>/dev/
 /// fail dirty. Each sub-probe tolerates the relevant tool being absent and is
 /// read-only (mutates nothing), so it is safe to run repeatedly.
 const MACOS_NODE_CLEAN_PROBE: &str = "rn_pf=''; \
-     for a in $(sudo -n pfctl -s Anchors 2>/dev/null \
-         | sed 's/^[[:space:]]*//' | grep -i rustynet || true); do \
+     for a in $( { sudo -n pfctl -s Anchors; sudo -n pfctl -a com.apple -s Anchors; sudo -n pfctl -a com.rustynet -s Anchors; } 2>/dev/null \
+         | sed 's/^[[:space:]]*//' | grep -i rustynet | sort -u ); do \
          if sudo -n pfctl -a \"$a\" -sr 2>/dev/null | grep -q . \
              || sudo -n pfctl -a \"$a\" -sn 2>/dev/null | grep -q .; then \
              rn_pf=\"${rn_pf}${a},\"; \
@@ -525,8 +526,9 @@ pub fn macos_diagnostic_collectors() -> Vec<(&'static str, &'static str)> {
         ("pf_anchors", "sudo -n pfctl -s Anchors"),
         (
             "pf_anchor_rules",
-            "for a in $(sudo -n pfctl -s Anchors 2>/dev/null \
-             | sed 's/^[[:space:]]*//' | grep -i rustynet || true); do \
+            "for a in $( { sudo -n pfctl -s Anchors; sudo -n pfctl -a com.apple -s Anchors; \
+             sudo -n pfctl -a com.rustynet -s Anchors; } 2>/dev/null \
+             | sed 's/^[[:space:]]*//' | grep -i rustynet | sort -u ); do \
              echo \"== anchor $a\"; sudo -n pfctl -a \"$a\" -s rules 2>/dev/null; done",
         ),
         // Literal rather than format!(&const): a unit test pins this to
@@ -563,28 +565,33 @@ fn build_diag_archive_script(remote_tar: &str) -> String {
     );
     for (name, cmd) in macos_diagnostic_collectors() {
         // Per-collector watchdog (macOS ships no `timeout`): background the
-        // collector, kill it after 20s, and wait. Diagnostics run precisely
+        // collector, kill it after 8s, and wait. Diagnostics run precisely
         // because the node is broken — e.g. `rustynet status` against a
         // wedged daemon blocks on its socket — and without this a single
         // hung collector burns the whole script's MEDIUM_TIMEOUT and loses
-        // every other collector's output.
+        // every other collector's output. 8 s keeps the worst case (every
+        // collector hung) inside MEDIUM_TIMEOUT, which 20 s did not.
         script.push_str(&format!(
             "; ( {{ {cmd}; }} & p=$!; \
-               ( sleep 20; kill $p ) >/dev/null 2>&1 & wait $p ) \
+               ( sleep 8; kill $p ) >/dev/null 2>&1 & wait $p ) \
               > \"$staging/{name}.txt\" 2>&1"
         ));
     }
+    // The archive path list is kept in the positional parameters ("$@"), not
+    // in an unquoted string variable: the guest runs this under zsh, which
+    // does not word-split an unquoted parameter expansion, so `$files` would
+    // reach tar as ONE path and the archive would always come back empty.
     script.push_str(&format!(
-        "; files=\"$staging\"; \
-         [ -d '{MACOS_STATE_ROOT}' ] && files=\"$files {MACOS_STATE_ROOT}\"; \
-         [ -d /usr/local/var/log/rustynet ] && files=\"$files /usr/local/var/log/rustynet\"; \
+        "; set -- \"$staging\"; \
+         [ -d '{MACOS_STATE_ROOT}' ] && set -- \"$@\" '{MACOS_STATE_ROOT}'; \
+         [ -d /usr/local/var/log/rustynet ] && set -- \"$@\" /usr/local/var/log/rustynet; \
          tar -czf '{remote_tar}' \
          --exclude='{MACOS_STATE_ROOT}/keys' \
          --exclude='{MACOS_KEYS_DIR}' \
          --exclude='*.priv' \
          --exclude='*.key' \
          --exclude='*.pem' \
-         $files; \
+         \"$@\"; \
          members=$(tar -tzf '{remote_tar}' 2>/dev/null | grep -vc '/$'); \
          [ \"$members\" -gt 0 ] || exit 42"
     ));
@@ -698,6 +705,12 @@ pub fn is_rustynet_pf_anchor(name: &str) -> bool {
     }
 }
 
+/// True when the top-level `pfctl -s Anchors` listing names the `com.rustynet`
+/// parent, i.e. when its sub-anchors must be enumerated separately.
+pub fn needs_nested_rustynet_listing(top_level: &[String]) -> bool {
+    top_level.iter().any(|name| name == "com.rustynet")
+}
+
 /// Parse `pfctl -s Anchors` output into a list of anchor names: one per line,
 /// surrounding whitespace trimmed, empty lines dropped.
 pub fn parse_pfctl_anchor_list(output: &str) -> Vec<String> {
@@ -757,11 +770,38 @@ pub fn flush_rustynet_pf_anchors_argv(
     ];
     let list_cmd = ssh::RemoteCommand::from_args("macos list pf anchors", &list_args)?;
     let output = ssh::run_remote(conn, list_cmd.as_str(), SHORT_TIMEOUT)?;
+    let mut names = parse_pfctl_anchor_list(&output);
+    // `pfctl -s Anchors` prints TOP-LEVEL anchors only (`com.apple`,
+    // `com.rustynet`); the strict family lives one level down
+    // (`com.rustynet/blind_exit`, `com.rustynet/nat`), so enumerate the
+    // parent's sub-anchors whenever the parent is present. A listed parent
+    // whose sub-anchor listing cannot be read is UNVERIFIABLE — propagate the
+    // error rather than report "nothing to flush" (mirrors rustynetd's
+    // `read_pf_dns_block_floor`).
+    if needs_nested_rustynet_listing(&names) {
+        let nested_args = vec![
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("pfctl")?,
+            ValidatedArg::cli_token("-a")?,
+            ValidatedArg::cli_token("com.rustynet")?,
+            ValidatedArg::cli_token("-s")?,
+            ValidatedArg::cli_token("Anchors")?,
+        ];
+        let nested_cmd = ssh::RemoteCommand::from_args(
+            "macos list nested com.rustynet pf anchors",
+            &nested_args,
+        )?;
+        let nested = ssh::run_remote(conn, nested_cmd.as_str(), SHORT_TIMEOUT)?;
+        names.extend(parse_pfctl_anchor_list(&nested));
+    }
+    names.sort();
+    names.dedup();
 
     let mut found = 0usize;
     let mut flushed = 0usize;
     let mut failures = Vec::new();
-    for anchor in parse_pfctl_anchor_list(&output) {
+    for anchor in names {
         if !is_rustynet_pf_anchor(&anchor) {
             continue;
         }
@@ -814,11 +854,12 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
 
     // Second, argv-only pass over the strict com.rustynet/* family with
     // Rust-side name validation: unlike the shell pass above (whose errors
-    // are swallowed by `|| true`), a `sudo -n` denial or pfctl failure here
-    // is printed, so a surviving anchor is visible instead of silent.
-    if let Err(e) = flush_rustynet_pf_anchors_argv(conn) {
-        eprintln!("macos cleanup: strict com.rustynet/* pf anchor flush failed: {e}");
-    }
+    // are swallowed by `|| true`), a `sudo -n` denial, an unreadable
+    // sub-anchor listing or a surviving anchor here FAILS the cleanup. A
+    // guest still carrying blind_exit's `block drop out quick all` is not
+    // clean, and this is the path the engine's cleanup stages actually run
+    // (`uninstall_daemon` has no stage caller), so the error must propagate.
+    flush_rustynet_pf_anchors_argv(conn)?;
 
     // Remove runtime state but keep WG keys and the installation. This now
     // includes the seed trust evidence (`rustynetd.trust`) and its anti-replay
@@ -1248,10 +1289,17 @@ mod tests {
         assert!(cmd.contains("ifconfig") && cmd.contains("destroy"));
         // Best-effort at every privileged step.
         assert!(cmd.contains("|| true"));
-        // Captures the anchor list into a variable first, then iterates with a
-        // `for` loop — same anti-stdin-drain shape as the Linux resets.
-        assert!(cmd.contains("rn_anchors=$("));
-        assert!(cmd.contains("for a in $rn_anchors"));
+        // Iterates a `for` loop over a command substitution — same
+        // anti-stdin-drain shape as the Linux resets — and NOT over an
+        // unquoted variable, which zsh (the guest login shell) does not
+        // word-split. The substitution unions the nested `com.apple` and
+        // `com.rustynet` listings because `pfctl -s Anchors` hides sub-anchors
+        // (QH-73 merge-time correction, live-proven on macos-utm-1 2026-09-07).
+        assert!(cmd.contains("for a in $( {"));
+        assert!(cmd.contains("pfctl -a com.rustynet -s Anchors"));
+        assert!(cmd.contains("pfctl -a com.apple -s Anchors"));
+        assert!(cmd.contains("sort -u"));
+        assert!(!cmd.contains("$rn_anchors"));
         assert!(
             !cmd.contains("while read"),
             "reset must not pipe into `while read` (inner sudo drains the pipe)"
@@ -1738,8 +1786,17 @@ mod tests {
         // Per-collector watchdog: a hung collector (e.g. `rustynet status`
         // against a wedged daemon) must not burn the whole script timeout.
         assert!(
-            script.contains("sleep 20; kill $p"),
-            "each collector must be wrapped in a kill-after-20s watchdog"
+            script.contains("sleep 8; kill $p"),
+            "each collector must be wrapped in a kill-after-8s watchdog"
+        );
+        // zsh does not word-split `$files`; the path list must travel in "$@".
+        assert!(
+            script.contains("set -- \"$staging\"") && script.contains("\"$@\"; "),
+            "archive paths must be passed as positional parameters"
+        );
+        assert!(
+            !script.contains("$files"),
+            "unquoted $files expansion must stay gone"
         );
     }
 
@@ -1780,6 +1837,39 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// QH-73 merge-time correction: `pfctl -s Anchors` hides sub-anchors, so
+    /// every enumeration must also read the nested `com.apple` and
+    /// `com.rustynet` listings, and the strict flush must know when to.
+    #[test]
+    fn pf_anchor_enumerations_read_nested_listings() {
+        for (what, snippet) in [
+            ("reset", MACOS_RESET_COMMAND),
+            ("clean probe", MACOS_NODE_CLEAN_PROBE),
+        ] {
+            assert!(
+                snippet.contains("pfctl -a com.rustynet -s Anchors")
+                    && snippet.contains("pfctl -a com.apple -s Anchors"),
+                "{what} must enumerate nested anchors"
+            );
+            assert!(
+                !snippet.contains("$rn_anchors"),
+                "{what}: zsh does not split $var"
+            );
+        }
+        let rules = macos_diagnostic_collectors()
+            .into_iter()
+            .find(|(name, _)| *name == "pf_anchor_rules")
+            .map(|(_, cmd)| cmd)
+            .expect("pf_anchor_rules collector");
+        assert!(rules.contains("pfctl -a com.rustynet -s Anchors"));
+        assert!(needs_nested_rustynet_listing(&[
+            "com.apple".to_owned(),
+            "com.rustynet".to_owned()
+        ]));
+        assert!(!needs_nested_rustynet_listing(&["com.apple".to_owned()]));
+        assert!(!needs_nested_rustynet_listing(&[]));
+    }
+
     #[test]
     fn rustynet_pf_anchor_validator_accepts_strict_names() {
         assert!(is_rustynet_pf_anchor("com.rustynet/nat"));

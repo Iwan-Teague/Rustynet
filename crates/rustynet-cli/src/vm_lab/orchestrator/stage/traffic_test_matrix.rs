@@ -272,7 +272,7 @@ fn capture_failure_state(ctx: &OrchestrationContext) -> Vec<String> {
         out.push_str("# traffic_test_matrix failure capture\n");
         out.push_str(&format!("node: {alias}\n"));
         match &mesh_ip {
-            Ok(ip) => out.push_str(&format!("mesh_ip: {ip}\n")),
+            Ok(ip) => out.push_str(&format!("mesh_ip: {}\n", single_line(ip))),
             Err(e) => out.push_str(&format!(
                 "capture error: collect_mesh_ip: {}\n",
                 single_line(&e.to_string())
