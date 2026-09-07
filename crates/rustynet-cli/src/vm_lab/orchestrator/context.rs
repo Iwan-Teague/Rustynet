@@ -269,6 +269,13 @@ pub struct OrchestrationContext {
     /// skip — the fail-closed direction (a resumed context reloads `false`;
     /// the flag is re-derived from the selector on every run).
     pub macos_reboot_recovery_elected: bool,
+    /// True only when the run elected `--enable-relay-forwarding-validation`
+    /// AND the stage is really in this run's plan (tightened in native.rs
+    /// after the plan is built). `false` grades `refresh_signed_bundles` as
+    /// a reported skip — the fail-closed direction (a resumed context
+    /// reloads `false`; the flag is re-derived from the selector on every
+    /// run).
+    pub relay_forwarding_validation_elected: bool,
     /// Absolute path of the resolved inventory this run started from,
     /// threaded so runtime stages can self-serve inventory lookups
     /// (e.g. the macOS anchor validator set re-reading per-node lab
@@ -307,6 +314,7 @@ impl OrchestrationContext {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
             inventory_path: None,
         }
     }
@@ -448,6 +456,12 @@ impl OrchestrationContext {
             // from the `--role-switch-platform macos` selector.
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            // Same run-local rule for the relay-forwarding election: never
+            // persisted, so a resumed context reloads `false` and the
+            // refresh_signed_bundles stage grades as a reported skip until
+            // the run is re-derived from the
+            // `--enable-relay-forwarding-validation` selector.
+            relay_forwarding_validation_elected: false,
             // Same run-local rule: the absolute inventory path is never
             // persisted; macOS anchor stages fail closed on `None`.
             inventory_path: None,
