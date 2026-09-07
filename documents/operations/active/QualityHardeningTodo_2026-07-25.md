@@ -6469,3 +6469,29 @@ history. Either the `--node` engine should default to the mission-canonical
 userspace-shared backend on Linux, or the run-matrix row should record each
 node's backend so a mixed topology is at least visible in evidence. Not
 decided here; the flag makes the choice explicit per run.
+
+### QH-74 — the vm-lab orchestrator resolves the stage-triage ledger and the run-matrix/stage-results append paths relative to its BUILD worktree instead of the runtime repo root, so evidence rows land in an unrelated worktree
+**Severity: high (evidence integrity — session-6 rows for runs executed from `edit-1788757368303-22407-0` were appended to the CSVs of `edit-1788746785362-28885-0`, the worktree the pinned binary happened to be compiled in; the launch gate also reads that wrong ledger, so a stub remedy recorded in the runtime worktree does not cure a gate refusal). Confidence: VERIFIED 2026-09-07 — `git -C …28885-0 status` showed the three ledger files modified after runs launched from a different worktree, and rebuilding the same binary from the runtime worktree made the same runs append locally (session-7 attempt 3, `livelab-1788758343-06dfb93915d5`).**
+
+Mechanism: `workspace_root_path()` in
+`crates/rustynet-cli/src/live_lab_run_matrix.rs:950` is
+`PathBuf::from(env!("CARGO_MANIFEST_DIR"))…` — a compile-time-embedded
+absolute path to the worktree the binary was BUILT in. It has 42 call sites,
+including the run-matrix append (`live_lab_run_matrix.rs:477`), the
+stage-results CSV, and (via `TRIAGE_LEDGER_RELATIVE_PATH`,
+`live_lab_stage_triage.rs:72`) the stage-triage ledger that
+`enforce_launch_gate` reads for unremedied stubs. A binary in a shared
+`CARGO_TARGET_DIR` (`target-pinned`) therefore always writes and reads the
+ledgers of whatever worktree most recently built it, not the one it runs
+against — and the runtime worktree's committed evidence silently misses rows
+while a stale worktree accumulates them.
+
+**Fix direction (proposed, not implemented — not a one-liner: 42 call sites,
+no existing test pins `workspace_root_path`, and the provenance gate
+deliberately compares paths, so the change needs a design decision):** resolve
+the repo root at RUNTIME — walk up from the process cwd (or better, from the
+`--inventory` path) to the enclosing repo root (marker: workspace `Cargo.toml`
+or the `documents/operations/` tree), falling back to the compile-time path
+only when no marker is found; pin it with a test that runs the binary from a
+copy of the tree and asserts the ledger append landed beside that copy.
+**Disposition: OPEN, filed by manager session 7 (2026-09-07).**
