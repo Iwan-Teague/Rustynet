@@ -976,14 +976,29 @@ edits (verified — `edit: deny` blocks new files too).
 **The four tools:**
 - `ai_edit_run` — launch a job. `task` (required), `mode` (`restricted` default /
   `full`), `model` (OpenCode `provider/model`, default `deepseek/deepseek-v4-pro`),
-  `base_ref` (default `HEAD`). Async: returns a `job_id`, poll `ai_edit_result`.
+  `base_ref` (default `HEAD`), and optional `path_allowlist` (string array of
+  repo-relative rules; `**` matches any remainder, a rule without `**` is a
+  directory prefix). Every job is mechanically scoped to a path allowlist —
+  the default is `crates/rustynet-cli/src/vm_lab/**`, `documents/**`,
+  `scripts/vm_lab/**`, `scripts/mcp/**` — written to the worktree as
+  `allowlist.txt` and enforced by a per-worktree pre-commit hook plus the
+  end-of-job checkpoint: out-of-allowlist edits are NEVER committed to the
+  branch (the hook defends against accident, not against the agent — the
+  checkpoint is the boundary). Each rule is validated (relative, non-empty,
+  no `..`, not `**` alone, no newline); any invalid rule or an empty array
+  DENIES the call; omit the parameter for the default.
+  Async: returns a `job_id`, poll `ai_edit_result`.
   The worktree checks out `HEAD` — so the edit agent sees **committed** config,
   including these agent definitions. Uncommitted changes to `.opencode/` are NOT
   visible to a freshly launched job; commit config changes before relying on them.
 - `ai_edit_result` — poll. States: `launching` (worktree+serve booting) →
   `running` → (restricted only) `awaiting_approval` (returns the proposed unified
   diff; answer with approve/deny) → `done` (returns the branch's full diff to
-  review + merge) / `failed` (setup error) / `timed_out`.
+  review + merge) / `failed` (setup error) / `timed_out` /
+  `scope_violation` (the job edited paths outside its allowlist — those edits
+  were never committed, stay uncommitted in the worktree, and the offending
+  paths + diff are recorded as `scope_violations`/`out_of_scope_diff` in the
+  job record; a scope violation is NEVER reported as `done`).
 - `ai_edit_approve` — approve the one pending edit; the agent applies it and
   continues (the *next* edit pauses again).
 - `ai_edit_deny` — reject it; `reason` is fed back to the agent as context and it
