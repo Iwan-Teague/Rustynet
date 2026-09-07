@@ -46,7 +46,16 @@ Unit: monotonic-watermark rejection test; pre-expiry refresh with stub fetch app
 
 - 2026-09-07 (a) LAB review fixes: applying F1–F4 of `RefreshSignedBundlesStageReview_2026-09-07.md` (review authored on sibling worktree branch `ai-edit/edit-1788779180857-40090-0`, commit `c4003886`; imported verbatim to this branch first). F1 makes refresh-before-HP-3 structural (dependency edge + test); F2 re-wraps the TTL hard-error literal via `concat!`; F3 updates the stale Windows bootstrap comment; F4 drops the unreachable `Skipped` arm with a design note.
 
-## STATUS 2026-09-07 10:58 UTC
-- (a) LAB: **DONE** in worktree (branch `ai-edit/edit-1788775747880-75665-0`, NOT merged). Stage `refresh_signed_bundles` implemented + registered at all gated sites; `TRAVERSAL_TTL_SECS` silent 120 default closed into a hard error; all unit gates green.
+## Review fixes applied
+Applied F1–F4 from `RefreshSignedBundlesStageReview_2026-09-07.md` (authored on sibling worktree branch `ai-edit/edit-1788779180857-40090-0`, commit `c4003886`; imported verbatim to this branch in `99e85c1c` so the fixes' referent is on-branch):
+- **F1 (should-fix)** — `168069dd`: `relay_forwards_frame_validation` now lists `StageId::RefreshSignedBundles` in `dependencies()` (`crates/rustynet-cli/src/vm_lab/orchestrator/stage/relay_forwards_frame_validation.rs`), making refresh-before-HP-3 structural — a skipped/failed refresh cascades to HP-3 exactly like any other dependency. Dependency test in the same file updated; no plan-order test assumed the old list (plan order is catalog-driven, the adjacency pin still holds).
+- **F2 (nit)** — `168069dd`: the `TRAVERSAL_TTL_SECS` hard-error literal in `ops_e2e.rs` re-wrapped with `concat!` — single-spaced, still greppable for `TRAVERSAL_TTL_SECS`; negative test unchanged and green.
+- **F3 (nit)** — `168069dd`: `scripts/bootstrap/windows/Install-RustyNetWindowsService.ps1` comment now says the TTL is configured explicitly and the minter hard-errors on a missing value, replacing the stale "hard cap enforced by ops_e2e" wording.
+- **F4 (nit)** — `168069dd`: the unreachable `Skipped` branch after the DnsZone leg in `refresh_signed_bundles.rs` removed and replaced with a note documenting why (`distribute_bundle_kind` only returns `Passed`/`Failed`).
+- Gates re-run clean: `cargo fmt --all -- --check`; `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings`; `cargo test -p rustynet-cli --all-targets --all-features` exit 0 across 93 test binaries (stage/plan filters green first).
+
+## STATUS 2026-09-07 11:35 UTC
+- (a) LAB: **DONE** in worktree (branch `ai-edit/edit-1788780856953-61353-0`): stage work carried from `ai-edit/edit-1788775747880-75665-0` commits (87f23584, 1e29a9e5, e31333f5, 4cf4e260, 4707a663) + review fixes F1–F4 applied (99e85c1c, 168069dd). All unit gates green.
 - Live proof (fwd9 relay-forwarding live-lab run, stage must pass with refresh preceding it): **NOT DONE** — owner-scheduled next relay fwd run; the stage is fail-closed (Skipped) unless `--enable-relay-forwarding-validation` is elected.
 - (b) PRODUCT: **NOT DONE** (explicitly out of scope for this worktree; trust-state owner per plan §(b)).
+- Next: merge this branch; owner-scheduled relay fwd live run proves `refresh_signed_bundles` + HP-3 on the `--node` ledger.
