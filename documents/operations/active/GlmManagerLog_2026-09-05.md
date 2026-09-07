@@ -845,3 +845,21 @@ Confirmed: single status script used for BOTH peers in wait loop (mod.rs:14166);
 
 - fwd8d refused at enforce_launch_gate (new stub livelab-1788746201-d5864aae2d55::prepare_source_archive from fwd8c abort) — remedy recorded, committed 9b654b13.
 - fwd8e LAUNCHED 02:00Z RD=state/live-lab-linux-relay-fwd8e-20260907-020008, same topology/flags. bootstrap_hosts running 02:00:43Z. This is the operative relay_forwards_frame_validation verification run for the 6228d1d6 fix. Polling every ~2 min.
+
+--- 2026-09-07T02:07:54Z MANAGER A RESUMED (new worktree edit-1788746785362-28885-0, branch head 38470603). STEP 0: poll fwd8e (pid 27297, RD=state/live-lab-linux-relay-fwd8e-20260907-020008 in OLD worktree edit-1788742681528-17771-0). At resume: etime 07:33, bootstrap_hosts running since 02:00:43Z. No vm_lab edits while in flight. Polling every sleep 120.
+
+--- 2026-09-07T02:5xZ STEP 0 RESULT: fwd8e FINAL VERDICT (attempt 3/3) — relay_forwards_frame_validation FAIL rc=1
+Run: RD=state/live-lab-linux-relay-fwd8e-20260907-020008 (old worktree edit-1788742681528-17771-0), orchestrator pid 27297 exited ~02:27Z. Everything else PASSED: setup, membership, baseline, deploy_relay_service, relay_validation, traffic_test_matrix, role_switch_matrix, exit_handoff, active_exit, exit_dns_failclosed, exit_nat_lifecycle, exit_demotion_residue, live_managed_dns, live_network_flap, live_reboot_recovery, live_secrets_not_in_logs, live_key_custody, live_hello_limiter_flood; macos/two_hop skipped as designed; cross_network_nat_classification fail rc1 (pre-existing, out of scope).
+
+Root cause (stage log): NOT the old HP3/EACCES status issue — 6228d1d6 fix WORKED (status script returned full daemon payload). Stage timed out after 90s waiting for both client peers (debian-headless-2, fedora-utm-1) to report a relay-routed session. Both clients stuck:
+  state=FailClosed restricted_safe_mode=true restriction_mode=Permanent
+  bootstrap_error=reconcile failure threshold exceeded (97/101, 93/97 failures)
+  last_reconcile_error=traversal authority rejected reconcile apply: traversal authority requires valid signed traversal state: traversal bundle is stale
+  dns_zone_error=dns_zone_bundle_is_stale
+  traversal_stale_rejections=138/133; traversal_preexpiry_refresh_events=21/20
+  path_mode=fail_closed; relay_session_state=disabled
+Interpretation: the mesh was healthy for all earlier stages in the SAME run/topology/epoch (traffic_test_matrix, role_switch, exit_handoff all passed). relay_forwards_frame_validation runs LATE — immediately after live_reboot_recovery_validation (which reboots nodes and PASSED). Post-reboot the anchor is not re-minting fresh signed traversal/dns bundles; cached bundles age past the freshness window; clients attempt pre-expiry refresh (21/20 events) but rejections climb; clients enter Permanent fail-closed and never rejoin. Root cause lives in the trust-state/bundle-refresh domain (anchor re-mint after reboot / refresh-on-stale path) = PROPOSE-ONLY for me (trust-state/validator constraint). NO further relay attempts this session (3/3 used).
+
+PROPOSED DIFF (not applied — trust-state domain): anchor-side, after a node reboot or on receiving a reconcile rejected with stale-bundle, re-mint + gossip a fresh signed traversal bundle and dns_zone bundle (equivalent of the pre-expiry refresh path but triggered by staleness rejection feedback, not just timer). Files to investigate by owner: anchor bundle mint loop + traversal authority verify path (rustynet-control traversal authority; freshness window constant).
+
+NEXT: transfer ledger rows (old worktree commit), ff-merge into this worktree, record stage-patch stub remedies via ops live-lab-record-stage-patch, commit, then STEP 2 (macOS role-transition cell).
