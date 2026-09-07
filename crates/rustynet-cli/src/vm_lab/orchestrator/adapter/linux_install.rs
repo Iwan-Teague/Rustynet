@@ -401,7 +401,30 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
         short_timeout,
     )?;
 
-    // 4. Install + enable + start rustynet-relay.service via the shared helper.
+    // 4. Drop any /etc/default/rustynet-relay left by a PREVIOUS run before
+    //    installing the unit. The unit sources it with
+    //    `EnvironmentFile=-/etc/default/rustynet-relay`, so a stale file's
+    //    `RUSTYNET_RELAY_BIND` overrides every `Environment=` default in the
+    //    freshly installed unit. When a guest's LAN address changes between
+    //    runs (routine here: vmnet reassigns addresses on start order), the
+    //    relay then binds an address the host no longer holds, dies with
+    //    EADDRNOTAVAIL, and crash-loops — observed live in run
+    //    `live-lab-linux-relay-fwd9-20260907-172608`, where a file written
+    //    2026-09-06 pinned `192.168.64.10:4500` on a guest that had since
+    //    moved to 192.168.65.5. That deadlocks the relay track: the HP-3
+    //    provisioner which rewrites this file with the live address runs
+    //    inside `relay_forwards_frame_validation`, which is gated behind the
+    //    `relay_validation` that the stale bind breaks. Removing it restores
+    //    the unit's own loopback-only default (the documented posture: an
+    //    operator must opt in before the relay serves off-host peers), which
+    //    the HP-3 provisioner still widens when it runs.
+    ssh::run_remote(
+        conn,
+        "sudo -n rm -f /etc/default/rustynet-relay",
+        short_timeout,
+    )?;
+
+    // 5. Install + enable + start rustynet-relay.service via the shared helper.
     //    It reads scripts/systemd/rustynet-relay.service relative to cwd, so run
     //    from the source root the bootstrap extracted to ($HOME/Rustynet). The
     //    source dir is passed only inside a single-quoted env assignment; the
@@ -423,8 +446,39 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
         "sudo -n env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {LINUX_RUSTYNET_PATH} ops install-systemd-relay'"
     );
     ssh::run_remote(conn, &install_cmd, Duration::from_secs(120))?;
+
+    // 6. Fail closed on a unit that installed but did not come up. The helper
+    //    exits 0 once systemd accepts the unit, so without this check a relay
+    //    that crash-loops (bad bind, missing key, restart-limit hit) is
+    //    reported as a clean deploy and the failure only surfaces one stage
+    //    later as an unexplained `relay_validation` failure. Report the unit
+    //    state with the journal tail so the cause is in this stage's evidence.
+    let state = ssh::run_remote(conn, RELAY_UNIT_ACTIVE_QUERY, short_timeout)?;
+    if state.trim() != "active" {
+        let journal = ssh::run_remote(conn, RELAY_UNIT_JOURNAL_QUERY, short_timeout)
+            .unwrap_or_else(|err| format!("<journal unavailable: {err}>"));
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "rustynet-relay.service is {} after install (expected active); journal tail: {}",
+                state.trim(),
+                journal.trim()
+            ),
+        });
+    }
     Ok(())
 }
+
+/// Unit-state query for the post-install relay health gate. `is-active` exits
+/// non-zero for an inactive unit, so the `|| echo` keeps the transport error
+/// distinct from a legitimately dead unit: a transport failure is still `Err`,
+/// while a dead unit returns its state as data for the caller to report.
+const RELAY_UNIT_ACTIVE_QUERY: &str =
+    "sudo -n systemctl is-active rustynet-relay.service 2>/dev/null || true";
+
+/// Journal tail for the post-install relay health gate. Read only when the
+/// unit is not active, so a healthy deploy pays no extra round trip.
+const RELAY_UNIT_JOURNAL_QUERY: &str =
+    "sudo -n journalctl -u rustynet-relay.service -n 12 --no-pager 2>&1 | tail -12";
 
 /// Start the rustynetd systemd service.
 ///
@@ -579,6 +633,87 @@ fn write_temp_file(
     // valid build with the wrong identity. `tempfile` creates a collision-free
     // mode-0600 file; persist it only until the caller finishes SCP.
     super::write_secure_temp_file(prefix, suffix, content)
+}
+
+#[cfg(test)]
+mod relay_deploy_hygiene_tests {
+    //! Pins the two properties that made run
+    //! `live-lab-linux-relay-fwd9-20260907-172608` unrecoverable: a stale
+    //! `/etc/default/rustynet-relay` surviving the deploy, and a deploy that
+    //! reports success while the unit crash-loops.
+    use super::{RELAY_UNIT_ACTIVE_QUERY, RELAY_UNIT_JOURNAL_QUERY};
+
+    /// The deploy MUST remove the previous run's environment override before
+    /// installing the unit. Without this the unit's
+    /// `EnvironmentFile=-/etc/default/rustynet-relay` re-applies a bind
+    /// address the guest may no longer hold (EADDRNOTAVAIL crash-loop).
+    #[test]
+    fn deploy_removes_the_stale_relay_environment_override() {
+        let source = include_str!("linux_install.rs");
+        let start = source
+            .find("pub fn deploy_relay_service(")
+            .expect("relay deploy fn must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("sudo -n rm -f /etc/default/rustynet-relay"),
+            "deploy must drop the previous run's env override"
+        );
+        let removal = body
+            .find("rm -f /etc/default/rustynet-relay")
+            .expect("removal present");
+        let install = body
+            .find("ops install-systemd-relay")
+            .expect("install present");
+        assert!(
+            removal < install,
+            "the stale override must be removed BEFORE the unit is installed"
+        );
+    }
+
+    /// The deploy MUST verify the unit actually came up. A helper that exits 0
+    /// once systemd accepts the unit says nothing about whether it stayed up.
+    #[test]
+    fn deploy_fails_closed_when_the_unit_is_not_active() {
+        let source = include_str!("linux_install.rs");
+        let start = source
+            .find("pub fn deploy_relay_service(")
+            .expect("relay deploy fn must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("RELAY_UNIT_ACTIVE_QUERY"),
+            "deploy must query the unit state after install"
+        );
+        assert!(
+            body.contains("!= \"active\""),
+            "deploy must compare against the exact healthy state token"
+        );
+        assert!(
+            body.contains("AdapterError::Protocol"),
+            "a non-active unit must fail the deploy, not warn"
+        );
+    }
+
+    /// The state query must not let a dead unit read as a transport error, and
+    /// must not swallow one either.
+    #[test]
+    fn unit_state_query_separates_a_dead_unit_from_a_transport_failure() {
+        assert!(RELAY_UNIT_ACTIVE_QUERY.contains("systemctl is-active rustynet-relay.service"));
+        assert!(
+            RELAY_UNIT_ACTIVE_QUERY.contains("|| true"),
+            "is-active exits non-zero for a dead unit; that must return data, not an Err"
+        );
+        assert!(RELAY_UNIT_JOURNAL_QUERY.contains("journalctl -u rustynet-relay.service"));
+    }
 }
 
 #[cfg(test)]
