@@ -6657,4 +6657,45 @@ The test writes a fake `ps` script into a temp dir and probes it through `local_
 
 `force_fail_closed` (phase10.rs) applies only `block_all_egress` (`apply_pf_rules(true)`: `pass quick on lo0 all`, management allowances, `block drop out quick all`); it never re-installs the networksetup pins or the scoped resolver, and `maybe_assert_dns_posture` is gated off while restricted. The persisted session snapshot (`restore_state`) still carries `selected_exit_node`, i.e. the last full-tunnel intent. Design question for the owner: on entering FailClosed with a persisted full-tunnel/exit intent and `protected_dns` enabled, should the daemon re-apply the M1 pin sequence (backup with the residue guard, `-setdnsservers 127.0.0.1` per service, resolv.conf, scoped resolver) WITHOUT touching the strict pf ruleset, so fail-closed is never a posture downgrade relative to the last persisted intent? Constraints: A6's resolver-live probe must gate it (never pin at a dead resolver); idempotent per reconcile tick; failure escalates through the existing ladder. Until decided, the reboot cell proves the pins only after fresh bundles let the daemon re-apply its generation (follow-up (a) in `MacosDnsBackupRebootSurvivalPlan_2026-09-02.md`).
 
-**Disposition: OPEN (owner design decision), filed 2026-09-07.**
+**Disposition: DECIDED 2026-09-08 (managing session, acting on the owner's standing
+instruction to make the call); IMPLEMENTATION NOT STARTED.**
+
+**The rule.** On entering fail-closed, a node adopts the MORE RESTRICTIVE of the posture its
+live state computes and the posture it last persisted as its intent. Never the less
+restrictive. Concretely on macOS: `macos_dns_posture` recomputes `ScopedResolverOnly` after
+`force_fail_closed` clears `current_exit_mode` and `current_serve_exit_node`, so a node whose
+last committed intent was `FullyProtected` must keep `FullyProtected`.
+
+**Why this direction is safe and the opposite would not be.** DNS pins redirect the machine's
+own resolution to a loopback listener. They grant nothing, reach nothing off the host, and can
+only restrict. Acting on a stale intent is therefore conservative in this direction, and would
+not be in the other — which is why this is a floor, not a general licence to trust the last
+persisted snapshot. A deliberate signed demotion is unaffected: it commits a new generation and
+persists the weaker intent, so the floor it raises is the weaker one. Only an unplanned drop to
+fail-closed, which persists nothing, keeps the older stricter floor.
+
+**Why it matters.** Today the only thing between the downgrade and a real leak is that pf's
+fail-closed ruleset happens to block DNS egress. Two independent mechanisms have to stay in
+agreement forever and nothing tests that they do; a future pf regression turns a silent posture
+downgrade into an actual leak.
+
+**Shape of the fix.** A pure decision function beside `macos_dns_posture` in `phase10.rs`:
+
+```
+fn dns_posture_restrictiveness(p: DnsPosture) -> u8   // Untouched 0, ScopedResolverOnly 1, FullyProtected 2
+pub(crate) fn fail_closed_dns_posture_floor(current: DnsPosture, persisted_intent: Option<DnsPosture>) -> DnsPosture
+```
+
+returning the more restrictive of the two, with `None` a no-op. Tests: a protective intent
+raises a weaker current posture; a weaker intent NEVER lowers the current one; absent intent is
+a no-op for every variant; the relation is idempotent.
+
+**The wiring is the hard half, and is why this is not yet implemented.** The two existing
+`macos_dns_posture` call sites (`daemon.rs` bootstrap and reconcile) are APPLY sites, and a
+fail-closed node performs no apply at all — so wrapping them achieves nothing for the reboot
+case this item was filed for. Closing QH-78 requires a path that installs the protective DNS
+posture while fail-closed and without a committed generation, plus persisting the last
+protective intent across a reboot. That is new behaviour in the fail-closed path and must be
+implemented and reviewed deliberately, not bolted on. A pure function landed without that
+wiring would be dead code, which repo law forbids in a completed deliverable, so it was
+deliberately not landed on its own.
