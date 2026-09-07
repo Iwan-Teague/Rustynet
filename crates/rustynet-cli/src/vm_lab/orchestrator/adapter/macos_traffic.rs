@@ -337,6 +337,20 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     Ok(trimmed)
 }
 
+/// The live `rustynet status` query, shared by [`query_live_identity`] and
+/// [`collect_daemon_status`] so both walk the same proven path: the macOS
+/// daemon socket is root-owned under `/private/var/run/rustynet`, so the
+/// query pins it by env behind `sudo -n`.
+///
+/// The trailing `echo now_unix=$(date +%s)` (review F2, 2026-09-07) reports
+/// the GUEST clock alongside the status line, so handshake freshness is
+/// judged on the clock that wrote `path_latest_live_handshake_unix` instead
+/// of the orchestrator host clock. [`query_live_identity`]'s field scan only
+/// looks for `node_id=`, so the extra token is inert there.
+pub(crate) const DAEMON_STATUS_COMMAND: &str = "sudo -n env \
+     RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
+     /usr/local/bin/rustynet status; echo now_unix=$(date +%s)";
+
 /// Gather a LIVE node-identity for the §4.7 challenge: query the running daemon
 /// over its control socket and tag the result `LiveDaemonSocket`. Unlike
 /// [`collect_node_id`], this deliberately does NOT prefer the launchd plist —
@@ -344,12 +358,7 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 /// it queries `rustynet status` only. At validator time the daemon is up, so a
 /// single short-timeout query is correct.
 pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, AdapterError> {
-    let status = ssh::run_remote(
-        conn,
-        "sudo -n env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
-         /usr/local/bin/rustynet status",
-        SHORT_TIMEOUT,
-    )?;
+    let status = ssh::run_remote(conn, DAEMON_STATUS_COMMAND, SHORT_TIMEOUT)?;
     match ssh::parse_status_node_id(&status) {
         Some(node_id) => Ok(IdentityEvidence::live(node_id)),
         None => Err(AdapterError::Protocol {
@@ -359,6 +368,18 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
             ),
         }),
     }
+}
+
+/// Fetch the daemon's verbatim `rustynet status` text — the QH-70
+/// live-handshake-evidence surface. Same proven command as
+/// [`query_live_identity`] (socket env pinned, `sudo -n`), full text returned
+/// instead of just the node id. A transport failure is `Err` (fail closed),
+/// never an empty string.
+pub fn collect_daemon_status(conn: &NodeConnection) -> Result<String, AdapterError> {
+    // Local binding + as_str(): a compile-time constant command with zero
+    // interpolation, passed through the established seam-lowered call shape.
+    let command = DAEMON_STATUS_COMMAND.to_owned();
+    ssh::run_remote(conn, command.as_str(), SHORT_TIMEOUT)
 }
 
 /// Collect the daemon-reported STUN server-reflexive candidates via
@@ -1933,6 +1954,34 @@ mod tests {
         assert!(
             !body.contains("if let Err(e) =\n        crate::vm_lab::orchestrator::adapter::macos_traffic::flush_rustynet_pf_anchors_argv"),
             "uninstall_daemon must not swallow the anchor-flush error"
+        );
+    }
+
+    /// QH-70 dispatch mutation guard: the shared status command MUST pin the
+    /// daemon socket by env and MUST invoke `rustynet status`. Dropping either
+    /// breaks this test — the discrimination the addendum asks the
+    /// MockShellHost argv test to provide, applied to the command string the
+    /// adapter actually runs.
+    #[test]
+    fn daemon_status_command_pins_socket_env_and_status_verb() {
+        let cmd = super::DAEMON_STATUS_COMMAND;
+        assert!(
+            cmd.contains("RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock"),
+            "status query must pin the daemon socket: {cmd}"
+        );
+        assert!(
+            cmd.contains("/usr/local/bin/rustynet status"),
+            "status query must run the CLI's status verb: {cmd}"
+        );
+        assert!(
+            cmd.contains("sudo -n env"),
+            "status query must keep the proven sudo -n env form: {cmd}"
+        );
+        // Review F2: the query must also report the guest clock so handshake
+        // freshness is judged on the node's own clock, not the host's.
+        assert!(
+            cmd.contains("echo now_unix=$(date +%s)"),
+            "status query must emit the guest clock (now_unix) for freshness: {cmd}"
         );
     }
 }
