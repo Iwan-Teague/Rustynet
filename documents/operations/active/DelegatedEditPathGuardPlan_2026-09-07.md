@@ -56,6 +56,7 @@ Live-lab: **no existing stage exercises `ai_edit_run`** (matrix stages are netwo
 
 - 2026-09-07 — starting implementation per this plan; worktree `edit-1788775612865-74537-0`, branch `ai-edit/edit-1788775612865-74537-0`. Step 1 next: allowlist constant + pure matchers + unit tests.
 - Step 1 done: `DEFAULT_EDIT_PATH_ALLOWLIST` + pure `path_in_allowlist`/`validate_allowlist_rule`/`classify_porcelain` in `ai_agent.rs` (after `EDIT_SESSION_START_GRACE_SECS`), 6 unit tests added; 117/117 pass, fmt clean. Deviation: none. Step 2 next.
+- Step 2 done: optional `path_allowlist: string[]` on `ai_edit_run` (validated: relative, non-empty, no `..`; invalid rule or empty array ⇒ call denied; default = the constant), stored as `path_allowlist` in the job record at launch; schema + launch-output line added; test `edit_run_denies_calls_with_invalid_path_allowlist_rules` (6 deny cases). 118/118 pass. Deviation: rules are stored at launch; they are threaded to `create_edit_worktree`/`checkpoint_edit_worktree` in steps 3–4. Step 3 next.
 
 ## Open questions
 
