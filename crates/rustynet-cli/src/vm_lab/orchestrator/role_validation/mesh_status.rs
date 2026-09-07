@@ -754,4 +754,35 @@ mod tests {
         evaluate_live_handshake_status("n1", &full, 2, NOW)
             .unwrap_or_else(|err| panic!("a full live mesh must pass; got: {err}"));
     }
+
+    /// Review F3 (nit): `relay_session_state` / `relay_session_established_peers`
+    /// are ECHO-ONLY. A status line carrying neither relay field must still
+    /// pass (this stage runs before relay deploy), and a failure on such a
+    /// line must echo `relay_session_state=absent` as evidence — a regression
+    /// that starts gating on either field breaks this test.
+    #[test]
+    fn relay_fields_are_echo_only_and_optional() {
+        let stripped: String = LIVE_STATUS
+            .split_whitespace()
+            .filter(|t| {
+                !t.starts_with("relay_session_state=")
+                    && !t.starts_with("relay_session_established_peers=")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        evaluate_live_handshake_status("n1", &stripped, 1, NOW)
+            .unwrap_or_else(|err| panic!("missing relay fields must stay a pass; got: {err}"));
+        let err = evaluate_live_handshake_status(
+            "n1",
+            &status_line_with(&stripped, "path_live_peer_count", "0"),
+            1,
+            NOW,
+        )
+        .expect_err("the failure must still be raised");
+        assert!(
+            err.contains("relay_session_state=absent")
+                && err.contains("relay_session_established_peers=absent"),
+            "absent relay fields must be echoed as evidence, got: {err}"
+        );
+    }
 }
