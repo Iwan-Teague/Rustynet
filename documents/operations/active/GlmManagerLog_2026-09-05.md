@@ -960,3 +960,13 @@ NEXT: STEP 3 — macOS reboot-recovery cell (`--reboot-platform macos`, fresh
 RD=state/live-lab-macos-reboot-<ts>, same base flags/topology; verdict from
 `$RD/logs/validate_macos_reboot_recovery.log`; ensure mac guest back on SSH
 after; max 2 attempts; lab tooling fixes only).
+
+## 2026-09-07 04:11Z — STEP 3 (macOS reboot-recovery) attempt 1: FAIL + root cause + fix
+
+- Run: PID 996, RD state/live-lab-macos-reboot-20260907-034405, 03:44→04:05Z. setup/membership/baseline all pass; **validate_macos_reboot_recovery FAIL rc=1**; ledger row appended (330→331, finalizer records failed runs — selectors recorded correctly, `"reboot_platform": "macos"` in manifest, finalizer fixes held).
+- Stage log (verbatim): `macos-utm-1: pre-reboot evidence capture on macos-utm-1 failed: UTM transport failed for macos-utm-1 (local UTM guest exec is not yet implemented for macOS targets); SSH fallback failed: remote command exited with status 1: backup mode is 600, expected 0600`.
+- Root cause (lab tooling): mod.rs:15167 pre-reboot script compared `[ "$MODE" = "0600" ]`, but BSD `stat -f %Lp` prints minimal digits ("600" for octal 0600) — string compare can never pass. Backup file itself is correctly mode 0600 (daemon-created). First live run of this stage with a real backup present.
+- Fix applied (this commit): POSIX case accepting both renderings — `case "$MODE" in 600|0600) ;; *) echo ... exit 1 ;; esac` — exact-mode fail-closed preserved, pure sh, no arithmetic.
+- Verified: scoped `cargo check -p rustynet-cli --all-targets --all-features --features vm-lab` exit 0; `cargo test -p rustynet-cli --features vm-lab --lib -- reboot` 17/17 pass; cargo fmt clean; no test pins the old string (rg 'backup mode' → only :15167). Pinned binary rebuilt (contains fix on top of 6d3fea6c).
+- Ledger trio in this commit = STEP 3 attempt-1 FAIL row + auto-recorded triage stub.
+- NEXT: relaunch attempt 2 (max 2), same flags, fresh RD. Session note: an earlier in-session summary claimed this commit+relaunch already happened (RD …050912, PID 2816) — filesystem disproved it (no commit, no RD, no log append); this section + commit + the real relaunch are the authoritative record.
