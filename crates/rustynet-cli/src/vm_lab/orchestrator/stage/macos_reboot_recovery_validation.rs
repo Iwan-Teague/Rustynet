@@ -11,8 +11,10 @@
 //! and the post-reboot pin probe, the stage redistributes FRESH signed
 //! traversal + dns_zone bundles to the rebooted node — through the SAME
 //! issue + verifier-key barrier + install path the setup stages use, scoped
-//! to the rebooted node — and polls `rustynet status` until the node has
-//! LEFT FailClosed and reports a programmed generation. This is load-bearing
+//! to the rebooted node — and polls `rustynet status` until the daemon
+//! reports a HEALTHY TERMINAL state (allowlisted exactly:
+//! `DataplaneApplied` or `ExitActive`, review F1) with a programmed
+//! generation. This is load-bearing
 //! because the M1 startup guard restores the pre-protection DNS baseline by
 //! design: the loopback pins only return when the daemon re-applies its
 //! generation, which needs valid (non-expired) signed state. Only then does
@@ -45,10 +47,16 @@ use std::time::Duration;
 const RECOVERY_POLL_MAX_ATTEMPTS: u32 = 18;
 /// Interval between `rustynet status` polls of the recovery window.
 const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(10);
-/// The daemon's fail-closed state token (`state=FailClosed` in `rustynet
-/// status` output). A freshly rebooted node starts here until the daemon
-/// validates signed state and programs its generation.
-const FAILCLOSED_STATE: &str = "FailClosed";
+/// Healthy terminal `DataplaneState` tokens the recovery criterion accepts
+/// (review F1). The daemon's `state=` field is the Debug render of
+/// `DataplaneState` (`crates/rustynetd/src/phase10.rs`), so the criterion is
+/// an ALLOWLIST of exactly those two known-healthy terminal states: any
+/// other token — `FailClosed`, a renamed/drifted variant family such as
+/// `FailClosedDegraded`, or a MISSING `state` field entirely — counts as
+/// NOT recovered. A source-pin test below keeps these names tied to the
+/// defining enum so a daemon-side rename fails this crate's tests.
+const RECOVERED_STATE_DATAPLANE_APPLIED: &str = "DataplaneApplied";
+const RECOVERED_STATE_EXIT_ACTIVE: &str = "ExitActive";
 
 pub struct MacosRebootRecoveryValidationStage {
     max_parallel_node_workers: usize,
@@ -177,15 +185,19 @@ fn redistribute_fresh_bundles_and_await_generation(
     max_parallel_node_workers: usize,
     shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
-    const KINDS: [(&str, &str, &str); 2] = [
-        ("traversal", "rn-traversal", "traversal"),
-        ("dns_zone", "rn-dns-zone", "dns-zone"),
+    // Review F3: the kind travels IN the tuple — a string-label round trip
+    // with a catch-all arm would silently issue a second dns_zone generation
+    // on a typo or a future third kind instead of failing to compile.
+    const KINDS: [(BundleKind, &str, &str, &str); 2] = [
+        (
+            BundleKind::Traversal,
+            "traversal",
+            "rn-traversal",
+            "traversal",
+        ),
+        (BundleKind::DnsZone, "dns_zone", "rn-dns-zone", "dns-zone"),
     ];
-    for (label, file_prefix, file_ext) in KINDS {
-        let kind = match label {
-            "traversal" => BundleKind::Traversal,
-            _ => BundleKind::DnsZone,
-        };
+    for (kind, label, file_prefix, file_ext) in KINDS {
         match distribute_bundle_kind_scoped(
             ctx,
             kind,
@@ -228,7 +240,7 @@ fn redistribute_fresh_bundles_and_await_generation(
         // Keep the proof line in the stage's own log output: the recovery
         // window closed on this exact status observation.
         eprintln!(
-            "macos_reboot_recovery: {alias} (node {node_id}) re-applied a programmed              generation after fresh bundle redistribution; status: {status_line}"
+            "macos_reboot_recovery: {alias} (node {node_id}) re-applied a programmed generation after fresh bundle redistribution; status: {status_line}"
         );
     })
 }
@@ -236,7 +248,9 @@ fn redistribute_fresh_bundles_and_await_generation(
 /// One parsed `rustynet status` observation during the recovery window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoveryStatusObservation {
-    /// The daemon's `state=` token (e.g. `FailClosed`).
+    /// The daemon's `state=` token — the Debug render of `DataplaneState`
+    /// (e.g. `FailClosed` while stuck). A MISSING field stays `None` and the
+    /// recovery criterion treats it as not recovered (review F1).
     pub state: Option<String>,
     /// `path_programmed_peer_count=` — peers the daemon has PROGRAMMED from
     /// its applied generation. A missing or unparseable value counts as 0
@@ -259,18 +273,23 @@ pub(crate) fn parse_recovery_status(status_text: &str) -> RecoveryStatusObservat
     }
 }
 
-/// The recovery criterion: the node has LEFT FailClosed AND reports a
+/// The recovery criterion (review F1): the daemon reports one of the
+/// HEALTHY TERMINAL states — allowlisted exactly, never negated — AND a
 /// programmed generation (at least one programmed peer). Both halves are
-/// required — a daemon that is merely live but still fail-closed, or one
-/// that left FailClosed without applying the fresh bundles, has not
-/// recovered.
+/// required — a daemon still fail-closed (or in any unknown/drifted state,
+/// or reporting no state at all), or one that left FailClosed without
+/// applying the fresh bundles, has not recovered.
 pub(crate) fn node_has_recovered_generation(observation: &RecoveryStatusObservation) -> bool {
-    observation.state.as_deref() != Some(FAILCLOSED_STATE) && observation.programmed_peer_count >= 1
+    matches!(
+        observation.state.as_deref(),
+        Some(RECOVERED_STATE_DATAPLANE_APPLIED) | Some(RECOVERED_STATE_EXIT_ACTIVE)
+    ) && observation.programmed_peer_count >= 1
 }
 
-/// Poll `rustynet status` through the adapter's remote shell until the node
-/// has left FailClosed with a programmed generation, bounded to
-/// `max_attempts` polls with `between_attempts` invoked between them.
+/// Poll `rustynet status` through the adapter's remote shell until the
+/// daemon reports a healthy terminal state with a programmed generation,
+/// bounded to `max_attempts` polls with `between_attempts` invoked between
+/// them.
 ///
 /// FAIL CLOSED: on exhaustion the error carries the LAST observation verbatim
 /// (the exact status line, or the transport error) — never a silent skip. A
@@ -321,8 +340,10 @@ pub(crate) fn poll_generation_recovery(
         }
     }
     Err(format!(
-        "{alias} (node {node_id}) did not leave {FAILCLOSED_STATE} with a programmed generation \
-         within the post-reboot recovery window ({max_attempts} attempts); last status: {last_observation}"
+        "{alias} (node {node_id}) did not reach a healthy terminal state \
+         ({RECOVERED_STATE_DATAPLANE_APPLIED}|{RECOVERED_STATE_EXIT_ACTIVE}) with a programmed \
+         generation within the post-reboot recovery window ({max_attempts} attempts); \
+         last status: {last_observation}"
     ))
 }
 
@@ -707,7 +728,7 @@ mod tests {
     }
 
     fn recovered_status_line() -> String {
-        "state=Applied path_programmed_peer_count=3 path_live_peer_count=3 node_role=client"
+        "state=DataplaneApplied path_programmed_peer_count=3 path_live_peer_count=3 node_role=client"
             .to_owned()
     }
 
@@ -727,13 +748,13 @@ mod tests {
         assert_eq!(obs.programmed_peer_count, 0);
         assert_eq!(obs.live_peer_count.as_deref(), Some("0"));
         let obs = parse_recovery_status(&recovered_status_line());
-        assert_eq!(obs.state.as_deref(), Some("Applied"));
+        assert_eq!(obs.state.as_deref(), Some("DataplaneApplied"));
         assert_eq!(obs.programmed_peer_count, 3);
         assert_eq!(obs.live_peer_count.as_deref(), Some("3"));
     }
 
     #[test]
-    fn recovery_criterion_requires_not_failclosed_and_programmed_generation() {
+    fn recovery_criterion_requires_allowlisted_state_and_programmed_generation() {
         // Both halves required: still-fail-closed never recovers…
         assert!(!node_has_recovered_generation(&parse_recovery_status(
             &failclosed_status_line()
@@ -741,11 +762,85 @@ mod tests {
         // …and a missing programmed count (fail-closed parse to 0) never
         // reads as recovered, even off FailClosed.
         assert!(!node_has_recovered_generation(&parse_recovery_status(
-            "state=Applied path_live_peer_count=2"
+            "state=DataplaneApplied path_live_peer_count=2"
         )));
         assert!(node_has_recovered_generation(&parse_recovery_status(
             &recovered_status_line()
         )));
+    }
+
+    #[test]
+    fn recovery_criterion_is_an_allowlist_of_healthy_terminal_states() {
+        // Review F1: the criterion must ALLOWLIST the healthy terminal
+        // states instead of negating one token. A MISSING state field…
+        assert!(!node_has_recovered_generation(&parse_recovery_status(
+            "path_programmed_peer_count=3"
+        )));
+        // …a drifted/renamed fail-closed family token, and every other
+        // non-allowlisted state count as NOT recovered…
+        assert!(!node_has_recovered_generation(&parse_recovery_status(
+            "state=FailClosedDegraded path_programmed_peer_count=3"
+        )));
+        assert!(!node_has_recovered_generation(&parse_recovery_status(
+            "state=Init path_programmed_peer_count=3"
+        )));
+        assert!(!node_has_recovered_generation(&parse_recovery_status(
+            "state=ControlTrusted path_programmed_peer_count=3"
+        )));
+        // …while EACH allowlisted state with a programmed generation
+        // recovers…
+        for token in [
+            RECOVERED_STATE_DATAPLANE_APPLIED,
+            RECOVERED_STATE_EXIT_ACTIVE,
+        ] {
+            assert!(
+                node_has_recovered_generation(&parse_recovery_status(&format!(
+                    "state={token} path_programmed_peer_count=1"
+                ))),
+                "state={token} with a programmed generation must read as recovered"
+            );
+        }
+        // …but an allowlisted state with ZERO programmed peers does not.
+        assert!(!node_has_recovered_generation(&parse_recovery_status(
+            "state=DataplaneApplied path_programmed_peer_count=0"
+        )));
+        assert!(!node_has_recovered_generation(&parse_recovery_status(
+            "state=ExitActive path_live_peer_count=2"
+        )));
+    }
+
+    #[test]
+    fn recovered_state_names_are_pinned_to_the_daemon_enum() {
+        // Review F1: the allowlist names must be REAL unit variants of the
+        // daemon's `DataplaneState` — the enum whose Debug render the status
+        // line carries as `state={:?}`. include_str! of the DEFINING FILE
+        // keeps the pin honest: a daemon-side rename fails this test, and so
+        // does a typo here.
+        let phase10_rs = include_str!("../../../../../rustynetd/src/phase10.rs");
+        let enum_start = phase10_rs
+            .find("pub enum DataplaneState {")
+            .expect("DataplaneState must be defined in crates/rustynetd/src/phase10.rs");
+        let enum_block = &phase10_rs[enum_start..];
+        let enum_end = enum_block
+            .find('}')
+            .expect("the DataplaneState enum block must terminate");
+        let enum_block = &enum_block[..enum_end];
+        // The two allowlisted healthy terminals must exist as unit variants…
+        for token in [
+            RECOVERED_STATE_DATAPLANE_APPLIED,
+            RECOVERED_STATE_EXIT_ACTIVE,
+        ] {
+            assert!(
+                enum_block.contains(&format!("\n    {token},\n")),
+                "allowlisted state `{token}` must be a unit variant of DataplaneState"
+            );
+        }
+        // …and the fail-closed terminal this criterion rejects must still
+        // exist too, so a rename on either side is caught.
+        assert!(
+            enum_block.contains("\n    FailClosed,\n"),
+            "the FailClosed unit variant must still exist in DataplaneState"
+        );
     }
 
     #[test]
@@ -798,7 +893,13 @@ mod tests {
     // ── Redistribution order + scoping ───────────────────────────
 
     #[test]
-    fn redistribution_invoked_once_per_kind_after_daemon_live_probe() {
+    fn redistributes_once_per_kind_and_polls_generation() {
+        // Renamed (review F2): this test drives the seam implementation
+        // DIRECTLY — it proves one fresh bundle per kind + verifier key per
+        // kind + a successful generation poll, NOT the probe ordering (the
+        // ordering contract is pinned by the source-slice test below; the
+        // live exercise fn needs a real SSH target, so a runtime hook
+        // recorder is not reachable from unit tests).
         let (mut ctx, log) = recovery_ctx();
         redistribute_fresh_bundles_and_await_generation(
             &mut ctx,
@@ -878,26 +979,51 @@ mod tests {
     fn source_pins_redistribution_before_the_pin_probe() {
         // The seam hook must run BEFORE the post-reboot pin/marker/boottime
         // probe is even constructed — reading the real source keeps this
-        // order contractual rather than incidental.
+        // order contractual rather than incidental. Review F2: the pin is
+        // anchored INSIDE the exercise fn's body (sliced to the fn first),
+        // so a doc-comment or unrelated occurrence of the call expression
+        // elsewhere in mod.rs can never satisfy it, and the call expression
+        // must occur EXACTLY ONCE in that body.
         let mod_rs = include_str!("../../mod.rs");
-        let seam = mod_rs
+        let fn_start = mod_rs
+            .find("pub fn exercise_macos_reboot_recovery_with_recovery_actions(")
+            .expect("the seam-aware exercise fn must exist in vm_lab/mod.rs");
+        let fn_end = mod_rs[fn_start..]
+            .find("fn parse_macos_boottime_line(")
+            .expect("the exercise fn must be followed by parse_macos_boottime_line");
+        let fn_body = &mod_rs[fn_start..fn_start + fn_end];
+        let seam_occurrences = fn_body.matches("post_daemon_live(&node_id)").count();
+        assert_eq!(
+            seam_occurrences, 1,
+            "the mid-recovery seam hook must be invoked exactly once in the exercise fn body"
+        );
+        let seam = fn_body
             .find("post_daemon_live(&node_id)")
-            .expect("the mid-recovery seam hook call must exist in vm_lab/mod.rs");
-        let pin_probe = mod_rs
+            .expect("the mid-recovery seam hook call must exist in the exercise fn body");
+        let pin_probe = fn_body
             .find("let post_script = format!(")
-            .expect("the post-reboot probe construction must exist in vm_lab/mod.rs");
+            .expect("the post-reboot probe construction must exist in the exercise fn body");
         assert!(
             seam < pin_probe,
             "the redistribution seam ({seam}) must precede the pin probe ({pin_probe})"
         );
-        // And the stage's seam implementation redistributes BEFORE it polls.
+        // And the stage's seam implementation redistributes BEFORE it polls
+        // — likewise sliced to the owning fn body so a doc-comment mention
+        // of either call cannot satisfy the pin.
         let stage_rs = include_str!("macos_reboot_recovery_validation.rs");
-        let redistribute = stage_rs
+        let stage_fn_start = stage_rs
+            .find("fn redistribute_fresh_bundles_and_await_generation(")
+            .expect("the seam implementation fn must exist in this file");
+        let stage_fn_end = stage_rs[stage_fn_start..]
+            .find("pub(crate) struct RecoveryStatusObservation")
+            .expect("the seam implementation fn must precede RecoveryStatusObservation");
+        let stage_fn_body = &stage_rs[stage_fn_start..stage_fn_start + stage_fn_end];
+        let redistribute = stage_fn_body
             .find("distribute_bundle_kind_scoped(")
-            .expect("the scoped redistribution call must exist");
-        let poll = stage_rs
+            .expect("the scoped redistribution call must exist in the seam fn body");
+        let poll = stage_fn_body
             .find("poll_generation_recovery(")
-            .expect("the generation poll call must exist");
+            .expect("the generation poll call must exist in the seam fn body");
         assert!(
             redistribute < poll,
             "redistribution ({redistribute}) must precede the generation poll ({poll})"
