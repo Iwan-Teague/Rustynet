@@ -970,3 +970,9 @@ after; max 2 attempts; lab tooling fixes only).
 - Verified: scoped `cargo check -p rustynet-cli --all-targets --all-features --features vm-lab` exit 0; `cargo test -p rustynet-cli --features vm-lab --lib -- reboot` 17/17 pass; cargo fmt clean; no test pins the old string (rg 'backup mode' → only :15167). Pinned binary rebuilt (contains fix on top of 6d3fea6c).
 - Ledger trio in this commit = STEP 3 attempt-1 FAIL row + auto-recorded triage stub.
 - NEXT: relaunch attempt 2 (max 2), same flags, fresh RD. Session note: an earlier in-session summary claimed this commit+relaunch already happened (RD …050912, PID 2816) — filesystem disproved it (no commit, no RD, no log append); this section + commit + the real relaunch are the authoritative record.
+
+### 2026-09-07 04:24Z — STEP 3 attempt-2 gate refusal ×2, root cause: ledger path divergence
+- Launch RD state/live-lab-macos-reboot-20260907-041501 refused at enforce_launch_gate: stub `livelab-1788753367-2498a83338cc::validate_macos_reboot_recovery` "no recorded remedy" — despite step-3b recording.
+- Root cause: gate reads the stage-triage ledger from the stub's run-provenance worktree `state/edit-worktrees/edit-1788746785362-28885-0/documents/operations/live_lab_stage_triage.jsonl` (its own hint prints that path); step 3b recorded into THIS worktree's ledger. Stub confirmed present, remedy absent, in the 28885-0 copy.
+- Fix action now: run live-lab-record-stage-patch with --ledger pointed at the 28885-0 path (exact command the gate prints). That ledger is the designed mechanism, not a source edit.
+- Note: 041137 and 041501 are gate REFUSALS, not lab attempts (0 stages ran) — attempt count for the reboot cell stays at 1 real run; one real relaunch remains.
