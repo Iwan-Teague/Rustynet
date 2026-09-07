@@ -45,7 +45,16 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
     fn dependencies(&self) -> &[StageId] {
         // Needs the relay service deployed AND the lifecycle validation
         // green: a relay that cannot stay up is not a forwarding candidate.
-        &[StageId::DeployRelayService, StageId::RelayValidation]
+        // The refresh_signed_bundles dependency makes the freshness
+        // invariant structural: the traversal + dns_zone bundles are
+        // re-minted before this proof, and a skipped or failed refresh
+        // cascades here exactly like any other dependency (never stale
+        // setup-time bundles validating the forwarding proof).
+        &[
+            StageId::DeployRelayService,
+            StageId::RelayValidation,
+            StageId::RefreshSignedBundles,
+        ]
     }
     fn applies_to_roles(&self) -> &[NodeRole] {
         // Topology-scoped: the proof runs ONCE against the assigned relay
@@ -253,7 +262,11 @@ mod tests {
         assert_eq!(stage.name(), "relay_forwards_frame_validation");
         assert_eq!(
             stage.dependencies(),
-            &[StageId::DeployRelayService, StageId::RelayValidation]
+            &[
+                StageId::DeployRelayService,
+                StageId::RelayValidation,
+                StageId::RefreshSignedBundles
+            ]
         );
         assert!(matches!(stage.fanout(), StageFanout::Once));
         assert_eq!(stage.applies_to_roles(), &[NodeRole::Relay]);
