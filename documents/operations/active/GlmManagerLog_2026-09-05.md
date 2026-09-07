@@ -1070,7 +1070,7 @@ Commits since 092e94cf, grouped:
 ## 2026-09-07 session 7 — STEP 5
 - Writing final STATUS + refreshed MERGE NOTE; last commit of session.
 
-## STATUS 2026-09-07T05:4?Z (session 7 close-out)
+## STATUS 2026-09-07T05:27Z (session 7 close-out)
 
 DONE:
 - STEP 1 ledger reconciliation: session-6 rows (reboot attempt 2 livelab-1788755496, anchor re-proof livelab-1788756583) + 3 stub remedies committed in provenance worktree 28885-0 (b8c28039), branch merged here (d94defab, jsonl conflict resolved append-only, both sides kept). `grep -c livelab-1788756583 …run_matrix.csv` = 1 verified.
