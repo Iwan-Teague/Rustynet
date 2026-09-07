@@ -4411,10 +4411,16 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             // QH-74: resolve the workspace root from the run's --inventory (or
             // cwd) at parse time so every evidence-path derivation below sees
             // the tree the binary actually runs from, not the build tree. The
-            // error propagates exactly like a parse error.
-            let inventory_path =
-                parser.path_or_default("--inventory", vm_lab::default_inventory_path());
-            workspace_root::init_workspace_root(Some(inventory_path.as_path()))?;
+            // error propagates exactly like a parse error. Consult the
+            // optional --inventory FIRST and only then derive the default
+            // inventory path: `default_inventory_path()` reads the resolved
+            // root, so evaluating it eagerly (as a by-value `path_or_default`
+            // argument) would initialize the OnceLock from cwd before init
+            // ran and silently discard the operator's --inventory hint
+            // (review F1).
+            let inventory_opt = parser.optional_path("--inventory");
+            workspace_root::init_workspace_root(inventory_opt.as_deref())?;
+            let inventory_path = inventory_opt.unwrap_or_else(vm_lab::default_inventory_path);
             Ok(OpsCommand::VmLabOrchestrateLiveLab {
                 config: Box::new(vm_lab::VmLabOrchestrateLiveLabConfig {
                     inventory_path,
