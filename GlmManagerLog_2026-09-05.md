@@ -21,3 +21,11 @@ Verdict source: $RD/logs/validate_macos_reboot_recovery.log + $RD/state/stages.t
 - Root cause mod.rs:15195-15205: dispatch tolerates `Err(_)` (channel death) but macOS ssh returns `Ok(status=255)` when remote closes channel mid-command; 255 unhandled → false failure.
 - Fix (in scope: vm_lab stage code; no run in flight): add arm `Ok(status) if status.code() == Some(255) => {}` with comment. Then scoped gates, commit, record stub remedy (new stub `livelab-1788755496-b4c3097999cd::validate_macos_reboot_recovery`) in BOTH ledgers (this worktree + 28885-0 provenance).
 - Attempt accounting: 2 real attempts used (034405, 041909). No attempt 3 for reboot cell. Moving to STEP 4 anchor after fix+records.
+
+## 2026-09-07 04:38Z — STEP 4 launch: macOS anchor re-proof cell
+
+- Fix 1ff7d04a committed (ssh-255 arm, check+17 reboot tests+fmt green). Stub livelab-1788755496-b4c3097999cd::validate_macos_reboot_recovery remedied in 28885-0 provenance ledger (gate-read path). This worktree's ledger has no such stub — nothing to commit here.
+- TOPOLOGY (Rust --node form, explicit anchor election): macos-utm-1:anchor, debian-headless-4:exit, debian-headless-2:client. No --anchor-platform (mutually exclusive with --node per MCP routing rules; :anchor role is the engine-native election).
+- RD=state/live-lab-macos-anchor-20260907-043830 (mkdir -p before nohup). Same base flags as reboot run minus --reboot-platform, keep --skip-linux-live-suite --skip-soak --collect-artifacts-on-failure --source-mode local-head --trust-inventory-ready --linux-backend linux-wireguard-userspace-shared + full SSH/inventory flags.
+- Verdict source: logs/validate_macos_anchor_*.log (all MacosAnchor* stages) + stages.tsv only.
+- Mac guest confirmed on SSH (up 2 mins after its reboot, hostname answers).
