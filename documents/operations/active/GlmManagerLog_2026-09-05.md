@@ -792,3 +792,10 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
 - Polling stages.tsv every ~3 min; verdict only from logs/relay_forwards_frame_validation.log + stages.tsv.
 - fwd7 (000653) ABORTED pre-deployment: prepare_source_archive refused dirty tree (uncommitted log append + remedies). Committed dirt as 002aabc1 + 774a7f7a; aborted-run ledger rows committed. Launch attempt fwd7b refused at gate (new stub livelab-1788739920-a0b29f83e74a::prepare_source_archive no remedy) — recorded remedy, commit a746051c.
 - fwd7c LAUNCHED 00:20Z pid 61158, RD=state/live-lab-linux-relay-fwd7c-20260907-00201 (exact: fwd7c-20260907-002001), same topology/flags. bootstrap_hosts in progress 00:20:52Z. This is the real attempt 2/3 for relay_forwards_frame_validation (fwd7/fwd7b aborted pre-deploy, no relay verdict). Polling.
+
+## 2026-09-07 00:55Z — fwd7c verdict + triage
+- fwd7c (state/live-lab-linux-relay-fwd7c-20260907-002001) EXITED ~00:49Z.
+- relay_validation PASS 00:33:55 → interface-IP ss-parser fix (a0b29f83) PROVEN live.
+- relay_forwards_frame_validation FAIL 00:45:23 (attempt 2/3): sender dh2 + receiver fedora both report `daemon unreachable: inspect daemon socket failed (/run/rustynet/rustynetd.sock): Permission denied (os error 13)` → HP3_STATUS_UNREACHABLE. Root cause: build_relay_forward_test_status_script (mod.rs:14096) runs `/usr/local/bin/rustynet status` as plain ssh user; daemon socket is root-owned. Other status-querying stages in the SAME run passed using privileged_rustynet_cli_script (mod.rs:37152, `sudo -n env RUSTYNET_DAEMON_SOCKET=... rustynet status`).
+- cross_network_nat_classification fail (netns substrate, out of scope, declined on record). All other stages green/skip-by-topology.
+- PLAN: run glm-5.3-flash ai_read triage for confirmation; then fix lab tooling: make build_relay_forward_test_status_script delegate to privileged_rustynet_cli_script + `|| echo HP3_STATUS_UNREACHABLE`; pin with unit test; scoped gates; rebuild target-pinned binary; commit; record stub remedy; launch fwd8 = attempt 3/3 FINAL.
