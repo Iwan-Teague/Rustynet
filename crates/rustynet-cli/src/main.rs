@@ -80,6 +80,13 @@ mod security_audit_catalog;
 mod text_truncate;
 #[cfg(feature = "vm-lab")]
 mod vm_lab;
+// QH-74: the ONE runtime workspace-root derivation (see the module docs and
+// the twin declaration in `lib.rs`). Declared in BOTH crate roots because the
+// binary compiles its own module tree — the single structural `main.rs` line
+// the plan deviation note records, alongside the `init_workspace_root` call
+// at the vm-lab verb parse sites.
+#[cfg(feature = "vm-lab")]
+mod workspace_root;
 
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
@@ -4400,104 +4407,112 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             },
         }),
         #[cfg(feature = "vm-lab")]
-        "vm-lab-orchestrate-live-lab" => Ok(OpsCommand::VmLabOrchestrateLiveLab {
-            config: Box::new(vm_lab::VmLabOrchestrateLiveLabConfig {
-                inventory_path: parser
-                    .path_or_default("--inventory", vm_lab::default_inventory_path()),
-                profile_path: parser.optional_path("--profile"),
-                profile_output_path: parser.optional_path("--profile-output"),
-                network_profile: parser.value("--network-profile"),
-                exit_vm: parser.value("--exit-vm"),
-                client_vm: parser.value("--client-vm"),
-                entry_vm: parser.value("--entry-vm"),
-                aux_vm: parser.value("--aux-vm"),
-                extra_vm: parser.value("--extra-vm"),
-                fifth_client_vm: parser.value("--fifth-client-vm"),
-                relay_vm: parser.value("--relay-vm"),
-                windows_vm: parser.value("--windows-vm"),
-                macos_vm: parser.value("--macos-vm"),
-                ssh_identity_file: parser.required_path("--ssh-identity-file")?,
-                known_hosts_path: parser.optional_path("--known-hosts-file"),
-                require_same_network: parser.has_flag("--require-same-network"),
-                report_dir: parser.required_path("--report-dir")?,
-                source_mode: parser.value("--source-mode"),
-                repo_ref: parser.value("--repo-ref"),
-                rebuild_nodes: parser.value("--rebuild-nodes").map(split_csv),
-                max_parallel_node_workers: match parser.value("--max-parallel-node-workers") {
-                    Some(value) => Some(value.parse::<usize>().map_err(|err| {
-                        format!("invalid value for --max-parallel-node-workers: {err}")
-                    })?),
-                    None => None,
-                },
-                skip_gates: parser.has_flag("--skip-gates"),
-                skip_soak: parser.has_flag("--skip-soak"),
-                skip_cross_network: parser.has_flag("--skip-cross-network"),
-                cross_network_nat_profiles: parser.value("--cross-network-nat-profiles"),
-                cross_network_required_nat_profiles: parser
-                    .value("--cross-network-required-nat-profiles"),
-                cross_network_impairment_profile: parser
-                    .value("--cross-network-impairment-profile"),
-                cross_network_substrate: parser.value("--cross-network-substrate"),
-                utm_documents_root: parser.optional_path("--utm-documents-root"),
-                utmctl_path: parser.optional_path("--utmctl-path"),
-                ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
-                    .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
-                discovery_timeout_secs: parser
-                    .parse_u64_or_default("--discovery-timeout-secs", 5)?,
-                ready_timeout_secs: parser
-                    .parse_u64_or_default("--wait-ready-timeout-secs", 300)?,
-                timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
-                collect_artifacts_on_failure: parser.has_flag("--collect-artifacts-on-failure"),
-                skip_diagnose_on_failure: parser.has_flag("--skip-diagnose-on-failure"),
-                setup_only: parser.has_flag("--setup-only"),
-                run_only: parser.has_flag("--run-only"),
-                stop_after_ready: parser.has_flag("--stop-after-ready"),
-                dry_run: parser.has_flag("--dry-run"),
-                trust_inventory_ready: parser.has_flag("--trust-inventory-ready"),
-                windows_only: parser.has_flag("--windows-only"),
-                validate_linux_daemon_state: parser.has_flag("--validate-linux-daemon-state"),
-                enable_chaos_suite: parser.has_flag("--enable-chaos-suite"),
-                enable_clock_remediation: parser.has_flag("--enable-clock-remediation"),
-                enable_negative_control: parser.has_flag("--enable-negative-control"),
-                enable_relay_forwarding_validation: parser
-                    .has_flag("--enable-relay-forwarding-validation"),
-                node_assignments: {
-                    let raw = collect_repeated_option_values(&args[1..], "--node");
-                    let mut out = Vec::with_capacity(raw.len());
-                    for s in raw {
-                        out.push(
-                            vm_lab::orchestrator::role_assignment::parse_node_role_arg(&s)
-                                .map_err(|e| format!("invalid --node value '{s}': {e}"))?,
-                        );
-                    }
-                    out
-                },
-                orchestrate_ssh_allow_cidrs: parser.value("--ssh-allow-cidrs"),
-                no_fail_on_authenticode: parser.has_flag("--no-fail-on-authenticode"),
-                topology_profile: parser.optional_path("--topology-profile"),
-                exit_platform: parser.value("--exit-platform"),
-                relay_platform: parser.value("--relay-platform"),
-                anchor_platform: parser.value("--anchor-platform"),
-                admin_platform: parser.value("--admin-platform"),
-                blind_exit_platform: parser.value("--blind-exit-platform"),
-                role_switch_platform: parser.value("--role-switch-platform"),
-                reboot_platform: parser.value("--reboot-platform"),
-                macos_promote_exit: parser.has_flag("--macos-promote-exit"),
-                stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
-                skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
-                allow_dirty: parser.has_flag("--allow-dirty"),
-                lab_stun_servers: match parser.value("--lab-stun-servers") {
-                    Some(raw) => vm_lab::parse_lab_stun_servers(&raw)?,
-                    None => Vec::new(),
-                },
-                linux_backend: match parser.value("--linux-backend") {
-                    Some(raw) => Some(vm_lab::parse_linux_backend(&raw)?),
-                    None => None,
-                },
-                resume_from: parser.value("--resume-from"),
-                rerun_stage: parser.value("--rerun-stage"),
-            }),
-        }),
+        "vm-lab-orchestrate-live-lab" => {
+            // QH-74: resolve the workspace root from the run's --inventory (or
+            // cwd) at parse time so every evidence-path derivation below sees
+            // the tree the binary actually runs from, not the build tree. The
+            // error propagates exactly like a parse error.
+            let inventory_path =
+                parser.path_or_default("--inventory", vm_lab::default_inventory_path());
+            workspace_root::init_workspace_root(Some(inventory_path.as_path()))?;
+            Ok(OpsCommand::VmLabOrchestrateLiveLab {
+                config: Box::new(vm_lab::VmLabOrchestrateLiveLabConfig {
+                    inventory_path,
+                    profile_path: parser.optional_path("--profile"),
+                    profile_output_path: parser.optional_path("--profile-output"),
+                    network_profile: parser.value("--network-profile"),
+                    exit_vm: parser.value("--exit-vm"),
+                    client_vm: parser.value("--client-vm"),
+                    entry_vm: parser.value("--entry-vm"),
+                    aux_vm: parser.value("--aux-vm"),
+                    extra_vm: parser.value("--extra-vm"),
+                    fifth_client_vm: parser.value("--fifth-client-vm"),
+                    relay_vm: parser.value("--relay-vm"),
+                    windows_vm: parser.value("--windows-vm"),
+                    macos_vm: parser.value("--macos-vm"),
+                    ssh_identity_file: parser.required_path("--ssh-identity-file")?,
+                    known_hosts_path: parser.optional_path("--known-hosts-file"),
+                    require_same_network: parser.has_flag("--require-same-network"),
+                    report_dir: parser.required_path("--report-dir")?,
+                    source_mode: parser.value("--source-mode"),
+                    repo_ref: parser.value("--repo-ref"),
+                    rebuild_nodes: parser.value("--rebuild-nodes").map(split_csv),
+                    max_parallel_node_workers: match parser.value("--max-parallel-node-workers") {
+                        Some(value) => Some(value.parse::<usize>().map_err(|err| {
+                            format!("invalid value for --max-parallel-node-workers: {err}")
+                        })?),
+                        None => None,
+                    },
+                    skip_gates: parser.has_flag("--skip-gates"),
+                    skip_soak: parser.has_flag("--skip-soak"),
+                    skip_cross_network: parser.has_flag("--skip-cross-network"),
+                    cross_network_nat_profiles: parser.value("--cross-network-nat-profiles"),
+                    cross_network_required_nat_profiles: parser
+                        .value("--cross-network-required-nat-profiles"),
+                    cross_network_impairment_profile: parser
+                        .value("--cross-network-impairment-profile"),
+                    cross_network_substrate: parser.value("--cross-network-substrate"),
+                    utm_documents_root: parser.optional_path("--utm-documents-root"),
+                    utmctl_path: parser.optional_path("--utmctl-path"),
+                    ssh_port: u16::try_from(parser.parse_u64_or_default("--ssh-port", 22)?)
+                        .map_err(|_| "invalid value for --ssh-port: must fit in u16".to_owned())?,
+                    discovery_timeout_secs: parser
+                        .parse_u64_or_default("--discovery-timeout-secs", 5)?,
+                    ready_timeout_secs: parser
+                        .parse_u64_or_default("--wait-ready-timeout-secs", 300)?,
+                    timeout_secs: parser.parse_u64_or_default("--timeout-secs", 86_400)?,
+                    collect_artifacts_on_failure: parser.has_flag("--collect-artifacts-on-failure"),
+                    skip_diagnose_on_failure: parser.has_flag("--skip-diagnose-on-failure"),
+                    setup_only: parser.has_flag("--setup-only"),
+                    run_only: parser.has_flag("--run-only"),
+                    stop_after_ready: parser.has_flag("--stop-after-ready"),
+                    dry_run: parser.has_flag("--dry-run"),
+                    trust_inventory_ready: parser.has_flag("--trust-inventory-ready"),
+                    windows_only: parser.has_flag("--windows-only"),
+                    validate_linux_daemon_state: parser.has_flag("--validate-linux-daemon-state"),
+                    enable_chaos_suite: parser.has_flag("--enable-chaos-suite"),
+                    enable_clock_remediation: parser.has_flag("--enable-clock-remediation"),
+                    enable_negative_control: parser.has_flag("--enable-negative-control"),
+                    enable_relay_forwarding_validation: parser
+                        .has_flag("--enable-relay-forwarding-validation"),
+                    node_assignments: {
+                        let raw = collect_repeated_option_values(&args[1..], "--node");
+                        let mut out = Vec::with_capacity(raw.len());
+                        for s in raw {
+                            out.push(
+                                vm_lab::orchestrator::role_assignment::parse_node_role_arg(&s)
+                                    .map_err(|e| format!("invalid --node value '{s}': {e}"))?,
+                            );
+                        }
+                        out
+                    },
+                    orchestrate_ssh_allow_cidrs: parser.value("--ssh-allow-cidrs"),
+                    no_fail_on_authenticode: parser.has_flag("--no-fail-on-authenticode"),
+                    topology_profile: parser.optional_path("--topology-profile"),
+                    exit_platform: parser.value("--exit-platform"),
+                    relay_platform: parser.value("--relay-platform"),
+                    anchor_platform: parser.value("--anchor-platform"),
+                    admin_platform: parser.value("--admin-platform"),
+                    blind_exit_platform: parser.value("--blind-exit-platform"),
+                    role_switch_platform: parser.value("--role-switch-platform"),
+                    reboot_platform: parser.value("--reboot-platform"),
+                    macos_promote_exit: parser.has_flag("--macos-promote-exit"),
+                    stage_timeout_secs: parser.parse_u64_or_default("--stage-timeout-secs", 0)?,
+                    skip_linux_live_suite: parser.has_flag("--skip-linux-live-suite"),
+                    allow_dirty: parser.has_flag("--allow-dirty"),
+                    lab_stun_servers: match parser.value("--lab-stun-servers") {
+                        Some(raw) => vm_lab::parse_lab_stun_servers(&raw)?,
+                        None => Vec::new(),
+                    },
+                    linux_backend: match parser.value("--linux-backend") {
+                        Some(raw) => Some(vm_lab::parse_linux_backend(&raw)?),
+                        None => None,
+                    },
+                    resume_from: parser.value("--resume-from"),
+                    rerun_stage: parser.value("--rerun-stage"),
+                }),
+            })
+        }
         #[cfg(feature = "vm-lab")]
         "vm-lab-overnight" => Ok(OpsCommand::VmLabOvernight {
             config: vm_lab::VmLabOvernightConfig {
