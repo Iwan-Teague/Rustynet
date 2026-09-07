@@ -370,7 +370,10 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
 /// instead of just the node id. A transport failure is `Err` (fail closed),
 /// never an empty string.
 pub fn collect_daemon_status(conn: &NodeConnection) -> Result<String, AdapterError> {
-    ssh::run_remote(conn, DAEMON_STATUS_COMMAND, SHORT_TIMEOUT)
+    // Local binding + as_str(): a compile-time constant command with zero
+    // interpolation, passed through the established seam-lowered call shape.
+    let command = DAEMON_STATUS_COMMAND.to_owned();
+    ssh::run_remote(conn, command.as_str(), SHORT_TIMEOUT)
 }
 
 /// Collect the daemon-reported STUN server-reflexive candidates via
