@@ -186,6 +186,10 @@ impl NodeAdapter for LinuxNodeAdapter {
         linux_traffic::query_live_identity(&self.conn)
     }
 
+    fn collect_daemon_status(&self) -> Result<String, AdapterError> {
+        linux_traffic::collect_daemon_status(&self.conn)
+    }
+
     // ── Bundle distribution ───────────────────────────────────────────────────
 
     fn distribute_signed_bundle(

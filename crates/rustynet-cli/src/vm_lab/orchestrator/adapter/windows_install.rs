@@ -166,6 +166,24 @@ impl PowerShellScript {
         Ok(Self(rendered))
     }
 
+    /// [`PowerShellScript::from_call_argv`] plus a trailing guest-clock
+    /// emission (review F2, 2026-09-07): the daemon-status query must report
+    /// the NODE's own clock (`now_unix=<unix seconds>`) so handshake
+    /// freshness is judged against the clock that wrote
+    /// `path_latest_live_handshake_unix`, not the orchestrator host. The
+    /// suffix is a fixed compile-time literal whose `[DateTimeOffset]::UtcNow`
+    /// expression takes no input, so nothing interpolated can reach it.
+    pub(crate) fn from_call_argv_with_guest_clock(
+        label: &str,
+        argv: &[crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg],
+    ) -> Result<Self, AdapterError> {
+        const GUEST_CLOCK_SUFFIX: &str = "; Write-Output \
+             (\"now_unix=\" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())";
+        let mut rendered = Self::from_call_argv(label, argv)?.0;
+        rendered.push_str(GUEST_CLOCK_SUFFIX);
+        Ok(Self(rendered))
+    }
+
     // Deliberately NO whole-script constructor from a plain `String`: it
     // would accept any `format!` result (voiding the type boundary), and
     // `ps_quote` turns a script body into a single-quoted literal, which is

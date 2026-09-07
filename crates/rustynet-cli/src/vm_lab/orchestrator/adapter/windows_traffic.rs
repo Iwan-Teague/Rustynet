@@ -151,16 +151,46 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
     live_identity_from_status(&status)
 }
 
+/// Fetch the daemon's verbatim `rustynet status` text — the QH-70
+/// live-handshake-evidence surface. Same proven script as
+/// [`query_live_identity`] (trust CLI `status` verb over the daemon-control
+/// pipe), full text returned instead of just the node id. A transport failure
+/// is `Err` (fail closed), never an empty string.
+pub fn collect_daemon_status(conn: &NodeConnection) -> Result<String, AdapterError> {
+    let script = daemon_status_script()?;
+    run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)
+}
+
+/// The validated argv both status seams run: the trust CLI's `status` verb
+/// (no shell, no untrusted interpolation — the only dynamic part is the
+/// reviewed install path).
+fn trust_cli_status_argv() -> Result<[ValidatedArg; 2], AdapterError> {
+    Ok([
+        ValidatedArg::windows_path(WINDOWS_RUSTYNET_PATH)?,
+        ValidatedArg::cli_token("status")?,
+    ])
+}
+
+/// Build the PowerShell script [`collect_daemon_status`] runs: the trust-CLI
+/// status call plus a trailing guest-clock emission (`now_unix=<unix>`,
+/// review F2, 2026-09-07) so handshake freshness is judged on the node's own
+/// clock. Split from [`query_live_identity`], which keeps the bare status
+/// call — its field scan only needs `node_id=`.
+fn daemon_status_script() -> Result<PowerShellScript, AdapterError> {
+    let argv = trust_cli_status_argv()?;
+    PowerShellScript::from_call_argv_with_guest_clock(
+        "windows daemon status with guest clock",
+        &argv,
+    )
+}
+
 /// Build the PowerShell script [`query_live_identity`] runs: invoke the
 /// trust CLI's `status` verb (no shell, no untrusted interpolation — the
 /// only dynamic part is the reviewed install path).
 fn live_identity_status_script() -> Result<PowerShellScript, AdapterError> {
     // QH-01 Step 4b: the single interpolated value (the reviewed install path)
     // is validated as a windows path and ps-quoted by the seam renderer.
-    let argv = [
-        ValidatedArg::windows_path(WINDOWS_RUSTYNET_PATH)?,
-        ValidatedArg::cli_token("status")?,
-    ];
+    let argv = trust_cli_status_argv()?;
     PowerShellScript::from_call_argv("windows live identity status", &argv)
 }
 
@@ -1941,6 +1971,38 @@ mod tests {
         assert!(
             !rendered.contains("rustynetd.env"),
             "live identity must not read the config env-file: {rendered}"
+        );
+    }
+
+    /// Review F2 mutation guard: the daemon-status script MUST end with the
+    /// guest-clock emission (`now_unix=` from
+    /// `[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()`) so handshake freshness
+    /// is judged on the node's own clock, while the live-identity script
+    /// keeps the bare status call — keeping the two seams distinct proves the
+    /// emission was added to the status path deliberately, not smeared over
+    /// both.
+    #[test]
+    fn daemon_status_script_emits_guest_clock_but_identity_script_does_not() {
+        let status = super::daemon_status_script().expect("install path must pass ps_quote");
+        let rendered = status.as_str();
+        assert!(
+            rendered.contains("now_unix="),
+            "daemon status must report the guest clock: {rendered}"
+        );
+        assert!(
+            rendered.contains("[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"),
+            "the guest clock must come from the node's own clock: {rendered}"
+        );
+        assert!(
+            rendered.contains("'status'"),
+            "daemon status must still run the status verb: {rendered}"
+        );
+        let identity =
+            super::live_identity_status_script().expect("install path must pass ps_quote");
+        let identity_rendered = identity.as_str();
+        assert!(
+            !identity_rendered.contains("now_unix="),
+            "live identity keeps the bare status call: {identity_rendered}"
         );
     }
 

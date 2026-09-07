@@ -217,3 +217,98 @@ Fail-closed preserved: missing/unparseable status → error → stage failure; e
 3. Should the relay-session clauses gate a *later* stage (post-RelayValidation) instead — separate increment?
 4. Do role-switch/fast-run workflows that legitimately show `path_live_peer_count=0` (`mod.rs:14885-14890`) ever reach this stage, or only the bash-era suite?
 
+
+## Implementation log
+- 2026-09-07 (review fixes, branch `ai-edit/edit-1788780834790-61108-0`; applying
+  `MeshStatusLiveHandshakeReview_2026-09-07.md`, verdict MERGE-WITH-FIXES): F1 (blocker) —
+  `evaluate_live_handshake_status` now fails when `path_live_peer_count < expected_live_peers`
+  (partial mesh), keeping the `== 0` early-out for genuine single-node runs; new tests cover a
+  3-node partial mesh (expected 2, live 1 → fail) and the full mesh (live 2 → pass).
+- 2026-09-07 (review fixes): F2 (should-fix) — handshake freshness is now judged on the GUEST
+  clock, not the orchestrator host clock: every platform's daemon-status query additionally
+  emits `now_unix=<guest unix seconds>` (Linux/macOS append `; echo now_unix=$(date +%s)` to
+  `DAEMON_STATUS_COMMAND`; Windows status script gains a fixed
+  `[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()` suffix via a new typed constructor
+  `PowerShellScript::from_call_argv_with_guest_clock`), the stage parses it through
+  `parse_guest_now_unix` (fail-closed when missing/unparseable, retrying within the poll
+  window) and passes it to the evaluator instead of `SystemTime::now()`. `query_live_identity`
+  keeps the bare status call on Windows (its token scan only needs `node_id=`); on Linux/macOS
+  the shared const's extra line is inert for the token scan.   Mutation guards extended to pin
+  the emission.
+- 2026-09-07 (review fixes): F3 (nit) — echo-only contract for `relay_session_*` now has its
+  negative test: a status line with both relay fields stripped still passes, and a failure on
+  that same line echoes `relay_session_state=absent`, proving the fields are parsed as
+  optional evidence, never gates.
+- 2026-09-07 (QH-70 addendum, delegated edit branch `ai-edit/edit-1788775586214-74221-0`): step 1 — add `MAX_HANDSHAKE_AGE_SECONDS=180` + pure `evaluate_live_handshake_status` (fail-closed on missing/unparseable fields, zero live/programmed peers when expected, stale or future-dated handshake; relay fields echoed, never gating) to `role_validation/mesh_status.rs` with the addendum's evaluator tests. Deviation logged here per the plan's contract: the helpers are COPIED from `gossip_convergence.rs:79-96` (the addendum allows copy-or-hoist; copy avoids touching a second module's private surface).
+- 2026-09-07: step 2 — `NodeAdapter::collect_daemon_status` default `Err(UnsupportedPlatform)`; per-platform impls in the three adapters delegating to new `collect_daemon_status(conn)` fns in `linux_traffic.rs`/`macos_traffic.rs`/`windows_traffic.rs`, each reusing the EXACT proven `query_live_identity` status command (sudo + socket env + `rustynet status`; Windows trust-CLI `status` verb script). Deviation logged: the Linux/macOS status query goes through `ssh::run_remote` (NodeConnection) like `query_live_identity` — NOT the `RemoteShellHost` seam — because the proven live queries carry `sudo -n env`, which the seam's env-param argv does not express; the addendum's MockShellHost "dispatch mutation" test therefore pins the command STRING builders (socket env + `status` verb present) instead of a programmed argv, which fails identically if the status query or socket env is dropped.
+- 2026-09-07: step 3 — stage wiring in `stage/mesh_status_validation.rs`: after the existing validator passes per node, poll `collect_daemon_status` (120 s deadline, 10 s interval, `gossip_convergence` precedent) and require `evaluate_live_handshake_status` to pass with `expected_live_peers = assignments.len()-1` (full mesh is the run's own contract — `traffic_test_matrix` pings all pairs). Any poll/dispatch/eval error past the deadline joins the existing fail-closed `failures` path. Stage + module doc comments corrected: "pass" now means snapshot-valid AND live-handshake-proven; ledger semantics change is forward-only.
+- 2026-09-07: step 4 — gates: `cargo fmt --all -- --check`; `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings`; `cargo test -p rustynet-cli --all-targets --all-features` (mesh_status filter first — green, then full crate).
+- 2026-09-07: gates result — fmt check PASS (also normalized two pre-existing unformatted test blocks in `linux_traffic.rs`/`macos_traffic.rs`); clippy `-p rustynet-cli --all-targets --all-features -- -D warnings` PASS; `cargo test -p rustynet-cli --all-targets --all-features` PASS (8412 passed, 0 failed). One gate iteration: the new `run_remote` call sites tripped the `raw_sink_call_site_count_must_only_go_down` tripwire (130→131); fixed by passing the compile-time-constant command through the established seam-lowered shape (`let command = DAEMON_STATUS_COMMAND.to_owned(); run_remote(conn, command.as_str(), …)`), baseline left untouched — no interpolation exists at either site.
+
+## QH-70 disposition: FIXED-IN-BRANCH (2026-09-07, branch `ai-edit/edit-1788775586214-74221-0`)
+
+Implemented stage-side per the addendum, daemon untouched. Commits: `46b16bee` (evaluator +
+tests), `e8e41bd0` (`collect_daemon_status` adapter plumbing + fail-closed default + dispatch
+pins), `066477e7` (stage poll wiring + doc comments), `4f94c21d` (raw-sink tripwire kept green).
+Gates: fmt PASS, clippy `-p rustynet-cli --all-targets --all-features -- -D warnings` PASS,
+`cargo test -p rustynet-cli --all-targets --all-features` 8412 passed / 0 failed.
+
+**Live proof outstanding (required before flipping to FIXED on main):** the next full `--node`
+Live run's `mesh_status_validation` stage must agree with `traffic_test_matrix` (latest
+comparable run `3aedcfff`, 2026-09-05, failed exactly on `traffic_test_matrix`). A red
+mesh_status on that same node class is the defect closing; a green one where traffic is green is
+the parity confirming it. Until that run, this is branch-only evidence.
+
+## Review fixes applied (2026-09-07, branch `ai-edit/edit-1788780834790-61108-0`)
+
+Applying `MeshStatusLiveHandshakeReview_2026-09-07.md` (verdict MERGE-WITH-FIXES) to the
+QH-70 live-handshake work. Each finding and its commit:
+
+- **F1 (blocker) — partial mesh passed**: `evaluate_live_handshake_status` now fails when
+  `path_live_peer_count < expected_live_peers` (the former gate compared against zero only,
+  so a 3-node run with one dead tunnel pair passed on `live=1`). The `== 0` early-out stays
+  for genuine single-node runs. Tests: 3-node partial mesh (expected 2, live 1 → fail with
+  "partial mesh") and full mesh (live 2 → pass). Commit: `fec33392`.
+- **F2 (should-fix) — host-clock freshness flake**: freshness is now judged on the GUEST
+  clock. Every platform's daemon-status query additionally emits `now_unix=<guest unix
+  seconds>`: Linux/macOS append `; echo now_unix=$(date +%s)` to the shared
+  `DAEMON_STATUS_COMMAND` (inert for `query_live_identity`'s `node_id=` token scan); the
+  Windows status script gains a fixed `[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()` suffix
+  via the new typed constructor `PowerShellScript::from_call_argv_with_guest_clock`
+  (`live_identity_status_script` keeps the bare call — pinned by a new mutation guard). The
+  stage parses it through `parse_guest_now_unix` (fail-closed on missing/unparseable,
+  re-entering the retry loop) and passes it to the evaluator; `SystemTime::now()` is gone
+  from the poll. Mutation guards on all three platforms pin the emission. Commit: `e125b624`.
+- **F3 (nit) — echo-only relay contract untested**: negative test added — a status line with
+  both `relay_session_*` fields stripped still passes, and a failure on that same line echoes
+  `relay_session_state=absent` / `relay_session_established_peers=absent` as evidence.
+  Commit: `8a76c4b9`.
+- **F4/F5/F6 (nits) — not applied, no code change**: F4 (first-match token parsing) is
+  defensive against a multi-line status output the CLI does not emit today
+  (`daemon.rs:9259` single line; revisit if `rustynet status` ever grows per-peer blocks);
+  F5 (serialized per-node poll latency) is a pure performance/latency concern — worst case
+  on the current 3-4-node lab is minutes, semantics correct, and a thread fan-out would add
+  concurrency the stage does not need yet; F6 (non-desktop reported-skip bypass) is
+  informational — no such node exists in the inventory, the default `collect_daemon_status`
+  already fails closed, and the invariant "`expected_live_peers` must only count
+  poll-eligible nodes if the inventory ever changes" is now recorded here. If the owner
+  wants F4/F5 fixed, they are follow-up increments in this same file set.
+- Gate fix en route: `cargo fmt --all -- --check` was red on PRE-EXISTING style-edition
+  drift in the same files (assert!/use wrapping from the pinned rustfmt); normalized the
+  `rustynet-cli` scope only, no semantic change. Commit: `534816c4`.
+- Gates: fmt PASS; `cargo clippy -p rustynet-cli --all-targets --all-features --locked
+  -- -D warnings` PASS; `cargo test -p rustynet-cli --all-targets --all-features --locked`
+  PASS (93 test binaries, all ok; `mesh_status` filter 32 passed / 0 failed).
+- Design contract: unchanged — same stage order, same evaluator/stage split, adapter trait
+  shape untouched (`collect_daemon_status` still returns `Result<String, AdapterError>`);
+  only the status TEXT gained the `now_unix=` line. The only deviation class is the one the
+  implementation log already records (Windows needs the typed script seam, not a const).
+
+## STATUS 2026-09-07 11:57 UTC
+
+DONE: review fixes F1/F2/F3 applied on `ai-edit/edit-1788780834790-61108-0` (commits
+`fec33392`, `e125b624`, `8a76c4b9`, fmt normalization `534816c4`), all gates green.
+NOT DONE: live `--node` run proof (out of scope for this edit branch) — unchanged from the
+disposition above: after merge, one full `--node` run must show `mesh_status_validation`
+agreeing with `traffic_test_matrix` before QH-70 is marked FIXED on main. NEXT: owner review
+and merge; optional follow-ups F4/F5 if wanted.

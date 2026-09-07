@@ -1,17 +1,41 @@
 #![allow(dead_code)]
-use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
+use std::time::{Duration, Instant};
+
+use crate::vm_lab::orchestrator::adapter::node_adapter::{NodeAdapter, RoleValidatorKind};
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::role_validation::mesh_status::{
+    evaluate_live_handshake_status, parse_guest_now_unix,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const REPORTED_SKIPS_FILENAME: &str = "mesh_status_validation.reported_skips.json";
+
+/// QH-70 live-handshake poll: handshakes complete asynchronously after the
+/// membership bundles are enforced, so a first-poll failure would be a flaky
+/// failure, and a flaky stage gets ignored. Wait across the deadline (the
+/// `gossip_convergence` poll precedent) before calling it a failure.
+const LIVE_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(120);
+const LIVE_HANDSHAKE_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Prove every Linux node's daemon passes the mesh-status self-check —
 /// the daemon's mesh-status view reports no drift (no stale state,
 /// expected peer IDs present, within max-age bounds) — folding the
 /// formerly bash-only check into the standard Rust orchestrator so a
 /// `--node` run exercises it.
+///
+/// A snapshot pass alone is NOT sufficient (QH-70): after the validator
+/// succeeds, the stage polls the node's daemon `status` surface and requires
+/// LIVE dataplane evidence — `path_live_peer_count` and
+/// `path_programmed_peer_count` non-zero and a latest handshake within the
+/// 180 s window whenever the run topology expects peers
+/// (`assignments.len() - 1`: full mesh is the run's own contract, since
+/// `traffic_test_matrix` pings every pair). `relay_session_*` fields are
+/// echoed into failures as evidence but never gate — relay deploy runs two
+/// stages later. **A pass therefore means snapshot-valid AND
+/// live-handshake-proven**; historical rows that passed on the snapshot alone
+/// are not comparable (forward-only ledger boundary).
 ///
 /// Runs after `key_custody_validation` and before the relay/traffic stages.
 /// This is a per-node posture check, so it applies to every node regardless
@@ -43,6 +67,10 @@ impl OrchestrationStage for MeshStatusValidationStage {
         if aliases.is_empty() {
             return StageOutcome::Passed;
         }
+        // Every OTHER assigned node must be live: full mesh is the run's own
+        // contract (traffic_test_matrix pings every pair). A single-node run
+        // expects zero live peers.
+        let expected_live_peers = ctx.assignments.len().saturating_sub(1) as u32;
 
         let mut failures: Vec<String> = Vec::new();
         let mut reported_skips: Vec<(String, String)> = Vec::new();
@@ -64,6 +92,12 @@ impl OrchestrationStage for MeshStatusValidationStage {
                 adapter.run_role_validator(RoleValidatorKind::MeshStatus, expected_node_id, None)
             {
                 failures.push(format!("{alias}: {e}"));
+                continue;
+            }
+            // QH-70: the snapshot passing is necessary but not sufficient —
+            // demand live dataplane evidence before this stage may pass.
+            if let Err(e) = poll_live_handshake(adapter.as_ref(), alias, expected_live_peers) {
+                failures.push(e);
             }
         }
 
@@ -71,6 +105,54 @@ impl OrchestrationStage for MeshStatusValidationStage {
             write_reported_skips_note(ctx, &reported_skips);
         }
         outcome_for(&failures, &reported_skips)
+    }
+}
+
+/// Poll the node's daemon status until [`evaluate_live_handshake_status`]
+/// passes or the deadline expires; a poll that never got a passing status
+/// fails the stage (fail-closed, the existing `failures` path). Every peer
+/// other than this node is expected live: `assignments.len() - 1`.
+/// Freshness is judged on the GUEST clock the status query reports
+/// (`now_unix=<...>`, review F2) — never the orchestrator host clock.
+fn poll_live_handshake(
+    adapter: &dyn NodeAdapter,
+    alias: &str,
+    expected_live_peers: u32,
+) -> Result<(), String> {
+    let deadline = Instant::now() + LIVE_HANDSHAKE_DEADLINE;
+    loop {
+        let attempt = match adapter.collect_daemon_status() {
+            Ok(status) => {
+                // Review F2: freshness is judged on the GUEST clock the
+                // status query itself reports (`now_unix=<...>`), not the
+                // orchestrator host clock — host/guest skew (VM
+                // pause/resume, NTP drift) must not flake a healthy node.
+                // A missing or unparseable emission is an Err and re-enters
+                // the retry loop (fail closed).
+                match parse_guest_now_unix(&status) {
+                    Ok(now_unix) => evaluate_live_handshake_status(
+                        alias,
+                        &status,
+                        expected_live_peers,
+                        now_unix,
+                    ),
+                    Err(err) => Err(format!("{alias}: live handshake: {err}")),
+                }
+            }
+            Err(e) => Err(format!("{alias}: live handshake: {e}")),
+        };
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "{err} (after {}s)",
+                        LIVE_HANDSHAKE_DEADLINE.as_secs()
+                    ));
+                }
+                std::thread::sleep(LIVE_HANDSHAKE_POLL_INTERVAL);
+            }
+        }
     }
 }
 
