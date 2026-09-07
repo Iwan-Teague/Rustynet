@@ -44581,8 +44581,11 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     #[test]
     fn macos_reboot_post_probe_enumerates_logs_as_root_and_accepts_both_recovery_lines() {
         let source = include_str!("mod.rs");
+        // The live cell is `exercise_macos_reboot_recovery_with_recovery_actions`
+        // since the post-reboot bundle refresh split the original fn; the
+        // probe (and its token const) live in the split fn.
         let start = source
-            .find("pub fn exercise_macos_reboot_recovery_live(")
+            .find("pub fn exercise_macos_reboot_recovery_with_recovery_actions(")
             .expect("reboot cell live fn must exist");
         let body = &source[start..];
         let end = body[1..]
