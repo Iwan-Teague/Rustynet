@@ -635,13 +635,19 @@ fn validate_allowlist_rule(rule: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Split `git status --porcelain` output into (in-scope, out-of-scope) paths
-/// under `rules`.
+/// Split `git status --porcelain=v1 -z` output into (in-scope, out-of-scope)
+/// paths under `rules`.
 ///
-/// Line shapes handled: `XY PATH` and `XY ORIG -> DEST` (renames contribute
-/// BOTH paths, so a rename touching either side is checked on that side).
-/// Quoted paths (porcelain C-escapes names with special characters) have the
-/// surrounding quotes stripped; the inner name is matched as-is.
+/// In `-z` mode each entry is NUL-terminated as `XY PATH`, and a rename/copy
+/// entry carries TWO NUL-terminated fields — DESTINATION first, then ORIGIN
+/// (`dest\0orig`). There is no ` -> ` parsing and no C-style quoting layer at
+/// all, so quoted and non-ASCII paths arrive byte-exact instead of as escaped
+/// gibberish the matcher cannot see through (DelegatedEditPathGuardReview
+/// 2026-09-07 F3 — the quoted form made `git add` fail silently on in-scope
+/// exotic names). Renames contribute BOTH paths, so a rename touching either
+/// side is checked on that side. Entries shorter than `XY P` are skipped; a
+/// rename whose origin field is missing still classifies its destination —
+/// both fail closed (toward deny), never toward allow.
 ///
 /// Pure and git-free: `checkpoint_edit_worktree` classifies real porcelain
 /// output through exactly this function, so the unit tests pin the behaviour
@@ -649,19 +655,21 @@ fn validate_allowlist_rule(rule: &str) -> Result<(), String> {
 fn classify_porcelain(status: &str, rules: &[String]) -> (Vec<String>, Vec<String>) {
     let mut in_scope = Vec::new();
     let mut out_scope = Vec::new();
-    for line in status.lines() {
-        if line.len() < 4 {
-            continue; // "XY P" is the shortest meaningful line
+    let mut fields = status.split('\0');
+    while let Some(entry) = fields.next() {
+        if entry.len() < 4 {
+            continue; // empty (trailing NUL) or "XY P" is the shortest entry
         }
-        let path_part = &line[3..];
-        let paths: Vec<&str> = match path_part.split_once(" -> ") {
-            Some((orig, dest)) => vec![orig, dest],
-            None => vec![path_part],
-        };
+        let xy = &entry[..2];
+        let mut paths = vec![&entry[3..]];
+        if xy.starts_with('R') || xy.starts_with('C') {
+            // Rename/copy: the NEXT NUL-terminated field is the origin path.
+            match fields.next() {
+                Some(orig) if !orig.is_empty() => paths.push(orig),
+                _ => {} // unparsable pair — destination alone is still classified
+            }
+        }
         for p in paths {
-            let p = p.trim();
-            let p = p.strip_prefix('"').unwrap_or(p);
-            let p = p.strip_suffix('"').unwrap_or(p);
             if p.is_empty() {
                 continue;
             }
@@ -3575,7 +3583,10 @@ impl AiAgentServer {
         let empty = (Vec::new(), String::new());
         let dirty = run_with_timeout(
             "git",
-            &["status", "--porcelain"],
+            // -z (F3, DelegatedEditPathGuardReview_2026-09-07): NUL-separated,
+            // unquoted — quoted/non-ASCII paths must reach the classifier
+            // byte-exact, and renames arrive as `dest\0orig`.
+            &["status", "--porcelain=v1", "-z"],
             worktree,
             &[],
             Duration::from_secs(30),
@@ -3619,17 +3630,16 @@ impl AiAgentServer {
         {
             viol_diff.push_str(&o.stdout);
         }
-        for line in out.stdout.lines() {
-            let Some(rest) = line.get(3..) else {
-                continue;
-            };
-            if !line.starts_with("??") {
+        // Untracked files (which diff cannot see) are captured via --no-index
+        // against /dev/null, per-file capped so a junk file cannot blow up the
+        // record. The same NUL-separated status output is re-scanned here —
+        // no quoting layer, so exotic names match the classifier's paths (F3).
+        let mut status_fields = out.stdout.split('\0');
+        while let Some(entry) = status_fields.next() {
+            if entry.len() < 4 || !entry.starts_with("??") {
                 continue;
             }
-            // line[3..] is the path itself (the "XY " prefix was consumed);
-            // strip the C-style quoting porcelain uses for exotic names.
-            let p = rest.strip_prefix('"').unwrap_or(rest);
-            let p = p.strip_suffix('"').unwrap_or(p);
+            let p = &entry[3..];
             if !out_scope.iter().any(|o| o == p) {
                 continue;
             }
@@ -8707,13 +8717,16 @@ mod tests {
     #[test]
     fn classify_porcelain_splits_in_scope_from_out_of_scope() {
         let rules = vec!["documents/**".to_string(), "scripts/mcp/**".to_string()];
+        // `git status --porcelain=v1 -z` shape: NUL-terminated `XY PATH`
+        // entries, renames as `dest\0orig`.
         let status = [
             " M documents/notes.md",
             "?? crates/rustynet-cli/src/main.rs",
             "M  scripts/mcp/drive.py",
-            " R old.txt -> documents/renamed.txt",
+            "R  documents/renamed.txt",
+            "old.txt",
         ]
-        .join("\n");
+        .join("\0");
         let (in_scope, out_scope) = classify_porcelain(&status, &rules);
         assert!(in_scope.contains(&"documents/notes.md".to_string()));
         assert!(in_scope.contains(&"scripts/mcp/drive.py".to_string()));
@@ -8726,9 +8739,35 @@ mod tests {
     }
 
     #[test]
+    fn classify_porcelain_z_keeps_quoted_and_non_ascii_paths_byte_exact() {
+        // F3 (DelegatedEditPathGuardReview_2026-09-07): -z output is never
+        // C-quoted, so a non-ASCII name must classify as its REAL path — the
+        // old line-based parser matched git's escaped form
+        // (`\320\264…`) and silently dropped it from the checkpoint.
+        let rules = vec!["documents/**".to_string()];
+        let status = "?? documents/док.md\0";
+        let (in_scope, out_scope) = classify_porcelain(status, &rules);
+        assert!(
+            in_scope.contains(&"documents/док.md".to_string()),
+            "in: {in_scope:?}"
+        );
+        assert!(out_scope.is_empty(), "out: {out_scope:?}");
+        // A quoted name (as the line-based form would emit) is treated as a
+        // literal path — matched on its own characters, never unescaped into
+        // something else.
+        let (in_q, out_q) = classify_porcelain("?? documents/\"q.md\"\0", &rules);
+        assert!(in_q.contains(&"documents/\"q.md\"".to_string()));
+        assert!(out_q.is_empty());
+        // A copy entry also carries the two-field `dest\0orig` shape.
+        let (in_c, out_c) = classify_porcelain("C  documents/copy.md\0scripts/orig.py\0", &rules);
+        assert!(in_c.contains(&"documents/copy.md".to_string()));
+        assert!(out_c.contains(&"scripts/orig.py".to_string()));
+    }
+
+    #[test]
     fn classify_porcelain_denies_traversal_paths() {
         let rules = vec!["documents/**".to_string()];
-        let (in_scope, out_scope) = classify_porcelain("?? ../escape.txt\n", &rules);
+        let (in_scope, out_scope) = classify_porcelain("?? ../escape.txt\0", &rules);
         assert!(in_scope.is_empty());
         assert!(out_scope.contains(&"../escape.txt".to_string()));
     }
