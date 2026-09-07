@@ -217,3 +217,6 @@ Fail-closed preserved: missing/unparseable status → error → stage failure; e
 3. Should the relay-session clauses gate a *later* stage (post-RelayValidation) instead — separate increment?
 4. Do role-switch/fast-run workflows that legitimately show `path_live_peer_count=0` (`mod.rs:14885-14890`) ever reach this stage, or only the bash-era suite?
 
+
+## Implementation log
+- 2026-09-07 (QH-70 addendum, delegated edit branch `ai-edit/edit-1788775586214-74221-0`): step 1 — add `MAX_HANDSHAKE_AGE_SECONDS=180` + pure `evaluate_live_handshake_status` (fail-closed on missing/unparseable fields, zero live/programmed peers when expected, stale or future-dated handshake; relay fields echoed, never gating) to `role_validation/mesh_status.rs` with the addendum's evaluator tests. Deviation logged here per the plan's contract: the helpers are COPIED from `gossip_convergence.rs:79-96` (the addendum allows copy-or-hoist; copy avoids touching a second module's private surface).
