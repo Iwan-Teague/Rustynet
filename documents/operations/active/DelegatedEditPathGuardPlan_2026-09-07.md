@@ -73,6 +73,8 @@ DONE. All 8 plan steps implemented on branch `ai-edit/edit-1788775612865-74537-0
 - Step R2 (F1 + F7) next: checkpoint resets the index before the scoped add and commits with an explicit pathspec, add/commit/reset failures are loud; `edit_job_diff` diffs `base..HEAD` (F7) because the F1 test pins the branch diff; tests for a pre-staged smuggled file and a staged out-of-scope rename origin.
 - Step R2 (F1 + F7) done: `checkpoint_edit_worktree` runs `git reset -q` before the scoped `git add` and commits via `git commit --no-verify -m … -- <in_scope…>`; every reset/add/commit failure is a loud `eprintln!` with git's stderr (no `let _ =`). `edit_job_diff` now diffs `<pinned base>..HEAD`. New tests: `persist_edit_diff_never_commits_a_pre_staged_out_of_scope_file` (branch tip lacks the smuggled path; record lists it), `checkpoint_leaves_a_staged_rename_origin_out_of_scope`. 125 tests pass. Deviation: F7 landed in the same commit as F1 because the F1 test asserts the branch diff.
 - Step R3 (F2) next: `pin_worktree_hooks` — enable `extensions.worktreeConfig` on the repo, pin `core.hooksPath` worktree-locally to the job's hooks dir; either failure fails the launch.
+- Step R3 (F2) done: `create_edit_worktree` calls `pin_worktree_hooks` (enables `extensions.worktreeConfig` repo-wide once, sets `--worktree core.hooksPath` to the job's hooks dir); any failure fails the launch. Tests: worktree-scoped config asserted after creation (and shown to outrank a simulated install.sh repo-level value); fail-closed error pinned outside a git repo. 127 tests pass. Deviation: none.
+- Step R4 (F5 + F6) next: `validate_allowlist_rule` rejects `**` alone (allow-all) and any `\n`/`\r`; single `*` documented as literal.
 
 ## Open questions
 
