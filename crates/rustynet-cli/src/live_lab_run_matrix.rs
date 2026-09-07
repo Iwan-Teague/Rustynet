@@ -6476,6 +6476,26 @@ mod conclusion_barrier_tests {
         }
     }
 
+    /// Removes the fixture tree when dropped, on success OR failure, so an
+    /// assertion failure no longer leaks the copy (review F6).
+    struct Qh74FixtureGuard {
+        root: PathBuf,
+    }
+
+    impl Qh74FixtureGuard {
+        fn keep(root: &std::path::Path) -> Self {
+            Self {
+                root: root.to_path_buf(),
+            }
+        }
+    }
+
+    impl Drop for Qh74FixtureGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     /// QH-74: the append must land beside the workspace the binary RUNS from
     /// (the copy), not beside the tree it was BUILT in. Before this fix both
     /// derivations hardcoded the compile-time path, so a binary executed from
@@ -6483,6 +6503,7 @@ mod conclusion_barrier_tests {
     #[test]
     fn append_lands_in_runtime_resolved_workspace_root() {
         let (copy_root, report_dir, profile) = write_qh74_copied_workspace("qh74-append");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
         let compiled_root = crate::workspace_root::compiled_in_root().expect("compiled root");
         let real_ledger = compiled_root.join("documents/operations/live_lab_node_run_matrix.csv");
         let real_before = fs::read(&real_ledger).expect("real --node ledger must exist");
@@ -6518,7 +6539,6 @@ mod conclusion_barrier_tests {
             real_before,
             "the build tree's ledger must be untouched by a run from a copy"
         );
-        let _ = fs::remove_dir_all(&copy_root);
     }
 
     /// QH-74 companion: the launch gate must see the triage stubs the append
@@ -6528,6 +6548,7 @@ mod conclusion_barrier_tests {
     #[test]
     fn launch_gate_reads_stubs_written_to_the_copied_root() {
         let (copy_root, report_dir, profile) = write_qh74_copied_workspace("qh74-gate");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
         let _guard = Qh74RootGuard::force(&copy_root);
         super::append_live_lab_run_matrix_row(super::LiveLabRunMatrixAppendConfig {
             command_name: "vm-lab-orchestrate-live-lab",
@@ -6554,7 +6575,6 @@ mod conclusion_barrier_tests {
             err.contains("live-lab launch refused") && err.contains("live_two_hop_validation"),
             "gate error must name the blocking stage: {err}"
         );
-        let _ = fs::remove_dir_all(&copy_root);
     }
 }
 

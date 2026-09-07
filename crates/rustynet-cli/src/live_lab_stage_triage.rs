@@ -131,14 +131,15 @@ pub fn default_triage_ledger_path(workspace_root: &Path) -> PathBuf {
 /// same "which checkout holds this evidence" problem the fleet-evidence work
 /// exists to close. An explicit path cannot be silently wrong.
 ///
-/// **Known inconsistency, deliberately not "fixed" here.** The auto-stub path
-/// does exactly what this rejects: `live_lab_run_matrix.rs` resolves the ledger
-/// via `default_triage_ledger_path(workspace_root_path())`, and that root is
-/// `env!("CARGO_MANIFEST_DIR")` — build-time-derived. A binary run outside its
-/// build tree therefore writes (and `create_dir_all`s) a ledger nobody reads.
-/// Changing it is a behaviour change to the evidence-finalization path and
-/// wants its own live verification, so it is recorded rather than bundled in.
-/// See `FleetEvidenceCollectionPlan_2026-07-28.md`.
+/// **The former inconsistency is resolved (QH-74).** The auto-stub path now
+/// resolves its ledger from the runtime workspace root
+/// (`crate::workspace_root::workspace_root_path()` — the tree the binary
+/// runs in, from `--inventory` ancestors, cwd, or the validated compiled-in
+/// fallback), not from the build-time manifest directory, so both this
+/// command and the auto-stub writer agree on "which tree holds this
+/// evidence". `ledger` stays REQUIRED here rather than defaulted: this
+/// project routinely drives several checkouts at once (the lab host box,
+/// per-job worktrees), and an explicit path cannot be silently wrong.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordStagePatchConfig {
     pub ledger: PathBuf,
