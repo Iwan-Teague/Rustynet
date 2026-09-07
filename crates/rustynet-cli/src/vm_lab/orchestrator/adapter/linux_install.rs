@@ -617,6 +617,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx).expect("env");
         assert!(
@@ -671,6 +672,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
         };
         let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
         assert!(
@@ -710,6 +712,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
         };
         let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
         assert!(
@@ -772,6 +775,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
         };
         for role in [
             NodeRole::Client,
