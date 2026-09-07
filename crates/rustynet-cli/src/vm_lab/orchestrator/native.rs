@@ -716,8 +716,9 @@ pub(crate) fn execute_rust_native_orchestration(
 
     // Build the manifest audit snapshot from this run's resolved topology and
     // only the selectors the Rust plan honors. The `--node` plan now honors
-    // chaos, cross-network, soak, and skip-linux-live-suite; bash-only platform
-    // election selectors remain inactive. wants_macos/windows come from the real
+    // chaos, cross-network, soak, skip-linux-live-suite, and the C6/C7
+    // role-switch/reboot platform elections; the remaining bash-only platform
+    // election selectors stay inactive. wants_macos/windows come from the real
     // `--node` guest platforms, not the ignored `*_platform` flags.
     let manifest_selectors = crate::live_lab_stage_registry::TargetSelectors {
         wants_macos: node_entries
@@ -732,8 +733,17 @@ pub(crate) fn execute_rust_native_orchestration(
         anchor_platform: String::new(),
         admin_platform: String::new(),
         blind_exit_platform: String::new(),
-        role_switch_platform: String::new(),
-        reboot_platform: String::new(),
+        // C6/C7: record the raw selectors so the finalizer's plan
+        // reconstruction
+        // (resolved_plan::verify_recorded_plan_not_shrunk) re-derives the
+        // same elections the runner made from the same inputs. Empty when
+        // the flags are absent, which leaves the expected plan unelected —
+        // the fail-closed direction. Hardcoding empty here (the pre-fix
+        // behavior) made the finalizer reject every faithful
+        // `--role-switch-platform macos` / `--reboot-platform macos` run at
+        // evidence-finalization time with "unexpected added stages".
+        role_switch_platform: config.role_switch_platform.clone().unwrap_or_default(),
+        reboot_platform: config.reboot_platform.clone().unwrap_or_default(),
         skip_linux_live_suite: skip_live_suite,
         chaos_suite: enable_chaos_suite && !skip_live_suite,
         cross_network_suite: enable_cross_network_suite && !skip_live_suite,

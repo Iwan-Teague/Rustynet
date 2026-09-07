@@ -897,3 +897,28 @@ Fix (lab tooling only, allowed scope):
 - Tests: `verify_honors_role_switch_and_reboot_selector_elections` (positive roundtrip for rs/rb/both) and `verify_rejects_a_fabricated_role_switch_election_without_a_selector` (negative, asserts "added" + "validate_macos_role_transition"). resolved_plan suite 19/19 pass; stage_manifest suite 6/6; scoped cargo check exit 0; cargo fmt applied; pinned binary rebuilt 04:05Z.
 
 NEXT: relaunch attempt 3 (attempt 2b evidence-finalization fix), same flags, fresh RD. Stage itself already PASSED live in attempt 2 (RD state/live-lab-macos-roleswitch-20260907-023534, 02:47:35→02:47:47Z); re-run needed only for the ledger-backed evidence row.
+
+### 2026-09-07 ~04:30Z — STEP 2 attempt-3 postmortem + wrapper selector-copy fix (2nd fix cycle, final for this cell)
+
+Attempt 3 (RD=state/live-lab-macos-roleswitch-20260907-030720, binary from 61983773): stage
+validate_macos_role_transition PASSED live (third consecutive live pass), but evidence
+finalization failed with IDENTICAL digests to attempt 2 (expected f608b906…) → no ledger row.
+
+Ground truth from run artifacts: orchestration/stage_manifest.json records
+`role_switch_platform: ""` and `reboot_platform: ""` — the serialization-side gap. My 61983773
+fix taught the finalizer to derive C6/C7 elections from manifest selectors, but the runner's
+manifest snapshot (native.rs ~735) hardcoded both fields to String::new() even though
+`config.role_switch_platform`/`config.reboot_platform` are in scope and drive the real
+election (native.rs C6/C7 elector calls). Stale comment claimed "bash-only platform election
+selectors remain inactive".
+
+FIX (lab tooling only): native.rs manifest_selectors now copies
+`config.role_switch_platform.clone().unwrap_or_default()` and
+`config.reboot_platform.clone().unwrap_or_default()` (+comment); stale comment updated.
+Verified: scoped `cargo check -p rustynet-cli --all-targets --all-features --features vm-lab`
+exit 0; `cargo test -p rustynet-cli --features vm-lab --lib -- resolved_plan stage_manifest`
+25/25 pass; cargo fmt applied; pinned binary rebuilt (45181552 bytes, 04:29 local).
+
+NEXT: relaunch attempt 4, same flags, fresh RD. Early check: after prepare_source_archive,
+cat $RD/orchestration/stage_manifest.json and confirm `"role_switch_platform": "macos"` —
+catches a repeat finalizer fail without waiting for the full run.
