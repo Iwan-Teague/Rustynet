@@ -57,8 +57,9 @@
 
 use rustynet_mcp::{
     LedgerEngine, McpServer, ServerInfo, Tool, ToolCallResult, engine_schema_property,
-    json_schema_boolean, json_schema_object, json_schema_string, repo_root, run_server,
-    run_with_timeout, spawn_logged, tail_file, text_content, tool_error, truncate_output,
+    json_schema_array_string, json_schema_boolean, json_schema_object, json_schema_string,
+    repo_root, run_server, run_with_timeout, spawn_logged, tail_file, text_content, tool_error,
+    truncate_output,
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
@@ -2761,6 +2762,45 @@ impl AiAgentServer {
             .filter(|s| !s.is_empty())
             .unwrap_or("HEAD")
             .to_string();
+        // Per-job path allowlist (DelegatedEditPathGuardPlan_2026-09-07).
+        // Absent → the DEFAULT list. Present → every rule is validated and ANY
+        // invalid rule DENIES the whole call (fail closed, never narrowed);
+        // an explicitly empty list denies every path, so it is refused up front
+        // as a likely caller mistake rather than a silent no-op job.
+        let path_allowlist: Vec<String> = match args.get("path_allowlist") {
+            None | Some(Value::Null) => DEFAULT_EDIT_PATH_ALLOWLIST
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            Some(Value::Array(items)) => {
+                let mut rules = Vec::new();
+                for item in items {
+                    let Some(rule) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                        return tool_error(
+                            "path_allowlist entries must be non-empty strings (call denied)",
+                        );
+                    };
+                    if let Err(e) = validate_allowlist_rule(rule) {
+                        return tool_error(&format!(
+                            "invalid path_allowlist rule '{rule}': {e} — the call is DENIED; \
+                             pass only relative, non-empty rules without '..' components"
+                        ));
+                    }
+                    rules.push(rule.to_string());
+                }
+                if rules.is_empty() {
+                    return tool_error(
+                        "path_allowlist is empty — an empty allowlist denies every path; the \
+                         call is DENIED. Omit the parameter for the default allowlist, or pass \
+                         at least one rule.",
+                    );
+                }
+                rules
+            }
+            Some(_) => {
+                return tool_error("path_allowlist must be an array of rule strings");
+            }
+        };
 
         let job_id = self.new_job_id("edit");
         // Initial record so a crash mid-setup leaves a findable "launching"
@@ -2774,6 +2814,7 @@ impl AiAgentServer {
                 "agent": agent,
                 "model": model,
                 "base_ref": base_ref,
+                "path_allowlist": path_allowlist,
                 "state": "launching",
                 "task": truncate_output(&task, 40, 4000),
                 "started_unix": now_unix(),
@@ -2819,7 +2860,9 @@ impl AiAgentServer {
                  - mode: {mode}{}\n\
                  - agent: {agent}\n\
                  - model: {model}\n\
-                 - base_ref: {base_ref}\n\n\
+                 - base_ref: {base_ref}\n\
+                  - path allowlist: {} rule(s) — out-of-allowlist edits are never committed \
+                 and end the job in `scope_violation`\n\n\
                  Poll `ai_edit_result` with this job_id. In RESTRICTED mode the result will \
                  report `awaiting_approval` with the proposed diff whenever the agent wants to \
                  edit a file — answer with `ai_edit_approve` / `ai_edit_deny`. The agent works in \
@@ -2829,7 +2872,8 @@ impl AiAgentServer {
                     " (every file edit pauses for your approval)"
                 } else {
                     " (edits without per-change approval)"
-                }
+                },
+                path_allowlist.len()
             )),
             is_error: None,
         }
@@ -7909,6 +7953,7 @@ impl McpServer for AiAgentServer {
                         "mode":     json_schema_string("'restricted' (default, per-edit approval) or 'full' (unattended edits)."),
                         "model":    json_schema_string("OpenCode 'provider/model' ref (default 'deepseek/deepseek-v4-pro'). This is OpenCode's routing, not this server's flash/pro."),
                         "base_ref": json_schema_string("Git ref to branch the worktree from (default 'HEAD')."),
+                        "path_allowlist": json_schema_array_string("Optional per-job path allowlist (repo-relative gitignore-style rules; '**' matches any remainder, a rule without '**' is a directory prefix). Omit for the default allowlist (crates/rustynet-cli/src/vm_lab/**, documents/**, scripts/vm_lab/**, scripts/mcp/**). Every rule is validated (relative, non-empty, no '..') and ANY invalid rule denies the call; an empty array is refused. Out-of-allowlist edits are never committed and end the job in scope_violation."),
                     }),
                     vec!["task"],
                 ),
@@ -8436,6 +8481,25 @@ mod tests {
         let s = server();
         let r = s.call_edit_run(&json!({ "task": "x", "model": "deepseek-v4-pro" }));
         assert_eq!(r.is_error, Some(true));
+    }
+
+    #[test]
+    fn edit_run_denies_calls_with_invalid_path_allowlist_rules() {
+        // Fail closed: ANY invalid rule denies the WHOLE call — never a silent
+        // narrowing to the valid subset. Validation runs before any worktree or
+        // record is created, so these calls have no side effects.
+        let s = server();
+        for bad in [
+            json!({ "task": "x", "path_allowlist": ["../escape"] }),
+            json!({ "task": "x", "path_allowlist": ["/etc/passwd"] }),
+            json!({ "task": "x", "path_allowlist": ["a/../b"] }),
+            json!({ "task": "x", "path_allowlist": [""] }),
+            json!({ "task": "x", "path_allowlist": [] }),
+            json!({ "task": "x", "path_allowlist": "documents/**" }),
+        ] {
+            let r = s.call_edit_run(&bad);
+            assert_eq!(r.is_error, Some(true), "must deny: {bad}");
+        }
     }
 
     #[test]
