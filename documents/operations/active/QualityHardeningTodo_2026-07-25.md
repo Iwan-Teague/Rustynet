@@ -6470,7 +6470,7 @@ userspace-shared backend on Linux, or the run-matrix row should record each
 node's backend so a mixed topology is at least visible in evidence. Not
 decided here; the flag makes the choice explicit per run.
 
-### QH-70 — OPEN: `mesh_status_validation` is a false-green — it checks configured peers, not live tunnels, so it PASSED run 130201 with all four tunnel legs dead
+### QH-70 — FIXED IN TREE, LIVE PROOF PENDING: `mesh_status_validation` was a false-green — it checks configured peers, not live tunnels, so it PASSED run 130201 with all four tunnel legs dead
 **Severity: high (validator false-positive: a dataplane-dead mesh read as healthy evidence). Confidence: VERIFIED — run `130201` records `mesh_status_validation=pass` for macos-utm-1 while the same run's per-leg evidence shows all four tunnel legs without handshake/traffic.**
 
 The stage derives its verdict from the daemon's configured peer set (who
@@ -6487,6 +6487,8 @@ nonzero transfer counter per configured peer before the stage can pass, and
 fail closed when the tunnel state is unobservable. Filed from the
 GLM Manager C code-stream session (2026-09-06) as the remaining un-cloned
 member of the QH-71/72/73 family (those three are fixed in this branch).
+
+**Disposition (2026-09-07): FIXED IN TREE** — owner decision 5 (stage side): the evaluator now judges the daemon's own live-handshake fields (`path_live_peer_count`, `path_latest_live_handshake_unix`) against the expected peer count, fails a partial mesh (`live < expected`), judges freshness on the GUEST clock (`now_unix=` emitted by the status query on Linux/macOS/Windows), and keeps the relay fields echo-only. Implemented in `ai-edit/edit-1788775586214-74221-0`, review `MeshStatusLiveHandshakeReview_2026-09-07.md` applied in `ai-edit/edit-1788780834790-61108-0`. Live proof pending: a run whose `mesh_status_validation` and `traffic_test_matrix` verdicts agree (owner-scheduled). Original disposition kept below for history.
 
 **Disposition: OPEN — needs an owner decision on which crate owns the check
 (`rustynetd` validator vs `rustynet-cli` stage reading `wg show` output), then
