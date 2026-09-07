@@ -476,15 +476,23 @@ const EDIT_BRANCH_PREFIX: &str = "ai-edit";
 /// exporting a variable. A missing/unreadable file makes the hook refuse to
 /// commit (fail closed). It is excluded from git via the worktree's own
 /// `info/exclude` so it never pollutes status or a checkpoint.
+///
+/// F4 (DelegatedEditPathGuardReview_2026-09-07): this file sits WRITABLE at
+/// the worktree root and the edit agent has `bash`, so the agent could edit
+/// it. The hook therefore defends against ACCIDENT, not against the agent —
+/// the programmatic `checkpoint_edit_worktree`, which reads the immutable
+/// launch record instead of this file, is the enforcement boundary.
 const EDIT_ALLOWLIST_FILENAME: &str = "allowlist.txt";
 /// The per-worktree pre-commit hook `create_edit_worktree` installs under
-/// `$GIT_COMMON_DIR/worktrees/<job>/hooks/` (linked worktrees consult their
-/// own `$GIT_DIR/hooks` when `core.hooksPath` is unset). POSIX sh. Reads the
-/// allowlist positionally, rejects any staged path outside it, and chains to
-/// the repo's own `scripts/git-hooks/pre-commit` when present so the
-/// staleness/mirror guards still run. This hook is defence in depth: the
-/// AGENT can bypass it with `commit --no-verify`, which is exactly why the
-/// programmatic `checkpoint_edit_worktree` — not this script — is the
+/// `$GIT_COMMON_DIR/worktrees/<job>/hooks/` and pins via a worktree-local
+/// `core.hooksPath` (so a repo-level value from `scripts/git-hooks/install.sh`
+/// cannot shadow it — F2). POSIX sh. Reads the allowlist positionally,
+/// rejects any staged path outside it, and chains to the repo's own
+/// `scripts/git-hooks/pre-commit` when present so the staleness/mirror
+/// guards still run. This hook is defence in depth against ACCIDENT, not
+/// against the agent: the agent can bypass it with `commit --no-verify` AND
+/// can edit the allowlist file it reads — which is exactly why the
+/// programmatic `checkpoint_edit_worktree`, not this script, is the
 /// enforcement boundary.
 const EDIT_WORKTREE_PRE_COMMIT_HOOK: &str = r#"#!/bin/sh
 # Per-worktree path allowlist guard (DelegatedEditPathGuardPlan_2026-09-07).
