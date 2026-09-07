@@ -15163,8 +15163,8 @@ pub fn exercise_macos_reboot_recovery_live(
          ST={STATE_ROOT}/rustynetd.state; \
          BAK=\"$ST.networksetup-dns.failclosed.bak\"; \
          sudo -n test -f \"$BAK\" || {{ echo 'durable networksetup DNS backup missing before reboot' >&2; exit 1; }}; \
-         MODE=\"$(sudo -n stat -f %Lp \"$BAK\")\"; \
-         [ \"$MODE\" = \"0600\" ] || {{ echo \"backup mode is $MODE, expected 0600\" >&2; exit 1; }}; \
+          MODE=\"$(sudo -n stat -f %Lp \"$BAK\")\"; \
+          case \"$MODE\" in 600|0600) ;; *) echo \"backup mode is $MODE, expected 0600\" >&2; exit 1 ;; esac; \
          {LOOPBACK_PIN_CHECK}; \
          {BOOTTIME_CAPTURE}; \
          echo \"pre-reboot evidence ok: backup present at $BAK, mode $MODE, all enabled services loopback-pinned\""
