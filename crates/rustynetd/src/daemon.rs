@@ -11929,6 +11929,37 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             std::time::Duration::from_millis(config.privileged_helper_timeout_ms.get()),
         )
         .map_err(DaemonError::InvalidConfig)?;
+        // QH-40 marker retirement after a REBOOT (owner decision 1,
+        // OwnerDecisions_2026-09-07.md; live evidence: run
+        // state/live-lab-macos-reboot-20260907-050612). The marker documents
+        // firewall / route / exit-NAT residue from a failed shutdown rollback
+        // — typically `set exit mode off` failing because launchd had already
+        // torn the privileged helper down. None of that residue survives a
+        // reboot (launchd's boot-time `pfctl -F` clears anchors; routes and
+        // NAT state are gone with the kernel), and the one class that does —
+        // system-configuration DNS pins — was just handled by the guard
+        // above, which either restored the backup or refused startup. So a
+        // marker recorded BEFORE the current boot is superseded evidence:
+        // retire it, loudly, naming the original error. A same-boot marker
+        // (daemon restart without reboot) or an unknown boot time keeps the
+        // marker on the operator-acknowledgement path, exactly as before.
+        {
+            let boot = crate::shutdown_residue::boot_time_unix();
+            let scan = crate::shutdown_residue::scan(&config.state_path);
+            let decision = crate::shutdown_residue::decide_marker_retirement(&scan, boot, true);
+            if let Some(boot_unix) = boot
+                && let Err(err) = crate::shutdown_residue::retire_marker_after_reboot(
+                    &config.state_path,
+                    &decision,
+                    boot_unix,
+                )
+            {
+                // Retirement is bookkeeping: a failure to remove the file
+                // must not stop a daemon whose host is provably clean, but
+                // it must stay visible.
+                log::error!("rustynetd startup: residue marker retirement failed: {err}");
+            }
+        }
     }
     prepare_runtime_wireguard_key(&config)?;
     log::info!("rustynetd startup: runtime key material prepared");
