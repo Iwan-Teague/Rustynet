@@ -206,6 +206,10 @@ impl NodeAdapter for MacosNodeAdapter {
         macos_traffic::query_live_identity(&self.conn)
     }
 
+    fn collect_daemon_status(&self) -> Result<String, AdapterError> {
+        macos_traffic::collect_daemon_status(&self.conn)
+    }
+
     // ── Bundle distribution ───────────────────────────────────────────────────
 
     fn distribute_signed_bundle(

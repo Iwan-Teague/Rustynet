@@ -223,6 +223,26 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Fetch the daemon's verbatim `rustynet status` IPC text from this node —
+    /// the surface [`evaluate_live_handshake_status`] reads for QH-70
+    /// live-handshake evidence (`path_live_peer_count`,
+    /// `path_programmed_peer_count`, `path_latest_live_handshake_unix`).
+    ///
+    /// The default fails closed (unsupported) — exactly the
+    /// [`NodeAdapter::probe_membership_owner_signing_key_present`] pattern: a
+    /// platform that has not implemented the collection must never be read as
+    /// "no live peers", because that reading would fail the stage for the
+    /// wrong reason (or, worse, be softened away). Desktop adapters override
+    /// it with their platform's proven status query.
+    fn collect_daemon_status(&self) -> Result<String, AdapterError> {
+        Err(AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message: "daemon status collection is not implemented for this platform; \
+                      refusing to fabricate live-handshake evidence"
+                .to_owned(),
+        })
+    }
+
     // ── Bundle distribution ───────────────────────────────────────
 
     fn distribute_signed_bundle(
@@ -664,6 +684,34 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::extract_daemon_failure_reason;
+
+    /// QH-70 fail-closed guard: an adapter that does not implement
+    /// `collect_daemon_status` must surface `UnsupportedPlatform` — never a
+    /// silent "no peers" reading, which would both fail the stage for the
+    /// wrong reason and invite softening the check away. Android is the
+    /// standing example of an adapter inheriting the default.
+    #[test]
+    fn collect_daemon_status_defaults_to_unsupported_platform() {
+        use super::NodeAdapter;
+        use std::path::PathBuf;
+
+        let conn = crate::vm_lab::orchestrator::connection::NodeConnection::Ssh {
+            host: "ad-1".to_owned(),
+            port: 22,
+            user: None,
+            identity_file: PathBuf::from("/tmp/id"),
+            known_hosts: PathBuf::from("/tmp/known_hosts"),
+            ssh_password: None,
+        };
+        let adapter = super::super::android::AndroidNodeAdapter::new("ad-1", conn);
+        let err = adapter
+            .collect_daemon_status()
+            .expect_err("the default must fail closed, never report status");
+        assert!(
+            matches!(err, AdapterError::UnsupportedPlatform { .. }),
+            "expected UnsupportedPlatform, got: {err:?}"
+        );
+    }
 
     #[test]
     fn extract_reason_prefers_reconcile_fail_closed_line() {
