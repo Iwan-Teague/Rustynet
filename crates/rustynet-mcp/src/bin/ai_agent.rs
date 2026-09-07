@@ -675,6 +675,24 @@ fn classify_porcelain(status: &str, rules: &[String]) -> (Vec<String>, Vec<Strin
     (in_scope, out_scope)
 }
 
+/// The effective allowlist of an edit-job record: the `path_allowlist` stored
+/// at launch, or the default for legacy records that predate the guard. Never
+/// an empty list — an empty array is refused at launch, and a legacy record
+/// falls back to the default rather than to deny-everything (which would
+/// misreport every path as a violation on an old job).
+fn rec_allowlist(rec: &Value) -> Vec<String> {
+    match rec["path_allowlist"].as_array() {
+        Some(items) if !items.is_empty() => items
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => DEFAULT_EDIT_PATH_ALLOWLIST
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
 // ── Delegated-edit budget ceilings ───────────────────────────────────────────
 //
 // A `full`-permission job may delegate to cheap sub-agents (see the subagent
@@ -3528,21 +3546,33 @@ impl AiAgentServer {
         }
     }
 
-    /// Commit whatever is uncommitted in the worktree to the job's own branch
-    /// before the job ends, so the BRANCH is the complete deliverable.
+    /// Commit whatever UNCOMMITTED IN-SCOPE work the worktree holds to the
+    /// job's own branch before the job ends, so the BRANCH is the complete
+    /// deliverable — and nothing else.
     ///
-    /// Without this the "hard stop keeps your work" promise is false in exactly
-    /// the case that matters most: a job halted on budget mid-edit has usually
-    /// NOT reached its own commit step, so the change exists only as untracked
-    /// files in a worktree nobody will look at, and the advertised resume
-    /// (`base_ref=<branch>`) branches from a tip that never saw it — silently
-    /// discarding the work. Verified by doing exactly that before this existed.
+    /// Scope-aware per DelegatedEditPathGuardPlan_2026-09-07 (owner decision
+    /// 7): the worktree's `git status --porcelain` output is classified through
+    /// the SAME pure `classify_porcelain` the unit tests pin, and ONLY
+    /// in-scope paths are staged and committed. Out-of-scope paths are left
+    /// uncommitted in the worktree and returned (with their diff) so the
+    /// caller can record them as `scope_violations` — the job then ends in the
+    /// distinct `scope_violation` state, never `done`.
     ///
-    /// Safe to do on the agent's behalf: this is a throwaway branch that a human
-    /// reviews before merging, and the alternative is losing the work outright.
-    /// The message marks it as an automatic checkpoint so no one mistakes it for
-    /// the agent's own considered commit.
-    fn checkpoint_edit_worktree(&self, worktree: &Path, state: &str) {
+    /// `--no-verify` stays: scope is enforced programmatically HERE (server
+    /// control flow, in-process), not by the hook, which the agent could
+    /// bypass. Without the in-scope-only staging this was the exact incident
+    /// path of 2026-09-07: `git add -A` + commit carried an unauthorised
+    /// `crates/rustynet-cli/src/main.rs` edit onto the branch.
+    ///
+    /// Returns `(out_of_scope_paths, out_of_scope_diff)`; both are empty when
+    /// everything dirty was in scope (or nothing was dirty).
+    fn checkpoint_edit_worktree(
+        &self,
+        worktree: &Path,
+        state: &str,
+        rules: &[String],
+    ) -> (Vec<String>, String) {
+        let empty = (Vec::new(), String::new());
         let dirty = run_with_timeout(
             "git",
             &["status", "--porcelain"],
@@ -3550,40 +3580,108 @@ impl AiAgentServer {
             &[],
             Duration::from_secs(30),
         );
-        match dirty {
-            Ok(o) if o.success && o.stdout.trim().is_empty() => return, // nothing to save
+        let out = match dirty {
+            Ok(o) if o.success && o.stdout.trim().is_empty() => return empty, // nothing to save
             Ok(o) if o.success => o,
-            _ => return, // not a worktree, or git unavailable — nothing to do
+            _ => return empty, // not a worktree, or git unavailable — nothing to do
         };
-        let _ = run_with_timeout(
-            "git",
-            &["add", "-A"],
-            worktree,
-            &[],
-            Duration::from_secs(60),
-        );
-        let msg = format!(
-            "WIP: automatic checkpoint ({state})\n\nCommitted by the delegated-edit tier because \
-             the job ended before the agent committed. Review before merging."
-        );
-        let _ = run_with_timeout(
-            "git",
-            &["commit", "--no-verify", "-m", &msg],
-            worktree,
-            &[],
-            Duration::from_secs(120),
-        );
+        let (in_scope, out_scope) = classify_porcelain(&out.stdout, rules);
+        if !in_scope.is_empty() {
+            let mut add_args: Vec<&str> = vec!["add", "--"];
+            add_args.extend(in_scope.iter().map(String::as_str));
+            let _ = run_with_timeout("git", &add_args, worktree, &[], Duration::from_secs(60));
+            let msg = format!(
+                "WIP: automatic checkpoint ({state})\n\nCommitted by the delegated-edit tier \
+                 because the job ended before the agent committed. Only paths inside the job's \
+                 path allowlist are included; anything out of scope is left uncommitted and \
+                 reported as scope_violations. Review before merging."
+            );
+            let _ = run_with_timeout(
+                "git",
+                &["commit", "--no-verify", "-m", &msg],
+                worktree,
+                &[],
+                Duration::from_secs(120),
+            );
+        }
+        if out_scope.is_empty() {
+            return (out_scope, String::new());
+        }
+        // Capture the out-of-scope evidence: tracked modifications via
+        // `git diff -- <paths>`; untracked files (which diff cannot see) via
+        // --no-index against /dev/null, per-file capped so a junk file cannot
+        // blow up the record.
+        let mut viol_diff = String::new();
+        let mut diff_args: Vec<&str> = vec!["diff", "--"];
+        diff_args.extend(out_scope.iter().map(String::as_str));
+        if let Ok(o) = run_with_timeout("git", &diff_args, worktree, &[], Duration::from_secs(60))
+            && !o.stdout.trim().is_empty()
+        {
+            viol_diff.push_str(&o.stdout);
+        }
+        for line in out.stdout.lines() {
+            let Some(rest) = line.get(3..) else {
+                continue;
+            };
+            if !line.starts_with("??") {
+                continue;
+            }
+            // line[3..] is the path itself (the "XY " prefix was consumed);
+            // strip the C-style quoting porcelain uses for exotic names.
+            let p = rest.strip_prefix('"').unwrap_or(rest);
+            let p = p.strip_suffix('"').unwrap_or(p);
+            if !out_scope.iter().any(|o| o == p) {
+                continue;
+            }
+            let cap = run_with_timeout(
+                "git",
+                &["diff", "--no-index", "--", "/dev/null", p],
+                worktree,
+                &[],
+                Duration::from_secs(60),
+            );
+            if let Ok(o) = cap
+                && !o.stdout.trim().is_empty()
+            {
+                viol_diff.push_str(&truncate_output(&o.stdout, 400, 40_000));
+                viol_diff.push('\n');
+            }
+        }
+        (out_scope, viol_diff)
     }
 
     /// Capture the worktree's diff-vs-base into the record so the terminal
     /// summary can show it without the serve/worktree still being live.
-    /// Checkpoints first so the diff and the branch agree.
+    /// Checkpoints first so the diff and the branch agree. Records
+    /// `scope_violations` + `out_of_scope_diff` when the checkpoint found
+    /// out-of-allowlist paths, and — per the plan — re-stamps the job into the
+    /// distinct `scope_violation` terminal state (never `done`) regardless of
+    /// the state the caller had just set.
     fn persist_edit_diff(&self, rec: &mut Value, worktree: &Path, base_ref: &str) {
         let state = rec["state"].as_str().unwrap_or("ended").to_string();
-        self.checkpoint_edit_worktree(worktree, &state);
+        let rules = rec_allowlist(rec);
+        let (violations, viol_diff) = self.checkpoint_edit_worktree(worktree, &state, &rules);
         let diff = self.edit_job_diff(worktree, base_ref);
         if let Some(o) = rec.as_object_mut() {
             o.insert("diff".into(), json!(truncate_output(&diff, 4000, 200_000)));
+            if !violations.is_empty() {
+                // Preserve what the job would otherwise have been reported as,
+                // then fail loudly: scope_violation must never be skim-read
+                // as a normal done/timed_out.
+                o.insert("pre_scope_state".into(), json!(state));
+                o.insert("scope_violations".into(), json!(violations));
+                o.insert(
+                    "out_of_scope_diff".into(),
+                    json!(truncate_output(&viol_diff, 4000, 200_000)),
+                );
+            }
+        }
+        if !violations.is_empty() {
+            self.mark_edit_terminal(
+                rec,
+                "scope_violation",
+                Some("edits outside the path allowlist"),
+            );
         }
     }
 
@@ -8784,12 +8882,20 @@ mod tests {
         git(&["config", "user.email", "t@example.com"]);
         git(&["config", "user.name", "t"]);
         git(&["commit", "-q", "--allow-empty", "-m", "base"]);
-        std::fs::write(repo.join("unsaved.txt"), b"work the agent never committed").unwrap();
+        std::fs::create_dir_all(repo.join("documents")).unwrap();
+        std::fs::write(
+            repo.join("documents/unsaved.md"),
+            b"work the agent never committed",
+        )
+        .unwrap();
 
         let before = git(&["status", "--porcelain"]);
         assert!(!before.stdout.trim().is_empty(), "precondition: dirty tree");
 
-        server().checkpoint_edit_worktree(repo, "halted_budget");
+        let (violations, viol_diff) =
+            server().checkpoint_edit_worktree(repo, "halted_budget", &["documents/**".to_string()]);
+        assert!(violations.is_empty(), "in-scope work is not a violation");
+        assert!(viol_diff.is_empty());
 
         let after = git(&["status", "--porcelain"]);
         assert!(
@@ -8805,8 +8911,124 @@ mod tests {
         );
         // And the content is actually in the commit, not just staged away.
         let show = git(&["show", "--stat", "HEAD"]);
-        assert!(show.stdout.contains("unsaved.txt"), "{}", show.stdout);
+        assert!(show.stdout.contains("unsaved.md"), "{}", show.stdout);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn checkpoint_never_commits_out_of_allowlist_paths() {
+        // The 2026-09-07 incident, pinned: the OLD checkpoint did `git add -A`
+        // + commit, so a timed-out job carried an unauthorised
+        // crates/rustynet-cli/src/main.rs edit onto the branch. The scoped
+        // checkpoint must leave out-of-scope paths UNCOMMITTED and report them.
+        let root = std::env::temp_dir().join(format!(
+            "rustynet_ckpt_scope_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.as_path();
+        let git = |args: &[&str]| {
+            run_with_timeout("git", args, repo, &[], Duration::from_secs(30)).expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(repo.join("crates/rustynet-cli/src")).unwrap();
+        std::fs::write(
+            repo.join("crates/rustynet-cli/src/main.rs"),
+            b"fn main() {}\n",
+        )
+        .unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "base"]);
+        // An out-of-allowlist edit plus an in-allowlist one, both uncommitted.
+        std::fs::write(
+            repo.join("crates/rustynet-cli/src/main.rs"),
+            b"fn main() { /* smuggled */ }\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("documents")).unwrap();
+        std::fs::write(repo.join("documents/ok.md"), b"fine\n").unwrap();
+
+        let base = git(&["rev-parse", "HEAD"]).stdout;
+        let (violations, viol_diff) =
+            server().checkpoint_edit_worktree(repo, "timed_out", &["documents/**".to_string()]);
+        assert_eq!(
+            violations,
+            vec!["crates/rustynet-cli/src/main.rs".to_string()]
+        );
+        assert!(
+            viol_diff.contains("smuggled"),
+            "violation diff must be captured: {viol_diff}"
+        );
+        // The in-scope file WAS committed; the smuggled one was not.
+        let show = git(&["show", "--stat", "HEAD"]);
+        assert!(show.stdout.contains("documents/ok.md"), "{}", show.stdout);
+        assert!(!show.stdout.contains("main.rs"), "{}", show.stdout);
+        let committed = git(&["diff", "--name-only", base.trim(), "HEAD"]).stdout;
+        assert!(!committed.contains("main.rs"), "{}", committed);
+        // And the out-of-scope change is still visibly dirty in the worktree.
+        let status = git(&["status", "--porcelain"]);
+        assert!(
+            status.stdout.contains("crates/rustynet-cli/src/main.rs"),
+            "{}",
+            status.stdout
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn persist_edit_diff_stamps_scope_violation_and_never_done() {
+        // A job whose checkpoint finds out-of-allowlist paths must END in the
+        // distinct scope_violation state — even if the caller had just marked
+        // it done — with the offending paths + diff in the record.
+        let root = std::env::temp_dir().join(format!(
+            "rustynet_persist_scope_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.as_path();
+        let git = |args: &[&str]| {
+            run_with_timeout("git", args, repo, &[], Duration::from_secs(30)).expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        std::fs::write(repo.join("smuggled.txt"), b"out of scope\n").unwrap();
+
+        let mut rec = json!({
+            "job_id": "edit-1-2-3",
+            "state": "done",
+            "worktree": repo.to_string_lossy(),
+            "base_ref": "HEAD",
+            "path_allowlist": ["documents/**"],
+        });
+        server().persist_edit_diff(&mut rec, repo, "HEAD");
+        assert_eq!(rec["state"], "scope_violation", "{}", rec);
+        assert_eq!(rec["pre_scope_state"], "done");
+        let viols = rec["scope_violations"].as_array().unwrap();
+        assert_eq!(viols.len(), 1);
+        assert!(viols[0].as_str().unwrap().contains("smuggled.txt"));
+        assert!(
+            rec["out_of_scope_diff"]
+                .as_str()
+                .unwrap()
+                .contains("out of scope")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn rec_allowlist_falls_back_to_the_default_for_legacy_records() {
+        let rules = rec_allowlist(&json!({}));
+        assert_eq!(rules.len(), DEFAULT_EDIT_PATH_ALLOWLIST.len());
+        let explicit = rec_allowlist(&json!({ "path_allowlist": ["a/**"] }));
+        assert_eq!(explicit, vec!["a/**".to_string()]);
     }
 
     #[test]
@@ -8965,7 +9187,7 @@ mod tests {
         git(&["commit", "-q", "--allow-empty", "-m", "base"]);
 
         let before = git(&["rev-parse", "HEAD"]).stdout;
-        server().checkpoint_edit_worktree(repo, "done");
+        server().checkpoint_edit_worktree(repo, "done", &[]);
         let after = git(&["rev-parse", "HEAD"]).stdout;
         assert_eq!(before, after, "clean worktree must not gain a commit");
         let _ = std::fs::remove_dir_all(&root);
