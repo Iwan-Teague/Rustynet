@@ -9,14 +9,15 @@
 //!
 //! A snapshot pass alone is NOT sufficient (QH-70): the module also evaluates
 //! LIVE dataplane evidence from the daemon's IPC `status` line via
-//! [`evaluate_live_handshake_status`] — at least one live, programmed peer and
-//! a fresh latest-handshake whenever the run topology expects peers. The
+//! [`evaluate_live_handshake_status`] — every expected peer live (the full
+//! `assignments.len()-1` mesh), non-zero programmed peers, and a fresh
+//! latest-handshake whenever the run topology expects peers. The
 //! stage's "pass" therefore means snapshot-valid AND live-handshake-proven;
 //! historical run-matrix rows that passed on the snapshot alone are not
 //! comparable (forward-only boundary, as plan §3 records).
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::VmGuestPlatform;
 
 /// Freshness bound passed to every `*-mesh-status-check` dispatch.
 ///
@@ -130,6 +131,10 @@ fn count_field(tokens: &[(&str, &str)], key: &str) -> Result<u64, String> {
 ///   observed, so pass");
 /// * `expected_live_peers > 0` and `path_live_peer_count == 0` → the node
 ///   reached no peer (the QH-70 defect itself);
+/// * `expected_live_peers > 0` and `path_live_peer_count < expected` →
+///   partial mesh: some tunnel pairs carry live handshakes while at least
+///   one is dead (review F1, 2026-09-07 — the zero-only gate admitted a
+///   single dead pair on any ≥3-node run);
 /// * `expected_live_peers > 0` and `path_programmed_peer_count == 0` → the
 ///   dataplane was never applied;
 /// * `path_latest_live_handshake_unix` future-dated (`> now_unix`, no slack)
@@ -184,6 +189,12 @@ pub fn evaluate_live_handshake_status(
         return fail(format!(
             "path_live_peer_count=0 but {expected_live_peers} live peer(s) expected — \
              no live dataplane evidence ({relay_evidence})"
+        ));
+    }
+    if live < u64::from(expected_live_peers) {
+        return fail(format!(
+            "path_live_peer_count={live} but {expected_live_peers} live peer(s) expected — \
+             partial mesh: at least one tunnel pair is dead ({relay_evidence})"
         ));
     }
     if programmed == 0 {
@@ -556,9 +567,8 @@ mod tests {
          relay_session_state=none relay_session_established_peers=0 \
          gossip_peers_registered=1 gossip_identity_mismatch=false";
 
-    fn status_with(field_name: &str, value: &str) -> String {
-        LIVE_STATUS
-            .split_whitespace()
+    fn status_line_with(base: &str, field_name: &str, value: &str) -> String {
+        base.split_whitespace()
             .map(|token| {
                 if token.starts_with(&format!("{field_name}=")) {
                     format!("{field_name}={value}")
@@ -568,6 +578,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ")
+    }
+
+    fn status_with(field_name: &str, value: &str) -> String {
+        status_line_with(LIVE_STATUS, field_name, value)
     }
 
     fn status_without(field_name: &str) -> String {
@@ -684,5 +698,31 @@ mod tests {
             evaluate_live_handshake_status("n1", &status_with("path_live_peer_count", "0"), 1, NOW)
                 .expect_err("live=0 must fail regardless of programmed");
         assert!(err.contains("no live dataplane evidence"), "got: {err}");
+    }
+
+    /// Review F1 (blocker): on a 3-node run (expected 2) a single dead tunnel
+    /// pair — `live=1`, others alive — must fail. The former zero-only gate
+    /// admitted exactly this shape on any ≥3-node run.
+    #[test]
+    fn partial_live_mesh_fails_when_below_expected() {
+        let err = evaluate_live_handshake_status("n1", LIVE_STATUS, 2, NOW)
+            .expect_err("live < expected must fail on a multi-node run");
+        assert!(
+            err.contains("partial mesh"),
+            "the partial-mesh condition must be named, got: {err}"
+        );
+    }
+
+    /// Review F1 positive half: the same 3-node topology with every pair
+    /// alive passes (live == expected).
+    #[test]
+    fn full_live_mesh_passes_when_live_matches_expected() {
+        let full = status_line_with(
+            &status_with("path_programmed_peer_count", "2"),
+            "path_live_peer_count",
+            "2",
+        );
+        evaluate_live_handshake_status("n1", &full, 2, NOW)
+            .unwrap_or_else(|err| panic!("a full live mesh must pass; got: {err}"));
     }
 }
