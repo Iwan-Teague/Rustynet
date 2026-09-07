@@ -922,3 +922,41 @@ exit 0; `cargo test -p rustynet-cli --features vm-lab --lib -- resolved_plan sta
 NEXT: relaunch attempt 4, same flags, fresh RD. Early check: after prepare_source_archive,
 cat $RD/orchestration/stage_manifest.json and confirm `"role_switch_platform": "macos"` —
 catches a repeat finalizer fail without waiting for the full run.
+
+## 2026-09-07 ~04:50Z — STEP 2 VERDICT: macOS role-transition cell PASS (PROJECT-FIRST)
+
+Run `livelab-1788752486-6d3fea6cf2aa`, commit `6d3fea6c` (clean), report
+`state/live-lab-macos-roleswitch-20260907-032942`, topology macos-utm-1:client /
+debian-headless-4:exit / debian-headless-2:client, `--role-switch-platform macos
+--skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared
+--source-mode local-head --trust-inventory-ready --skip-soak`.
+
+`validate_macos_role_transition` **hard pass rc=0** (evidence:
+`$RD/logs/validate_macos_role_transition.log` + `$RD/state/stages.tsv` +
+`report_state.json` run_complete=true run_passed=true). 17 pass / 0 fail /
+3 skip (anchor/admin/blind_exit — no such roles in topology). Ledger row
+appended: `live_lab_node_run_matrix.csv` 329→330 lines.
+
+Attempts history (stage passed live 4x; only attempt 4 carries the row):
+- 1 (023159): aborted — prepare_source_archive dirty-tree (post-commit log
+  append; lesson recorded).
+- 2 (023534): 17/17 stages pass incl the target, but evidence finalization
+  rejected the run — finalizer's `verify_recorded_plan_not_shrunk`
+  (resolved_plan.rs) never derived C6/C7 role-switch/reboot elections from
+  manifest selectors → "unexpected added stages: [validate_macos_role_transition]".
+- 3 (030720): identical failure after fix `61983773` (reconstruction now
+  honors selectors) because the runner's manifest snapshot (native.rs
+  manifest_selectors) hardcoded `role_switch_platform`/`reboot_platform` to
+  "" — the reconstruction could never see the election. Fix `6d3fea6c`
+  copies the real selectors into the snapshot.
+- 4 (032942): FULL PASS with row. Both fixes regression-pinned in
+  resolved_plan.rs tests.
+
+Parity doc `CrossPlatformRoleParityRefresh_2026-07-23.md` role-transition
+macOS cell updated ⬛→🟢 with run id. LiveLabRunMatrix.md inspected: it is a
+rules doc (no per-run rows) — the CSV ledger is the run record, no edit needed.
+
+NEXT: STEP 3 — macOS reboot-recovery cell (`--reboot-platform macos`, fresh
+RD=state/live-lab-macos-reboot-<ts>, same base flags/topology; verdict from
+`$RD/logs/validate_macos_reboot_recovery.log`; ensure mac guest back on SSH
+after; max 2 attempts; lab tooling fixes only).
