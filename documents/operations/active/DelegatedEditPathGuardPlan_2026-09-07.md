@@ -77,6 +77,26 @@ DONE. All 8 plan steps implemented on branch `ai-edit/edit-1788775612865-74537-0
 - Step R4 (F5 + F6) next: `validate_allowlist_rule` rejects `**` alone (allow-all) and any `\n`/`\r`; single `*` documented as literal.
 - Step R4 (F5 + F6) done: validation rejects `**` and newline-bearing rules (matcher doc documents single `*` as literal); deny cases added to the unit test and the end-to-end call-denial test; `single_star_in_a_rule_is_literal_not_a_wildcard` pins the documented semantics. 128 tests pass. Deviation: none.
 - Step R5 (F4) next: allowlist-file/hook doc comments and the AGENTS/CLAUDE §12.6 sentence now say the hook defends against accident, not against the agent (the checkpoint is the boundary); mirror check green.
+- Step R5 (F4) done: comments + §12.6 sentence updated (also carrying the F5/F6 rule wording); `check_agents_claude_mirror.sh` + `cmp` green.
+- Step R6 (gates) next: clippy (`while_let_on_iterator` fix in the untracked-capture loop), then the full scoped test suite.
+
+## Review fixes applied (DelegatedEditPathGuardReview_2026-09-07)
+
+Applied on branch `ai-edit/edit-1788780913676-61725-0`, one commit per step (clippy fix rides with the final docs commit):
+
+- **F1 (BLOCKER)** — `923d9f3b`: `checkpoint_edit_worktree` now runs `git reset -q` (mixed) BEFORE the scoped `git add -- <in_scope…>` and commits via `git commit --no-verify -m <msg> -- <in_scope…>`, so pre-staged out-of-scope index content (including a staged rename's out-of-scope origin) can never reach the branch; reset/add/commit failures are loud `eprintln!`s with git's stderr (no `let _ =`). Tests: `persist_edit_diff_never_commits_a_pre_staged_out_of_scope_file` (staged smuggle + in-scope edit → `git show --name-only` lacks the smuggled path while the record lists it under `scope_violations`), `checkpoint_leaves_a_staged_rename_origin_out_of_scope`.
+- **F2** — `6247d0d4`: `pin_worktree_hooks` enables `extensions.worktreeConfig` once on the repo and sets `core.hooksPath` worktree-locally to the job's hooks dir; either failing fails the LAUNCH. Test asserts the worktree-scoped config value after creation (and that it outranks a simulated `install.sh` repo-level value).
+- **F3** — `9da51336`: status is read as `git status --porcelain=v1 -z` and split on NUL (renames arrive as `dest\0orig`); quoted/non-ASCII paths are neither dropped nor mangled, unparsable entries stay fail-closed.
+- **F4** — `f1c18f23`: the allowlist-file and hook doc comments and the AGENTS.md/CLAUDE.md §12.6 sentence state the hook defends against accident, not against the agent (the checkpoint is the boundary).
+- **F5** — `349d59b2`: `validate_allowlist_rule` rejects a rule that is exactly `**` (allow-all); a single `*` is documented as a literal character (`single_star_in_a_rule_is_literal_not_a_wildcard`).
+- **F6** — `349d59b2`: rules containing `\n` or `\r` are rejected (the hook's line-delimited allowlist file and the Rust matcher can no longer disagree).
+- **F7** — `923d9f3b`: `edit_job_diff` computes the branch diff from `git diff <pinned base>..HEAD`; the terminal summary's "Changes on the branch" no longer shows dirty-worktree content (landed with F1 because the F1 test pins the branch diff).
+
+Gates at the final commit (pinned 1.88.0 toolchain): `cargo fmt --all -- --check` clean; `cargo clippy -p rustynet-mcp --all-targets --all-features -- -D warnings` clean; `cargo test -p rustynet-mcp --all-targets --all-features` = 288 tests pass across all 5 binaries (25+128+4+110+21); `./scripts/ci/check_agents_claude_mirror.sh` + `cmp AGENTS.md CLAUDE.md` silent.
+
+## STATUS 2026-09-07 11:57 UTC (review-fix job, worktree `edit-1788780913676-61725-0`)
+
+DONE. All seven findings of `DelegatedEditPathGuardReview_2026-09-07` applied and committed on branch `ai-edit/edit-1788780913676-61725-0`: F3 `9da51336`, F1+F7 `923d9f3b`, F2 `6247d0d4`, F5+F6 `349d59b2`, F4 `f1c18f23`, gates + this section in the final commit. Gates: fmt clean; scoped clippy clean; 288/288 `rustynet-mcp` tests pass; AGENTS/CLAUDE mirror verified. Not done (unchanged from the plan's own STATUS): the scripted live `ai_edit_run` smoke and the Open questions (1–3) — out of scope for this job. Next: human review + merge of this branch; open questions remain owner decisions.
 
 ## Open questions
 
