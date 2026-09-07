@@ -112,6 +112,18 @@ fn count_field(tokens: &[(&str, &str)], key: &str) -> Result<u64, String> {
         .map_err(|err| format!("`{key}` is not a count: {raw:?} ({err})"))
 }
 
+/// Parse the guest-clock emission appended to every platform's daemon-status
+/// query (review F2, 2026-09-07): each status command now also prints
+/// `now_unix=<unix seconds>` from the NODE's own clock, so handshake
+/// freshness is judged on the same clock that wrote
+/// `path_latest_live_handshake_unix` — not the orchestrator host clock,
+/// whose skew (VM pause/resume, NTP drift) would flake a healthy node as
+/// "future-dated" or "idle-dead". Missing or unparseable is an error (fail
+/// closed), the same contract as the required `path_*` fields.
+pub fn parse_guest_now_unix(stdout: &str) -> Result<u64, String> {
+    count_field(&status_tokens(stdout), "now_unix")
+}
+
 /// Evaluate the LIVE dataplane half of a `rustynet status` line (QH-70).
 /// Pure, so the contract is testable without a node.
 ///
@@ -698,6 +710,23 @@ mod tests {
             evaluate_live_handshake_status("n1", &status_with("path_live_peer_count", "0"), 1, NOW)
                 .expect_err("live=0 must fail regardless of programmed");
         assert!(err.contains("no live dataplane evidence"), "got: {err}");
+    }
+
+    /// Review F2: the guest-clock emission parses; missing or unparseable
+    /// fails closed (the same contract as the required `path_*` fields).
+    #[test]
+    fn guest_now_unix_parses_and_fails_closed() {
+        assert_eq!(
+            parse_guest_now_unix(LIVE_STATUS),
+            Err("status output has no `now_unix` field".to_owned()),
+            "a status line without the guest-clock emission must fail closed"
+        );
+        let with_now = format!("{LIVE_STATUS} now_unix={NOW}");
+        assert_eq!(parse_guest_now_unix(&with_now), Ok(NOW));
+        assert!(
+            parse_guest_now_unix("now_unix=notanumber").is_err(),
+            "a non-numeric guest clock must fail closed"
+        );
     }
 
     /// Review F1 (blocker): on a 3-node run (expected 2) a single dead tunnel

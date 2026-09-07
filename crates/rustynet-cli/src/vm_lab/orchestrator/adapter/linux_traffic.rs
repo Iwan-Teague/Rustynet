@@ -390,8 +390,15 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 /// control socket is pinned by env (a stale default path must never be read),
 /// and `sudo -n` keeps the query working for non-root SSH users whose socket
 /// directory is root-only.
+///
+/// The trailing `echo now_unix=$(date +%s)` (review F2, 2026-09-07) reports
+/// the GUEST clock alongside the status line, so handshake freshness is
+/// judged on the clock that wrote `path_latest_live_handshake_unix` instead
+/// of the orchestrator host clock. [`query_live_identity`]'s field scan only
+/// looks for `node_id=`, so the extra token is inert there.
 pub(crate) const DAEMON_STATUS_COMMAND: &str = "sudo -n env \
-     RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status";
+     RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status; \
+     echo now_unix=$(date +%s)";
 
 /// Gather a LIVE node-identity for the §4.7 challenge: query the running daemon
 /// over its control socket and tag the result `LiveDaemonSocket`. Unlike
@@ -1632,10 +1639,9 @@ mod tests {
     fn parse_node_clean_probe_reports_running_daemon() {
         let err = parse_node_clean_probe("nft=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(
-            err.to_string()
-                .contains("rustynetd or rustynet-relay still running")
-        );
+        assert!(err
+            .to_string()
+            .contains("rustynetd or rustynet-relay still running"));
     }
 
     #[test]
@@ -1879,12 +1885,10 @@ table ip other_nat {
             dport=443 [UNREPLIED] src=1.1.1.1 dst=203.0.113.7 sport=443 dport=54321 use=1";
         assert!(conntrack_line_mesh_nat_session(non_mesh).is_none());
         // Single tuple / empty => None.
-        assert!(
-            conntrack_line_mesh_nat_session(
-                "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443"
-            )
-            .is_none()
-        );
+        assert!(conntrack_line_mesh_nat_session(
+            "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443"
+        )
+        .is_none());
         assert!(conntrack_line_mesh_nat_session("").is_none());
     }
 
@@ -2149,6 +2153,12 @@ table ip other_nat {
         assert!(
             cmd.contains("sudo -n env"),
             "status query must keep the proven sudo -n env form: {cmd}"
+        );
+        // Review F2: the query must also report the guest clock so handshake
+        // freshness is judged on the node's own clock, not the host's.
+        assert!(
+            cmd.contains("echo now_unix=$(date +%s)"),
+            "status query must emit the guest clock (now_unix) for freshness: {cmd}"
         );
     }
 }

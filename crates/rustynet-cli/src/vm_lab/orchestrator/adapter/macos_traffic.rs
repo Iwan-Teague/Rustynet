@@ -341,9 +341,15 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 /// [`collect_daemon_status`] so both walk the same proven path: the macOS
 /// daemon socket is root-owned under `/private/var/run/rustynet`, so the
 /// query pins it by env behind `sudo -n`.
+///
+/// The trailing `echo now_unix=$(date +%s)` (review F2, 2026-09-07) reports
+/// the GUEST clock alongside the status line, so handshake freshness is
+/// judged on the clock that wrote `path_latest_live_handshake_unix` instead
+/// of the orchestrator host clock. [`query_live_identity`]'s field scan only
+/// looks for `node_id=`, so the extra token is inert there.
 pub(crate) const DAEMON_STATUS_COMMAND: &str = "sudo -n env \
      RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock \
-     /usr/local/bin/rustynet status";
+     /usr/local/bin/rustynet status; echo now_unix=$(date +%s)";
 
 /// Gather a LIVE node-identity for the §4.7 challenge: query the running daemon
 /// over its control socket and tag the result `LiveDaemonSocket`. Unlike
@@ -1369,11 +1375,8 @@ mod tests {
             );
         }
         assert!(cmd.contains("launchctl bootout system/com.rustynet.anchor"));
-        assert!(
-            cmd.contains(
-                "launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist"
-            )
-        );
+        assert!(cmd
+            .contains("launchctl bootout system /Library/LaunchDaemons/com.rustynet.anchor.plist"));
         assert!(cmd.contains("pkill -TERM -x rustynetd"));
         assert!(cmd.contains("pkill -TERM -f '/usr/local/bin/rustynetd.*privileged-helper'"));
         assert!(cmd.contains("pkill -KILL -x rustynetd"));
@@ -1532,10 +1535,9 @@ mod tests {
     fn parse_macos_node_clean_probe_reports_running_daemon() {
         let err = parse_macos_node_clean_probe("pf=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(
-            err.to_string()
-                .contains("rustynetd or rustynet-relay still running")
-        );
+        assert!(err
+            .to_string()
+            .contains("rustynetd or rustynet-relay still running"));
     }
 
     #[test]
@@ -1970,6 +1972,12 @@ mod tests {
         assert!(
             cmd.contains("sudo -n env"),
             "status query must keep the proven sudo -n env form: {cmd}"
+        );
+        // Review F2: the query must also report the guest clock so handshake
+        // freshness is judged on the node's own clock, not the host's.
+        assert!(
+            cmd.contains("echo now_unix=$(date +%s)"),
+            "status query must emit the guest clock (now_unix) for freshness: {cmd}"
         );
     }
 }
