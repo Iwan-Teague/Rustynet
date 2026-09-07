@@ -716,8 +716,9 @@ function Build-ReviewedDaemonArgsJson {
     # next install-release must rotate evidence again.
     #
     # --traversal-max-age-secs 86400: the traversal bundle is issued
-    # with TRAVERSAL_TTL_SECS=120 (the hard cap enforced by ops_e2e),
-    # so the bundle itself is always short-lived. However the Windows
+    # with TRAVERSAL_TTL_SECS=120 configured explicitly (the minter
+    # hard-errors on a missing value rather than defaulting; see
+    # ops_e2e), so the bundle itself is always short-lived. However the Windows
     # lab orchestration pipeline (bootstrap → distribute membership →
     # distribute assignment → distribute traversal → restart service →
     # validate mesh-join) can take 30+ minutes end-to-end, meaning

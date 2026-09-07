@@ -875,6 +875,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
         }
     }
 
@@ -923,6 +924,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
         };
         let outcome = PreflightStage {
             clock_remediation_enabled: false,

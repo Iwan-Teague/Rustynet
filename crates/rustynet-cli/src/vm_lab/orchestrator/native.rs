@@ -310,6 +310,13 @@ pub(crate) fn execute_rust_native_orchestration(
         reboot_platform_macos_elected(config.reboot_platform.as_deref());
     ctx.macos_reboot_recovery_elected = reboot_platform_macos_elected;
 
+    // HP-3 freshness prerequisite: the refresh_signed_bundles stage only runs
+    // when relay-forwarding validation is elected for this run. Like the flag
+    // above this is tightened AFTER the plan is built, so it only stays true
+    // when the stage really is in this run's plan. A resumed context reloads
+    // `false`, the fail-closed direction (the stage grades as a reported skip).
+    ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation;
+
     // MAC-D3: the macOS anchor validator stages need the inventory path to
     // resolve SSH targets inside the legacy vm_lab helpers they call. Run-local
     // only; a resumed context reloads `None` and the stages fail closed.
@@ -461,6 +468,8 @@ pub(crate) fn execute_rust_native_orchestration(
     // a reported skip instead of attempted live evidence. Never silently green.
     ctx.macos_reboot_recovery_elected = reboot_platform_macos_elected
         && plan_stage_ids.contains(&orchestrator::stage::StageId::MacosRebootRecoveryValidation);
+    ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation
+        && plan_stage_ids.contains(&orchestrator::stage::StageId::RefreshSignedBundles);
 
     let reuse_binding: Option<(Vec<orchestrator::stage::StageId>, String)> = if run_only {
         Some((
