@@ -3797,8 +3797,7 @@ impl AiAgentServer {
         // against /dev/null, per-file capped so a junk file cannot blow up the
         // record. The same NUL-separated status output is re-scanned here —
         // no quoting layer, so exotic names match the classifier's paths (F3).
-        let mut status_fields = out.stdout.split('\0');
-        while let Some(entry) = status_fields.next() {
+        for entry in out.stdout.split('\0') {
             if entry.len() < 4 || !entry.starts_with("??") {
                 continue;
             }
