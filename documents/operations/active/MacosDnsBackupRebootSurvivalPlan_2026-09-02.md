@@ -453,3 +453,41 @@ Daemon ~1.5 days (fn + wiring + unit tests), stage ~0.5 day, one live reboot run
 
 - Should re-apply also cover the Linux twin (`/run` backup volatility, plan §1.7) in the same change?
 - Confirm marker content post-reboot (add marker dump to stage evidence) to pin scenario A vs B in the run record.
+
+### Corrected root cause from the live daemon log (2026-09-07, managing session)
+
+Read on macos-utm-1 (`/usr/local/var/log/rustynet/rustynetd-error.log`) after run
+`state/live-lab-macos-reboot-20260907-050612`, which the draft above was written without:
+
+1. At `shutdown -r now` the rollback gate restored every service's networksetup DNS
+   from the backup and retired the backup (correct), then **`set exit mode off` failed
+   with `privileged helper connect failed`** — launchd had already torn the helper down —
+   so the daemon recorded the QH-40 residue marker (`shutdown rollback failed
+   (fail-closed) … trigger=unix_shutdown_signal`). That ordering gap is
+   `MacOsHelperShutdownOrderingDesign_2026-08-27.md`, not a DNS defect.
+2. At boot the M1 startup guard **did** run and logged
+   `rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup
+   recovery)`. The stage reported `startup_recovery_line=absent` because its probe ran
+   `sudo -n grep … /usr/local/var/log/rustynet/*.log` under the unprivileged zsh: the
+   directory is root-owned, the glob expanded to nothing ("no matches found") and grep
+   never ran. Fixed in the stage (root-run `find -exec grep`, accepting either line).
+3. The marker was still present because nothing ever retires it automatically. Fixed in
+   rustynetd: a marker recorded **before the current boot** (kernel `kern.boottime` later
+   than `recorded_unix`) is retired after the startup DNS guard completes, with a loud
+   `shutdown_rollback_residue_retired_after_reboot` line naming the original error; a
+   same-boot marker (daemon restart, residue still live) and an unknown boot time keep the
+   operator-acknowledgement path unchanged (`shutdown_residue::decide_marker_retirement`).
+4. The Ethernet service had no DNS servers post-reboot because the guard restored the
+   pre-protection baseline **by design**; loopback pins only return when the daemon
+   re-applies its generation, which needs a valid signed state — and the lab's traversal
+   and dns_zone bundles (120 s TTL) are stale by then, so the node sits FailClosed. In that
+   state pf's strict ruleset (`pass quick on lo0 all` … `block drop out quick all`) blocks
+   DNS egress, so this is an advertised-posture inconsistency, not a leak. Two follow-ups:
+   (a) the reboot stage must redistribute fresh bundles for the rebooted node before its
+   pin check (reuse the `refresh_signed_bundles` stage helper from
+   `TraversalBundleFreshnessPlan_2026-09-07.md`); (b) design question, filed as QH-78:
+   should a node whose persisted snapshot was full-tunnel / exit-serving re-apply the M1
+   pins on entering FailClosed after a reboot, so fail-closed is never a posture downgrade
+   relative to the last persisted intent.
+
+Proof: reboot attempt 4 with fixes 2 and 3 (and, for the pin check, follow-up (a)).

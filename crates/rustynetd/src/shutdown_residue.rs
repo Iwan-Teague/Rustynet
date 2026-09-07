@@ -254,9 +254,145 @@ pub fn scan(state_path: &Path) -> ResidueScan {
     }
 }
 
-/// Remove the marker. Only ever called from the explicit operator
-/// acknowledgement path — never automatically on daemon start, because an
-/// automatic clear would let a restart erase the only durable evidence that
+/// Log token emitted when a marker is retired automatically because the host
+/// has REBOOTED since the marker was recorded (see [`decide_marker_retirement`]).
+pub const SHUTDOWN_RESIDUE_RETIRED_AFTER_REBOOT_LOG_TOKEN: &str =
+    "shutdown_rollback_residue_retired_after_reboot";
+
+/// What the startup path decided about an existing residue marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkerRetirementDecision {
+    /// No marker, or the marker is unreadable: nothing to retire (an
+    /// unreadable marker stays as a loud finding — it is never removed).
+    Keep,
+    /// The marker was recorded BEFORE the current boot and the startup DNS
+    /// guard completed: the dataplane residue the marker documents (pf
+    /// anchors, routes, exit NAT) cannot survive a reboot, and the one
+    /// residue class that can (system-configuration DNS pins) has just been
+    /// handled by the guard, so the evidence is superseded. Carries the
+    /// marker's recorded reason so the retirement log names what it closes.
+    RetireRebooted {
+        recorded_unix: u64,
+        rollback_error: String,
+    },
+}
+
+/// Pure decision for automatic marker retirement at daemon start.
+///
+/// Retirement is deliberately narrow: it needs a *present* (parseable)
+/// marker, a known boot time that is strictly LATER than the marker's
+/// `recorded_unix` (the host provably rebooted after the failed rollback),
+/// and a startup DNS guard that ran to completion (`guard_ok`). A same-boot
+/// marker — the daemon restarted without a reboot — is KEPT, because the
+/// residue it documents is still live on the host; that case stays on the
+/// explicit operator acknowledgement path. An unknown boot time never
+/// retires (fail closed on the evidence, not the residue).
+pub fn decide_marker_retirement(
+    scan: &ResidueScan,
+    boot_time_unix: Option<u64>,
+    guard_ok: bool,
+) -> MarkerRetirementDecision {
+    let ResidueScan::Present(marker) = scan else {
+        return MarkerRetirementDecision::Keep;
+    };
+    let Some(boot) = boot_time_unix else {
+        return MarkerRetirementDecision::Keep;
+    };
+    if !guard_ok || boot <= marker.recorded_unix {
+        return MarkerRetirementDecision::Keep;
+    }
+    MarkerRetirementDecision::RetireRebooted {
+        recorded_unix: marker.recorded_unix,
+        rollback_error: marker.rollback_error.clone(),
+    }
+}
+
+/// The kernel's boot time as a unix timestamp (`kern.boottime`), or `None`
+/// when it cannot be read — the caller must then treat the reboot as
+/// unproven and keep the marker. Read through the fixed-path `sysctl`
+/// binary with a constant argv (this workspace forbids `unsafe`, so the
+/// libc sysctl call is not an option); the output is parsed by the pure
+/// [`parse_sysctl_boottime`].
+#[cfg(target_os = "macos")]
+pub fn boot_time_unix() -> Option<u64> {
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "kern.boottime"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sysctl_boottime(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `sysctl -n kern.boottime` output, e.g.
+/// `{ sec = 1788758289, usec = 402231 } Sun Sep  7 05:18:09 2026`, into the
+/// `sec` field. Anything unexpected is `None` (never a guess): a missing or
+/// non-positive `sec` is treated as unknown.
+pub fn parse_sysctl_boottime(output: &str) -> Option<u64> {
+    // Fields are `key = value` pairs separated by commas inside braces; match
+    // the `sec` KEY exactly so `usec` can never be mistaken for it.
+    let mut sec: Option<u64> = None;
+    for field in output.split([',', '{', '}', '\n']) {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "sec" {
+            continue;
+        }
+        let digits: String = value
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if digits.is_empty() {
+            return None;
+        }
+        sec = digits.parse().ok();
+        break;
+    }
+    match sec {
+        Some(value) if value > 0 => Some(value),
+        _ => None,
+    }
+}
+
+/// Non-macOS builds do not retire markers automatically (no boot-time source
+/// is wired); the marker stays on the operator-acknowledgement path.
+#[cfg(not(target_os = "macos"))]
+pub fn boot_time_unix() -> Option<u64> {
+    None
+}
+
+/// Retire a marker that [`decide_marker_retirement`] classified as
+/// `RetireRebooted`, logging the token, the marker's original reason and the
+/// reboot evidence so nothing is erased silently. Returns `Ok(true)` when a
+/// marker was removed.
+pub fn retire_marker_after_reboot(
+    state_path: &Path,
+    decision: &MarkerRetirementDecision,
+    boot_time_unix_value: u64,
+) -> Result<bool, String> {
+    match decision {
+        MarkerRetirementDecision::Keep => Ok(false),
+        MarkerRetirementDecision::RetireRebooted {
+            recorded_unix,
+            rollback_error,
+        } => {
+            let removed = acknowledge_marker(state_path)?;
+            log::warn!(
+                "{SHUTDOWN_RESIDUE_RETIRED_AFTER_REBOOT_LOG_TOKEN} residue marker recorded at {recorded_unix} retired: host booted at {boot_time_unix_value}, after the failed rollback, and the startup DNS guard completed (original rollback error: {rollback_error})"
+            );
+            Ok(removed)
+        }
+    }
+}
+
+/// Remove the marker. Called from the explicit operator acknowledgement path
+/// and from [`retire_marker_after_reboot`] — the only automatic caller, and
+/// only for a marker recorded before the current boot (see
+/// [`decide_marker_retirement`]). A plain daemon restart never clears it,
+/// because that would let a restart erase the only durable evidence that
 /// the host is carrying residue.
 ///
 /// Returns `Ok(true)` when a marker was removed, `Ok(false)` when there was
@@ -270,6 +406,117 @@ pub fn acknowledge_marker(state_path: &Path) -> Result<bool, String> {
             "remove residue marker {} failed: {err}",
             path.display()
         )),
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+
+    fn present(recorded_unix: u64) -> ResidueScan {
+        ResidueScan::Present(Box::new(ShutdownResidueMarker::new(
+            recorded_unix,
+            "node-a",
+            TRIGGER_UNIX_SHUTDOWN_SIGNAL,
+            "rollback failed: set exit mode off: privileged helper connect failed",
+        )))
+    }
+
+    #[test]
+    fn retires_only_a_marker_recorded_before_the_current_boot() {
+        let decision = decide_marker_retirement(&present(1_000), Some(2_000), true);
+        assert!(matches!(
+            decision,
+            MarkerRetirementDecision::RetireRebooted {
+                recorded_unix: 1_000,
+                ..
+            }
+        ));
+        if let MarkerRetirementDecision::RetireRebooted { rollback_error, .. } = decision {
+            assert!(rollback_error.contains("privileged helper connect failed"));
+        }
+    }
+
+    #[test]
+    fn keeps_a_same_boot_or_later_marker() {
+        // Recorded after (or at) boot: the daemon restarted without a reboot,
+        // the residue is live — operator path only.
+        assert_eq!(
+            decide_marker_retirement(&present(2_000), Some(2_000), true),
+            MarkerRetirementDecision::Keep
+        );
+        assert_eq!(
+            decide_marker_retirement(&present(3_000), Some(2_000), true),
+            MarkerRetirementDecision::Keep
+        );
+    }
+
+    #[test]
+    fn keeps_when_boot_time_is_unknown_or_the_guard_did_not_complete() {
+        assert_eq!(
+            decide_marker_retirement(&present(1_000), None, true),
+            MarkerRetirementDecision::Keep
+        );
+        assert_eq!(
+            decide_marker_retirement(&present(1_000), Some(2_000), false),
+            MarkerRetirementDecision::Keep
+        );
+    }
+
+    #[test]
+    fn never_retires_a_clean_or_unreadable_scan() {
+        assert_eq!(
+            decide_marker_retirement(&ResidueScan::Clean, Some(2_000), true),
+            MarkerRetirementDecision::Keep
+        );
+        let unreadable = ResidueScan::Unreadable {
+            path: PathBuf::from("/tmp/x"),
+            reason: "parse failed".to_owned(),
+        };
+        assert_eq!(
+            decide_marker_retirement(&unreadable, Some(2_000), true),
+            MarkerRetirementDecision::Keep
+        );
+    }
+
+    #[test]
+    fn parses_the_boottime_sec_field_and_rejects_garbage() {
+        assert_eq!(
+            parse_sysctl_boottime("{ sec = 1788758289, usec = 402231 } Sun Sep  7 05:18:09 2026\n"),
+            Some(1_788_758_289)
+        );
+        assert_eq!(parse_sysctl_boottime("{ sec = 0, usec = 1 }"), None);
+        assert_eq!(parse_sysctl_boottime("sec=12\n"), Some(12));
+        assert_eq!(parse_sysctl_boottime("kern.boottime: unavailable"), None);
+        assert_eq!(parse_sysctl_boottime(""), None);
+        assert_eq!(parse_sysctl_boottime("{ usec = 5 }"), None);
+    }
+
+    #[test]
+    fn retire_removes_the_file_only_for_a_reboot_decision() {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-residue-retire-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let state_path = dir.join("rustynetd.state");
+        let marker = ShutdownResidueMarker::new(
+            1_000,
+            "node-a",
+            TRIGGER_UNIX_SHUTDOWN_SIGNAL,
+            "rollback failed",
+        );
+        record_marker(&state_path, &marker).expect("record");
+        let scan = scan(&state_path);
+        assert!(matches!(scan, ResidueScan::Present(_)));
+        let keep = retire_marker_after_reboot(&state_path, &MarkerRetirementDecision::Keep, 2_000)
+            .expect("keep path");
+        assert!(!keep);
+        assert!(matches!(super::scan(&state_path), ResidueScan::Present(_)));
+        let decision = decide_marker_retirement(&super::scan(&state_path), Some(2_000), true);
+        let removed = retire_marker_after_reboot(&state_path, &decision, 2_000).expect("retire");
+        assert!(removed);
+        assert!(matches!(super::scan(&state_path), ResidueScan::Clean));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

@@ -16,7 +16,7 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **77** (QH-01 through QH-77, contiguous;
+> then claimed; it has since grown to **78** (QH-01 through QH-78, contiguous;
 > re-counted 2026-09-05 — QH-65/66 were filed from the macOS exit membership
 > role-fix design's independent review).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
@@ -6618,3 +6618,10 @@ copy of the tree and asserts the ledger append landed beside that copy.
 The test writes a fake `ps` script into a temp dir and probes it through `local_utm_process_present_with_ps` with a 30 s budget; under load the spawn/permission/temp-dir path is slow enough to trip something (exact assertion not captured — the runner's summary only recorded the FAILED line). Direction: capture the panic text on the next occurrence (run with `-- --nocapture`), check whether the 30 s budget or the `unique_suffix()` temp path is the sensitive part, and consider marking the probe budget test-configurable. Not a merge blocker: untouched by the merge and green in isolation.
 
 **Disposition: OPEN, filed 2026-09-07 at merge time.**
+
+### QH-78 — DESIGN: a macOS node that was full-tunnel / exit-serving before shutdown re-enters FailClosed after a reboot without its M1 loopback DNS pins (advertised-posture downgrade, not a leak)
+**Severity: medium (posture consistency; pf's strict fail-closed ruleset still blocks DNS egress, so no packets leak). Confidence: VERIFIED from the daemon log of run `state/live-lab-macos-reboot-20260907-050612` and the code: the M1 startup guard restores the pre-protection baseline by design, and pins return only with a successful generation apply, which a rebooted lab node cannot complete while its 120 s traversal/dns_zone bundles are stale.**
+
+`force_fail_closed` (phase10.rs) applies only `block_all_egress` (`apply_pf_rules(true)`: `pass quick on lo0 all`, management allowances, `block drop out quick all`); it never re-installs the networksetup pins or the scoped resolver, and `maybe_assert_dns_posture` is gated off while restricted. The persisted session snapshot (`restore_state`) still carries `selected_exit_node`, i.e. the last full-tunnel intent. Design question for the owner: on entering FailClosed with a persisted full-tunnel/exit intent and `protected_dns` enabled, should the daemon re-apply the M1 pin sequence (backup with the residue guard, `-setdnsservers 127.0.0.1` per service, resolv.conf, scoped resolver) WITHOUT touching the strict pf ruleset, so fail-closed is never a posture downgrade relative to the last persisted intent? Constraints: A6's resolver-live probe must gate it (never pin at a dead resolver); idempotent per reconcile tick; failure escalates through the existing ladder. Until decided, the reboot cell proves the pins only after fresh bundles let the daemon re-apply its generation (follow-up (a) in `MacosDnsBackupRebootSurvivalPlan_2026-09-02.md`).
+
+**Disposition: OPEN (owner design decision), filed 2026-09-07.**
