@@ -976,3 +976,6 @@ after; max 2 attempts; lab tooling fixes only).
 - Root cause: gate reads the stage-triage ledger from the stub's run-provenance worktree `state/edit-worktrees/edit-1788746785362-28885-0/documents/operations/live_lab_stage_triage.jsonl` (its own hint prints that path); step 3b recorded into THIS worktree's ledger. Stub confirmed present, remedy absent, in the 28885-0 copy.
 - Fix action now: run live-lab-record-stage-patch with --ledger pointed at the 28885-0 path (exact command the gate prints). That ledger is the designed mechanism, not a source edit.
 - Note: 041137 and 041501 are gate REFUSALS, not lab attempts (0 stages ran) — attempt count for the reboot cell stays at 1 real run; one real relaunch remains.
+
+## 2026-09-07 session 7 — STEP 1 (evidence safety)
+- Committing session-6 ledger rows in provenance worktree 28885-0 (3 files), then merging that branch here; verify run_id livelab-1788756583 count = 1 in local CSV.
