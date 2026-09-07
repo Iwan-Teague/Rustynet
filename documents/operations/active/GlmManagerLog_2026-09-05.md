@@ -879,3 +879,21 @@ RD=state/live-lab-macos-roleswitch-20260907-023129
 ### STEP 2 attempt-1 abort + relaunch (2026-09-07 ~02:35Z)
 Attempt 1 (pid 83171, RD=state/live-lab-macos-roleswitch-20260907-023159) refused at prepare_source_archive: worktree dirty — a stray RD=state/live-lab-macos-roleswitch-20260907-023129 line was appended to this log AFTER commit 3b1b4a38. Same failure class as fwd8c (dirty-tree refusal). Not a stage failure; lab untouched. Remedy: commit this log (incl. the stray line for the record), verify  M documents/operations/active/GlmManagerLog_2026-09-05.md empty, relaunch with fresh RD=state/live-lab-macos-roleswitch-<newts>. Relaunch = attempt 2 of max 2 for this cell.
 RD(attempt2)=state/live-lab-macos-roleswitch-20260907-023534 PID=84398 launched 02:35:34Z; prepare_source_archive PASS (clean tree confirmed), bootstrap_hosts running at 02:38Z.
+
+### 2026-09-07 04:05Z — STEP 2 fix: finalizer plan reconstruction dropped role-switch/reboot elections
+
+Root cause (confirmed in code, no run in flight): the runner elects
+StageId::MacosRoleTransitionValidation / MacosRebootRecoveryValidation from
+`--role-switch-platform` / `--reboot-platform` (native.rs C6/C7 electors), but
+`verify_recorded_plan_not_shrunk` (resolved_plan.rs) rebuilt the expected plan
+with NEITHER flag set — same failure class as the MAC-D1 anchor bug fixed in
+that file earlier. Additionally ManifestSelectors never recorded
+`reboot_platform`, so the reconstruction could not see it at all.
+
+Fix (lab tooling only, allowed scope):
+- native.rs: `role_switch_platform_macos_elected` / `reboot_platform_macos_elected` made pub(crate).
+- live_lab_stage_manifest.rs: ManifestSelectors gains `#[serde(default)] pub reboot_platform: String`, populated from TargetSelectors (legacy manifests parse as empty = not elected → fail-closed toward stricter plan).
+- resolved_plan.rs: reconstruction now derives both elections from the manifest selectors and passes `.with_role_switch_platform_macos(..)` + `.with_reboot_platform_macos(..)` to the PlanBuilder, mirroring native.rs.
+- Tests: `verify_honors_role_switch_and_reboot_selector_elections` (positive roundtrip for rs/rb/both) and `verify_rejects_a_fabricated_role_switch_election_without_a_selector` (negative, asserts "added" + "validate_macos_role_transition"). resolved_plan suite 19/19 pass; stage_manifest suite 6/6; scoped cargo check exit 0; cargo fmt applied; pinned binary rebuilt 04:05Z.
+
+NEXT: relaunch attempt 3 (attempt 2b evidence-finalization fix), same flags, fresh RD. Stage itself already PASSED live in attempt 2 (RD state/live-lab-macos-roleswitch-20260907-023534, 02:47:35→02:47:47Z); re-run needed only for the ledger-backed evidence row.

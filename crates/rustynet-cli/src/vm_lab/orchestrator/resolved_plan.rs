@@ -387,12 +387,31 @@ pub fn verify_recorded_plan_not_shrunk(report_dir: &Path) -> Result<(), String> 
         &manifest_assignments,
         &platform_of_alias,
     );
+    // C6/C7 parity with the runner's election: the runner elects the macOS
+    // role-transition and reboot-recovery validators straight from the raw
+    // `--role-switch-platform` / `--reboot-platform` selectors (no
+    // role-assignment disjunct — the flip/reboot target is the single macOS
+    // guest). The pre-fix reconstruction never set either flag, so every
+    // faithful `--role-switch-platform macos` run was rejected at
+    // finalization with "unexpected added stages:
+    // [validate_macos_role_transition]" — the same failure class as the
+    // MAC-D1 anchor bug above. Deriving both here reproduces the runner's
+    // membership exactly.
+    let role_switch_platform_macos =
+        crate::vm_lab::orchestrator::native::role_switch_platform_macos_elected(
+            Some(selectors.role_switch_platform.as_str()).filter(|s| !s.is_empty()),
+        );
+    let reboot_platform_macos = crate::vm_lab::orchestrator::native::reboot_platform_macos_elected(
+        Some(selectors.reboot_platform.as_str()).filter(|s| !s.is_empty()),
+    );
     let expected_stages = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
         .with_skip_live_suite(selectors.skip_linux_live_suite)
         // MAC-D3: the reconstruction must reproduce the exact membership the
         // runner built — a fast-path run that elected a macOS anchor recorded
         // the three validator stages even with the live suite skipped.
         .with_anchor_platform_macos(anchor_platform_macos)
+        .with_role_switch_platform_macos(role_switch_platform_macos)
+        .with_reboot_platform_macos(reboot_platform_macos)
         .with_enable_chaos_suite(selectors.chaos_suite)
         .with_enable_negative_control(selectors.negative_control_suite)
         .with_enable_relay_forwarding_validation(selectors.relay_forwarding_validation)
@@ -1071,6 +1090,78 @@ mod tests {
         assert!(
             err.contains("added"),
             "the rejection must name the divergence: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_honors_role_switch_and_reboot_selector_elections() {
+        // C6/C7: a run launched with `--role-switch-platform macos
+        // --reboot-platform macos` records both validators, and the
+        // finalization-time reconstruction must elect them from the manifest
+        // selectors exactly like the runner did (regression: the pre-fix
+        // reconstruction dropped both flags and rejected every faithful run
+        // with "unexpected added stages: [validate_macos_role_transition]").
+        for (role_switch, reboot) in [(true, false), (false, true), (true, true)] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let dir = tmp.path();
+            let mut selectors = fast_path_selectors();
+            if role_switch {
+                selectors.role_switch_platform = "macos".to_owned();
+            }
+            if reboot {
+                selectors.reboot_platform = "macos".to_owned();
+            }
+            let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+            crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
+                dir,
+                "vm-lab-orchestrate-live-lab",
+                "full",
+                &selectors,
+                &empty,
+                &[],
+                None,
+            )
+            .expect("write manifest");
+            let mut builder = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
+                .with_skip_live_suite(true)
+                .with_role_switch_platform_macos(role_switch)
+                .with_reboot_platform_macos(reboot);
+            // Keep the builder chain shape identical regardless of election.
+            builder = builder.with_anchor_platform_macos(false);
+            let stages = builder.build();
+            let graph = StageGraph::from_stages(&stages);
+            let selection = PlanSelection::Standard {
+                stages: stages.iter().map(|stage| stage.id()).collect(),
+            };
+            let plan = resolve(&graph, &selection, &[]).expect("resolve");
+            write_resolved_plan(dir, &plan).expect("write plan");
+            verify_recorded_plan_not_shrunk(dir)
+                .expect("a faithful selector-elected run must verify");
+        }
+    }
+
+    #[test]
+    fn verify_rejects_a_fabricated_role_switch_election_without_a_selector() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        // Selector empty → the reconstruction must NOT elect the role-switch
+        // validator; a recorded plan that carries it is an unexpected addition.
+        write_fast_path_manifest(dir, &[]);
+        let stages = crate::vm_lab::orchestrator::plan::PlanBuilder::new()
+            .with_skip_live_suite(true)
+            .with_role_switch_platform_macos(true)
+            .build();
+        let graph = StageGraph::from_stages(&stages);
+        let selection = PlanSelection::Standard {
+            stages: stages.iter().map(|stage| stage.id()).collect(),
+        };
+        let plan = resolve(&graph, &selection, &[]).expect("resolve");
+        write_resolved_plan(dir, &plan).expect("write plan");
+        let err = verify_recorded_plan_not_shrunk(dir)
+            .expect_err("no selector may not verify a role-switch-carrying plan");
+        assert!(
+            err.contains("added") && err.contains("validate_macos_role_transition"),
+            "the rejection must name the added role-transition stage: {err}"
         );
     }
 

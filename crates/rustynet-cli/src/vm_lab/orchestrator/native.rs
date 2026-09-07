@@ -1219,7 +1219,7 @@ pub(crate) fn anchor_platform_macos_elected(
 /// the run config's `role_switch_platform` alone — the flip target is the
 /// single macOS guest, so unlike the MAC-D3 anchor election there is no
 /// role-assignment disjunct.
-fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> bool {
+pub(crate) fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> bool {
     role_switch_platform == Some("macos")
 }
 
@@ -1227,7 +1227,7 @@ fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> boo
 /// role-transition election: the reboot target is the single macOS guest, so
 /// the run config's `reboot_platform` alone decides the election — no
 /// role-assignment disjunct.
-fn reboot_platform_macos_elected(reboot_platform: Option<&str>) -> bool {
+pub(crate) fn reboot_platform_macos_elected(reboot_platform: Option<&str>) -> bool {
     reboot_platform == Some("macos")
 }
 
