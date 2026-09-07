@@ -588,7 +588,11 @@ const DEFAULT_EDIT_PATH_ALLOWLIST: &[&str] = &[
 ///   (`crates/x/**` matches everything under `crates/x/`);
 /// - a rule without `**` is a directory-prefix rule: it matches the directory
 ///   itself and everything under it (`documents` covers `documents/x.md` but
-///   NOT `documents_evil/x.md` — the `/` boundary is required);
+///   NOT `documents_evil/x.md` — the `/` boundary is required). A single `*`
+///   is a LITERAL character here, not a single-character wildcard: rule
+///   `documents/*.md` matches only a path literally spelled `documents/*.md`
+///   (F5, DelegatedEditPathGuardReview_2026-09-07 — documented so the
+///   "gitignore-style" wording cannot be read as promising glob semantics);
 /// - any path containing a `..` component matches nothing, regardless of the
 ///   rules — fail closed on traversal attempts;
 /// - empty rules match nothing (deny).
@@ -619,8 +623,12 @@ fn path_in_allowlist(rel: &str, rules: &[String]) -> bool {
 }
 
 /// Validate one caller-supplied allowlist rule. Rules must be relative,
-/// non-empty (after trimming), and contain no `..` component — anything else
-/// is an error so the CALL is denied rather than silently narrowed or widened.
+/// non-empty (after trimming), contain no `..` component, no newline (the
+/// hook's allowlist file is line-delimited — F6), and must not be exactly
+/// `**` (which would match every path — the driving agent opting itself into
+/// allow-all; F5). A single `*` is a literal character, not a wildcard. Any
+/// violation is an error so the CALL is denied rather than silently narrowed
+/// or widened.
 fn validate_allowlist_rule(rule: &str) -> Result<(), String> {
     let rule = rule.trim();
     if rule.is_empty() {
@@ -631,6 +639,19 @@ fn validate_allowlist_rule(rule: &str) -> Result<(), String> {
     }
     if rule.split('/').any(|c| c == "..") {
         return Err("rule must not contain a '..' component".to_string());
+    }
+    if rule == "**" {
+        return Err(
+            "rule '**' would allow every path (allow-all) — name real paths instead".to_string(),
+        );
+    }
+    if rule.contains('\n') || rule.contains('\r') {
+        return Err(
+            "rule must not contain a newline or carriage return (the worktree \
+             allowlist file is line-delimited; a multi-line rule would mean \
+             different things to the hook and the matcher)"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -8846,6 +8867,24 @@ mod tests {
         assert!(validate_allowlist_rule("/etc/passwd").is_err());
         assert!(validate_allowlist_rule("").is_err());
         assert!(validate_allowlist_rule("   ").is_err());
+        // F5: `**` alone is allow-all — the very actor this guard constrains
+        // must not be able to opt itself into it with one explicit-looking
+        // rule.
+        assert!(validate_allowlist_rule("**").is_err());
+        // F6: a newline inside one rule would be TWO rules to the hook's
+        // line-delimited allowlist file but ONE unmatchable rule to the Rust
+        // matcher — the layers must never disagree.
+        assert!(validate_allowlist_rule("documents/**\ncrates/**").is_err());
+        assert!(validate_allowlist_rule("documents/**\r\nx").is_err());
+    }
+
+    #[test]
+    fn single_star_in_a_rule_is_literal_not_a_wildcard() {
+        // F5, documented half: a rule without `**` matches itself and its
+        // directory contents; a lone `*` is an ordinary character.
+        let rules = vec!["documents/*.md".to_string()];
+        assert!(path_in_allowlist("documents/*.md", &rules));
+        assert!(!path_in_allowlist("documents/notes.md", &rules));
     }
 
     #[test]
@@ -8934,6 +8973,10 @@ mod tests {
             json!({ "task": "x", "path_allowlist": ["a/../b"] }),
             json!({ "task": "x", "path_allowlist": [""] }),
             json!({ "task": "x", "path_allowlist": [] }),
+            // F5: `**` alone is allow-all — denied.
+            json!({ "task": "x", "path_allowlist": ["**"] }),
+            // F6: an embedded newline would fork the two enforcement layers.
+            json!({ "task": "x", "path_allowlist": ["documents/**\ncrates/**"] }),
             json!({ "task": "x", "path_allowlist": "documents/**" }),
         ] {
             let r = s.call_edit_run(&bad);
