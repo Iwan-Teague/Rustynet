@@ -1054,3 +1054,12 @@ Commits since 092e94cf, grouped:
 - Rebuilding pinned orchestrator binary from THIS worktree (edit-1788757368303-22407-0) so ledgers resolve here; then macOS reboot-recovery attempt 3 with both fixes (b4c30979 + 1ff7d04a) in tree.
 
 - Pinned binary rebuilt from this worktree (BUILD_RC=0). Launch-gate stub check + mac SSH preflight next; then attempt 3 launch.
+
+## 2026-09-07 session 7 — STEP 3 attempt 3 RESULT: FAIL (genuine product gap, no 4th attempt)
+
+- Run livelab-1788758343-06dfb93915d5 (commit 06dfb93915d5), RD state/live-lab-macos-reboot-20260907-050612, PID 23489, 05:06:12→~05:20Z. Ledger rows landed in THIS worktree (binary rebuilt here — cross-worktree divergence cured; grep run_id CSV = 1).
+- stages.tsv: all setup stages pass incl. pre-reboot evidence (b4c30979 held) and shutdown dispatch (1ff7d04a held — no ssh-255 failure; Mac provably rebooted, uptime 2 min post-run, hostname answers).
+- validate_macos_reboot_recovery FAIL rc=1, exact error: post-reboot verification failed: startup_recovery_line=absent; shutdown_residue_marker=present; zsh:1: no matches found: /usr/local/var/log/rustynet/*.log; "service Ethernet is not loopback-pinned: There aren't any DNS Servers set on Ethernet."
+- Diagnosis (direct code read vm_lab/mod.rs:15263-15303; glm-5.3-flash ai_read UNAVAILABLE — deepseek 402, glm MCP timeout + drive script malformed-response; two attempts, moved on per budget): daemon IS live post-reboot (bounded probe passed: daemon-live marker + node id) and boottime changed, but (a) QH-40 shutdown-residue marker still PRESENT — daemon recovery did not retire shutdown-residue.json; (b) Ethernet has NO DNS servers — daemon did not re-apply loopback DNS pinning after reboot. The pin-check exit 1 is the stage working as designed (fail-closed). This is a GENUINE macOS recovery gap in rustynetd, not lab tooling. Secondary tooling noise only: hardcoded log glob /usr/local/var/log/rustynet/*.log matches nothing under zsh (nomatch) — check path fragility, non-gating.
+- Disposition: stub recorded DECLINED-as-product-gap (exact CLI form, this worktree ledger). PROPOSED fix (owner; I never touch rustynetd/trust-state): in rustynetd macOS recovery — retire shutdown-residue.json once posture re-applied, re-pin loopback DNS after boot, verify launchd StandardOutPath matches the stage glob (or relax stage glob). No 4th attempt per instructions.
+- Mac guest back on SSH post-run: macs-Virtual-Machine.local, up 2 mins. Launch log: 0 "evidence finalization failed".
