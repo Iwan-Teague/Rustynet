@@ -7,8 +7,8 @@ use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    PowerShellScript, WINDOWS_RELAY_SERVICE_NAME, WINDOWS_RUSTYNET_PATH, WINDOWS_SERVICE_NAME,
-    WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT, ps_quote, run_remote_ps, run_remote_ps_check,
+    ps_quote, run_remote_ps, run_remote_ps_check, PowerShellScript, WINDOWS_RELAY_SERVICE_NAME,
+    WINDOWS_RUSTYNET_PATH, WINDOWS_SERVICE_NAME, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{AdapterError, TrafficTestResult, TunnelsList};
@@ -157,8 +157,31 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
 /// pipe), full text returned instead of just the node id. A transport failure
 /// is `Err` (fail closed), never an empty string.
 pub fn collect_daemon_status(conn: &NodeConnection) -> Result<String, AdapterError> {
-    let script = live_identity_status_script()?;
+    let script = daemon_status_script()?;
     run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)
+}
+
+/// The validated argv both status seams run: the trust CLI's `status` verb
+/// (no shell, no untrusted interpolation — the only dynamic part is the
+/// reviewed install path).
+fn trust_cli_status_argv() -> Result<[ValidatedArg; 2], AdapterError> {
+    Ok([
+        ValidatedArg::windows_path(WINDOWS_RUSTYNET_PATH)?,
+        ValidatedArg::cli_token("status")?,
+    ])
+}
+
+/// Build the PowerShell script [`collect_daemon_status`] runs: the trust-CLI
+/// status call plus a trailing guest-clock emission (`now_unix=<unix>`,
+/// review F2, 2026-09-07) so handshake freshness is judged on the node's own
+/// clock. Split from [`query_live_identity`], which keeps the bare status
+/// call — its field scan only needs `node_id=`.
+fn daemon_status_script() -> Result<PowerShellScript, AdapterError> {
+    let argv = trust_cli_status_argv()?;
+    PowerShellScript::from_call_argv_with_guest_clock(
+        "windows daemon status with guest clock",
+        &argv,
+    )
 }
 
 /// Build the PowerShell script [`query_live_identity`] runs: invoke the
@@ -167,10 +190,7 @@ pub fn collect_daemon_status(conn: &NodeConnection) -> Result<String, AdapterErr
 fn live_identity_status_script() -> Result<PowerShellScript, AdapterError> {
     // QH-01 Step 4b: the single interpolated value (the reviewed install path)
     // is validated as a windows path and ps-quoted by the seam renderer.
-    let argv = [
-        ValidatedArg::windows_path(WINDOWS_RUSTYNET_PATH)?,
-        ValidatedArg::cli_token("status")?,
-    ];
+    let argv = trust_cli_status_argv()?;
     PowerShellScript::from_call_argv("windows live identity status", &argv)
 }
 
@@ -1063,7 +1083,7 @@ pub fn issue_bundles_to_dir(
     env_content: &str,
     local_out_dir: &std::path::Path,
 ) -> Result<(), AdapterError> {
-    use crate::vm_lab::orchestrator::adapter::windows_install::{WINDOWS_STAGING_DIR, ps_quote};
+    use crate::vm_lab::orchestrator::adapter::windows_install::{ps_quote, WINDOWS_STAGING_DIR};
     use std::io::Write as IoWrite;
     let pid = std::process::id();
     let remote_env = format!(r"{WINDOWS_STAGING_DIR}\rn_issue_env_{pid}.env");
@@ -1355,12 +1375,10 @@ mod tests {
     #[test]
     fn parse_winnat_nat_session_line_fails_closed_on_non_ok_output() {
         // The FAIL line from the inline script parses to nothing.
-        assert!(
-            parse_winnat_nat_session_line(
-                "FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address"
-            )
-            .is_none()
-        );
+        assert!(parse_winnat_nat_session_line(
+            "FAIL: no WinNAT session translating a mesh-sourced (100.64.0.0/10) client address"
+        )
+        .is_none());
         // Empty / garbage / malformed pair syntax also parse to nothing.
         assert!(parse_winnat_nat_session_line("").is_none());
         assert!(parse_winnat_nat_session_line("garbage").is_none());
@@ -1706,26 +1724,20 @@ mod tests {
 
     #[test]
     fn parse_windows_node_clean_probe_accepts_fully_clean_node() {
-        assert!(
-            parse_windows_node_clean_probe(
-                "rules=0 outbound=allow service=stopped relay=stopped adapter=-\n"
-            )
-            .is_ok()
-        );
+        assert!(parse_windows_node_clean_probe(
+            "rules=0 outbound=allow service=stopped relay=stopped adapter=-\n"
+        )
+        .is_ok());
         // An absent service is benign (a never-installed / uninstalled node).
-        assert!(
-            parse_windows_node_clean_probe(
-                "rules=0 outbound=allow service=absent relay=absent adapter=-"
-            )
-            .is_ok()
-        );
+        assert!(parse_windows_node_clean_probe(
+            "rules=0 outbound=allow service=absent relay=absent adapter=-"
+        )
+        .is_ok());
         // Tolerates a leading banner/log line before the result line.
-        assert!(
-            parse_windows_node_clean_probe(
-                "WARNING: blah\nrules=0 outbound=allow service=stopped relay=stopped adapter=-"
-            )
-            .is_ok()
-        );
+        assert!(parse_windows_node_clean_probe(
+            "WARNING: blah\nrules=0 outbound=allow service=stopped relay=stopped adapter=-"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -1734,10 +1746,9 @@ mod tests {
             "rules=3 outbound=allow service=stopped relay=stopped adapter=-",
         )
         .expect_err("leftover firewall rules must fail");
-        assert!(
-            err.to_string()
-                .contains("3 leftover RustyNet firewall rule")
-        );
+        assert!(err
+            .to_string()
+            .contains("3 leftover RustyNet firewall rule"));
         let err2 = parse_windows_node_clean_probe(
             "rules=0 outbound=block service=stopped relay=stopped adapter=-",
         )
@@ -1951,6 +1962,38 @@ mod tests {
         assert!(
             !rendered.contains("rustynetd.env"),
             "live identity must not read the config env-file: {rendered}"
+        );
+    }
+
+    /// Review F2 mutation guard: the daemon-status script MUST end with the
+    /// guest-clock emission (`now_unix=` from
+    /// `[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()`) so handshake freshness
+    /// is judged on the node's own clock, while the live-identity script
+    /// keeps the bare status call — keeping the two seams distinct proves the
+    /// emission was added to the status path deliberately, not smeared over
+    /// both.
+    #[test]
+    fn daemon_status_script_emits_guest_clock_but_identity_script_does_not() {
+        let status = super::daemon_status_script().expect("install path must pass ps_quote");
+        let rendered = status.as_str();
+        assert!(
+            rendered.contains("now_unix="),
+            "daemon status must report the guest clock: {rendered}"
+        );
+        assert!(
+            rendered.contains("[DateTimeOffset]::UtcNow.ToUnixTimeSeconds()"),
+            "the guest clock must come from the node's own clock: {rendered}"
+        );
+        assert!(
+            rendered.contains("'status'"),
+            "daemon status must still run the status verb: {rendered}"
+        );
+        let identity =
+            super::live_identity_status_script().expect("install path must pass ps_quote");
+        let identity_rendered = identity.as_str();
+        assert!(
+            !identity_rendered.contains("now_unix="),
+            "live identity keeps the bare status call: {identity_rendered}"
         );
     }
 

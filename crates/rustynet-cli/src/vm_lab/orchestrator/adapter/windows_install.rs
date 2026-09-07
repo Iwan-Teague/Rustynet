@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use base64::prelude::*;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::VmGuestPlatform;
 
 pub const WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
@@ -163,6 +163,24 @@ impl PowerShellScript {
             rendered.push_str(&quoted);
         }
         rendered.push_str(" 2>&1; Write-Output $out");
+        Ok(Self(rendered))
+    }
+
+    /// [`PowerShellScript::from_call_argv`] plus a trailing guest-clock
+    /// emission (review F2, 2026-09-07): the daemon-status query must report
+    /// the NODE's own clock (`now_unix=<unix seconds>`) so handshake
+    /// freshness is judged against the clock that wrote
+    /// `path_latest_live_handshake_unix`, not the orchestrator host. The
+    /// suffix is a fixed compile-time literal whose `[DateTimeOffset]::UtcNow`
+    /// expression takes no input, so nothing interpolated can reach it.
+    pub(crate) fn from_call_argv_with_guest_clock(
+        label: &str,
+        argv: &[crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg],
+    ) -> Result<Self, AdapterError> {
+        const GUEST_CLOCK_SUFFIX: &str = "; Write-Output \
+             (\"now_unix=\" + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())";
+        let mut rendered = Self::from_call_argv(label, argv)?.0;
+        rendered.push_str(GUEST_CLOCK_SUFFIX);
         Ok(Self(rendered))
     }
 
@@ -1213,7 +1231,7 @@ fn run_windows_e2e_bootstrap(
 /// Returns `(verifier_key_file_content, trust_evidence_file_content)`.
 fn generate_local_trust_material() -> Result<(String, String), String> {
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::{TryRngCore, rngs::OsRng};
+    use rand::{rngs::OsRng, TryRngCore};
     use zeroize::Zeroize;
 
     let mut seed = [0u8; 32];
@@ -2320,11 +2338,9 @@ mod tests {
             .expect("status query script should render");
 
         assert!(script.as_str().contains("Get-Service -Name 'RustyNet'"));
-        assert!(
-            script
-                .as_str()
-                .contains("if ($svc) { $svc.Status.ToString() } else { 'Absent' }")
-        );
+        assert!(script
+            .as_str()
+            .contains("if ($svc) { $svc.Status.ToString() } else { 'Absent' }"));
         // A service name with a quote is spelled inertly by the PowerShell
         // quoting seam, never as syntax.
         let hostile = windows_daemon_status_query_script("Rusty'Net")

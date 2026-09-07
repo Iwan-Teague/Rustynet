@@ -5,7 +5,9 @@ use crate::vm_lab::orchestrator::adapter::node_adapter::{NodeAdapter, RoleValida
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::role_validation::mesh_status::evaluate_live_handshake_status;
+use crate::vm_lab::orchestrator::role_validation::mesh_status::{
+    evaluate_live_handshake_status, parse_guest_now_unix,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const REPORTED_SKIPS_FILENAME: &str = "mesh_status_validation.reported_skips.json";
@@ -110,6 +112,8 @@ impl OrchestrationStage for MeshStatusValidationStage {
 /// passes or the deadline expires; a poll that never got a passing status
 /// fails the stage (fail-closed, the existing `failures` path). Every peer
 /// other than this node is expected live: `assignments.len() - 1`.
+/// Freshness is judged on the GUEST clock the status query reports
+/// (`now_unix=<...>`, review F2) — never the orchestrator host clock.
 fn poll_live_handshake(
     adapter: &dyn NodeAdapter,
     alias: &str,
@@ -119,11 +123,21 @@ fn poll_live_handshake(
     loop {
         let attempt = match adapter.collect_daemon_status() {
             Ok(status) => {
-                let now_unix = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_err(|e| format!("{alias}: live handshake: system clock error: {e}"))?
-                    .as_secs();
-                evaluate_live_handshake_status(alias, &status, expected_live_peers, now_unix)
+                // Review F2: freshness is judged on the GUEST clock the
+                // status query itself reports (`now_unix=<...>`), not the
+                // orchestrator host clock — host/guest skew (VM
+                // pause/resume, NTP drift) must not flake a healthy node.
+                // A missing or unparseable emission is an Err and re-enters
+                // the retry loop (fail closed).
+                match parse_guest_now_unix(&status) {
+                    Ok(now_unix) => evaluate_live_handshake_status(
+                        alias,
+                        &status,
+                        expected_live_peers,
+                        now_unix,
+                    ),
+                    Err(err) => Err(format!("{alias}: live handshake: {err}")),
+                }
             }
             Err(e) => Err(format!("{alias}: live handshake: {e}")),
         };
