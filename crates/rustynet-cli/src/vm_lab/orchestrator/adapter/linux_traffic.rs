@@ -385,6 +385,14 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
     }
 }
 
+/// The live `rustynet status` query, shared by [`query_live_identity`] and
+/// [`collect_daemon_status`] so both walk the same proven path: the daemon's
+/// control socket is pinned by env (a stale default path must never be read),
+/// and `sudo -n` keeps the query working for non-root SSH users whose socket
+/// directory is root-only.
+pub(crate) const DAEMON_STATUS_COMMAND: &str = "sudo -n env \
+     RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status";
+
 /// Gather a LIVE node-identity for the §4.7 challenge: query the running daemon
 /// over its control socket and tag the result `LiveDaemonSocket`. Unlike
 /// [`collect_node_id`], this does NOT fall back to any config artifact and does
@@ -392,11 +400,7 @@ pub fn collect_node_id(conn: &NodeConnection) -> Result<String, AdapterError> {
 /// single short-timeout query is correct (a hung/absent daemon must FAIL the
 /// challenge, never be tolerated).
 pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, AdapterError> {
-    let status = ssh::run_remote(
-        conn,
-        "sudo -n env RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status",
-        SHORT_TIMEOUT,
-    )?;
+    let status = ssh::run_remote(conn, DAEMON_STATUS_COMMAND, SHORT_TIMEOUT)?;
     match ssh::parse_status_node_id(&status) {
         Some(node_id) => Ok(IdentityEvidence::live(node_id)),
         None => Err(AdapterError::Protocol {
@@ -406,6 +410,15 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
             ),
         }),
     }
+}
+
+/// Fetch the daemon's verbatim `rustynet status` text — the QH-70
+/// live-handshake-evidence surface. Same proven command as
+/// [`query_live_identity`] (socket env pinned, `sudo -n`), full text returned
+/// instead of just the node id. A transport failure is `Err` (fail closed),
+/// never an empty string.
+pub fn collect_daemon_status(conn: &NodeConnection) -> Result<String, AdapterError> {
+    ssh::run_remote(conn, DAEMON_STATUS_COMMAND, SHORT_TIMEOUT)
 }
 
 /// Collect the daemon-reported STUN server-reflexive candidates via
@@ -2111,5 +2124,28 @@ table ip other_nat {
         // A rejected argument means from_args never produces a command string.
         let rejected = ValidatedArg::ip("100.64.0.1 && id");
         assert!(rejected.is_err(), "metacharacter ip must be rejected");
+    }
+
+    /// QH-70 dispatch mutation guard: the shared status command MUST pin the
+    /// daemon socket by env and MUST invoke `rustynet status`. Dropping either
+    /// (querying a stale default socket, or swapping the status verb away)
+    /// breaks this test — the same discrimination the addendum asks the
+    /// MockShellHost argv test to provide, applied to the command string the
+    /// adapter actually runs.
+    #[test]
+    fn daemon_status_command_pins_socket_env_and_status_verb() {
+        let cmd = super::DAEMON_STATUS_COMMAND;
+        assert!(
+            cmd.contains("RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock"),
+            "status query must pin the daemon socket: {cmd}"
+        );
+        assert!(
+            cmd.contains("/usr/local/bin/rustynet status"),
+            "status query must run the CLI's status verb: {cmd}"
+        );
+        assert!(
+            cmd.contains("sudo -n env"),
+            "status query must keep the proven sudo -n env form: {cmd}"
+        );
     }
 }

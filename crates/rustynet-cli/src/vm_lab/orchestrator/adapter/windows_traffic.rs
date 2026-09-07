@@ -151,6 +151,16 @@ pub fn query_live_identity(conn: &NodeConnection) -> Result<IdentityEvidence, Ad
     live_identity_from_status(&status)
 }
 
+/// Fetch the daemon's verbatim `rustynet status` text — the QH-70
+/// live-handshake-evidence surface. Same proven script as
+/// [`query_live_identity`] (trust CLI `status` verb over the daemon-control
+/// pipe), full text returned instead of just the node id. A transport failure
+/// is `Err` (fail closed), never an empty string.
+pub fn collect_daemon_status(conn: &NodeConnection) -> Result<String, AdapterError> {
+    let script = live_identity_status_script()?;
+    run_remote_ps(conn, script.as_str(), SHORT_TIMEOUT)
+}
+
 /// Build the PowerShell script [`query_live_identity`] runs: invoke the
 /// trust CLI's `status` verb (no shell, no untrusted interpolation — the
 /// only dynamic part is the reviewed install path).
