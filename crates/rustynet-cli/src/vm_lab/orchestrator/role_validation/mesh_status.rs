@@ -16,8 +16,8 @@
 //! historical run-matrix rows that passed on the snapshot alone are not
 //! comparable (forward-only boundary, as plan §3 records).
 
-use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
 /// Freshness bound passed to every `*-mesh-status-check` dispatch.
 ///
