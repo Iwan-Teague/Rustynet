@@ -1066,3 +1066,27 @@ Commits since 092e94cf, grouped:
 
 ## 2026-09-07 session 7 — STEP 4
 - Filing QH-74 (orchestrator resolves ledgers relative to BUILD worktree) in QualityHardeningTodo_2026-07-25.md, existing entry format. Checking fixability as one-liner first.
+
+## 2026-09-07 session 7 — STEP 5
+- Writing final STATUS + refreshed MERGE NOTE; last commit of session.
+
+## STATUS 2026-09-07T05:4?Z (session 7 close-out)
+
+DONE:
+- STEP 1 ledger reconciliation: session-6 rows (reboot attempt 2 livelab-1788755496, anchor re-proof livelab-1788756583) + 3 stub remedies committed in provenance worktree 28885-0 (b8c28039), branch merged here (d94defab, jsonl conflict resolved append-only, both sides kept). `grep -c livelab-1788756583 …run_matrix.csv` = 1 verified.
+- STEP 2: stray root GlmManagerLog_2026-09-05.md folded into documents/operations/active/GlmManagerLog_2026-09-05.md, removed (9c6c807e).
+- STEP 3: pinned binary REBUILT from this worktree (06dfb939) — ledgers now resolve HERE (attempt-3 rows landed locally). macOS reboot-recovery attempt 3 (livelab-1788758343-06dfb93915d5, RD state/live-lab-macos-reboot-20260907-050612): both prior fixes held (pre-reboot capture passed; shutdown dispatch accepted, Mac provably rebooted, uptime 2 min post-run, daemon-live probe passed). Stage FAIL on GENUINE product gap: shutdown-residue marker present + Ethernet DNS not re-pinned post-reboot — stage fail-closed gate correct; stub DECLINED with PROPOSED rustynetd fix (45ca03e1). No 4th attempt (per instructions, and it is not a tooling bug). Mac guest back on SSH.
+- STEP 4: QH-74 filed (ac7c4646) — orchestrator resolves ledgers via compile-time env!("CARGO_MANIFEST_DIR") (live_lab_run_matrix.rs:950, 42 call sites); mechanism + runtime-resolution fix direction; proposed not fixed (not a one-liner, no test to adapt).
+- glm-5.3-flash triage attempted per rules: deepseek 402 (credit), glm MCP timeout, drive-script malformed-response — diagnosis done from direct code read instead (vm_lab/mod.rs:15263-15303).
+
+NOT DONE / OPEN (owner):
+- reboot-recovery macOS row stays 🔴 — now a PRODUCT defect, not tooling: rustynetd macOS recovery must retire shutdown-residue.json and re-apply loopback DNS pinning on boot (proposed in stub + above). Lab-tooling side note: recovery-line check hardcodes /usr/local/var/log/rustynet/*.log (zsh nomatch noise, non-gating).
+
+### MERGE NOTE (for the owner)
+
+This branch (session 6+7, 48 commits since 092e94cf) contains:
+(a) Lab-tooling fixes + proving runs: 61983773 finalizer plan derivation (proved run 032942 full pass); 6d3fea6c manifest selectors snapshot (proved 032942); b4c30979 BSD stat 600|0600 (proved 041909); 1ff7d04a ssh-255 shutdown-dispatch acceptance (proved 050612: dispatch accepted, Mac rebooted).
+(b) Product-gap evidence (NOT fixed — proposed only): attempt 3 (050612) proves rustynetd macOS recovery leaves QH-40 residue marker + does not re-pin Ethernet DNS post-reboot. Fix belongs in rustynetd (forbidden zone for this manager).
+(c) Ledger/doc records incl. session-7 reconciliation (b8c28039 in 28885-0 + merge d94defab here) and QH-74 (ac7c4646).
+(d) Open owner decisions: rustynetd reboot-recovery product gap (above); relay frame-forwarding stale-bundle trust-state refresh (PROPOSED, see fwd8 verdict); QH-70; QH-74; CP-1 pf override persistence (not loaded this session — macOS↔Linux dataplane stages never ran, by instruction).
+The 28885-0 worktree's ledger commits are merged; its branch can be discarded after merge. Ledger append paths now correct for any binary rebuilt from the merged tree (QH-74 for the durable fix).
