@@ -2517,6 +2517,15 @@ impl AiAgentServer {
             std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))
                 .map_err(|e| format!("cannot chmod +x per-worktree pre-commit hook: {e}"))?;
         }
+        // F2 (DelegatedEditPathGuardReview_2026-09-07): a repo-level
+        // `core.hooksPath` (set by scripts/git-hooks/install.sh) is shared by
+        // every linked worktree and SHADOWS `$GIT_DIR/hooks` — the guard hook
+        // above would silently never run on any clone that installed the
+        // hooks. Enable `extensions.worktreeConfig` once on the repo and pin
+        // `core.hooksPath` worktree-locally to this job's hooks dir. Either
+        // command failing fails the LAUNCH: an unguarded worktree must not
+        // start pretending it is scoped.
+        self.pin_worktree_hooks(&self.repo_root, &path, &hooks_dir)?;
         let exclude_dir = common_dir.join("worktrees").join(job_id).join("info");
         std::fs::create_dir_all(&exclude_dir)
             .map_err(|e| format!("cannot create per-worktree info dir: {e}"))?;
@@ -2526,6 +2535,60 @@ impl AiAgentServer {
         )
         .map_err(|e| format!("cannot write per-worktree info/exclude: {e}"))?;
         Ok((path, branch, base_sha))
+    }
+
+    /// Make the per-worktree guard hook actually FIRE: enable
+    /// `extensions.worktreeConfig` once on the repo, then pin
+    /// `core.hooksPath` worktree-locally to the job's hooks dir.
+    ///
+    /// Why (F2, DelegatedEditPathGuardReview_2026-09-07): `scripts/git-hooks/
+    /// install.sh` sets a repo-level `core.hooksPath`, repo config is shared
+    /// by every linked worktree, and git consults `core.hooksPath` BEFORE
+    /// `$GIT_DIR/hooks` — so on any clone that ran install.sh, the hook
+    /// written into the worktree's own hooks dir never executes, silently.
+    /// A worktree-scoped config outranks the repo-level value and restores
+    /// the guard. Both steps are fail-closed: if either fails, the LAUNCH
+    /// fails — an unguarded worktree must not start.
+    fn pin_worktree_hooks(
+        &self,
+        repo_root: &Path,
+        worktree: &Path,
+        hooks_dir: &Path,
+    ) -> Result<(), String> {
+        let enable = run_with_timeout(
+            "git",
+            &["config", "extensions.worktreeConfig", "true"],
+            repo_root,
+            &[],
+            Duration::from_secs(30),
+        )?;
+        if !enable.success {
+            return Err(format!(
+                "cannot enable extensions.worktreeConfig (without it a repo-level \
+                 core.hooksPath silently shadows the per-worktree guard hook): {}",
+                enable.stderr.trim()
+            ));
+        }
+        let pin = run_with_timeout(
+            "git",
+            &[
+                "config",
+                "--worktree",
+                "core.hooksPath",
+                &hooks_dir.to_string_lossy(),
+            ],
+            worktree,
+            &[],
+            Duration::from_secs(30),
+        )?;
+        if !pin.success {
+            return Err(format!(
+                "cannot pin a worktree-local core.hooksPath (without it a repo-level \
+                 core.hooksPath silently shadows the per-worktree guard hook): {}",
+                pin.stderr.trim()
+            ));
+        }
+        Ok(())
     }
 
     /// Spawn a detached `opencode serve` whose cwd is the job's worktree, and
@@ -9273,6 +9336,90 @@ mod tests {
         // Its deletion remains uncommitted in the worktree.
         let status = git(&["status", "--porcelain"]);
         assert!(status.stdout.contains(" D old.txt"), "{}", status.stdout);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_hook_config_pins_a_worktree_local_hooks_path() {
+        // F2 (DelegatedEditPathGuardReview_2026-09-07): scripts/git-hooks/
+        // install.sh sets a repo-level core.hooksPath that every linked
+        // worktree inherits and that SHADOWS the per-worktree hooks dir —
+        // the guard hook would silently never run. The pin must enable
+        // extensions.worktreeConfig on the repo and set a worktree-scoped
+        // core.hooksPath that outranks the repo-level value.
+        let root = std::env::temp_dir().join(format!(
+            "rustynet_hookpin_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = root.as_path();
+        let git = |args: &[&str]| {
+            run_with_timeout("git", args, repo, &[], Duration::from_secs(30)).expect("git")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "base"]);
+        // Simulate the owner having run scripts/git-hooks/install.sh.
+        git(&["config", "core.hooksPath", "scripts/git-hooks"]);
+
+        let wt = root.join("wt-under-test");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "wt-hookpin-test",
+            "wt-under-test",
+            "HEAD",
+        ]);
+        let hooks_dir = root
+            .join("common")
+            .join("worktrees")
+            .join("job-x")
+            .join("hooks");
+        server()
+            .pin_worktree_hooks(repo, &wt, &hooks_dir)
+            .expect("pin must succeed on a real worktree");
+
+        let wt_git = |args: &[&str]| {
+            run_with_timeout("git", args, &wt, &[], Duration::from_secs(30)).expect("git")
+        };
+        // The worktree-scoped value is set (the assertion the review asked for).
+        let scoped = wt_git(&["config", "--worktree", "core.hooksPath"]);
+        assert_eq!(scoped.stdout.trim(), hooks_dir.to_string_lossy());
+        // It OUTRANKS the repo-level value, so the guard hook now fires.
+        let effective = wt_git(&["config", "core.hooksPath"]);
+        assert_eq!(effective.stdout.trim(), hooks_dir.to_string_lossy());
+        // The repo-level value itself is untouched, and the extension is on.
+        let repo_level = git(&["config", "core.hooksPath"]);
+        assert_eq!(repo_level.stdout.trim(), "scripts/git-hooks");
+        let ext = git(&["config", "extensions.worktreeConfig"]);
+        assert_eq!(ext.stdout.trim(), "true");
+
+        git(&["worktree", "remove", "--force", "wt-under-test"]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pin_worktree_hooks_fails_closed_outside_a_git_repo() {
+        // Fail closed: outside a git repo neither config command can write,
+        // so the helper must return Err — create_edit_worktree maps that to a
+        // failed LAUNCH rather than a silently unguarded worktree.
+        let root = std::env::temp_dir().join(format!(
+            "rustynet_hookpin_fail_{}_{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            server()
+                .pin_worktree_hooks(&root, &root, &root.join("hooks"))
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
