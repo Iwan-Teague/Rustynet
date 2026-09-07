@@ -36,3 +36,6 @@ Unit: monotonic-watermark rejection test; pre-expiry refresh with stub fetch app
 - Exact daemon CLI flag name for `trust_url` (field confirmed at daemon.rs:751-752; flag not located).
 - Whether the DNS-zone `auto_bundle` source (`daemon.rs:5775`, 940) already has a live authority producer in product, or lab-only.
 - Production signing-key/verifier rotation ownership (trust-state owner).
+
+## Implementation log
+- 2026-09-07 (a) LAB step 1: add `refresh_signed_bundles` orchestrator stage (Disruptive/T1Role, immediately before `relay_forwards_frame_validation`); reuses `distribute_bundle_kind` for Traversal then DnsZone through the existing exit-adapter + verifier-key barrier path.
