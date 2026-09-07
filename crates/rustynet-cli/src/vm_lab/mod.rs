@@ -15112,12 +15112,30 @@ pub fn exercise_macos_role_transition_live(
 ///
 /// `report_dir`, when given, receives the raw evidence under
 /// `<report_dir>/logs/validate_macos_reboot_recovery.{log,json}`.
-pub fn exercise_macos_reboot_recovery_live(
+/// Post-reboot bundle redistribution seam: the hook the reboot-recovery
+/// stage installs between "SSH is back + daemon live" and the post-reboot
+/// pin/marker/boottime probe. The daemon-live probe hands the hook the
+/// parseable node id; the hook redistributes FRESH signed bundles and waits
+/// for the daemon to re-apply its generation (see the stage). An `Err` here
+/// fails the whole proof before the pin probe runs — the pins CANNOT be
+/// present until the daemon re-applies a valid generation, so probing before
+/// redistribution would prove nothing.
+pub type MacosRebootPostDaemonLiveHook<'a> = dyn FnMut(&str) -> Result<(), String> + 'a;
+
+/// The live reboot-recovery exercise with the mid-recovery seam exposed:
+/// `post_daemon_live` runs exactly once AFTER the bounded SSH-return +
+/// daemon-LIVE wait succeeds (with the parseable node id) and BEFORE the
+/// post-reboot pin/marker/boottime probe. A hook error fails the whole
+/// exercise (fail closed, never a skip). The reboot-recovery stage installs
+/// the fresh-bundle redistribution + generation poll here; passing a no-op
+/// hook reproduces the pre-seam behaviour.
+pub fn exercise_macos_reboot_recovery_with_recovery_actions(
     macos_alias: &str,
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
     report_dir: Option<&Path>,
+    post_daemon_live: &mut MacosRebootPostDaemonLiveHook<'_>,
 ) -> Result<String, String> {
     const RECOVERY_LOG_LINE: &str = "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)";
     // The daemon's post-reboot marker retirement (QH-40, owner decision 1,
@@ -15263,6 +15281,16 @@ pub fn exercise_macos_reboot_recovery_live(
                 "post-reboot `rustynet status` on {macos_alias} carried the daemon-live marker but no parseable node id"
             )
         })?;
+
+    // Mid-recovery seam (follow-up (a)): the stage redistributes FRESH signed
+    // traversal + dns_zone bundles here and waits for the daemon to leave
+    // FailClosed with a programmed generation. Running it BEFORE the pin
+    // probe is load-bearing: the M1 startup guard restores the pre-protection
+    // DNS baseline by design, so the loopback pins only return once the
+    // daemon re-applies its generation from valid signed state.
+    post_daemon_live(&node_id).map_err(|e| {
+        format!("post-reboot recovery actions on {macos_alias} (node {node_id}) failed before the pin probe: {e}")
+    })?;
 
     // 4. Post-reboot proof: recovery log line (or clean re-apply via the
     //    typed check), typed fail-closed evaluation, live loopback pinning,
