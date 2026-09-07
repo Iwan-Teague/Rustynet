@@ -57,12 +57,15 @@ impl OrchestrationStage for RefreshSignedBundlesStage {
                 "relay forwarding validation not enabled for this run".to_owned(),
             );
         }
-        use crate::vm_lab::orchestrator::stage::distribute_assignments::distribute_bundle_kind;
+        use crate::vm_lab::orchestrator::stage::distribute_assignments::{
+            DNS_ZONE_BUNDLE_FILE_EXT, DNS_ZONE_BUNDLE_FILE_PREFIX, TRAVERSAL_BUNDLE_FILE_EXT,
+            TRAVERSAL_BUNDLE_FILE_PREFIX, distribute_bundle_kind,
+        };
         let traversal = distribute_bundle_kind(
             ctx,
             BundleKind::Traversal,
-            "rn-traversal",
-            "traversal",
+            TRAVERSAL_BUNDLE_FILE_PREFIX,
+            TRAVERSAL_BUNDLE_FILE_EXT,
             self.max_parallel_node_workers,
             &self.shutdown_flag,
         );
@@ -75,8 +78,8 @@ impl OrchestrationStage for RefreshSignedBundlesStage {
         let dns_zone = distribute_bundle_kind(
             ctx,
             BundleKind::DnsZone,
-            "rn-dns-zone",
-            "dns_zone",
+            DNS_ZONE_BUNDLE_FILE_PREFIX,
+            DNS_ZONE_BUNDLE_FILE_EXT,
             self.max_parallel_node_workers,
             &self.shutdown_flag,
         );
@@ -88,6 +91,64 @@ impl OrchestrationStage for RefreshSignedBundlesStage {
         // missing exit node is Failed, never Skipped), so a Skipped outcome
         // here would be unreachable defensive code.
         traversal
+    }
+}
+
+#[cfg(test)]
+mod bundle_naming_pins {
+    //! Pins the naming agreement that made this stage fail the first time it
+    //! ran live: the minter writes `<prefix>-<node_id>.<ext>` and the
+    //! distributor looks the same name up, so every caller must spell both
+    //! halves identically. This stage shipped with `"dns_zone"` against the
+    //! setup stage's `"dns-zone"` and could not find a single bundle.
+    use crate::vm_lab::orchestrator::stage::distribute_assignments::{
+        DNS_ZONE_BUNDLE_FILE_EXT, DNS_ZONE_BUNDLE_FILE_PREFIX, TRAVERSAL_BUNDLE_FILE_EXT,
+        TRAVERSAL_BUNDLE_FILE_PREFIX,
+    };
+
+    /// The extension is what the minter actually writes. `dns-zone` is the
+    /// proven setup-stage spelling; an underscore here is the live failure.
+    #[test]
+    fn dns_zone_extension_is_the_minted_spelling() {
+        assert_eq!(DNS_ZONE_BUNDLE_FILE_EXT, "dns-zone");
+        assert_eq!(DNS_ZONE_BUNDLE_FILE_PREFIX, "rn-dns-zone");
+        assert_eq!(TRAVERSAL_BUNDLE_FILE_EXT, "traversal");
+        assert_eq!(TRAVERSAL_BUNDLE_FILE_PREFIX, "rn-traversal");
+    }
+
+    /// No caller of `distribute_bundle_kind` may re-spell the names inline —
+    /// that is exactly how the two spellings diverged. Every stage that
+    /// distributes a bundle must reference the shared constants.
+    #[test]
+    fn no_stage_spells_bundle_file_names_inline() {
+        for (name, source) in [
+            (
+                "refresh_signed_bundles",
+                include_str!("refresh_signed_bundles.rs"),
+            ),
+            (
+                "distribute_dns_zone",
+                include_str!("distribute_dns_zone.rs"),
+            ),
+            (
+                "distribute_traversal",
+                include_str!("distribute_traversal.rs"),
+            ),
+        ] {
+            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            for literal in [
+                "\"dns-zone\"",
+                "\"dns_zone\"",
+                "\"rn-dns-zone\"",
+                "\"rn-traversal\"",
+            ] {
+                assert!(
+                    !production.contains(literal),
+                    "{name} spells {literal} inline; use the shared constant so the \
+                     minter and the lookup cannot drift"
+                );
+            }
+        }
     }
 }
 

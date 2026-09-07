@@ -39,12 +39,14 @@ impl OrchestrationStage for DistributeTraversalStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        use crate::vm_lab::orchestrator::stage::distribute_assignments::distribute_bundle_kind;
+        use crate::vm_lab::orchestrator::stage::distribute_assignments::{
+            TRAVERSAL_BUNDLE_FILE_EXT, TRAVERSAL_BUNDLE_FILE_PREFIX, distribute_bundle_kind,
+        };
         distribute_bundle_kind(
             ctx,
             BundleKind::Traversal,
-            "rn-traversal",
-            "traversal",
+            TRAVERSAL_BUNDLE_FILE_PREFIX,
+            TRAVERSAL_BUNDLE_FILE_EXT,
             self.max_parallel_node_workers,
             &self.shutdown_flag,
         )
