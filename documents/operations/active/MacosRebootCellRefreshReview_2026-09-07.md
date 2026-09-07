@@ -80,3 +80,50 @@ Adding a third kind tuple or typo'ing `"traversal"` silently issues and installs
 ---
 
 VERDICT: MERGE-WITH-FIXES — the seam, barrier reuse, and fail-closed poll are sound and tested, but F1's negate-one-token recovery criterion silently inverts to fail-open on any future daemon state-token drift and should be an allowlist before this becomes load-bearing in more cells.
+
+---
+
+## Disposition (edit job edit-1788781850025-90987-0)
+
+All six findings fixed on branch `ai-edit/edit-1788781850025-90987-0`; the review doc itself
+committed verbatim first (`05cd36a9`), code fixes in `1290f68f`.
+
+- **F1 — FIXED.** `node_has_recovered_generation` now allowlists the healthy terminal states:
+  `matches!(observation.state.as_deref(), Some(RECOVERED_STATE_DATAPLANE_APPLIED) | Some(RECOVERED_STATE_EXIT_ACTIVE))`
+  AND `programmed_peer_count >= 1`. Variant names confirmed against
+  `crates/rustynetd/src/phase10.rs` `pub enum DataplaneState { Init, ControlTrusted, DataplaneApplied, ExitActive, FailClosed }`
+  (all unit variants; `daemon.rs` prints `state={:?}` of `controller.state()`), and pinned by
+  `recovered_state_names_are_pinned_to_the_daemon_enum` (`include_str!` of the defining file,
+  exact unit-variant line match). A missing `state` field is NOT recovered. New tests:
+  `recovery_criterion_is_an_allowlist_of_healthy_terminal_states` (missing state; `FailClosedDegraded`
+  drift token; `Init`/`ControlTrusted` non-terminal tokens; each allowlisted state with peers ≥ 1;
+  allowlisted state with 0 peers) and `recovery_criterion_requires_allowlisted_state_and_programmed_generation`
+  (renamed from the negation phrasing). Test fixtures updated from the fictional `state=Applied`
+  token (which the old criterion accepted — exactly the fail-open F1 describes) to
+  `state=DataplaneApplied`.
+- **F2 — FIXED (source-slice route; runtime recorder infeasible).** The exercise fn requires a real
+  SSH inventory target, so a runtime recording hook is not reachable from unit tests. Instead
+  `source_pins_redistribution_before_the_pin_probe` now slices `mod.rs` to the body of
+  `exercise_macos_reboot_recovery_with_recovery_actions` (bounded by `fn parse_macos_boottime_line`)
+  and requires the seam expression `post_daemon_live(&node_id)` to occur EXACTLY ONCE inside that
+  body, before `let post_script = format!(` — a doc-comment occurrence can no longer satisfy the
+  pin. The stage-side half is likewise sliced to the body of
+  `redistribute_fresh_bundles_and_await_generation` for redistribute-before-poll. The behavioral
+  test is renamed to what it proves: `redistributes_once_per_kind_and_polls_generation` (it drives
+  the seam implementation directly; the probe-order claim is the source pin's).
+- **F3 — FIXED.** `KINDS` is now `[(BundleKind, &str, &str, &str); 2]` carrying the kind in the
+  tuple; the string-label round trip with its `DnsZone` catch-all is removed (a typo or a future
+  third kind fails to compile instead of silently issuing a second dns_zone generation).
+- **F4 — FIXED.** The barrier comment in `distribute_assignments.rs` now reads "to every in-scope
+  node", noting scoped mode covers exactly the scoped alias.
+- **F5 — FIXED.** The success log line's stray-space run collapsed to single spaces.
+- **F6 — FIXED.** Both ledgers updated: `MacosDnsBackupRebootSurvivalPlan_2026-09-02.md` (Step 2
+  renamed-split wording corrected to rename; Step 3 poll criterion restated as the F1 allowlist)
+  and `MacosRebootRecoveryStageImplementationReview_2026-09-02.md` (helper named with its rename).
+
+Gates (toolchain 1.88.0 per `rust-toolchain.toml`, `CARGO_TARGET_DIR=/Users/iwan/Desktop/Rustynet/target-pinned-j4`):
+`cargo fmt --all -- --check` clean; `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings`
+clean; `cargo test -p rustynet-cli --lib --all-features -- macos_reboot` → **17 passed, 0 failed**.
+Note: a Homebrew cargo 1.97.0 shadowed rustup in this worktree's PATH and flags three
+`collapsible_if` lints in `crates/rustynetd/src/phase10.rs` (untouched files, out of scope);
+under the pinned 1.88.0 clippy they do not fire — no rustynetd change was made.
