@@ -382,6 +382,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
         };
         write_per_control_evidence(&ctx, &[]).expect("evidence write must succeed");
 
