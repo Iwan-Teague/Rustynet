@@ -482,21 +482,189 @@ pub fn collect_active_tunnels(conn: &NodeConnection) -> Result<TunnelsList, Adap
     Ok(TunnelsList { tunnels })
 }
 
-/// Collect diagnostic artifacts from the macOS host to `dst`.
-/// Key material paths (`keys/*`, `*.priv`) MUST NOT appear in the archive.
-pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
-    let remote_tmp = "/tmp/rn_diag_artifacts.tar.gz";
+/// Diagnostic surfaces captured on failure, as `(file-stem, command)` pairs.
+/// Every command is read-only and individually best-effort: its output (or its
+/// error text) lands in `<staging>/<file-stem>.txt` inside the diagnostics
+/// archive, so a denied `sudo -n` or an absent tool degrades ONE file instead
+/// of emptying the whole archive. Mirrors the collectors the blocker doc
+/// (MacosCrossNetworkTrafficBlocker_2026-09-03) asks for at failure time.
+///
+/// `launchctl print` output is piped through a sed range that drops each
+/// service's `environment = { ... }` dictionary: launchctl prints the full
+/// per-job environment and program arguments, and any secret env var set by a
+/// plist would otherwise land verbatim in the archive — the tar excludes are
+/// name-based and `verify_no_key_material_tarball` never reads member
+/// CONTENT, so redaction at the source is the only barrier.
+pub fn macos_diagnostic_collectors() -> Vec<(&'static str, &'static str)> {
+    vec![
+        (
+            "launchctl_daemon",
+            "sudo -n launchctl print system/com.rustynet.daemon \
+             | sed '/[[:space:]]environment = {/,/^[[:space:]]*}/d'",
+        ),
+        (
+            "launchctl_anchor",
+            "sudo -n launchctl print system/com.rustynet.anchor \
+             | sed '/[[:space:]]environment = {/,/^[[:space:]]*}/d'",
+        ),
+        (
+            "launchctl_relay",
+            "sudo -n launchctl print system/com.rustynet.relay \
+             | sed '/[[:space:]]environment = {/,/^[[:space:]]*}/d'",
+        ),
+        (
+            "launchctl_exit",
+            "sudo -n launchctl print system/com.rustynet.exit \
+             | sed '/[[:space:]]environment = {/,/^[[:space:]]*}/d'",
+        ),
+        (
+            "launchctl_privileged_helper",
+            "sudo -n launchctl print system/com.rustynet.privileged-helper \
+             | sed '/[[:space:]]environment = {/,/^[[:space:]]*}/d'",
+        ),
+        ("pf_anchors", "sudo -n pfctl -s Anchors"),
+        (
+            "pf_anchor_rules",
+            "for a in $(sudo -n pfctl -s Anchors 2>/dev/null \
+             | sed 's/^[[:space:]]*//' | grep -i rustynet || true); do \
+             echo \"== anchor $a\"; sudo -n pfctl -a \"$a\" -s rules 2>/dev/null; done",
+        ),
+        // Literal rather than format!(&const): a unit test pins this to
+        // MACOS_RUSTYNET_PATH so the two cannot drift apart silently.
+        ("daemon_status", "/usr/local/bin/rustynet status"),
+        ("routes", "netstat -rn"),
+        ("dns", "scutil --dns"),
+        (
+            "daemon_log",
+            "if [ -d /usr/local/var/log/rustynet ]; then \
+             ls -la /usr/local/var/log/rustynet; \
+             tail -n 200 /usr/local/var/log/rustynet/* 2>/dev/null; \
+             else echo 'no rustynet log dir at /usr/local/var/log/rustynet'; fi",
+        ),
+    ]
+}
 
-    let diag_cmd = format!(
-        "tar -czf '{remote_tmp}' \
+/// Build the remote sh script that stages every diagnostic collector and tars
+/// the staging dir (plus `[ -d ]`-guarded state/log roots) into `remote_tar`.
+/// Split out from [`collect_artifacts`] so the unit tests can pin its shape.
+///
+/// Fail-loud contract (run 130201 lesson): the OLD script tared two fixed
+/// paths and, when either was missing, fell back to `tar --files-from
+/// /dev/null` — a VALID EMPTY archive that sailed through the key-material
+/// verification as "success". The new script always stages collector output
+/// first (so the archive always has members), and ends with an in-script
+/// assertion: zero non-directory members → `exit 42`, which `run_remote`
+/// surfaces as `AdapterError::Command`. A second, LOCAL assertion
+/// ([`assert_tarball_non_empty`]) re-checks the downloaded copy.
+fn build_diag_archive_script(remote_tar: &str) -> String {
+    let mut script = String::from(
+        "staging=/tmp/rn_diag_capture; rm -rf \"$staging\" 2>/dev/null; \
+         mkdir -p \"$staging\"",
+    );
+    for (name, cmd) in macos_diagnostic_collectors() {
+        // Per-collector watchdog (macOS ships no `timeout`): background the
+        // collector, kill it after 20s, and wait. Diagnostics run precisely
+        // because the node is broken — e.g. `rustynet status` against a
+        // wedged daemon blocks on its socket — and without this a single
+        // hung collector burns the whole script's MEDIUM_TIMEOUT and loses
+        // every other collector's output.
+        script.push_str(&format!(
+            "; ( {{ {cmd}; }} & p=$!; \
+               ( sleep 20; kill $p ) >/dev/null 2>&1 & wait $p ) \
+              > \"$staging/{name}.txt\" 2>&1"
+        ));
+    }
+    script.push_str(&format!(
+        "; files=\"$staging\"; \
+         [ -d '{MACOS_STATE_ROOT}' ] && files=\"$files {MACOS_STATE_ROOT}\"; \
+         [ -d /usr/local/var/log/rustynet ] && files=\"$files /usr/local/var/log/rustynet\"; \
+         tar -czf '{remote_tar}' \
          --exclude='{MACOS_STATE_ROOT}/keys' \
+         --exclude='{MACOS_KEYS_DIR}' \
          --exclude='*.priv' \
          --exclude='*.key' \
          --exclude='*.pem' \
-         '{MACOS_STATE_ROOT}' /usr/local/var/log/rustynet 2>/dev/null || \
-         tar -czf '{remote_tmp}' --files-from /dev/null"
-    );
-    ssh::run_remote(conn, &diag_cmd, MEDIUM_TIMEOUT)?;
+         $files; \
+         members=$(tar -tzf '{remote_tar}' 2>/dev/null | grep -vc '/$'); \
+         [ \"$members\" -gt 0 ] || exit 42"
+    ));
+    script
+}
+
+/// Local fail-loud assertion: the downloaded diagnostics archive must contain
+/// at least one non-directory member. Belt-and-braces behind the in-script
+/// `exit 42` guard in [`build_diag_archive_script`].
+fn assert_tarball_non_empty(path: &Path) -> Result<(), AdapterError> {
+    use std::process::Command;
+    let output = Command::new("tar")
+        .args(["-tzf"])
+        .arg(path.as_os_str())
+        .output()
+        .map_err(|err| AdapterError::Io {
+            message: format!("list tar contents failed: {err}"),
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AdapterError::Io {
+            message: format!(
+                "list tar contents failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            ),
+        });
+    }
+    let non_dir = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|l| !l.is_empty() && !l.ends_with('/'))
+        .count();
+    if non_dir == 0 {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "macOS diagnostics archive {} is empty (0 non-directory members); \
+                 collectors staged nothing — failing loud instead of shipping an \
+                 empty artifact",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Collect diagnostic artifacts from the macOS host to `dst`.
+/// Key material paths (`keys/*`, `*.priv`) MUST NOT appear in the archive.
+/// Fails loud when the archive would be empty (see [`build_diag_archive_script`]).
+pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), AdapterError> {
+    let remote_tmp = "/tmp/rn_diag_artifacts.tar.gz";
+
+    // Built up front so the fail-loud error paths below can best-effort
+    // clean the remote archive instead of orphaning it in /tmp.
+    // QH-01 Step 4b: through the validated seam so the path is validated
+    // and shell-quoted before any command string exists.
+    let rm_args = [
+        ValidatedArg::cli_token("rm")?,
+        ValidatedArg::cli_token("-f")?,
+        ValidatedArg::path(remote_tmp)?,
+    ];
+    let rm_cmd = ssh::RemoteCommand::from_args("macos remove diagnostic archive", &rm_args)?;
+
+    let diag_cmd = build_diag_archive_script(remote_tmp);
+    let diag_result = ssh::run_remote(conn, &diag_cmd, MEDIUM_TIMEOUT).map_err(|err| match err {
+        AdapterError::Command {
+            exit_code: Some(42),
+            ..
+        } => AdapterError::Protocol {
+            message: "macOS diagnostics archive is empty: staged collectors and \
+                              state/log roots produced 0 members"
+                .to_owned(),
+        },
+        other => other,
+    });
+    if diag_result.is_err() {
+        // The `?` below would skip the normal cleanup, leaving the (possibly
+        // 0-member) tarball behind in the remote /tmp.
+        let _ = ssh::run_remote(conn, rm_cmd.as_str(), SHORT_TIMEOUT);
+    }
+    diag_result?;
 
     if let Some(parent) = dst.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|err| AdapterError::Io {
@@ -505,20 +673,126 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &Path) -> Result<(), Adapte
     }
     ssh::scp_from(conn, remote_tmp, dst, Duration::from_secs(120))?;
 
-    // Remove temp archive from remote (best-effort). QH-01 Step 4b: built
-    // through the validated seam so the path is validated and shell-quoted
-    // before any command string exists.
-    let rm_args = [
-        ValidatedArg::cli_token("rm")?,
-        ValidatedArg::cli_token("-f")?,
-        ValidatedArg::path(remote_tmp)?,
-    ];
-    let rm_cmd = ssh::RemoteCommand::from_args("macos remove diagnostic archive", &rm_args)?;
+    // Remove temp archive from remote (best-effort).
     let _ = ssh::run_remote(conn, rm_cmd.as_str(), SHORT_TIMEOUT);
 
     verify_no_key_material_tarball(dst)?;
+    assert_tarball_non_empty(dst)?;
 
     Ok(())
+}
+
+/// Strict `com.rustynet/*` pf-anchor name check (charset-validated, no regex dep):
+/// `^com\.rustynet/[A-Za-z0-9_.-]+$`. Anything else (including the killswitch
+/// family `com.apple/rustynet_g<N>` and shell metacharacters) is rejected so a
+/// crafted anchor name can never reach an exec argv.
+pub fn is_rustynet_pf_anchor(name: &str) -> bool {
+    match name.strip_prefix("com.rustynet/") {
+        Some(rest) => {
+            !rest.is_empty()
+                && rest
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        }
+        None => false,
+    }
+}
+
+/// Parse `pfctl -s Anchors` output into a list of anchor names: one per line,
+/// surrounding whitespace trimmed, empty lines dropped.
+pub fn parse_pfctl_anchor_list(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Build the argv-only flush command for one `com.rustynet/*` anchor. Fails
+/// closed (never builds a command) for a name that does not pass
+/// [`is_rustynet_pf_anchor`].
+pub fn build_anchor_flush_args(anchor: &str) -> Result<Vec<ValidatedArg>, AdapterError> {
+    if !is_rustynet_pf_anchor(anchor) {
+        return Err(AdapterError::Protocol {
+            message: format!("refusing to flush pf anchor with invalid name: {anchor:?}"),
+        });
+    }
+    Ok(vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("pfctl")?,
+        ValidatedArg::cli_token("-a")?,
+        ValidatedArg::cli_token(anchor)?,
+        ValidatedArg::cli_token("-F")?,
+        ValidatedArg::cli_token("all")?,
+    ])
+}
+
+/// Enumerate pf anchors over SSH, then flush every strictly-named
+/// `com.rustynet/*` anchor through an argv-only `pfctl -a <anchor> -F all`
+/// (Rust-side name validation; no shell interpolation of remote output).
+/// Complements — does not replace — the broader shell `MACOS_RESET_COMMAND`
+/// pass, which also covers the `com.apple/rustynet_g<N>` killswitch family
+/// the strict prefix deliberately excludes.
+///
+/// Returns `(found, flushed)` — the count of strict `com.rustynet/*` anchors
+/// observed and the count successfully flushed. If ANY observed anchor fails
+/// to flush, returns `Err` naming the failures: a surviving default-deny
+/// anchor (e.g. blind_exit's `block drop out quick all`) is a live security
+/// residue, and a bare count cannot distinguish "nothing to flush" from
+/// "flush denied" — callers must not be able to mistake the two
+/// (glm-5.3 review of 229ba864). Enumeration failure propagates unchanged
+/// (`run_remote` errors on any nonzero exit, so a `sudo -n` denial during
+/// the listing cannot be parsed as an empty anchor list).
+pub fn flush_rustynet_pf_anchors_argv(
+    conn: &NodeConnection,
+) -> Result<(usize, usize), AdapterError> {
+    let list_args = vec![
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("pfctl")?,
+        ValidatedArg::cli_token("-s")?,
+        ValidatedArg::cli_token("Anchors")?,
+    ];
+    let list_cmd = ssh::RemoteCommand::from_args("macos list pf anchors", &list_args)?;
+    let output = ssh::run_remote(conn, list_cmd.as_str(), SHORT_TIMEOUT)?;
+
+    let mut found = 0usize;
+    let mut flushed = 0usize;
+    let mut failures = Vec::new();
+    for anchor in parse_pfctl_anchor_list(&output) {
+        if !is_rustynet_pf_anchor(&anchor) {
+            continue;
+        }
+        found += 1;
+        let flush_cmd = match ssh::RemoteCommand::from_args(
+            "macos flush rustynet pf anchor",
+            &build_anchor_flush_args(&anchor)?,
+        ) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                failures.push(format!("{anchor}: {e}"));
+                continue;
+            }
+        };
+        match ssh::run_remote(conn, flush_cmd.as_str(), SHORT_TIMEOUT) {
+            Ok(_) => flushed += 1,
+            Err(e) => failures.push(format!("{anchor}: {e}")),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "com.rustynet/* pf anchor flush left {} of {} anchor(s) in place \
+                 (default-deny anchors keep blocking after uninstall): {}",
+                failures.len(),
+                found,
+                failures.join("; ")
+            ),
+        });
+    }
+    Ok((found, flushed))
 }
 
 /// Remove runtime state files, leaving the installation intact.
@@ -537,6 +811,14 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
     // carrying the mesh CIDR collides with the fresh bring-up. Best-effort and
     // idempotent — a clean node is a no-op.
     let _ = ssh::run_remote(conn, MACOS_RESET_COMMAND, Duration::from_secs(30));
+
+    // Second, argv-only pass over the strict com.rustynet/* family with
+    // Rust-side name validation: unlike the shell pass above (whose errors
+    // are swallowed by `|| true`), a `sudo -n` denial or pfctl failure here
+    // is printed, so a surviving anchor is visible instead of silent.
+    if let Err(e) = flush_rustynet_pf_anchors_argv(conn) {
+        eprintln!("macos cleanup: strict com.rustynet/* pf anchor flush failed: {e}");
+    }
 
     // Remove runtime state but keep WG keys and the installation. This now
     // includes the seed trust evidence (`rustynetd.trust`) and its anti-replay
@@ -895,6 +1177,7 @@ fn verify_no_key_material_tarball(path: &Path) -> Result<(), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNET_PATH;
 
     /// Tests-first item 7 of MacosDnsBackupRebootSurvivalPlan_2026-09-02
     /// (review A4): the macOS cleanup's explicit rm batch must include the
@@ -1350,6 +1633,216 @@ mod tests {
         assert!(
             result.is_err(),
             "unreadable artifact tarball must fail closed"
+        );
+    }
+
+    /// QH-71 / TASK 2: the failure-diagnostics collector list must cover every
+    /// surface the blocker doc asks for — launchd state per RustyNet label,
+    /// pfctl anchor enumeration + per-anchor rules, daemon status, routes,
+    /// DNS, and the daemon log. A collector missing from this list is a
+    /// regression that silently narrows what a failure report can explain.
+    #[test]
+    fn diagnostic_collectors_cover_required_failure_surfaces() {
+        let collectors = macos_diagnostic_collectors();
+        let joined = collectors
+            .iter()
+            .map(|(name, cmd)| format!("{name}: {cmd}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for label in [
+            "com.rustynet.daemon",
+            "com.rustynet.anchor",
+            "com.rustynet.relay",
+            "com.rustynet.exit",
+            "com.rustynet.privileged-helper",
+        ] {
+            assert!(
+                joined.contains(&format!("launchctl print system/{label}")),
+                "missing launchctl collector for {label}"
+            );
+        }
+        assert!(
+            joined.contains("pfctl -s Anchors"),
+            "must enumerate anchors"
+        );
+        assert!(
+            joined.contains("pfctl -a \"$a\" -s rules"),
+            "must dump per-anchor rules for every rustynet anchor"
+        );
+        assert!(
+            joined.contains("rustynet status"),
+            "must capture `rustynet status`"
+        );
+        // The daemon_status command must invoke the SAME binary the bootstrap
+        // installs; pinned so a MACOS_RUSTYNET_PATH change cannot silently
+        // desync the collector.
+        let daemon_status = collectors
+            .iter()
+            .find(|(name, _)| *name == "daemon_status")
+            .expect("daemon_status collector must exist");
+        assert_eq!(daemon_status.1, format!("{MACOS_RUSTYNET_PATH} status"));
+        assert!(joined.contains("netstat -rn"), "must capture routes");
+        assert!(joined.contains("scutil --dns"), "must capture DNS config");
+        assert!(
+            joined.contains("/usr/local/var/log/rustynet"),
+            "must capture the daemon log dir"
+        );
+        // Every launchctl collector must redact the service environment
+        // dictionary: launchctl print dumps env vars verbatim, the tar
+        // excludes are name-based, and no downstream check reads member
+        // content — this sed is the only secret barrier.
+        for (name, cmd) in &collectors {
+            if name.starts_with("launchctl_") {
+                assert!(
+                    cmd.contains("environment = {"),
+                    "collector {name} must redact the environment dict"
+                );
+            }
+        }
+    }
+
+    /// QH-71 / TASK 2: the archive script must (a) stage every collector into
+    /// the staging dir so the archive ALWAYS has members, (b) keep the key
+    /// material excludes, and (c) carry the in-script fail-loud assertion
+    /// (`exit 42` on zero non-directory members) so the run-130201
+    /// empty-but-valid-tarball class can never read as success again.
+    #[test]
+    fn diag_archive_script_stages_collectors_and_fails_loud_when_empty() {
+        let script = build_diag_archive_script("/tmp/rn_diag_artifacts.tar.gz");
+        for (name, _cmd) in macos_diagnostic_collectors() {
+            assert!(
+                script.contains(&format!("> \"$staging/{name}.txt\"")),
+                "collector {name} not staged"
+            );
+        }
+        // Key material stays excluded (first line of defense; the local
+        // verify_no_key_material_tarball pass is the second).
+        assert!(script.contains("--exclude='/usr/local/var/rustynet/keys'"));
+        assert!(script.contains("--exclude='*.priv'"));
+        assert!(script.contains("--exclude='*.key'"));
+        assert!(script.contains("--exclude='*.pem'"));
+        // Fail-loud: no `--files-from /dev/null` empty-archive fallback may
+        // remain, and the member-count assertion must exit non-zero.
+        assert!(
+            !script.contains("--files-from /dev/null"),
+            "the empty-archive fallback was the run-130201 root cause; it must stay gone"
+        );
+        assert!(
+            script.contains("exit 42"),
+            "in-script empty-archive assertion missing"
+        );
+        assert!(
+            script.contains("grep -vc '/$'"),
+            "member count must ignore directory entries"
+        );
+        // Per-collector watchdog: a hung collector (e.g. `rustynet status`
+        // against a wedged daemon) must not burn the whole script timeout.
+        assert!(
+            script.contains("sleep 20; kill $p"),
+            "each collector must be wrapped in a kill-after-20s watchdog"
+        );
+    }
+
+    /// QH-71 / TASK 2: local belt-and-braces assertion — a tarball whose only
+    /// members are directories must read as empty, and a missing file must
+    /// fail closed.
+    #[test]
+    fn assert_tarball_non_empty_rejects_dir_only_and_missing_archives() {
+        // Missing file: fails closed with an Io error.
+        let missing = std::env::temp_dir().join(format!(
+            "rustynet-macos-absent-artifact-{}.tar.gz",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&missing);
+        assert!(assert_tarball_non_empty(&missing).is_err());
+
+        // Dir-only archive: build a REAL tarball whose only member is a
+        // directory and assert the function itself rejects it — the earlier
+        // inline re-count only pinned a copy of the logic and would have
+        // passed even if the function counted directories.
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-macos-dironly-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("onlydir")).expect("mkdir dir-only fixture");
+        let tar_path = dir.join("archive.tar.gz");
+        let tar_status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&dir)
+            .arg("onlydir")
+            .status()
+            .expect("tar fixture");
+        assert!(tar_status.success(), "dir-only tar fixture must build");
+        assert!(
+            assert_tarball_non_empty(&tar_path).is_err(),
+            "dir-only archive must read as empty"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn rustynet_pf_anchor_validator_accepts_strict_names() {
+        assert!(is_rustynet_pf_anchor("com.rustynet/nat"));
+        assert!(is_rustynet_pf_anchor("com.rustynet/blind_exit"));
+        assert!(is_rustynet_pf_anchor("com.rustynet/exit_v2"));
+    }
+
+    #[test]
+    fn rustynet_pf_anchor_validator_rejects_crafted_names() {
+        assert!(!is_rustynet_pf_anchor("com.rustynet/x;reboot"));
+        assert!(!is_rustynet_pf_anchor("com.rustynet/../../etc"));
+        assert!(!is_rustynet_pf_anchor("com.rustynet/"));
+        assert!(!is_rustynet_pf_anchor("com.apple/rustynet_g4"));
+        assert!(!is_rustynet_pf_anchor("com.rustynet/a b"));
+        assert!(!is_rustynet_pf_anchor(";reboot"));
+        assert!(!is_rustynet_pf_anchor(""));
+    }
+
+    #[test]
+    fn pfctl_anchor_list_parser_trims_and_drops_empty_lines() {
+        let out = "com.rustynet/nat\n\n  com.rustynet/blind_exit  \ncom.apple/rustynet_g4\n";
+        assert_eq!(
+            parse_pfctl_anchor_list(out),
+            vec![
+                "com.rustynet/nat".to_owned(),
+                "com.rustynet/blind_exit".to_owned(),
+                "com.apple/rustynet_g4".to_owned(),
+            ]
+        );
+        assert!(parse_pfctl_anchor_list("").is_empty());
+    }
+
+    #[test]
+    fn anchor_flush_args_reject_invalid_and_build_valid() {
+        assert!(build_anchor_flush_args("com.rustynet/x;reboot").is_err());
+        let args = build_anchor_flush_args("com.rustynet/blind_exit").unwrap();
+        let cmd = ssh::RemoteCommand::from_args("macos flush rustynet pf anchor", &args).unwrap();
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' 'pfctl' '-a' 'com.rustynet/blind_exit' '-F' 'all'"
+        );
+    }
+
+    #[test]
+    fn uninstall_daemon_flushes_rustynet_pf_anchors() {
+        let src = include_str!("macos_install.rs");
+        let start = src.find("pub fn uninstall_daemon").unwrap();
+        let end = src[start..].find("\n}\n").map(|i| start + i).unwrap();
+        let body = &src[start..end];
+        assert!(
+            body.contains("flush_rustynet_pf_anchors_argv"),
+            "uninstall_daemon must flush com.rustynet/* pf anchors"
+        );
+        // Fail-closed pin (glm-5.3 review of 229ba864): a flush failure must
+        // PROPAGATE — a best-effort eprintln would let a surviving
+        // default-deny anchor outlive an "uninstalled" machine.
+        assert!(
+            body.contains("flush_rustynet_pf_anchors_argv(conn)?"),
+            "uninstall_daemon must propagate the anchor-flush error"
+        );
+        assert!(
+            !body.contains("if let Err(e) =\n        crate::vm_lab::orchestrator::adapter::macos_traffic::flush_rustynet_pf_anchors_argv"),
+            "uninstall_daemon must not swallow the anchor-flush error"
         );
     }
 }

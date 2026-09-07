@@ -206,15 +206,140 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         if errors.is_empty() {
             StageOutcome::Passed
         } else {
-            StageOutcome::Failed(errors.join("; "))
+            // Failure-time tunnel capture (MacosCrossNetworkTrafficBlocker
+            // §6 item 3): the matrix already failed, so snapshot every
+            // node's tunnel/daemon state before returning. Best effort —
+            // capture errors are recorded in the per-node capture file and
+            // never mask the stage failure that triggered the capture.
+            let mut message = errors.join("; ");
+            for summary in capture_failure_state(ctx) {
+                message.push_str("; ");
+                message.push_str(&summary);
+            }
+            StageOutcome::Failed(message)
         }
     }
+}
+
+/// Snapshot per-node tunnel state at failure time so a blocked-mesh failure
+/// can be triaged from the report directory without re-running the lab.
+///
+/// For every topology node with an adapter, collect the mesh IP, the active
+/// tunnel list (which carries per-peer latest-handshake lines on kernel-wg
+/// backends), and the daemon failure reason, then write them to
+/// `logs/traffic_test_matrix.failure_capture.<alias>.txt` under the report
+/// dir. Each collector error is recorded inside that file as a
+/// `capture error: ...` line — capture is diagnostic only and must never
+/// change the stage outcome. Returns one summary line per node for the stage
+/// failure message.
+/// True when `alias` is safe to embed as a filename component of the capture
+/// file: no path separators and no parent-directory fragment, so a malformed
+/// topology entry cannot make `std::fs::write` escape the report dir.
+fn is_safe_capture_alias(alias: &str) -> bool {
+    !alias.is_empty() && !alias.contains(['/', '\\']) && !alias.contains("..")
+}
+
+/// Collapse newlines and carriage returns so a remote-controlled string (SSH
+/// output collected from the node under test) cannot forge additional lines
+/// in the evidence file.
+fn single_line(s: &str) -> String {
+    s.replace(['\n', '\r'], "\\n")
+}
+
+fn capture_failure_state(ctx: &OrchestrationContext) -> Vec<String> {
+    let mut summaries = Vec::new();
+    let logs_dir = ctx.report_dir.join("logs");
+    if let Err(e) = std::fs::create_dir_all(&logs_dir) {
+        eprintln!("traffic_test_matrix: failure-capture cannot create logs dir: {e}");
+        return summaries;
+    }
+    for assignment in &ctx.assignments {
+        let alias = assignment.alias.as_str();
+        if !is_safe_capture_alias(alias) {
+            // Diagnostic-only capture: skipping an unsafe alias is fail-safe,
+            // while writing it would let a topology entry clobber a file
+            // outside the report dir.
+            eprintln!("traffic_test_matrix: failure-capture skipped unsafe alias {alias:?}");
+            continue;
+        }
+        let Some(adapter) = ctx.adapters.get(alias) else {
+            continue;
+        };
+        let mesh_ip = adapter.collect_mesh_ip();
+        let tunnels = adapter.collect_active_tunnels();
+        let daemon_reason = adapter.collect_daemon_failure_reason();
+        let mut out = String::new();
+        out.push_str("# traffic_test_matrix failure capture\n");
+        out.push_str(&format!("node: {alias}\n"));
+        match &mesh_ip {
+            Ok(ip) => out.push_str(&format!("mesh_ip: {ip}\n")),
+            Err(e) => out.push_str(&format!(
+                "capture error: collect_mesh_ip: {}\n",
+                single_line(&e.to_string())
+            )),
+        }
+        match &tunnels {
+            Ok(list) => {
+                out.push_str(&format!("tunnels: {} line(s)\n", list.tunnels.len()));
+                for line in &list.tunnels {
+                    out.push_str(&format!("tunnel: {}\n", single_line(line)));
+                }
+            }
+            Err(e) => out.push_str(&format!(
+                "capture error: collect_active_tunnels: {}\n",
+                single_line(&e.to_string())
+            )),
+        }
+        match &daemon_reason {
+            Ok(Some(reason)) => {
+                out.push_str(&format!("daemon_failure_reason: {}\n", single_line(reason)))
+            }
+            Ok(None) => out.push_str("daemon_failure_reason: (none reported)\n"),
+            Err(e) => {
+                out.push_str(&format!(
+                    "capture error: collect_daemon_failure_reason: {}\n",
+                    single_line(&e.to_string())
+                ));
+            }
+        }
+        let capture_path =
+            logs_dir.join(format!("traffic_test_matrix.failure_capture.{alias}.txt"));
+        if let Err(e) = std::fs::write(&capture_path, &out) {
+            eprintln!("traffic_test_matrix: failure-capture write failed for {alias}: {e}");
+        }
+        let daemon_summary = match &daemon_reason {
+            Ok(Some(_)) => "reported",
+            Ok(None) => "none",
+            Err(_) => "error",
+        };
+        // A tunnel-collector error is NOT "no tunnels established": report it
+        // distinctly so triage does not misread an unknown state as a
+        // blocked-mesh signal.
+        let tunnel_summary = match tunnels.as_ref() {
+            Ok(list) => format!("{} tunnel line(s)", list.tunnels.len()),
+            Err(_) => "tunnels=error".to_string(),
+        };
+        summaries.push(format!(
+            "[failure-capture {alias}: {tunnel_summary}, daemon={daemon_summary}]"
+        ));
+    }
+    summaries
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+    use crate::vm_lab::orchestrator::error::{
+        AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+        MembershipSnapshot, NodeId, NodeMembershipPeer, TunnelsList, ValidatorReport,
+        WireguardPublicKey,
+    };
+    use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+    use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+    use crate::vm_lab::{DaemonProbeOp, VmGuestPlatform};
     use std::collections::HashMap;
+    use std::path::Path;
 
     #[test]
     fn empty_assignments_no_mesh_ips_fails() {
@@ -248,5 +373,241 @@ mod tests {
             TrafficTestMatrixStage.execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
+    }
+
+    /// Stub adapter for the failure-capture tests: implements only the
+    /// methods the traffic matrix touches on its failure path. A single-node
+    /// topology means the peer-ping loop is skipped, and
+    /// `probe_denied_peer` returning Blocked with no baseline reachability
+    /// fails closed as INCONCLUSIVE fast (no retry-loop sleeps).
+    #[derive(Debug)]
+    struct FakeCaptureAdapter {
+        fail_collectors: bool,
+    }
+
+    impl NodeAdapter for FakeCaptureAdapter {
+        fn platform(&self) -> VmGuestPlatform {
+            VmGuestPlatform::Linux
+        }
+        fn alias(&self) -> &str {
+            "node-a"
+        }
+        fn ssh_connection_params(
+            &self,
+        ) -> Option<crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams>
+        {
+            None
+        }
+        fn install_daemon(
+            &self,
+            _source: &SourceArchive,
+            _ctx: &OrchestrationContext,
+        ) -> Result<InstallReport, AdapterError> {
+            unimplemented!()
+        }
+        fn start_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn stop_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn restart_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+            unimplemented!()
+        }
+        fn init_membership_snapshot(
+            &self,
+            _owner_key: &MembershipOwnerKey,
+            _peers: &[NodeMembershipPeer],
+        ) -> Result<MembershipSnapshot, AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_signed_bundle(
+            &self,
+            _kind: BundleKind,
+            _bundle_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_verifier_key(
+            &self,
+            _kind: BundleKind,
+            _pub_key_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_bundles_to_dir(
+            &self,
+            _kind: BundleKind,
+            _env_content: &str,
+            _local_out_dir: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+            unimplemented!()
+        }
+        fn run_validator(
+            &self,
+            _op: DaemonProbeOp,
+            _extra_args: &[String],
+        ) -> Result<ValidatorReport, AdapterError> {
+            unimplemented!()
+        }
+        fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn probe_denied_peer(&self, _denied: &str) -> Result<TrafficTestResult, AdapterError> {
+            Ok(TrafficTestResult::Blocked)
+        }
+        fn collect_daemon_failure_reason(&self) -> Result<Option<String>, AdapterError> {
+            if self.fail_collectors {
+                Err(AdapterError::Ssh {
+                    message: "collector down".to_owned(),
+                })
+            } else {
+                Ok(Some("daemon exited: killswitch active".to_owned()))
+            }
+        }
+        fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+            if self.fail_collectors {
+                Err(AdapterError::Ssh {
+                    message: "collector down".to_owned(),
+                })
+            } else {
+                Ok(TunnelsList {
+                    tunnels: vec!["wg0\tpeer-a\tlatest-handshake=1234".to_owned()],
+                })
+            }
+        }
+        fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn endpoint(&self) -> String {
+            unimplemented!()
+        }
+        fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+            Ok("100.64.0.1".to_owned())
+        }
+        fn collect_artifacts(&self, _dst: &Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+    }
+
+    fn capture_ctx(report_dir: &Path, fail_collectors: bool) -> OrchestrationContext {
+        let mut adapters: HashMap<String, Box<dyn NodeAdapter>> = HashMap::new();
+        adapters.insert(
+            "node-a".to_owned(),
+            Box::new(FakeCaptureAdapter { fail_collectors }),
+        );
+        OrchestrationContext {
+            assignments: vec![NodeRoleAssignment {
+                alias: "node-a".to_owned(),
+                role: NodeRole::Client,
+            }],
+            adapters,
+            source_archive: None,
+            report_dir: report_dir.to_path_buf(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
+            linux_backend: None,
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+        }
+    }
+
+    #[test]
+    fn failure_capture_writes_per_node_file_on_failed_stage() {
+        let report_dir =
+            std::env::temp_dir().join(format!("ttm-capture-ok-{}", std::process::id()));
+        let mut ctx = capture_ctx(&report_dir, false);
+        let message = match TrafficTestMatrixStage.execute(&mut ctx) {
+            StageOutcome::Failed(m) => m,
+            _ => panic!("expected StageOutcome::Failed"),
+        };
+        assert!(
+            message.contains("[failure-capture node-a: 1 tunnel line(s), daemon=reported]"),
+            "message: {message}"
+        );
+        let capture_path = report_dir.join("logs/traffic_test_matrix.failure_capture.node-a.txt");
+        let content = std::fs::read_to_string(&capture_path).expect("capture file written");
+        assert!(content.contains("mesh_ip: 100.64.0.1"));
+        assert!(content.contains("tunnel: wg0\tpeer-a\tlatest-handshake=1234"));
+        assert!(content.contains("daemon_failure_reason: daemon exited: killswitch active"));
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn failure_capture_errors_do_not_mask_stage_failure() {
+        let report_dir =
+            std::env::temp_dir().join(format!("ttm-capture-err-{}", std::process::id()));
+        let mut ctx = capture_ctx(&report_dir, true);
+        let message = match TrafficTestMatrixStage.execute(&mut ctx) {
+            StageOutcome::Failed(m) => m,
+            _ => panic!("expected StageOutcome::Failed"),
+        };
+        assert!(
+            message.contains("INCONCLUSIVE"),
+            "original stage error masked: {message}"
+        );
+        assert!(
+            message.contains("[failure-capture node-a: tunnels=error, daemon=error]"),
+            "message: {message}"
+        );
+        let capture_path = report_dir.join("logs/traffic_test_matrix.failure_capture.node-a.txt");
+        let content = std::fs::read_to_string(&capture_path).expect("capture file written");
+        assert!(content.contains("capture error: collect_active_tunnels"));
+        assert!(content.contains("capture error: collect_daemon_failure_reason"));
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn capture_alias_safety_rejects_path_fragments() {
+        assert!(is_safe_capture_alias("node-a"));
+        assert!(is_safe_capture_alias("linux.x86_exit.1"));
+        // Path separators, parent-directory fragments, and the empty alias
+        // must never become filename components of the capture file.
+        assert!(!is_safe_capture_alias("../escape"));
+        assert!(!is_safe_capture_alias("a/b"));
+        assert!(!is_safe_capture_alias("a\\b"));
+        assert!(!is_safe_capture_alias(".."));
+        assert!(!is_safe_capture_alias(""));
+    }
+
+    #[test]
+    fn single_line_collapses_newlines_from_remote_output() {
+        assert_eq!(single_line("ok"), "ok");
+        assert_eq!(
+            single_line("forged\nmesh_ip: 100.64.0.1\r\n"),
+            "forged\\nmesh_ip: 100.64.0.1\\n\\n"
+        );
     }
 }

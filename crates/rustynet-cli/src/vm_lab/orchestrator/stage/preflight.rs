@@ -300,6 +300,11 @@ pub struct PreflightStage {
     /// (the default) keeps every failure text byte-identical to the
     /// pre-flag behaviour (review A-6).
     pub clock_remediation_enabled: bool,
+    /// Stage ids the PlanBuilder elected for this run. Drives the
+    /// cross-bridge decision severity: a subnet split is a warning for
+    /// control-plane-only plans but a hard failure when any
+    /// cross-bridge dataplane stage is planned.
+    pub planned_stage_ids: Vec<StageId>,
 }
 
 impl OrchestrationStage for PreflightStage {
@@ -490,7 +495,348 @@ impl OrchestrationStage for PreflightStage {
             }
         }
 
-        StageOutcome::Passed
+        self.cross_bridge_preflight(ctx)
+    }
+}
+
+/// One /24 subnet group derived from live ssh_target addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CrossBridgeSubnetGroup {
+    subnet: [u8; 4],
+    aliases: Vec<String>,
+}
+
+/// Strip an optional `:port` suffix from an ssh host string, returning the
+/// bare host. Only strips when the suffix parses as u16. NOTE: an IPv6
+/// literal CAN end in a numeric group (`::1`, `fd00::1:22` → the tail parses
+/// as u16 and gets stripped) — that is harmless here only because the
+/// stripped remnant still fails the later `Ipv4Addr` parse and lands in
+/// `excluded`, never in a probe argv.
+fn strip_ssh_port(host: &str) -> &str {
+    if let Some((head, tail)) = host.rsplit_once(':') {
+        if tail.parse::<u16>().is_ok() {
+            return head;
+        }
+    }
+    host
+}
+
+/// Classify live ssh targets into /24 groups. Unparseable and IPv6 targets
+/// are returned in `excluded` so the report can name them without letting
+/// them silently pass or fail the split decision.
+fn classify_subnet_split(
+    targets: &[(String, String)],
+) -> (Vec<CrossBridgeSubnetGroup>, Vec<String>) {
+    let mut excluded = Vec::new();
+    let mut groups: Vec<CrossBridgeSubnetGroup> = Vec::new();
+    for (alias, host) in targets {
+        let bare = strip_ssh_port(host);
+        match bare.parse::<std::net::Ipv4Addr>() {
+            Ok(ip) => {
+                let octets = ip.octets();
+                let subnet = [octets[0], octets[1], octets[2], 0];
+                if let Some(g) = groups.iter_mut().find(|g| g.subnet == subnet) {
+                    g.aliases.push(alias.clone());
+                } else {
+                    groups.push(CrossBridgeSubnetGroup {
+                        subnet,
+                        aliases: vec![alias.clone()],
+                    });
+                }
+            }
+            Err(_) => excluded.push(alias.clone()),
+        }
+    }
+    for g in &mut groups {
+        g.aliases.sort();
+    }
+    groups.sort_by(|a, b| a.subnet.cmp(&b.subnet));
+    (groups, excluded)
+}
+
+/// Build the argv-only TCP/22 probe command for a guest platform. `ip` is
+/// always the display form of a validated Ipv4Addr, never untrusted text.
+fn cross_bridge_probe_argv(platform: crate::vm_lab::VmGuestPlatform, ip: &str) -> Vec<String> {
+    match platform {
+        crate::vm_lab::VmGuestPlatform::Macos => vec![
+            "nc".to_owned(),
+            "-z".to_owned(),
+            "-G".to_owned(),
+            "5".to_owned(),
+            ip.to_owned(),
+            "22".to_owned(),
+        ],
+        crate::vm_lab::VmGuestPlatform::Windows => vec![
+            "powershell.exe".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            // Exit code is the ONLY discriminator: `Test-NetConnection`
+            // prints `PingSucceeded : True` whenever the host answers ICMP,
+            // so matching the string "True" in stdout would pass the probe
+            // on ping-reachable-but-TCP-blocked hosts (the exact shape the
+            // CP-1 pf block produces).
+            "-Command".to_owned(),
+            format!(
+                "if ((Test-NetConnection -ComputerName {ip} -Port 22).TcpTestSucceeded) \
+                 {{ exit 0 }} else {{ exit 1 }}"
+            ),
+        ],
+        // Linux (and any other unix-ish guest): bash /dev/tcp under timeout.
+        _ => vec![
+            "timeout".to_owned(),
+            "10".to_owned(),
+            "bash".to_owned(),
+            "-c".to_owned(),
+            format!("exec 3<>/dev/tcp/{ip}/22"),
+        ],
+    }
+}
+
+/// Dataplane stages whose results are meaningless when the fleet spans
+/// more than one L2 segment without the CP-1 pf override.
+///
+/// Drift note: the four `StageId`s below are compile-time pinned — renaming
+/// any of them breaks this match. Only ADDING a new cross-bridge dataplane
+/// stage without listing it here drifts silently (degrading Fail→Warn), so
+/// any such stage MUST be added here in the same change.
+fn plan_has_cross_bridge_dataplane_stage(planned: &[StageId]) -> bool {
+    planned.iter().any(|id| {
+        matches!(
+            id,
+            StageId::TrafficTestMatrix
+                | StageId::LiveTwoHopValidation
+                | StageId::LiveManagedDnsValidation
+                | StageId::RelayForwardsFrameValidation
+        )
+    })
+}
+
+/// Collapse control characters (ANSI escapes, CR) in probe stderr so
+/// guest-influenced bytes cannot forge or garble operator-facing failure
+/// text. Newlines become literal `\n` to keep one probe = one report line.
+fn sanitize_probe_text(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\r' => '\\',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect()
+}
+
+/// Pure decision for the cross-bridge preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrossBridgeOutcome {
+    NoSplit,
+    Pass,
+    Warn(String),
+    Fail(String),
+}
+
+fn decide_cross_bridge(
+    groups: &[CrossBridgeSubnetGroup],
+    excluded: &[String],
+    probe_failures: &[String],
+    planned: &[StageId],
+) -> CrossBridgeOutcome {
+    // Non-IPv4 ssh hosts (IPv6 literals, hostnames) cannot be classified
+    // into a /24, so cross-bridge reachability is UNPROVABLE for them. A
+    // fleet carrying such a target must never read as a clean single-subnet
+    // pass: hard-fail under a dataplane plan, warn otherwise.
+    let excluded_note = (!excluded.is_empty()).then(|| excluded.join(", "));
+    if let Some(names) = &excluded_note {
+        if plan_has_cross_bridge_dataplane_stage(planned) {
+            return CrossBridgeOutcome::Fail(format!(
+                "cross-bridge preflight: non-IPv4 ssh host(s) cannot be classified into a \
+                 /24 ({names}); cross-bridge reachability is unprovable for them while \
+                 cross-bridge dataplane stages (traffic_test_matrix / \
+                 live_two_hop_validation / live_managed_dns_validation / \
+                 relay_forwards_frame_validation) are planned (CP-1: \
+                 documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md \
+                 §9, scripts/vm_lab/cross_vmnet_pf_override.pf)"
+            ));
+        }
+    }
+    if groups.len() <= 1 {
+        if excluded.is_empty() {
+            return CrossBridgeOutcome::NoSplit;
+        }
+        return CrossBridgeOutcome::Warn(format!(
+            "cross-bridge preflight: single /24 plus unclassifiable non-IPv4 ssh host(s) \
+             ({excluded_note:?}); reachability for them unproven, continuing (control-plane \
+             plan; CP-1: documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md \
+             §9, scripts/vm_lab/cross_vmnet_pf_override.pf)"
+        ));
+    }
+    if probe_failures.is_empty() {
+        if excluded.is_empty() {
+            return CrossBridgeOutcome::Pass;
+        }
+        return CrossBridgeOutcome::Warn(format!(
+            "cross-bridge preflight: probes reachable, but non-IPv4 ssh host(s) \
+             ({excluded_note:?}) were never probed (control-plane plan; CP-1: \
+             documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md §9, \
+             scripts/vm_lab/cross_vmnet_pf_override.pf)"
+        ));
+    }
+    let failure_detail = probe_failures.join("; ");
+    if plan_has_cross_bridge_dataplane_stage(planned) {
+        CrossBridgeOutcome::Fail(format!(
+            "cross-bridge preflight: guests span {} /24 subnets and guest-to-guest TCP/22 is blocked across the split ({failure_detail}); cross-bridge dataplane stages (traffic_test_matrix / live_two_hop_validation / live_managed_dns_validation / relay_forwards_frame_validation) cannot pass without CP-1 (see documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md §9 and scripts/vm_lab/cross_vmnet_pf_override.pf)",
+            groups.len()
+        ))
+    } else {
+        CrossBridgeOutcome::Warn(format!(
+            "cross-bridge preflight: guests span {} /24 subnets and guest-to-guest TCP/22 is blocked across the split ({failure_detail}); no cross-bridge dataplane stage is planned, continuing (CP-1: documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md §9, scripts/vm_lab/cross_vmnet_pf_override.pf)",
+            groups.len()
+        ))
+    }
+}
+
+impl PreflightStage {
+    /// Probe guest-to-guest TCP/22 across every derived /24 pair and gate
+    /// the run on the result. WARN-only for control-plane plans; hard fail
+    /// when a cross-bridge dataplane stage is planned (CP-1).
+    fn cross_bridge_preflight(&self, ctx: &OrchestrationContext) -> StageOutcome {
+        use std::fmt::Write as _;
+
+        let mut targets: Vec<(String, String)> = Vec::new();
+        for (alias, adapter) in &ctx.adapters {
+            if let Some(params) = adapter.ssh_connection_params() {
+                targets.push((alias.clone(), params.host));
+            }
+        }
+        let (groups, excluded) = classify_subnet_split(&targets);
+
+        let mut report = String::new();
+        let _ = writeln!(report, "# cross-bridge preflight");
+        for (alias, host) in &targets {
+            let _ = writeln!(report, "target: {alias} host: {host}");
+        }
+        for g in &groups {
+            let _ = writeln!(
+                report,
+                "subnet: {}.{}.{}.0 nodes: {}",
+                g.subnet[0],
+                g.subnet[1],
+                g.subnet[2],
+                g.aliases.join(", ")
+            );
+        }
+        for alias in &excluded {
+            let _ = writeln!(report, "excluded (non-IPv4 ssh host): {alias}");
+        }
+        let _ = writeln!(
+            report,
+            "note: one alias per /24 is sampled per probe direction (spot check, not full mesh)"
+        );
+
+        let mut probe_failures: Vec<String> = Vec::new();
+        if groups.len() >= 2 {
+            for i in 0..groups.len() {
+                for j in (i + 1)..groups.len() {
+                    let a = &groups[i];
+                    let b = &groups[j];
+                    let a_alias = &a.aliases[0];
+                    let b_alias = &b.aliases[0];
+                    let (Some(a_adapter), Some(b_adapter)) =
+                        (ctx.adapters.get(a_alias), ctx.adapters.get(b_alias))
+                    else {
+                        // A silently skipped pair would let decide_cross_bridge
+                        // read zero failures as Pass — record the unproven
+                        // pair as a probe failure instead (fail-closed).
+                        probe_failures.push(format!(
+                            "probe skipped: adapter missing for {a_alias} or {b_alias} \
+                             — cross-bridge pair unproven"
+                        ));
+                        continue;
+                    };
+                    let a_ip = strip_ssh_port(
+                        &a_adapter
+                            .ssh_connection_params()
+                            .map(|p| p.host)
+                            .unwrap_or_default(),
+                    )
+                    .to_owned();
+                    let b_ip = strip_ssh_port(
+                        &b_adapter
+                            .ssh_connection_params()
+                            .map(|p| p.host)
+                            .unwrap_or_default(),
+                    )
+                    .to_owned();
+                    for (src_alias, src_adapter, dst_alias, dst_ip) in [
+                        (a_alias, a_adapter, b_alias, b_ip.clone()),
+                        (b_alias, b_adapter, a_alias, a_ip.clone()),
+                    ] {
+                        let reachable = (|| {
+                            let host = src_adapter.shell_host().map_err(|e| e.to_string())?;
+                            let argv = cross_bridge_probe_argv(src_adapter.platform(), &dst_ip);
+                            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                            let status = host
+                                .run_argv(&argv_refs, &[], &[])
+                                .map_err(|e| e.to_string())?;
+                            if !status.is_success() {
+                                return Err(format!(
+                                    "exit {}: {}",
+                                    status.code,
+                                    sanitize_probe_text(
+                                        String::from_utf8_lossy(&status.stderr).trim()
+                                    )
+                                ));
+                            }
+                            Ok(())
+                        })();
+                        match reachable {
+                            Ok(()) => {
+                                let _ = writeln!(
+                                    report,
+                                    "probe: {src_alias} -> {dst_alias} ({dst_ip}):22 reachable"
+                                );
+                            }
+                            Err(e) => {
+                                let line = format!(
+                                    "{src_alias} → {dst_alias} ({dst_ip}):22 cross-bridge unreachable ({e})"
+                                );
+                                let _ = writeln!(report, "probe: {line}");
+                                probe_failures.push(line);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let outcome =
+            decide_cross_bridge(&groups, &excluded, &probe_failures, &self.planned_stage_ids);
+        let decision_line = match &outcome {
+            CrossBridgeOutcome::NoSplit => "decision: no subnet split (single /24)".to_owned(),
+            CrossBridgeOutcome::Pass => {
+                "decision: split present, all cross-bridge probes reachable".to_owned()
+            }
+            CrossBridgeOutcome::Warn(msg) => format!("decision: WARN — {msg}"),
+            CrossBridgeOutcome::Fail(msg) => format!("decision: FAIL — {msg}"),
+        };
+        let _ = writeln!(report, "{decision_line}");
+
+        let log_path = ctx.report_dir.join("logs/cross_bridge_preflight.txt");
+        if let Some(parent) = log_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!("cross-bridge preflight: cannot create log dir: {e}");
+            }
+        }
+        if let Err(e) = std::fs::write(&log_path, &report) {
+            eprintln!("cross-bridge preflight: cannot write report: {e}");
+        }
+
+        match outcome {
+            CrossBridgeOutcome::NoSplit | CrossBridgeOutcome::Pass => StageOutcome::Passed,
+            CrossBridgeOutcome::Warn(msg) => {
+                eprintln!("preflight warning: {msg}");
+                StageOutcome::Passed
+            }
+            CrossBridgeOutcome::Fail(msg) => StageOutcome::Failed(msg),
+        }
     }
 }
 
@@ -537,6 +883,7 @@ mod tests {
         let mut ctx = make_ctx_with_exit(tmp.path());
         let outcome = PreflightStage {
             clock_remediation_enabled: false,
+            planned_stage_ids: Vec::new(),
         }
         .execute(&mut ctx);
         assert!(
@@ -578,6 +925,7 @@ mod tests {
         };
         let outcome = PreflightStage {
             clock_remediation_enabled: false,
+            planned_stage_ids: Vec::new(),
         }
         .execute(&mut ctx);
         assert!(
@@ -986,5 +1334,220 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(calls.get(), 1, "zero attempts clamps to exactly one try");
+    }
+
+    // ---- cross-bridge preflight (QH-72) ---------------------------------
+
+    #[test]
+    fn classify_subnet_split_separates_and_sorts_subnets() {
+        let targets = vec![
+            ("node-b".to_owned(), "192.168.64.20".to_owned()),
+            ("node-a".to_owned(), "192.168.64.10".to_owned()),
+            ("node-c".to_owned(), "192.168.65.30".to_owned()),
+        ];
+        let (groups, excluded) = classify_subnet_split(&targets);
+        assert_eq!(excluded.len(), 0);
+        assert_eq!(groups.len(), 2, "two /24s must yield two groups");
+        assert_eq!(groups[0].subnet, [192, 168, 64, 0]);
+        assert_eq!(
+            groups[0].aliases,
+            vec!["node-a".to_owned(), "node-b".to_owned()]
+        );
+        assert_eq!(groups[1].subnet, [192, 168, 65, 0]);
+        assert_eq!(groups[1].aliases, vec!["node-c".to_owned()]);
+    }
+
+    #[test]
+    fn classify_subnet_split_groups_same_subnet_and_strips_port() {
+        let targets = vec![
+            ("a".to_owned(), "10.0.0.7:2222".to_owned()),
+            ("b".to_owned(), "10.0.0.9".to_owned()),
+        ];
+        let (groups, excluded) = classify_subnet_split(&targets);
+        assert_eq!(
+            excluded.len(),
+            0,
+            "host:port must be stripped, not excluded"
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].subnet, [10, 0, 0, 0]);
+        assert_eq!(groups[0].aliases.len(), 2);
+    }
+
+    #[test]
+    fn classify_subnet_split_excludes_non_ipv4() {
+        let targets = vec![
+            ("v6".to_owned(), "fd00::1".to_owned()),
+            ("junk".to_owned(), "not-an-ip".to_owned()),
+            ("v6port".to_owned(), "[fd00::2]:22".to_owned()),
+            ("ok".to_owned(), "172.16.0.5".to_owned()),
+        ];
+        let (groups, excluded) = classify_subnet_split(&targets);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].aliases, vec!["ok".to_owned()]);
+        assert_eq!(excluded.len(), 3);
+    }
+
+    #[test]
+    fn cross_bridge_probe_argv_per_platform() {
+        let linux = cross_bridge_probe_argv(crate::vm_lab::VmGuestPlatform::Linux, "192.168.64.9");
+        assert_eq!(
+            linux[..4],
+            ["timeout", "10", "bash", "-c"].map(String::from).to_vec()
+        );
+        assert!(linux[4].contains("/dev/tcp/192.168.64.9/22"));
+
+        let macos = cross_bridge_probe_argv(crate::vm_lab::VmGuestPlatform::Macos, "192.168.64.9");
+        assert_eq!(
+            macos,
+            ["nc", "-z", "-G", "5", "192.168.64.9", "22"]
+                .map(String::from)
+                .to_vec()
+        );
+
+        let windows =
+            cross_bridge_probe_argv(crate::vm_lab::VmGuestPlatform::Windows, "192.168.64.9");
+        assert_eq!(windows[0], "powershell.exe");
+        assert!(windows[4].contains("Test-NetConnection"));
+        assert!(windows[4].contains("192.168.64.9"));
+    }
+
+    #[test]
+    fn decide_cross_bridge_no_split_and_pass() {
+        let one = vec![CrossBridgeSubnetGroup {
+            subnet: [192, 168, 64, 0],
+            aliases: vec!["a".to_owned(), "b".to_owned()],
+        }];
+        assert_eq!(
+            decide_cross_bridge(&one, &[], &["x".to_owned()], &[]),
+            CrossBridgeOutcome::NoSplit,
+            "a single subnet never fails regardless of probes"
+        );
+
+        let two = two_groups();
+        assert_eq!(
+            decide_cross_bridge(&two, &[], &[], &[]),
+            CrossBridgeOutcome::Pass,
+            "reachable probes pass regardless of plan"
+        );
+    }
+
+    #[test]
+    fn decide_cross_bridge_hard_fails_for_each_dataplane_stage() {
+        for stage in [
+            StageId::TrafficTestMatrix,
+            StageId::LiveTwoHopValidation,
+            StageId::LiveManagedDnsValidation,
+            StageId::RelayForwardsFrameValidation,
+        ] {
+            let outcome = decide_cross_bridge(
+                &two_groups(),
+                &[],
+                &["a → b (192.168.65.9):22 cross-bridge unreachable (exit 1)".to_owned()],
+                &[stage.clone()],
+            );
+            match outcome {
+                CrossBridgeOutcome::Fail(ref msg) => {
+                    assert!(msg.contains("CP-1"), "{stage:?}: {msg}");
+                    assert!(
+                        msg.contains("MacosCrossNetworkTrafficBlocker_2026-09-03"),
+                        "{stage:?}: {msg}"
+                    );
+                    assert!(
+                        msg.contains("scripts/vm_lab/cross_vmnet_pf_override.pf"),
+                        "{stage:?}: {msg}"
+                    );
+                }
+                ref other => panic!("{stage:?}: expected Fail, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn decide_cross_bridge_warns_for_control_plane_only_plans() {
+        let control_plane = [
+            StageId::MacosAnchorProfileDeploy,
+            StageId::MacosRoleTransitionValidation,
+            StageId::MacosRebootRecoveryValidation,
+        ];
+        let outcome = decide_cross_bridge(
+            &two_groups(),
+            &[],
+            &["a → b (192.168.65.9):22 cross-bridge unreachable (exit 1)".to_owned()],
+            &control_plane,
+        );
+        assert!(matches!(outcome, CrossBridgeOutcome::Warn(_)));
+
+        let empty = decide_cross_bridge(
+            &two_groups(),
+            &[],
+            &["a → b (192.168.65.9):22 cross-bridge unreachable (exit 1)".to_owned()],
+            &[],
+        );
+        assert!(matches!(empty, CrossBridgeOutcome::Warn(_)));
+    }
+
+    /// glm-5.3 review (TASK 3): a fleet with an unclassifiable (non-IPv4)
+    /// ssh target must never read as a clean pass — reachability for that
+    /// host is unprovable, so a cross-bridge dataplane plan hard-fails and a
+    /// control-plane plan warns even when all classified probes are green.
+    #[test]
+    fn decide_cross_bridge_excluded_targets_never_pass_cleanly() {
+        let excluded = vec!["ula-node".to_owned()];
+        // Single /24 + excluded, control-plane plan → Warn (not NoSplit).
+        let one = vec![CrossBridgeSubnetGroup {
+            subnet: [192, 168, 64, 0],
+            aliases: vec!["a".to_owned()],
+        }];
+        assert!(matches!(
+            decide_cross_bridge(&one, &excluded, &[], &[]),
+            CrossBridgeOutcome::Warn(_)
+        ));
+        // Split + all probes green + excluded, control-plane plan → Warn.
+        assert!(matches!(
+            decide_cross_bridge(&two_groups(), &excluded, &[], &[]),
+            CrossBridgeOutcome::Warn(_)
+        ));
+        // Any excluded target under a dataplane plan → Fail.
+        for stage in [
+            StageId::TrafficTestMatrix,
+            StageId::LiveTwoHopValidation,
+            StageId::LiveManagedDnsValidation,
+            StageId::RelayForwardsFrameValidation,
+        ] {
+            let outcome = decide_cross_bridge(&one, &excluded, &[], &[stage.clone()]);
+            assert!(
+                matches!(outcome, CrossBridgeOutcome::Fail(ref msg) if msg.contains("non-IPv4")),
+                "{stage:?}: expected Fail naming the non-IPv4 host, got {outcome:?}"
+            );
+        }
+    }
+
+    /// glm-5.3 review (TASK 3): the Windows probe must discriminate on EXIT
+    /// CODE, not on the string "True" — Test-NetConnection prints
+    /// `PingSucceeded : True` on ICMP-reachable but TCP-blocked hosts, which
+    /// would false-pass a stdout substring check.
+    #[test]
+    fn cross_bridge_windows_probe_exits_on_tcp_result() {
+        let windows =
+            cross_bridge_probe_argv(crate::vm_lab::VmGuestPlatform::Windows, "192.168.64.9");
+        let script = &windows[4];
+        assert!(script.contains("if ((Test-NetConnection"));
+        assert!(script.contains("TcpTestSucceeded"));
+        assert!(script.contains("exit 0"));
+        assert!(script.contains("exit 1"));
+    }
+
+    fn two_groups() -> Vec<CrossBridgeSubnetGroup> {
+        vec![
+            CrossBridgeSubnetGroup {
+                subnet: [192, 168, 64, 0],
+                aliases: vec!["mac-node".to_owned()],
+            },
+            CrossBridgeSubnetGroup {
+                subnet: [192, 168, 65, 0],
+                aliases: vec!["linux-node".to_owned()],
+            },
+        ]
     }
 }
