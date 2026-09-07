@@ -16,7 +16,7 @@
 > and QH-05's "history" framing), and **split the confidence label** where mechanism and
 > example diverge (VERIFIED-mechanism / REFUTED-example is more useful than one word).
 > This register had **15** items at the 2026-07-25 review, not the 13 `README.md`
-> then claimed; it has since grown to **74** (QH-01 through QH-74, contiguous;
+> then claimed; it has since grown to **77** (QH-01 through QH-77, contiguous;
 > re-counted 2026-09-05 — QH-65/66 were filed from the macOS exit membership
 > role-fix design's independent review).
 > QH-39/40/41 were filed 2026-08-11 from the `percontrol-rebaseline-20260811`
@@ -6539,7 +6539,7 @@ matrix including all four dataplane stage ids.
 `ba3ff9a3` (2026-09-06, GLM Manager C TASK 3); live re-proof across a real
 split pending (CP-1 override intentionally not loaded this session).**
 
-### QH-73 — FIXED: macOS cleanup/uninstall left `com.rustynet/*` pf anchors behind — a surviving `com.rustynet/blind_exit` (`block drop out quick all`) outlived uninstall
+### QH-73 — FIXED IN TREE, LIVE PROOF PENDING: macOS cleanup/uninstall left `com.rustynet/*` pf anchors behind — a surviving `com.rustynet/blind_exit` (`block drop out quick all`) outlived uninstall
 **Severity: high (residual default-deny pf state on a lab guest persists into every later run and can blackhole that guest's outbound traffic). Confidence: VERIFIED — live finding on macos-utm-1: `com.rustynet/blind_exit` with `block drop out quick all` survived uninstall; root cause read in code this session.**
 
 Two gaps compounded: (1) `uninstall_daemon` (macos_install.rs) removed
@@ -6559,7 +6559,7 @@ killswitch anchors. Unit tests pin the validator (accept/reject cases), the
 list parser, the exact flush argv, and (source-pinned) that uninstall calls
 the flush.
 
-**Disposition: FIXED in branch `ai-edit/edit-1788730584891-34192-0` commit
+**Disposition: FIXED in branch `ai-edit/edit-1788730584891-34192-0` commit **Merge-time correction (2026-09-07, independent review of the branch):** the branch's flush enumerated `pfctl -s Anchors`, which lists only TOP-LEVEL anchors (`com.apple`, `com.rustynet`) — the nested `com.rustynet/blind_exit` it targets was never observed, `uninstall_daemon` has no caller, and the live `cleanup_runtime_state` path swallowed the error. Corrected in the merge: the strict flush also enumerates `pfctl -a com.rustynet -s Anchors` (fail-closed when the parent is listed but unreadable), the shell reset/clean-probe/diagnostics enumerations union the nested `com.apple` and `com.rustynet` listings, and `cleanup_runtime_state` propagates a surviving-anchor error. **Live mechanism proof 2026-09-07 on macos-utm-1 (at 192.168.64.18 that boot):** `pfctl -s Anchors` listed only `com.apple`/`com.rustynet`; a planted `com.rustynet/qh73test` (one pass rule) appeared only under `pfctl -a com.rustynet -s Anchors`; the corrected union enumeration flushed it (`pfctl -a com.rustynet/qh73test -F all` → rules cleared, anchor empty afterwards); and zsh printed `[a b]` for an unquoted `$files` but `[x][/tmp]` for `"$@"`, confirming the archive-script defect. Remaining: one orchestrator-driven cleanup on a guest carrying a real `com.rustynet/blind_exit` anchor (the next macOS blind-exit or exit cell run) to prove the code path end to end; then mark FIXED.
 `229ba864` (2026-09-06, GLM Manager C TASK 4); live re-proof on macos-utm-1
 pending (rustynetd's own pf/killswitch code untouched by design).
 
@@ -6588,3 +6588,33 @@ or the `documents/operations/` tree), falling back to the compile-time path
 only when no marker is found; pin it with a test that runs the binary from a
 copy of the tree and asserts the ledger append landed beside that copy.
 **Disposition: OPEN, filed by manager session 7 (2026-09-07).**
+
+### QH-75 — relay-proof and lab-SSH follow-ups from the 2026-09-07 merge review of the GLM lab chain (six findings, none merge-blocking, all lab tooling)
+**Severity: medium (proof quality and misleading safety claims; no verdict weakened). Confidence: VERIFIED by reading the merged tree at the cited lines; none of these was fixed in the merge, which only reverted the shipped-CLI anchor widening (see the merge commit) and made the `ss` matcher fail closed on a missing peer column.**
+
+1. `crates/rustynet-cli/src/vm_lab/orchestrator/adapter/ssh.rs` ProxyJump: OpenSSH expands `-J` into an inner `ssh … -W %h:%p jump` that inherits only `-l/-p/-J/-F/-v`, so the pinned identity, `UserKnownHostsFile`, `IdentitiesOnly`, `BatchMode` and `StrictHostKeyChecking` do NOT apply to the jump hop (it uses default keys, default known_hosts, interactive host-key prompts). The doc comment now says so; the durable fix is an explicit `-o ProxyCommand=ssh -F /dev/null -i <id> -o UserKnownHostsFile=<kh> -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -W %h:%p <jump>` built through the validated-arg seam. The `[A-Za-z0-9.-_@:]` allowlist on the jump spec is load-bearing (OpenSSH interpolates it into a `/bin/sh -c` ProxyCommand) — keep it.
+2. `role_validation/relay.rs` ~192: after the relay restart, `wait_until_ready` returns `Ok(last_snapshot)` on budget exhaustion and the snapshot is dropped, so `restart_status` reads `Ok` for a relay that never came back; the comment claims otherwise. Fix: fail when the final snapshot is not serving.
+3. `role_validation/relay.rs` ~1313 `validate_linux_lifecycle_fails_when_during_run_not_serving`: passes because the mock runs out of programmed responses (readiness loop drains them, +3 s), not because the during-run assertions fire. Program a default run response and assert on the `unit_state` / `was NOT bound` text.
+4. `vm_lab/mod.rs` `select_relay_forward_test_topology_for_run`: peer exclusion is still inventory-flag based (`exit_capable` / `relay_capable`), so a run that assigns `exit`/`anchor` to a node whose flag is unset can elect it as the "spare" sender. Pass the run's `NodeRoleAssignment`s and admit only client/aux/extra roles.
+5. `vm_lab/mod.rs` relay-forward status script: `privileged_rustynet_cli_script("status")` resolves `rustynet` via `command -v` and prints `rustynet-not-installed` with exit 0 on a PATH miss, so the `HP3_STATUS_UNREACHABLE` marker never fires and the loop polls to the 90 s timeout. Fails closed, but the triage text misleads (cf. the sbin-PATH incident). Use the absolute `/usr/local/bin/rustynet` or map the not-installed line to the marker.
+6. `adapter/ssh.rs` tests `ssh_and_scp_carry_the_proxyjump_only_for_elected_hosts` (and the two shared-hardening tests) read the real `RUSTYNET_LAB_PROXYJUMP{,_CIDRS}` environment; `vm_lab/mod.rs` `append_lab_proxyjump` splits the target on the last `:` and mangles IPv6/bracketed hosts (silently no jump). Inject the env in tests; parse hosts with the existing address helpers.
+
+**Disposition: OPEN, filed at merge time 2026-09-07 from the independent review of `ai-edit/edit-1788757368303-22407-0`.**
+
+### QH-76 — merge-review follow-ups on the cross-bridge preflight, macOS diagnostics and cleanup (2026-09-07; none merge-blocking)
+**Severity: medium (usability and residual proof gaps; verdict semantics unchanged). Confidence: VERIFIED at the cited lines of the merged tree.**
+
+1. `stage/preflight.rs`: a hostname `ssh_target` (the inventory carries `debian-lan-11`) is classified as non-IPv4 and hard-fails any run that plans a dataplane stage, although reachability is provable — resolve via `ToSocketAddrs` to an IPv4 before classifying and keep the Fail only for genuinely unresolvable hosts.
+2. `stage/preflight.rs`: the criterion is guest→guest TCP/22, stricter than the dataplane needs; multi-host fleets behind separate NATs (UTM 192.168.64/65.x + libvirt 192.168.121.x over the ProxyJump) cannot pass it yet form the mesh via STUN. Add an explicit, report-recorded `--allow-cross-bridge-split` (or gate on the cross-network substrate mode) that downgrades Fail→Warn.
+3. `adapter/macos_traffic.rs`: the diagnostics staging paths `/tmp/rn_diag_capture` and `/tmp/rn_diag_artifacts.tar.gz` are fixed names (symlink-plant class the relay drop already hardened with `unique_suffix()`); use the suffix for consistency.
+4. `adapter/macos_install.rs` `uninstall_daemon` has no caller in the engine (teardown goes through `cleanup_runtime_state`); either wire it into a stage or delete it so its fail-closed flush is not dead code.
+5. Pre-existing zsh hazard, now fixed for the diagnostics archive at merge time (`set --` positional list instead of an unquoted `$files` expansion, which zsh does not word-split): audit the remaining `for a in $var`-style loops in the macOS shell snippets for the same class.
+
+**Disposition: OPEN, filed at merge time 2026-09-07 from the independent review of `ai-edit/edit-1788734269512-30091-0`.**
+
+### QH-77 — `vm_lab::tests::local_utm_process_present_uses_wide_ps_output` fails under heavy host load (observed once, 2026-09-07)
+**Severity: low (test flake, no product bearing). Confidence: OBSERVED once during `cargo test -p rustynet-cli --lib --all-features` on the merged tree while two other cargo jobs and a secrets-hygiene gate contended for the same target dir; the same test passed 3/3 in isolation immediately afterwards (4–15 s each, i.e. slow), and the full workspace gate on the same tree had passed it minutes earlier.**
+
+The test writes a fake `ps` script into a temp dir and probes it through `local_utm_process_present_with_ps` with a 30 s budget; under load the spawn/permission/temp-dir path is slow enough to trip something (exact assertion not captured — the runner's summary only recorded the FAILED line). Direction: capture the panic text on the next occurrence (run with `-- --nocapture`), check whether the 30 s budget or the `unique_suffix()` temp path is the sensitive part, and consider marking the probe budget test-configurable. Not a merge blocker: untouched by the merge and green in isolation.
+
+**Disposition: OPEN, filed 2026-09-07 at merge time.**

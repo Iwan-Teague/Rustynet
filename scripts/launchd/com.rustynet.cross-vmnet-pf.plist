@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Self-healing keeper for the CP-1 host pf override (owner decision 4,
+  OwnerDecisions_2026-09-07.md). Re-loads the four `pass quick` rules that let
+  the two UTM vmnet-shared lab /24s reach each other into the anchor
+  com.apple/100.rustynet-lab whenever they are missing (they vanish on every
+  reboot). Loads nothing unless both lab bridges exist; never edits /etc/pf.conf;
+  opens routed IPv4 between 192.168.64.0/24 and 192.168.65.0/24 only.
+  Details: documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md §9.
+
+  Install once (owner, needs sudo):
+    sudo mkdir -p /usr/local/lib/rustynet
+    sudo install -m 0755 scripts/vm_lab/ensure_cross_vmnet_pf_override.sh \
+        /usr/local/lib/rustynet/ensure_cross_vmnet_pf_override.sh
+    sudo install -m 0644 scripts/vm_lab/cross_vmnet_pf_override.pf \
+        /usr/local/lib/rustynet/cross_vmnet_pf_override.pf
+    sudo install -m 0644 scripts/launchd/com.rustynet.cross-vmnet-pf.plist \
+        /Library/LaunchDaemons/com.rustynet.cross-vmnet-pf.plist
+    sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.cross-vmnet-pf.plist
+  Verify:   sudo pfctl -a com.apple/100.rustynet-lab -sr      (four pass-quick rules)
+            tail /var/log/rustynet-cross-vmnet-pf.log
+  Uninstall:
+    sudo launchctl bootout system/com.rustynet.cross-vmnet-pf
+    sudo rm /Library/LaunchDaemons/com.rustynet.cross-vmnet-pf.plist
+    sudo pfctl -a com.apple/100.rustynet-lab -F all          (re-blocks CP-1 now)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.rustynet.cross-vmnet-pf</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/usr/local/lib/rustynet/ensure_cross_vmnet_pf_override.sh</string>
+    </array>
+    <!-- Run at load and every 30s; the script is idempotent and cheap, and
+         re-asserts the anchor after a vmnet restart within one interval. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/rustynet-cross-vmnet-pf.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/rustynet-cross-vmnet-pf.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

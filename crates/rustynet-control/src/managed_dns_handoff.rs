@@ -29,7 +29,7 @@
 //! signed carriage decision does not block this control-plane wiring.
 //!
 //! This module is domain-layer and transport-agnostic: it imports no backend,
-//! WireGuard, OS, or process-management types, performs no I/O, and never
+//! tunnel-backend, OS, or process-management types, performs no I/O, and never
 //! decides the exit-side port-53 redirect (D-6c, out of scope).
 
 use crate::tandem_dns::{

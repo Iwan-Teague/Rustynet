@@ -145,3 +145,75 @@ cited as one.
 The argv carries both flags on all three platforms; every test above is mutation-proven; a live
 run shows the stage's verdict changing where it should; the ledger-semantics boundary is
 recorded; and the misleading doc comment at `mesh_status.rs:5-8` is corrected in the same change.
+
+## Addendum 2026-09-07 — QH-70: live-handshake evidence (owner decision 5, stage-side)
+
+<!-- Drafted 2026-09-07 by a glm-5.3-flash grounded read-only agent at the owner's request (owner decision 5, QH-70); reviewed and placed by the managing Claude session. Status: PLAN — implementation tracked in OwnerDecisions_2026-09-07.md. Line references are against main at 2a5c4e1d unless stated. -->
+
+
+## Goal
+`mesh_status_validation` must fail unless the node presents **live dataplane evidence**: ≥1 live peer and a fresh latest-handshake whenever the run topology expects peers. Snapshot-loads-and-is-fresh stays necessary but is no longer sufficient.
+
+## Existing state
+- Prior fix (Revision 2, C2) landed: all three `validate_*_mesh_status` dispatch `--max-age-seconds 180` (`role_validation/mesh_status.rs:15`, `:61-66`, `:99-103`, `:135-139`); macOS adds `--expected-node-id` (`:84-88`). That still proves only snapshot convergence, not dataplane — exactly the gap that plan §2/C3 flags ("membership convergence, not reachability").
+- The stage loops every assigned alias and calls `adapter.run_role_validator(RoleValidatorKind::MeshStatus, expected_node_id, None)` (`stage/mesh_status_validation.rs:55-71`); dispatch per platform at `adapter/node_adapter.rs:614-629`; trait signature `node_adapter.rs:272-279`.
+- The daemon's IPC `status` line already carries the needed fields — `path_programmed_peer_count`, `path_live_peer_count`, `path_latest_live_handshake_unix`, `relay_session_*` (`rustynetd/src/daemon.rs:9259`; `latest_live_handshake_unix` is max-over-peers, `daemon.rs:8431-8500`).
+- Cross-OS precedent for querying status live: Linux `query_live_identity` runs `rustynet status` with `RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock` (`adapter/linux_traffic.rs:394-399`); Windows via trust-CLI `status` verb (`windows_traffic.rs:148-165`); macOS queries `rustynet status` only (`macos_traffic.rs:345`).
+- Poll-deadline + pure-evaluator + `MockShellHost` template already exists: `role_validation/gossip_convergence.rs:37-40` (150s/10s), `:63-67` (status argv), `:79-96` (`splitn(2,'=')` token/field/count helpers), `:98+` (fail-closed evaluator).
+- Handshakes complete asynchronously post-enforce (`stage/traffic_test_matrix.rs:90-96`), so a first-poll failure would be flaky.
+- Stage order: MeshStatusValidation (plan.rs:1012) runs **before** DeployRelayService/RelayValidation/TrafficTestMatrix (plan.rs:1016-1018), so relay sessions may legitimately be absent at this point.
+
+## Design
+1. **New pure evaluator** — `role_validation/mesh_status.rs`:
+```rust
+/// Live-handshake evidence window. Same 180s basis as SNAPSHOT_MAX_AGE_SECONDS:
+/// a WireGuard handshake rekeys ≤~180s under traffic; if the daemon keeps none
+/// alive inside this window the dataplane is idle-dead, which is the false-green
+/// QH-70 exists to catch. Future-dated handshake_unix fails (no slack).
+pub(crate) const MAX_HANDSHAKE_AGE_SECONDS: u64 = 180;
+
+pub fn evaluate_live_handshake_status(
+    alias: &str, stdout: &str, expected_live_peers: u32, now_unix: u64,
+) -> Result<(), String>
+```
+Parse with the `splitn(2,'=')` helpers (copy the three small fns from `gossip_convergence.rs:79-96`, or hoist them into `role_validation/mod.rs` and reuse). Fail closed when:
+- any required field missing/unparseable: `path_live_peer_count`, `path_programmed_peer_count`, `path_latest_live_handshake_unix`;
+- `expected_live_peers > 0` and `path_live_peer_count == 0` or `path_programmed_peer_count == 0` (programmed-but-not-live = dataplane applied, handshake never proven; mirrors `linux_traffic.rs:591-603`);
+- `now_unix.saturating_sub(handshake_unix) > MAX_HANDSHAKE_AGE_SECONDS` or `handshake_unix > now_unix`.
+`relay_session_state`/`relay_session_established_peers` are parsed and echoed into the failure/evidence string but **never gate** here — relay deploy is two stages later (plan.rs:1016). `expected_live_peers == 0` skips the peer/handshake clauses (single-node run).
+2. **Adapter plumbing** — add to `NodeAdapter` (default = `Err(AdapterError::UnsupportedPlatform)`, the `probe_membership_owner_signing_key_present` pattern at `node_adapter.rs:216-229`):
+```rust
+fn collect_daemon_status(&self) -> Result<String, AdapterError> { ... }
+```
+Implemented per platform from the three existing `query_live_identity` status queries (`linux_traffic.rs:394`, `macos_traffic.rs:345`, `windows_traffic.rs:148`), returning full status text instead of extracting `node_id`.
+3. **Stage wiring** — `stage/mesh_status_validation.rs`, inside the per-alias loop after `run_role_validator` succeeds:
+```rust
+let expected_live_peers = (ctx.assignments.len().saturating_sub(1)) as u32;
+let deadline = Instant::now() + LIVE_HANDSHAKE_DEADLINE; // 120s, poll 10s — gossip_convergence.rs:37-38 precedent
+loop { match adapter.collect_daemon_status() { ... evaluate_live_handshake_status(alias, &s, expected_live_peers, now_unix()) ... } }
+```
+Peers expected = **every other assigned node** (`assignments.len() - 1`): traffic_test_matrix pings all pairs (`traffic_test_matrix.rs:105-110`), so full-mesh liveness is the run's own contract; zero live peers on a multi-node run is the QH-70 defect. Any dispatch/eval error after the deadline → `failures` (existing fail-closed path, `mesh_status_validation.rs:70-72`).
+4. Correct the doc comment (`mesh_status.rs:5-8` / stage doc `:11-19`): "pass" now means snapshot-valid **and** live-handshake-proven; ledger semantics change (forward-only, as plan §3 warns).
+
+## Security analysis
+Fail-closed preserved: missing/unparseable status → error → stage failure; empty output denied (gossip evaluator precedent); no new trust boundary — reads the same local IPC surface the §4.7 challenge already trusts; no secrets in output (status line carries public-key material only, `daemon.rs:9259` `local_wg_public_key`). Risk: over-strict window reds healthy-but-idle nodes — mitigated by the poll deadline, and it is the safe direction. A future-dated timestamp check must use `saturating_sub` and explicit `>` comparison, not `abs()`.
+
+## Tests (stub `MockShellHost`, pattern `mesh_status.rs:112-160` / `gossip_convergence.rs:169+`)
+1. live=0, expected=1 → fail; live=1, fresh handshake → pass.
+2. Stale handshake (now−ts = 181s) → fail; boundary 180 → pass.
+3. Future-dated `path_latest_live_handshake_unix` → fail.
+4. Missing any of the three fields / empty output / `garbage` → fail (mutation: delete a field).
+5. expected=0 (single-node) with live=0 → pass (mutation: drop the expectation → fail).
+6. Dispatch mutation: mock programmed only for status argv + socket env; dropping the status query breaks the test (the `every_platform_dispatch_passes_the_freshness_bound` pattern, `mesh_status.rs:243+`).
+7. Adapter: `collect_daemon_status` default impl returns `UnsupportedPlatform` (never a silent "no peers").
+**Live proof:** next full `--node` Live run's `mesh_status_validation` stage — it must now agree with `traffic_test_matrix` (latest comparable run `3aedcfff`, 2026-09-05, failed exactly on `traffic_test_matrix`); a red mesh_status on that same node class is the defect closing.
+
+## Effort
+~1 day: evaluator + tests (half day), three adapter impls + stage wiring + doc comments (half day), one live run to prove.
+
+## Open questions
+1. Is 180s the right handshake window on an idle-but-healthy node — does the daemon send persistent keepalives at this plan point (unverified)? If not, only the post-`traffic_test_matrix` window would be safe, which conflicts with stage order; measure from the next run before committing the constant.
+2. Should macOS/Windows status implementations also carry `sudo`/env differences (Linux needs `RUSTYNET_DAEMON_SOCKET`; macOS socket path unverified here)?
+3. Should the relay-session clauses gate a *later* stage (post-RelayValidation) instead — separate increment?
+4. Do role-switch/fast-run workflows that legitimately show `path_live_peer_count=0` (`mod.rs:14885-14890`) ever reach this stage, or only the bash-era suite?
+
