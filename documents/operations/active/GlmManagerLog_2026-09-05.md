@@ -804,3 +804,15 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
 - fwd7c finalizer appended ledger rows + 2 null-patch stubs (livelab-1788742006-650de5d3bbca::relay_forwards_frame_validation, ::cross_network_nat_classification). Committing ledger dirt first.
 - Fix plan: mod.rs build_relay_forward_test_status_script (~14096) — replace plain `/usr/local/bin/rustynet status` with privileged_rustynet_cli_script("status") + `|| echo HP3_STATUS_UNREACHABLE`; add unit test pinning sudo form.
 - Then gates, rebuild, commit, record both stub remedies, launch fwd8 = FINAL attempt 3/3.
+
+### 2026-09-07 ~01:1xZ — fwd8 prep: privileged status-script fix pinning test
+- Next: add unit test `relay_forward_test_status_script_uses_privileged_form` near
+  `format_assembled_scripts_render_expected_bodies` (mod.rs ~54131) pinning that
+  `build_relay_forward_test_status_script()` emits the sudo/env form
+  (`sudo -n env RUSTYNET_DAEMON_SOCKET`) and keeps the trailing
+  `|| echo HP3_STATUS_UNREACHABLE` marker. Then gates (fmt, scoped clippy
+  `-p rustynet-cli --features vm-lab --all-targets --all-features -D warnings`,
+  targeted lib test), rebuild pinned binary, commit fix+test+log, record fwd7c
+  stub remedies (relay_forwards_frame_validation → fix; cross_network_nat_classification
+  → decline netns out of scope), launch fwd8 = attempt 3/3 FINAL with fwd7c
+  flags/topology.
