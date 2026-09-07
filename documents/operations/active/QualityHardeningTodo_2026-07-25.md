@@ -6587,7 +6587,7 @@ the repo root at RUNTIME — walk up from the process cwd (or better, from the
 or the `documents/operations/` tree), falling back to the compile-time path
 only when no marker is found; pin it with a test that runs the binary from a
 copy of the tree and asserts the ledger append landed beside that copy.
-**Disposition: OPEN, filed by manager session 7 (2026-09-07).**
+**Disposition: FIXED-IN-BRANCH 2026-09-07 — branch `ai-edit/edit-1788775555939-73909-0`, commits `6588bb79` (shared runtime `workspace_root` module replacing both compiled-in definitions, with unit tests), `bafc3b2f` (init at the `vm-lab-orchestrate-live-lab` parse site), `75337040` (pinning tests: append lands beside a workspace COPY, build-tree ledger byte-unchanged; launch gate reads stubs written into the copy). fmt/clippy/full-crate-test green on the pinned toolchain. Live `--node` proof from a copied tree pending a supervised lab session — see the plan doc (`LedgerRuntimeRootResolutionPlan_2026-09-07.md`) Implementation log/STATUS.**
 
 ### QH-75 — relay-proof and lab-SSH follow-ups from the 2026-09-07 merge review of the GLM lab chain (six findings, none merge-blocking, all lab tooling)
 **Severity: medium (proof quality and misleading safety claims; no verdict weakened). Confidence: VERIFIED by reading the merged tree at the cited lines; none of these was fixed in the merge, which only reverted the shipped-CLI anchor widening (see the merge commit) and made the `ss` matcher fail closed on a missing peer column.**
