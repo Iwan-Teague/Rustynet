@@ -22,6 +22,46 @@ Stop `relay_forwards_frame_validation` from failing on `traversal bundle is stal
 - Authority (admin/anchor, `rustynet-control`): loop re-mints per-pair hint bundles at `generated_at + ttl − MIN_TRAVERSAL_REFRESH_MARGIN_SECS` (same 15 s margin as clients, `daemon.rs:620`) with strictly increasing `generated_at_unix` and fresh nonce; **same long-term signing key** (the lab's `generate_ephemeral_signing_secret` is lab-only). DNS zone re-mint rides the same schedule (`parse_signed_dns_zone_bundle_wire`, `daemon.rs:154-155`).
 - Pickup: point the daemon's existing B1 pull at the authority HTTPS endpoint (`trust_url`, daemon.rs:751) so the already-present pre-expiry schedulers (`daemon.rs:6212`, `5775`) succeed; publish event also triggers `StateRefresh` IPC (precedent `role_signing_subflow.rs:88-90`) for push pickup. One apply path only: verify signature against pinned verifier key → freshness → **new monotonicity watermark: reject `generated_at_unix ≤ last_accepted` even if still unexpired** (the traversal hint apply path around `daemon.rs:6120-6158`/6022 currently lacks the membership-style replay cache — owner must add it; counters `traversal_replay_rejections` already exist) → atomic tmp+rename install (DNS precedent 959-973) → clear `traversal_hint_error`. TTL unchanged; refresh failure keeps `restrict_recoverable` → Permanent.
 
+## (b) PRODUCT — corrected grounding (2026-09-07, managing session)
+
+The pull shape proposed above does not survive the code. `rustynetd` refuses every remote
+state URL in its hardened path: `daemon.rs:13104` returns `InvalidConfig("remote network
+state fetch is disabled in hardened daemon paths; use pinned local signed artifacts")` when
+`trust_url`, `traversal_url`, `assignment_url` or `dns_zone_url` is set, so
+`refresh_signed_state_with_reason` (`daemon.rs:6022`) always sees `FetchDecision::Skipped`
+from the fetcher and re-loads the **pinned local artifacts** (`load_verified_trust`,
+`load_verified_membership`, `refresh_traversal_hint_state`). The pre-expiry scheduler
+(`maybe_preexpiry_refresh_traversal`, `daemon.rs:6212`) therefore only helps when something
+has already replaced the local traversal bundle set; nothing in product does today. The
+D2.5 peer gossip (`peer_gossip::GossipBundle`, `ingest_inbound_gossip_bundle`) carries peer
+candidate sets, not the authority-signed `SignedEndpointHintBundle` / dns_zone artifacts,
+so it does not close the gap either.
+
+Product design to implement (trust-state, owner/Claude-implemented — never a delegated
+edit):
+
+1. Authority side (`rustynet-control` + the admin/anchor daemon): a re-mint loop that
+   re-issues each node's traversal bundle set and the dns_zone bundle at
+   `generated_at + ttl − MIN_TRAVERSAL_REFRESH_MARGIN_SECS` with a strictly increasing
+   `generated_at_unix` (the existing watermark) and a fresh nonce, signed by the same
+   pinned signer; no TTL extension, no re-signing of stale content.
+2. Channel: the existing D2.5 gossip transport gains an authority-signed
+   **artifact-refresh frame** type (verified against the already-pinned traversal / dns_zone
+   verifier keys, not the gossip peer key) that a node persists through the SAME staged
+   write + `load_traversal_bundle_set` watermark barrier the fetcher uses
+   (`daemon.rs:803-840`), then triggers `SignedStateRefreshReason::PreExpiry`. Zero-ingress
+   preserved: nothing listens on a new port and no URL is introduced.
+3. Fail-closed unchanged: a missing or unrefreshed bundle still reaches `Permanent` on
+   expiry; a frame that fails signature, watermark, or age is dropped and counted, never
+   applied.
+4. Tests: watermark-monotonic rejection over the frame path; refresh applies and clears
+   the hint error; refresh failure keeps `Permanent`; authority re-mint has strictly newer
+   `generated_at_unix`; frame with the wrong key (gossip peer key) is rejected.
+
+Estimated 5–8 days. Until it lands the lab's `refresh_signed_bundles` stage (half (a)) is
+the only freshness path and every product deployment must keep TTLs long enough to cover
+the intended uptime, which is exactly the posture the plan set out to remove.
+
 ## Security analysis
 Fail-closed preserved: no path extends a stale bundle; Permanent-on-unrefreshed-expiry unchanged. No new trust boundary: bundles are authenticated by signature against a pre-distributed pinned verifier key (existing barrier), the pull endpoint adds availability only, not authorization. Risks: replay of an older-but-valid bundle (closed by the watermark); lab re-mint doubles issuance traffic (bounded, fanout once); misconfigured `trust_url` must fail loudly, not silently skip refresh.
 
