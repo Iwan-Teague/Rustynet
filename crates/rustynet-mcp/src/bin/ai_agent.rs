@@ -3190,7 +3190,7 @@ impl AiAgentServer {
                     rec["error"].as_str().unwrap_or("(no detail)")
                 ));
             }
-            "done" | "timed_out" | "halted_budget" | "provider_error" => {
+            "done" | "timed_out" | "halted_budget" | "provider_error" | "scope_violation" => {
                 return self.edit_text(self.edit_terminal_summary(&rec));
             }
             "launching" => {
@@ -3697,6 +3697,9 @@ impl AiAgentServer {
             "timed_out" => "TIMED OUT",
             "halted_budget" => "HALTED — BUDGET",
             "provider_error" => "PROVIDER ERROR — no work was done",
+            // Distinct from done ON PURPOSE: it must never be skim-read as a
+            // successful finish (DelegatedEditPathGuardPlan_2026-09-07).
+            "scope_violation" => "SCOPE VIOLATION — edits outside the path allowlist",
             other => other,
         };
         let reason = rec["reason"]
@@ -3738,10 +3741,35 @@ impl AiAgentServer {
         } else {
             String::new()
         };
+        // Scope violations (DelegatedEditPathGuardPlan_2026-09-07): name every
+        // out-of-allowlist path and attach its diff so the human reviewing the
+        // job sees EXACTLY what the agent tried to change outside its brief.
+        let violations_section = match rec["scope_violations"].as_array() {
+            Some(v) if !v.is_empty() => {
+                let paths: Vec<String> = v
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect();
+                let viol_diff = rec["out_of_scope_diff"]
+                    .as_str()
+                    .unwrap_or("(diff not captured)");
+                format!(
+                    "\n\nOUT-OF-ALLOWLIST EDITS (recorded as scope_violations; NEVER committed \
+                     to the branch — left uncommitted in the worktree):\n{}\n\nTheir diff:\n\
+                     ```diff\n{viol_diff}\n```",
+                    paths
+                        .iter()
+                        .map(|p| format!("  - `{p}`"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            }
+            _ => String::new(),
+        };
         format!(
             "Edit job `{job_id}` — {verdict}{reason}.\n\
              - branch: `{branch}` (review + merge this yourself; nothing here merges it)\n\
-             - worktree: `{worktree}`{spend}\n\n\
+             - worktree: `{worktree}`{spend}{violations_section}\n\n\
              Changes on the branch:\n```diff\n{diff}\n```{resume}"
         )
     }
@@ -8205,7 +8233,9 @@ impl McpServer for AiAgentServer {
                     `provider_error` (the session ended with ZERO token spend — the provider \
                     almost certainly errored before producing anything, e.g. insufficient \
                     balance; this is NOT the same as a real 'no changes needed' `done`), \
-                    `timed_out` (overall or approval-watchdog timeout). Safe to call repeatedly."
+                    `timed_out` (overall or approval-watchdog timeout), `scope_violation` \
+                    (the job edited paths outside its path_allowlist — those edits were never \
+                    committed and the offending diff is attached). Safe to call repeatedly."
                     .into(),
                 input_schema: json_schema_object(
                     json!({ "job_id": json_schema_string("The job_id from ai_edit_run.") }),
@@ -8757,7 +8787,13 @@ mod tests {
         // The whole safety model is "review + merge the branch yourself" — the
         // summary must always surface the branch, in every terminal state.
         let s = server();
-        for state in ["done", "timed_out", "halted_budget", "provider_error"] {
+        for state in [
+            "done",
+            "timed_out",
+            "halted_budget",
+            "provider_error",
+            "scope_violation",
+        ] {
             let rec = json!({
                 "job_id": "edit-1-2-3",
                 "state": state,
@@ -8775,6 +8811,35 @@ mod tests {
                 "summary for state '{state}' must state the human-merge rule"
             );
         }
+    }
+
+    #[test]
+    fn edit_terminal_summary_renders_scope_violations_with_their_diff() {
+        // scope_violation must read UNMISTAKABLY as a failure, name the
+        // offending paths, and attach their diff — never skim as "done".
+        let s = server();
+        let rec = json!({
+            "job_id": "edit-4-5-6",
+            "state": "scope_violation",
+            "branch": "ai-edit/edit-4-5-6",
+            "worktree": "state/edit-worktrees/edit-4-5-6",
+            "diff": "+ in-scope work",
+            "pre_scope_state": "timed_out",
+            "scope_violations": ["crates/rustynet-cli/src/main.rs"],
+            "out_of_scope_diff": "+ smuggled_edit();",
+            "reason": "edits outside the path allowlist",
+        });
+        let summary = s.edit_terminal_summary(&rec);
+        assert!(summary.contains("SCOPE VIOLATION"), "{summary}");
+        assert!(
+            summary.contains("crates/rustynet-cli/src/main.rs"),
+            "{summary}"
+        );
+        assert!(summary.contains("smuggled_edit();"), "{summary}");
+        assert!(summary.contains("NEVER committed"), "{summary}");
+        // No auto-resume hint for a scope violation: the caller must decide
+        // what to do about the out-of-scope edits first.
+        assert!(!summary.contains("ai_edit_run("), "{summary}");
     }
 
     #[test]
