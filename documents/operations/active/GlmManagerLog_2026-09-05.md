@@ -799,3 +799,8 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
 - relay_forwards_frame_validation FAIL 00:45:23 (attempt 2/3): sender dh2 + receiver fedora both report `daemon unreachable: inspect daemon socket failed (/run/rustynet/rustynetd.sock): Permission denied (os error 13)` → HP3_STATUS_UNREACHABLE. Root cause: build_relay_forward_test_status_script (mod.rs:14096) runs `/usr/local/bin/rustynet status` as plain ssh user; daemon socket is root-owned. Other status-querying stages in the SAME run passed using privileged_rustynet_cli_script (mod.rs:37152, `sudo -n env RUSTYNET_DAEMON_SOCKET=... rustynet status`).
 - cross_network_nat_classification fail (netns substrate, out of scope, declined on record). All other stages green/skip-by-topology.
 - PLAN: run glm-5.3-flash ai_read triage for confirmation; then fix lab tooling: make build_relay_forward_test_status_script delegate to privileged_rustynet_cli_script + `|| echo HP3_STATUS_UNREACHABLE`; pin with unit test; scoped gates; rebuild target-pinned binary; commit; record stub remedy; launch fwd8 = attempt 3/3 FINAL.
+
+## 2026-09-07 00:51 UTC — fwd7c post-verdict: fix + prep fwd8 (attempt 3/3)
+- fwd7c finalizer appended ledger rows + 2 null-patch stubs (livelab-1788742006-650de5d3bbca::relay_forwards_frame_validation, ::cross_network_nat_classification). Committing ledger dirt first.
+- Fix plan: mod.rs build_relay_forward_test_status_script (~14096) — replace plain `/usr/local/bin/rustynet status` with privileged_rustynet_cli_script("status") + `|| echo HP3_STATUS_UNREACHABLE`; add unit test pinning sudo form.
+- Then gates, rebuild, commit, record both stub remedies, launch fwd8 = FINAL attempt 3/3.
