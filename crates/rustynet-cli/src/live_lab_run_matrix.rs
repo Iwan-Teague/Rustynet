@@ -6383,6 +6383,173 @@ mod conclusion_barrier_tests {
         assert!(control_values(&root, &other).is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
+
+    /// QH-74 pinning fixture: a minimal workspace COPY (a `Cargo.toml` marker
+    /// file, a `documents/operations/` dir, and an inventory) plus a complete
+    /// `--node` report under its `state/` dir whose single planned stage
+    /// FAILED. Mirrors the fixture shape of `write_fixture_report` but adds
+    /// the node-stage evidence files `append_live_lab_run_matrix_row`
+    /// requires (node_stage_plan.json / nodes.tsv / stages.tsv).
+    fn write_qh74_copied_workspace(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let copy_root = std::env::temp_dir().join(format!("rustynet-run-matrix-{tag}-{stamp}"));
+        fs::create_dir_all(copy_root.join("documents/operations")).expect("docs dir");
+        fs::create_dir_all(copy_root.join("state")).expect("state dir");
+        fs::write(copy_root.join("Cargo.toml"), "[workspace]\n").expect("marker file");
+        let inventory = copy_root.join("inventory.json");
+        fs::write(&inventory, r#"{"vms": []}"#).expect("inventory");
+
+        let report_dir = copy_root.join("state/report-qh74");
+        let state = report_dir.join("state");
+        fs::create_dir_all(&state).expect("report state dir");
+        let profile = report_dir.join("profile.env");
+        fs::write(
+            &profile,
+            "EXIT_TARGET=\"debian@exit\"\nEXIT_PLATFORM=\"linux\"\nEXIT_REMOTE_SHELL=\"posix\"\nEXIT_GUEST_EXEC_MODE=\"linux_bash\"\nEXIT_SERVICE_MANAGER=\"systemd\"\nEXIT_UTM_NAME=\"debian-exit\"\nCLIENT_TARGET=\"debian@client\"\nCLIENT_PLATFORM=\"linux\"\nCLIENT_REMOTE_SHELL=\"posix\"\nCLIENT_GUEST_EXEC_MODE=\"linux_bash\"\nCLIENT_SERVICE_MANAGER=\"systemd\"\nCLIENT_UTM_NAME=\"debian-client\"\n",
+        )
+        .expect("profile");
+        fs::write(
+            state.join("setup_manifest.json"),
+            format!(
+                r#"{{
+  "profile": {{"path": "{}"}},
+  "git": {{"git_commit": "fedcba9876543210fedcba9876543210fedcba98", "git_tree_clean": false}}
+}}"#,
+                profile.display()
+            ),
+        )
+        .expect("manifest");
+        fs::write(
+            state.join("report_state.json"),
+            r#"{"run_complete": true, "run_passed": false, "run_id": "qh74-pinning-run-1"}"#,
+        )
+        .expect("report state");
+        fs::write(
+            state.join("nodes.tsv"),
+            "exit\tdebian@exit\texit-1\texit\tlinux\tDebian GNU/Linux 13 (trixie)\nclient\tdebian@client\tclient-1\tclient\tlinux\tDebian GNU/Linux 13 (trixie)\n",
+        )
+        .expect("nodes");
+        fs::write(
+            state.join("stages.tsv"),
+            "live_two_hop_validation\thard\tfail\t1\t/tmp/twohop.log\texit: two_hop verification failed\t2026-09-07T10:00:00Z\t2026-09-07T10:05:00Z\n",
+        )
+        .expect("stages");
+        fs::write(
+            state.join("node_stage_plan.json"),
+            r#"{"schema_version": 1, "stages": [{"stage": "live_two_hop_validation", "fanout": "per_node", "roles": ["exit"]}]}"#,
+        )
+        .expect("plan");
+        (copy_root, report_dir, profile)
+    }
+
+    /// Restores the test override when dropped. Holding the serializer for the
+    /// guard's whole life keeps other tests that touch the forced root off it
+    /// while the override is live.
+    struct Qh74RootGuard {
+        _serializer: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Qh74RootGuard {
+        fn force(copy_root: &std::path::Path) -> Self {
+            let serializer = crate::workspace_root::TEST_SERIALIZER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::workspace_root::set_workspace_root_for_tests(Some(copy_root.to_path_buf()));
+            Self {
+                _serializer: serializer,
+            }
+        }
+    }
+
+    impl Drop for Qh74RootGuard {
+        fn drop(&mut self) {
+            crate::workspace_root::set_workspace_root_for_tests(None);
+        }
+    }
+
+    /// QH-74: the append must land beside the workspace the binary RUNS from
+    /// (the copy), not beside the tree it was BUILT in. Before this fix both
+    /// derivations hardcoded the compile-time path, so a binary executed from
+    /// a copied tree silently recorded its evidence in the original checkout.
+    #[test]
+    fn append_lands_in_runtime_resolved_workspace_root() {
+        let (copy_root, report_dir, profile) = write_qh74_copied_workspace("qh74-append");
+        let compiled_root = crate::workspace_root::compiled_in_root().expect("compiled root");
+        let real_ledger = compiled_root.join("documents/operations/live_lab_node_run_matrix.csv");
+        let real_before = fs::read(&real_ledger).expect("real --node ledger must exist");
+
+        let result = {
+            let _guard = Qh74RootGuard::force(&copy_root);
+            super::append_live_lab_run_matrix_row(super::LiveLabRunMatrixAppendConfig {
+                command_name: "vm-lab-orchestrate-live-lab",
+                report_dir: &report_dir,
+                profile_path: Some(profile.as_path()),
+                inventory_path: Some(&copy_root.join("inventory.json")),
+                extra_stage_outcomes: &[],
+                notes: None,
+                row_role: super::LiveLabRunMatrixRowRole::Final,
+            })
+            .expect("append into the copied workspace")
+        };
+
+        assert!(
+            result
+                .matrix_path
+                .starts_with(copy_root.join("documents/operations")),
+            "row must land in the copied tree, got {}",
+            result.matrix_path.display()
+        );
+        let copied = fs::read_to_string(&result.matrix_path).expect("copied ledger");
+        assert!(
+            copied.lines().count() >= 2 && copied.contains("qh74"),
+            "copied ledger must carry the new data row: {copied:?}"
+        );
+        assert_eq!(
+            fs::read(&real_ledger).expect("real ledger still readable"),
+            real_before,
+            "the build tree's ledger must be untouched by a run from a copy"
+        );
+        let _ = fs::remove_dir_all(&copy_root);
+    }
+
+    /// QH-74 companion: the launch gate must see the triage stubs the append
+    /// wrote INTO THE COPY's triage ledger, so the gate reads and the writer
+    /// writes the same runtime-resolved root. This is the one-derivation
+    /// invariant the gate/stub doc comment pins, proven across a copied tree.
+    #[test]
+    fn launch_gate_reads_stubs_written_to_the_copied_root() {
+        let (copy_root, report_dir, profile) = write_qh74_copied_workspace("qh74-gate");
+        let _guard = Qh74RootGuard::force(&copy_root);
+        super::append_live_lab_run_matrix_row(super::LiveLabRunMatrixAppendConfig {
+            command_name: "vm-lab-orchestrate-live-lab",
+            report_dir: &report_dir,
+            profile_path: Some(profile.as_path()),
+            inventory_path: Some(&copy_root.join("inventory.json")),
+            extra_stage_outcomes: &[],
+            notes: None,
+            row_role: super::LiveLabRunMatrixRowRole::Final,
+        })
+        .expect("append into the copied workspace");
+
+        let triage = crate::live_lab_stage_triage::default_triage_ledger_path(&copy_root);
+        assert!(
+            triage.exists(),
+            "failed-stage append must leave a triage stub in the copied tree"
+        );
+        let err = crate::live_lab_stage_triage::enforce_launch_gate(
+            &triage,
+            &["live_two_hop_validation".to_owned()],
+        )
+        .expect_err("an unfilled failure for a planned stage must refuse the launch");
+        assert!(
+            err.contains("live-lab launch refused") && err.contains("live_two_hop_validation"),
+            "gate error must name the blocking stage: {err}"
+        );
+        let _ = fs::remove_dir_all(&copy_root);
+    }
 }
 
 #[test]
