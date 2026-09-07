@@ -816,3 +816,12 @@ QH-64 watch active (probe restarts sender+receiver daemons mid-run).
   stub remedies (relay_forwards_frame_validation → fix; cross_network_nat_classification
   → decline netns out of scope), launch fwd8 = attempt 3/3 FINAL with fwd7c
   flags/topology.
+
+### 2026-09-07 ~01:2xZ — fwd8 prep: gates on fix+test, then commit + remedies
+- Test `relay_forward_test_status_script_uses_privileged_form` added at mod.rs
+  EOF (after `format_assembled_scripts_render_expected_bodies`). Now: run gates
+  (fmt --check; clippy -p rustynet-cli --features vm-lab --all-targets
+  --all-features -D warnings; cargo test --lib filter relay_forward_test_status),
+  rebuild pinned binary, commit fix+test, record fwd7c stub remedies
+  (relay_forwards_frame_validation → fix commit; cross_network_nat_classification
+  → decline netns out of scope), then launch fwd8 (attempt 3/3 FINAL).
