@@ -1052,3 +1052,5 @@ Commits since 092e94cf, grouped:
 
 ## 2026-09-07 session 7 — STEP 3
 - Rebuilding pinned orchestrator binary from THIS worktree (edit-1788757368303-22407-0) so ledgers resolve here; then macOS reboot-recovery attempt 3 with both fixes (b4c30979 + 1ff7d04a) in tree.
+
+- Pinned binary rebuilt from this worktree (BUILD_RC=0). Launch-gate stub check + mac SSH preflight next; then attempt 3 launch.
