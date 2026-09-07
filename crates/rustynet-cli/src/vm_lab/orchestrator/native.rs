@@ -716,8 +716,9 @@ pub(crate) fn execute_rust_native_orchestration(
 
     // Build the manifest audit snapshot from this run's resolved topology and
     // only the selectors the Rust plan honors. The `--node` plan now honors
-    // chaos, cross-network, soak, and skip-linux-live-suite; bash-only platform
-    // election selectors remain inactive. wants_macos/windows come from the real
+    // chaos, cross-network, soak, skip-linux-live-suite, and the C6/C7
+    // role-switch/reboot platform elections; the remaining bash-only platform
+    // election selectors stay inactive. wants_macos/windows come from the real
     // `--node` guest platforms, not the ignored `*_platform` flags.
     let manifest_selectors = crate::live_lab_stage_registry::TargetSelectors {
         wants_macos: node_entries
@@ -732,8 +733,17 @@ pub(crate) fn execute_rust_native_orchestration(
         anchor_platform: String::new(),
         admin_platform: String::new(),
         blind_exit_platform: String::new(),
-        role_switch_platform: String::new(),
-        reboot_platform: String::new(),
+        // C6/C7: record the raw selectors so the finalizer's plan
+        // reconstruction
+        // (resolved_plan::verify_recorded_plan_not_shrunk) re-derives the
+        // same elections the runner made from the same inputs. Empty when
+        // the flags are absent, which leaves the expected plan unelected —
+        // the fail-closed direction. Hardcoding empty here (the pre-fix
+        // behavior) made the finalizer reject every faithful
+        // `--role-switch-platform macos` / `--reboot-platform macos` run at
+        // evidence-finalization time with "unexpected added stages".
+        role_switch_platform: config.role_switch_platform.clone().unwrap_or_default(),
+        reboot_platform: config.reboot_platform.clone().unwrap_or_default(),
         skip_linux_live_suite: skip_live_suite,
         chaos_suite: enable_chaos_suite && !skip_live_suite,
         cross_network_suite: enable_cross_network_suite && !skip_live_suite,
@@ -826,12 +836,18 @@ pub(crate) fn execute_rust_native_orchestration(
     // monitor) render live roles from the current run instead of inferring them
     // from the previous finalized matrix row (emit-don't-infer).
     let manifest_node_assignments: Vec<crate::live_lab_stage_manifest::ManifestNodeAssignment> =
-        ctx.assignments
+        node_entries
             .iter()
-            .map(|a| crate::live_lab_stage_manifest::ManifestNodeAssignment {
-                alias: a.alias.clone(),
-                role: a.role.as_str().to_owned(),
-            })
+            .map(
+                |(entry, a)| crate::live_lab_stage_manifest::ManifestNodeAssignment {
+                    alias: a.alias.clone(),
+                    role: a.role.as_str().to_owned(),
+                    platform: entry
+                        .platform
+                        .map(|p| p.as_str().to_owned())
+                        .unwrap_or_default(),
+                },
+            )
             .collect();
     crate::live_lab_stage_manifest::ensure_stage_manifest_with_plan(
         report_dir.as_path(),
@@ -1193,7 +1209,7 @@ fn augment_assignments_from_platform_selectors(
 /// AnchorPlatformSelectorPropagationInvestigation_2026-08-31.md §4).
 /// `platform_of_alias` resolves an assignment alias to its inventory platform
 /// (`None` when the alias is absent, which never counts as macOS).
-fn anchor_platform_macos_elected(
+pub(crate) fn anchor_platform_macos_elected(
     anchor_platform: Option<&str>,
     assignments: &[orchestrator::role_assignment::NodeRoleAssignment],
     platform_of_alias: &dyn Fn(&str) -> Option<VmGuestPlatform>,
@@ -1213,7 +1229,7 @@ fn anchor_platform_macos_elected(
 /// the run config's `role_switch_platform` alone — the flip target is the
 /// single macOS guest, so unlike the MAC-D3 anchor election there is no
 /// role-assignment disjunct.
-fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> bool {
+pub(crate) fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> bool {
     role_switch_platform == Some("macos")
 }
 
@@ -1221,7 +1237,7 @@ fn role_switch_platform_macos_elected(role_switch_platform: Option<&str>) -> boo
 /// role-transition election: the reboot target is the single macOS guest, so
 /// the run config's `reboot_platform` alone decides the election — no
 /// role-assignment disjunct.
-fn reboot_platform_macos_elected(reboot_platform: Option<&str>) -> bool {
+pub(crate) fn reboot_platform_macos_elected(reboot_platform: Option<&str>) -> bool {
     reboot_platform == Some("macos")
 }
 

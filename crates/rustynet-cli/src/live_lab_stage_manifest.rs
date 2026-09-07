@@ -89,12 +89,18 @@ pub const NATIVE_EXECUTION_DIALECT: &str = "native_node_v1";
 
 /// One `<alias>:<role>` assignment from a Rust `--node` run, recorded in the
 /// manifest so consumers render the current run's topology (emit-don't-infer).
-/// Platform is intentionally absent — a consumer already knows each alias's OS
-/// from the inventory; the run only adds the role.
+/// `platform` is the inventory platform string for the alias (empty on legacy
+/// manifests, which read back as not-macos) — the anti-shrink verifier needs it
+/// to re-derive the MAC-D1 anchor election from `--node <alias>:anchor`
+/// assignments, because the raw `--anchor-platform` selector is always empty on
+/// the `--node` path and the election cannot be reconstructed from selectors
+/// alone.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestNodeAssignment {
     pub alias: String,
     pub role: String,
+    #[serde(default)]
+    pub platform: String,
 }
 
 /// Snapshot of the selectors the plan was resolved from — recorded so a
@@ -116,6 +122,8 @@ pub struct ManifestSelectors {
     pub blind_exit_platform: String,
     #[serde(default)]
     pub role_switch_platform: String,
+    #[serde(default)]
+    pub reboot_platform: String,
     pub skip_linux_live_suite: bool,
     pub chaos_suite: bool,
     pub cross_network_suite: bool,
@@ -144,6 +152,7 @@ impl From<&TargetSelectors> for ManifestSelectors {
             admin_platform: selectors.admin_platform.clone(),
             blind_exit_platform: selectors.blind_exit_platform.clone(),
             role_switch_platform: selectors.role_switch_platform.clone(),
+            reboot_platform: selectors.reboot_platform.clone(),
             skip_linux_live_suite: selectors.skip_linux_live_suite,
             chaos_suite: selectors.chaos_suite,
             cross_network_suite: selectors.cross_network_suite,

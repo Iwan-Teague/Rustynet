@@ -6433,8 +6433,18 @@ from persisted daemon identity (or refuse a `--self-node-id` that differs),
 so the orchestrator cannot choose the queried identity at all. Until then a
 pass is only as strong as the stage's validation-time cross-check.
 
-**Disposition: FIXED in code; live re-proof pending the next macOS anchor
-cell run (`--anchor-platform macos`, `--skip-linux-live-suite`).**
+**Disposition: FIXED in code; LIVE RE-PROOF PASSED 2026-09-05**
+(`livelab-1788635706-1eb6e800c4cf`, commit `1eb6e800`, clean, report
+`state/live-lab-macos-anchor-portmap2-20260905-190047`, topology
+macos-utm-1:anchor / debian-headless-4:exit / debian-headless-2:client,
+`--skip-linux-live-suite --linux-backend
+linux-wireguard-userspace-shared`): 20 pass / 0 fail / 2 skip
+(admin_issue, blind_exit — role-absence skips), with
+`validate_macos_anchor_port_mapping_authority` **pass** against the
+daemon-reported identity `macos-utm-1-bootstrap` (matrix row records
+`macos_anchor_node_id=macos-utm-1-bootstrap`,
+`macos_stage_anchor=pass`). The residual above (guest check answers for
+the id it is told) still stands as the G2 hard-path item.
 
 ### QH-69 — FIXED (flag) / OPEN (default): the `--node` engine left each Linux guest's WireGuard backend to guest history, which put a kernel-backend client into a STUN proof run
 **Severity: medium (nondeterministic lab topology — the same command produced a userspace-shared exit and a kernel-backend client because the two guests' `/etc/default/rustynetd` files carried different `RUSTYNET_BACKEND` values from earlier profile-driven runs). Confidence: VERIFIED on both guests during `livelab-1788628792` (file mtimes = that run's install; values = history); flag landed in `874a9aaa`.**
@@ -6459,3 +6469,29 @@ history. Either the `--node` engine should default to the mission-canonical
 userspace-shared backend on Linux, or the run-matrix row should record each
 node's backend so a mixed topology is at least visible in evidence. Not
 decided here; the flag makes the choice explicit per run.
+
+### QH-74 — the vm-lab orchestrator resolves the stage-triage ledger and the run-matrix/stage-results append paths relative to its BUILD worktree instead of the runtime repo root, so evidence rows land in an unrelated worktree
+**Severity: high (evidence integrity — session-6 rows for runs executed from `edit-1788757368303-22407-0` were appended to the CSVs of `edit-1788746785362-28885-0`, the worktree the pinned binary happened to be compiled in; the launch gate also reads that wrong ledger, so a stub remedy recorded in the runtime worktree does not cure a gate refusal). Confidence: VERIFIED 2026-09-07 — `git -C …28885-0 status` showed the three ledger files modified after runs launched from a different worktree, and rebuilding the same binary from the runtime worktree made the same runs append locally (session-7 attempt 3, `livelab-1788758343-06dfb93915d5`).**
+
+Mechanism: `workspace_root_path()` in
+`crates/rustynet-cli/src/live_lab_run_matrix.rs:950` is
+`PathBuf::from(env!("CARGO_MANIFEST_DIR"))…` — a compile-time-embedded
+absolute path to the worktree the binary was BUILT in. It has 42 call sites,
+including the run-matrix append (`live_lab_run_matrix.rs:477`), the
+stage-results CSV, and (via `TRIAGE_LEDGER_RELATIVE_PATH`,
+`live_lab_stage_triage.rs:72`) the stage-triage ledger that
+`enforce_launch_gate` reads for unremedied stubs. A binary in a shared
+`CARGO_TARGET_DIR` (`target-pinned`) therefore always writes and reads the
+ledgers of whatever worktree most recently built it, not the one it runs
+against — and the runtime worktree's committed evidence silently misses rows
+while a stale worktree accumulates them.
+
+**Fix direction (proposed, not implemented — not a one-liner: 42 call sites,
+no existing test pins `workspace_root_path`, and the provenance gate
+deliberately compares paths, so the change needs a design decision):** resolve
+the repo root at RUNTIME — walk up from the process cwd (or better, from the
+`--inventory` path) to the enclosing repo root (marker: workspace `Cargo.toml`
+or the `documents/operations/` tree), falling back to the compile-time path
+only when no marker is found; pin it with a test that runs the binary from a
+copy of the tree and asserts the ledger append landed beside that copy.
+**Disposition: OPEN, filed by manager session 7 (2026-09-07).**
