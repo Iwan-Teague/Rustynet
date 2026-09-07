@@ -31,7 +31,7 @@ pub(crate) fn is_workspace_root(p: &Path) -> bool {
 /// The compile-time root derived from this crate's location inside the
 /// workspace. Only the derivation lives here; validation against the markers
 /// happens at the single fallback site in [`resolve_workspace_root_from`].
-fn compiled_in_root() -> Result<PathBuf, String> {
+pub(crate) fn compiled_in_root() -> Result<PathBuf, String> {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -102,7 +102,7 @@ static RESOLVED_ROOT: OnceLock<Result<PathBuf, String>> = OnceLock::new();
 /// failure). Call at verb-parse time, before any evidence path is derived.
 /// When the resolved root differs from the compiled-in root, both paths are
 /// printed once for transparency (no secrets — directory paths only).
-pub(crate) fn init_workspace_root(inventory: Option<&Path>) -> Result<(), String> {
+pub fn init_workspace_root(inventory: Option<&Path>) -> Result<(), String> {
     let resolved = RESOLVED_ROOT.get_or_init(|| {
         let resolved = match std::env::current_dir() {
             Ok(cwd) => resolve_workspace_root(inventory, &cwd),

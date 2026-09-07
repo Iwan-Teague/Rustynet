@@ -106,7 +106,7 @@ mod vm_lab;
 // `main.rs` (the established pattern for this crate) so both crate roots —
 // the binary compiles its own module tree — share a single definition.
 #[cfg(feature = "vm-lab")]
-mod workspace_root;
+pub mod workspace_root;
 
 /// Orchestrator surface for integration tests (RNQ-09). Everything here is
 /// already `pub` inside the vm_lab tree; this only makes it reachable from
