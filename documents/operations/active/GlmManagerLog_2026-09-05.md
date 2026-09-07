@@ -863,3 +863,14 @@ Interpretation: the mesh was healthy for all earlier stages in the SAME run/topo
 PROPOSED DIFF (not applied — trust-state domain): anchor-side, after a node reboot or on receiving a reconcile rejected with stale-bundle, re-mint + gossip a fresh signed traversal bundle and dns_zone bundle (equivalent of the pre-expiry refresh path but triggered by staleness rejection feedback, not just timer). Files to investigate by owner: anchor bundle mint loop + traversal authority verify path (rustynet-control traversal authority; freshness window constant).
 
 NEXT: transfer ledger rows (old worktree commit), ff-merge into this worktree, record stage-patch stub remedies via ops live-lab-record-stage-patch, commit, then STEP 2 (macOS role-transition cell).
+
+## 2026-09-07 ~02:5xZ — MANAGER A (resumed): STEP 2 — macOS role-transition cell
+
+Prior steps complete: ledger transfer (old worktree commit `5a4df786`, merge `cd701e0c`), stub remedies recorded + committed (`a1e190ab`); tree clean.
+
+Plan (logged before execution):
+1. Flush stale GUEST pf anchors on mac@192.168.65.101 (`sudo -n pfctl -a <anchor> -F all` for each `com.rustynet/` anchor — guest-side only, allowed).
+2. Launch macOS role-transition cell from clean tree, detached (nohup+disown), RD=`state/live-lab-macos-roleswitch-<ts>`, pinned binary `/Users/iwan/Desktop/Rustynet/target-pinned/debug/rustynet-cli ops vm-lab-orchestrate-live-lab --node macos-utm-1:client --node debian-headless-4:exit --node debian-headless-2:client --role-switch-platform macos --skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --skip-soak --collect-artifacts-on-failure --known-hosts-file ~/.ssh/known_hosts_lab --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --inventory documents/operations/active/vm_lab_inventory.json --report-dir <RD>`.
+3. Poll every 120s (`tail -4 $RD/state/stages.tsv; ps -p <pid> -o etime=`).
+4. Verdict ONLY from `$RD/logs/validate_macos_role_transition.log` + stages.tsv. PASS → update macOS role-transition row in CrossPlatformRoleParityRefresh_2026-07-23.md + LiveLabRunMatrix.md, commit ledger rows. FAIL → triage (glm-5.3-flash ai_read on stage log if unclear); fix ONLY lab tooling (stage/macos_role_transition_validation.rs, vm_lab/mod.rs exercise_macos_role_transition_live); max 2 attempts.
+5. Then STEP 3 (reboot cell) and STEP 4 (anchor re-prove) if budget remains. Finish with `## STATUS <UTC>`.
