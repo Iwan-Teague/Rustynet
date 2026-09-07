@@ -9074,7 +9074,7 @@ mod tests {
             "path_allowlist": ["documents/**"],
         });
         server().persist_edit_diff(&mut rec, repo, "HEAD");
-        assert_eq!(rec["state"], "scope_violation", "{}", rec);
+        assert_eq!(rec["state"], "scope_violation", "{rec}");
         assert_eq!(rec["pre_scope_state"], "done");
         let viols = rec["scope_violations"].as_array().unwrap();
         assert_eq!(viols.len(), 1);
