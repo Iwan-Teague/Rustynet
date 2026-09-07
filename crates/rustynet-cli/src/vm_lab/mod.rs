@@ -15121,6 +15121,15 @@ pub fn exercise_macos_reboot_recovery_live(
     report_dir: Option<&Path>,
 ) -> Result<String, String> {
     const RECOVERY_LOG_LINE: &str = "rustynetd startup: restored pre-protection networksetup DNS from backup (M1 startup recovery)";
+    // The daemon's post-reboot marker retirement (QH-40, owner decision 1,
+    // 2026-09-07) is the second acceptable recovery evidence: a marker
+    // recorded before the boot, retired after the DNS guard completed.
+    // Byte-pinned to `rustynetd::shutdown_residue::SHUTDOWN_RESIDUE_RETIRED_AFTER_REBOOT_LOG_TOKEN`.
+    const RETIRED_LOG_TOKEN: &str = "shutdown_rollback_residue_retired_after_reboot";
+    // The log directory is root-owned (0750): an unprivileged shell glob over
+    // `*.log` expands to nothing under zsh ("no matches found") and the grep
+    // never runs — the run-050612 false "absent". `find -exec` runs the
+    // enumeration as root and never relies on the caller's glob.
     const STATE_ROOT: &str = "/usr/local/var/rustynet";
     // Line-oriented (review F3): service names carry spaces ("Thunderbolt
     // Bridge"), so a `for svc in $(...)` word-split would visit bogus
@@ -15263,7 +15272,8 @@ pub fn exercise_macos_reboot_recovery_live(
     let post_script = format!(
         "set -eu; \
          ST={STATE_ROOT}/rustynetd.state; \
-         if sudo -n grep -hF '{RECOVERY_LOG_LINE}' /usr/local/var/log/rustynet/*.log >/dev/null 2>&1; then \
+         if sudo -n find /usr/local/var/log/rustynet -maxdepth 1 -name '*.log' \
+              -exec grep -hF -e '{RECOVERY_LOG_LINE}' -e '{RETIRED_LOG_TOKEN}' {{}} + >/dev/null 2>&1; then \
            echo 'startup_recovery_line=present'; \
          else \
            echo 'startup_recovery_line=absent'; \
@@ -44530,6 +44540,57 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert_eq!(
             parse_local_utm_list_started_status(list_output, "missing-vm"),
             None
+        );
+    }
+
+    /// The macOS reboot cell's post-reboot probe must enumerate the daemon's
+    /// root-owned log directory AS ROOT (`find -exec grep`), never through an
+    /// unprivileged shell glob: under the guest's zsh the glob over
+    /// `/usr/local/var/log/rustynet/*.log` expanded to nothing and the grep
+    /// never ran, which reported `startup_recovery_line=absent` for a run
+    /// whose log carried the M1 recovery line (run 050612, 2026-09-07). Both
+    /// recovery evidences — the M1 restore line and the post-reboot marker
+    /// retirement token — must be accepted.
+    #[test]
+    fn macos_reboot_post_probe_enumerates_logs_as_root_and_accepts_both_recovery_lines() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub fn exercise_macos_reboot_recovery_live(")
+            .expect("reboot cell live fn must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("sudo -n find /usr/local/var/log/rustynet -maxdepth 1 -name '*.log'"),
+            "post probe must enumerate the log dir as root"
+        );
+        assert!(
+            body.contains("-exec grep -hF -e '{RECOVERY_LOG_LINE}' -e '{RETIRED_LOG_TOKEN}'"),
+            "post probe must accept the restore line and the retirement token"
+        );
+        assert!(
+            !body.contains("grep -hF '{RECOVERY_LOG_LINE}' /usr/local/var/log/rustynet/*.log"),
+            "the unprivileged zsh glob form must stay gone"
+        );
+        // The token literal lives exactly once in the live fn (the const);
+        // the probe references it only through `{RETIRED_LOG_TOKEN}`.
+        assert_eq!(
+            body.matches("\"shutdown_rollback_residue_retired_after_reboot\"")
+                .count(),
+            1,
+            "the retirement token is byte-pinned to rustynetd's constant"
+        );
+        // Cross-crate pin: the daemon must emit the SAME literal, or the probe
+        // greps for a dead string and the cell fails for the wrong reason.
+        let daemon_source = include_str!("../../../rustynetd/src/shutdown_residue.rs");
+        assert!(
+            daemon_source.contains(
+                "SHUTDOWN_RESIDUE_RETIRED_AFTER_REBOOT_LOG_TOKEN: &str =\n    \"shutdown_rollback_residue_retired_after_reboot\""
+            ),
+            "rustynetd's retirement token drifted from the lab probe's literal"
         );
     }
 
