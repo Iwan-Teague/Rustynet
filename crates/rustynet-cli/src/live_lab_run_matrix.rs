@@ -4851,6 +4851,12 @@ mod registry_equivalence_tests {
             | "distribute_membership_state" => Some("membership"),
             "distribute_assignments" | "issue_and_distribute_assignments" => Some("assignments"),
             "distribute_traversal" => Some("traversal"),
+            // 2026-09-07 (bundle freshness): the HP-3 prerequisite re-mint
+            // stage folds into the same `traversal` evidence column the
+            // setup distribute_traversal stage feeds — same artifact family,
+            // just re-issued later in the run
+            // (TraversalBundleFreshnessPlan_2026-09-07.md).
+            "refresh_signed_bundles" => Some("traversal"),
             "distribute_dns_zone" => Some("managed_dns"),
             "enforce_baseline_runtime" | "validate_baseline_runtime" => Some("baseline_runtime"),
             "anchor_validation" | "live_anchor" => Some("anchor"),

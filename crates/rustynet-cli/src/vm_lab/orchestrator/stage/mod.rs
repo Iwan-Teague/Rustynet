@@ -77,6 +77,7 @@ pub mod membership_init;
 pub mod mesh_status_validation;
 pub mod negative_control;
 pub mod preflight;
+pub mod refresh_signed_bundles;
 pub mod relay_forwards_frame_validation;
 pub mod relay_validation;
 pub mod role_switch_matrix;
@@ -281,6 +282,13 @@ define_stage_catalog! {
     // restarts mid-run, QH-64) — hence its own Disruptive suite, last Live
     // placement to minimize the post-restart tail, opt-in via
     // --enable-relay-forwarding-validation. Role-capability proof: T1.
+    // HP-3 freshness prerequisite: re-mint + redistribute the signed
+    // traversal and dns_zone bundles immediately before HP-3 so the proof
+    // never runs against bundles that expired mid-run (BUNDLE_TTL_SECS /
+    // TRAVERSAL_TTL_SECS stay as configured; this stage never lengthens
+    // them). Gated by the same --enable-relay-forwarding-validation flag;
+    // skipped (fail-closed) otherwise. Role-capability proof: T1.
+    RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role,
     RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role,
     LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience,
     // Cross-NETWORK ≠ cross-OS: this suite exercises NAT/netns traversal

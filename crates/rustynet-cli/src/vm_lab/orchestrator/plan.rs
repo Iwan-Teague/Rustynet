@@ -95,6 +95,7 @@ use crate::vm_lab::orchestrator::stage::negative_control::{
     NegativeControlSignedBundleRejectionStage, NegativeControlWrongNodeSubstitutionStage,
 };
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
+use crate::vm_lab::orchestrator::stage::refresh_signed_bundles::RefreshSignedBundlesStage;
 use crate::vm_lab::orchestrator::stage::relay_forwards_frame_validation::RelayForwardsFrameValidationStage;
 use crate::vm_lab::orchestrator::stage::relay_validation::RelayValidationStage;
 use crate::vm_lab::orchestrator::stage::role_switch_matrix::RoleSwitchMatrixStage;
@@ -460,6 +461,10 @@ impl PlanBuilder {
                     // Relay node so relay_validation has a live relay to prove.
                     StageId::DeployRelayService => Box::new(DeployRelayServiceStage),
                     StageId::RelayValidation => Box::new(RelayValidationStage),
+                    StageId::RefreshSignedBundles => Box::new(RefreshSignedBundlesStage::new(
+                        max_parallel_node_workers,
+                        std::sync::Arc::clone(&shutdown_flag),
+                    )),
                     StageId::RelayForwardsFrameValidation => {
                         Box::new(RelayForwardsFrameValidationStage)
                     }
@@ -830,8 +835,8 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            67,
-            "relay-forwarding-enabled plan must contain 67 stages"
+            68,
+            "relay-forwarding-enabled plan must contain 68 stages (refresh + HP-3)"
         );
         assert!(ids.contains(&StageId::RelayForwardsFrameValidation));
         // Placed after relay_validation (its lifecycle gate) and still last
@@ -848,6 +853,14 @@ mod tests {
         assert!(
             hp3_pos > relay_pos,
             "HP-3 stage must run after relay_validation"
+        );
+        let refresh_pos = ids
+            .iter()
+            .position(|id| id == &StageId::RefreshSignedBundles)
+            .expect("refresh_signed_bundles in plan");
+        assert!(
+            refresh_pos == hp3_pos - 1,
+            "refresh_signed_bundles must sit immediately before the HP-3 proof"
         );
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
@@ -876,8 +889,8 @@ mod tests {
             .build();
         assert_eq!(
             chaos_plus_hp3.len(),
-            76,
-            "66 default + 9 chaos + 1 relay-forwarding"
+            77,
+            "66 default + 9 chaos + 1 refresh + 1 relay-forwarding"
         );
         let stacked = PlanBuilder::new()
             .with_enable_chaos_suite(true)
@@ -887,8 +900,8 @@ mod tests {
         let ids: Vec<StageId> = stacked.iter().map(|s| s.id()).collect();
         assert_eq!(
             stacked.len(),
-            80,
-            "66 default + 9 chaos + 4 negative-control + 1 relay-forwarding"
+            81,
+            "66 default + 9 chaos + 4 negative-control + 1 refresh + 1 relay-forwarding"
         );
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }

@@ -134,6 +134,7 @@ mod tests {
             macos_anchor_validators_elected: false,
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
             ssh_allow_cidrs: String::new(),
             adapters: HashMap::new(),
             stage_outcomes: HashMap::new(),

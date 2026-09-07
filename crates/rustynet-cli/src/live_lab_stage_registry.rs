@@ -2232,6 +2232,19 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::RelayForwardingValidation,
         ..DEFAULT_SPEC
     },
+    // ── HP-3 freshness prerequisite (opt-in, same gate) ─────────────────
+    // Re-mints + redistributes the signed traversal and dns_zone bundles
+    // immediately before the HP-3 proof. Folds into the existing
+    // `traversal` evidence column (same `logical` constraint as above —
+    // no `{os}_stage_refresh_signed_bundles` schema column exists).
+    StageSpec {
+        name: "refresh_signed_bundles",
+        group: StageGroup::Disruptive,
+        logical: Some("traversal"),
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::RelayForwardingValidation,
+        ..DEFAULT_SPEC
+    },
     // ── cross-network + job-level ───────────────────────────────────────
     // Topology-level substrate lifecycle (spec §0.5, 2026-08-27). Setup runs
     // in the Setup suite BEFORE collect_pubkeys (endpoint seam) and is a
@@ -3162,7 +3175,10 @@ mod tests {
             // joined T1Role as first-class --node stages.
             // +1 on 2026-09-02 (C6): validate_macos_role_transition ported
             // from the legacy vm_lab hub into a first-class --node stage.
-            ("t1_role", 23),
+            // +1 on 2026-09-07 (bundle freshness): refresh_signed_bundles,
+            // the HP-3 prerequisite re-mint stage
+            // (TraversalBundleFreshnessPlan_2026-09-07.md).
+            ("t1_role", 24),
             // +1 on 2026-09-02 (C7): validate_macos_reboot_recovery joins
             // T2Resilience as the macOS reboot-with-protection live stage
             // (MacosDnsBackupRebootSurvivalPlan_2026-09-02.md).

@@ -3565,13 +3565,24 @@ pub(crate) fn issue_traversal_bundles_locally(
     let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "traversal env")?;
     ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
-    // Fail loud on a present-but-malformed TRAVERSAL_TTL_SECS instead of
-    // silently swallowing it into the default (see BUNDLE_TTL_SECS rationale).
+    // Fail loud on a missing or malformed TRAVERSAL_TTL_SECS instead of
+    // silently swallowing it into a default (see BUNDLE_TTL_SECS rationale).
+    // The orchestrator's build_bundle_env always sets it explicitly; a bare
+    // 120 default here would silently mint short-lived bundles that expire
+    // mid-run (TraversalBundleFreshnessPlan_2026-09-07.md), so absence is a
+    // hard error naming the env var.
     let bundle_ttl_secs: u64 = match env_values.get("TRAVERSAL_TTL_SECS") {
         Some(raw) => raw
             .parse::<u64>()
             .map_err(|err| format!("invalid TRAVERSAL_TTL_SECS in traversal env: {err}"))?,
-        None => 120,
+        None => {
+            return Err(concat!(
+                "TRAVERSAL_TTL_SECS missing from traversal env: the bundle TTL must be ",
+                "configured explicitly (never defaulted); the orchestrator's ",
+                "build_bundle_env sets it for every traversal mint"
+            )
+            .to_owned());
+        }
     };
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_generic_allow_specs(allow_spec.as_str())?;
@@ -7561,6 +7572,29 @@ pub fn execute_ops_e2e_worker_enforce_runtime(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue_traversal_bundles_locally_hard_errors_without_traversal_ttl() {
+        // TraversalBundleFreshnessPlan_2026-09-07: the former silent default
+        // (None => 120) minted bundles that expired mid-run. Absence of the
+        // var is now a hard error naming it; the orchestrator's
+        // build_bundle_env always sets it (pinned by the
+        // traversal_env_always_pins_the_traversal_ttl_explicitly test).
+        let env_without_ttl = concat!(
+            "NODES_SPEC=n1|10.0.0.1:51820|aabb|client,",
+            "n2|10.0.0.2:51820|ccdd|exit_server\n",
+            "ALLOW_SPEC=n1|n2\n"
+        );
+        let err = super::issue_traversal_bundles_locally(
+            env_without_ttl,
+            &std::env::temp_dir().join("rn-no-ttl-test"),
+        )
+        .expect_err("missing TRAVERSAL_TTL_SECS must be a hard error");
+        assert!(
+            err.contains("TRAVERSAL_TTL_SECS"),
+            "error must name the missing env var: {err}"
+        );
+    }
+
     use std::collections::BTreeMap;
     use std::fs;
 
