@@ -9,7 +9,7 @@ All anchors cite this worktree at `acb7f5c0` unless noted.
 ## 1. Scope reviewed
 
 - Stage: `crates/rustynet-cli/src/vm_lab/orchestrator/stage/macos_reboot_recovery_validation.rs` (184 lines: skip when not elected, fail-closed when elected with zero or ≥2 macOS nodes, dependency on `ValidateBaselineRuntime`, `StageFanout::Once`, 3 unit tests).
-- Helper: `exercise_macos_reboot_recovery_live` at `crates/rustynet-cli/src/vm_lab/mod.rs:14896-15092`; evidence writer `write_macos_reboot_recovery_evidence` at `:15099-15136` (writes `<report_dir>/logs/validate_macos_reboot_recovery.{log,json}`, fail-loud on write error).
+- Helper: `exercise_macos_reboot_recovery_live` (since renamed to `exercise_macos_reboot_recovery_with_recovery_actions` by the mid-recovery seam) at `crates/rustynet-cli/src/vm_lab/mod.rs:14896-15092` at the time of this review; evidence writer `write_macos_reboot_recovery_evidence` at `:15099-15136` (writes `<report_dir>/logs/validate_macos_reboot_recovery.{log,json}`, fail-loud on write error).
 - Wiring: `native.rs` (election `reboot_platform_macos_elected` ~`:1102-1108`; elected∧plan-contains tightening ~`:441-448`, mirroring C6), `plan.rs` (selector, fast-path retain exception, stage box, count pins), `context.rs` (flag default false, reset false on resume), `live_lab_stage_registry.rs` (`EnableRule::RebootPlatform`, `TargetSelectors.reboot_platform`, spec at `:1247-1253`), `main.rs` (`--reboot-platform` parser), `evidence.rs` (manifest selectors), `live_lab_stage_manifest.rs` / `live_lab_run_matrix.rs` / `topology.rs` / `run_exclusion.rs` (fixtures + threading).
 
 ## 2. Findings

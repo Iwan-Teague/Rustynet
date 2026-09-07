@@ -312,8 +312,10 @@ fn distribute_bundle_kind_inner(
         }
     }
 
-    // Verify and distribute the verifier key to EVERY node before ANY signed
-    // bundle is installed. A daemon must never observe a new bundle without
+    // Verify and distribute the verifier key to every in-scope node before
+    // ANY signed bundle is installed (in scoped mode the scope is just the
+    // scoped alias — e.g. the single rebooted node during a redistribution).
+    // A daemon must never observe a new bundle without
     // its matching verifier. Missing/malformed issuer output fails closed.
     let pub_key_path = tmp_dir.join(format!("rn-{kind}.pub"));
     if let Err(err) =
