@@ -1259,15 +1259,15 @@ fn build_bootstrap_env(
 ///   2. The installed + bootstrapped `com.rustynet.relay` launchd service, via
 ///      the shared `ops install-macos-relay` helper — the one hardened relay-
 ///      install path. It copies the reviewed plist from
-///      `scripts/launchd/com.rustynet.relay.plist` relative to the source root,
-///      so it runs from that cwd (the configured workdir, else `$HOME/Rustynet`).
+///      `scripts/launchd/com.rustynet.relay.plist` relative to its cwd; the
+///      guest has no persistent source root, so the orchestrator uploads the
+///      reviewed plist from its own workspace and runs the installer from a
+///      temp staging cwd (see step 4 below).
 ///
-/// Fail-closed throughout: a missing assignment key, a malformed key, or a
-/// failed install all surface as `Err`.
-pub fn deploy_relay_service(
-    conn: &NodeConnection,
-    workdir: Option<&str>,
-) -> Result<(), AdapterError> {
+/// Fail-closed throughout: a missing assignment key, a malformed key, a
+/// missing reviewed plist on the orchestrator host, or a failed install all
+/// surface as `Err`.
+pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     let short_timeout = Duration::from_secs(30);
 
     // 1. Read the already-distributed assignment authority pubkey (hex). On
@@ -1297,52 +1297,83 @@ pub fn deploy_relay_service(
     //    hardcoded path (mode 0644 — a public key). scp the bytes (no shell data
     //    interpolation), then install with a constant command. `mkdir -p` keeps
     //    the existing rustynetd-owned state-root mode (no chmod of an existing
-    //    dir) while fail-closing if the state root is somehow absent.
+    //    dir) while fail-closing if the state root is somehow absent. The
+    //    /tmp drop path carries a per-run unpredictable suffix (adversarial
+    //    review 2026-09-05): a fixed name in the world-writable sticky /tmp
+    //    could be pre-planted as a symlink (scp follows it and clobbers a
+    //    victim file) or pre-created attacker-owned and swapped before the
+    //    root read — an attacker-chosen verifier key would make the relay
+    //    trust attacker-signed assignment state.
     let tmp = write_temp_file("rn_relay_verifier_", ".pub", &verifier_bytes)?;
-    let ship = ssh::scp_to(
-        conn,
-        tmp.as_path(),
-        "/tmp/rn-relay-verifier.pub",
-        short_timeout,
+    let verifier_drop = format!(
+        "/tmp/rn-relay-verifier-{}.pub",
+        crate::vm_lab::unique_suffix()
     );
+    let ship = ssh::scp_to(conn, tmp.as_path(), &verifier_drop, short_timeout);
     let _ = std::fs::remove_file(&tmp);
     ship?;
     ssh::run_remote(
         conn,
+        // rc-capture shape (not an `&&` chain) so the drop file is removed
+        // even when `install` fails — a stale pubkey must not linger in /tmp
+        // (adversarial-review hardening 2026-09-05; the key is public, this
+        // is hygiene).
         &format!(
             "sudo -n sh -c 'mkdir -p {MACOS_STATE_ROOT} && \
-             install -m 0644 /tmp/rn-relay-verifier.pub {MACOS_STATE_ROOT}/relay-verifier.pub && \
-             rm -f /tmp/rn-relay-verifier.pub'"
+             install -m 0644 {verifier_drop} {MACOS_STATE_ROOT}/relay-verifier.pub; rc=$?; \
+             rm -f {verifier_drop}; exit $rc'"
         ),
         short_timeout,
     )?;
 
-    // 4. Install + bootstrap com.rustynet.relay via the shared helper. It reads
-    //    scripts/launchd/com.rustynet.relay.plist relative to cwd, so run from
-    //    the source root (the configured workdir, else $HOME/Rustynet). The
-    //    source dir is passed only inside a single-quoted env assignment; the
-    //    executed shell body is a compile-time constant. Absolute CLI path so
-    //    the install never depends on sudo's PATH inside the root `sh -c`.
-    let src_dir = match workdir {
-        Some(w) if !w.trim().is_empty() => w.trim().to_owned(),
-        _ => {
-            let home = ssh::run_remote(conn, "echo $HOME", Duration::from_secs(10))?
-                .trim()
-                .to_owned();
-            if home.is_empty() {
-                return Err(AdapterError::Protocol {
-                    message: "could not determine $HOME on remote for install-macos-relay"
-                        .to_owned(),
-                });
-            }
-            format!("{home}/Rustynet")
-        }
-    };
-    let src_dir_esc = src_dir.replace('\'', "'\\''");
-    let install_cmd = format!(
-        "sudo -n env RN_SRC='{src_dir_esc}' sh -c 'cd \"$RN_SRC\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay'"
+    // 4. Install + bootstrap com.rustynet.relay via the shared helper. The
+    //    helper reads `scripts/launchd/com.rustynet.relay.plist` cwd-relative,
+    //    and the guest has no persistent source root (bootstrap installs from
+    //    the shipped archive; the inventory's `rustynet_src_dir` is never
+    //    materialized on the fast path — proven live 2026-09-05 by
+    //    `deploy_relay_service` failing with `cd: /Users/mac/Rustynet: No such
+    //    file or directory`), so upload the reviewed plist from the
+    //    orchestrator's workspace and run the installer from a temp staging
+    //    cwd — the same proven shape as the quarantined
+    //    `exercise_macos_relay_lifecycle_live` (vm_lab/mod.rs). The executed
+    //    shell body interpolates only the Rust-generated /tmp drop path (a
+    //    literal `/tmp/rn-relay-reviewed-<suffix>.plist`; the suffix is a
+    //    numeric pid/time value, never guest- or operator-controlled text),
+    //    and the absolute CLI path keeps the install independent of sudo's
+    //    PATH inside the root `sh -c`.
+    let plist_bytes = reviewed_relay_plist_bytes(&crate::vm_lab::workspace_root_path())?;
+    let plist_tmp = write_temp_file("rn_relay_plist_", ".plist", &plist_bytes)?;
+    // Per-run unpredictable drop path (adversarial review 2026-09-05): a
+    // fixed /tmp name could be symlink-planted (scp clobbers the victim) or
+    // swapped before the root cp, planting an unreviewed launchd plist. The
+    // suffix never enters a shell string — it is interpolated into the scp
+    // destination argument by Rust, and the root script only references the
+    // resulting literal path.
+    let plist_drop = format!(
+        "/tmp/rn-relay-reviewed-{}.plist",
+        crate::vm_lab::unique_suffix()
     );
-    ssh::run_remote(conn, &install_cmd, Duration::from_secs(120))?;
+    let ship_plist = ssh::scp_to(conn, plist_tmp.as_path(), &plist_drop, short_timeout);
+    let _ = std::fs::remove_file(&plist_tmp);
+    ship_plist?;
+    // The staging script is fail-closed by construction: every use of $T
+    // except the final `rm -rf "$T"` sits inside the `&&` chain, so a failed
+    // `mktemp -d` (empty T) aborts the chain before any path is built, and
+    // `rm -rf ""` is a harmless no-op error. `cp` failing aborts before
+    // install-macos-relay can run, so no fallback path is reachable; the
+    // installer itself has no embedded-default plist (read_source_plist
+    // errors on a missing file outside dry-run).
+    ssh::run_remote(
+        conn,
+        &format!(
+            "sudo -n sh -c 'T=\"$(mktemp -d /tmp/rn-relay.XXXXXX)\" && \
+             mkdir -p \"$T/scripts/launchd\" && \
+             cp {plist_drop} \"$T/scripts/launchd/com.rustynet.relay.plist\" && \
+             cd \"$T\" && {MACOS_RUSTYNET_PATH} ops install-macos-relay; rc=$?; \
+             rm -rf \"$T\"; rm -f {plist_drop}; exit $rc'",
+        ),
+        Duration::from_secs(120),
+    )?;
     Ok(())
 }
 
@@ -1477,6 +1508,26 @@ fn write_temp_file(
     content: &[u8],
 ) -> Result<std::path::PathBuf, AdapterError> {
     super::write_secure_temp_file(prefix, suffix, content)
+}
+
+/// Read the reviewed `com.rustynet.relay` launchd plist from the
+/// orchestrator's own workspace (`scripts/launchd/com.rustynet.relay.plist`
+/// under `ws_root`). Fail-closed: absent or unreadable surfaces as `Err` —
+/// `deploy_relay_service` must never fall back to a guest-local copy or a
+/// synthesized plist, because the reviewed file IS the artifact under test.
+fn reviewed_relay_plist_bytes(ws_root: &std::path::Path) -> Result<Vec<u8>, AdapterError> {
+    let host_plist = ws_root.join("scripts/launchd/com.rustynet.relay.plist");
+    if !host_plist.is_file() {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "reviewed relay plist missing at {} on the orchestrator host",
+                host_plist.display()
+            ),
+        });
+    }
+    std::fs::read(&host_plist).map_err(|e| AdapterError::Protocol {
+        message: format!("read reviewed relay plist {}: {e}", host_plist.display()),
+    })
 }
 
 #[cfg(test)]
@@ -3764,5 +3815,41 @@ mod tests {
         .expect_err("refresh failure must fail the enforce");
         assert_eq!(*log.borrow(), vec!["wait", "refresh"]);
         assert!(err.to_string().contains("state refresh failed"));
+    }
+
+    #[test]
+    fn reviewed_relay_plist_fails_closed_when_missing() {
+        let ws = std::env::temp_dir().join(format!(
+            "rn-ws-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // Deliberately do NOT create the workspace: the lookup must fail
+        // closed rather than fall back to any default location.
+        let err = reviewed_relay_plist_bytes(&ws).expect_err("missing plist must Err");
+        assert!(
+            err.to_string().contains("reviewed relay plist missing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn reviewed_relay_plist_returns_exact_workspace_bytes() {
+        let ws = std::env::temp_dir().join(format!(
+            "rn-ws-plist-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(1)
+        ));
+        let dir = ws.join("scripts/launchd");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let body = b"<?xml version=\"1.0\"?>\n<!-- reviewed relay plist probe -->\n";
+        std::fs::write(dir.join("com.rustynet.relay.plist"), body).expect("write plist");
+        let got = reviewed_relay_plist_bytes(&ws).expect("plist bytes");
+        assert_eq!(got, body.to_vec());
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

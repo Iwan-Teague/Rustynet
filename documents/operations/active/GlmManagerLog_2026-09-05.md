@@ -1,0 +1,1092 @@
+# GLM Manager Log — 2026-09-05
+
+Operating log for the GLM manager session on branch
+`ai-edit/edit-1788631826676-82735-0` (worktree
+`state/edit-worktrees/edit-1788631826676-82735-0`, base `3aedcfff`).
+Records what ran, verdicts with run ids, decisions taken, decisions
+deferred to the owner, and next steps. Security-relevant code changes are
+out of this manager's write scope and appear here only as proposed diffs
+for human review.
+
+## 17:45–18:20 — handover, run #5 monitored to completion
+
+Run #5 (`livelab-1788631948-3aedcfff9a75`, commit `3aedcfff`, clean) was
+launched from the MAIN tree by the previous manager (pid 78346, report
+`state/live-lab-macos-client-stun2-20260905-175914` in the main tree) and
+monitored to completion without intervention.
+
+Verdict, taken from the stage artifacts (stages.tsv + per-stage logs),
+never the CSV column alone:
+
+- `collect_pubkeys` **pass** — first time in this series. The
+  `--linux-backend linux-wireguard-userspace-shared` pin closed run #4's
+  kernel-backend stall: every node gathered reflexive candidates and the
+  flag → STUN gather → `SRRLX_SPEC` pipeline is proven live end to end.
+- `key_custody_validation` **pass**; 51 stage rows pass; skips all
+  legitimate (relay stages: no relay node in topology; cross-network NAT
+  matrix; ipv6_leak runtime skip).
+- `traffic_test_matrix` **fail** — all four cross-vmnet legs 100% loss in
+  both directions (macos-utm-1↔debian-headless-4 100.124.191.164,
+  macos-utm-1↔debian-headless-2 100.80.169.183, both Linux→mac legs
+  100.64.181.171); mac default-deny probe INCONCLUSIVE (fails closed).
+
+Assessment: the remaining failure is CP-1 (host/lab topology split across
+two isolated vmnet nets) — owner-deferred, not a rustynet defect. The next
+lever is daemon-side traversal work consuming `SRRLX_SPEC`/srflx when
+building mac↔Linux peer paths, not more lab plumbing. No lab-side fix in
+this manager's scope.
+
+Ledger note: the run was launched from the main tree, so its run-matrix
+row and any triage stub landed in the MAIN tree's
+`documents/operations/live_lab_node_run_matrix.csv` /
+`live_lab_node_stage_results.csv` / `live_lab_stage_triage.jsonl`. The
+worktree branch does not carry them (recorded, not fabricated).
+
+Docs updated on this branch: `MacosCrossNetworkTrafficBlocker_2026-09-03.md`
+§7 Run #5 paragraph appended; `CrossPlatformRoleParityRefresh_2026-07-23.md`
+client row updated with run #5 and anchor row CORRECTED (the
+port-mapping-authority failure was QH-68, a validator identity bug fixed in
+`874a9aaa` — the earlier "same family as the exit-cell membership gap"
+claim was wrong and is retracted).
+
+Decisions deferred to owner (unchanged, do not take):
+
+1. CP-1 bridged-NIC/profile re-attach (host change).
+2. QH-69-default — whether `--linux-backend` should have a default or the
+   backend should be recorded per run-matrix row.
+3. QH-66 Option D — owner signing key custody (F1 disclosure stands: sole
+   owner signing key sits on the blind_exit host).
+
+Next: commit docs, then macOS anchor re-proof from this worktree
+(`--source-mode local-head` deploys branch HEAD, hence commit first),
+then relay frame-forwarding opt-in cell (QH-64).
+
+## 18:20–18:55 — anchor re-proof run 1: all stages pass, finalization blocked by verifier bug; fixed
+
+Launched the QH-68 re-proof from this worktree (commit `fb61cf9d`'s tree):
+report `state/live-lab-macos-anchor-portmap-20260905-181715`, topology
+macos-utm-1:anchor / debian-headless-4:exit / debian-headless-2:client,
+`--skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared`,
+pid 84428.
+
+Stage verdicts (stages.tsv + stage logs): **20 pass / 0 fail / 2 skip**
+(admin_issue, blind_exit — both legitimate role-absence skips). In
+particular all four anchor stages pass:
+`deploy_macos_anchor_profile`, `validate_macos_anchor_bundle_pull`,
+`anchor_validation`, and — the QH-68 re-proof target —
+`validate_macos_anchor_port_mapping_authority` **PASS**. The fix in
+`874a9aaa` is now live-proven.
+
+BUT evidence finalization failed, so no run-matrix row was appended:
+`Rust --node evidence finalization failed: recorded plan integrity check
+failed: recorded plan does not match the independently-derived expected
+plan ... unexpected added stages: [deploy_macos_anchor_profile,
+validate_macos_anchor_bundle_pull,
+validate_macos_anchor_port_mapping_authority]`.
+
+Root cause (read from code, not guessed): the anti-shrink verifier
+`verify_recorded_plan_not_shrunk` (resolved_plan.rs) rebuilt the expected
+plan with `.with_anchor_platform_macos(selectors.anchor_platform ==
+"macos")` — the raw flag only. On `--node` runs the recorded selector is
+ALWAYS empty (native.rs records `anchor_platform: String::new()`; "bash-only
+platform election selectors remain inactive"), while the runner's election
+is OR(flag, Anchor-assigned-to-macOS-entry) via
+`anchor_platform_macos_elected` (native.rs:1196, added by `451f9730`).
+Every faithful `--node <mac>:anchor` fast-path run therefore under-derives
+the expected plan and is rejected as having "added" the three anchor
+stages.
+
+Fix applied (lab tooling, rustynet-cli — no verdict/trust code):
+
+1. `ManifestNodeAssignment` gains `#[serde(default)] platform: String`
+   (live_lab_stage_manifest.rs), filled at manifest-write time from the
+   inventory entry (native.rs now maps over `node_entries`, which carries
+   the platform). Empty/absent platform reads as not-macos.
+2. `verify_recorded_plan_not_shrunk` re-derives the election by calling the
+   SAME `anchor_platform_macos_elected` fn the runner used (now `pub(crate)`,
+   body unchanged), over the manifest's recorded node assignments;
+   unparseable role → `NodeRole::Custom` (never Anchor → no election);
+   unparseable platform → None (no election). Every failure path bends
+   toward the stricter no-election plan.
+3. Tests: `verify_honors_a_node_assigned_macos_anchor_on_the_fast_path`
+   (the regression — passes now, failed pre-fix),
+   `verify_fails_closed_for_a_platform_less_legacy_anchor_assignment`
+   (legacy platform-less manifest must NOT elect; mismatch names "added" +
+   "macos_anchor"), `verify_rejects_a_fabricated_anchor_election_without_an_assignment`.
+   Existing anti-shrink tests unchanged and green. Scoped gates: fmt,
+   clippy -D warnings, resolved_plan tests 17/17.
+
+Security review: the mandatory adversarial review (ai_read, glm-5.3) was
+attempted TWICE with the full diff; both calls timed out (MCP -32001).
+Recorded here per the max-2-retries rule; will retry when the provider
+answers. My own adversarial analysis in the interim: the change does not
+move the trust boundary in kind — the manifest already records raw CLI
+selectors authored by the runner, and the gate's purpose is to catch
+selection↔recording divergence, not to authenticate inputs; a runner that
+falsely wanted the anchor stages in its expected plan could always have
+claimed `--anchor-platform macos` pre-fix. No new growth power, all
+degenerate inputs fail toward no-election, full-digest comparison and
+dropped/added naming unchanged.
+
+Next: commit, rebuild the vm-lab binary, relaunch the re-proof with a
+fresh report dir so the matrix row actually lands.
+
+## 19:00–19:35 — anchor re-proof run 2: GREEN, row recorded
+
+Relaunched after the verifier fix (same recipe, fresh report dir
+`state/live-lab-macos-anchor-portmap2-20260905-190047`, pid 94413,
+deploying branch HEAD `1eb6e800` via `--source-mode local-head`).
+
+Verdict (stages.tsv + stage logs + matrix row cross-check):
+`livelab-1788635706-1eb6e800c4cf`, commit `1eb6e800`, clean —
+**20 pass / 0 fail / 2 skip** (admin_issue, blind_exit: role-absence
+skips). All four anchor stages pass; QH-68 re-proof target
+`validate_macos_anchor_port_mapping_authority` passes against the
+daemon-reported identity `macos-utm-1-bootstrap`. Run-matrix row appended
+IN THE WORKTREE ledger (run launched from the worktree):
+`macos_anchor=pass`, `macos_stage_anchor=pass`,
+`macos_anchor_node_id=macos-utm-1-bootstrap`,
+`overall_result=partial` — partial is the fast-path semantic (stages
+outside the elected cell are `not_run` by design under
+`--skip-linux-live-suite`), not a failure.
+
+The plan-integrity fix is thereby live-proven too: finalization succeeded
+and the row landed.
+
+Third attempt at the glm-5.3 adversarial review of the verifier fix also
+timed out (MCP -32001) — provider unavailable this hour; standing note
+above stands (own analysis recorded; no invariant weakened).
+
+macOS cell status after this run: client 🟡 (CP-1 owner-deferred), admin 🟢,
+relay lifecycle 🟢, **anchor 🟢**, exit 🟢 (blind_exit posture; F1 owner),
+blind_exit 🟢, relay frame-forwarding ⬛ (opt-in, never run live).
+
+Next: relay frame-forwarding opt-in cell (QH-64-aware:
+`--node macos-utm-1:relay --node debian-headless-4:exit
+--node debian-headless-2:client --enable-relay-forwarding-validation
+--skip-linux-live-suite` + common flags). Disruptive by design; if
+`gossip_accepted_total=0` / `restrict_permanent` symptoms appear, that is
+QH-64 evidence, not a new defect.
+
+## 19:20–20:10 — successor manager (edit-1788642144227-82735-2): relay attempt 1 = setup-only (HP-3 skip-trap); glm-5.3 adversarial review APPROVE
+
+Handover processing. The predecessor's relay launch
+(`state/live-lab-macos-relay-fwd-20260905-191701` in the OLD worktree,
+pid 591) had already exited cleanly by the time this manager read the log:
+`orchestration/orchestrate_result.json` exists, run
+`livelab-1788636568-2a7cbf6ac22e`, commit `2a7cbf6a` (the predecessor's
+timed-out checkpoint HEAD, an ancestor of this branch), clean.
+
+Verdict (from `state/stages.tsv` + stage logs + the appended ledger row,
+never the CSV column alone): **setup-only — 16 pass / 0 fail / 3 skip**
+(anchor_validation, admin_issue, blind_exit: role-absence skips),
+`overall_result=partial` (fast-path `not_run` semantics). **The relay
+frame-forwarding stage was never planned.** Root cause, read from code:
+the stage is `StageSuite::Disruptive` and the plan gate is
+`!skip_live_suite && enable_relay_forwarding_validation`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/plan.rs:372`, with the
+regression test `skip_live_suite_drops_relay_forwarding_validation_too`
+at plan.rs:845), and `native.rs:743` records the selector as
+`enable_relay_forwarding_validation && !skip_live_suite` — the launch
+recipe combined `--enable-relay-forwarding-validation` with
+`--skip-linux-live-suite`, so the opt-in was dropped BY DESIGN (same
+contract as chaos/negative-control; the recorded manifest confirms
+`relay_forwarding_validation:false`). Not a defect; a launch-recipe
+trap. QH-64 symptoms therefore never came into play (no restarts
+happened).
+
+Ledger carry: the run-matrix row (line 314) and the 46 stage-results
+rows (lines 43295–43340) were appended uncommitted in the OLD worktree;
+copied line-exact into this branch's
+`documents/operations/live_lab_node_run_matrix.csv` /
+`live_lab_node_stage_results.csv` via python (all 47 lines verified to
+reference the report dir before appending). No triage stub was created
+for this run (grep of the old worktree's `live_lab_stage_triage.jsonl`
+for the report dir: zero matches), so there is no stub to fill.
+
+glm-5.3 adversarial review of the verifier fix `1eb6e800` — RETRY
+SUCCEEDED via the stdio driver
+(`scripts/mcp/drive_ai_agent.py --tool ai_agent`, provider glm, model
+glm-5.3, grounding itself with its own git/read tools after four MCP
+-32001/-style failures): **VERDICT APPROVE.** All five attack attempts
+fail: (a) anti-shrink bypass — the election disjunction only ever
+ENLARGES the expected plan; the pre-fix runner could already shrink via
+the raw selector, so the trust boundary is unmoved and the dangerous
+direction is strictly reduced; (b) no self-election path — the manifest
+platform field is copied from the operator-controlled inventory at
+write time (`native.rs:320-336`), unknown alias is a hard error;
+(c) degenerate inputs all bend strict (unparseable role →
+`NodeRole::Custom` ≠ `Anchor` → no election; unparseable/absent
+platform → `None`/`""` → parse fails → no election); (d) the digest
+gate `verify_recorded_matches_expected` (`resolved_plan.rs:274-308`) is
+untouched by the commit; (e) `""` vs `"linux"` both converge on the
+identical no-election plan. Two OPTIONAL non-blocking hardening notes:
+reject duplicate aliases in `ManifestNodeAssignment` at manifest-write
+time (kills the last-wins HashMap ambiguity), and pin
+`VmGuestPlatform::parse("") → Err` in a unit test. Reviewer's stated
+limits: did not run cargo, did not read the `parse` sources directly
+(enum-inequality inferred from the committed regression tests).
+Operational consequence noted by the reviewer: legacy pre-fix manifests
+with legitimately-elected anchors now fail verification loudly —
+intended fail-closed direction. Disposition: APPROVE recorded; the two
+optional hardenings are lab-tooling-only and queued behind the relay
+cell (they harden, they do not fix a defect).
+
+Docs updated on this branch: Refresh §1 relay (frame-forwarding) row
+now records attempt 1 with run id, the skip-trap root cause with
+file:line, and the corrected launch recipe (NO
+`--skip-linux-live-suite`).
+
+macOS cell status unchanged otherwise: client 🟡 (CP-1 owner-deferred),
+admin 🟢, relay lifecycle 🟢, anchor 🟢, exit 🟢, blind_exit 🟢, relay
+frame-forwarding ⬛→ attempt-1 evidence recorded, still never run.
+
+Next: relaunch the relay cell from THIS worktree without
+`--skip-linux-live-suite` (`--node macos-utm-1:relay --node
+debian-headless-4:exit --node debian-headless-2:client
+--enable-relay-forwarding-validation --linux-backend
+linux-wireguard-userspace-shared --source-mode local-head`), expect the
+full Live suite to run (longer), QH-64-aware monitoring, fill any triage
+stub before the next launch.
+
+## 21:33 — relay attempt 2 launched from THIS worktree (correct recipe)
+
+Relaunched the relay frame-forwarding cell without the trap flag:
+`--node macos-utm-1:relay --node debian-headless-4:exit --node
+debian-headless-2:client --enable-relay-forwarding-validation
+--skip-soak --linux-backend linux-wireguard-userspace-shared
+--source-mode local-head --trust-inventory-ready --known-hosts-file
+~/.ssh/known_hosts`, report `state/live-lab-macos-relay-fwd2-20260905-213253`,
+pid 12879, deploying branch HEAD `0a118d10` (docs-only on top of
+`2a7cbf6a`). First launch died immediately on a missing required flag
+(`--known-hosts-file is required when --node flags are present`) —
+relaunched with it; report dir wiped and reused. The recorded manifest
+now shows `relay_forwarding_validation:true` — the stage IS planned this
+time. `--skip-soak` keeps the Soak suite out (StageSuite::Soak would
+otherwise run for hours); the full Live suite runs, so expect
+role-switch/two-hop/managed-dns/relay-lifecycle stages alongside the
+Disruptive relay-forwarding stage. QH-64 watch active.
+
+## 22:30 — successor manager (edit-1788646982493-23815-0): attempt 2 verdict — relay cell STILL not exercised; macOS deploy-adapter defect identified; checkpoint fix in progress
+
+Handover processing. Attempt 2 ended at 21:50 UTC (15m 33s) in the
+PREDECESSOR's worktree (read-only for this manager): run
+`rust-1788644094`, commit `0a118d10`, clean, report
+`state/live-lab-macos-relay-fwd2-20260905-213253` (absolute:
+`/Users/iwan/Desktop/Rustynet/state/edit-worktrees/edit-1788642144227-82735-2/state/live-lab-macos-relay-fwd2-20260905-213253`).
+
+Verdict from `run_summary.json` + `failure_digest.md` + stage logs:
+**66 planned, 23 pass / 2 fail / 41 skip, overall fail.** The relay
+frame-forwarding stage WAS planned (selectors
+`relay_forwarding_validation:true`) but NEVER RAN:
+
+1. `deploy_relay_service` **FAIL** on macos-utm-1: `remote command
+   failed (exit Some(1)): sh: line 0: cd: /Users/mac/Rustynet: No such
+   file or directory`. Root cause (read from code,
+   `macos_install.rs:1270` pre-fix): the macOS adapter built
+   `sudo -n env RN_SRC=… sh -c 'cd "$RN_SRC" && rustynet ops
+   install-macos-relay'` with `RN_SRC` = configured workdir else
+   `$HOME/Rustynet` — assuming a source checkout on the guest that a
+   `--node` bootstrap never materializes (bootstrap installs from the
+   shipped archive; the inventory `rustynet_src_dir` is not a live
+   checkout). Lab-tooling defect, NOT a rustynet daemon defect. The
+   earlier relay-lifecycle green row (`livelab-1784497253`) predates
+   the `--node` engine. `relay_validation` and
+   `relay_forwards_frame_validation` skipped as failed-dependency — the
+   cell is still ⬛.
+2. `traffic_test_matrix` **FAIL** — same CP-1 cross-vmnet 100% loss
+   pattern as run #5 (all four mac↔Linux legs, default-deny
+   INCONCLUSIVE failing closed). Owner-deferred; not chased. Its
+   cascade skips (role_switch → … → live_two_hop → cross_network_*)
+   account for most of the 41 skips.
+
+Ledger state, verified with quote-aware greps of BOTH worktrees' CSVs
+and the triage jsonl: **NO run-matrix row, NO stage-results rows, NO
+triage stub exist for `rust-1788644094` anywhere** — evidence
+finalization itself failed (job wrapper reported transient_failure 70),
+so nothing was appended to port. Recorded here; nothing fabricated. The
+handover's assumption that rows landed uncommitted in the predecessor
+worktree was checked and is FALSE (clean tree, zero grep matches for
+the run id and report dir).
+
+macOS cell status: client 🟡 (CP-1 owner-deferred), admin 🟢, relay
+lifecycle 🟢, anchor 🟢, exit 🟢, blind_exit 🟢, relay frame-forwarding
+⬛ (two attempts, both pre-exercise).
+
+Fix in flight: the automatic checkpoint `25e885d9` (from the timed-out
+predecessor, already on this branch) carries a WIP fix —
+`deploy_relay_service` drops the `workdir` param, uploads the reviewed
+`scripts/launchd/com.rustynet.relay.plist` from the orchestrator's
+workspace to `/tmp`, and runs `ops install-macos-relay` from a
+`mktemp -d` staging cwd so no guest source root is needed (same proven
+shape as the quarantined `exercise_macos_relay_lifecycle_live`). This
+manager verifies/completes it (compile, unit tests, scoped gates,
+binary rebuild) before relaunching attempt 3.
+
+## 23:30 — deploy fix completed + glm-5.3 adversarial review APPROVE
+
+Completed the checkpoint's WIP fix on this branch (commit `98664b0e` +
+hardening follow-up):
+
+1. Extracted `reviewed_relay_plist_bytes(ws_root)` — fail-closed read
+   of the reviewed plist from the orchestrator workspace (missing →
+   Err, never a fallback). Unit tests:
+   `reviewed_relay_plist_fails_closed_when_missing`,
+   `reviewed_relay_plist_returns_exact_workspace_bytes`.
+2. `deploy_relay_service(conn)` (workdir param dropped): scp the
+   reviewed plist to a per-run /tmp drop path, root script stages it in
+   a `mktemp -d` tree and runs `ops install-macos-relay` from there;
+   `rc=$?; cleanup; exit $rc`. `install-macos-relay`'s
+   `read_source_plist` verified to have NO embedded fallback (Err on
+   missing file outside dry-run).
+3. Adversarial review (ai_read, glm-5.3, two rounds): round 1 caught
+   real design issues at the fixed `/tmp` drop names — symlink
+   pre-planting (scp follows a planted symlink and clobbers a victim),
+   pre-created-attacker-file swap before the root read (arbitrary
+   launchd plist = root persistence; attacker-chosen verifier key =
+   relay trusts attacker-signed assignment state), concurrent
+   collision, and the empty-`$T` rm concern. Fix: BOTH drop paths
+   (verifier key and plist) now carry a per-run `unique_suffix()`
+   (u128 pid+counter+time) formatted by Rust into the scp destination
+   and interpolated as a literal — never a shell-active string.
+   Round-2 verdict on the actual diff: **APPROVE**, angles (a)–(f) all
+   resolved: same-uid swap remains structurally possible but is moot
+   under passwordless `sudo -n` (same-uid compromise = root; nothing
+   left to defend); `rc=$?` captures the whole `&&` chain; scp rc
+   gated in Rust; empty-$T unreachable past the first `&&`; no new
+   secret handling. One non-blocking hardening applied: verifier-drop
+   cleanup moved to the rc-capture shape so a failed `install` still
+   removes the drop file. Remaining optional (NOT applied): hash-pin
+   the reviewed plist at review time; pipe bytes over stdin instead of
+   /tmp. Scoped gates: fmt clean, clippy `-D warnings --locked` clean,
+   `macos_install` tests 84/84, `deploy_relay` tests 9/9.
+
+Ledger note: the 36 empty-patch triage stubs in
+`live_lab_stage_triage.jsonl` predate this series (latest 2026-07-25)
+with no surviving run artifacts to ground patches — left for the
+owner, not fabricated.
+
+Next: rebuild the vm-lab binary, relaunch relay attempt 3 from this
+worktree (`--source-mode local-head` on the new commit).
+
+## 00:05 — relay attempt 3 launched (fix deployed)
+
+Rebuilt `rustynet-cli` (vm-lab binary, target-pinned debug, contains
+the staged-plist deploy path — verified by `rn-relay-reviewed-` string
+present in the binary). All three nodes verified UP+reachable first
+(macos-utm-1 192.168.65.101, debian-headless-4 192.168.64.10,
+debian-headless-2 192.168.64.4, TCP/22 open).
+
+Launched attempt 3: `--node macos-utm-1:relay --node
+debian-headless-4:exit --node debian-headless-2:client
+--enable-relay-forwarding-validation --skip-soak --linux-backend
+linux-wireguard-userspace-shared --source-mode local-head
+--trust-inventory-ready --ssh-identity-file ~/.ssh/id_ed25519
+--known-hosts-file ~/.ssh/known_hosts`, report
+`state/live-lab-macos-relay-fwd3-20260906-000522`, pid 31921,
+deploying branch HEAD `6e3bb383`. (First try exited bad_args 64 —
+`--ssh-identity-file` is required; relaunched with it.) Resolved plan
+verified from `state/resolved_plan.json`: 66 stages,
+`deploy_relay_service` AND `relay_forwards_frame_validation` both
+planned, selectors `relay_forwarding_validation:true`,
+`skip_linux_live_suite:false`, `soak_suite:false`. QH-64 watch active.
+
+## Successor session (2026-09-06, worktree edit-1788651195477-40131-0)
+
+This session continues the chain from checkpoint `f094cc1b` (which
+carried the attempt-3 evidence rows, both filled triage stubs, and the
+readiness-wait fix into this branch).
+
+### Attempt 3 verdict (recorded from stage artifacts)
+
+Run `livelab-1788650472-ef1c5ed0ec20` (report
+`state/live-lab-macos-relay-fwd3-20260906-000522` in the predecessor
+worktree, source archive commit `6e3bb383`, clean): 66 stages, 24 pass /
+2 fail / 40 skip, overall fail, first_failed_stage `relay_validation`.
+
+- `deploy_relay_service` PASS on macos-utm-1 — FIRST time on macOS. The
+  staged-plist deploy fix (98664b0e + 6e3bb383) works.
+- `relay_validation` FAIL: during-run UDP :4500 not bound, TCP :4501 not
+  bound, `/healthz` unreachable. Triage (stub already filled on this
+  branch, independently reconfirmed): startup race — validation captured
+  its snapshot in the same second the deploy kickstart returned;
+  post-run guest state proves the service healthy (launchd running,
+  UDP 127.0.0.1:4500 + TCP 127.0.0.1:4501 LISTEN, `/healthz` ok). Remedy
+  `wait_until_ready` (30s/1s poll) is in `role_validation/relay.rs` on
+  this branch; 126 scoped relay tests green under pinned 1.88.0.
+- `relay_forwards_frame_validation` SKIPPED (failed dependency).
+- `traffic_test_matrix` FAIL: CP-1 cross-vmnet 100% loss, unchanged
+  (stub filled). Skip-cascade took role_switch/two_hop/etc., as in
+  attempt 2.
+
+### CP-1 elevated to a structural blocker for the frame-forwarding cell
+
+New evidence gathered live this session: from debian-headless-2
+(192.168.64.4), the macOS guest 192.168.65.101 is unreachable at the
+LAN level entirely — ICMP 100% loss AND TCP/22 connection timeout. This
+is not a mesh/WireGuard symptom: no Linux peer can send any packet to
+the macOS guest's LAN address. Since the HP-3 frame-forwarding proof
+requires two Linux peers to direct UDP frames at the relay's LAN bind
+(provisioned as `<relay_lan_ip>:4500`), `relay_forwards_frame_validation`
+with a macOS relay is structurally impossible under the current lab
+topology. Additionally the stage carries an explicit fail-closed
+`adapter.platform() != Linux` gate (`relay_forwards_frame_validation.rs`,
+"probe is Linux-only (nft + systemd unit restarts)"), and
+`select_relay_forward_test_topology` elects only Linux relay_capable
+nodes — a macOS-relay port of the probe would be moot until CP-1 is
+resolved anyway. Porting the probe to macOS is therefore NOT attempted;
+CP-1 (bridged-NIC/host topology change) stays the owner decision it has
+been recorded as since attempt 2, now with LAN-level evidence.
+
+Note for honesty: `linux_relay_forwards_frame` has itself never passed
+on any OS (matrix tally: 313 not_run / 1 skip), so the forwarding stage
+is unproven even where it is implementable.
+
+### Attempt 4 (relay_validation goal) — launched and concluded
+
+Launched from THIS worktree at 23:52:48Z (pid 43705, report
+`state/live-lab-macos-relay-fwd4-20260906-005210`, `--source-mode
+local-head` deploying `04c85129`, 66 planned stages verified from
+`resolved_plan.json` with `relay_forwards_frame_validation` enabled).
+Results (from stage artifacts, `state/stages.tsv` + per-stage logs):
+
+- `deploy_relay_service` PASS (00:05:05–00:05:16Z).
+- **`relay_validation` PASS (00:05:16–00:05:21Z) — the macOS relay
+  lifecycle is now proven on the `--node` engine** (run
+  `livelab-1788653310-04c85129bb4f`, commit `04c85129`, clean). The
+  readiness-wait fix is live-verified: the during-run capture now finds
+  UDP :4500 + TCP :4501 bound and `/healthz` ok, the stop/restart
+  lifecycle assertions hold, and the matrix column
+  `macos_stage_relay_service_lifecycle=pass` agrees with the stage
+  artifact.
+- `relay_forwards_frame_validation` FAIL exactly as predicted, fail-closed
+  before touching any host: "relay node macos-utm-1 is Macos; the
+  relay-frame-forwarding probe is Linux-only (nft + systemd unit
+  restarts)" (`logs/relay_forwards_frame_validation.log`). This is the
+  durable in-ledger evidence that the cell is blocked, not skipped.
+- `traffic_test_matrix` FAIL (CP-1, as in every prior run; stub filled
+  "none: owner-deferred"). Skip cascade followed; tally 26 pass /
+  2 fail / 38 skip. Ledger row + 170 stage rows appended to
+  `documents/operations/live_lab_node_run_matrix.csv` /
+  `live_lab_node_stage_results.csv` in THIS worktree and verified.
+
+## Session close (2026-09-06)
+
+Cell status after this session: macOS relay **lifecycle GREEN on the
+engine of record**; macOS relay **frame-forwarding BLOCKED** by (a) the
+HP-3 probe being Linux-only by construction and (b) CP-1 cross-vmnet
+unreachability (now evidenced at the LAN level: ICMP + TCP/22 dead
+between vmnets). A macOS probe port is moot until CP-1 lands. No
+rustynet-relay production code was modified this session; the only code
+change on this branch remains the predecessor's readiness wait in
+`role_validation/relay.rs` (lab validation harness).
+
+Owner decisions outstanding (not mine to make), with evidence pointers:
+
+- **CP-1** — re-pin lab guests to one vmnet / enable host forwarding
+  between bridge100 and the macOS vmnet. Blocks: macOS↔any cross-node
+  dataplane stage (`traffic_test_matrix`, `cross_os_*`,
+  `relay_forwards_frame_validation` with a macOS relay, two_hop).
+  Evidence: attempt-3/4 `traffic_test_matrix.log`, live LAN probe
+  (debian-headless-2 → 192.168.65.101 ICMP 100% / TCP/22 timeout),
+  `MacosCrossNetworkTrafficBlocker_2026-09-03.md`.
+- **QH-66 Option D** — owner signing-key custody (unchanged).
+- **QH-69** — `--linux-backend` default vs per-row recording
+  (unchanged).
+- Optional (queued by predecessor, not applied): hash-pin the reviewed
+  relay plist / stdin-pipe bytes; `ManifestNodeAssignment`
+  duplicate-alias rejection; `VmGuestPlatform::parse("")` pin.
+
+## Closing pass (2026-09-06, worktree edit-1788655036704-53137-0, branch ai-edit/edit-1788655036704-53137-0)
+
+No lab runs this session — closing work only.
+
+**Ledger verification (attempt-4 port, already landed in `325cbae2`).**
+Re-verified in THIS worktree with a quote-aware reader:
+`live_lab_node_run_matrix.csv` carries exactly one attempt-4 row (run
+`livelab-1788653310-04c85129bb4f`, start 2026-09-05T23:52:48Z, end
+2026-09-06T00:08:30Z, commit `04c85129bb4f4b5d3a3a00d2a91b496406e0fddb`,
+branch `ai-edit/edit-1788651195477-40131-0`, clean);
+`live_lab_node_stage_results.csv` carries the 170 attempt-4 stage rows;
+no duplicates. The three triage stubs from this series
+(`live_lab_stage_triage.jsonl` lines 213–215:
+`livelab-1788650472-ef1c5ed0ec20::relay_validation` readiness-race
+remedy, `livelab-1788650472-ef1c5ed0ec20::traffic_test_matrix` CP-1, and
+`livelab-1788653310-04c85129bb4f::traffic_test_matrix` "none: CP-1
+cross-vmnet substrate gap, owner-deferred") all carry non-empty `patch`
+text. Per the ledger's own schema
+(`crates/rustynet-cli/src/live_lab_stage_triage.rs`, lines 16–22 and
+`StageTriageRecord::is_unfilled`), a filled `patch` is the ONLY fill
+marker — there is deliberately no patch-commit field (the row's own
+commit is the patch commit) — so no `live-lab-record-stage-patch` call
+is needed or possible for them.
+
+**Docs synced this pass.**
+`CrossPlatformRoleParityRefresh_2026-07-23.md` relay rows (lifecycle +
+frame-forwarding) were already current with attempt 4 (landed in
+`325cbae2`); re-read, no further edit. QH-68 is recorded FIXED and QH-69
+FIXED(flag)/OPEN(default) in `QualityHardeningTodo_2026-07-25.md` — both
+dispositions final, no edit. Added §8 to
+`MacosCrossNetworkTrafficBlocker_2026-09-03.md` pointing at attempt 4 as
+the newest CP-1 confirming run. AGENTS.md/CLAUDE.md untouched.
+
+**Final macOS cell status (engine of record = Rust `--node`; evidence =
+stage artifacts, not matrix columns):**
+
+| Cell | Status | Proving run (commit, clean) |
+| --- | --- | --- |
+| client | 🟡 CP-1-deferred — STUN/orchestrator half proven live (run #5 `livelab-1788631948-3aedcfff9a75`, `3aedcfff`), `traffic_test_matrix` cross-vmnet legs still 100% loss | `livelab-1788631948-3aedcfff9a75` |
+| admin | 🟢 `macos_admin=pass` | `livelab-1784501586` (`537e1901`) |
+| relay (lifecycle) | 🟢 `deploy_relay_service` + `relay_validation` PASS | `livelab-1788653310-04c85129bb4f` (`04c85129`) |
+| relay (frame-forwarding) | ⬛ structurally Linux-only probe (platform gate, `relay_forwards_frame_validation.rs`) AND CP-1-blocked; durable fail-closed record in the attempt-4 ledger row | `livelab-1788653310-04c85129bb4f` (`04c85129`) |
+| anchor | 🟢 all four anchor stages incl. QH-68 re-proof | `livelab-1788635706-1eb6e800c4cf` (`1eb6e800`) |
+| exit | 🟢 baseline chain green on the blind_exit posture (QH-67 fix); admin-posture `Exit` preset stays N/A-by-decree | `livelab-1788628164-40e7409ff2a4` (`40e7409f`) |
+| blind_exit | 🟢 first election + pass | `livelab-1788172934687-17194-11` (`7bdcfe60`) |
+| role-transition | ⬛ never run on `--node` for macOS (unchanged, out of this push's scope) | — |
+
+**Owner decisions outstanding (not the manager's), with evidence
+pointers** — unchanged from the session-close section above: **CP-1**
+(re-pin to one vmnet / host forwarding between bridge100 and the macOS
+vmnet; evidence: attempt-3/4 `traffic_test_matrix.log`, LAN probe
+ICMP 100% + TCP/22 timeout, `MacosCrossNetworkTrafficBlocker_2026-09-03.md`
+§5–§8); **QH-66 Option D** (owner signing-key custody, evidenced by
+`owner_signing_key_present=true` in `logs/membership_init.log` of
+`livelab-1788625551-504605015758`); **QH-69** (`--linux-backend` default
+vs per-row backend recording; `QualityHardeningTodo_2026-07-25.md`).
+
+**Gates (pinned 1.88.0, `target-pinned`):** `cargo fmt --all
+-- --check` PASS; `cargo clippy -p rustynet-cli --all-targets
+--all-features -- -D warnings` PASS (2m12s, zero warnings) —
+`rustynet-cli` is the only crate this branch touches (readiness wait in
+`vm_lab/orchestrator/role_validation/relay.rs`).
+
+**Branch is NOT merged.** `ai-edit/edit-1788655036704-53137-0` (head
+carries this closing commit) holds the full manager-chain work; review
+and merge into `main` is the owner's step, per the delegated-edit
+contract. Nothing was pushed.
+
+closing pass complete
+
+
+
+
+---
+
+## 2026-09-06 (session 2) — Linux relay frame-forwarding push (HP-3, target #1)
+
+Context: macOS role cells closed in the prior section; owner says keep
+going. Target order per handoff: (1) Linux `relay_forwards_frame_validation`
+(NEVER passed on any OS), (2) macOS role-transition, (3) macOS reboot
+recovery, (4) Windows role cells.
+
+### Topology resolution (read the code before launching)
+
+`select_relay_forward_test_topology` (`vm_lab/mod.rs:13839`) elects from
+the INVENTORY, not the run assignments: relay = the only
+`relay_capable=true` Linux entry — **fedora-x86-1** — and the stage
+(`relay_forwards_frame_validation.rs:140`) FAILS unless the assigned relay
+== the elected relay. Peers = non-relay, non-exit-capable Linux entries
+ranked by `lab_role` `aux`/`extra` then alias → sender **debian-headless-2**
+(receiver **debian-headless-4**). All three must be IN the run mesh (probe
+restarts sender+receiver daemons and asserts relay-routed status on both).
+
+Elected run topology: `fedora-x86-1:relay linux-x86-exit-1:exit
+debian-headless-2:client debian-headless-4:client`, full flag recipe per
+attempt-2 line 252-259 + `--enable-relay-forwarding-validation --skip-soak`.
+
+### Blocker found + fixed: tailnet ACL denies this Mac → 192.168.121.0/24
+
+First launches failed the OS-version probe on `linux-x86-exit-1`
+("refusing Linux-umbrella evidence"), and the failure was NOT transient:
+from this Mac, TCP to 192.168.121.26/.227:22 gets **RST** and ICMP is
+100% blackholed, while `virsh list` (all 4 KVM guests running),
+`domifaddr` (IPs correct), and host→guest SSH from ubuntu-kvm-1 itself
+all pass. `tailscale status --json` shows ubuntu-kvm-1 advertising
+`192.168.121.0/24` and the Mac holding the utun4 route — RST+blackhole
+with a working far side is the tailnet-ACL-deny signature. That is an
+OWNER-level tailnet ACL change; not mine to make.
+
+Workaround (landed on this branch, commit `caa11fdc`): the adapter SSH
+transport passes `-F /dev/null`, so `~/.ssh/config` ProxyJump can never
+apply there. Added env-gated, CIDR-scoped jump to the shared ssh/scp
+hardening: `RUSTYNET_LAB_PROXYJUMP=<user@host>` + required companion
+`RUSTYNET_LAB_PROXYJUMP_CIDRS=192.168.121.0/24` appends one
+`-o ProxyJump=` — jump hop inherits the pinned identity + known_hosts
+(verified live: lab key authorizes `ubuntu-server@100.117.1.47`, whose
+key is pinned in `known_hosts_lab`). Fail-closed on half-configured or
+malformed env; unit tests for the whole matrix; fmt+clippy clean. Also
+added a `~/.ssh/config` block for 192.168.121.* (supervisor lenovo-guest
+pattern) — that covers the legacy helper paths that DO read ssh_config.
+
+### Run 5 (Linux relay) — IN FLIGHT at writing
+
+Dry-run green: 4 nodes, 66 planned stages. Launched (pid 85569, nohup —
+note macOS has no setsid):
+`state/live-lab-linux-relay-fwd1-20260906-082801-r2`, commit `caa11fdc`
+clean, env ProxyJump pair set. QH-64 watch active (the probe restarts
+sender+receiver daemons mid-run; `RestrictionMode::Permanent` /
+`gossip_accepted_total=0` = QH-64 evidence, not new defects). Result
+append: next section.
+
+## 2026-09-06 (session 3) — run 5 (Linux relay fwd, attempt 1) verdict + stable-topology retry
+
+Successor manager (worktree `edit-1788682024523-99861-0`, branch
+`ai-edit/edit-1788682024523-99861-0`, base = timed-out checkpoint `d731826a`
+which already carries run 5's ledger rows and the ProxyJump commits
+`caa11fdc`/`9c709139`).
+
+### Run 5 verdict (from stage artifacts, report
+`state/live-lab-linux-relay-fwd1-20260906-082801-r2` in worktree
+`edit-1788678035879-79896-0`; ledger id `livelab-1788681040-caa11fdc1fc8`,
+commit `caa11fdc`, clean, 07:29–07:50Z, 4 nodes
+debian-headless-2:client / debian-headless-4:client / fedora-x86-1:relay /
+linux-x86-exit-1:exit)
+
+- `deploy_relay_service` **pass** and `relay_validation` **pass** on
+  fedora-x86-1 — first `--node`-engine Linux relay-service lifecycle proof in
+  this series (the macOS lifecycle proof landed earlier as
+  `livelab-1788653310-04c85129bb4f`).
+- `relay_forwards_frame_validation` **fail — but NOT a probe/platform
+  failure**: `fedora-x86-1: relay provisioning on fedora-x86-1 failed: remote
+  command exited with status 255: ssh: connect to host 192.168.121.227 port 22:
+  Connection refused`. fedora-x86-1 dropped sshd mid-run (known ubuntu-kvm
+  guest flakiness); bootstrap_hosts had reached all four nodes minutes earlier
+  in the same run with the ProxyJump pair active, and the watchdog re-probe
+  shows the port answering again. The frame-forwarding probe was never
+  exercised. Triage stub amended to record this root cause (the previous patch
+  text misattributed it to the tailnet ACL, which the jump hop already
+  solves).
+- `traffic_test_matrix` **fail**: ALL 121.x↔64.x legs 100% loss both
+  directions (fedora-x86-1↔both Debians, linux-x86-exit-1↔both Debians). New
+  environment evidence: the two subnets are underlay-partitioned (121.x =
+  libvirt NAT behind ubuntu-kvm-1, tailnet-ACL-blocked from this Mac; 64.x =
+  local UTM shared net). 64.x↔64.x legs passed. Consequence for topology
+  design: relay, sender, AND receiver for the frame-forwarding probe must sit
+  on ONE mutually-reachable subnet — lenovo (192.168.0.x, bridged) cannot
+  serve: 64.x→0.x works (NAT egress) but 0.x→64.x is unrouted, and both the
+  receiver→relay UDP flow and any relay-on-lenovo forwarding direction need
+  that dead path.
+- Ledger port: the checkpoint `d731826a` already committed run 5's row + 224
+  stage rows; verified byte-identical to the report artifacts (0 field diffs)
+  and both new triage stubs are now filled (run 5's amended; the 08:03Z
+  relaunch stub `livelab-1788681822-9c709139ad16::prepare_source_archive` was
+  the clean-worktree gate tripping on the then-uncommitted rows — launch
+  hygiene, no code defect).
+
+### Retry topology (avoids fedora-x86-1 entirely; read from
+`select_relay_forward_test_topology` at `vm_lab/mod.rs:13840`)
+
+Election is inventory-driven: relay = first `relay_capable=true` Linux entry
+in entries order; peers = Linux, non-relay, non-`exit_capable=true`, ranked by
+lab_role aux(0)/extra(1)/other(2) then alias. fedora-x86-1 is currently the
+only `relay_capable` Linux entry, and the stage fails unless the assigned
+relay == the elected relay — so avoiding fedora REQUIRES an inventory change.
+Worktree-only inventory edits (never merged without owner review; documented
+here):
+
+1. `debian-headless-4.relay_capable: false → true` — elects the stable local
+   Debian as relay (entries order puts it ahead of fedora-x86-1).
+2. `debian-lan-11.exit_capable: (absent) → true` — exclusion hack only:
+   debian-lan-11 is a physical device with no mesh_ip/controller; without an
+   exclusion it sorts in as receiver and the stage fails at topology
+   formation ("peer debian-lan-11 has no mesh_ip recorded"). exit_capable is
+   the minimal lever that excludes it from peer candidates.
+3. No lab_role edits needed: with dh4 as relay, rank-2 alias order elects
+   sender=debian-headless-2 and receiver=fedora-utm-1 (a local UTM Linux
+   guest on the same utm-shared 192.168.64.0/24 — verified below before
+   launch).
+
+Run recipe: `--node debian-headless-4:relay --node debian-headless-2:client
+--node fedora-utm-1:client --enable-relay-forwarding-validation --skip-soak
+--linux-backend linux-wireguard-userspace-shared --source-mode local-head
+--trust-inventory-ready --ssh-identity-file ~/.ssh/rustynet_lab_ed25519
+--known-hosts-file ~/.ssh/known_hosts_lab --collect-artifacts-on-failure`,
+fresh report dir, NO ProxyJump env (all-local topology). Per-node SSH
+preflight with the lab key immediately before launch; abort on any miss.
+QH-64 watch active (probe restarts sender+receiver daemons mid-run).
+
+## 2026-09-06 run fwd3 (retry of relay-forward proof on 975d9bbb)
+- Worktree HEAD = 975d9bbb (relay-forward role-assignment election fix), clean.
+- Rebuild: cargo build -p rustynet-cli --features vm-lab @ target-pinned, OK (1m56s).
+- Preflight SSH: debian@192.168.64.10=dh4 OK, debian@192.168.64.4=dh2 OK, fedora@192.168.64.103=fedora-utm-1 OK (inventory ssh_target 192.168.65.10 and live_ip 192.168.64.20 both stale/dead; 64.103 live).
+- First launch attempt died instantly: worktree had no state/ dir → zsh redirect failure. mkdir state, relaunched.
+- RD=state/live-lab-linux-relay-fwd3-20260906-112215 pid 65322, flags: --node dh4:relay dh2:client fedora-utm-1:client --enable-relay-forwarding-validation --skip-soak --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --collect-artifacts-on-failure. Log: state/live-lab-linux-relay-fwd3-20260906-112215.log
+
+## 2026-09-06 runs fwd3–fwd5b (relay-forward proof, commit 975d9bbb)
+- fwd3 (state/live-lab-linux-relay-fwd3-20260906-112215, pid 65322) DIED early:
+  fedora-utm-1 OS-version probe degraded to 'linux' placeholder after 3 SSH
+  retries (evidence.rs validate_collected_os_version fails loud, exit 70
+  transient_failure). Manual probe with identical key/known-hosts works
+  ("Fedora Linux 44 (Server Edition) (aarch64)") — transient, no defect.
+- fwd4 (state/live-lab-linux-relay-fwd4-20260906-112854, pid 66518) ran further,
+  FAILED preflight: "lab requires exactly 1 Exit node, found 0" — the retry
+  recipe in the session-3 section was written against the inventory-driven
+  election era and never included an Exit; preflight invariant applies to every
+  --node run (preflight.rs:377-385 counts role assignments, not capability
+  flags). All other stages cascade-skipped; run-matrix row + 166 stage rows +
+  triage stub appended by the finalizer (uncommitted).
+- All inventory exit nodes unreachable from this Mac (libvirt 121.x tailnet
+  ACL-blocked — SSH to fedora-x86-1 192.168.121.227 times out; lenovo 0.x
+  unrouted). Local UTM 64.x candidates: rocky-utm-1 (linux, 192.168.64.105,
+  key-auth OK, Rocky 10.2).
+- Commit 1a59ab6f: rocky-utm-1 exit_capable true + fedora-utm-1 live-IP refresh
+  (sanctioned --update-inventory-live-ips; my first python edit mangled
+  em-dashes to \u2014 — redone with ensure_ascii=False, then restored the
+  sanctioned fedora refresh the git checkout had reverted). exit_capable flag
+  ALSO excludes rocky from relay-forward peer election (aux rank 0 would
+  otherwise elect the exit node as sender — select_relay_forward_test_topology_
+  for_run filters exit_capable==Some(true)).
+- fwd5 (113905) refused at launch gate: fwd4's preflight stub had no recorded
+  remedy (enforce_launch_gate, no bypass by design). Recorded remedy via
+  `ops live-lab-record-stage-patch --stub-id livelab-1788694287-8edbc55259c3::
+  preflight` (topology fix, commit 1a59ab6f).
+- fwd5b LAUNCHED 11:41:47Z: RD=state/live-lab-linux-relay-fwd5b-20260906-114147
+  pid 69402, 4 nodes dh4:relay dh2:client fedora-utm-1:client rocky-utm-1:exit,
+  same flags + --enable-relay-forwarding-validation. Election expectation:
+  sender=debian-headless-2, receiver=fedora-utm-utm-1... precisely:
+  sender=dh2 (client→rank2, alias order), receiver=fedora-utm-1. QH-64 watch
+  active. Polling; verdict from logs/relay_forwards_frame_validation.log +
+  stages.tsv only.
+
+## 2026-09-06 fwd5b verdict + nft syntax fix (session 4 cont.)
+
+- **fwd5b** (`state/live-lab-linux-relay-fwd5b-20260906-114147`, pid 69402, source 02cfba0c): run COMPLETED ~11:58Z. Everything passed EXCEPT two stages:
+  - `relay_forwards_frame_validation` FAIL: `debian-headless-4: expected 2 udp-drop rules on sender debian-headless-2, got: HP3_NFT_RULE_COUNT=0`. Root cause (verified live over SSH on dh2): **invalid nft syntax in stage tooling** — `build_relay_forward_test_block_script` emits `ip daddr <peer> udp drop`; a bare protocol name before `drop` is a parse error on nft (`syntax error, unexpected drop, expecting length or checksum or sport or dport`). Table+chain were created, both rules failed, count=0. Election itself WORKED: sender=debian-headless-2, receiver=fedora-utm-1, relay=debian-headless-4 as designed (975d9bbb); relay provisioned (unit active + /healthz ok) and counters parsed before the block step — the proof got further than ever before.
+  - `exit_dns_failclosed_validation` FAIL on rocky-utm-1: `dig` binary absent (fresh Rocky 10 cloud image, no bind-utils, no egress). Installed bind-utils via host reverse SOCKS tunnel (`ssh -R 1080` + `dnf --setopt=proxy=socks5h://127.0.0.1:1080 install -y bind-utils`), `/usr/bin/dig` verified. Guest gap, not code.
+- **FIX**: `build_relay_forward_test_block_script` now emits `ip daddr <peer> meta l4proto udp drop` / `ip saddr <peer> meta l4proto udp drop` (accepted + rendered with `udp drop` substring on dh2, so the HP3_NFT_RULE_COUNT grep still works). Unit test `relay_forward_test_block_script_targets_exactly_the_given_peer_ip` updated with a comment pinning the live-verified syntax error.
+- Gates (pinned toolchain): scoped `cargo test -p rustynet-cli --features vm-lab --all-targets --all-features relay_forward_test_block_script` → 93 result sets all ok (includes the named test pass); `cargo fmt --all -- --check` OK; `cargo clippy -p rustynet-cli --all-targets --all-features -- -D warnings` clean; binary rebuilt.
+- Both fwd5b stubs recorded in `live_lab_stage_triage.jsonl` via `ops live-lab-record-stage-patch`.
+- Cleanup verified: NO hp3 table residue on dh2 (stage's unconditional unblock ran).
+- NEXT: relaunch fwd6 with identical flags (new commit as source).
+
+## 2026-09-06 13:02 UTC — TARGET 1 launched: macOS client traffic_test_matrix (run #5 shape)
+
+- Step (a) cross-bridge preflight PASSED: debian-headless-4 (192.168.64.4) -> 192.168.65.101 ping 2/2 0% loss; macos-utm-1 (192.168.65.101) -> 192.168.64.4 ping 2/2 0% loss. CP-1 host override (com.apple/100.rustynet-lab) confirmed loaded.
+- Stale pf anchors on macos-utm-1 flushed: com.rustynet/blind_exit and com.rustynet/nat both `-F all`'d, re-verified rule-free.
+- Step (b) pinned rebuild of rustynet-cli --features vm-lab from this worktree (HEAD 17c9c3d4 + 8e766946 nft fix): Finished dev profile in 3m 11s.
+- Step (c) FULL run launched DETACHED 13:02:01 UTC: RD=state/live-lab-macos-client-traffic-20260906-130201, PID=84497. Topology: macos-utm-1:client, debian-headless-4:exit, debian-headless-2:client. Flags: --skip-soak --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --collect-artifacts-on-failure.
+- Verdict source: $RD/logs/traffic_test_matrix.log + $RD/state/stages.tsv ONLY. Also watching: live_two_hop_validation, live_managed_dns_validation (CP-1-gated).
+- While in flight: lab-tooling follow-ups (i) cross-bridge preflight gate, (ii) macOS uninstall anchor teardown, (iii) §9 MacosCrossNetworkTrafficBlocker_2026-09-03.md.
+
+## 2026-09-06 21:37 UTC — MANAGER A session start; STEP 1 fwd6 preflight
+- Worktree HEAD 092e94cf (checkpoint incl. 8e766946 nft fix, verified at vm_lab/mod.rs:14070 `meta l4proto udp drop`). Host rebooted 14:55Z; CP-1 pf override NOT loaded this session → all macOS<->Linux dataplane stages OFF (traffic_test_matrix, two_hop, managed_dns, relay-via-mac). Earlier 13:02Z traffic run is stale/dead, not touched.
+- Plan: (1) fwd6 relay fwd proof = fwd5b flags + rocky-utm-1:exit; (2) macos role-switch; (3) macos reboot-recovery; (4) macos anchor if budget. Preflight SSH+clock 4 Linux guests, then sanctioned live-IP refresh, commit inventory if changed, launch detached.
+- Preflight 21:36–21:41Z: dh2/dh4/fedora/macos skew 0–1s OK. rocky-utm-1 skew 23665s → fail-closed `utmctl stop/start rocky_10`, re-probe skew 0. Pinned rebuild OK. Sanctioned --update-inventory-live-ips: no change (git clean on inventory).
+- fwd6 launch attempts: (1) PID 50604 21:41:59 died — macOS has no `setsid` (`env: setsid: No such file or directory`); (2) fwd6b 21:42:37 refused at enforce_launch_gate — stale stub `livelab-1788701161-8c39e42b12c0::traffic_test_matrix` (13:26Z traffic run, CP-1-gated). Recorded decline remedy ("none: CP-1 not loaded this session, owner decision") per gate's own mechanism.
+- **fwd6 LAUNCHED 21:46Z**: RD=state/live-lab-linux-relay-fwd6-20260906-2146 PID=51569, topology dh4:relay dh2:client fedora-utm-1:client rocky-utm-1:exit, flags = fwd5b set (relay-forwarding validation enabled, userspace-shared backend, local-head, trust-inventory-ready, skip-soak, collect-on-failure). Election expectation: sender=dh2, receiver=fedora-utm-1. Verdict from $RD/logs/relay_forwards_frame_validation.log + $RD/state/stages.tsv ONLY.
+
+## 2026-09-06 22:35 UTC — fwd6e verdict FAIL (attempt 1/3); root cause = ss parser too narrow
+- fwd6e (state/live-lab-linux-relay-fwd6e-215129, PID 56690) completed 22:19Z. `relay_validation` FAIL at 22:05:59 (1s after deploy_relay_service pass 22:05:58): "debian-headless-4: during-run relay datapath listener on :4500 was NOT bound" → `relay_forwards_frame_validation` cascade-SKIPPED (target unproven). Everything else relevant green: traffic_test_matrix pass, role_switch_matrix pass, live_managed_dns pass, deploy_relay_service pass. cross_network_nat_classification fail (netns substrate, out of scope today).
+- Live evidence on dh4 post-run: `systemctl start rustynet-relay` → active, binds in <2s: `UNCONN 0 0 192.168.64.10:4500 0.0.0.0:* users:(("rustynet-relay"...))` and `LISTEN 127.0.0.1:4501`. Env: `RUSTYNET_RELAY_BIND=192.168.64.10:4500`, `RUSTYNET_RELAY_HEALTH_BIND=127.0.0.1:4501`. Binary/unit healthy — pure probe false-negative.
+- ROOT CAUSE (lab tooling): `linux_udp_summary_contains_port` (crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/relay.rs:~677) accepts only `127.0.0.1:`/`0.0.0.0:`/`*:`/`[::1]:`/`[::]:` needles. The deploy stage deliberately binds the datapath to the guest's live interface IP, which matches NO needle → wait_until_ready exhausts budget → formal assertion fails. fwd5b passed only because that run's bind happened to hit an accepted form. Same latent gap in `linux_tcp_summary_contains_listen_port`.
+- FIX (lab tooling only, no verdict-logic change): parse the LOCAL endpoint column of the `ss` line and accept ANY local address ending `:port` while requiring the PEER endpoint to be a wildcard (`0.0.0.0:*`, `*:*`, `[::]:*`) — preserving the existing outbound-socket exclusion (a connected socket has the port on the PEER side, local ephemeral). Unit tests extended with the live-observed `192.168.64.10:4500` fixture. Then relaunch fwd7 (attempt 2/3).
+
+## 2026-09-07 session 5 (resume after timeout): fwd7 prep
+
+- Resume: checkpoint e0f90556 contains the complete ss-parser fix + 3 unit tests; fmt + targeted lib tests already green. Remaining: scoped clippy, rebuild host orchestrator binary, proper commit message, record fwd6e stub remedies, launch fwd7.
+- fwd6e stubs with no remedy (block launch gate): livelab-1788733193-b988773938d4::relay_validation (record: ss-parser interface-IP fix) and ::cross_network_nat_classification (record decline: netns substrate out of scope, owner decision).
+- Step order this session: (1) clippy -p rustynet-cli --all-targets --all-features (-D warnings, vm-lab feature) in target-pinned; (2) cargo build -p rustynet-cli --features vm-lab (host binary must carry the fix — role_validation runs host-side); (3) git commit --amend proper message on e0f90556; (4) record-stage-patch both stubs; (5) launch fwd7 nohup+disown, RD=state/live-lab-linux-relay-fwd7-<ts>.
+- fwd7 gates done: clippy -p rustynet-cli (vm-lab, all-targets/all-features, -D warnings) CLEAN 4m24s; host binary rebuilt in target-pinned (00:51, post-checkpoint); WIP checkpoint amended to proper commit **a0b29f83** (author Iwan-Teague, no co-author).
+- fwd6e stub remedies recorded in live_lab_stage_triage.jsonl: ::relay_validation -> ss-parser fix a0b29f83; ::cross_network_nat_classification -> decline 'none: netns substrate out of scope, owner decision'.
+- fwd7 LAUNCHED 00:10Z pid 58840, RD=state/live-lab-linux-relay-fwd7-20260907-000653, topology dh4:relay dh2:client fedora-utm-1:client rocky-utm-1:exit, flags --enable-relay-forwarding-validation --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --skip-soak --collect-artifacts-on-failure --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --known-hosts-file ~/.ssh/known_hosts_lab. Attempt 2/3 for relay_forwards_frame_validation. NOTE: two launch lessons — worktree had no state/ dir (created), and --node runs REQUIRE --ssh-identity-file + --known-hosts-file; 'holds N guest lock(s)' is informational self-acquire, not a refusal.
+- Polling stages.tsv every ~3 min; verdict only from logs/relay_forwards_frame_validation.log + stages.tsv.
+- fwd7 (000653) ABORTED pre-deployment: prepare_source_archive refused dirty tree (uncommitted log append + remedies). Committed dirt as 002aabc1 + 774a7f7a; aborted-run ledger rows committed. Launch attempt fwd7b refused at gate (new stub livelab-1788739920-a0b29f83e74a::prepare_source_archive no remedy) — recorded remedy, commit a746051c.
+- fwd7c LAUNCHED 00:20Z pid 61158, RD=state/live-lab-linux-relay-fwd7c-20260907-00201 (exact: fwd7c-20260907-002001), same topology/flags. bootstrap_hosts in progress 00:20:52Z. This is the real attempt 2/3 for relay_forwards_frame_validation (fwd7/fwd7b aborted pre-deploy, no relay verdict). Polling.
+
+## 2026-09-07 00:55Z — fwd7c verdict + triage
+- fwd7c (state/live-lab-linux-relay-fwd7c-20260907-002001) EXITED ~00:49Z.
+- relay_validation PASS 00:33:55 → interface-IP ss-parser fix (a0b29f83) PROVEN live.
+- relay_forwards_frame_validation FAIL 00:45:23 (attempt 2/3): sender dh2 + receiver fedora both report `daemon unreachable: inspect daemon socket failed (/run/rustynet/rustynetd.sock): Permission denied (os error 13)` → HP3_STATUS_UNREACHABLE. Root cause: build_relay_forward_test_status_script (mod.rs:14096) runs `/usr/local/bin/rustynet status` as plain ssh user; daemon socket is root-owned. Other status-querying stages in the SAME run passed using privileged_rustynet_cli_script (mod.rs:37152, `sudo -n env RUSTYNET_DAEMON_SOCKET=... rustynet status`).
+- cross_network_nat_classification fail (netns substrate, out of scope, declined on record). All other stages green/skip-by-topology.
+- PLAN: run glm-5.3-flash ai_read triage for confirmation; then fix lab tooling: make build_relay_forward_test_status_script delegate to privileged_rustynet_cli_script + `|| echo HP3_STATUS_UNREACHABLE`; pin with unit test; scoped gates; rebuild target-pinned binary; commit; record stub remedy; launch fwd8 = attempt 3/3 FINAL.
+
+## 2026-09-07 00:51 UTC — fwd7c post-verdict: fix + prep fwd8 (attempt 3/3)
+- fwd7c finalizer appended ledger rows + 2 null-patch stubs (livelab-1788742006-650de5d3bbca::relay_forwards_frame_validation, ::cross_network_nat_classification). Committing ledger dirt first.
+- Fix plan: mod.rs build_relay_forward_test_status_script (~14096) — replace plain `/usr/local/bin/rustynet status` with privileged_rustynet_cli_script("status") + `|| echo HP3_STATUS_UNREACHABLE`; add unit test pinning sudo form.
+- Then gates, rebuild, commit, record both stub remedies, launch fwd8 = FINAL attempt 3/3.
+
+### 2026-09-07 ~01:1xZ — fwd8 prep: privileged status-script fix pinning test
+- Next: add unit test `relay_forward_test_status_script_uses_privileged_form` near
+  `format_assembled_scripts_render_expected_bodies` (mod.rs ~54131) pinning that
+  `build_relay_forward_test_status_script()` emits the sudo/env form
+  (`sudo -n env RUSTYNET_DAEMON_SOCKET`) and keeps the trailing
+  `|| echo HP3_STATUS_UNREACHABLE` marker. Then gates (fmt, scoped clippy
+  `-p rustynet-cli --features vm-lab --all-targets --all-features -D warnings`,
+  targeted lib test), rebuild pinned binary, commit fix+test+log, record fwd7c
+  stub remedies (relay_forwards_frame_validation → fix; cross_network_nat_classification
+  → decline netns out of scope), launch fwd8 = attempt 3/3 FINAL with fwd7c
+  flags/topology.
+
+### 2026-09-07 ~01:2xZ — fwd8 prep: gates on fix+test, then commit + remedies
+- Test `relay_forward_test_status_script_uses_privileged_form` added at mod.rs
+  EOF (after `format_assembled_scripts_render_expected_bodies`). Now: run gates
+  (fmt --check; clippy -p rustynet-cli --features vm-lab --all-targets
+  --all-features -D warnings; cargo test --lib filter relay_forward_test_status),
+  rebuild pinned binary, commit fix+test, record fwd7c stub remedies
+  (relay_forwards_frame_validation → fix commit; cross_network_nat_classification
+  → decline netns out of scope), then launch fwd8 (attempt 3/3 FINAL).
+
+--- 2026-09-07T01:00:38Z STEP 1: verify fwd7c fix (privileged status probe)
+Confirmed: single status script used for BOTH peers in wait loop (mod.rs:14166); fix uses privileged_rustynet_cli_script (sudo -n env RUSTYNET_DAEMON_SOCKET). Running gates next: fmt, scoped clippy, targeted test.
+
+--- $(date -u +%Y-%m-%dT%H:%M:%SZ) STEP 1 result: gates + glm-5.3 adversarial review
+- fmt OK; clippy -p rustynet-cli --features vm-lab --all-targets --all-features -D warnings OK (4m26s); targeted test relay_forward_test OK (lib+bin, incl. new relay_forward_test_status_script_uses_privileged_form).
+- glm-5.3 review (ai_read): VERDICT ship conditional on F1 (absolute /usr/local/bin/rustynet in helper). F1/F2 target the SHARED helper privileged_rustynet_cli_script (mod.rs:37155) — pre-existing, used by other live-passing stages, pinned by privileged_rustynet_cli_script_uses_sudo_env_when_available; DECLINED helper edit mid-loop (blast radius; fwd7c empirically proves PATH resolution works over lab SSH — the CLI ran and printed EACCES). F3 caller-safe (parses fields, never marker). F5 &'static str literal, compiler-enforced. F4/F6 noted, pre-existing patterns, not blocking. Fix ships as-is.
+
+--- 2026-09-07T02:4xZ STEP 1b: preflight + fwd8 launch (attempt 3/3 FINAL)
+- Fix commit 6228d1d6 amended proper; remedies recorded + committed 60ad3f9f; pinned binary rebuilt; tree clean.
+- Preflight: ssh hostname+date on dh2 dh4 fedora rocky macos; skew must be <=60s (rocky drifts — utmctl stop/start rocky_10 if so). Then launch fwd8 detached from worktree, RD=state/live-lab-linux-relay-fwd8-<ts>, topology dh4:relay dh2:client fedora-utm-1:client rocky-utm-1:exit, flags: --enable-relay-forwarding-validation --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --skip-soak --collect-artifacts-on-failure --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --known-hosts-file ~/.ssh/known_hosts_lab --inventory documents/operations/active/vm_lab_inventory.json.
+
+- fwd8 LAUNCHED 02:5xZ pid=23265 RD=state/live-lab-linux-relay-fwd8-20260907-014218 (attempt 3/3 FINAL for relay_forwards_frame_validation). Guest-lock line informational (self-acquire). Poll stages.tsv every ~120s; verdict ONLY from $RD/logs/relay_forwards_frame_validation.log + stages.tsv.
+
+- fwd8 (014218) ABORTED instantly: SIGTERM reached orchestrator ~25s after launch (all stages "shutdown was requested", cleanup pass, overall partial). Source of TERM not identified (nohup+disown; plain `sleep 300 & disown` SURVIVES command boundaries in this shell — 39s+ proof). Attempt 2: relaunch as launchctl job (session-independent; `launchctl submit` verified working) = fwd8b, same topology/flags, RD below. Attempt count for relay_forwards_frame_validation unchanged in substance (014218 ran zero stages).
+
+- fwd8b (launchctl) STALLED in dyld (Bitdefender/teardown CPU storm; binary open blocked 7+min) — killed. fwd8c (015521, nohup) reached preflight PASS then prepare_source_archive FAIL (dirty tree: uncommitted fwd8b-abort log lines + aborted-run ledger rows). Root cause of original fwd8 TERM identified as the claude-runtime teardown storm (rm -rf /Applications/.claude-runtime at 62% CPU; my shell's process group got TERMed). Storm over — nohup path stable again. Committing dirt, relaunching fwd8d. Zero relay stages have run in fwd8/fwd8b/fwd8c (attempt count for relay_forwards_frame_validation still effectively 0/3 used post-fix).
+
+- fwd8d refused at enforce_launch_gate (new stub livelab-1788746201-d5864aae2d55::prepare_source_archive from fwd8c abort) — remedy recorded, committed 9b654b13.
+- fwd8e LAUNCHED 02:00Z RD=state/live-lab-linux-relay-fwd8e-20260907-020008, same topology/flags. bootstrap_hosts running 02:00:43Z. This is the operative relay_forwards_frame_validation verification run for the 6228d1d6 fix. Polling every ~2 min.
+
+--- 2026-09-07T02:07:54Z MANAGER A RESUMED (new worktree edit-1788746785362-28885-0, branch head 38470603). STEP 0: poll fwd8e (pid 27297, RD=state/live-lab-linux-relay-fwd8e-20260907-020008 in OLD worktree edit-1788742681528-17771-0). At resume: etime 07:33, bootstrap_hosts running since 02:00:43Z. No vm_lab edits while in flight. Polling every sleep 120.
+
+--- 2026-09-07T02:5xZ STEP 0 RESULT: fwd8e FINAL VERDICT (attempt 3/3) — relay_forwards_frame_validation FAIL rc=1
+Run: RD=state/live-lab-linux-relay-fwd8e-20260907-020008 (old worktree edit-1788742681528-17771-0), orchestrator pid 27297 exited ~02:27Z. Everything else PASSED: setup, membership, baseline, deploy_relay_service, relay_validation, traffic_test_matrix, role_switch_matrix, exit_handoff, active_exit, exit_dns_failclosed, exit_nat_lifecycle, exit_demotion_residue, live_managed_dns, live_network_flap, live_reboot_recovery, live_secrets_not_in_logs, live_key_custody, live_hello_limiter_flood; macos/two_hop skipped as designed; cross_network_nat_classification fail rc1 (pre-existing, out of scope).
+
+Root cause (stage log): NOT the old HP3/EACCES status issue — 6228d1d6 fix WORKED (status script returned full daemon payload). Stage timed out after 90s waiting for both client peers (debian-headless-2, fedora-utm-1) to report a relay-routed session. Both clients stuck:
+  state=FailClosed restricted_safe_mode=true restriction_mode=Permanent
+  bootstrap_error=reconcile failure threshold exceeded (97/101, 93/97 failures)
+  last_reconcile_error=traversal authority rejected reconcile apply: traversal authority requires valid signed traversal state: traversal bundle is stale
+  dns_zone_error=dns_zone_bundle_is_stale
+  traversal_stale_rejections=138/133; traversal_preexpiry_refresh_events=21/20
+  path_mode=fail_closed; relay_session_state=disabled
+Interpretation: the mesh was healthy for all earlier stages in the SAME run/topology/epoch (traffic_test_matrix, role_switch, exit_handoff all passed). relay_forwards_frame_validation runs LATE — immediately after live_reboot_recovery_validation (which reboots nodes and PASSED). Post-reboot the anchor is not re-minting fresh signed traversal/dns bundles; cached bundles age past the freshness window; clients attempt pre-expiry refresh (21/20 events) but rejections climb; clients enter Permanent fail-closed and never rejoin. Root cause lives in the trust-state/bundle-refresh domain (anchor re-mint after reboot / refresh-on-stale path) = PROPOSE-ONLY for me (trust-state/validator constraint). NO further relay attempts this session (3/3 used).
+
+PROPOSED DIFF (not applied — trust-state domain): anchor-side, after a node reboot or on receiving a reconcile rejected with stale-bundle, re-mint + gossip a fresh signed traversal bundle and dns_zone bundle (equivalent of the pre-expiry refresh path but triggered by staleness rejection feedback, not just timer). Files to investigate by owner: anchor bundle mint loop + traversal authority verify path (rustynet-control traversal authority; freshness window constant).
+
+NEXT: transfer ledger rows (old worktree commit), ff-merge into this worktree, record stage-patch stub remedies via ops live-lab-record-stage-patch, commit, then STEP 2 (macOS role-transition cell).
+
+## 2026-09-07 ~02:5xZ — MANAGER A (resumed): STEP 2 — macOS role-transition cell
+
+Prior steps complete: ledger transfer (old worktree commit `5a4df786`, merge `cd701e0c`), stub remedies recorded + committed (`a1e190ab`); tree clean.
+
+Plan (logged before execution):
+1. Flush stale GUEST pf anchors on mac@192.168.65.101 (`sudo -n pfctl -a <anchor> -F all` for each `com.rustynet/` anchor — guest-side only, allowed).
+2. Launch macOS role-transition cell from clean tree, detached (nohup+disown), RD=`state/live-lab-macos-roleswitch-<ts>`, pinned binary `/Users/iwan/Desktop/Rustynet/target-pinned/debug/rustynet-cli ops vm-lab-orchestrate-live-lab --node macos-utm-1:client --node debian-headless-4:exit --node debian-headless-2:client --role-switch-platform macos --skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --skip-soak --collect-artifacts-on-failure --known-hosts-file ~/.ssh/known_hosts_lab --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --inventory documents/operations/active/vm_lab_inventory.json --report-dir <RD>`.
+3. Poll every 120s (`tail -4 $RD/state/stages.tsv; ps -p <pid> -o etime=`).
+4. Verdict ONLY from `$RD/logs/validate_macos_role_transition.log` + stages.tsv. PASS → update macOS role-transition row in CrossPlatformRoleParityRefresh_2026-07-23.md + LiveLabRunMatrix.md, commit ledger rows. FAIL → triage (glm-5.3-flash ai_read on stage log if unclear); fix ONLY lab tooling (stage/macos_role_transition_validation.rs, vm_lab/mod.rs exercise_macos_role_transition_live); max 2 attempts.
+5. Then STEP 3 (reboot cell) and STEP 4 (anchor re-prove) if budget remains. Finish with `## STATUS <UTC>`.
+RD=state/live-lab-macos-roleswitch-20260907-023129
+
+### STEP 2 attempt-1 abort + relaunch (2026-09-07 ~02:35Z)
+Attempt 1 (pid 83171, RD=state/live-lab-macos-roleswitch-20260907-023159) refused at prepare_source_archive: worktree dirty — a stray RD=state/live-lab-macos-roleswitch-20260907-023129 line was appended to this log AFTER commit 3b1b4a38. Same failure class as fwd8c (dirty-tree refusal). Not a stage failure; lab untouched. Remedy: commit this log (incl. the stray line for the record), verify  M documents/operations/active/GlmManagerLog_2026-09-05.md empty, relaunch with fresh RD=state/live-lab-macos-roleswitch-<newts>. Relaunch = attempt 2 of max 2 for this cell.
+RD(attempt2)=state/live-lab-macos-roleswitch-20260907-023534 PID=84398 launched 02:35:34Z; prepare_source_archive PASS (clean tree confirmed), bootstrap_hosts running at 02:38Z.
+
+### 2026-09-07 04:05Z — STEP 2 fix: finalizer plan reconstruction dropped role-switch/reboot elections
+
+Root cause (confirmed in code, no run in flight): the runner elects
+StageId::MacosRoleTransitionValidation / MacosRebootRecoveryValidation from
+`--role-switch-platform` / `--reboot-platform` (native.rs C6/C7 electors), but
+`verify_recorded_plan_not_shrunk` (resolved_plan.rs) rebuilt the expected plan
+with NEITHER flag set — same failure class as the MAC-D1 anchor bug fixed in
+that file earlier. Additionally ManifestSelectors never recorded
+`reboot_platform`, so the reconstruction could not see it at all.
+
+Fix (lab tooling only, allowed scope):
+- native.rs: `role_switch_platform_macos_elected` / `reboot_platform_macos_elected` made pub(crate).
+- live_lab_stage_manifest.rs: ManifestSelectors gains `#[serde(default)] pub reboot_platform: String`, populated from TargetSelectors (legacy manifests parse as empty = not elected → fail-closed toward stricter plan).
+- resolved_plan.rs: reconstruction now derives both elections from the manifest selectors and passes `.with_role_switch_platform_macos(..)` + `.with_reboot_platform_macos(..)` to the PlanBuilder, mirroring native.rs.
+- Tests: `verify_honors_role_switch_and_reboot_selector_elections` (positive roundtrip for rs/rb/both) and `verify_rejects_a_fabricated_role_switch_election_without_a_selector` (negative, asserts "added" + "validate_macos_role_transition"). resolved_plan suite 19/19 pass; stage_manifest suite 6/6; scoped cargo check exit 0; cargo fmt applied; pinned binary rebuilt 04:05Z.
+
+NEXT: relaunch attempt 3 (attempt 2b evidence-finalization fix), same flags, fresh RD. Stage itself already PASSED live in attempt 2 (RD state/live-lab-macos-roleswitch-20260907-023534, 02:47:35→02:47:47Z); re-run needed only for the ledger-backed evidence row.
+
+### 2026-09-07 ~04:30Z — STEP 2 attempt-3 postmortem + wrapper selector-copy fix (2nd fix cycle, final for this cell)
+
+Attempt 3 (RD=state/live-lab-macos-roleswitch-20260907-030720, binary from 61983773): stage
+validate_macos_role_transition PASSED live (third consecutive live pass), but evidence
+finalization failed with IDENTICAL digests to attempt 2 (expected f608b906…) → no ledger row.
+
+Ground truth from run artifacts: orchestration/stage_manifest.json records
+`role_switch_platform: ""` and `reboot_platform: ""` — the serialization-side gap. My 61983773
+fix taught the finalizer to derive C6/C7 elections from manifest selectors, but the runner's
+manifest snapshot (native.rs ~735) hardcoded both fields to String::new() even though
+`config.role_switch_platform`/`config.reboot_platform` are in scope and drive the real
+election (native.rs C6/C7 elector calls). Stale comment claimed "bash-only platform election
+selectors remain inactive".
+
+FIX (lab tooling only): native.rs manifest_selectors now copies
+`config.role_switch_platform.clone().unwrap_or_default()` and
+`config.reboot_platform.clone().unwrap_or_default()` (+comment); stale comment updated.
+Verified: scoped `cargo check -p rustynet-cli --all-targets --all-features --features vm-lab`
+exit 0; `cargo test -p rustynet-cli --features vm-lab --lib -- resolved_plan stage_manifest`
+25/25 pass; cargo fmt applied; pinned binary rebuilt (45181552 bytes, 04:29 local).
+
+NEXT: relaunch attempt 4, same flags, fresh RD. Early check: after prepare_source_archive,
+cat $RD/orchestration/stage_manifest.json and confirm `"role_switch_platform": "macos"` —
+catches a repeat finalizer fail without waiting for the full run.
+
+## 2026-09-07 ~04:50Z — STEP 2 VERDICT: macOS role-transition cell PASS (PROJECT-FIRST)
+
+Run `livelab-1788752486-6d3fea6cf2aa`, commit `6d3fea6c` (clean), report
+`state/live-lab-macos-roleswitch-20260907-032942`, topology macos-utm-1:client /
+debian-headless-4:exit / debian-headless-2:client, `--role-switch-platform macos
+--skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared
+--source-mode local-head --trust-inventory-ready --skip-soak`.
+
+`validate_macos_role_transition` **hard pass rc=0** (evidence:
+`$RD/logs/validate_macos_role_transition.log` + `$RD/state/stages.tsv` +
+`report_state.json` run_complete=true run_passed=true). 17 pass / 0 fail /
+3 skip (anchor/admin/blind_exit — no such roles in topology). Ledger row
+appended: `live_lab_node_run_matrix.csv` 329→330 lines.
+
+Attempts history (stage passed live 4x; only attempt 4 carries the row):
+- 1 (023159): aborted — prepare_source_archive dirty-tree (post-commit log
+  append; lesson recorded).
+- 2 (023534): 17/17 stages pass incl the target, but evidence finalization
+  rejected the run — finalizer's `verify_recorded_plan_not_shrunk`
+  (resolved_plan.rs) never derived C6/C7 role-switch/reboot elections from
+  manifest selectors → "unexpected added stages: [validate_macos_role_transition]".
+- 3 (030720): identical failure after fix `61983773` (reconstruction now
+  honors selectors) because the runner's manifest snapshot (native.rs
+  manifest_selectors) hardcoded `role_switch_platform`/`reboot_platform` to
+  "" — the reconstruction could never see the election. Fix `6d3fea6c`
+  copies the real selectors into the snapshot.
+- 4 (032942): FULL PASS with row. Both fixes regression-pinned in
+  resolved_plan.rs tests.
+
+Parity doc `CrossPlatformRoleParityRefresh_2026-07-23.md` role-transition
+macOS cell updated ⬛→🟢 with run id. LiveLabRunMatrix.md inspected: it is a
+rules doc (no per-run rows) — the CSV ledger is the run record, no edit needed.
+
+NEXT: STEP 3 — macOS reboot-recovery cell (`--reboot-platform macos`, fresh
+RD=state/live-lab-macos-reboot-<ts>, same base flags/topology; verdict from
+`$RD/logs/validate_macos_reboot_recovery.log`; ensure mac guest back on SSH
+after; max 2 attempts; lab tooling fixes only).
+
+## 2026-09-07 04:11Z — STEP 3 (macOS reboot-recovery) attempt 1: FAIL + root cause + fix
+
+- Run: PID 996, RD state/live-lab-macos-reboot-20260907-034405, 03:44→04:05Z. setup/membership/baseline all pass; **validate_macos_reboot_recovery FAIL rc=1**; ledger row appended (330→331, finalizer records failed runs — selectors recorded correctly, `"reboot_platform": "macos"` in manifest, finalizer fixes held).
+- Stage log (verbatim): `macos-utm-1: pre-reboot evidence capture on macos-utm-1 failed: UTM transport failed for macos-utm-1 (local UTM guest exec is not yet implemented for macOS targets); SSH fallback failed: remote command exited with status 1: backup mode is 600, expected 0600`.
+- Root cause (lab tooling): mod.rs:15167 pre-reboot script compared `[ "$MODE" = "0600" ]`, but BSD `stat -f %Lp` prints minimal digits ("600" for octal 0600) — string compare can never pass. Backup file itself is correctly mode 0600 (daemon-created). First live run of this stage with a real backup present.
+- Fix applied (this commit): POSIX case accepting both renderings — `case "$MODE" in 600|0600) ;; *) echo ... exit 1 ;; esac` — exact-mode fail-closed preserved, pure sh, no arithmetic.
+- Verified: scoped `cargo check -p rustynet-cli --all-targets --all-features --features vm-lab` exit 0; `cargo test -p rustynet-cli --features vm-lab --lib -- reboot` 17/17 pass; cargo fmt clean; no test pins the old string (rg 'backup mode' → only :15167). Pinned binary rebuilt (contains fix on top of 6d3fea6c).
+- Ledger trio in this commit = STEP 3 attempt-1 FAIL row + auto-recorded triage stub.
+- NEXT: relaunch attempt 2 (max 2), same flags, fresh RD. Session note: an earlier in-session summary claimed this commit+relaunch already happened (RD …050912, PID 2816) — filesystem disproved it (no commit, no RD, no log append); this section + commit + the real relaunch are the authoritative record.
+
+### 2026-09-07 04:24Z — STEP 3 attempt-2 gate refusal ×2, root cause: ledger path divergence
+- Launch RD state/live-lab-macos-reboot-20260907-041501 refused at enforce_launch_gate: stub `livelab-1788753367-2498a83338cc::validate_macos_reboot_recovery` "no recorded remedy" — despite step-3b recording.
+- Root cause: gate reads the stage-triage ledger from the stub's run-provenance worktree `state/edit-worktrees/edit-1788746785362-28885-0/documents/operations/live_lab_stage_triage.jsonl` (its own hint prints that path); step 3b recorded into THIS worktree's ledger. Stub confirmed present, remedy absent, in the 28885-0 copy.
+- Fix action now: run live-lab-record-stage-patch with --ledger pointed at the 28885-0 path (exact command the gate prints). That ledger is the designed mechanism, not a source edit.
+- Note: 041137 and 041501 are gate REFUSALS, not lab attempts (0 stages ran) — attempt count for the reboot cell stays at 1 real run; one real relaunch remains.
+
+## 2026-09-07 session 7 — STEP 1 (evidence safety)
+- Committing session-6 ledger rows in provenance worktree 28885-0 (3 files), then merging that branch here; verify run_id livelab-1788756583 count = 1 in local CSV.
+
+## 2026-09-07 session 7 — STEP 2
+- Folding stray root GlmManagerLog_2026-09-05.md into documents/operations/active/GlmManagerLog_2026-09-05.md and removing it.
+
+## 2026-09-07 04:15Z — STEP 3b: record reboot-failure stub remedy, then relaunch (attempt 2/final)
+- Tree clean at b4c30979. Recording patch for stub `livelab-1788753367-2498a83338cc::validate_macos_reboot_recovery` via target-pinned CLI, then committing ledger, then mac SSH preflight, then launching attempt 2.
+
+## 2026-09-07 04:15Z — STEP 3 attempt 2 (FINAL) launch
+- Stub remedy recorded + committed (b2eeb5d5). Mac preflight OK (macs-Virtual-Machine.local, skew 0s).
+- Launching: RD=state/live-lab-macos-reboot-20260907-041501, topology macos-utm-1:client debian-headless-4:exit debian-headless-2:client, --reboot-platform macos --skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --skip-soak --collect-artifacts-on-failure.
+
+### 2026-09-07T04:19Z — STEP 3 reboot attempt 2: FINAL relaunch (gate cured)
+Stub remedy now recorded in the provenance-worktree ledger (28885-0) the gate reads. Fresh RD (041501 holds only a refusal log). Launching:
+`RD=state/live-lab-macos-reboot-$(date -u +%Y%m%d-%H%M%S); mkdir -p $RD; nohup /Users/iwan/Desktop/Rustynet/target-pinned/debug/rustynet-cli ops vm-lab-orchestrate-live-lab --node macos-utm-1:client --node debian-headless-4:exit --node debian-headless-2:client --reboot-platform macos --skip-linux-live-suite --linux-backend linux-wireguard-userspace-shared --source-mode local-head --trust-inventory-ready --skip-soak --collect-artifacts-on-failure --known-hosts-file ~/.ssh/known_hosts_lab --ssh-identity-file ~/.ssh/rustynet_lab_ed25519 --inventory documents/operations/active/vm_lab_inventory.json --report-dir $RD > $RD.launch.log 2>&1 & disown`
+Verdict source: $RD/logs/validate_macos_reboot_recovery.log + $RD/state/stages.tsv only.
+
+## 2026-09-07 04:35Z — STEP 3 reboot attempt 2 RESULT: FAIL (new root cause) + fix plan
+
+- Run livelab-1788755496-b4c3097999cd, RD state/live-lab-macos-reboot-20260907-041909, PID 9208, 04:19:33→04:31:36Z.
+- stages.tsv: prepare_source_archive/verify_ssh/cleanup/bootstrap_hosts/cross_network_substrate_setup/collect_pubkeys/distribute_assignments/distribute_traversal/distribute_dns_zone/enforce_baseline_runtime/validate_baseline_runtime ALL pass. BSD-stat fix (b4c30979) HELD — pre-reboot evidence capture passed this time.
+- validate_macos_reboot_recovery FAIL rc=1: `macos-utm-1: shutdown -r now dispatched but exited non-zero (exit status: 255) on macos-utm-1`.
+- teardown soft pass, cleanup pass. Launch log: 0 "evidence finalization failed". Matrix row appended to the 28885-0 provenance worktree's CSV (row 331) — same cross-worktree ledger resolution as enforce_launch_gate (pinned binary built from 28885-0 resolves ledgers there).
+- PROOF THE MAC ACTUALLY REBOOTED: post-run SSH check 04:32Z → `macs-Virtual-Machine.local up 2 mins`. The reboot happened; the stage misclassified it.
+- Root cause mod.rs:15195-15205: dispatch tolerates `Err(_)` (channel death) but macOS ssh returns `Ok(status=255)` when remote closes channel mid-command; 255 unhandled → false failure.
+- Fix (in scope: vm_lab stage code; no run in flight): add arm `Ok(status) if status.code() == Some(255) => {}` with comment. Then scoped gates, commit, record stub remedy (new stub `livelab-1788755496-b4c3097999cd::validate_macos_reboot_recovery`) in BOTH ledgers (this worktree + 28885-0 provenance).
+- Attempt accounting: 2 real attempts used (034405, 041909). No attempt 3 for reboot cell. Moving to STEP 4 anchor after fix+records.
+
+## 2026-09-07 04:38Z — STEP 4 launch: macOS anchor re-proof cell
+
+- Fix 1ff7d04a committed (ssh-255 arm, check+17 reboot tests+fmt green). Stub livelab-1788755496-b4c3097999cd::validate_macos_reboot_recovery remedied in 28885-0 provenance ledger (gate-read path). This worktree's ledger has no such stub — nothing to commit here.
+- TOPOLOGY (Rust --node form, explicit anchor election): macos-utm-1:anchor, debian-headless-4:exit, debian-headless-2:client. No --anchor-platform (mutually exclusive with --node per MCP routing rules; :anchor role is the engine-native election).
+- RD=state/live-lab-macos-anchor-20260907-043830 (mkdir -p before nohup). Same base flags as reboot run minus --reboot-platform, keep --skip-linux-live-suite --skip-soak --collect-artifacts-on-failure --source-mode local-head --trust-inventory-ready --linux-backend linux-wireguard-userspace-shared + full SSH/inventory flags.
+- Verdict source: logs/validate_macos_anchor_*.log (all MacosAnchor* stages) + stages.tsv only.
+- Mac guest confirmed on SSH (up 2 mins after its reboot, hostname answers).
+
+## 2026-09-07T04:52Z — STEP 4 anchor re-proof: PASS
+
+Run `livelab-1788756583-b4c3097999cd`, RD `state/live-lab-macos-anchor-20260907-043630`, PID 15067, 04:36:59→04:49:43Z. run_passed=true (report_state.json). 20 pass / 0 fail / 2 legit skips (admin_issue, blind_exit — not elected). All four anchor stages hard-pass: anchor_validation, deploy_macos_anchor_profile, validate_macos_anchor_bundle_pull, validate_macos_anchor_port_mapping_authority. 0 'evidence finalization failed'. Matrix row appended → 28885-0 provenance ledger (332nd row, macos_anchor=pass; pinned binary appends to its build-worktree CSV). Mac guest SSH OK post-run (macs-Virtual-Machine.local, up 20 min). Refresh doc anchor cell updated with re-proof entry (row already 🟢 from 2026-09-05; this re-proves on current tree).
+
+## STATUS 2026-09-07T04:52Z
+
+DONE:
+- STEP 2 macOS role-transition cell: GREEN + recorded (livelab-1788752486-6d3fea6cf2aa).
+- STEP 3 macOS reboot-recovery: 2 real attempts, both FAIL on lab-tooling, both root-caused + fixed + stub-remedied (b4c30979 BSD stat; 1ff7d04a ssh-255). Attempt 2 PROVED the Mac actually rebooted (uptime 2 min post-run) — false failure in dispatch status handling. Attempts exhausted; Refresh row stays red; fixes need a future run to prove (pinned binary must be rebuilt with 1ff7d04a first).
+- STEP 4 anchor re-proof: PASS + recorded (livelab-1788756583-b4c3097999cd).
+- CP-1 (not loaded): macOS↔Linux dataplane stages never ran this session — by instruction.
+
+NOT DONE / OPEN:
+- reboot-recovery macOS row still 🔴 (2 tooling-caused false failures; both fixes committed but unproven by a green run).
+
+### MERGE NOTE (for the owner)
+
+Commits since 092e94cf, grouped:
+
+(a) Lab-tooling fixes + proving live run:
+- 61983773 finalizer plan derivation (proved by run 032942 full pass)
+- 6d3fea6c manifest selectors snapshot (proved by run 032942)
+- b4c30979 BSD stat 600|0600 (proved by run 041909: pre-reboot capture passed)
+- 1ff7d04a ssh-255 shutdown-dispatch acceptance (run 041909 proved Mac rebooted; fix itself UNPROVEN by a green run — rebuild pinned binary + rerun when convenient)
+- (pre-092e94cf-history in ledger commits: a0b29f83 relay ss parser, 6228d1d6 privileged status probe)
+
+(b) Ledger/doc records:
+- 2498a833, 664d28ea, 981c9231, 3b1b4a38, 5ec4e99a, b2eeb5d5, 031e8f64, a134f76e, 4a71fb44, a81baad8, 4aca5d01, + this commit
+- 5a4df786, e88bbe76, 0d389d35, 774a7f7a, 01b9bdcb (earlier fwd-run rows), 160ee56c, 38470603, 9b654b13, 1778258b, d5864aae, 60ad3f9f, 82d733f9, d6a64963, a746051c, b9887739, b319b2d9, 002aabc1, a1e190ab (fwd-series logs/stubs)
+
+(c) Open owner decisions:
+- relay frame-forwarding: blocked on stale traversal/dns bundles after live_reboot_recovery (trust-state refresh — PROPOSED only, never edited; see fwd8e verdict 160ee56c / a1e190ab)
+- QH-70 (open)
+- CP-1 pf override persistence: not loaded this session → macOS↔Linux dataplane stages (traffic_test_matrix/two_hop/managed_dns/relay-through-mac) OFF
+- 28885-0 ledger divergence: pinned binary resolves stage-triage ledger + appends matrix rows to its BUILD worktree (edit-1788746785362-28885-0). Three cross-worktree stub remedies recorded there (BSD-stat, ssh-255, + earlier) and rows 331/332 landed in its CSV. Owner must reconcile ledgers/CSVs when merging this branch.
+
+## 2026-09-07 session 7 — STEP 3
+- Rebuilding pinned orchestrator binary from THIS worktree (edit-1788757368303-22407-0) so ledgers resolve here; then macOS reboot-recovery attempt 3 with both fixes (b4c30979 + 1ff7d04a) in tree.
+
+- Pinned binary rebuilt from this worktree (BUILD_RC=0). Launch-gate stub check + mac SSH preflight next; then attempt 3 launch.
+
+## 2026-09-07 session 7 — STEP 3 attempt 3 RESULT: FAIL (genuine product gap, no 4th attempt)
+
+- Run livelab-1788758343-06dfb93915d5 (commit 06dfb93915d5), RD state/live-lab-macos-reboot-20260907-050612, PID 23489, 05:06:12→~05:20Z. Ledger rows landed in THIS worktree (binary rebuilt here — cross-worktree divergence cured; grep run_id CSV = 1).
+- stages.tsv: all setup stages pass incl. pre-reboot evidence (b4c30979 held) and shutdown dispatch (1ff7d04a held — no ssh-255 failure; Mac provably rebooted, uptime 2 min post-run, hostname answers).
+- validate_macos_reboot_recovery FAIL rc=1, exact error: post-reboot verification failed: startup_recovery_line=absent; shutdown_residue_marker=present; zsh:1: no matches found: /usr/local/var/log/rustynet/*.log; "service Ethernet is not loopback-pinned: There aren't any DNS Servers set on Ethernet."
+- Diagnosis (direct code read vm_lab/mod.rs:15263-15303; glm-5.3-flash ai_read UNAVAILABLE — deepseek 402, glm MCP timeout + drive script malformed-response; two attempts, moved on per budget): daemon IS live post-reboot (bounded probe passed: daemon-live marker + node id) and boottime changed, but (a) QH-40 shutdown-residue marker still PRESENT — daemon recovery did not retire shutdown-residue.json; (b) Ethernet has NO DNS servers — daemon did not re-apply loopback DNS pinning after reboot. The pin-check exit 1 is the stage working as designed (fail-closed). This is a GENUINE macOS recovery gap in rustynetd, not lab tooling. Secondary tooling noise only: hardcoded log glob /usr/local/var/log/rustynet/*.log matches nothing under zsh (nomatch) — check path fragility, non-gating.
+- Disposition: stub recorded DECLINED-as-product-gap (exact CLI form, this worktree ledger). PROPOSED fix (owner; I never touch rustynetd/trust-state): in rustynetd macOS recovery — retire shutdown-residue.json once posture re-applied, re-pin loopback DNS after boot, verify launchd StandardOutPath matches the stage glob (or relax stage glob). No 4th attempt per instructions.
+- Mac guest back on SSH post-run: macs-Virtual-Machine.local, up 2 mins. Launch log: 0 "evidence finalization failed".
+
+## 2026-09-07 session 7 — STEP 4
+- Filing QH-74 (orchestrator resolves ledgers relative to BUILD worktree) in QualityHardeningTodo_2026-07-25.md, existing entry format. Checking fixability as one-liner first.
+
+## 2026-09-07 session 7 — STEP 5
+- Writing final STATUS + refreshed MERGE NOTE; last commit of session.
+
+## STATUS 2026-09-07T05:27Z (session 7 close-out)
+
+DONE:
+- STEP 1 ledger reconciliation: session-6 rows (reboot attempt 2 livelab-1788755496, anchor re-proof livelab-1788756583) + 3 stub remedies committed in provenance worktree 28885-0 (b8c28039), branch merged here (d94defab, jsonl conflict resolved append-only, both sides kept). `grep -c livelab-1788756583 …run_matrix.csv` = 1 verified.
+- STEP 2: stray root GlmManagerLog_2026-09-05.md folded into documents/operations/active/GlmManagerLog_2026-09-05.md, removed (9c6c807e).
+- STEP 3: pinned binary REBUILT from this worktree (06dfb939) — ledgers now resolve HERE (attempt-3 rows landed locally). macOS reboot-recovery attempt 3 (livelab-1788758343-06dfb93915d5, RD state/live-lab-macos-reboot-20260907-050612): both prior fixes held (pre-reboot capture passed; shutdown dispatch accepted, Mac provably rebooted, uptime 2 min post-run, daemon-live probe passed). Stage FAIL on GENUINE product gap: shutdown-residue marker present + Ethernet DNS not re-pinned post-reboot — stage fail-closed gate correct; stub DECLINED with PROPOSED rustynetd fix (45ca03e1). No 4th attempt (per instructions, and it is not a tooling bug). Mac guest back on SSH.
+- STEP 4: QH-74 filed (ac7c4646) — orchestrator resolves ledgers via compile-time env!("CARGO_MANIFEST_DIR") (live_lab_run_matrix.rs:950, 42 call sites); mechanism + runtime-resolution fix direction; proposed not fixed (not a one-liner, no test to adapt).
+- glm-5.3-flash triage attempted per rules: deepseek 402 (credit), glm MCP timeout, drive-script malformed-response — diagnosis done from direct code read instead (vm_lab/mod.rs:15263-15303).
+
+NOT DONE / OPEN (owner):
+- reboot-recovery macOS row stays 🔴 — now a PRODUCT defect, not tooling: rustynetd macOS recovery must retire shutdown-residue.json and re-apply loopback DNS pinning on boot (proposed in stub + above). Lab-tooling side note: recovery-line check hardcodes /usr/local/var/log/rustynet/*.log (zsh nomatch noise, non-gating).
+
+### MERGE NOTE (for the owner)
+
+This branch (session 6+7, 48 commits since 092e94cf) contains:
+(a) Lab-tooling fixes + proving runs: 61983773 finalizer plan derivation (proved run 032942 full pass); 6d3fea6c manifest selectors snapshot (proved 032942); b4c30979 BSD stat 600|0600 (proved 041909); 1ff7d04a ssh-255 shutdown-dispatch acceptance (proved 050612: dispatch accepted, Mac rebooted).
+(b) Product-gap evidence (NOT fixed — proposed only): attempt 3 (050612) proves rustynetd macOS recovery leaves QH-40 residue marker + does not re-pin Ethernet DNS post-reboot. Fix belongs in rustynetd (forbidden zone for this manager).
+(c) Ledger/doc records incl. session-7 reconciliation (b8c28039 in 28885-0 + merge d94defab here) and QH-74 (ac7c4646).
+(d) Open owner decisions: rustynetd reboot-recovery product gap (above); relay frame-forwarding stale-bundle trust-state refresh (PROPOSED, see fwd8 verdict); QH-70; QH-74; CP-1 pf override persistence (not loaded this session — macOS↔Linux dataplane stages never ran, by instruction).
+The 28885-0 worktree's ledger commits are merged; its branch can be discarded after merge. Ledger append paths now correct for any binary rebuilt from the merged tree (QH-74 for the durable fix).

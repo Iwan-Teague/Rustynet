@@ -159,7 +159,7 @@ impl NodeAdapter for MacosNodeAdapter {
     }
 
     fn deploy_relay_service(&self) -> Result<(), AdapterError> {
-        macos_install::deploy_relay_service(&self.conn, self.workdir.as_deref())
+        macos_install::deploy_relay_service(&self.conn)
     }
 
     // ── Membership owner ──────────────────────────────────────────────────────

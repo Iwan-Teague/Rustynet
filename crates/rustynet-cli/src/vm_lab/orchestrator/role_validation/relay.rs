@@ -93,6 +93,17 @@ const RELAY_HEALTH_PATH: &str = "/healthz";
 /// listener sockets before the after-stop capture.
 const STOP_SETTLE: Duration = Duration::from_secs(3);
 
+/// Readiness-wait budget: how long after a start verb (or a deploy stage's
+/// kickstart) to keep polling for a fully-serving snapshot before handing
+/// the (possibly still-not-ready) snapshot to the formal assertions. The
+/// live measurement behind this budget is ~3 s from `launchctl kickstart`
+/// to "UDP :4500 bound + TCP :4501 LISTEN + /healthz ok" on macos-utm-1
+/// (2026-09-05, run rust-1788649523 triage); 30 s leaves headroom for a
+/// cold SCM/systemd start without masking a genuinely-dead service.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Poll interval for [`wait_until_ready`].
+const READINESS_POLL: Duration = Duration::from_secs(1);
+
 /// Cross-OS relay lifecycle observation. Mirrors the shared snapshot the
 /// `live_linux_relay_test` bin captures on every platform: the
 /// active/inactive service word, whether the datapath + health listeners
@@ -149,7 +160,19 @@ pub fn validate_relay_lifecycle(
 ) -> Result<(), String> {
     let (datapath_port, health_port) = relay_ports(platform);
 
-    let during = capture_snapshot(shell, platform)
+    // Bounded readiness wait before the formal during-run capture: the start
+    // verbs (launchd kickstart, systemctl start, SCM start) return as soon as
+    // the service manager ACCEPTS the job, not when the process has exec'd and
+    // bound its sockets. Proven live 2026-09-05 (run rust-1788649523,
+    // macos-utm-1): `relay_validation` captured its during-run snapshot in the
+    // same second as `deploy_relay_service`'s kickstart and failed all three
+    // listener/healthz assertions while the relay reached full readiness
+    // (UDP :4500 bound, TCP :4501 LISTEN, /healthz ok) about three seconds
+    // later. The wait is not an assertion — after it (or after its budget is
+    // exhausted, in which case the formal assertions below fail with their
+    // existing messages) the snapshot is captured and asserted exactly as
+    // before, so a genuinely-down relay still fails identically.
+    let during = wait_until_ready(shell, platform)
         .map_err(|err| format!("during-run capture failed: {err}"))?;
 
     stop_relay_service(shell, platform)?;
@@ -161,8 +184,12 @@ pub fn validate_relay_lifecycle(
     // Restart so later stages inherit a serving relay. A restart failure
     // is part of the lifecycle contract: the orchestrator hands the host
     // back to subsequent stages, so a silent restart failure must surface
-    // as a failed result rather than hide under a pass.
-    let restart_status = start_relay_service(shell, platform);
+    // as a failed result rather than hide under a pass. The same readiness
+    // budget applies: a restart verb whose process never reaches a serving
+    // state would otherwise hand the next stage (relay frame-forwarding)
+    // the identical startup race this validator just tripped on.
+    let restart_status = start_relay_service(shell, platform)
+        .and_then(|()| wait_until_ready(shell, platform).map(|_| ()));
 
     let mut failures: Vec<String> = Vec::new();
 
@@ -237,6 +264,44 @@ fn relay_ports(platform: VmGuestPlatform) -> (u16, u16) {
             REVIEWED_WINDOWS_RELAY_HEALTH_PORT,
         ),
         _ => (RELAY_BIND_PORT, RELAY_HEALTH_PORT),
+    }
+}
+
+/// Whether a snapshot represents a fully-serving relay: active unit, both
+/// listeners bound, `/healthz` ok. Mirrors the during-run invariant set in
+/// [`validate_relay_lifecycle`] — kept as a predicate so the readiness loop
+/// and the formal assertions cannot drift apart.
+fn snapshot_is_ready(snapshot: &RelayLifecycleSnapshot) -> bool {
+    snapshot.unit_state.eq_ignore_ascii_case("active")
+        && snapshot.listener_bound_datapath
+        && snapshot.listener_bound_health
+        && snapshot.health_status.eq_ignore_ascii_case("ok")
+}
+
+/// Poll [`capture_snapshot`] until it reports a fully-serving relay or
+/// [`READINESS_TIMEOUT`] is exhausted, then return the LAST snapshot either
+/// way. Readiness success short-circuits the loop; exhaustion is not an
+/// error — the caller's formal assertions (unchanged) decide pass/fail from
+/// the snapshot's own evidence, so a genuinely-down relay still fails with
+/// the exact messages the triage ledger already knows. A capture transport
+/// error propagates immediately, exactly as a direct [`capture_snapshot`]
+/// call would.
+fn wait_until_ready(
+    shell: &dyn RemoteShellHost,
+    platform: VmGuestPlatform,
+) -> Result<RelayLifecycleSnapshot, String> {
+    let deadline = std::time::Instant::now()
+        .checked_add(READINESS_TIMEOUT)
+        .unwrap_or_else(std::time::Instant::now);
+    loop {
+        let snapshot = capture_snapshot(shell, platform)?;
+        if snapshot_is_ready(&snapshot) {
+            return Ok(snapshot);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(snapshot);
+        }
+        sleep(READINESS_POLL);
     }
 }
 
@@ -603,34 +668,61 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 /// wildcard so an outbound UDP socket on the same port number
 /// cannot be confused for a bound listener.
 fn linux_udp_summary_contains_port(summary: &str, port: u16) -> bool {
-    let needles = [
-        format!("127.0.0.1:{port}"),
-        format!("0.0.0.0:{port}"),
-        format!("*:{port}"),
-        format!("[::1]:{port}"),
-        format!("[::]:{port}"),
-    ];
-    summary.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("UNCONN") && needles.iter().any(|needle| trimmed.contains(needle))
-    })
+    summary
+        .lines()
+        .any(|line| linux_ss_line_binds_port(line, "UNCONN", port))
 }
 
 /// `ss -tlnp` TCP-LISTEN lines start with `LISTEN`. Require the
 /// LISTEN state so an ESTABLISHED outbound socket on the same port
 /// number cannot satisfy the check.
 fn linux_tcp_summary_contains_listen_port(summary: &str, port: u16) -> bool {
-    let needles = [
-        format!("127.0.0.1:{port}"),
-        format!("0.0.0.0:{port}"),
-        format!("*:{port}"),
-        format!("[::1]:{port}"),
-        format!("[::]:{port}"),
-    ];
-    summary.lines().any(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("LISTEN") && needles.iter().any(|needle| trimmed.contains(needle))
-    })
+    summary
+        .lines()
+        .any(|line| linux_ss_line_binds_port(line, "LISTEN", port))
+}
+
+/// Column-based `ss` matcher for a BOUND local socket on `port`.
+///
+/// `ss` prints bound sockets as
+/// `UNCONN 0 0 <local>:<port> <peer> users:(("rustynet-relay",...))`
+/// (UDP; TCP uses `LISTEN`). The deploy stage deliberately binds the
+/// relay datapath to the guest's live interface IP (for example
+/// `RUSTYNET_RELAY_BIND=192.168.64.10:4500` on debian-headless-4), so a
+/// needle list of loopback/wildcard forms misses a healthy bind — this
+/// exact false negative failed `relay_validation` in run fwd6e
+/// (2026-09-06, state/live-lab-linux-relay-fwd6e-215129) while the relay
+/// was serving on 192.168.64.10:4500. Match instead on the LOCAL endpoint
+/// column (whitespace field 4, 0-indexed 3) ending in `:<port>`, and
+/// require the PEER endpoint (field 5) to be a wildcard — a bound,
+/// unconnected socket has no peer. An outbound/connected socket carries
+/// the port on the PEER side with an ephemeral local port, so it still
+/// cannot satisfy the check.
+fn linux_ss_line_binds_port(line: &str, state: &str, port: u16) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with(state) {
+        return false;
+    }
+    let port_suffix = format!(":{port}");
+    let mut fields = trimmed.split_whitespace();
+    let _state = fields.next();
+    let _recv_q = fields.next();
+    let _send_q = fields.next();
+    let Some(local) = fields.next() else {
+        return false;
+    };
+    if !local.ends_with(&port_suffix) {
+        return false;
+    }
+    match fields.next() {
+        // No peer column at all (truncated `ss` output): the local
+        // endpoint match stands.
+        None => true,
+        // Bound unconnected sockets report a wildcard peer. A concrete
+        // peer address means this is a connected socket whose local port
+        // merely coincides with the requested one.
+        Some(peer) => peer == "0.0.0.0:*" || peer == "*:*" || peer == "[::]:*" || peer == "-",
+    }
 }
 
 /// Parse `launchctl print system/<label>` stdout into a state word
@@ -779,6 +871,41 @@ fn first_token(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snap(
+        unit_state: &str,
+        datapath: bool,
+        health: bool,
+        health_status: &str,
+    ) -> RelayLifecycleSnapshot {
+        RelayLifecycleSnapshot {
+            unit_state: unit_state.to_owned(),
+            listener_bound_datapath: datapath,
+            listener_bound_health: health,
+            health_status: health_status.to_owned(),
+        }
+    }
+
+    #[test]
+    fn snapshot_is_ready_requires_every_invariant() {
+        // Fully serving: the only ready combination.
+        assert!(snapshot_is_ready(&snap("active", true, true, "ok")));
+        // Each single missing invariant must block readiness — the startup
+        // race proven on macos-utm-1 (run rust-1788649523) showed exactly
+        // this shape: launchd "active" with no bound sockets yet.
+        assert!(!snapshot_is_ready(&snap("active", false, true, "ok")));
+        assert!(!snapshot_is_ready(&snap("active", true, false, "ok")));
+        assert!(!snapshot_is_ready(&snap(
+            "active",
+            true,
+            true,
+            "unreachable"
+        )));
+        assert!(!snapshot_is_ready(&snap("inactive", true, true, "ok")));
+        // Case-insensitivity of the state and health words (parsers
+        // normalize, but the predicate must not care).
+        assert!(snapshot_is_ready(&snap("Active", true, true, "OK")));
+    }
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
     fn ok(stdout: &str) -> RemoteExitStatus {
@@ -815,6 +942,32 @@ mod tests {
         let body = "State        Recv-Q Send-Q Local Address:Port   Peer Address:Port\n\
                     UNCONN       0      0      127.0.0.1:4500       0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=10))\n";
         assert!(linux_udp_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn linux_udp_summary_matches_interface_ip_bound_socket() {
+        // The deploy stage binds the datapath to the guest's live
+        // interface IP (live-verified on debian-headless-4, run fwd6e
+        // 2026-09-06): a needle list of loopback/wildcard forms missed
+        // this healthy bind and failed relay_validation spuriously.
+        let body = "UNCONN       0      0      192.168.64.10:4500   0.0.0.0:*           users:((\"rustynet-relay\",pid=122529,fd=9))\n";
+        assert!(linux_udp_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn linux_udp_summary_rejects_connected_socket_with_port_on_peer_side() {
+        // A socket that learnt a peer endpoint (local ephemeral, peer
+        // :4500) is an outbound association, not a bound listener.
+        let body = "UNCONN       0      0      127.0.0.1:5555       10.0.0.1:4500        users:((\"rustynetd\",pid=1234,fd=11))\n";
+        assert!(!linux_udp_summary_contains_port(body, 4500));
+    }
+
+    #[test]
+    fn linux_tcp_summary_matches_interface_ip_listen_socket() {
+        // Symmetric coverage for the TCP health listener: an interface-IP
+        // LISTEN must satisfy the check just like 127.0.0.1 does.
+        let body = "LISTEN       0      128    192.168.64.10:4501   0.0.0.0:*           users:((\"rustynet-relay\",pid=1234,fd=10))\n";
+        assert!(linux_tcp_summary_contains_listen_port(body, 4501));
     }
 
     #[test]
@@ -1068,33 +1221,40 @@ mod tests {
         }
     }
 
-    /// Program a Linux mock shell with a during-run + after-stop phase
-    /// and the stop/start exit codes. The mock keys responses by exact
-    /// argv, FIFO, so we push two responses per repeated probe (during,
-    /// then after).
+    /// Program a Linux mock shell with a during-run + after-stop +
+    /// post-restart phase and the stop/start exit codes. The mock keys
+    /// responses by exact argv, FIFO, so we push three responses per
+    /// repeated probe: during-readiness (polled by `wait_until_ready`),
+    /// after-stop, and post-restart readiness (the restart path also
+    /// waits for readiness before handing the host to later stages).
     fn program_linux_lifecycle(
         mock: &MockShellHost,
         during: &LinuxPhase,
         after: &LinuxPhase,
+        restarted: &LinuxPhase,
         stop_ok: bool,
         start_ok: bool,
     ) {
         let is_active = ["systemctl", "is-active", SYSTEMD_RELAY_UNIT];
         mock.program_run_response(&is_active, ok(during.state));
         mock.program_run_response(&is_active, ok(after.state));
+        mock.program_run_response(&is_active, ok(restarted.state));
 
         let ss_udp = ["ss", "-ulnp"];
         mock.program_run_response(&ss_udp, ok(during.udp));
         mock.program_run_response(&ss_udp, ok(after.udp));
+        mock.program_run_response(&ss_udp, ok(restarted.udp));
 
         let ss_tcp = ["ss", "-tlnp"];
         mock.program_run_response(&ss_tcp, ok(during.tcp));
         mock.program_run_response(&ss_tcp, ok(after.tcp));
+        mock.program_run_response(&ss_tcp, ok(restarted.tcp));
 
         let health_url = format!("http://127.0.0.1:{RELAY_HEALTH_PORT}{RELAY_HEALTH_PATH}");
         let curl = ["curl", "--silent", "--max-time", "5", health_url.as_str()];
         mock.program_run_response(&curl, ok(during.health));
         mock.program_run_response(&curl, ok(after.health));
+        mock.program_run_response(&curl, ok(restarted.health));
 
         let stop = ["systemctl", "stop", SYSTEMD_RELAY_UNIT];
         mock.program_run_response(
@@ -1123,6 +1283,7 @@ mod tests {
             &mock,
             &LinuxPhase::serving(),
             &LinuxPhase::torn_down(),
+            &LinuxPhase::serving(),
             true,
             true,
         );
@@ -1139,6 +1300,7 @@ mod tests {
             &mock,
             &LinuxPhase::serving(),
             &LinuxPhase::serving(),
+            &LinuxPhase::serving(),
             true,
             true,
         );
@@ -1149,11 +1311,13 @@ mod tests {
 
     #[test]
     fn validate_linux_lifecycle_fails_when_during_run_not_serving() {
-        // Service inactive + ports unbound during the run → the
-        // during-run invariants must fail closed.
+        // Service inactive + ports unbound during the run → the readiness
+        // wait exhausts the programmed phases and the formal during-run
+        // invariants fail closed.
         let mock = MockShellHost::new();
         program_linux_lifecycle(
             &mock,
+            &LinuxPhase::torn_down(),
             &LinuxPhase::torn_down(),
             &LinuxPhase::torn_down(),
             true,
@@ -1173,6 +1337,7 @@ mod tests {
             &mock,
             &LinuxPhase::serving(),
             &LinuxPhase::torn_down(),
+            &LinuxPhase::serving(),
             true,
             false,
         );
