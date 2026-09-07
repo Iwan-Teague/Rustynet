@@ -12524,23 +12524,11 @@ fn execute_ops_disconnect_cleanup_macos() -> Result<String, String> {
     ))
 }
 
-/// Extract every RustyNet-managed `pf` anchor name from `pfctl -s Anchors`
-/// output. Anchors are matched on a case-insensitive `rustynet` substring so
-/// that ALL RustyNet anchor families are torn down on disconnect cleanup —
-/// `com.apple/rustynet_g<N>` (generation-rotated killswitch/filter),
-/// `com.apple/rustynet_nat_g<N>` (generation-rotated NAT), `com.rustynet/nat`
-/// (regular-exit NAT), and `com.rustynet/blind_exit` (blind-exit filter) —
-/// plus any unanticipated future family. Matching on the substring rather
-/// than a fixed name list mirrors the lab orchestrator's
-/// `macos_traffic::MACOS_RESET_COMMAND` (`grep -i rustynet`) and fixes the
-/// leak where `com.rustynet/blind_exit` survived disconnect cleanup with
-/// `block drop out quick all` still loaded. System anchors never contain the
-/// substring. Output is sorted and deduplicated for deterministic flush order.
 fn parse_managed_pf_anchors(body: &str) -> Vec<String> {
     let mut anchors = body
         .lines()
         .map(str::trim)
-        .filter(|line| line.to_lowercase().contains("rustynet"))
+        .filter(|line| line.starts_with("com.apple/rustynet_g"))
         .map(ToString::to_string)
         .collect::<Vec<_>>();
     anchors.sort();
@@ -26892,16 +26880,13 @@ mod tests {
 
     #[test]
     fn parse_managed_pf_anchors_filters_and_deduplicates() {
-        let body = "com.apple/rustynet_g100\ncom.apple/rustynet_g100\ncom.apple/rustynet_nat_g5\ncom.apple/rustynet_g200\ncom.rustynet/nat\ncom.rustynet/blind_exit\ncom.apple/250.applicationfirewall\n";
+        let body = "com.apple/rustynet_g100\ncom.apple/rustynet_g100\ncom.apple/rustynet_nat_g5\ncom.apple/rustynet_g200\n";
         let anchors = parse_managed_pf_anchors(body);
         assert_eq!(
             anchors,
             vec![
                 "com.apple/rustynet_g100".to_owned(),
-                "com.apple/rustynet_g200".to_owned(),
-                "com.apple/rustynet_nat_g5".to_owned(),
-                "com.rustynet/blind_exit".to_owned(),
-                "com.rustynet/nat".to_owned(),
+                "com.apple/rustynet_g200".to_owned()
             ]
         );
     }

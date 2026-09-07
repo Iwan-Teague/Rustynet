@@ -613,7 +613,8 @@ fn plan_has_cross_bridge_dataplane_stage(planned: &[StageId]) -> bool {
 
 /// Collapse control characters (ANSI escapes, CR) in probe stderr so
 /// guest-influenced bytes cannot forge or garble operator-facing failure
-/// text. Newlines become literal `\n` to keep one probe = one report line.
+/// text. Newlines and carriage returns become a single backslash and every
+/// other control character a space, so one probe stays one report line.
 fn sanitize_probe_text(s: &str) -> String {
     s.chars()
         .map(|c| match c {

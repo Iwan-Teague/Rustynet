@@ -366,11 +366,15 @@ const SHARED_HARDENING_O_FLAGS: &[&str] = &[
 /// means `~/.ssh/config` can never contribute a ProxyJump, this is the
 /// explicit, pinned, opt-in escape hatch:
 ///
-/// - `RUSTYNET_LAB_PROXYJUMP=<user@host>` — the jump spec. The jump hop
-///   inherits this module's full hardening posture (pinned identity,
-///   pinned known_hosts, `IdentitiesOnly`, `BatchMode`), so the jump host
-///   must accept the SAME pinned identity and be pinned in the SAME
-///   known_hosts file as the guests behind it.
+/// - `RUSTYNET_LAB_PROXYJUMP=<user@host>` — the jump spec. NOTE: OpenSSH
+///   expands `-J` into an inner `ssh … -W %h:%p <jump>` that inherits only
+///   `-l`, `-p`, `-J`, `-F` and `-v`; the pinned identity, the pinned
+///   known_hosts file, `IdentitiesOnly`, `BatchMode` and
+///   `StrictHostKeyChecking` set for the guest hop do NOT reach the jump
+///   hop, which therefore authenticates with the default `~/.ssh` keys and
+///   agent and verifies the jump host against the default known_hosts. The
+///   guest hop itself keeps the full hardening. Making the jump hop carry the
+///   same pins needs an explicit `ProxyCommand` form (QH-75).
 /// - `RUSTYNET_LAB_PROXYJUMP_CIDRS=<cidr[,cidr...]>` — the destination
 ///   CIDRs the jump applies to. Required when PROXYJUMP is set: a jump that
 ///   silently applied to every target would also reroute directly

@@ -715,9 +715,10 @@ fn linux_ss_line_binds_port(line: &str, state: &str, port: u16) -> bool {
         return false;
     }
     match fields.next() {
-        // No peer column at all (truncated `ss` output): the local
-        // endpoint match stands.
-        None => true,
+        // No peer column at all: real `ss -ulnp` / `ss -tlnp` output always
+        // carries one, so a missing column means truncated or malformed
+        // output. Fail closed rather than count it as a bind.
+        None => false,
         // Bound unconnected sockets report a wildcard peer. A concrete
         // peer address means this is a connected socket whose local port
         // merely coincides with the requested one.
