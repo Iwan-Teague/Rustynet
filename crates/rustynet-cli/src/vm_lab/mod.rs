@@ -15194,6 +15194,11 @@ pub fn exercise_macos_reboot_recovery_live(
     );
     match shutdown_status {
         Ok(status) if status.success() => {}
+        // ssh exits 255 when the remote tears the channel down mid-command —
+        // the EXPECTED path for `shutdown -r now` on macOS (the command never
+        // returns; the guest powers off first). Distinguish from an in-guest
+        // rejection, which surfaces as a different non-zero status.
+        Ok(status) if status.code() == Some(255) => {}
         Ok(status) => {
             return Err(format!(
                 "shutdown -r now dispatched but exited non-zero ({status}) on {macos_alias}"
