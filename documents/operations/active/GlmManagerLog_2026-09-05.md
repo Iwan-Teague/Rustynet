@@ -1049,3 +1049,6 @@ Commits since 092e94cf, grouped:
 - QH-70 (open)
 - CP-1 pf override persistence: not loaded this session → macOS↔Linux dataplane stages (traffic_test_matrix/two_hop/managed_dns/relay-through-mac) OFF
 - 28885-0 ledger divergence: pinned binary resolves stage-triage ledger + appends matrix rows to its BUILD worktree (edit-1788746785362-28885-0). Three cross-worktree stub remedies recorded there (BSD-stat, ssh-255, + earlier) and rows 331/332 landed in its CSV. Owner must reconcile ledgers/CSVs when merging this branch.
+
+## 2026-09-07 session 7 — STEP 3
+- Rebuilding pinned orchestrator binary from THIS worktree (edit-1788757368303-22407-0) so ledgers resolve here; then macOS reboot-recovery attempt 3 with both fixes (b4c30979 + 1ff7d04a) in tree.
