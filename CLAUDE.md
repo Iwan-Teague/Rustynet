@@ -983,8 +983,10 @@ edits (verified — `edit: deny` blocks new files too).
   `scripts/vm_lab/**`, `scripts/mcp/**` — written to the worktree as
   `allowlist.txt` and enforced by a per-worktree pre-commit hook plus the
   end-of-job checkpoint: out-of-allowlist edits are NEVER committed to the
-  branch. Each rule is validated (relative, non-empty, no `..`); any invalid
-  rule or an empty array DENIES the call; omit the parameter for the default.
+  branch (the hook defends against accident, not against the agent — the
+  checkpoint is the boundary). Each rule is validated (relative, non-empty,
+  no `..`, not `**` alone, no newline); any invalid rule or an empty array
+  DENIES the call; omit the parameter for the default.
   Async: returns a `job_id`, poll `ai_edit_result`.
   The worktree checks out `HEAD` — so the edit agent sees **committed** config,
   including these agent definitions. Uncommitted changes to `.opencode/` are NOT

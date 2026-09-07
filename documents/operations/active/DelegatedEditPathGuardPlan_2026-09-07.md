@@ -75,6 +75,8 @@ DONE. All 8 plan steps implemented on branch `ai-edit/edit-1788775612865-74537-0
 - Step R3 (F2) next: `pin_worktree_hooks` — enable `extensions.worktreeConfig` on the repo, pin `core.hooksPath` worktree-locally to the job's hooks dir; either failure fails the launch.
 - Step R3 (F2) done: `create_edit_worktree` calls `pin_worktree_hooks` (enables `extensions.worktreeConfig` repo-wide once, sets `--worktree core.hooksPath` to the job's hooks dir); any failure fails the launch. Tests: worktree-scoped config asserted after creation (and shown to outrank a simulated install.sh repo-level value); fail-closed error pinned outside a git repo. 127 tests pass. Deviation: none.
 - Step R4 (F5 + F6) next: `validate_allowlist_rule` rejects `**` alone (allow-all) and any `\n`/`\r`; single `*` documented as literal.
+- Step R4 (F5 + F6) done: validation rejects `**` and newline-bearing rules (matcher doc documents single `*` as literal); deny cases added to the unit test and the end-to-end call-denial test; `single_star_in_a_rule_is_literal_not_a_wildcard` pins the documented semantics. 128 tests pass. Deviation: none.
+- Step R5 (F4) next: allowlist-file/hook doc comments and the AGENTS/CLAUDE §12.6 sentence now say the hook defends against accident, not against the agent (the checkpoint is the boundary); mirror check green.
 
 ## Open questions
 
