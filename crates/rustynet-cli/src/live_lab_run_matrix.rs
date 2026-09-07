@@ -947,13 +947,12 @@ fn upsert_node_stage_csv(
 /// writer ever derived the root differently the gate would read a file nobody
 /// writes and pass unconditionally — a silent no-op, the worst failure mode
 /// available to a fail-closed check.
-pub(crate) fn workspace_root_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root must be resolvable from rustynet-cli crate")
-        .to_path_buf()
-}
+///
+/// QH-74: the derivation itself now lives in exactly one place,
+/// `crate::workspace_root`, and resolves at RUNTIME (--inventory ancestors →
+/// cwd → validated compiled-in fallback) instead of from
+/// `env!("CARGO_MANIFEST_DIR")`. Single derivation by construction.
+pub(crate) use crate::workspace_root::workspace_root_path;
 
 fn ensure_matrix_schema(path: &Path) -> Result<Vec<String>, String> {
     if !path.exists() {

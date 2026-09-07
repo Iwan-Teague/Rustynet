@@ -80,6 +80,13 @@ mod security_audit_catalog;
 mod text_truncate;
 #[cfg(feature = "vm-lab")]
 mod vm_lab;
+// QH-74: the ONE runtime workspace-root derivation (see the module docs and
+// the twin declaration in `lib.rs`). Declared in BOTH crate roots because the
+// binary compiles its own module tree — the single structural `main.rs` line
+// the plan deviation note records, alongside the `init_workspace_root` call
+// at the vm-lab verb parse sites.
+#[cfg(feature = "vm-lab")]
+mod workspace_root;
 
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;

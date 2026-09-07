@@ -101,6 +101,12 @@ mod secret_material;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code, unused_imports)]
 mod vm_lab;
+// QH-74: the ONE runtime workspace-root derivation (inventory ancestors →
+// cwd → validated compiled-in fallback). Declared here as well as in
+// `main.rs` (the established pattern for this crate) so both crate roots —
+// the binary compiles its own module tree — share a single definition.
+#[cfg(feature = "vm-lab")]
+mod workspace_root;
 
 /// Orchestrator surface for integration tests (RNQ-09). Everything here is
 /// already `pub` inside the vm_lab tree; this only makes it reachable from

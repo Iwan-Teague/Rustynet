@@ -69,6 +69,10 @@ Fail-closed preserved: no markers → error, not a guess; compile-time fallback 
 
 ~1 day: module + 2 deletions + 1 init site (~80 LOC), ~150 LOC tests, one verification run.
 
+## Implementation log
+
+- 2026-09-07 — Step 1+3 combined (so every commit stays lint-green): created `crates/rustynet-cli/src/workspace_root.rs` (marker check, pure `resolve_workspace_root`, validated compiled-in fallback, `OnceLock` cache + `init_workspace_root`/`workspace_root_path`, cfg(test) forced-root hook for the pinning test); deleted both compiled-in definitions and re-exported the shared one at the two former sites. **Deviation (structural, logged):** `mod workspace_root;` declared in BOTH crate roots (`lib.rs` and `main.rs`) — the binary target compiles its own module tree, so without the one-line `main.rs` declaration the shared definition cannot resolve there and the two-definitions defect QH-74 kills would simply reappear. This extends the "init call only" `main.rs` rule by one structural line; no other `main.rs` change in this step.
+
 ## Open questions
 
 1. Where is QH-74 actually recorded? The cited ledger has no such ID — confirm numbering before implementation.
