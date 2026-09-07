@@ -2701,13 +2701,12 @@ fn windows_orchestrator_bootstrap_phases() -> &'static [bootstrap::BootstrapPhas
     ]
 }
 
-fn workspace_root_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root must be resolvable from rustynet-cli crate")
-        .to_path_buf()
-}
+// QH-74: the runtime workspace-root derivation lives in ONE place,
+// `crate::workspace_root` (--inventory ancestors → cwd → validated
+// compiled-in fallback). This private `use` replaces the former compiled-in
+// `env!("CARGO_MANIFEST_DIR")` copy; descendants keep reaching it through
+// `super::workspace_root_path` and `crate::vm_lab::workspace_root_path`.
+use crate::workspace_root::workspace_root_path;
 
 pub fn default_inventory_path() -> PathBuf {
     workspace_root_path().join(DEFAULT_VM_LAB_INVENTORY_PATH)
