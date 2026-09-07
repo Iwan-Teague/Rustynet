@@ -44583,6 +44583,15 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             1,
             "the retirement token is byte-pinned to rustynetd's constant"
         );
+        // Cross-crate pin: the daemon must emit the SAME literal, or the probe
+        // greps for a dead string and the cell fails for the wrong reason.
+        let daemon_source = include_str!("../../../rustynetd/src/shutdown_residue.rs");
+        assert!(
+            daemon_source.contains(
+                "SHUTDOWN_RESIDUE_RETIRED_AFTER_REBOOT_LOG_TOKEN: &str =\n    \"shutdown_rollback_residue_retired_after_reboot\""
+            ),
+            "rustynetd's retirement token drifted from the lab probe's literal"
+        );
     }
 
     #[test]

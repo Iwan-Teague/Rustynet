@@ -11923,12 +11923,16 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // directory: a missing parent reads as "backup missing" (fail
         // closed, strand message), never as an error — see invariant 6 of
         // MacosDnsBackupRebootSurvivalPlan_2026-09-02.
-        crate::macos_dns_sc_protect::run_startup_dns_recovery(
+        // `guard_ok` is DATA the retirement decision consumes, not source
+        // layout: a guard failure returns here and retirement never runs.
+        let guard_ok = match crate::macos_dns_sc_protect::run_startup_dns_recovery(
             &config.state_path,
             config.privileged_helper_socket_path.as_deref(),
             std::time::Duration::from_millis(config.privileged_helper_timeout_ms.get()),
-        )
-        .map_err(DaemonError::InvalidConfig)?;
+        ) {
+            Ok(()) => true,
+            Err(err) => return Err(DaemonError::InvalidConfig(err)),
+        };
         // QH-40 marker retirement after a REBOOT (owner decision 1,
         // OwnerDecisions_2026-09-07.md; live evidence: run
         // state/live-lab-macos-reboot-20260907-050612). The marker documents
@@ -11939,14 +11943,17 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // NAT state are gone with the kernel), and the one class that does —
         // system-configuration DNS pins — was just handled by the guard
         // above, which either restored the backup or refused startup. So a
-        // marker recorded BEFORE the current boot is superseded evidence:
-        // retire it, loudly, naming the original error. A same-boot marker
-        // (daemon restart without reboot) or an unknown boot time keeps the
-        // marker on the operator-acknowledgement path, exactly as before.
+        // marker recorded under an EARLIER boot (the marker stores the
+        // `kern.boottime` it was written under; a same-boot clock step cannot
+        // move that) is superseded evidence: archive it, loudly, naming the
+        // original error. A same-boot marker (daemon restart without
+        // reboot), an unknown boot time, or a legacy marker without a stored
+        // boot time keeps the operator-acknowledgement path, exactly as
+        // before.
         {
             let boot = crate::shutdown_residue::boot_time_unix();
             let scan = crate::shutdown_residue::scan(&config.state_path);
-            let decision = crate::shutdown_residue::decide_marker_retirement(&scan, boot, true);
+            let decision = crate::shutdown_residue::decide_marker_retirement(&scan, boot, guard_ok);
             if let Some(boot_unix) = boot
                 && let Err(err) = crate::shutdown_residue::retire_marker_after_reboot(
                     &config.state_path,
