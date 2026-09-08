@@ -79,7 +79,13 @@ pub(crate) fn build_bundle_env(
             .adapters
             .get(&a.alias)
             .map(|adapter| adapter.platform())
-            .unwrap_or(crate::vm_lab::VmGuestPlatform::Linux);
+            .ok_or_else(|| {
+                format!(
+                    "'{}': no adapter registered; platform unknown; \
+                     refusing to assume Linux",
+                    a.alias
+                )
+            })?;
         let capabilities = a.role.product_capabilities_for_platform(&platform)?;
         let caps_csv = role_capability_csv(&capabilities);
         // WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md §11.3: temporary
@@ -424,10 +430,127 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm_lab::orchestrator::error::WireguardPublicKey;
+    use crate::vm_lab::VmGuestPlatform;
+    use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+    use crate::vm_lab::orchestrator::error::{
+        AdapterError, GossipIdentity, InstallReport, MembershipOwnerKey, MembershipSnapshot,
+        NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList, ValidatorReport,
+        WireguardPublicKey,
+    };
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+    use crate::vm_lab::orchestrator::source_archive::SourceArchive;
     use std::collections::HashMap;
+    use std::path::Path;
     use std::sync::{Arc, Mutex};
+
+    /// Minimal adapter double (same pattern as `mesh_status_validation`):
+    /// only `platform`/`alias` matter for `build_bundle_env`; everything
+    /// else is `unimplemented!()` so an unexpected call fails loudly.
+    #[derive(Debug)]
+    struct FakePlatformAdapter {
+        alias: &'static str,
+        platform: VmGuestPlatform,
+    }
+
+    impl NodeAdapter for FakePlatformAdapter {
+        fn platform(&self) -> VmGuestPlatform {
+            self.platform
+        }
+        fn alias(&self) -> &str {
+            self.alias
+        }
+        fn collect_artifacts(&self, _dst: &Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn start_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn stop_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn restart_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+            unimplemented!()
+        }
+        fn run_validator(
+            &self,
+            _op: crate::vm_lab::DaemonProbeOp,
+            _extra_args: &[String],
+        ) -> Result<ValidatorReport, AdapterError> {
+            unimplemented!()
+        }
+        fn ping_mesh_peer(&self, _peer_mesh_ip: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn probe_denied_peer(&self, _denied_ip: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+            unimplemented!()
+        }
+        fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn endpoint(&self) -> String {
+            unimplemented!()
+        }
+        fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+            unimplemented!()
+        }
+        fn install_daemon(
+            &self,
+            _source: &SourceArchive,
+            _ctx: &OrchestrationContext,
+        ) -> Result<InstallReport, AdapterError> {
+            unimplemented!()
+        }
+        fn init_membership_snapshot(
+            &self,
+            _owner_key: &MembershipOwnerKey,
+            _peers: &[NodeMembershipPeer],
+        ) -> Result<MembershipSnapshot, AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_signed_bundle(
+            &self,
+            _kind: BundleKind,
+            _bundle_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_verifier_key(
+            &self,
+            _kind: BundleKind,
+            _pub_key_path: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_bundles_to_dir(
+            &self,
+            _kind: BundleKind,
+            _env_content: &str,
+            _local_out_dir: &Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+    }
 
     fn make_two_node_ctx() -> OrchestrationContext {
         let mut ctx = OrchestrationContext {
@@ -477,7 +600,45 @@ mod tests {
             .insert("exit-1".to_owned(), "10.0.0.1:51820".to_owned());
         ctx.endpoints
             .insert("client-1".to_owned(), "10.0.0.2:51820".to_owned());
+        // The platform must come from the live adapter record, not a silent
+        // Linux default; the base fixture therefore registers one per node.
+        ctx.adapters.insert(
+            "exit-1".to_owned(),
+            Box::new(FakePlatformAdapter {
+                alias: "exit-1",
+                platform: VmGuestPlatform::Linux,
+            }),
+        );
+        ctx.adapters.insert(
+            "client-1".to_owned(),
+            Box::new(FakePlatformAdapter {
+                alias: "client-1",
+                platform: VmGuestPlatform::Linux,
+            }),
+        );
         ctx
+    }
+
+    /// Platform-branching audit R7: capabilities are minted per platform, so
+    /// with no adapter registered the platform is UNKNOWN and the bundle env
+    /// must not be built on a silent Linux assumption. If the fix reverts to
+    /// `unwrap_or(VmGuestPlatform::Linux)` this test observes `Ok` and fails.
+    #[test]
+    fn build_bundle_env_fails_closed_without_a_registered_adapter() {
+        let mut ctx = make_two_node_ctx();
+        ctx.adapters.remove("exit-1");
+        let err = match build_bundle_env(&ctx, &BundleKind::Traversal) {
+            Ok(_) => panic!("missing adapter must fail closed, not default to Linux"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("no adapter registered"),
+            "error must name the missing platform, got: {err}"
+        );
+        assert!(
+            err.contains("exit-1"),
+            "error must name the alias, got: {err}"
+        );
     }
 
     #[test]
