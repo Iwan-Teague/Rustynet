@@ -460,15 +460,82 @@ impl MembershipOperation {
     /// Owner approver and `quorum_threshold` is 1, so quorum already implies
     /// the owner; and nothing on the automated paths, which already sign with
     /// the owner key.
-    fn requires_owner_signer(&self) -> bool {
-        matches!(
-            self,
+    /// The four operations above are decidable from the operation alone. The
+    /// two added below need the CURRENT STATE, because whether they are a
+    /// privilege change depends on what the target node holds today.
+    ///
+    /// **Why `AddNode` and `RemoveNode` are here (H1, 2026-09-08).** The
+    /// original guard listed only the four, and a multi-agent review
+    /// reproduced the gap against this crate's public API: with a non-owner
+    /// quorum, a direct `SetNodeCapabilities` on a `blind_exit` node is
+    /// correctly refused as immutable, but `RemoveNode` followed by `AddNode`
+    /// re-admits the same `node_id` and `node_pubkey_hex` without
+    /// `blind_exit` and with anchor capabilities granted. The round trip
+    /// reached exactly the state the guard existed to forbid, because
+    /// `AddNode`'s reducer writes both capabilities and the pubkey
+    /// (`:2069`) and `RemoveNode`'s is a bare `retain` (`:2126`).
+    ///
+    /// **The rule.** A non-owner quorum may only ever mint or retire an
+    /// UNPRIVILEGED node: capability set exactly `{Client}`. Anything that
+    /// grants mesh authority, and anything that retires a node currently
+    /// holding such authority, needs the owner. Both halves are required:
+    /// guarding only the add still lets a quorum delete a `blind_exit` node,
+    /// and guarding only the remove still lets it enrol an anchor.
+    ///
+    /// This keeps unattended CLIENT enrolment owner-free, which is why the
+    /// list was not simply extended with both operations — that would have
+    /// made every enrolment owner-signed, and
+    /// `I4GossipImplementationHandoff_2026-08-05.md` D5 warns specifically
+    /// against widening this list without that distinction.
+    fn requires_owner_signer(&self, state: &MembershipState) -> bool {
+        match self {
             MembershipOperation::RotateApprover(_)
-                | MembershipOperation::SetQuorum { .. }
-                | MembershipOperation::SetNodeCapabilities { .. }
-                | MembershipOperation::RotateNodeKey { .. }
-        )
+            | MembershipOperation::SetQuorum { .. }
+            | MembershipOperation::SetNodeCapabilities { .. }
+            | MembershipOperation::RotateNodeKey { .. } => true,
+            MembershipOperation::AddNode(node) => {
+                if !is_unprivileged_capability_set(&node.capabilities) {
+                    return true;
+                }
+                // Re-admitting an identity the mesh already knows is an
+                // identity substitution even when the new grant is plain
+                // `Client`: the reducer refuses a duplicate `node_id`, but
+                // nothing there looks at the pubkey, so a different id
+                // carrying a known key would otherwise pass unsigned.
+                state
+                    .nodes
+                    .iter()
+                    .any(|existing| existing.node_pubkey_hex == node.node_pubkey_hex)
+            }
+            MembershipOperation::RemoveNode { node_id } => {
+                match state
+                    .nodes
+                    .iter()
+                    .find(|candidate| candidate.node_id == *node_id)
+                {
+                    Some(node) => !is_unprivileged_capability_set(&node.capabilities),
+                    // Fail closed: an unknown target is refused by the
+                    // reducer anyway, and demanding the owner signature for
+                    // a target we cannot evaluate is the safe default.
+                    None => true,
+                }
+            }
+            _ => false,
+        }
     }
+}
+
+/// A capability set a non-owner quorum may mint or retire: exactly `{Client}`.
+///
+/// Every other variant of [`RoleCapability`] grants mesh authority of some
+/// kind — serving as an exit, hosting a relay, acting as an anchor, or
+/// carrying the irreversible `blind_exit` marking — so a set containing any
+/// of them is privileged. The EMPTY set is also treated as privileged: it
+/// grants nothing, but it is not a shape any normal enrolment produces, and
+/// default-deny says an unusual input asks for the owner rather than being
+/// waved through.
+fn is_unprivileged_capability_set(capabilities: &[RoleCapability]) -> bool {
+    !capabilities.is_empty() && capabilities.iter().all(|c| *c == RoleCapability::Client)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1953,7 +2020,7 @@ fn verify_membership_signatures(
             .map_err(|_| MembershipError::SignatureInvalid)?;
     }
 
-    if signed_update.record.operation.requires_owner_signer() && !owner_signed {
+    if signed_update.record.operation.requires_owner_signer(state) && !owner_signed {
         return Err(MembershipError::OwnerSignatureRequired);
     }
 
@@ -4290,6 +4357,142 @@ mod tests {
         SignedMembershipUpdate {
             record,
             approver_signatures,
+        }
+    }
+
+    /// H1 (2026-09-08). THE ACTUAL ATTACK the owner-signer gap allowed: a
+    /// guardian-only quorum could not change a node's capabilities directly,
+    /// but it could DELETE the node and re-add it with different ones. The
+    /// delete half is now owner-gated whenever the target holds authority, so
+    /// the round trip cannot start.
+    #[test]
+    fn removing_a_privileged_node_requires_the_owner() {
+        let state = base_state();
+        assert_eq!(
+            state.nodes[0].capabilities,
+            vec![RoleCapability::Anchor],
+            "fixture must hold a privileged capability for this test to mean anything"
+        );
+        let mut candidate = state.clone();
+        candidate.nodes.clear();
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-remove-privileged",
+            "node-a",
+            MembershipOperation::RemoveNode {
+                node_id: "node-a".to_owned(),
+            },
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("a guardian-only quorum must not retire a node holding authority");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// The other half of the round trip: enrolling a node that already
+    /// carries authority is a grant, and needs the owner just as
+    /// `SetNodeCapabilities` does.
+    #[test]
+    fn adding_a_privileged_node_requires_the_owner() {
+        let state = base_state();
+        let mut newcomer = active_node("node-b", 11);
+        newcomer.capabilities = crate::roles::canonicalize_role_capabilities([
+            RoleCapability::Client,
+            RoleCapability::ExitServer,
+        ]);
+        let mut candidate = state.clone();
+        candidate.nodes.push(newcomer.clone());
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-add-privileged",
+            "node-b",
+            MembershipOperation::AddNode(newcomer),
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("a guardian-only quorum must not enrol an exit server");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// The reason the guard is a SPLIT and not simply "both operations need
+    /// the owner": unattended enrolment of an ordinary client must keep
+    /// working without an owner signature. If this test ever starts failing,
+    /// the gate has been widened too far and every enrolment now needs the
+    /// owner key.
+    #[test]
+    fn enrolling_a_plain_client_stays_owner_free() {
+        let state = base_state();
+        let mut newcomer = active_node("node-b", 11);
+        newcomer.capabilities = vec![RoleCapability::Client];
+        let mut candidate = state.clone();
+        candidate.nodes.push(newcomer.clone());
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-add-client",
+            "node-b",
+            MembershipOperation::AddNode(newcomer),
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect("a guardian quorum must still be able to enrol a plain client");
+    }
+
+    /// Re-admitting a key the mesh already knows is an identity substitution
+    /// even when the capability set offered is plain `Client`: the reducer
+    /// only refuses a duplicate `node_id`, never a duplicate pubkey.
+    #[test]
+    fn readmitting_a_known_pubkey_requires_the_owner_even_as_a_plain_client() {
+        let state = base_state();
+        let mut impostor = active_node("node-b", 11);
+        impostor.node_pubkey_hex = state.nodes[0].node_pubkey_hex.clone();
+        impostor.capabilities = vec![RoleCapability::Client];
+        let mut candidate = state.clone();
+        candidate.nodes.push(impostor.clone());
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-readmit-key",
+            "node-b",
+            MembershipOperation::AddNode(impostor),
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("re-using a known node pubkey must need the owner");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Default-deny on the odd shape: an empty capability set grants nothing,
+    /// but it is not what a normal enrolment produces, so it asks for the
+    /// owner rather than being waved through.
+    #[test]
+    fn an_empty_capability_set_is_treated_as_privileged() {
+        assert!(!super::is_unprivileged_capability_set(&[]));
+        assert!(super::is_unprivileged_capability_set(&[
+            RoleCapability::Client
+        ]));
+        for privileged in [
+            RoleCapability::Anchor,
+            RoleCapability::ExitServer,
+            RoleCapability::BlindExit,
+            RoleCapability::RelayHost,
+            RoleCapability::AnchorBundlePull,
+            RoleCapability::ServesNas,
+        ] {
+            assert!(
+                !super::is_unprivileged_capability_set(&[RoleCapability::Client, privileged]),
+                "{privileged:?} alongside Client must still count as privileged"
+            );
         }
     }
 
