@@ -39185,14 +39185,29 @@ fn kept_after() {}\n\
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vm_lab/orchestrator/stage");
         let mut offenders = Vec::new();
         let mut checked = 0usize;
-        for entry in fs::read_dir(&stage_dir).expect("read stage dir").flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
+        // Walk the WHOLE stage tree (B2, NodeEngineAuditConsolidation
+        // 2026-09-08): a flat read_dir skipped `cross_network/scenario/`,
+        // whose launcher was never scanned, and an unreadable file was
+        // silently skipped. Both are fail-open for a gate; walk recursively
+        // and refuse to continue past a file that cannot be read.
+        fn collect_stage_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir)
+                .unwrap_or_else(|err| panic!("stage dir {} must read: {err}", dir.display()))
+            {
+                let path = entry.expect("stage dir entry must read").path();
+                if path.is_dir() {
+                    collect_stage_sources(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
             }
-            let Ok(body) = fs::read_to_string(&path) else {
-                continue;
-            };
+        }
+        let mut sources = Vec::new();
+        collect_stage_sources(&stage_dir, &mut sources);
+        sources.sort();
+        for path in sources {
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("stage source {} must read: {err}", path.display()));
             // EVERY cargo invocation in the file must carry the feature, not
             // just one of them. The per-FILE check this replaced passed
             // vacuously on cross_network.rs: that file spawns cargo twice, the
@@ -39219,10 +39234,16 @@ fn kept_after() {}\n\
                 ));
             }
         }
-        assert!(
-            checked >= 12,
-            "expected many stage launchers spawning a bin; found {checked} — did the \
-             launch style change? This test would silently pass if so."
+        // Exact pin, not a floor: a floor with slack detects nothing (the old
+        // `>= 12` sat under a measured 15 and would have absorbed two files
+        // losing their launcher). Measured 2026-09-09: 14 files directly
+        // under stage/ plus cross_network/scenario/host.rs. Bump this number
+        // deliberately when a launcher is added or removed.
+        assert_eq!(
+            checked, 15,
+            "expected exactly 15 stage launchers spawning a bin; found {checked} — a \
+             launcher was added or removed, or the launch style changed. Re-measure and \
+             pin the new count on purpose."
         );
         assert!(
             offenders.is_empty(),
