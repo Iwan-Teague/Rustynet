@@ -41415,6 +41415,93 @@ fn kept_after() {}\n\
     }
 
     #[test]
+    fn discovery_unmatched_utm_without_inferable_platform_degrades_to_unknown() {
+        // Catches: the unmatched-local-UTM branch reverting to
+        // default_platform_profile(inferred.unwrap_or(Linux)) — the record
+        // would then carry platform "linux", a debian ssh user, and a
+        // platform-shaped advisory target instead of the honest
+        // "unknown" degradation with its note.
+        let unique = super::unique_suffix();
+        let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-unknown-{unique}.dir"));
+        let bundle = root.join("mystery-box.utm");
+        fs::create_dir_all(&bundle).expect("bundle should exist");
+
+        let utmctl = write_temp_executable(
+            "#!/bin/sh\nif [ \"$1\" = \"ip-address\" ] && [ \"$2\" = \"mystery-box\" ]; then\n  printf '192.0.2.77\\n100.64.0.99\\n'\n  exit 0\nfi\nexit 1\n",
+        );
+
+        let report = super::execute_ops_vm_lab_discover_local_utm_with_probes(
+            super::VmLabDiscoverLocalUtmConfig {
+                inventory_path: None,
+                utm_documents_root: Some(root.clone()),
+                utmctl_path: Some(utmctl.clone()),
+                ssh_identity_file: None,
+                known_hosts_path: None,
+                ssh_port: 65_534,
+                timeout_secs: 30,
+                update_inventory_live_ips: false,
+                report_dir: None,
+            },
+            hermetic_discovery_probes(),
+        )
+        .expect("discovery must enumerate, not gate, an unknown VM");
+        let parsed: serde_json::Value =
+            serde_json::from_str(report.as_str()).expect("discovery report should parse as JSON");
+        let entry = &parsed["entries"][0];
+        assert_eq!(entry["utm_name"].as_str(), Some("mystery-box"));
+        assert_eq!(
+            entry["inventory_match"].as_bool(),
+            Some(false),
+            "the unmatched branch is the one under test"
+        );
+        assert_eq!(
+            entry["platform"].as_str(),
+            Some("unknown"),
+            "an un-inferable UTM must not be serialized as linux"
+        );
+        let notes = entry["notes"]
+            .as_array()
+            .expect("discovery notes must be an array")
+            .iter()
+            .filter_map(|n| n.as_str())
+            .collect::<Vec<&str>>()
+            .join("|");
+        assert!(
+            notes.contains("platform-not-inferable-from-utm-name"),
+            "the degradation note must be present: {notes}"
+        );
+        assert_eq!(
+            entry["ssh_user"].as_str(),
+            None,
+            "no debian ssh user may be minted for an unknown platform"
+        );
+        assert_eq!(
+            entry["ssh_target_source"].as_str(),
+            Some("platform-uninferable-unmatched"),
+            "the raw-address source must replace the platform-aware one"
+        );
+        assert_eq!(
+            entry["live_ip"].as_str(),
+            Some("192.0.2.77"),
+            "the live address itself is still discovered"
+        );
+        assert_eq!(
+            entry["ssh_auth_state"]["reason"].as_str(),
+            Some("no-ssh-user"),
+            "the auth probe must not guess a user for an unknown platform"
+        );
+        assert_eq!(parsed["summary"]["ready_count"].as_u64(), Some(0));
+        assert_eq!(
+            entry["windows_ssh_probe_state"].as_str(),
+            None,
+            "windows-shaped probes must stay off for an unknown platform"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(utmctl.parent().expect("temp executable parent"));
+    }
+
+    #[test]
     fn execute_ops_vm_lab_discover_local_utm_reports_live_bundle_status() {
         let unique = super::unique_suffix();
         let root = std::env::temp_dir().join(format!("rustynet-vm-lab-utm-root-{unique}.dir"));
@@ -48374,6 +48461,114 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(err.contains("spare Linux peers"));
     }
 
+    // ── QH-82 platform-inference migration: behaviour pins ──
+    // Each test names the mutation it catches; none may pass against the
+    // pre-migration code.
+
+    #[test]
+    fn infer_returns_none_when_no_platform_substring_matches() {
+        // Catches: re-adding the unconditional `else { Self::Linux }`
+        // residue inside `infer` (or any None -> Linux substitution).
+        let inferred = super::VmGuestPlatform::infer(None, None, "node-7", None);
+        assert_eq!(inferred, None, "a hint-less name must not infer Linux");
+    }
+
+    #[test]
+    fn infer_still_yields_linux_for_hint_bearing_names() {
+        // Catches: the over-correction (Linux hint arm dropped), which
+        // would fail-closed every plain Linux guest like debian-headless-4.
+        assert_eq!(
+            super::VmGuestPlatform::infer(None, None, "debian-headless-4", None),
+            Some(super::VmGuestPlatform::Linux)
+        );
+        assert_eq!(
+            super::VmGuestPlatform::infer(None, None, "node", Some("ubuntu-24-04")),
+            Some(super::VmGuestPlatform::Linux)
+        );
+        assert_eq!(
+            super::VmGuestPlatform::infer(None, None, "mint-box", Some("Debian/Linux")),
+            Some(super::VmGuestPlatform::Linux)
+        );
+    }
+
+    #[test]
+    fn infer_platform_precedence_is_windows_then_macos_then_ios_then_android() {
+        // Catches: hint-table reordering during the edit — precedence is
+        // observable behaviour.
+        assert_eq!(
+            super::VmGuestPlatform::infer(None, None, "vm-macos-and-windows-11", None),
+            Some(super::VmGuestPlatform::Windows)
+        );
+        assert_eq!(
+            super::VmGuestPlatform::infer(None, None, "vm-ios-android", None),
+            Some(super::VmGuestPlatform::Ios)
+        );
+        assert_eq!(
+            super::VmGuestPlatform::infer(None, None, "vm-android", None),
+            Some(super::VmGuestPlatform::Android)
+        );
+        assert_eq!(
+            super::VmGuestPlatform::infer(None, None, "darwin-host", None),
+            Some(super::VmGuestPlatform::Macos)
+        );
+    }
+
+    #[test]
+    fn platform_profile_fails_closed_when_platform_is_uninferable() {
+        // Catches: unwrap_or / default_platform_profile(Linux) reintroduced
+        // inside effective_platform_profile or platform_profile().
+        let mut entry = hp3_test_inventory_entry("node-7", "client", false, false, None);
+        entry.platform = None;
+        entry.os = None;
+        let err = entry
+            .platform_profile()
+            .expect_err("an un-inferable platform must fail closed");
+        assert!(
+            err.contains("node-7"),
+            "the error must name the alias: {err}"
+        );
+        assert!(err.contains("refusing to assume Linux"), "error: {err}");
+
+        // Positive control: a hint-bearing name still resolves Linux.
+        entry.alias = "debian-headless-9".to_owned();
+        let profile = entry
+            .platform_profile()
+            .expect("hint-bearing names must still resolve");
+        assert_eq!(profile.platform, super::VmGuestPlatform::Linux);
+        assert_eq!(profile.remote_shell, super::VmRemoteShell::Posix);
+    }
+
+    #[test]
+    fn diagnose_fails_closed_for_entry_without_recorded_platform() {
+        // Catches: diagnose reverting to entry.platform.unwrap_or(Linux) —
+        // the mutation turns the expected named error into a Linux-adapter
+        // run against a node of unknown OS.
+        let inventory = write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "win-mystery",
+      "ssh_target": "192.0.2.9"
+    }
+  ]
+}"#,
+        );
+        let err = super::execute_ops_vm_lab_diagnose(super::VmLabDiagnoseConfig {
+            inventory_path: inventory.clone(),
+            vm_alias: "win-mystery".to_owned(),
+            ssh_identity_file: PathBuf::from("/nonexistent-identity"),
+            known_hosts_path: PathBuf::from("/nonexistent-known-hosts"),
+            ssh_port: 65_534,
+        })
+        .expect_err("a platform-less entry must be refused");
+        assert!(
+            err.contains("win-mystery") && err.contains("no platform recorded"),
+            "error must name the alias and the refusal: {err}"
+        );
+        let _ = fs::remove_file(inventory);
+    }
+
     #[test]
     fn relay_forward_test_topology_fails_closed_on_missing_mesh_ip() {
         let mut inventory = hp3_test_standard_topology();
@@ -48383,7 +48578,103 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(err.contains("mesh_ip"));
     }
 
+    #[test]
+    fn relay_forward_test_topology_excludes_platform_unknown_entries_and_names_them() {
+        // Catches BOTH regressions at once:
+        // (a) reverting the filter to e.platform.unwrap_or(Linux) — then the
+        //     platform-less relay candidate is silently selected and
+        //     assertion (1) fails;
+        // (b) over-correcting into a hard error inside the filter — then any
+        //     mixed topology containing an unknown entry aborts and
+        //     assertion (2) fails.
+        let mut standard = hp3_test_standard_topology();
+        // (1) The ONLY relay_capable entry has no recorded platform.
+        standard[2].platform = None;
+        let err = super::select_relay_forward_test_topology(&standard)
+            .expect_err("a platform-less relay candidate must not be minted into Linux");
+        assert!(
+            err.contains("no recorded platform: [debian-headless-3]"),
+            "the excluded alias must be named: {err}"
+        );
+        // (2) A mixed topology: one unknown entry beside recorded Linux
+        // peers. Selection still succeeds — from the recorded nodes only.
+        let mut mixed = hp3_test_standard_topology();
+        mixed[4].platform = None; // "extra" becomes un-inferable
+        let topology = super::select_relay_forward_test_topology(&mixed)
+            .expect("one unknown entry must not abort a legitimate mixed topology");
+        assert_eq!(topology.relay_alias, "debian-headless-3");
+        // Sender: aux wins the rank; receiver: the recorded client — NOT the
+        // excluded unknown.
+        assert_eq!(topology.sender_alias, "debian-headless-4");
+        assert_eq!(topology.receiver_alias, "debian-headless-2");
+        let _ = standard;
+    }
+
+    #[test]
+    fn relay_forward_test_peer_selection_skips_platform_unknown_entries() {
+        // Companion to the test above: the unknown entries must be excluded
+        // from the peer pool even when Linux peers are scarce — catching a
+        // revert where only the relay slot is guarded.
+        let mut mixed = hp3_test_standard_topology();
+        mixed[3].platform = None; // aux
+        mixed[4].platform = None; // extra
+        let err = super::select_relay_forward_test_topology(&mixed)
+            .expect_err("no recorded-platform peers means no selection");
+        assert!(
+            err.contains("spare Linux peers"),
+            "the pre-existing peer-count error path must carry the failure: {err}"
+        );
+        assert!(
+            err.contains("no recorded platform: [debian-headless-4, debian-headless-5]"),
+            "both excluded aliases must be named: {err}"
+        );
+    }
+
     // ── run-scoped election (`select_relay_forward_test_topology_for_run`) ──
+
+    #[test]
+    fn relay_forward_test_topology_for_run_excludes_platform_unknown_entries_and_names_them() {
+        // Catches: (a) reverting the run-scoped filter to unwrap_or(Linux) —
+        // the platform-less assigned relay would then be selected and (1)
+        // fails; (b) hard-erroring inside the filter — (2) proves a mixed
+        // run still selects from its recorded nodes.
+        let mut standard = hp3_test_standard_topology();
+        standard[2].platform = None; // the assigned relay itself
+        let err = super::select_relay_forward_test_topology_for_run(
+            &standard,
+            "debian-headless-3",
+            &run_aliases(&[
+                "debian-headless-2",
+                "debian-headless-3",
+                "debian-headless-4",
+            ]),
+        )
+        .expect_err("a platform-less assigned relay must be refused");
+        assert!(
+            err.contains("is not a Linux entry in the inventory")
+                && err.contains("no recorded platform: [debian-headless-3]"),
+            "error must reuse the existing path and name the exclusion: {err}"
+        );
+
+        // (2) Unknown peer inside the run's assignments: excluded, and the
+        // run still proves through the recorded nodes.
+        let mut mixed = hp3_test_standard_topology();
+        mixed[4].platform = None; // extra
+        let topology = super::select_relay_forward_test_topology_for_run(
+            &mixed,
+            "debian-headless-3",
+            &run_aliases(&[
+                "debian-headless-2",
+                "debian-headless-3",
+                "debian-headless-4",
+                "debian-headless-5",
+            ]),
+        )
+        .expect("an unknown run member must not abort the topology");
+        assert_eq!(topology.relay_alias, "debian-headless-3");
+        assert_eq!(topology.sender_alias, "debian-headless-4");
+        assert_eq!(topology.receiver_alias, "debian-headless-2");
+    }
 
     fn run_aliases(aliases: &[&str]) -> Vec<String> {
         aliases.iter().map(|a| a.to_string()).collect()
