@@ -6645,6 +6645,49 @@ binaries rather than a silent fall back to the default path. Audit the other
 
 **Disposition: OPEN, filed 2026-09-07.**
 
+### QH-80 — the relay forwarding proof reaches its own logic and fails there: blocking direct UDP leaves a peer pair with NO path instead of pushing it onto the relay
+
+**Severity: high (the relay forwarding capability is unproven end to end). Confidence: VERIFIED
+live in run `live-lab-linux-relay-fwd11-20260908-005016`, the first run in which this stage ever
+executed rather than skipping on a dependency.**
+
+Two earlier defects made this stage unreachable and are both fixed: the stale relay environment
+override (commit `232fbec3`) and the `dns_zone` bundle file-extension drift (commit `70447b35`).
+With those gone, `refresh_signed_bundles` passed for the first time and
+`relay_forwards_frame_validation` ran on its own merits.
+
+It then failed after 90 s waiting for both peers to report a relay-routed session. The evidence
+from the sender's own status line at the moment of failure:
+
+```
+path_mode=mixed_active            path_reason=partial_live_proof
+path_programmed_mode=direct_programmed   path_programmed_reason=traversal_authority
+path_programmed_direct_peers=3    path_programmed_relay_peers=0
+path_live_direct_peers=2          path_live_relay_peers=0
+relay_session_configured=false    relay_session_state=disabled
+```
+
+The relay itself was healthy: the HP-3 provisioner had rewritten
+`/etc/default/rustynet-relay` with the guest's LIVE address
+(`RUSTYNET_RELAY_BIND=192.168.64.10:4500`, the node's real address that run) and
+`rustynet-relay.service` was `active`.
+
+So the relay was up and reachable, and the stage did firewall direct UDP between the pair, but
+the traversal authority never PROGRAMMED a relay path for them: the programmed mode stayed
+`direct_programmed` with zero relay peers, and `relay_session_configured` stayed false.
+Removing the direct path therefore left the pair with no path at all rather than moving them
+onto the relay.
+
+**Open question, and it decides who owns the fix.** Either the product's traversal authority is
+expected to fall back to a relay path when the direct path stops working, in which case this is
+a daemon-side gap and 90 s may also be too short for whatever re-negotiation is meant to happen;
+or programming the relay path is the lab's job before it blocks direct UDP, in which case the
+stage is incomplete. Nobody has confirmed which, and the answer should be established from the
+D2/D3 dataplane design before either side is changed. Do not "fix" this by lengthening the
+timeout: the counters say zero relay peers were ever programmed, not that programming was slow.
+
+**Disposition: OPEN, filed 2026-09-08.**
+
 ### QH-79 — the stale-environment-override hazard is bounded to the relay, checked 2026-09-08
 
 **Severity: informational (no open defect). Confidence: VERIFIED on a live guest.**
