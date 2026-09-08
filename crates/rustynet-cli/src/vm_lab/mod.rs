@@ -32574,7 +32574,15 @@ fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventory
     }
     let last_known_ip = optional_string_field(object, "last_known_ip")?;
     if let Some(value) = last_known_ip.as_deref() {
-        ensure_no_control_chars("last_known_ip", value)?;
+        // QH-85 F3: this value is used as an ssh/scp destination, so it must be
+        // an actual address — parsing as IpAddr subsumes the old
+        // control-character denylist and rejects option-shaped values ("-4",
+        // "10.0.0.1 -oX") that a denylist cannot anticipate.
+        if value.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!(
+                "last_known_ip must parse as an IP address: {value}"
+            ));
+        }
     }
     let parent_device = optional_string_field(object, "parent_device")?;
     if let Some(value) = parent_device.as_deref() {
@@ -32728,6 +32736,23 @@ fn parse_host(value: &Value) -> Result<LabHost, String> {
                 kind.as_str()
             ));
         }
+        // QH-85 F3: the authority `ssh_endpoint` extracts from a
+        // `qemu+ssh://user@host[:port]/…` URI becomes an ssh destination on the
+        // host-launch paths, so the same destination allowlist applies to the
+        // exact slice the accessor will hand to the sink. A URI without a
+        // `+ssh://` authority (e.g. local `qemu:///system`) has no ssh
+        // destination and is not checked here.
+        if let Some((_, rest)) = uri.split_once("+ssh://") {
+            let authority = rest
+                .split('/')
+                .next()
+                .and_then(|part| part.split('?').next())
+                .unwrap_or_default();
+            ensure_ssh_target(
+                &format!("host {host_id}: connect_uri ssh endpoint"),
+                authority,
+            )?;
+        }
     }
 
     // Accept either `utm_documents_roots: [..]` or the single-value
@@ -32787,6 +32812,13 @@ fn parse_host(value: &Value) -> Result<LabHost, String> {
                     "host {host_id}: alt_ssh_endpoints entry must not be empty"
                 ));
             }
+            // QH-85 F3: each entry becomes an ssh/scp destination on the
+            // failover probe path, so it gets the same destination allowlist as
+            // `ssh_target` — not just the control-character denylist.
+            ensure_ssh_target(
+                &format!("host {host_id}: alt_ssh_endpoints entry"),
+                endpoint.trim(),
+            )?;
             alt_ssh_endpoints.push(endpoint.trim().to_owned());
         }
     }
@@ -32989,24 +33021,50 @@ fn ensure_inventory_alias(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Fail-closed analysis for the SSH destination allowlist (QH-85 F3; this was a
+/// denylist until 2026-09-09, and `ssh_target: "-F/tmp/x"` passed the parser
+/// and — before the `--` guards — reached `ssh` as an option):
+/// - absent: handled by `required_string_field` (unchanged, not weakened here);
+/// - empty: rejected;
+/// - leading `-`: rejected (the option-injection class above — `--` on every
+///   spawn site is the second layer, this is the parse-boundary layer);
+/// - whitespace, control characters, shell metacharacters, non-ASCII: rejected
+///   by the alphabet (anything outside `[A-Za-z0-9._:@-]` fails, which covers
+///   `'`, `"`, `` ` ``, `$`, `;`, `|`, `&`, `(`, `)`, `<`, `>`, `\`, space, tab,
+///   newline, CR, NUL, and every other control code);
+/// - `..`: allowed by the alphabet and deliberately so — the value is passed as
+///   a single execve argv element after `--`, never re-parsed as a shell word
+///   or a path segment, so `..` is inert at every sink;
+/// - a hostname with a trailing dot: allowed for the same reason (a legal DNS
+///   representation, harmless as an argv element);
+/// - an IPv6 literal (`2001:db8::1`): allowed via `:`, and `user@host` forms
+///   allowed via `@` — both already exist in the tracked inventory.
 fn ensure_ssh_target(label: &str, value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err(format!("{label} must not be empty"));
     }
-    if value.chars().any(char::is_whitespace) {
-        return Err(format!("{label} must not contain whitespace: {value}"));
+    if value.starts_with('-') {
+        return Err(format!(
+            "{label} must not start with '-' (option injection)"
+        ));
     }
-    ensure_no_control_chars(label, value)
+    let allowed =
+        |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '@' | '-');
+    if !value.chars().all(allowed) {
+        return Err(format!(
+            "{label} contains unsupported characters: {value} (allowed: [A-Za-z0-9._:@-])"
+        ));
+    }
+    Ok(())
 }
 
 fn ensure_ssh_user(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Err("SSH user must not be empty".to_owned());
-    }
-    if value.chars().any(char::is_whitespace) {
-        return Err(format!("SSH user must not contain whitespace: {value}"));
-    }
-    ensure_no_control_chars("SSH user", value)
+    // Delegate to the one per-class validator seam (QH-01): its alphabet
+    // `[A-Za-z0-9._-]` is a subset of the destination alphabet, it already
+    // rejects a leading `-` as option injection, and every entry in the
+    // tracked inventory is a plain name, so the stricter seam is compatible.
+    crate::vm_lab::orchestrator::adapter::validated_args::connection_user(value)
+        .map_err(|err| format!("SSH user: {err}"))
 }
 
 fn build_repo_sync_script(
@@ -38547,6 +38605,173 @@ fn execute_bootstrap_phase_for_target(
 
 #[cfg(test)]
 mod tests {
+    /// Sink-side guard for every privileged SSH spawn under `vm_lab/**`
+    /// (QH-85 F3). Every `ssh`/`scp` spawn must carry a literal `--` argument
+    /// before the destination, and `sshpass` must never be handed the password
+    /// through `.arg("-p")` (the `-e`/`SSHPASS` env path is the only allowed
+    /// form). This is a source scanner, not a runtime check: a NEW spawn site
+    /// fails the walk unless it is added to the commented allowlist below with
+    /// a reason. The scan fails closed — an unreadable or non-UTF-8 file is a
+    /// panic, never a skip — and the floor assertions keep it from going blind
+    /// silently if the spawn style changes. The needles are assembled from
+    /// parts so this scanner's own source cannot create phantom windows.
+    ///
+    /// Mutation each arm catches:
+    /// - dropping `--` from a destination (e.g. the pre-c3b127cf shape where
+    ///   `ssh_target: "-F/tmp/x"` reached `ssh` as an option) → arm 1;
+    /// - reintroducing `sshpass -p` (the QH-85 F1 defect that put the lab
+    ///   password on the local argv) → arm 2;
+    /// - a new sshpass-style spawn wrapping `ssh` without a destination guard →
+    ///   arm 3.
+    #[test]
+    fn ssh_sinks_carry_the_destination_guard_and_sshpass_never_takes_a_password_flag() {
+        const VM_LAB_SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vm_lab");
+
+        fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|err| panic!("vm_lab source tree {dir:?} must read: {err}"));
+            for entry in entries {
+                let entry = entry.expect("vm_lab source tree entry must read");
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let q = '"';
+        let ssh_spawn = format!("Command::new({q}ssh{q})");
+        let scp_spawn = format!("Command::new({q}scp{q})");
+        let sshpass_spawn = format!("Command::new({q}sshpass{q})");
+        let arg_ssh = format!(".arg({q}ssh{q})");
+        let destination_guard = format!("{q}--{q}");
+        let password_flag_arg = format!(".arg({q}-p{q})");
+        let spawn_boundary = "Command::new(";
+
+        // Allowlist: (path suffix, needle, reason). A spawn site may only be
+        // exempted here with a written reason; anything else must carry the
+        // guard itself.
+        let allowlist: &[(&str, &str, &str)] = &[(
+            "orchestrator/stage/preflight.rs",
+            &ssh_spawn,
+            "`ssh -V` version probe — it has no destination argument at all, and \
+             `--` would change `-V` into a hostname; the probe spawns the bare \
+             binary to assert it exists in PATH",
+        )];
+
+        let mut files = Vec::new();
+        collect_rs_files(std::path::Path::new(VM_LAB_SRC_DIR), &mut files);
+        assert!(
+            files.len() > 10,
+            "the scanner must find the vm_lab source tree, found {} files",
+            files.len()
+        );
+
+        let mut ssh_spawns_checked = 0usize;
+        let mut scp_spawns_checked = 0usize;
+        let mut sshpass_spawns_checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for file in &files {
+            // Fail closed: an unreadable or non-UTF-8 file must stop the scan,
+            // never be skipped — a scan that skips is a gate that lies.
+            let content = std::fs::read_to_string(file)
+                .unwrap_or_else(|err| panic!("vm_lab source {file:?} must read: {err}"));
+            let rel = file
+                .strip_prefix(std::path::Path::new(VM_LAB_SRC_DIR))
+                .unwrap_or(file)
+                .to_string_lossy()
+                .to_string();
+
+            for (needle, kind) in [
+                (&ssh_spawn, "ssh"),
+                (&scp_spawn, "scp"),
+                (&sshpass_spawn, "sshpass"),
+            ] {
+                let mut search_from = 0usize;
+                while let Some(offset) = content[search_from..].find(needle.as_str()) {
+                    let start = search_from + offset;
+                    search_from = start + needle.len();
+                    let line = content[..start].matches('\n').count() + 1;
+                    // The spawn's arg-building window: everything up to the
+                    // next spawn boundary (or end of file).
+                    let window_end = content[start + needle.len()..]
+                        .find(spawn_boundary)
+                        .map_or(content.len(), |rest| start + needle.len() + rest);
+
+                    if kind == "sshpass" {
+                        sshpass_spawns_checked += 1;
+                        // Arm 2: no `-p` between the sshpass spawn and the ssh
+                        // it wraps — the password must travel via SSHPASS/-e.
+                        let pre_ssh = &content[start..]
+                            .find(arg_ssh.as_str())
+                            .map_or(&content[start..window_end], |at| {
+                                &content[start..start + at]
+                            });
+                        if pre_ssh.contains(password_flag_arg.as_str()) {
+                            offenders.push(format!(
+                                "{rel}:{line} sshpass spawn carries {password_flag_arg} — \
+                                 the password must go through SSHPASS with `-e`, never argv"
+                            ));
+                        }
+                        // Arm 3: the wrapped ssh must still guard its
+                        // destination before the next spawn boundary.
+                        let wrapped = &content[start..window_end];
+                        if let Some(ssh_at) = wrapped.find(arg_ssh.as_str()) {
+                            if !wrapped[ssh_at..].contains(destination_guard.as_str()) {
+                                offenders.push(format!(
+                                    "{rel}:{line} sshpass-wrapped ssh has no {destination_guard} \
+                                     before its destination"
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Arm 1: a direct ssh/scp spawn must guard the destination.
+                    let exempt = allowlist.iter().any(|(path, allowed_needle, _)| {
+                        rel.ends_with(path) && *allowed_needle == needle
+                    });
+                    if !exempt && !content[start..window_end].contains(destination_guard.as_str())
+                    {
+                        offenders.push(format!(
+                            "{rel}:{line} {kind} spawn has no {destination_guard} argument \
+                             before its destination; a destination beginning with '-' would \
+                             parse as an ssh option"
+                        ));
+                    }
+                    if kind == "ssh" {
+                        ssh_spawns_checked += 1;
+                    } else {
+                        scp_spawns_checked += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            ssh_spawns_checked >= 10,
+            "expected ≥10 ssh spawns in vm_lab; found {ssh_spawns_checked} — \
+             did the spawn style change? This test would silently pass if so"
+        );
+        assert!(
+            scp_spawns_checked >= 3,
+            "expected ≥3 scp spawns in vm_lab; found {scp_spawns_checked} — \
+             did the spawn style change? This test would silently pass if so"
+        );
+        assert!(
+            sshpass_spawns_checked >= 1,
+            "expected ≥1 sshpass spawn in vm_lab; found {sshpass_spawns_checked} — \
+             did the spawn style change? This test would silently pass if so"
+        );
+        assert!(
+            offenders.is_empty(),
+            "SSH sink guard violations:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     /// Meta-test for the source-pin discipline (MultiAgentSecurityReviewAudit
     /// 2026-09-08, "self-proof kill"): a test that pins its OWN file's source
     /// with `include_str!` and searches the full text proves nothing — the
