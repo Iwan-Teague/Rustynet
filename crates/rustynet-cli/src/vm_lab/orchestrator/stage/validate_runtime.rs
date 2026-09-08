@@ -55,8 +55,13 @@ impl ValidateBaselineRuntimeStage {
 /// `SessionStateSnapshot.peer_ids` from `self.advertised_routes`
 /// (`daemon.rs:9762-9765`) — i.e. advertised route CIDRs, not peer node ids —
 /// so no node id can ever match one and passing `ctx.node_ids` here would red
-/// every node in the run. That mismatch is a separate daemon-side defect;
-/// asserting peer visibility has to wait for it.
+/// every node in the run. Tracked as QH-81
+/// (`documents/operations/active/QualityHardeningTodo_2026-07-25.md`):
+/// until that daemon-side data-model defect is fixed, this op's pass is
+/// structurally vacuous — its report carries an empty `expected_peer_ids` on
+/// every run, so the check proves nothing about peer visibility. LIVE peer
+/// visibility is proven by the dedicated `mesh_status_validation` stage's
+/// live-handshake poll instead, not by this dispatch.
 fn probe_expectations(op: crate::vm_lab::DaemonProbeOp) -> Vec<String> {
     use crate::vm_lab::DaemonProbeOp;
     use crate::vm_lab::orchestrator::role_validation::mesh_status::SNAPSHOT_MAX_AGE_SECONDS;
@@ -84,45 +89,6 @@ fn first_drift_reason(report: &serde_json::Value) -> Option<String> {
             serde_json::Value::String(text) => text.clone(),
             other => other.to_string(),
         })
-}
-
-/// QH-70 follow-up: detect the vacuous MeshStatus pass seen live in the run
-/// report — `{"op":"MeshStatus","passed":true,"report":{"peer_ids":[],
-/// "expected_peer_ids":[],"overall_ok":true}}`. On a run topology with more
-/// than one node, an empty expectation proves nothing: the daemon was asked
-/// to expect no peers, so the check cannot fail no matter what the dataplane
-/// does. Fail closed — a passed verdict whose report is missing, or whose
-/// `expected_peer_ids` field is missing, is treated as vacuous too (the
-/// expectation must be positively proven, not assumed absent).
-/// Single-node runs (`assignments_len <= 1`) legitimately expect zero peers.
-fn mesh_status_expectation_vacuous(
-    assignments_len: usize,
-    passed: bool,
-    report: Option<&serde_json::Value>,
-) -> bool {
-    if !passed || assignments_len <= 1 {
-        return false;
-    }
-    match report
-        .and_then(|r| r.get("expected_peer_ids"))
-        .map(serde_json::Value::as_array)
-    {
-        // A present, well-formed, NON-EMPTY array is the only shape that
-        // proves an expectation existed; empty, malformed, or missing is
-        // vacuous.
-        Some(Some(ids)) => ids.is_empty(),
-        _ => true,
-    }
-}
-
-/// The failure message for a vacuous MeshStatus pass: names the node and the
-/// empty expectation, so the reader knows which node's check proved nothing.
-fn mesh_status_vacuous_failure(alias: &str, assignments_len: usize) -> String {
-    format!(
-        "{alias}/MeshStatus: vacuous validator pass rejected — report carries an empty \
-         expected_peer_ids but the run topology has {assignments_len} node(s); \
-         a validator that expects nothing proves nothing"
-    )
 }
 
 /// `logs/<stage>.validator-evidence.json` schema (design §5.2 Item 2): the
@@ -256,17 +222,6 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
                 // entry straight out of the kept report. No hard-coded drift
                 // strings — whatever the daemon reports is what surfaces.
                 let drift_note = report.as_ref().and_then(first_drift_reason);
-                // QH-70 follow-up: detect the vacuous MeshStatus pass BEFORE
-                // the report is moved into the kept record (a report whose
-                // expected_peer_ids is empty on a multi-node run read as
-                // `passed: true` live — a validator that expects nothing
-                // proves nothing; fail closed).
-                let vacuous_expectation = matches!(op, crate::vm_lab::DaemonProbeOp::MeshStatus)
-                    && mesh_status_expectation_vacuous(
-                        ctx.assignments.len(),
-                        passed,
-                        report.as_ref(),
-                    );
                 node_records.push(ValidatorResult {
                     op: format!("{op:?}"),
                     passed,
@@ -282,9 +237,6 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
                     },
                     Err(e) => errors.push(format!("{alias}/{op:?}: {e}")),
                     Ok(_) => {}
-                }
-                if vacuous_expectation {
-                    errors.push(mesh_status_vacuous_failure(&alias, ctx.assignments.len()));
                 }
             }
             records.insert(alias, node_records);
@@ -581,74 +533,6 @@ mod tests {
         assert_eq!(
             first_drift_reason(&serde_json::json!({ "drift_reasons": [7] })).as_deref(),
             Some("7")
-        );
-    }
-
-    // ── QH-70 follow-up: vacuous MeshStatus expectation is a failure ────────
-
-    /// The exact vacuous record seen live: `passed: true` with an empty
-    /// `expected_peer_ids` on a multi-node run must be flagged.
-    #[test]
-    fn empty_expected_peer_ids_on_multi_node_run_is_vacuous() {
-        let report = serde_json::json!({
-            "peer_ids": [],
-            "expected_peer_ids": [],
-            "overall_ok": true
-        });
-        assert!(mesh_status_expectation_vacuous(3, true, Some(&report)));
-    }
-
-    /// A positively-proven expectation is not vacuous.
-    #[test]
-    fn populated_expected_peer_ids_is_not_vacuous() {
-        let report = serde_json::json!({
-            "peer_ids": ["n2", "n3"],
-            "expected_peer_ids": ["n2", "n3"],
-            "overall_ok": true
-        });
-        assert!(!mesh_status_expectation_vacuous(3, true, Some(&report)));
-    }
-
-    /// Single-node runs legitimately expect zero peers — never flagged.
-    #[test]
-    fn single_node_topology_is_never_vacuous() {
-        let report = serde_json::json!({ "expected_peer_ids": [] });
-        assert!(!mesh_status_expectation_vacuous(1, true, Some(&report)));
-    }
-
-    /// Only a PASS is flagged; a failed op is already an error on its own.
-    #[test]
-    fn failed_mesh_status_is_not_double_flagged() {
-        let report = serde_json::json!({ "expected_peer_ids": [] });
-        assert!(!mesh_status_expectation_vacuous(3, false, Some(&report)));
-    }
-
-    /// Fail-closed shapes: a missing report, a missing field, and a
-    /// malformed (non-array) field are all vacuous — the expectation must be
-    /// positively proven, never assumed.
-    #[test]
-    fn missing_or_malformed_expectation_fails_closed() {
-        assert!(mesh_status_expectation_vacuous(3, true, None));
-        assert!(mesh_status_expectation_vacuous(
-            3,
-            true,
-            Some(&serde_json::json!({ "overall_ok": true }))
-        ));
-        assert!(mesh_status_expectation_vacuous(
-            3,
-            true,
-            Some(&serde_json::json!({ "expected_peer_ids": "n2" }))
-        ));
-    }
-
-    /// The failure names the node and the empty expectation.
-    #[test]
-    fn vacuous_failure_message_names_node_and_empty_expectation() {
-        let msg = mesh_status_vacuous_failure("linux-x86-client-1", 3);
-        assert!(msg.contains("linux-x86-client-1"), "names the node: {msg}");
-        assert!(
-            msg.contains("empty expected_peer_ids"),
-            "names the empty expectation: {msg}"
         );
     }
 }

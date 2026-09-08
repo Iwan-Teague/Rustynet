@@ -6675,6 +6675,46 @@ binaries rather than a silent fall back to the default path. Audit the other
 
 **Disposition: OPEN, filed 2026-09-07.**
 
+### QH-81 — the MeshStatus validator cannot express a peer expectation at all: the daemon reports advertised route CIDRs in a field named `expected_peer_ids`/`peer_ids`, so the peer-visibility check is structurally vacuous on every platform
+**Severity: medium (a check that reads as proving peer visibility proves nothing; the live-handshake poll is currently the only thing making the stage meaningful). Confidence: VERIFIED — review
+`MeshStatusEvidenceReview_2026-09-08.md` (this directory) against the live record
+`{"op":"MeshStatus","passed":true,"report":{"peer_ids":[],"expected_peer_ids":[],"overall_ok":true}}`
+and the code cited below.**
+
+The daemon persists `SessionStateSnapshot.peer_ids` from `self.advertised_routes`
+(`rustynetd/src/daemon.rs:9762-9765`) — advertised route CIDRs, not peer node ids —
+so no node id can ever match a `peer_ids` entry, and the orchestrator-side
+`probe_expectations` never emits `--expected-peer-id`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/stage/validate_runtime.rs`,
+`probe_expectations` doc: emitting `ctx.node_ids` would red every node). The
+result: `expected_peer_ids` is `[]` on every MeshStatus record, on every
+platform, on every run shape — the field promises peer ids and cannot carry
+them. A branch attempt to reject the empty expectation orchestrator-side
+(commit `d944c700`) was REVERTED (2026-09-08): the rejection was
+unsatisfiable by construction (no code path could make a ≥2-node run green),
+so it would have failed `validate_baseline_runtime` on every multi-node run
+and cascaded into `deploy_relay`/`traffic_test_matrix`/
+`security_audit_validation`. The data model is mismatched, not the
+orchestrator — relaxing the condition to rescue it was rejected for the same
+reason.
+
+The same gap extends to the legacy consumers:
+`evaluate_linux_mesh_status_report` (`crates/rustynet-cli/src/vm_lab/mod.rs:23631-23656`)
+accepts `overall_ok: true` with an empty `expected_peer_ids` (pinned by its own
+tests, `mod.rs:50377-50401`), and the macOS/Windows focused-runner equivalents
+never check the field. Both now carry an explicit vacuous-pass disclosure
+pointing here.
+
+**NOT orchestrator work.** This needs a daemon-side change: either stop
+naming route CIDRs `peer_ids`/`expected_peer_ids`, or populate a real
+expected-peer list the validator can assert against. Until then, LIVE peer
+visibility is proven by the `mesh_status_validation` stage's live-handshake
+poll (`path_live_peer_count` / `path_programmed_peer_count` /
+`path_latest_live_handshake_unix`), and `validate_baseline_runtime`'s
+MeshStatus op must be read as schema/staleness posture only.
+
+**Disposition: OPEN, filed 2026-09-08 (daemon-side fix required).**
+
 ### QH-77 — `vm_lab::tests::local_utm_process_present_uses_wide_ps_output` fails under heavy host load (observed once, 2026-09-07)
 **Severity: low (test flake, no product bearing). Confidence: OBSERVED once during `cargo test -p rustynet-cli --lib --all-features` on the merged tree while two other cargo jobs and a secrets-hygiene gate contended for the same target dir; the same test passed 3/3 in isolation immediately afterwards (4–15 s each, i.e. slow), and the full workspace gate on the same tree had passed it minutes earlier.**
 
