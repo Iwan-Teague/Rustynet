@@ -7067,3 +7067,58 @@ read itself succeeded, so absence is proven, not assumed).
 
 **Disposition: FIXED on main; Windows-guest execution of the runner tests
 OPEN until the next Windows lab campaign.**
+
+### QH-85 — the macOS sudoers-priming path put the lab SSH password on the local argv (`sshpass -p`) and carried the guest sudo password as a source literal (`echo '<literal>' | sudo -S`) in a public repository — FIXED 2026-09-08, password rotation OWED
+
+**Severity: high (a live lab credential was published; lab guests only, but
+the repository is public and the literal is in history since `6908f20d`).
+Confidence: VERIFIED — the literal matched the untracked secrets sidecar for
+five guests. Source: GLM-flash privileged-exec audit of the lab robot
+(2026-09-08, `MultiAgentSecurityReviewAudit_2026-09-08.md` §4 item 3), findings
+F1/F2; F3 (inventory `ssh_target`/`ssh_user` denylist validators + missing `--`
+guard) is tracked separately below.**
+
+`prime_remote_access` (`crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs`)
+built `sshpass -p <password> ssh …` (password visible to every process on the
+orchestrator host via `ps`) and then pushed the `NOPASSWD` sudoers grant with a
+remote command that echoed a hardcoded literal into `sudo -S`. That literal
+arrived as a drive-by hunk in `6908f20d` and was never reviewed as a secret.
+`scripts/ci/secrets_hygiene_gates.sh` did not catch it: it checks inventory
+`ssh_password` fields and a token denylist, not literals in Rust source
+(pattern F of the 2026-09-08 review — a denylist where default-deny is
+required).
+
+**Fix.** One builder `sshpass_ssh_command` used by both invocations: the
+password reaches sshpass through the `SSHPASS` environment variable
+(`sshpass -e`), never `-p`; the destination is preceded by `--` so an
+inventory `ssh_target`/`ssh_user` beginning with `-` cannot be parsed as an
+ssh option; the sudo password is written to the remote `sudo -S` stdin through
+the SSH channel from the sidecar value, so no credential appears in this
+source, on the local argv, or on the guest command line. The literal is gone
+from the tree.
+
+**Fail-closed analysis.** No sidecar password → the `Some(password)` arm is
+not entered (unchanged: Linux/keyed guests). stdin pipe not created → `Err`
+and the child is killed. Password write fails → `Err` even if the child
+exited 0. Non-zero exit → `Err` (unchanged). Wrong password → `sudo -S`
+fails → non-zero → `Err`.
+
+**Test, with the mutation it catches:**
+`sshpass_prime_commands_never_carry_the_password_in_argv_or_source` — (1)
+`.arg("-p").arg(password)` reintroduced → argv scan finds the password; (2)
+`-e`/`SSHPASS` dropped → env assertion fails; (3) an `echo '<x>' | sudo -S`
+remote command → source pin (sliced BEFORE the test module) finds `| sudo -S`;
+(4) `--` removed → destination-guard assertion fails.
+
+**Owner actions OWED:** rotate the lab password shared by the five affected
+guests (it is in public git history and cannot be unpublished), then update
+the untracked sidecar. **Follow-ups (open):** F3 — replace the denylist
+`ensure_ssh_target`/`ensure_ssh_user`/`last_known_ip` validators in
+`vm_lab/mod.rs` with allowlists (reuse `validated_args::connection_user`,
+require `last_known_ip` to parse as `IpAddr`) and add the sink-side gate
+(every `ssh`/`scp` spawn under `vm_lab/**` carries `--` before the
+destination; `sshpass` never carries `-p`); extend
+`secrets_hygiene_gates` to reject `| sudo -S` fed by an echo literal and
+`sshpass -p` anywhere under `crates/`.
+
+**Disposition: FIXED on main (F1/F2); rotation + F3 + gate extension OPEN.**
