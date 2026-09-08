@@ -5602,11 +5602,13 @@ impl DataplaneSystem for MacosCommandSystem {
                 output.status, output.stderr
             )));
         }
-        if !output.stdout.contains(MACOS_PF_TERMINAL_BLOCK_RULE) {
-            return Err(SystemError::KillSwitchAssertionFailed(
-                "pf killswitch rule missing".to_owned(),
-            ));
-        }
+        // PF-05: presence is not precedence. pf evaluates top-down and `quick`
+        // wins immediately, so a `pass out quick` ABOVE the terminator makes
+        // the block unreachable while its text is still in the dump. Walk the
+        // anchor's rules in evaluation order and credit the terminator only
+        // when it is reachable (the same evaluator the offline report uses).
+        crate::macos_exit_killswitch_precedence::evaluate_macos_killswitch_rules(&output.stdout)
+            .map_err(SystemError::KillSwitchAssertionFailed)?;
         if self.dns_protected {
             if !Self::ruleset_contains_dns_rule(
                 &output.stdout,
@@ -14535,6 +14537,70 @@ mod tests {
                 .any(|cmd| cmd.contains("nft delete table ip rustynet_nat_g2")),
             "target nat table must not be pruned"
         );
+    }
+
+    /// PF-05 (AdversarialSecurityRemediation_2026-07-29 §S2; ledger-tick found
+    /// 2026-09-08): `assert_killswitch` used to be a substring search for the
+    /// terminal block, so a `pass out quick` ABOVE it — which pf honours first
+    /// — left the killswitch open while the assertion reported it verified.
+    /// The live assertion now walks the anchor rules through
+    /// `evaluate_macos_killswitch_rules`. Mutation caught: restoring the
+    /// `stdout.contains(MACOS_PF_TERMINAL_BLOCK_RULE)` check makes the
+    /// escaped ruleset pass this test's first arm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn macos_assert_killswitch_rejects_a_quick_pass_above_the_terminator() {
+        fn assert_with_rules(tag: &str, rules: &str) -> Result<(), SystemError> {
+            let socket_path = phase10_test_socket_path(tag);
+            let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![(
+                    "pfctl -a com.apple/rustynet_g1 -s rules".to_owned(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: rules.to_owned(),
+                        stderr: String::new(),
+                    },
+                )],
+            );
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system =
+                MacosCommandSystem::new("utun9", "en0", Some(client), false, Vec::new())
+                    .expect("macos command system should initialize");
+            system.anchor_name = Some("com.apple/rustynet_g1".to_owned());
+            let result = system.assert_killswitch();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            result
+        }
+
+        // Escaped: the terminator's text is present, but an interface-wide
+        // quick pass above it wins first. The old substring check credited
+        // this; the precedence walk must not.
+        let escaped =
+            "pass quick on lo0 all\npass out quick on en0 all\nblock drop out quick all\n";
+        let err = assert_with_rules("pf05e", escaped).expect_err("escaped ruleset must fail");
+        match err {
+            SystemError::KillSwitchAssertionFailed(reason) => assert!(
+                reason.contains("quick") && reason.contains("above"),
+                "reason must name the precedence defect: {reason}"
+            ),
+            other => panic!("unexpected error kind: {other:?}"),
+        }
+
+        // Contained: tunnel-scoped and loopback quick passes above the
+        // terminator are how encrypted traffic legitimately leaves.
+        let contained =
+            "pass quick on lo0 all\npass out quick on utun9 all\nblock drop out quick all\n";
+        assert_with_rules("pf05c", contained).expect("contained ruleset must pass");
+
+        // Missing terminator: still rejected, as before.
+        let missing = "pass quick on lo0 all\npass out quick on utun9 all\n";
+        assert_with_rules("pf05m", missing).expect_err("missing terminator must fail");
     }
 
     #[cfg(target_os = "linux")]
