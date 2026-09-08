@@ -68,6 +68,7 @@ From `documents/operations/active/vm_lab_inventory.json` plus the QH-41 verified
 | `lenovo-client-1`, `lenovo-exit-1` | libvirt on `lenovo-bot` (192.168.0.29), bridged via `br0` | 192.168.0.0/24 (the real LAN) | `lenovo-client-1` = 192.168.0.30. |
 | `debian-lan-11` | — | 192.168.0.0/24 | Real LAN. |
 | `linux-x86-client-1`, `linux-x86-exit-1`, `windows-x86-1`, `fedora-x86-1` | libvirt on `ubuntu-kvm-1` | 192.168.121.0/24 | Unreachable from both the UTM island and the real LAN (CN-PROOF probes: 100% loss from both sides). Out of scope. |
+| *(none yet)* | libvirt on `katana` (tailnet `debian`, 100.122.143.29; Wi-Fi 192.168.18.44/24) | 192.168.122.0/24 (NAT on `virbr0`; no bridging over Wi-Fi) | **Added 2026-09-09.** Third host on a THIRD physical LAN (192.168.18.0/24), x86-64 with nested virt (`kvm_intel nested=Y`), ovmf+swtpm+virtio-win staged for a Windows 11 x64 guest; replaces the offline `ubuntu-kvm-1` for the Windows cell. Reached only over the tailnet from the Mac and lenovo-bot, so a lenovo↔katana cross-network run needs guests exposed through the host (port-forward or a tailscale subnet route on katana) — no Mac host-networking change (CP-1) involved. Owner: nothing valuable on the box. Provisioning state: repo clone + apt build deps + pinned rustup in progress; Windows x64 ISO and a Debian cloud image are NOT on the host yet (owner download approval pending). |
 
 ### 2.2 Why CN-3 skipped on this fleet (the gap, precisely)
 
