@@ -1010,7 +1010,10 @@ mod tests {
         // And the stage's seam implementation redistributes BEFORE it polls
         // — likewise sliced to the owning fn body so a doc-comment mention
         // of either call cannot satisfy the pin.
-        let stage_rs = include_str!("macos_reboot_recovery_validation.rs");
+        let stage_rs = crate::vm_lab::implementation_source_slice(include_str!(
+            "macos_reboot_recovery_validation.rs"
+        ))
+        .expect("macos_reboot_recovery_validation.rs implementation slice must parse");
         let stage_fn_start = stage_rs
             .find("fn redistribute_fresh_bundles_and_await_generation(")
             .expect("the seam implementation fn must exist in this file");

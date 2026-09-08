@@ -2054,15 +2054,64 @@ fn run_logged_test(root_dir: &Path, log_path: &Path, command: &[&str]) -> Result
         .and_then(|_| file.write_all(output.stderr.as_bytes()))
         .map_err(|err| format!("failed to append log {}: {err}", log_path.display()))?;
     print!("{}{}", output.stdout, output.stderr);
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
+    verify_logged_test_harness_output(command, output.status, &output.stdout, &output.stderr)
+}
+
+/// Decides whether a logged `cargo test` invocation may count as a pass.
+///
+/// A successful exit status alone is NOT enough: the cargo test harness exits 0
+/// even when its filter matched nothing, so a typo'd or renamed test name makes
+/// this gate "pass" having executed zero tests. The verdict therefore also
+/// requires the harness summary to report at least one passed test, parsed with
+/// the same parser `ops_phase9` uses for its required-test verification.
+fn verify_logged_test_harness_output(
+    command: &[&str],
+    status: ExitStatus,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), String> {
+    if !status.success() {
+        return Err(format!(
             "command {} failed with status {}",
             command.join(" "),
-            output.status
-        ))
+            status
+        ));
     }
+    let passed_tests =
+        crate::ops_phase9::parse_required_test_output_total_passed(&format!("{stdout}{stderr}"));
+    if passed_tests < 1 {
+        return Err(format!(
+            "logged test command {} matched zero tests (filter={:?}, parsed passed_tests={}); \
+             the harness exited successfully without running anything, which is not a pass",
+            command.join(" "),
+            logged_test_filter(command),
+            passed_tests,
+        ));
+    }
+    Ok(())
+}
+
+/// Extracts the test-name filter from a `cargo test ... <filter> -- <args>`
+/// command line, for error reporting. The first positional argument after the
+/// subcommand that is neither a flag nor a flag value (only `-p`/`--package`
+/// take a separate value here) is the test filter.
+fn logged_test_filter(command: &[&str]) -> String {
+    let mut args = command.iter().skip(1);
+    for &arg in args.by_ref() {
+        if arg == "test" {
+            break;
+        }
+    }
+    for &arg in args.by_ref() {
+        if arg == "-p" || arg == "--package" {
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        return arg.to_owned();
+    }
+    "<no filter>".to_owned()
 }
 
 fn run_command_capture_allow_failure(
@@ -2829,5 +2878,102 @@ mod tests {
             "status!=pass message must quote the offending status value: {err}"
         );
         let _ = fs::remove_file(&path);
+    }
+
+    /// Counter-backed temp names: `unique_suffix()` is clock-based and two
+    /// parallel tests can land on the same coarse timestamp on macOS, which
+    /// made one test execute another's script file.
+    fn next_logged_test_seq() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn logged_test_command(body: &str, exit_code: i32) -> Vec<&'static str> {
+        // Round-trip the body/exit through a script file so no quoting rules
+        // leak into the assertion being tested.
+        let script = env::temp_dir().join(format!(
+            "rustynet-logged-test-{}-{}.sh",
+            std::process::id(),
+            next_logged_test_seq()
+        ));
+        fs::write(&script, format!("{body}\nexit {exit_code}\n")).unwrap();
+        let script_str: &'static str = Box::leak(
+            script
+                .into_os_string()
+                .into_string()
+                .unwrap()
+                .into_boxed_str(),
+        );
+        vec!["sh", script_str]
+    }
+
+    fn run_logged_test_with(body: &str, exit_code: i32) -> Result<(), String> {
+        let root = env::temp_dir();
+        let log = root.join(format!(
+            "rustynet-logged-test-{}-{}.log",
+            std::process::id(),
+            next_logged_test_seq()
+        ));
+        let result = run_logged_test(&root, &log, &logged_test_command(body, exit_code));
+        let _ = fs::remove_file(&log);
+        result
+    }
+
+    #[test]
+    fn logged_test_zero_match_filter_fails_loudly() {
+        // Mutation caught: reverting run_logged_test to a bare
+        // `output.status.success()` check makes this return Ok and the test
+        // fail — the vacuous-filter hole reopens.
+        let err = run_logged_test_with(
+            "printf 'running 0 tests\\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n'",
+            0,
+        )
+        .expect_err("a zero-match filter must not count as a pass");
+        assert!(
+            err.contains("matched zero tests"),
+            "error must name the vacuous-filter condition: {err}"
+        );
+        assert!(
+            err.contains("passed_tests=0"),
+            "error must carry the parsed count: {err}"
+        );
+    }
+
+    #[test]
+    fn logged_test_real_pass_succeeds() {
+        run_logged_test_with(
+            "printf 'running 1 test\\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\\n'",
+            0,
+        )
+        .expect("a genuinely passing test must remain a pass");
+    }
+
+    #[test]
+    fn logged_test_real_failure_still_fails() {
+        // Mutation caught: if the vacuous-filter guard accidentally swallowed
+        // genuine failures (e.g. checked the summary before the status), this
+        // would stop failing.
+        let err = run_logged_test_with(
+            "printf 'running 1 test\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out\\n'",
+            101,
+        )
+        .expect_err("a real failure must still fail");
+        assert!(
+            err.contains("failed with status"),
+            "error must report the failing status: {err}"
+        );
+    }
+
+    #[test]
+    fn logged_test_unparseable_output_fails_closed() {
+        // Mutation caught: any attempt to default to success (or skip the
+        // check) when no summary line is present makes this return Ok.
+        let err = run_logged_test_with("echo 'hello world'", 0)
+            .expect_err("output without a harness summary must fail closed");
+        assert!(
+            err.contains("matched zero tests"),
+            "unparseable output must fail through the same loud path: {err}"
+        );
     }
 }

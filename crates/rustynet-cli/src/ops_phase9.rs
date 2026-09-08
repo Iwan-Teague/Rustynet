@@ -3212,7 +3212,11 @@ fn phase9_contains_any_case_insensitive(value: &str, tokens: &[&str]) -> bool {
     tokens.iter().any(|token| lowered.contains(token))
 }
 
-fn parse_required_test_output_total_passed(output: &str) -> u64 {
+/// Sums the `passed` counters out of every `test result: ok.` summary line in a
+/// cargo/nextest harness transcript. Shared with `ops_ci_release_perf`'s
+/// `run_logged_test` (via this crate-internal visibility) so that gate cannot
+/// drift from this parser or grow a second, weaker one.
+pub(crate) fn parse_required_test_output_total_passed(output: &str) -> u64 {
     const PREFIX: &str = "test result: ok.";
     output
         .lines()
