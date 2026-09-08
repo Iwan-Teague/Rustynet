@@ -7164,7 +7164,7 @@ directions (a docker masquerade cannot fail a correct node; a foreign forward
 rule cannot pass an empty one). macOS: `pfctl -a com.rustynet/blind_exit -s
 rules` must show the mesh-sourced inbound pass on the tunnel and outbound
 pass on the egress, and `pfctl -a com.rustynet/nat -s nat` must be empty.
-Windows unchanged, annotated: H3 (silent NAT downgrade) owns it.
+Windows unchanged, annotated: H3 (silent NAT downgrade) owns it — H3 itself is closed: `88adebe6` refuses `blind_exit` in the Windows NAT stage, and the follow-up on 2026-09-09 refuses it at daemon startup (`validate_node_role_backend_capabilities` rejects `blind_exit` on `windows-wireguard-nt`, test `node_role_backend_capability_gate_rejects_unsupported_backend`) and in the installer (`[ValidateSet]` on `-NodeRole` without `blind_exit`).
 
 **Tests, each naming the mutation it catches:**
 `linux_fails_closed_when_no_forwarding_rules` (three REAL fixtures: killswitch
