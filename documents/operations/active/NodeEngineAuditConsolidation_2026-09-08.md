@@ -143,8 +143,10 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    literal. GLM-flash edit job, vm_lab only.
 6. **requires()/provisions()** per probe B — GLM-5.3 design-then-implement,
    depends on QH-83 landing first (same runner seam).
-7. **C: I1, I3, I4** small fixes (GLM-flash), then the `PlatformCapabilities`
-   table (L) after QH-82.
+7. **C: I1, I3** small fixes (GLM-flash, after QH-82 lands — same stage
+   files), then the `PlatformCapabilities` table (L). **I4 DONE** (this
+   commit): the non-Linux arm of `validate_bundle_pull_log_redaction` is now
+   `Err`, coverage decisions belong to the caller.
 8. **D: pattern G parity** — DONE (this commit): `evaluate_linux_runtime_acls_report`,
    `evaluate_linux_key_custody_report`, `evaluate_macos_key_custody_report`,
    `evaluate_macos_service_hardening_report` now reject `overall_ok=true`
