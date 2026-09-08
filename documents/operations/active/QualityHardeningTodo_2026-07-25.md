@@ -7136,3 +7136,46 @@ destination; `sshpass` never carries `-p`); extend
 `sshpass -p` anywhere under `crates/`.
 
 **Disposition: FIXED on main (F1/F2); rotation + F3 + gate extension OPEN.**
+
+### QH-86 — the blind_exit runtime validator passed on ANY output: `iptables -t nat -L` prints a chain header and `pfctl -s nat` prints every host NAT, so a blind_exit that installed nothing was blessed — FIXED 2026-09-09
+
+**Severity: high for ledger integrity (this validator is the whole runtime
+proof behind `BlindExitStage`; vm-lab is default-off so no shipped-code
+impact). Confidence: VERIFIED — B3 of
+`NodeEngineAuditConsolidation_2026-09-08.md` §2-A, re-read against
+`linux_blind_exit::build_linux_blind_exit_forward_commands` and
+`macos_blind_exit::render`, which define what a blind_exit actually installs.**
+
+`role_validation/blind_exit.rs` probed `iptables -t nat -L POSTROUTING || nft
+list ruleset` and `pfctl -s nat` and accepted any non-empty stdout. Both
+commands print something on every host (the iptables chain header; a
+libvirt/docker/Internet-Sharing NAT), so the only failing fixture the old
+test used (`stdout: Vec::new()`) was one the real producer cannot emit
+(pattern B of the 2026-09-08 review). Worse, a blind_exit installs NO
+masquerade — it forwards mesh-sourced traffic without translating — so the
+old probe was looking for the wrong thing entirely.
+
+**Fix.** Linux: read `nft list ruleset` (exit status checked, stderr folded
+in), then judge only `rustynet*` tables: the forward chain must carry
+`ct state established,related accept` and an `iifname … oifname … saddr …
+accept` rule, and NO rustynet table may hold `masquerade` (a masquerade means a
+regular exit is wearing the role). Foreign tables are ignored in both
+directions (a docker masquerade cannot fail a correct node; a foreign forward
+rule cannot pass an empty one). macOS: `pfctl -a com.rustynet/blind_exit -s
+rules` must show the mesh-sourced inbound pass on the tunnel and outbound
+pass on the egress, and `pfctl -a com.rustynet/nat -s nat` must be empty.
+Windows unchanged, annotated: H3 (silent NAT downgrade) owns it.
+
+**Tests, each naming the mutation it catches:**
+`linux_fails_closed_when_no_forwarding_rules` (three REAL fixtures: killswitch
+table without forward rules, the iptables chain header, empty — mutation:
+revert to `stdout.trim().is_empty()`), `linux_fails_closed_when_rustynet_table_masquerades`
+(drop the masquerade check), `linux_ignores_foreign_tables_in_both_directions`
+(judge every table), `linux_fails_closed_when_nft_exits_non_zero` (drop
+`is_success()`), `macos_fails_closed_on_empty_or_foreign_anchor_output`
+(revert to non-empty stdout), `macos_fails_closed_when_exit_nat_anchor_translates`
+(drop the NAT-anchor check), `macos_fails_closed_when_pfctl_exits_non_zero`.
+
+**Disposition: FIXED on main; live re-proof of the Linux blind_exit cell owed
+(the validator now demands the real rule shape, so the next run is the
+first honest one).**
