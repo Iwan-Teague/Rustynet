@@ -53174,6 +53174,182 @@ mod secrets_sidecar_tests {
 }
 
 #[cfg(test)]
+mod inventory_ssh_destination_allowlist_tests {
+    //! QH-85 F3: the inventory parse boundary must be an allowlist for every
+    //! field that becomes an ssh/scp destination, not a denylist. Each test
+    //! names the mutation it catches; `required_string_field` still owns the
+    //! absent-field case and is not touched here.
+
+    use super::load_inventory_with_hosts;
+    use std::path::{Path, PathBuf};
+
+    /// Minimal valid inventory whose single entry carries the three
+    /// destination fields under test. Passing `None` leaves a field out of the
+    /// JSON entirely, so the absent-field path stays exercised too.
+    fn write_entry_inventory(
+        dir: &Path,
+        ssh_target: Option<&str>,
+        ssh_user: Option<&str>,
+        last_known_ip: Option<&str>,
+    ) -> PathBuf {
+        // Hostile values may contain `"`/`\`/newline; escape them so serde_json
+        // reconstructs the exact hostile string before our validator sees it
+        // (otherwise the JSON parser rejects the file before validation runs).
+        let json_escape = |v: &str| {
+            v.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        };
+        let target = ssh_target
+            .map(|v| format!(r#""ssh_target": "{}","#, json_escape(v)))
+            .expect("ssh_target is required_string_field; tests always set it");
+        let user = ssh_user
+            .map(|v| format!(r#""ssh_user": "{}","#, json_escape(v)))
+            .unwrap_or_default();
+        let ip = last_known_ip
+            .map(|v| format!(r#""last_known_ip": "{}","#, json_escape(v)))
+            .unwrap_or_default();
+        let body = format!(
+            r#"{{
+              "version": 1,
+              "entries": [
+                {{
+                  "alias": "guest-a",
+                  "vm_name": "guest-a",
+                  {target}
+                  {user}
+                  {ip}
+                  "controller": {{
+                    "type": "local_utm",
+                    "utm_name": "guest-a",
+                    "bundle_path": "/tmp/guest-a.utm"
+                  }}
+                }}
+              ]
+            }}"#
+        );
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(&path, body).expect("write inventory");
+        path
+    }
+
+    /// MUTATION CAUGHT: reverting `ensure_ssh_target` to the old denylist
+    /// (whitespace + control characters only) lets `-oProxyCommand=x`,
+    /// `-F/tmp/x`, and `héte` through the parser — the pre-`c3b127cf` shape in
+    /// which a leading `-` reached the ssh argv as an option before the `--`
+    /// guards existed. Empty, `host; rm` (whitespace), and interior control
+    /// characters were rejected by the denylist too; the allowlist must keep
+    /// rejecting all of them. Note `required_string_field` trims the raw JSON
+    /// string before validation, so a value like `"host\n"` normalises to
+    /// `"host"` — the newline never survives the boundary; an INTERIOR newline
+    /// (`"ho\nst"`) survives the trim and must still be rejected here.
+    #[test]
+    fn ssh_target_allowlist_rejects_hostile_destinations() {
+        for hostile in [
+            "-oProxyCommand=x",
+            "-F/tmp/x",
+            "host; rm",
+            "ho\nst",
+            "héte",
+            "",
+        ] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let inv = write_entry_inventory(temp.path(), Some(hostile), None, None);
+            let err = load_inventory_with_hosts(&inv)
+                .expect_err("must reject hostile ssh_target")
+                .to_owned();
+            assert!(
+                err.contains("ssh_target"),
+                "rejection of {hostile:?} must name the field, got: {err}"
+            );
+        }
+    }
+
+    /// MUTATION CAUGHT: removing the `starts_with('-')` arm (or breaking the
+    /// delegation to `validated_args::connection_user`) re-admits `-oFoo` as a
+    /// user that ssh would parse as an option via `-l`. `""` normalises to an
+    /// absent optional field (the trim-then-filter in `optional_string_field`)
+    /// and is asserted for exactly that; `"a\nb"` is the interior-control case
+    /// the trim cannot hide.
+    #[test]
+    fn ssh_user_allowlist_rejects_hostile_users() {
+        for (hostile, field_class) in [("-oFoo", "SSH user"), ("a b", "SSH user"), ("a\nb", "SSH user")] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let inv = write_entry_inventory(temp.path(), Some("10.0.0.9"), Some(hostile), None);
+            let err = load_inventory_with_hosts(&inv)
+                .expect_err("must reject hostile ssh_user")
+                .to_owned();
+            assert!(
+                err.contains(field_class),
+                "rejection of {hostile:?} must name the field class, got: {err}"
+            );
+        }
+        // An empty value cannot survive as a user: it is normalised to an
+        // absent optional field, never to Some("").
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let inv = write_entry_inventory(temp.path(), Some("10.0.0.9"), Some(""), None);
+        let (entries, _) = load_inventory_with_hosts(&inv).expect("empty user normalises");
+        assert_eq!(
+            entries[0].ssh_user, None,
+            "an empty ssh_user must not parse into Some(\"\")"
+        );
+    }
+
+    /// MUTATION CAUGHT: reverting `last_known_ip` to the old
+    /// `ensure_no_control_chars` denylist re-admits `-4` (no control
+    /// characters, pure option shape) and `"10.0.0.1 -oX"`/`"not an ip"` in
+    /// any denylist variant that only blocks control characters.
+    #[test]
+    fn last_known_ip_must_parse_as_an_ip_address() {
+        for hostile in ["-4", "10.0.0.1 -oX", "not an ip"] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let inv = write_entry_inventory(temp.path(), Some("10.0.0.9"), None, Some(hostile));
+            let err = load_inventory_with_hosts(&inv)
+                .expect_err("must reject non-IP last_known_ip")
+                .to_owned();
+            assert!(
+                err.contains("last_known_ip"),
+                "rejection of {hostile:?} must name the field, got: {err}"
+            );
+        }
+    }
+
+    /// The allowlist must not be stricter than the real fleet: every entry of
+    /// the tracked inventory (IPv4 and hostname targets, plain users, and the
+    /// libvirt `qemu+ssh://user@host/system` URIs whose authorities are
+    /// validated too) must still parse. Blindness guard: assert the load
+    /// actually produced the fleet, not an empty file.
+    #[test]
+    fn real_lab_inventory_still_parses_under_the_allowlist() {
+        let real = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../documents/operations/active/vm_lab_inventory.json");
+        let (entries, hosts) = load_inventory_with_hosts(&real)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "tracked vm_lab_inventory.json must still parse under the \
+                     destination allowlist: {err}"
+                )
+            });
+        assert!(entries.len() >= 10, "fleet entries vanished: {}", entries.len());
+        assert!(hosts.len() >= 1, "hosts vanished: {}", hosts.len());
+    }
+
+    /// Positive unit cases the denylist could not express: an IPv6 literal
+    /// target (needs `:`), a `user@host` form (needs `@`), and a hostname with
+    /// a trailing DNS dot must all parse; `..` is inert because the value is a
+    /// single argv element after `--`, never a shell word or path segment.
+    #[test]
+    fn allowlist_still_accepts_ipv6_user_host_and_trailing_dot_forms() {
+        for target in ["2001:db8::1", "user@host.example.com", "host.example.com.", "a..b"] {
+            let temp = tempfile::TempDir::new().expect("tempdir");
+            let inv = write_entry_inventory(temp.path(), Some(target), None, Some("fe80::1"));
+            load_inventory_with_hosts(&inv)
+                .unwrap_or_else(|err| panic!("ssh_target {target:?} must parse: {err}"));
+        }
+    }
+}
+
+#[cfg(test)]
 mod local_utm_locality_tests {
     use super::{LabHost, LabHostKind, discover_local_utm_host};
     use std::path::{Path, PathBuf};
