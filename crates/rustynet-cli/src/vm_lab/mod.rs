@@ -44658,12 +44658,24 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         // result depends only on the stub's behaviour. The regression coverage
         // is unchanged and still fails on behaviour, not on the clock: a
         // narrowed argument list (plain `ps` instead of `axww -o command`)
-        // trips the args-log assertion, and a broken needle match or UTF-8
-        // handling trips the `present` assertion via the real spawn+parse
-        // path.
-        let present =
-            local_utm_process_present_with_ps(ps.as_path(), bundle.as_path(), Duration::MAX)
-                .expect("process probe should succeed");
+        // trips the args-log assertion, and a broken needle match trips the
+        // `present` assertion via the real spawn+parse path. (It does NOT
+        // guard the strict-UTF-8 error branch: the stub emits valid UTF-8, so
+        // a regression confined to that branch is invisible here.)
+        //
+        // The budget is large but FINITE, deliberately. `Duration::MAX` would
+        // also remove the load sensitivity, but it converts a pathological
+        // stall — a stub that never exits, a host in scheduling meltdown —
+        // from a bounded failure into an unbounded hang, and nextest has no
+        // per-test timeout to catch that, so one wedged test would hold the
+        // whole pool with no diagnosis. An hour is unreachable for a probe
+        // that completes in milliseconds while still terminating.
+        let present = local_utm_process_present_with_ps(
+            ps.as_path(),
+            bundle.as_path(),
+            Duration::from_secs(3600),
+        )
+        .expect("process probe should succeed");
 
         assert!(present);
         assert_eq!(
