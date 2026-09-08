@@ -1,10 +1,50 @@
 #![allow(dead_code)]
+use std::collections::HashMap;
+use std::path::Path;
+
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{StageOutcome, TrafficTestResult};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 pub struct TrafficTestMatrixStage;
+
+/// Mesh-IP settle budget for the fresh-collection loop before it accepts
+/// whatever it has. Shortened under cfg(test) so the collision-at-deadline
+/// test reaches the accept branch in ~1 s instead of sleeping 60 s.
+#[cfg(test)]
+const MESH_IP_SETTLE_SECS: u64 = 1;
+#[cfg(not(test))]
+const MESH_IP_SETTLE_SECS: u64 = 60;
+#[cfg(test)]
+const MESH_IP_RETRY_INTERVAL_SECS: u64 = 0;
+#[cfg(not(test))]
+const MESH_IP_RETRY_INTERVAL_SECS: u64 = 3;
+
+/// The settle deadline for the fresh mesh-IP collection loop.
+fn deadline() -> std::time::Instant {
+    std::time::Instant::now() + std::time::Duration::from_secs(MESH_IP_SETTLE_SECS)
+}
+
+/// The per-pair results witness backing the traffic-matrix verdict (QH-83
+/// `File` declaration on `StageId::TrafficTestMatrix`; H4 collision guard).
+const PAIR_RESULTS_RELATIVE: &str = "logs/traffic_test_matrix.pair_results.log";
+
+/// Write the pair-results witness. Called before EVERY return after mesh-IP
+/// collection (pass, fail, and collision-fail) so the verdict is never
+/// recorded without the on-disk evidence behind it. An unwritable witness is
+/// itself a failure: the stage must not pass with the evidence missing.
+fn write_pair_results(report_dir: &Path, lines: &[String]) -> Result<(), String> {
+    let path = report_dir.join(PAIR_RESULTS_RELATIVE);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("create logs dir for pair-results witness: {err}"))?;
+    }
+    let mut body = lines.join("\n");
+    body.push('\n');
+    std::fs::write(&path, body)
+        .map_err(|err| format!("write pair-results witness {}: {err}", path.display()))
+}
 
 impl OrchestrationStage for TrafficTestMatrixStage {
     fn id(&self) -> StageId {
@@ -25,6 +65,7 @@ impl OrchestrationStage for TrafficTestMatrixStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        let mut evidence: Vec<String> = Vec::new();
 
         // Always re-collect mesh IPs fresh here.  The values cached during
         // collect_pubkeys were gathered before bundle distribution and
@@ -33,14 +74,19 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         // assignment.  After enforce_runtime the daemon applies the assignment
         // bundle and sets the correct unique IP.
         //
-        // Retry for up to 60 s to allow the WireGuard interface to settle and
-        // to detect IP collisions (duplicate IPs across nodes indicate the
-        // assignment bundle has not yet been applied).
-        {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // Retry for up to MESH_IP_SETTLE_SECS to allow the WireGuard interface
+        // to settle and to detect IP collisions (duplicate IPs across nodes
+        // indicate the assignment bundle has not yet been applied).
+        //
+        // H4: a collision still present AT THE DEADLINE is a failure, not a
+        // degraded accept. The pre-guard code accepted the duplicates, after
+        // which every "pair" pinged the shared IP — i.e. a node pinging
+        // itself — and the matrix passed as a no-op. The guard fails the
+        // stage naming the duplicate IP and its aliases instead.
+        let collisions: Vec<(String, Vec<String>)> = {
+            let settle_deadline = deadline();
             loop {
-                let mut fresh: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
+                let mut fresh: HashMap<String, String> = HashMap::new();
                 let mut any_error = false;
                 for alias in &aliases {
                     match ctx
@@ -63,19 +109,74 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                 let has_collision = unique_count.len() < fresh.len();
                 let has_missing = any_error || fresh.len() < aliases.len();
                 // Accept results or keep retrying until deadline.
-                if (!has_collision && !has_missing) || std::time::Instant::now() >= deadline {
+                if (!has_collision && !has_missing) || std::time::Instant::now() >= settle_deadline
+                {
+                    // Group aliases by IP so the collision report can name every
+                    // node sharing a duplicate address (computed before `fresh`
+                    // moves into the context).
+                    let mut ip_aliases: HashMap<String, Vec<String>> = HashMap::new();
+                    for (alias, ip) in &fresh {
+                        ip_aliases
+                            .entry(ip.clone())
+                            .or_default()
+                            .push(alias.clone());
+                    }
+                    let mut collisions: Vec<(String, Vec<String>)> = ip_aliases
+                        .into_iter()
+                        .filter(|(_ip, aliases)| aliases.len() > 1)
+                        .collect();
+                    collisions.sort();
+                    for (_ip, shared) in &mut collisions {
+                        shared.sort();
+                    }
                     // Replace stale cached entries with fresh data.  Stale
                     // collect_pubkeys entries (pre-enforce IP values) must not
                     // survive into the traffic test; clear the map first so any
                     // node that failed collection here does not retain a stale IP.
                     ctx.mesh_ips.clear();
-                    for (alias, ip) in fresh {
-                        ctx.mesh_ips.insert(alias, ip);
-                    }
-                    break;
+                    ctx.mesh_ips.extend(fresh);
+                    break collisions;
                 }
-                std::thread::sleep(std::time::Duration::from_secs(3));
+                std::thread::sleep(std::time::Duration::from_secs(MESH_IP_RETRY_INTERVAL_SECS));
             }
+        };
+
+        // Witness header + the mesh-IP assignment snapshot behind whatever
+        // verdict follows.
+        evidence.push("# traffic_test_matrix pair results".to_owned());
+        for alias in &aliases {
+            match ctx.mesh_ips.get(alias) {
+                Some(ip) => evidence.push(format!("node: {alias} mesh_ip: {}", single_line(ip))),
+                None => evidence.push(format!("node: {alias} mesh_ip: (missing)")),
+            }
+        }
+        for (ip, shared) in &collisions {
+            evidence.push(format!(
+                "collision: ip={} aliases={}",
+                single_line(ip),
+                shared.join(",")
+            ));
+        }
+
+        if !collisions.is_empty() {
+            let detail = collisions
+                .iter()
+                .map(|(ip, shared)| format!("ip {ip} assigned to {}", shared.join(" and ")))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let message = format!(
+                "mesh IP collision at settle deadline: {detail} — the assignment bundle was \
+                 not applied distinctly on every node; failing instead of running a self-ping \
+                 matrix that would vacuously pass"
+            );
+            // The witness is written BEFORE the failure return so the verdict
+            // carries its evidence even on this path.
+            return match write_pair_results(&ctx.report_dir, &evidence) {
+                Ok(()) => StageOutcome::Failed(message),
+                Err(write_err) => StageOutcome::Failed(format!(
+                    "{message}; ALSO failed to write the pair-results witness: {write_err}"
+                )),
+            };
         }
 
         if ctx.mesh_ips.is_empty() {
@@ -121,6 +222,9 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                 let peer_ip = match mesh_ips.get(peer_alias) {
                     Some(ip) => ip.clone(),
                     None => {
+                        evidence.push(format!(
+                            "pair: src={src_alias} dst={peer_alias} ip=(missing) result=no-mesh-ip"
+                        ));
                         errors.push(format!("{src_alias}: no mesh IP for '{peer_alias}'"));
                         continue;
                     }
@@ -146,18 +250,39 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                 };
                 match final_result {
                     Some(Ok(TrafficTestResult::Reachable)) => {
+                        evidence.push(format!(
+                            "pair: src={src_alias} dst={peer_alias} ip={peer_ip} result=reachable"
+                        ));
                         src_reached_peer = true;
                     }
                     Some(Ok(TrafficTestResult::Blocked)) => {
+                        evidence.push(format!(
+                            "pair: src={src_alias} dst={peer_alias} ip={peer_ip} result=blocked"
+                        ));
                         errors.push(format!(
                             "{src_alias} → {peer_alias} ({peer_ip}): blocked (expected reachable)"
                         ));
                     }
                     Some(Ok(TrafficTestResult::Error(e))) => {
+                        evidence.push(format!(
+                            "pair: src={src_alias} dst={peer_alias} ip={peer_ip} result=error:{}",
+                            single_line(&e)
+                        ));
                         errors.push(format!("{src_alias} → {peer_alias} ({peer_ip}): {e}"));
                     }
-                    Some(Err(e)) => errors.push(format!("{src_alias} → {peer_alias}: {e}")),
-                    None => errors.push(format!("no adapter for '{src_alias}'")),
+                    Some(Err(e)) => {
+                        evidence.push(format!(
+                            "pair: src={src_alias} dst={peer_alias} ip={peer_ip} result=adapter-error:{}",
+                            single_line(&e.to_string())
+                        ));
+                        errors.push(format!("{src_alias} → {peer_alias}: {e}"));
+                    }
+                    None => {
+                        evidence.push(format!(
+                            "pair: src={src_alias} dst={peer_alias} ip={peer_ip} result=no-adapter"
+                        ));
+                        errors.push(format!("no adapter for '{src_alias}'"));
+                    }
                 }
             }
 
@@ -177,7 +302,14 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                 .map(|a| a.probe_denied_peer(denied_ip))
             {
                 Some(Ok(TrafficTestResult::Blocked)) => {
-                    if !src_reached_peer {
+                    if src_reached_peer {
+                        evidence.push(format!(
+                            "deny_probe: src={src_alias} ip={denied_ip} result=blocked"
+                        ));
+                    } else {
+                        evidence.push(format!(
+                            "deny_probe: src={src_alias} ip={denied_ip} result=inconclusive-no-baseline"
+                        ));
                         errors.push(format!(
                             "{src_alias}: default-deny INCONCLUSIVE — {denied_ip} was unreachable \
                              but the node reached no mesh peer, so the block cannot be attributed \
@@ -186,35 +318,65 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                     }
                 }
                 Some(Ok(TrafficTestResult::Reachable)) => {
+                    evidence.push(format!(
+                        "deny_probe: src={src_alias} ip={denied_ip} result=reachable (VIOLATION)"
+                    ));
                     errors.push(format!(
                         "{src_alias}: default-deny VIOLATED — {denied_ip} was reachable"
                     ));
                 }
                 Some(Ok(TrafficTestResult::Error(e))) => {
+                    evidence.push(format!(
+                        "deny_probe: src={src_alias} ip={denied_ip} result=inconclusive-error:{}",
+                        single_line(&e)
+                    ));
                     errors.push(format!(
                         "{src_alias}: default-deny INCONCLUSIVE — probe to {denied_ip} errored \
                          ({e}); cannot confirm the target is blocked by policy (failing closed)"
                     ));
                 }
-                Some(Err(e)) => errors.push(format!("{src_alias}: probe_denied_peer error: {e}")),
-                None => errors.push(format!(
-                    "{src_alias}: no adapter; cannot run default-deny negative test (failing closed)"
-                )),
+                Some(Err(e)) => {
+                    evidence.push(format!(
+                        "deny_probe: src={src_alias} ip={denied_ip} result=adapter-error:{}",
+                        single_line(&e.to_string())
+                    ));
+                    errors.push(format!("{src_alias}: probe_denied_peer error: {e}"));
+                }
+                None => {
+                    evidence.push(format!(
+                        "deny_probe: src={src_alias} ip={denied_ip} result=no-adapter"
+                    ));
+                    errors.push(format!(
+                        "{src_alias}: no adapter; cannot run default-deny negative test (failing closed)"
+                    ));
+                }
             }
         }
 
         if errors.is_empty() {
-            StageOutcome::Passed
-        } else {
-            // Failure-time tunnel capture (MacosCrossNetworkTrafficBlocker
-            // §6 item 3): the matrix already failed, so snapshot every
-            // node's tunnel/daemon state before returning. Best effort —
-            // capture errors are recorded in the per-node capture file and
-            // never mask the stage failure that triggered the capture.
+            // Pass path: the pair-results witness IS the declared QH-83
+            // evidence for this stage, so a failure to write it must not
+            // record a pass.
+            return match write_pair_results(&ctx.report_dir, &evidence) {
+                Ok(()) => StageOutcome::Passed,
+                Err(write_err) => StageOutcome::Failed(format!(
+                    "pair-results witness could not be written behind the pass: {write_err}"
+                )),
+            };
+        }
+        // Failure path: capture still runs, and the witness is written best
+        // effort so triage sees the pair data that produced the failure. A
+        // witness write failure here is recorded in the message but never
+        // masks the stage failure.
+        {
             let mut message = errors.join("; ");
             for summary in capture_failure_state(ctx) {
                 message.push_str("; ");
                 message.push_str(&summary);
+            }
+            if let Err(write_err) = write_pair_results(&ctx.report_dir, &evidence) {
+                message.push_str("; ");
+                message.push_str(&format!("pair-results witness write failed: {write_err}"));
             }
             StageOutcome::Failed(message)
         }
@@ -384,6 +546,24 @@ mod tests {
     #[derive(Debug)]
     struct FakeCaptureAdapter {
         fail_collectors: bool,
+        alias: &'static str,
+        mesh_ip: &'static str,
+        /// Factory for `ping_mesh_peer`'s result; `None` keeps the historical
+        /// unimplemented!() (single-node tests never ping).
+        ping: Option<fn() -> Result<TrafficTestResult, AdapterError>>,
+    }
+
+    impl FakeCaptureAdapter {
+        /// The historical single-node fixture: alias node-a, mesh IP
+        /// 100.64.0.1, ping never called.
+        fn single(fail_collectors: bool) -> Self {
+            FakeCaptureAdapter {
+                fail_collectors,
+                alias: "node-a",
+                mesh_ip: "100.64.0.1",
+                ping: None,
+            }
+        }
     }
 
     impl NodeAdapter for FakeCaptureAdapter {
@@ -391,7 +571,7 @@ mod tests {
             VmGuestPlatform::Linux
         }
         fn alias(&self) -> &str {
-            "node-a"
+            self.alias
         }
         fn ssh_connection_params(
             &self,
@@ -467,7 +647,10 @@ mod tests {
             unimplemented!()
         }
         fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {
-            unimplemented!()
+            match self.ping {
+                Some(make) => make(),
+                None => unimplemented!("ping_mesh_peer not configured for this fixture"),
+            }
         }
         fn probe_denied_peer(&self, _denied: &str) -> Result<TrafficTestResult, AdapterError> {
             Ok(TrafficTestResult::Blocked)
@@ -502,7 +685,7 @@ mod tests {
             unimplemented!()
         }
         fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
-            Ok("100.64.0.1".to_owned())
+            Ok(self.mesh_ip.to_owned())
         }
         fn collect_artifacts(&self, _dst: &Path) -> Result<(), AdapterError> {
             unimplemented!()
@@ -513,13 +696,27 @@ mod tests {
         let mut adapters: HashMap<String, Box<dyn NodeAdapter>> = HashMap::new();
         adapters.insert(
             "node-a".to_owned(),
-            Box::new(FakeCaptureAdapter { fail_collectors }),
+            Box::new(FakeCaptureAdapter::single(fail_collectors)),
         );
-        OrchestrationContext {
-            assignments: vec![NodeRoleAssignment {
+        matrix_ctx_from_adapters(
+            vec![NodeRoleAssignment {
                 alias: "node-a".to_owned(),
                 role: NodeRole::Client,
             }],
+            adapters,
+            report_dir,
+        )
+    }
+
+    /// Build a context from explicit assignments + adapters so multi-node
+    /// matrix tests can express per-node mesh IPs.
+    fn matrix_ctx_from_adapters(
+        assignments: Vec<NodeRoleAssignment>,
+        adapters: HashMap<String, Box<dyn NodeAdapter>>,
+        report_dir: &Path,
+    ) -> OrchestrationContext {
+        OrchestrationContext {
+            assignments,
             adapters,
             source_archive: None,
             report_dir: report_dir.to_path_buf(),
@@ -611,5 +808,129 @@ mod tests {
             single_line("forged\nmesh_ip: 100.64.0.1\r\n"),
             "forged\\nmesh_ip: 100.64.0.1\\n\\n"
         );
+    }
+
+    // ── H4: collision guard + pair-results witness ────────────────────────────
+
+    /// Mutation caught: reverting the H4 collision guard (accepting duplicate
+    /// mesh IPs at the settle deadline) makes this test see the old passing
+    /// no-op instead of the failure. Two nodes sharing one mesh IP must fail
+    /// the stage naming the duplicate IP and both aliases, with the
+    /// pair-results witness written behind the failure.
+    #[test]
+    fn collision_at_deadline_fails_naming_duplicate() {
+        let report_dir = std::env::temp_dir().join(format!("ttm-collision-{}", std::process::id()));
+        let mut adapters: HashMap<String, Box<dyn NodeAdapter>> = HashMap::new();
+        adapters.insert(
+            "node-a".to_owned(),
+            Box::new(FakeCaptureAdapter {
+                fail_collectors: false,
+                alias: "node-a",
+                mesh_ip: "100.64.0.9",
+                ping: None,
+            }),
+        );
+        adapters.insert(
+            "node-b".to_owned(),
+            Box::new(FakeCaptureAdapter {
+                fail_collectors: false,
+                alias: "node-b",
+                mesh_ip: "100.64.0.9",
+                ping: None,
+            }),
+        );
+        let ctx = matrix_ctx_from_adapters(
+            vec![
+                NodeRoleAssignment {
+                    alias: "node-a".to_owned(),
+                    role: NodeRole::Client,
+                },
+                NodeRoleAssignment {
+                    alias: "node-b".to_owned(),
+                    role: NodeRole::Client,
+                },
+            ],
+            adapters,
+            &report_dir,
+        );
+        let mut ctx = ctx;
+        let message = match TrafficTestMatrixStage.execute(&mut ctx) {
+            StageOutcome::Failed(m) => m,
+            other => panic!("expected Failed for duplicate mesh IP, got {other:?}"),
+        };
+        assert!(
+            message.contains("mesh IP collision"),
+            "message must name the collision: {message}"
+        );
+        assert!(
+            message.contains("100.64.0.9")
+                && message.contains("node-a")
+                && message.contains("node-b"),
+            "message must name the duplicate IP and both aliases: {message}"
+        );
+        let witness = std::fs::read_to_string(report_dir.join(PAIR_RESULTS_RELATIVE))
+            .expect("pair-results witness written on the collision-failure path");
+        assert!(witness.contains("node: node-a mesh_ip: 100.64.0.9"));
+        assert!(witness.contains("node: node-b mesh_ip: 100.64.0.9"));
+        assert!(witness.contains("collision: ip=100.64.0.9 aliases=node-a,node-b"));
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    /// Mutation caught: dropping the witness write on the pass path leaves
+    /// the declared QH-83 `File` evidence absent behind a `Passed` verdict
+    /// (the runner-level check would also demote it, but this test pins the
+    /// stage's own contract). A clean two-node matrix with reachable pairs
+    /// passes AND writes the full pair-results witness.
+    #[test]
+    fn pair_results_witness_written_on_pass() {
+        let report_dir =
+            std::env::temp_dir().join(format!("ttm-pass-witness-{}", std::process::id()));
+        let mut adapters: HashMap<String, Box<dyn NodeAdapter>> = HashMap::new();
+        adapters.insert(
+            "node-a".to_owned(),
+            Box::new(FakeCaptureAdapter {
+                fail_collectors: false,
+                alias: "node-a",
+                mesh_ip: "100.64.0.1",
+                ping: Some(|| Ok(TrafficTestResult::Reachable)),
+            }),
+        );
+        adapters.insert(
+            "node-b".to_owned(),
+            Box::new(FakeCaptureAdapter {
+                fail_collectors: false,
+                alias: "node-b",
+                mesh_ip: "100.64.0.2",
+                ping: Some(|| Ok(TrafficTestResult::Reachable)),
+            }),
+        );
+        let ctx = matrix_ctx_from_adapters(
+            vec![
+                NodeRoleAssignment {
+                    alias: "node-a".to_owned(),
+                    role: NodeRole::Client,
+                },
+                NodeRoleAssignment {
+                    alias: "node-b".to_owned(),
+                    role: NodeRole::Client,
+                },
+            ],
+            adapters,
+            &report_dir,
+        );
+        let mut ctx = ctx;
+        match TrafficTestMatrixStage.execute(&mut ctx) {
+            StageOutcome::Passed => {}
+            other => panic!("expected Passed for a clean two-node matrix, got {other:?}"),
+        }
+        let witness = std::fs::read_to_string(report_dir.join(PAIR_RESULTS_RELATIVE))
+            .expect("pair-results witness written on the pass path");
+        assert!(witness.contains("node: node-a mesh_ip: 100.64.0.1"));
+        assert!(witness.contains("node: node-b mesh_ip: 100.64.0.2"));
+        assert!(witness.contains("pair: src=node-a dst=node-b ip=100.64.0.2 result=reachable"));
+        assert!(witness.contains("pair: src=node-b dst=node-a ip=100.64.0.1 result=reachable"));
+        assert!(witness.contains("deny_probe: src=node-a ip=198.51.100.1 result=blocked"));
+        assert!(witness.contains("deny_probe: src=node-b ip=198.51.100.1 result=blocked"));
+        let _ = std::fs::remove_dir_all(&report_dir);
     }
 }
