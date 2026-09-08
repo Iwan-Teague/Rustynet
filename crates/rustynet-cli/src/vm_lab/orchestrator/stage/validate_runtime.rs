@@ -55,8 +55,13 @@ impl ValidateBaselineRuntimeStage {
 /// `SessionStateSnapshot.peer_ids` from `self.advertised_routes`
 /// (`daemon.rs:9762-9765`) — i.e. advertised route CIDRs, not peer node ids —
 /// so no node id can ever match one and passing `ctx.node_ids` here would red
-/// every node in the run. That mismatch is a separate daemon-side defect;
-/// asserting peer visibility has to wait for it.
+/// every node in the run. Tracked as QH-81
+/// (`documents/operations/active/QualityHardeningTodo_2026-07-25.md`):
+/// until that daemon-side data-model defect is fixed, this op's pass is
+/// structurally vacuous — its report carries an empty `expected_peer_ids` on
+/// every run, so the check proves nothing about peer visibility. LIVE peer
+/// visibility is proven by the dedicated `mesh_status_validation` stage's
+/// live-handshake poll instead, not by this dispatch.
 fn probe_expectations(op: crate::vm_lab::DaemonProbeOp) -> Vec<String> {
     use crate::vm_lab::DaemonProbeOp;
     use crate::vm_lab::orchestrator::role_validation::mesh_status::SNAPSHOT_MAX_AGE_SECONDS;
