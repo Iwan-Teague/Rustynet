@@ -702,6 +702,26 @@ fn classify_porcelain(status: &str, rules: &[String]) -> (Vec<String>, Vec<Strin
             if p.is_empty() {
                 continue;
             }
+            // The guard's OWN control file, written into the worktree root at
+            // launch, is neither the agent's edit nor a scope violation. The
+            // per-worktree `info/exclude` written beside it does not hide it:
+            // git resolves `info/exclude` from the COMMON dir for a linked
+            // worktree, so the per-worktree copy is never read, and writing to
+            // the common one would leak this job's rule into the user's real
+            // repo and every other worktree. Skipping it here is the
+            // self-contained fix. Observed on jobs edit-1788823407778-18779-0
+            // and edit-1788823521793-19065-0 (2026-09-08), both reported
+            // `scope_violation` for `allowlist.txt` alone while their actual
+            // work was entirely in scope.
+            //
+            // Skipped from BOTH lists deliberately: it must never be committed
+            // to the branch either. An agent that edits it changes only what
+            // the advisory hook reads, never what this checkpoint enforces —
+            // the classification here is the boundary, and it reads the rules
+            // from the job record, not from the file.
+            if p == EDIT_ALLOWLIST_FILENAME {
+                continue;
+            }
             if path_in_allowlist(p, rules) {
                 in_scope.push(p.to_string());
             } else {
@@ -8892,6 +8912,26 @@ mod tests {
         let rules = vec!["documents/*.md".to_string()];
         assert!(path_in_allowlist("documents/*.md", &rules));
         assert!(!path_in_allowlist("documents/notes.md", &rules));
+    }
+
+    /// The guard's own control file is not the agent's work and must not be
+    /// reported as a scope violation — two real jobs were marked
+    /// `scope_violation` for it alone. It must also never be committed, so it
+    /// belongs to NEITHER list.
+    #[test]
+    fn the_guard_control_file_is_neither_in_scope_nor_a_violation() {
+        let rules = vec!["documents/**".to_string()];
+        let (in_scope, out_scope) = classify_porcelain("?? allowlist.txt\0", &rules);
+        assert!(in_scope.is_empty(), "control file must not be committed");
+        assert!(out_scope.is_empty(), "control file must not be a violation");
+        // A path that merely ENDS in the same name is a real file and still
+        // classifies normally.
+        let (nested_in, nested_out) = classify_porcelain(
+            "?? documents/allowlist.txt\0?? crates/allowlist.txt\0",
+            &rules,
+        );
+        assert_eq!(nested_in, vec!["documents/allowlist.txt".to_string()]);
+        assert_eq!(nested_out, vec!["crates/allowlist.txt".to_string()]);
     }
 
     #[test]
