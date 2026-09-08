@@ -3750,10 +3750,86 @@ impl WireguardCommandRunner for WindowsHostWireguardRunner {
                     program_path.display()
                 ))
             })?;
-        Ok(WireguardCommandOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-        })
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // H2 (MultiAgentSecurityReview_2026-09-08): a non-zero exit status is
+        // a failed command, exactly as the Linux/macOS privileged-helper
+        // runner treats it. Reporting success here let a failed `wg set ...
+        // remove` or `netsh ... route` call drop a peer/route from memory
+        // while the live tunnel kept serving it. Sites where absence is a
+        // legitimate outcome (route/service already gone) prove absence with
+        // a separate successful read in the backend; they do not rely on
+        // this runner being lenient.
+        if output.status.success() {
+            return Ok(WireguardCommandOutput { stdout, stderr });
+        }
+        let stderr_trimmed = stderr.trim();
+        if stderr_trimmed.is_empty() {
+            return Err(BackendError::internal(format!(
+                "windows backend command {} exited with status {}",
+                program_path.display(),
+                output.status
+            )));
+        }
+        Err(BackendError::internal(format!(
+            "windows backend command {} exited with status {}: {stderr_trimmed}",
+            program_path.display(),
+            output.status
+        )))
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_host_runner_tests {
+    use super::WindowsHostWireguardRunner;
+    use rustynet_backend_wireguard::WireguardCommandRunner;
+
+    fn cmd_exe() -> String {
+        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+        format!("{system_root}\\System32\\cmd.exe")
+    }
+
+    #[test]
+    fn windows_host_runner_reports_non_zero_exit_status_as_error() {
+        // Mutation caught: dropping the `output.status.success()` check makes
+        // this call return Ok with empty stdout.
+        let mut runner = WindowsHostWireguardRunner;
+        let err = runner
+            .run_capture(&cmd_exe(), &["/c".to_owned(), "exit 3".to_owned()])
+            .expect_err("exit status 3 must be an error");
+        assert!(
+            err.to_string().contains("exited with status"),
+            "error must carry the exit status: {err}"
+        );
+        assert!(
+            runner
+                .run(&cmd_exe(), &["/c".to_owned(), "exit 3".to_owned()])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_host_runner_returns_stdout_on_success() {
+        let mut runner = WindowsHostWireguardRunner;
+        let out = runner
+            .run_capture(
+                &cmd_exe(),
+                &["/c".to_owned(), "echo rustynet-ok".to_owned()],
+            )
+            .expect("exit status 0 must succeed");
+        assert!(out.stdout.contains("rustynet-ok"));
+    }
+
+    #[test]
+    fn windows_host_runner_surfaces_stderr_in_error() {
+        let mut runner = WindowsHostWireguardRunner;
+        let err = runner
+            .run_capture(
+                &cmd_exe(),
+                &["/c".to_owned(), "echo boom 1>&2 & exit 5".to_owned()],
+            )
+            .expect_err("must fail");
+        assert!(err.to_string().contains("boom"), "{err}");
     }
 }
 

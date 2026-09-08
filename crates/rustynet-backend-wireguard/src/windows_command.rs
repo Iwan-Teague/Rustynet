@@ -188,13 +188,45 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
     }
 
     fn uninstall_tunnel_service(&mut self) -> Result<(), BackendError> {
-        self.runner.run(
+        let result = self.runner.run(
             self.wireguard_exe_path.to_string_lossy().as_ref(),
             &[
                 "/uninstalltunnelservice".to_owned(),
                 self.tunnel_name.clone(),
             ],
-        )
+        );
+        let Err(err) = result else {
+            return Ok(());
+        };
+        // `wireguard.exe /uninstalltunnelservice` exits non-zero when the
+        // service is already gone. Absence is only accepted as success when a
+        // SEPARATE, SUCCESSFUL read proves it (`wg show interfaces` exits 0
+        // and lists the remaining tunnels); a failed read keeps the original
+        // error so a broken wg.exe can never launder a failed uninstall.
+        match self.tunnel_interface_present() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(BackendError::internal(format!(
+                "tunnel service uninstall failed and interface '{}' is still present: {err}",
+                self.tunnel_name
+            ))),
+            Err(verify_err) => Err(BackendError::internal(format!(
+                "tunnel service uninstall failed ({err}) and absence could not be verified: \
+                 {verify_err}"
+            ))),
+        }
+    }
+
+    /// Successful read of `wg show interfaces` (exit 0 even when no tunnel
+    /// exists), answering whether this backend's tunnel is still listed.
+    fn tunnel_interface_present(&mut self) -> Result<bool, BackendError> {
+        let output = self.runner.run_capture(
+            self.wg_exe_path.to_string_lossy().as_ref(),
+            &["show".to_owned(), "interfaces".to_owned()],
+        )?;
+        Ok(output
+            .stdout
+            .split_whitespace()
+            .any(|name| name == self.tunnel_name))
     }
 
     fn apply_route_reconciliation(
@@ -242,7 +274,7 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
     fn delete_os_route(&mut self, destination_cidr: &str) -> Result<(), BackendError> {
         validate_cidr(destination_cidr)?;
         let (family, _) = route_family_and_next_hop(destination_cidr)?;
-        self.runner.run(
+        let result = self.runner.run(
             self.netsh_exe_path.to_string_lossy().as_ref(),
             &[
                 "interface".to_owned(),
@@ -253,7 +285,48 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
                 format!("interface={}", self.tunnel_name),
                 "store=active".to_owned(),
             ],
-        )
+        );
+        let Err(err) = result else {
+            return Ok(());
+        };
+        // `netsh interface <family> delete route` exits non-zero when the
+        // route is already absent. Absence is accepted only when a separate,
+        // SUCCESSFUL `show route` read proves the prefix is no longer bound
+        // to this tunnel; a failed read keeps the original error.
+        match self.os_route_present(family, destination_cidr) {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(BackendError::internal(format!(
+                "route delete failed and {destination_cidr} is still bound to '{}': {err}",
+                self.tunnel_name
+            ))),
+            Err(verify_err) => Err(BackendError::internal(format!(
+                "route delete failed ({err}) and absence could not be verified: {verify_err}"
+            ))),
+        }
+    }
+
+    /// Successful read of `netsh interface <family> show route store=active`,
+    /// answering whether `destination_cidr` is still a route on this tunnel.
+    fn os_route_present(
+        &mut self,
+        family: &str,
+        destination_cidr: &str,
+    ) -> Result<bool, BackendError> {
+        let output = self.runner.run_capture(
+            self.netsh_exe_path.to_string_lossy().as_ref(),
+            &[
+                "interface".to_owned(),
+                family.to_owned(),
+                "show".to_owned(),
+                "route".to_owned(),
+                "store=active".to_owned(),
+            ],
+        )?;
+        Ok(show_route_lists_prefix_on_interface(
+            &output.stdout,
+            destination_cidr,
+            &self.tunnel_name,
+        ))
     }
 
     fn render_config(&self) -> Result<String, BackendError> {
@@ -786,6 +859,40 @@ fn render_endpoint(endpoint: SocketEndpoint) -> String {
     } else {
         format!("{}:{}", endpoint.addr, endpoint.port)
     }
+}
+
+/// True when a `netsh interface <family> show route` listing has a row whose
+/// tokens include BOTH `destination_cidr` (compared as a parsed prefix, so
+/// canonical/compressed IPv6 spellings match) AND the exact interface alias.
+/// Conservative on purpose: any row that cannot be parsed is treated as
+/// present-unknown only if it names the interface and an equal prefix; a
+/// listing that does not mention the pair at all means absent.
+fn show_route_lists_prefix_on_interface(
+    listing: &str,
+    destination_cidr: &str,
+    interface_alias: &str,
+) -> bool {
+    let Some(wanted) = parse_prefix(destination_cidr) else {
+        // Unparseable target: cannot prove absence, report present.
+        return true;
+    };
+    listing.lines().any(|line| {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let names_interface = tokens.contains(&interface_alias);
+        let has_prefix = tokens
+            .iter()
+            .filter_map(|token| parse_prefix(token))
+            .any(|prefix| prefix == wanted);
+        names_interface && has_prefix
+    })
+}
+
+fn parse_prefix(text: &str) -> Option<(std::net::IpAddr, u8)> {
+    let (addr, len) = text.split_once('/')?;
+    let addr = addr.parse::<std::net::IpAddr>().ok()?;
+    let len = len.parse::<u8>().ok()?;
+    let max = if addr.is_ipv4() { 32 } else { 128 };
+    (len <= max).then_some((addr, len))
 }
 
 fn validate_cidr(value: &str) -> Result<(), BackendError> {
@@ -2313,6 +2420,241 @@ mod tests {
         assert!(
             !persisted.contains("[Peer]"),
             "converged persistent config must not contain the removed peer; got: {persisted}"
+        );
+    }
+
+    /// Runner that scripts failures for the idempotent-delete sites and the
+    /// listings their absence checks read.
+    #[derive(Clone)]
+    struct AbsenceScriptRunner {
+        inner: RecordingRunner,
+        fail_netsh_delete: Arc<Mutex<bool>>,
+        fail_uninstall: Arc<Mutex<bool>>,
+        show_route: Arc<Mutex<Result<String, String>>>,
+        show_interfaces: Arc<Mutex<Result<String, String>>>,
+    }
+
+    impl AbsenceScriptRunner {
+        fn new() -> Self {
+            Self {
+                inner: RecordingRunner::default(),
+                fail_netsh_delete: Arc::new(Mutex::new(false)),
+                fail_uninstall: Arc::new(Mutex::new(false)),
+                show_route: Arc::new(Mutex::new(Ok(String::new()))),
+                show_interfaces: Arc::new(Mutex::new(Ok(String::new()))),
+            }
+        }
+    }
+
+    impl WireguardCommandRunner for AbsenceScriptRunner {
+        fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
+            let is_netsh_delete =
+                args.iter().any(|a| a == "delete") && args.iter().any(|a| a == "route");
+            if is_netsh_delete && *self.fail_netsh_delete.lock().expect("flag") {
+                self.inner.run(program, args)?;
+                return Err(BackendError::internal(
+                    "scripted netsh delete route failure",
+                ));
+            }
+            if args.iter().any(|a| a == "/uninstalltunnelservice")
+                && *self.fail_uninstall.lock().expect("flag")
+            {
+                self.inner.run(program, args)?;
+                return Err(BackendError::internal("scripted uninstall failure"));
+            }
+            self.inner.run(program, args)
+        }
+
+        fn run_capture(
+            &mut self,
+            program: &str,
+            args: &[String],
+        ) -> Result<WireguardCommandOutput, BackendError> {
+            let is_show_route =
+                args.iter().any(|a| a == "show") && args.iter().any(|a| a == "route");
+            let is_show_interfaces = args.iter().any(|a| a == "interfaces");
+            if is_show_route || is_show_interfaces {
+                self.inner.run_capture(program, args)?;
+                let scripted = if is_show_route {
+                    self.show_route.lock().expect("show route").clone()
+                } else {
+                    self.show_interfaces
+                        .lock()
+                        .expect("show interfaces")
+                        .clone()
+                };
+                return match scripted {
+                    Ok(stdout) => Ok(WireguardCommandOutput {
+                        stdout,
+                        stderr: String::new(),
+                    }),
+                    Err(msg) => Err(BackendError::internal(msg)),
+                };
+            }
+            self.inner.run_capture(program, args)
+        }
+    }
+
+    fn absence_backend(
+        runner: &AbsenceScriptRunner,
+        temp_dir: &TempDir,
+    ) -> WindowsWireguardBackend<AbsenceScriptRunner> {
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(temp_dir);
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        backend
+    }
+
+    fn mesh_route(peer: &PeerConfig, cidr: &str) -> Route {
+        Route {
+            destination_cidr: cidr.to_owned(),
+            via_node: peer.node_id.clone(),
+            kind: RouteKind::Mesh,
+        }
+    }
+
+    #[test]
+    fn windows_route_delete_failure_is_success_only_when_show_route_proves_absence() {
+        // H2: `netsh ... delete route` exits non-zero when the route is already
+        // gone. Absence must be PROVEN by a successful `show route` read.
+        // Mutations caught: (1) reverting absent-is-success makes the
+        // absent-listing case Err; (2) dropping the still-present check makes
+        // the present-listing case Ok; (3) treating a failed read as absent
+        // makes the read-failure case Ok.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = AbsenceScriptRunner::new();
+        let mut backend = absence_backend(&runner, &temp_dir);
+        let peer = sample_peer("peer-a");
+        backend.configure_peer(peer.clone()).expect("peer");
+        backend
+            .apply_routes(vec![mesh_route(&peer, "100.64.20.0/24")])
+            .expect("route add");
+        *runner.fail_netsh_delete.lock().expect("flag") = true;
+
+        // (a) listing still shows the prefix on our tunnel -> error.
+        *runner.show_route.lock().expect("s") = Ok(
+            "Publish  Type      Met  Prefix                    Idx  Gateway/Interface Name\n\
+             No       Manual    1    100.64.20.0/24            12   rustynet0\n"
+                .to_owned(),
+        );
+        let err = backend
+            .apply_routes(vec![])
+            .expect_err("route still present must fail");
+        assert!(err.to_string().contains("still bound"), "{err}");
+
+        // (b) listing shows the prefix on ANOTHER interface only -> absent on
+        // ours -> success.
+        *runner.show_route.lock().expect("s") =
+            Ok("No       Manual    1    100.64.20.0/24            7    Ethernet\n".to_owned());
+        backend
+            .apply_routes(vec![])
+            .expect("route proven absent on our tunnel must succeed");
+
+        // Re-add, then (c) the verification read itself fails -> original
+        // error propagates, never success.
+        *runner.fail_netsh_delete.lock().expect("flag") = false;
+        backend
+            .apply_routes(vec![mesh_route(&peer, "100.64.20.0/24")])
+            .expect("route add");
+        *runner.fail_netsh_delete.lock().expect("flag") = true;
+        *runner.show_route.lock().expect("s") = Err("scripted show route failure".to_owned());
+        let err = backend
+            .apply_routes(vec![])
+            .expect_err("unverifiable absence must fail");
+        assert!(err.to_string().contains("could not be verified"), "{err}");
+    }
+
+    #[test]
+    fn windows_route_absence_check_matches_ipv6_prefix_spellings() {
+        // netsh prints canonical (compressed) IPv6; our CIDR may be spelled
+        // differently. Both must compare equal, or a real route is reported
+        // absent (fail-open). Mutation caught: comparing prefix strings
+        // textually.
+        let listing = "No  Manual  1  fd00:0:0:0::/64  12  rustynet0\n";
+        assert!(show_route_lists_prefix_on_interface(
+            listing,
+            "fd00::/64",
+            "rustynet0"
+        ));
+        assert!(!show_route_lists_prefix_on_interface(
+            listing,
+            "fd00::/64",
+            "rustynet1"
+        ));
+        assert!(!show_route_lists_prefix_on_interface(
+            listing,
+            "fd00:1::/64",
+            "rustynet0"
+        ));
+        // An unparseable target can never be proven absent.
+        assert!(show_route_lists_prefix_on_interface(
+            "",
+            "not-a-prefix",
+            "rustynet0"
+        ));
+    }
+
+    #[test]
+    fn windows_uninstall_failure_is_success_only_when_interfaces_listing_proves_absence() {
+        // H2 sibling: `/uninstalltunnelservice` exits non-zero when the
+        // service is already gone. Same three mutations as the route test.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = AbsenceScriptRunner::new();
+        *runner.fail_uninstall.lock().expect("flag") = true;
+
+        // (a) our tunnel is still listed -> error.
+        let mut backend = absence_backend(&runner, &temp_dir);
+        *runner.show_interfaces.lock().expect("s") = Ok("rustynet0 other0\n".to_owned());
+        let err = backend.shutdown().expect_err("present tunnel must fail");
+        assert!(err.to_string().contains("still present"), "{err}");
+
+        // (b) only other tunnels listed -> absent -> success.
+        let mut backend = absence_backend(&runner, &temp_dir);
+        *runner.show_interfaces.lock().expect("s") = Ok("other0\n".to_owned());
+        backend
+            .shutdown()
+            .expect("proven-absent tunnel must succeed");
+
+        // (c) the listing read fails -> original error propagates.
+        let mut backend = absence_backend(&runner, &temp_dir);
+        *runner.show_interfaces.lock().expect("s") = Err("scripted wg show failure".to_owned());
+        let err = backend
+            .shutdown()
+            .expect_err("unverifiable absence must fail");
+        assert!(err.to_string().contains("could not be verified"), "{err}");
+    }
+
+    #[test]
+    fn windows_remove_peer_keeps_peer_when_runner_reports_failure() {
+        // H2 consequence in the backend: a failed `wg set ... remove` must
+        // leave the peer in the map (the tunnel may still serve it).
+        // Mutation caught: removing the peer before checking the runner result.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = SelectiveFailureRunner::new();
+        let mut backend = failing_wg_backend(&runner, &temp_dir);
+        backend
+            .start(runtime_context())
+            .expect("backend should start");
+        let peer = sample_peer("peer-a");
+        backend.configure_peer(peer.clone()).expect("peer");
+        runner.set_fail_wg_set(true);
+        assert!(backend.remove_peer(&peer.node_id).is_err());
+        assert!(
+            backend.peers.contains_key(&peer.node_id),
+            "peer must stay recorded while the tunnel may still serve it"
         );
     }
 }

@@ -7012,3 +7012,58 @@ audit's minimal set (vacuous-filter kill; self-proof kill for source pins)
 are landed and gated; this item needs the staged per-stage wiring above and a
 reviewer per batch, and a wrapper landed without it would break every live run
 or lie by default — both worse than the honest gap this entry records.
+
+### QH-84 — H2 (MultiAgentSecurityReview_2026-09-08): the Windows host command runner discarded process exit status, so every failed `wg`/`netsh`/`wireguard.exe` call reported success — FIXED 2026-09-08
+
+**Severity: high (product security, Windows backend). Confidence: VERIFIED
+from code (`MultiAgentSecurityReviewAudit_2026-09-08.md` §H2 confirmed it
+independently). Fixed on `main` (this commit).**
+
+`WindowsHostWireguardRunner::run_capture` (`crates/rustynetd/src/daemon.rs`)
+built its return from stdout/stderr and never read `output.status`, while the
+Linux runner and the privileged-helper runner both fail on a non-zero status.
+Every mutating Windows command inherited the blindness through `run()`, so
+`remove_peer` dropped a peer from memory and disk while the live tunnel could
+still serve it, and route/exit-mode transitions reported success on failure.
+
+**Fix (three sites, mirrored on the Linux/macOS shape):**
+1. `run_capture` now returns `Err` carrying the exit status and trimmed stderr
+   on any non-zero status, exactly as the privileged-helper runner does.
+2. `WindowsWireguardBackend::delete_os_route` and `uninstall_tunnel_service`
+   (`crates/rustynet-backend-wireguard/src/windows_command.rs`) are the two
+   sites where absence is a legitimate outcome (`netsh … delete route` and
+   `/uninstalltunnelservice` exit non-zero when the object is already gone).
+   Absence is accepted as success ONLY when a separate, SUCCESSFUL read proves
+   it: `netsh interface <family> show route store=active` no longer lists the
+   prefix on this tunnel (prefixes compared as parsed `IpAddr`/length so
+   compressed IPv6 spellings match), or `wg show interfaces` (exit 0 even with
+   no tunnels) no longer lists the tunnel. A failed verification read keeps the
+   ORIGINAL error — a broken `wg.exe`/`netsh.exe` can never launder a failed
+   delete into success. No stderr text is parsed (localised messages).
+
+**Fail-closed analysis.** Non-zero status with no stderr → `Err` with the
+status. Verification read fails → `Err` (original + verify error). Unparseable
+target prefix → reported present → `Err`. Listing empty → absent → `Ok` (the
+read itself succeeded, so absence is proven, not assumed).
+
+**Tests, each naming the mutation it catches:**
+- `windows_route_delete_failure_is_success_only_when_show_route_proves_absence`
+  — (a) route still listed → `Err` (mutation: drop the still-present check);
+  (b) listed on another interface only → `Ok` (mutation: revert
+  absent-is-success); (c) `show route` read fails → `Err` (mutation: treat a
+  failed read as absent).
+- `windows_uninstall_failure_is_success_only_when_interfaces_listing_proves_absence`
+  — same three arms through `shutdown()`.
+- `windows_route_absence_check_matches_ipv6_prefix_spellings` — mutation:
+  textual prefix comparison reports a real route absent.
+- `windows_remove_peer_keeps_peer_when_runner_reports_failure` — mutation:
+  removing the map entry before checking the runner result.
+- `daemon::windows_host_runner_tests::*` (`#[cfg(all(test, windows))]`) —
+  `cmd.exe /c exit 3` must be `Err` containing the status; mutation: dropping
+  the `status.success()` check. Compiled under
+  `cargo check -p rustynetd --all-targets --all-features --target x86_64-pc-windows-gnu`
+  on 2026-09-08; execution on a Windows guest is owed (the Windows stream is
+  parked with `ubuntu-kvm-1`; `katana` is being onboarded as its replacement).
+
+**Disposition: FIXED on main; Windows-guest execution of the runner tests
+OPEN until the next Windows lab campaign.**
