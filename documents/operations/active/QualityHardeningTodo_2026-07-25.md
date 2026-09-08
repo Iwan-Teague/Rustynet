@@ -6865,3 +6865,77 @@ protective intent across a reboot. That is new behaviour in the fail-closed path
 implemented and reviewed deliberately, not bolted on. A pure function landed without that
 wiring would be dead code, which repo law forbids in a completed deliverable, so it was
 deliberately not landed on its own.
+
+### QH-82 — six orchestrator platform-resolution sites silently substituted Linux for an unrecorded platform; the root-cause `VmGuestPlatform::infer` else-Linux default remains open, checked 2026-09-08
+
+**The defect.** Six resolution sites read a node's platform as
+`adapter.platform()` / `entry.platform` and ended in
+`unwrap_or(VmGuestPlatform::Linux)`. A node whose adapter was not yet registered, or whose
+inventory entry omitted `platform`, therefore resolved to Linux and had Linux capabilities
+minted into the SIGNED membership snapshot (`build_membership_peers` feeds
+`product_capabilities_for_platform`) and the bundle env — the platform-branching audit's R7
+rows 1 and 2. The audit's attribution of row 1 to an inventory-field omission is imprecise
+for the membership site: its actual trigger is a MISSING ADAPTER in `ctx.adapters`, not the
+inventory `platform` field.
+
+**What landed (commit `f386b249`).** All six sites now fail closed with an error naming the
+alias, using the audit's message template `'{alias}': no platform recorded; refusing to
+assume Linux` (the two stage-level sites, which resolve via the adapter map, say
+`no adapter registered; platform unknown`):
+
+- `orchestrator/stage/membership_init.rs` `build_membership_peers` (signed snapshot minting)
+- `orchestrator/stage/distribute_assignments.rs` `build_bundle_env` (bundle capability CSV)
+- `orchestrator/native.rs` × 4 — role-assignability validation, the `node_targets`
+  run-summary snapshot, adapter construction, and the host-cross-binary arch-probe loop.
+  All four resolve through one new shared helper, `entry_platform_or_fail`, so the
+  enforcement point is singular. The `node_targets` site needed a shape change: its
+  `.map()` closure returned a bare tuple, so it now returns
+  `Result<(String, String, String, String), String>` and collects via
+  `.collect::<Result<Vec<_>, String>>()?`.
+
+Each site was checked individually against its enclosing function's error path (per the
+task brief's warning that not all six sit identically); all six turned out to be in
+`-> Result` context, but the tuple-closure site could not use `?` without the collect
+conversion above.
+
+**Verification.** Four new tests, each of which observes `Ok` (and fails) if its site
+reverts to `unwrap_or(VmGuestPlatform::Linux)`:
+
+- `entry_platform_or_fail_rejects_missing_platform_with_named_alias` — catches a revert of
+  the shared helper (all four native.rs sites at once); plus
+  `entry_platform_or_fail_returns_the_recorded_platform` guarding against a wrong-variant
+  helper.
+- `build_membership_peers_fails_closed_without_a_registered_adapter` — catches a revert at
+  the signed-snapshot site (existing fixtures had to register Linux `FakePlatformAdapter`s,
+  same pattern as `mesh_status_validation`, because they previously exercised the silent
+  default deliberately).
+- `build_bundle_env_fails_closed_without_a_registered_adapter` — catches a revert at the
+  bundle-env site.
+
+Gates: `cargo fmt --all -- --check` exit 0;
+`cargo clippy -p rustynet-cli --all-targets --all-features --locked -- -D warnings` exit 0;
+targeted `cargo test -p rustynet-cli --lib --all-features --locked` 10 passed / 0 failed.
+
+**Root cause deliberately NOT landed: `VmGuestPlatform::infer`'s `else { Self::Linux }`.**
+`infer` (`vm_lab/mod.rs` ~1984-2021) ends with an unconditional Linux fallback for any name
+matching no known substring, which defeats the compile-time platform discipline downstream
+and is invisible to a `VmGuestPlatform::Linux` grep because it is written `Self::Linux`.
+Measured, not assumed: `infer` itself has only THREE call sites (the unmatched-local-UTM
+discovery branch, `effective_platform_profile`, and the W5.7-quarantined dead-code
+`platform_for_entry` in `topology.rs`), so an Option-returning infer looks cheap — but
+`effective_platform_profile`'s only caller is `VmInventoryEntry::platform_profile()`
+(mod.rs ~2325), which has **34 call sites** across the macos/windows evidence assertions,
+the discovery summary, and the overnight loop (`overnight/mod.rs:97`,
+`overnight/executor.rs:492`). Converting that chain to `Result` means individually
+fail-closing 30+ call sites, most of which are assertion contexts where the right handling
+differs per site. That is a deliberate, reviewable increment of its own, not a rider on the
+R7 fix, so it was not landed here.
+
+**Shape of the eventual fix.** Make `infer` return `Option<Self>` with explicit Linux hint
+matching (`linux|debian|ubuntu|fedora|mint` substrings, aligned with the already-correct
+`VmGuestPlatform::parse` at mod.rs ~1971) so today's plain-Linux guests still infer Linux
+while genuinely ambiguous names yield `None`; propagate through
+`effective_platform_profile` → `platform_profile()` as `Result`, resolving each of the 34
+call sites explicitly. A naive None-without-Linux-hints variant would fail-closed every
+normal Linux guest (`debian-headless-4` contains no `linux` substring) and must not be
+shipped.

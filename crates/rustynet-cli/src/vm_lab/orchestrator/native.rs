@@ -25,6 +25,21 @@ use crate::vm_lab::{
     network_profile, normalize_manifest_path, resolve_absolute_path, write_orchestration_artifact,
 };
 
+/// Fail-closed platform resolution for an inventory entry (platform-branching
+/// audit R7): a missing `platform` must abort the run instead of silently
+/// minting Linux capabilities into signed membership state.
+fn entry_platform_or_fail(
+    entry: &VmInventoryEntry,
+    assignment: &crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment,
+) -> Result<VmGuestPlatform, String> {
+    entry.platform.ok_or_else(|| {
+        format!(
+            "'{}': no platform recorded; refusing to assume Linux",
+            assignment.alias
+        )
+    })
+}
+
 pub(crate) fn execute_rust_native_orchestration(
     config: VmLabOrchestrateLiveLabConfig,
 ) -> Result<String, String> {
@@ -345,7 +360,7 @@ pub(crate) fn execute_rust_native_orchestration(
         })
         .collect::<Result<Vec<_>, String>>()?;
     for (entry, assignment) in &node_entries {
-        let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+        let platform = entry_platform_or_fail(entry, assignment)?;
         if !assignment.role.is_lab_assignable_for_platform(&platform) {
             return Err(format!(
                 "role '{}' is not lab-assignable on platform {platform:?}",
@@ -524,15 +539,15 @@ pub(crate) fn execute_rust_native_orchestration(
                 .unwrap_or(entry.ssh_target.as_str())
                 .to_owned();
             let platform =
-                format!("{:?}", entry.platform.unwrap_or(VmGuestPlatform::Linux)).to_lowercase();
-            (
+                format!("{:?}", entry_platform_or_fail(entry, assignment)?).to_lowercase();
+            Ok((
                 assignment.alias.clone(),
                 target,
                 assignment.role.as_str().to_owned(),
                 platform,
-            )
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, String>>()?;
 
     // Auto-derive /24 ssh_allow_cidrs from node underlay IPs when not set.
     if ctx.ssh_allow_cidrs.is_empty() {
@@ -567,7 +582,7 @@ pub(crate) fn execute_rust_native_orchestration(
             .unwrap_or(entry.ssh_target.as_str())
             .to_owned();
 
-        let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+        let platform = entry_platform_or_fail(entry, assignment)?;
         if !assignment.role.is_lab_assignable_for_platform(&platform) {
             return Err(format!(
                 "role '{}' is not lab-assignable on platform {platform:?}; Windows Exit is lab-assignable for evidence generation only, but unsupported platforms remain fail-closed",
@@ -627,7 +642,7 @@ pub(crate) fn execute_rust_native_orchestration(
         let mut node_aa: Vec<(String, VmGuestPlatform, String)> =
             Vec::with_capacity(node_entries.len());
         for (entry, assignment) in &node_entries {
-            let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+            let platform = entry_platform_or_fail(entry, assignment)?;
             let host = entry
                 .last_known_ip
                 .as_deref()
@@ -1444,6 +1459,61 @@ mod tests {
             alias: alias.to_string(),
             role,
         }
+    }
+
+    fn inventory_entry(alias: &str, platform: Option<VmGuestPlatform>) -> VmInventoryEntry {
+        VmInventoryEntry {
+            alias: alias.to_owned(),
+            ssh_target: format!("{alias}.lab"),
+            ssh_user: None,
+            ssh_password: None,
+            include_in_all: None,
+            os: None,
+            last_known_ip: None,
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: None,
+            mesh_ip: None,
+            exit_capable: None,
+            relay_capable: None,
+            remote_temp_dir: None,
+            utm_staging_dir: None,
+            rustynet_src_dir: None,
+            platform,
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
+            controller: None,
+        }
+    }
+
+    /// R7: a missing inventory platform must fail closed with the alias named
+    /// instead of silently resolving to Linux. If the helper reverts to
+    /// `unwrap_or(VmGuestPlatform::Linux)` this returns `Ok(Linux)` and the
+    /// `expect_err` below fails.
+    #[test]
+    fn entry_platform_or_fail_rejects_missing_platform_with_named_alias() {
+        let entry = inventory_entry("mystery-node", None);
+        let a = assignment("mystery-node", NodeRole::Client);
+        let err =
+            entry_platform_or_fail(&entry, &a).expect_err("missing platform must fail closed");
+        assert!(err.contains("no platform recorded"), "got: {err}");
+        assert!(
+            err.contains("mystery-node"),
+            "error must name the alias, got: {err}"
+        );
+    }
+
+    #[test]
+    fn entry_platform_or_fail_returns_the_recorded_platform() {
+        let entry = inventory_entry("mac-node", Some(VmGuestPlatform::Macos));
+        let a = assignment("mac-node", NodeRole::Client);
+        assert_eq!(
+            entry_platform_or_fail(&entry, &a).unwrap(),
+            VmGuestPlatform::Macos
+        );
     }
 
     #[test]
