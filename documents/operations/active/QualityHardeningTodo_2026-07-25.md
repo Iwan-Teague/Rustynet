@@ -6708,15 +6708,39 @@ the traversal authority never PROGRAMMED a relay path for them: the programmed m
 Removing the direct path therefore left the pair with no path at all rather than moving them
 onto the relay.
 
-**Open question, and it decides who owns the fix.** Either the product's traversal authority is
-expected to fall back to a relay path when the direct path stops working, in which case this is
-a daemon-side gap and 90 s may also be too short for whatever re-negotiation is meant to happen;
-or programming the relay path is the lab's job before it blocks direct UDP, in which case the
-stage is incomplete. Nobody has confirmed which, and the answer should be established from the
-D2/D3 dataplane design before either side is changed. Do not "fix" this by lengthening the
-timeout: the counters say zero relay peers were ever programmed, not that programming was slow.
+**ROOT CAUSE ESTABLISHED 2026-09-08 (supersedes the open question this entry was filed with).
+It is entirely lab-side. The daemon is behaving correctly.**
 
-**Disposition: OPEN, filed 2026-09-08.**
+The daemon can only route a peer through a relay when TWO things are true, and the lab provides
+neither:
+
+1. **The signed traversal bundle must carry a `Relay` candidate.** The daemon reads its relay
+   endpoint straight out of the bundle (`select_runtime_traversal_endpoints`, consumed at
+   `daemon.rs:7594-7601`); with no relay candidate there is nothing to program, which is exactly
+   what `path_programmed_relay_peers=0` reports. Every candidate the lab mints is `relay_id:
+   None` — `traversal_candidates_for_target` (`ops_e2e.rs:3939-3958`) emits only `Host` and
+   `ServerReflexive`, and the other three mint sites (`ops_e2e.rs:3773`, `3792`, `3946`) are
+   `None` too. **No traversal bundle this lab has ever issued contained a relay candidate.**
+2. **The peer must have a relay client.** `load_relay_client` (`daemon.rs:4983`) returns `Some`
+   only when the daemon is configured with a relay session token spool or a signing secret, and
+   `load_optional_relay_fleet` (`5091`) needs a relay fleet bundle. Searching the whole vm_lab
+   surface for `relay_fleet`, `RUSTYNET_RELAY_SESSION` or `relay_session_token` returns **no
+   matches at all**: the lab never distributes relay fleet or session material to any node. That
+   is why the sender reported `relay_session_configured=false` and
+   `relay_session_state=disabled`.
+
+So the stage firewalls direct UDP and then waits ninety seconds for a relay-routed session that
+nothing in the run has made possible. Lengthening the timeout, or teaching the daemon to "fall
+back" (the shape this entry originally proposed), would both be wrong: there is no relay path to
+fall back TO.
+
+**The fix is the lab's minting and distribution, in two parts:** issue the relay pair a
+traversal bundle whose candidate list includes a `Relay` candidate naming the elected relay and
+its live bind endpoint, and distribute the relay fleet / session material the peers need for
+`load_relay_client` to return `Some`. Both belong to the orchestrator, alongside the existing
+bundle distribution.
+
+**Disposition: OPEN — root-caused, fix scoped, not yet implemented (2026-09-08).**
 
 ### QH-79 — the stale-environment-override hazard is bounded to the relay, checked 2026-09-08
 
