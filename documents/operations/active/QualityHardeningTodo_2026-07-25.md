@@ -6939,3 +6939,76 @@ while genuinely ambiguous names yield `None`; propagate through
 call sites explicitly. A naive None-without-Linux-hints variant would fail-closed every
 normal Linux guest (`debian-headless-4` contains no `linux` substring) and must not be
 shipped.
+### QH-83 — evidence-on-pass for `--node` stages (audit item 1 of "the smallest set of changes that makes a green run mean something") is a per-stage wiring job, not a wrapper change: filed 2026-09-08 after scoping, deliberately NOT landed
+
+**Severity: high (evidence integrity — a stage can record `Passed` while writing
+nothing behind the verdict). Confidence: VERIFIED by reading the seam and
+measuring the stage tree on 2026-09-08 (commits `5facede9`, `5c7acefd` carry
+items 2 and 3 of the audit's list; this item was scoped and intentionally
+stopped). Source: `MultiAgentSecurityReviewAudit_2026-09-08.md` §"The smallest
+set of changes that makes a green run mean something", item 1.**
+
+The audit's proposed shape — "one wrapper change in the stage framework" — is
+correct about the seam and optimistic about the work. What a day of scoping
+found:
+
+**The seam is exactly where the audit says.** A `Passed` outcome can be
+demoted to `NotProven { reason: MissingWitness, .. }` at ONE point:
+`StateMachineRunner::run_with_observer_and_pre_cleanup_hook`
+(`crates/rustynet-cli/src/vm_lab/orchestrator/runner.rs`, between
+`stage.execute(ctx)` returning and `ctx.record_outcome`). The verdict type and
+the blocking semantics already exist and are tested
+(`StageOutcome::NotProven`, `ReasonCode::MissingWitness`,
+`NotProven.is_blocking()` in `orchestrator/error.rs`). The named opt-out has a
+natural home: a required-by-default trait method on `OrchestrationStage`
+(`stage/mod.rs`), e.g. `fn evidence_artifact(&self) -> Option<String>`
+returning the report-dir-relative path of the data artifact behind the
+verdict, `None` only by an explicit, greppable override.
+
+**The gap is that there is nothing for the wrapper to check.** No per-stage
+artifact convention exists. The only file the engine guarantees per stage is
+the recorder-owned per-stage log `<report_dir>/logs/<stage>.log`
+(`rust_native_stage_log_path`, `orchestrator/evidence.rs`), which the recorder
+TRUNCATES at `stage_started` and appends the terminal verdict to at
+`stage_finished` — so at the wrapper's check instant it contains exactly what
+the stage wrote during execution, and nothing else. Measured on 2026-09-08:
+
+- only 2 of ~70 stage files call `append_stage_evidence_line` today
+  (`stage/membership_init.rs`, `stage/mesh_status_validation.rs`);
+- ~54 `fs::write`/JSON-report sites across the stage tree use AD-HOC paths
+  (`live_two_hop.log`, `live_linux_anchor_report.json`,
+  `validator_results.json`, `logs/traffic_test_matrix_progress.log`, …) with
+  no shared naming rule, so the runner cannot find them generically.
+
+So a wrapper that requires the per-stage log to be non-empty demotes nearly
+every currently-passing stage to `NotProven` (a BLOCKING non-pass) on the
+next live run: every dependency cascades, every run fails. That is not a gate
+coming online, it is the evidence layer breaking — and shipping it would be
+the half-landing the task forbids.
+
+**The real shape of the fix (for whoever picks this up).** Three parts, in
+order:
+
+1. Framework (small): the wrapper in the runner seam + the required-by-default
+   `evidence_artifact()` trait method + the failure path demoting `Passed` to
+   `NotProven{MissingWitness}` naming the stage and the missing/empty
+   artifact. Tests: pass with artifact stays `Passed`; pass without artifact
+   becomes `NotProven`; the opt-out is honoured and visibly named.
+2. Per-stage evidence wiring (the bulk — this is the multi-day part): every
+   stage either appends a MEANINGFUL data line to its own log during execute
+   (`append_stage_evidence_line` already enforces the one-line, no-newline,
+   fail-on-IO contract) or declares its real artifact path. Each of the ~70
+   stages needs an individual "what datum IS this verdict" decision — a stage
+   that appeases the check by appending a constant satisfies emptiness without
+   proving anything, which is the same defect one level up. Batch by suite
+   (Setup → Live → CrossNetwork → Chaos) with a live-lab re-verify per batch.
+3. Opt-out triage (explicitly named, each with a reason): stages that
+   legitimately produce no artifact — the teardown/cleanup family, pure
+   orchestration steps. The triage list must live in code as the `None`
+   overrides, not in a doc, so the compiler sees every stage's answer.
+
+**Disposition: OPEN, deliberately not implemented.** Items 2 and 3 of the
+audit's minimal set (vacuous-filter kill; self-proof kill for source pins)
+are landed and gated; this item needs the staged per-stage wiring above and a
+reviewer per batch, and a wrapper landed without it would break every live run
+or lie by default — both worse than the honest gap this entry records.

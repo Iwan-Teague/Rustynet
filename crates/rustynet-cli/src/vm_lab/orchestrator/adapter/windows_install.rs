@@ -2101,16 +2101,14 @@ mod tests {
     }
 
     /// Returns the implementation slice of `windows_install.rs` — the
-    /// source above the `#[cfg(test)] mod tests` marker. The
+    /// source with the `#[cfg(test)]` region removed. The
     /// source-pin tests below must check the implementation, not the
     /// test fixtures themselves; a naive `include_str!` would match
     /// patterns referenced in the test assertions (false-positive on
     /// the `assert!(!source.contains(...))` invariants).
-    fn windows_install_impl_source() -> &'static str {
-        let full = include_str!("windows_install.rs");
-        full.split("#[cfg(test)]")
-            .next()
-            .expect("implementation slice must precede tests")
+    fn windows_install_impl_source() -> String {
+        crate::vm_lab::implementation_source_slice(include_str!("windows_install.rs"))
+            .expect("windows_install.rs implementation slice must parse")
     }
 
     #[test]
