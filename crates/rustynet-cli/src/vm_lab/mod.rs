@@ -44648,12 +44648,22 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         permissions.set_mode(0o755);
         fs::set_permissions(&ps, permissions).expect("ps script should be executable");
 
-        let present = local_utm_process_present_with_ps(
-            ps.as_path(),
-            bundle.as_path(),
-            Duration::from_secs(30),
-        )
-        .expect("process probe should succeed");
+        // QH-77: inject an unreachable probe budget instead of a wall-clock
+        // 30 s. The deadline is the only load-sensitive part of this test —
+        // under a loaded host (parallel cargo jobs; Gatekeeper exec validation
+        // of freshly written scripts) the spawn of the stub `ps` alone can
+        // outlive a real budget and turn scheduling delay into a false probe
+        // failure. With `Duration::MAX` the poll loop in
+        // `run_output_with_timeout` can never take the timeout branch, so the
+        // result depends only on the stub's behaviour. The regression coverage
+        // is unchanged and still fails on behaviour, not on the clock: a
+        // narrowed argument list (plain `ps` instead of `axww -o command`)
+        // trips the args-log assertion, and a broken needle match or UTF-8
+        // handling trips the `present` assertion via the real spawn+parse
+        // path.
+        let present =
+            local_utm_process_present_with_ps(ps.as_path(), bundle.as_path(), Duration::MAX)
+                .expect("process probe should succeed");
 
         assert!(present);
         assert_eq!(
