@@ -900,6 +900,67 @@ pub(crate) fn macos_dns_posture(exit_mode: ExitMode, serve_exit_node: bool) -> D
 }
 
 #[cfg(test)]
+mod windows_blind_exit_fail_closed_tests {
+    use super::{DataplaneSystem, ExitMode, SystemError, WindowsCommandSystem};
+
+    fn system() -> WindowsCommandSystem {
+        WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback addr"),
+        )
+        .expect("windows system should construct")
+    }
+
+    /// H3 (2026-09-08). The Windows arm took `blind_exit` and DISCARDED it,
+    /// then installed the full masquerading exit: forwarding enabled on the
+    /// underlay NIC plus a `New-NetNat`. That is the exact posture
+    /// `blind_exit` exists to forbid, and `assert_exit_serving` then REQUIRED
+    /// it, so the stage went green because the node was wrong.
+    ///
+    /// Windows has no blind-exit implementation to branch into, so the only
+    /// honest behaviour is refusal. `blind_exit` is irreversible: a silent
+    /// downgrade cannot be corrected later, which is why this must fail
+    /// rather than warn.
+    ///
+    /// Mutation this catches: restore the `_blind_exit` parameter and the
+    /// unconditional `apply_windows_exit_nat_forwarding` call, and this test
+    /// observes `Ok(())` instead of the error.
+    #[test]
+    fn a_windows_blind_exit_node_refuses_to_install_a_full_nat() {
+        let mut sys = system();
+        let err = sys
+            .apply_nat_forwarding(true, ExitMode::Off, true, "100.64.0.0/10")
+            .expect_err("windows must refuse to serve blind_exit as a full NAT exit");
+        match err {
+            SystemError::NatApplyFailed(message) => {
+                assert!(
+                    message.contains("blind_exit is not implemented on Windows"),
+                    "the refusal must name the reason: {message}"
+                );
+                assert!(
+                    message.contains("irreversible"),
+                    "the refusal must say why a silent downgrade is unacceptable: {message}"
+                );
+            }
+            other => panic!("expected a NAT apply failure, got {other:?}"),
+        }
+    }
+
+    /// The refusal must be scoped to blind_exit only. A plain Windows client
+    /// still needs the early return, and this is the guard against "fail
+    /// closed" being widened into "Windows can never serve an exit".
+    #[test]
+    fn a_windows_client_still_short_circuits_without_touching_nat() {
+        let mut sys = system();
+        sys.apply_nat_forwarding(false, ExitMode::Off, false, "100.64.0.0/10")
+            .expect("a non-serving Windows client needs no NAT and must not error");
+        sys.apply_nat_forwarding(false, ExitMode::FullTunnel, true, "100.64.0.0/10")
+            .expect("blind_exit only matters when the node actually serves");
+    }
+}
+
+#[cfg(test)]
 mod dns_posture_tests {
     use super::{DnsPosture, ExitMode, macos_dns_posture};
 
@@ -6569,13 +6630,35 @@ impl DataplaneSystem for WindowsCommandSystem {
         &mut self,
         serve_exit_node: bool,
         _exit_mode: ExitMode,
-        _blind_exit: bool,
+        blind_exit: bool,
         mesh_cidr: &str,
     ) -> Result<(), SystemError> {
         if !serve_exit_node {
             // Windows client nodes can consume an exit node by routing traffic through
             // WireGuard NT via per-peer AllowedIPs; no local NAT is needed in that mode.
             return Ok(());
+        }
+        // H3 (2026-09-08): this arm took `_blind_exit` and DISCARDED it, then
+        // installed the full masquerading exit below — enabling forwarding on
+        // the underlay NIC and creating a `New-NetNat`, which is the exact
+        // posture `blind_exit` exists to forbid. Worse, `assert_exit_serving`
+        // then REQUIRES that posture, so the stage reported green precisely
+        // because the node was wrong. Both sibling platforms branch here
+        // (Linux `:3346`, macOS `:5146`).
+        //
+        // Windows has no blind-exit implementation to branch INTO — there is
+        // no `windows_blind_exit.rs` — so the only honest behaviour is to
+        // refuse. Failing closed leaves the node without exit NAT rather than
+        // silently serving as a full exit; `blind_exit` is irreversible, so a
+        // silent downgrade cannot be undone by a later correction.
+        if blind_exit {
+            return Err(SystemError::NatApplyFailed(
+                "blind_exit is not implemented on Windows: refusing to install a full \
+                 masquerading exit in its place. The role is irreversible, so a silent \
+                 downgrade to a non-blind exit is not recoverable — run this role on \
+                 Linux or macOS."
+                    .to_owned(),
+            ));
         }
         self.apply_windows_exit_nat_forwarding(mesh_cidr)
     }
