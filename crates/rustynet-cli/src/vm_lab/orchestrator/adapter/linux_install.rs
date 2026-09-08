@@ -418,11 +418,17 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     //    the unit's own loopback-only default (the documented posture: an
     //    operator must opt in before the relay serves off-host peers), which
     //    the HP-3 provisioner still widens when it runs.
-    ssh::run_remote(
-        conn,
-        "sudo -n rm -f /etc/default/rustynet-relay",
-        short_timeout,
+    let drop_stale_override = ssh::RemoteCommand::from_args(
+        "relay stale environment override",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("rm")?,
+            ValidatedArg::cli_token("-f")?,
+            ValidatedArg::path("/etc/default/rustynet-relay")?,
+        ],
     )?;
+    ssh::run_remote(conn, drop_stale_override.as_str(), short_timeout)?;
 
     // 5. Install + enable + start rustynet-relay.service via the shared helper.
     //    It reads scripts/systemd/rustynet-relay.service relative to cwd, so run
@@ -453,9 +459,39 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     //    reported as a clean deploy and the failure only surfaces one stage
     //    later as an unexplained `relay_validation` failure. Report the unit
     //    state with the journal tail so the cause is in this stage's evidence.
-    let state = ssh::run_remote(conn, RELAY_UNIT_ACTIVE_QUERY, short_timeout)?;
+    let unit_state_query = ssh::RemoteCommand::from_args(
+        "relay unit state",
+        &[
+            ValidatedArg::cli_token("sudo")?,
+            ValidatedArg::cli_token("-n")?,
+            ValidatedArg::cli_token("systemctl")?,
+            ValidatedArg::cli_token("is-active")?,
+            ValidatedArg::service(RELAY_SERVICE_NAME)?,
+        ],
+    )?;
+    // `systemctl is-active` exits non-zero for an inactive unit, so a dead
+    // relay arrives here as `Err` exactly like a transport failure would.
+    // Treat any failure as "not active" and let the journal read below explain
+    // which it was: a transport fault leaves the journal unavailable too, and
+    // that pair is reported verbatim. Never treat an unreadable state as
+    // healthy.
+    let state = ssh::run_remote(conn, unit_state_query.as_str(), short_timeout)
+        .unwrap_or_else(|err| format!("<unit state unavailable: {err}>"));
     if state.trim() != "active" {
-        let journal = ssh::run_remote(conn, RELAY_UNIT_JOURNAL_QUERY, short_timeout)
+        let journal_query = ssh::RemoteCommand::from_args(
+            "relay unit journal tail",
+            &[
+                ValidatedArg::cli_token("sudo")?,
+                ValidatedArg::cli_token("-n")?,
+                ValidatedArg::cli_token("journalctl")?,
+                ValidatedArg::cli_token("-u")?,
+                ValidatedArg::service(RELAY_SERVICE_NAME)?,
+                ValidatedArg::cli_token("-n")?,
+                ValidatedArg::cli_token("12")?,
+                ValidatedArg::cli_token("--no-pager")?,
+            ],
+        )?;
+        let journal = ssh::run_remote(conn, journal_query.as_str(), short_timeout)
             .unwrap_or_else(|err| format!("<journal unavailable: {err}>"));
         return Err(AdapterError::Protocol {
             message: format!(
@@ -468,17 +504,11 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     Ok(())
 }
 
-/// Unit-state query for the post-install relay health gate. `is-active` exits
-/// non-zero for an inactive unit, so the `|| echo` keeps the transport error
-/// distinct from a legitimately dead unit: a transport failure is still `Err`,
-/// while a dead unit returns its state as data for the caller to report.
-const RELAY_UNIT_ACTIVE_QUERY: &str =
-    "sudo -n systemctl is-active rustynet-relay.service 2>/dev/null || true";
-
-/// Journal tail for the post-install relay health gate. Read only when the
-/// unit is not active, so a healthy deploy pays no extra round trip.
-const RELAY_UNIT_JOURNAL_QUERY: &str =
-    "sudo -n journalctl -u rustynet-relay.service -n 12 --no-pager 2>&1 | tail -12";
+/// Service unit the post-install relay health gate inspects. Both the state
+/// query and the journal tail are built as validated argv through
+/// `RemoteCommand` + `ValidatedArg`, so neither reaches the remote sink as an
+/// interpolated string and neither needs a shell.
+const RELAY_SERVICE_NAME: &str = "rustynet-relay.service";
 
 /// Start the rustynetd systemd service.
 ///
@@ -641,7 +671,7 @@ mod relay_deploy_hygiene_tests {
     //! `live-lab-linux-relay-fwd9-20260907-172608` unrecoverable: a stale
     //! `/etc/default/rustynet-relay` surviving the deploy, and a deploy that
     //! reports success while the unit crash-loops.
-    use super::{RELAY_UNIT_ACTIVE_QUERY, RELAY_UNIT_JOURNAL_QUERY};
+    use super::RELAY_SERVICE_NAME;
 
     /// The deploy MUST remove the previous run's environment override before
     /// installing the unit. Without this the unit's
@@ -660,11 +690,11 @@ mod relay_deploy_hygiene_tests {
             .unwrap_or(body.len());
         let body = &body[..end];
         assert!(
-            body.contains("sudo -n rm -f /etc/default/rustynet-relay"),
-            "deploy must drop the previous run's env override"
+            body.contains("ValidatedArg::path(\"/etc/default/rustynet-relay\")"),
+            "deploy must drop the previous run's env override, as validated argv"
         );
         let removal = body
-            .find("rm -f /etc/default/rustynet-relay")
+            .find("ValidatedArg::path(\"/etc/default/rustynet-relay\")")
             .expect("removal present");
         let install = body
             .find("ops install-systemd-relay")
@@ -690,7 +720,7 @@ mod relay_deploy_hygiene_tests {
             .unwrap_or(body.len());
         let body = &body[..end];
         assert!(
-            body.contains("RELAY_UNIT_ACTIVE_QUERY"),
+            body.contains("\"is-active\""),
             "deploy must query the unit state after install"
         );
         assert!(
@@ -703,16 +733,44 @@ mod relay_deploy_hygiene_tests {
         );
     }
 
-    /// The state query must not let a dead unit read as a transport error, and
-    /// must not swallow one either.
+    /// Both post-install queries are built as validated argv, never as an
+    /// interpolated string at the remote sink, and both name the same unit.
+    /// The shell forms they replaced (`|| true`, `2>&1 | tail`) are gone: an
+    /// unreadable state is handled in Rust as "not active" rather than by a
+    /// shell that would also mask a transport failure.
     #[test]
-    fn unit_state_query_separates_a_dead_unit_from_a_transport_failure() {
-        assert!(RELAY_UNIT_ACTIVE_QUERY.contains("systemctl is-active rustynet-relay.service"));
-        assert!(
-            RELAY_UNIT_ACTIVE_QUERY.contains("|| true"),
-            "is-active exits non-zero for a dead unit; that must return data, not an Err"
+    fn both_post_install_queries_are_validated_argv_for_the_same_unit() {
+        let source = include_str!("linux_install.rs");
+        let start = source
+            .find("pub fn deploy_relay_service(")
+            .expect("relay deploy fn must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert_eq!(RELAY_SERVICE_NAME, "rustynet-relay.service");
+        assert_eq!(
+            body.matches("ValidatedArg::service(RELAY_SERVICE_NAME)")
+                .count(),
+            2,
+            "the state query and the journal tail must both name the unit through ValidatedArg"
         );
-        assert!(RELAY_UNIT_JOURNAL_QUERY.contains("journalctl -u rustynet-relay.service"));
+        assert!(
+            body.contains("\"journalctl\""),
+            "journal tail must be queried"
+        );
+        for shell_form in ["|| true", "2>&1", "| tail", "2>/dev/null"] {
+            assert!(
+                !body.contains(shell_form),
+                "post-install queries must not reach the sink through a shell ({shell_form})"
+            );
+        }
+        assert!(
+            body.contains("unit state unavailable"),
+            "an unreadable unit state must be reported, never read as healthy"
+        );
     }
 }
 
