@@ -125,9 +125,12 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    `evaluate_macos_killswitch_rules` on the captured anchor rules; negative
    test with a `pass out quick all` above the terminator; ledger row corrected
    (DONE → the real commit). Manager. **In progress.**
-2. **B3 blind_exit NAT probe** — require a rustynet-owned rule and the exit
-   status; negative fixture = the real chain-header-only output. Manager
-   (validator verdict class) or GLM-restricted.
+2. **B3 blind_exit NAT probe** — DONE `07cfb057` (QH-86): judges the
+   rustynet nft tables for the blind_exit forward rules and rejects any
+   masquerade; macOS reads the blind_exit anchor and requires the exit NAT
+   anchor empty; real-shaped negative fixtures. **B2** DONE in the same
+   pass: the feature-guard scan walks the stage tree recursively, fails
+   closed on an unreadable file, and pins the launcher count exactly (15).
 3. **QH-83** (in flight, relaunched `edit-1788908162525-23870-0` on glm-5.3
    after the first attempt stalled 4 h with zero edits) — folds B1, pattern H.
 4. **QH-82** (in flight, relaunched `edit-1788908182590-23933-0`).
@@ -141,7 +144,7 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
 7. **C: I1, I3, I4** small fixes (GLM-flash), then the `PlatformCapabilities`
    table (L) after QH-82.
 8. **D: pattern G parity** on the four Linux evaluators (GLM-flash, S).
-9. **B2, B4, B5** (S/S/M).
+9. **B4, B5** (S/M). B2 done (see item 2).
 
 ## 4) Method notes
 
