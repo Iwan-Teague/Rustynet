@@ -45,6 +45,351 @@ use tar::Builder;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+/// Returns the implementation slice of a vm_lab source file: the source with
+/// every `#[cfg(test)]`-annotated item removed.
+///
+/// Source-pin tests must search the implementation, never their own test
+/// module: a full-file `contains` search is satisfied by the assertion literal
+/// itself, so the pin proves nothing. `mod.rs` interleaves test modules with
+/// implementation code, so a "cut at the first marker" slice is wrong here;
+/// this helper removes each `#[cfg(test)]` region by brace-matching the item
+/// it annotates, skipping string literals, char literals, raw strings, and
+/// comments while matching so braces inside embedded scripts cannot desync
+/// the count. Unsupported attribute forms fail closed rather than leaking
+/// test code into the slice.
+///
+/// Test-support infrastructure: every caller is `#[cfg(test)]` code, so
+/// production builds legitimately never call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, String> {
+    let chars: Vec<char> = full_source.chars().collect();
+    let mut out = String::with_capacity(full_source.len());
+    let mut i = 0usize;
+    let marker: Vec<char> = "#[cfg(test)]".chars().collect();
+
+    // True when `chars[idx]` is not preceded by an identifier character, so
+    // `r`/`b` can start a raw/byte string and `r` inside an identifier is not
+    // mistaken for one.
+    fn at_identifier_boundary(chars: &[char], idx: usize) -> bool {
+        if idx == 0 {
+            return true;
+        }
+        let prev = chars[idx - 1];
+        !(prev.is_alphanumeric() || prev == '_')
+    }
+
+    // True when a raw/byte string (r"..." / r#"..."# / br#"..."#) opens at i.
+    fn opens_raw_string(chars: &[char], i: usize) -> bool {
+        if !at_identifier_boundary(chars, i) {
+            return false;
+        }
+        match chars[i] {
+            'r' => i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '#'),
+            'b' => {
+                i + 2 < chars.len()
+                    && chars[i + 1] == 'r'
+                    && (chars[i + 2] == '"' || chars[i + 2] == '#')
+            }
+            _ => false,
+        }
+    }
+
+    // Consume one string-like literal starting at `chars[i]` (which is known
+    // to open one); returns the index just past its end.
+    fn skip_string(chars: &[char], mut i: usize) -> Result<usize, String> {
+        // Raw strings: r"..." / r#"..."# / br#"..."#.
+        let raw_start = if at_identifier_boundary(chars, i)
+            && chars[i] == 'b'
+            && i + 1 < chars.len()
+            && chars[i + 1] == 'r'
+        {
+            Some(i + 2)
+        } else if at_identifier_boundary(chars, i) && chars[i] == 'r' {
+            Some(i + 1)
+        } else {
+            None
+        };
+        if let Some(start) = raw_start {
+            let mut hashes = 0usize;
+            let mut j = start;
+            while j < chars.len() && chars[j] == '#' {
+                hashes += 1;
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '"' {
+                if hashes == 0 {
+                    // r"..." — a raw string with no hashes; it cannot contain
+                    // a quote character and has no escape sequences.
+                    j += 1;
+                    while j < chars.len() {
+                        if chars[j] == '"' {
+                            return Ok(j + 1);
+                        }
+                        j += 1;
+                    }
+                    return Err("unterminated raw string literal".to_owned());
+                }
+                let terminator: Vec<char> = std::iter::once('"')
+                    .chain(std::iter::repeat_n('#', hashes))
+                    .collect();
+                j += 1;
+                while j + terminator.len() <= chars.len() {
+                    if chars[j..j + terminator.len()] == terminator[..] {
+                        return Ok(j + terminator.len());
+                    }
+                    j += 1;
+                }
+                return Err("unterminated raw string literal".to_owned());
+            }
+            // `r`/`br` not followed by a raw string: fall through as normal.
+        }
+        // Regular string literal.
+        if chars[i] != '"' {
+            return Err(format!("skip_string called at non-quote index {i}"));
+        }
+        i += 1;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' => i += 2,
+                '"' => return Ok(i + 1),
+                _ => i += 1,
+            }
+        }
+        Err("unterminated string literal".to_owned())
+    }
+
+    // Consume a char literal or lifetime starting at `chars[i] == '\''`.
+    fn skip_char_or_lifetime(chars: &[char], i: usize) -> Result<usize, String> {
+        let mut j = i + 1;
+        if j >= chars.len() {
+            return Err("unterminated char literal".to_owned());
+        }
+        // Escaped char literal: '\n', '\'', '\\', '\u{1F600}'.
+        if chars[j] == '\\' {
+            j += 1;
+            if j < chars.len() && chars[j] == 'u' {
+                while j < chars.len() && chars[j] != '}' {
+                    j += 1;
+                }
+                j += 1; // '}'
+            } else {
+                j += 1; // the escaped char itself
+            }
+            if j < chars.len() && chars[j] == '\'' {
+                return Ok(j + 1);
+            }
+            return Err("unterminated escaped char literal".to_owned());
+        }
+        if chars[j].is_alphabetic() || chars[j] == '_' {
+            // Lifetime 'ident, unless the quote closes immediately ('a').
+            if j + 1 < chars.len() && chars[j + 1] == '\'' {
+                return Ok(j + 2);
+            }
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            return Ok(j);
+        }
+        // Plain char literal: 'x'.
+        if j + 1 < chars.len() && chars[j + 1] == '\'' {
+            return Ok(j + 2);
+        }
+        Err(format!(
+            "unrecognised char-like token at char offset {i}: {:?}",
+            chars
+                .get(i.saturating_sub(40)..(i + 40).min(chars.len()))
+                .map(|window| window.iter().collect::<String>())
+                .unwrap_or_default()
+        ))
+    }
+
+    // Skip whitespace and comments from `i`; returns the next significant index.
+    fn skip_trivia(chars: &[char], mut i: usize) -> usize {
+        loop {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                let mut depth = 1usize;
+                i += 2;
+                while i < chars.len() && depth > 0 {
+                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                        depth += 1;
+                        i += 2;
+                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            return i;
+        }
+    }
+
+    while i < chars.len() {
+        // Marker detection only on real code (strings/comments are consumed
+        // below as units).
+        if i + marker.len() <= chars.len() && chars[i..i + marker.len()] == marker[..] {
+            let is_keyword = |chars: &[char], j: usize, kw: &str| -> bool {
+                let kw_chars: Vec<char> = kw.chars().collect();
+                chars.len() >= j + kw_chars.len()
+                    && chars[j..j + kw_chars.len()] == kw_chars[..]
+                    && (j + kw_chars.len() == chars.len()
+                        || !(chars[j + kw_chars.len()].is_alphanumeric()
+                            || chars[j + kw_chars.len()] == '_'))
+            };
+            let after_marker = i + "#[cfg(test)]".len();
+            let j = skip_trivia(&chars, after_marker);
+            if is_keyword(&chars, j, "use") {
+                i = j;
+                while i < chars.len() && chars[i] != ';' {
+                    if chars[i] == '"' {
+                        i = skip_string(&chars, i)?;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if i >= chars.len() {
+                    return Err("unterminated #[cfg(test)] use item".to_owned());
+                }
+                i += 1; // ';'
+                continue;
+            }
+            if !is_keyword(&chars, j, "mod") {
+                return Err(
+                    "unsupported #[cfg(test)] item form: expected `mod` or `use`".to_owned(),
+                );
+            }
+            i = j + "mod".len();
+            let j = skip_trivia(&chars, i);
+            if j >= chars.len() || !(chars[j].is_alphabetic() || chars[j] == '_') {
+                return Err("#[cfg(test)] mod without an identifier".to_owned());
+            }
+            i = j;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let j = skip_trivia(&chars, i);
+            if j < chars.len() && chars[j] == ';' {
+                // A cfg(test) mod declaration (no body).
+                i = j + 1;
+                continue;
+            }
+            if j >= chars.len() || chars[j] != '{' {
+                return Err("#[cfg(test)] mod without a body".to_owned());
+            }
+            // Brace-match the mod body, honouring strings and comments.
+            let mut depth = 0usize;
+            let mut k = j;
+            while k < chars.len() {
+                match chars[k] {
+                    '{' => {
+                        depth += 1;
+                        k += 1;
+                    }
+                    '}' => {
+                        depth -= 1;
+                        k += 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    '"' => {
+                        k = skip_string(&chars, k)?;
+                    }
+                    '\'' => {
+                        k = skip_char_or_lifetime(&chars, k)?;
+                    }
+                    _ if opens_raw_string(&chars, k) => {
+                        k = skip_string(&chars, k)?;
+                    }
+                    '/' if k + 1 < chars.len() && chars[k + 1] == '/' => {
+                        while k < chars.len() && chars[k] != '\n' {
+                            k += 1;
+                        }
+                    }
+                    '/' if k + 1 < chars.len() && chars[k + 1] == '*' => {
+                        let mut d = 1usize;
+                        k += 2;
+                        while k < chars.len() && d > 0 {
+                            if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+                                d += 1;
+                                k += 2;
+                            } else if k + 1 < chars.len() && chars[k] == '*' && chars[k + 1] == '/'
+                            {
+                                d -= 1;
+                                k += 2;
+                            } else {
+                                k += 1;
+                            }
+                        }
+                    }
+                    _ => k += 1,
+                }
+            }
+            if depth != 0 {
+                return Err("unbalanced braces in #[cfg(test)] mod body".to_owned());
+            }
+            i = k;
+            continue;
+        }
+        match chars[i] {
+            '"' => {
+                let end = skip_string(&chars, i)?;
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '\'' => {
+                let end = skip_char_or_lifetime(&chars, i)?;
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            _ if opens_raw_string(&chars, i) => {
+                let end = skip_string(&chars, i)?;
+                out.extend(&chars[i..end]);
+                i = end;
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1] == '/' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                let start = i;
+                let mut d = 1usize;
+                i += 2;
+                while i < chars.len() && d > 0 {
+                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                        d += 1;
+                        i += 2;
+                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                        d -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                out.extend(&chars[start..i]);
+            }
+            _ => {
+                out.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    Ok(out)
+}
+
 const DEFAULT_UTMCTL_PATH: &str = "/Applications/UTM.app/Contents/MacOS/utmctl";
 const DEFAULT_VM_LAB_INVENTORY_PATH: &str = "documents/operations/active/vm_lab_inventory.json";
 const DEFAULT_START_TIMEOUT_SECS: u64 = 60;
@@ -38202,6 +38547,136 @@ fn execute_bootstrap_phase_for_target(
 
 #[cfg(test)]
 mod tests {
+    /// Meta-test for the source-pin discipline (MultiAgentSecurityReviewAudit
+    /// 2026-09-08, "self-proof kill"): a test that pins its OWN file's source
+    /// with `include_str!` and searches the full text proves nothing — the
+    /// assertion literal itself satisfies the search. Every self-include must
+    /// therefore route through `implementation_source_slice(...)`, which strips
+    /// the `#[cfg(test)]` regions before the search. The scanner's own needle
+    /// is assembled from parts so the scan cannot match this file's scanner
+    /// source, and the floor assertion keeps it from going blind silently.
+    #[test]
+    fn source_pin_self_includes_must_search_the_implementation_slice() {
+        const VM_LAB_SRC_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/vm_lab");
+
+        fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|err| panic!("vm_lab source tree {dir:?} must read: {err}"));
+            for entry in entries {
+                let entry = entry.expect("vm_lab source tree entry must read");
+                let path = entry.path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        // Assembled so this scanner's own source never contains the raw
+        // `include_str!(` token it searches for.
+        let include_needle = format!("include_{}(", "str!");
+        let wrapper_suffix: &str = concat!("implementation_source_slice", "(");
+
+        let mut files = Vec::new();
+        collect_rs_files(std::path::Path::new(VM_LAB_SRC_DIR), &mut files);
+        assert!(
+            files.len() > 10,
+            "the scanner must find the vm_lab source tree, found {} files",
+            files.len()
+        );
+
+        let mut self_pins_checked = 0usize;
+        for file in &files {
+            let content = std::fs::read_to_string(file)
+                .unwrap_or_else(|err| panic!("vm_lab source {file:?} must read: {err}"));
+            let file_name = file
+                .file_name()
+                .unwrap_or_else(|| panic!("vm_lab source path {file:?} has no file name"))
+                .to_string_lossy()
+                .to_string();
+            let mut search_from = 0usize;
+            while let Some(offset) = content[search_from..].find(&include_needle) {
+                let token_at = search_from + offset;
+                search_from = token_at + include_needle.len();
+                // Parse the string-literal path argument, if literal.
+                let rest_trimmed = content[search_from..].trim_start();
+                let path_str = match rest_trimmed.strip_prefix('"') {
+                    Some(after_quote) => match after_quote.find('"') {
+                        Some(end) => &after_quote[..end],
+                        None => panic!("unterminated include path in {file:?}"),
+                    },
+                    None => continue,
+                };
+                if path_str != file_name {
+                    // Cross-file pins are not self-proofs; out of scope here.
+                    continue;
+                }
+                self_pins_checked += 1;
+                let before = content[..token_at].trim_end();
+                let line = content[..token_at].matches('\n').count() + 1;
+                assert!(
+                    before.ends_with(wrapper_suffix),
+                    "{file_name}:{line} pins its own file's source WITHOUT routing it \
+                     through implementation_source_slice(...); a full-file search can be \
+                     satisfied by this test's own assertion text, which proves nothing. \
+                     Wrap the include in crate::vm_lab::implementation_source_slice(...)."
+                );
+            }
+        }
+        assert!(
+            self_pins_checked >= 1,
+            "the self-pin scanner matched nothing; its needle assembly has gone blind"
+        );
+    }
+
+    /// The slicer must remove test regions that are INTERLEAVED with
+    /// implementation code (mod.rs's real shape), not just truncate at the
+    /// first marker: code between two test modules must survive, and braces /
+    /// quotes inside embedded scripts in a removed test must not desync it.
+    #[test]
+    fn implementation_source_slice_removes_interleaved_test_regions() {
+        let source = "\
+fn kept_before() {}\n\
+#[cfg(test)]\n\
+mod first_tests {\n\
+    const SCRIPT: &str = \"printf '{brace}' \\\"inside\\\"\";\n\
+    fn nested() { let raw = r#\" } \" unbalanced { \"#; }\n\
+}\n\
+fn kept_between() {}\n\
+#[cfg(test)]\n\
+use some::test_only::Thing;\n\
+#[cfg(test)]\n\
+mod last_tests {\n\
+    fn deeper() { if ch == '\\'' { } }\n\
+}\n\
+fn kept_after() {}\n\
+";
+        let slice =
+            super::implementation_source_slice(source).expect("interleaved source must slice");
+        assert!(slice.contains("fn kept_before()"));
+        assert!(slice.contains("fn kept_between()"));
+        assert!(slice.contains("fn kept_after()"));
+        assert!(!slice.contains("first_tests"));
+        assert!(!slice.contains("last_tests"));
+        assert!(!slice.contains("test_only::Thing"));
+        assert!(!slice.contains("unbalanced"));
+    }
+
+    /// Unsupported `#[cfg(test)]` item forms must fail closed: an attribute
+    /// this slicer cannot parse must never silently leak test code into the
+    /// implementation slice.
+    #[test]
+    fn implementation_source_slice_fails_closed_on_unsupported_item_form() {
+        let source = "fn kept() {}\n#[cfg(test)]\nfn a_test_fn() {}\n";
+        let err = super::implementation_source_slice(source)
+            .expect_err("an unsupported cfg(test) form must fail closed");
+        assert!(
+            err.contains("unsupported"),
+            "the error must name the unsupported form: {err}"
+        );
+    }
+
     use super::script_template;
     use super::{
         BoundedReadFailure, DEFAULT_LIBVIRT_CONNECT_URI, DEFAULT_UTM_IP_DISCOVERY_TIMEOUT_SECS,
@@ -44580,7 +45055,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     /// retirement token — must be accepted.
     #[test]
     fn macos_reboot_post_probe_enumerates_logs_as_root_and_accepts_both_recovery_lines() {
-        let source = include_str!("mod.rs");
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
         // The live cell is `exercise_macos_reboot_recovery_with_recovery_actions`
         // since the post-reboot bundle refresh split the original fn; the
         // probe (and its token const) live in the split fn.
@@ -50270,7 +50746,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
 
     #[test]
     fn macos_exit_capture_script_rechecks_daemon_state_after_nat_lifecycle() {
-        let source = include_str!("mod.rs");
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
         assert!(
             source.contains("post_capture_macos_mesh_status.json"),
             "capture wrapper must emit post-capture mesh-status evidence"

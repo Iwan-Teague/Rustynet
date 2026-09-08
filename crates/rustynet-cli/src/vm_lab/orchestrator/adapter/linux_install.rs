@@ -679,7 +679,8 @@ mod relay_deploy_hygiene_tests {
     /// address the guest may no longer hold (EADDRNOTAVAIL crash-loop).
     #[test]
     fn deploy_removes_the_stale_relay_environment_override() {
-        let source = include_str!("linux_install.rs");
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
         let start = source
             .find("pub fn deploy_relay_service(")
             .expect("relay deploy fn must exist");
@@ -709,7 +710,8 @@ mod relay_deploy_hygiene_tests {
     /// once systemd accepts the unit says nothing about whether it stayed up.
     #[test]
     fn deploy_fails_closed_when_the_unit_is_not_active() {
-        let source = include_str!("linux_install.rs");
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
         let start = source
             .find("pub fn deploy_relay_service(")
             .expect("relay deploy fn must exist");
@@ -740,7 +742,8 @@ mod relay_deploy_hygiene_tests {
     /// shell that would also mask a transport failure.
     #[test]
     fn both_post_install_queries_are_validated_argv_for_the_same_unit() {
-        let source = include_str!("linux_install.rs");
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
         let start = source
             .find("pub fn deploy_relay_service(")
             .expect("relay deploy fn must exist");

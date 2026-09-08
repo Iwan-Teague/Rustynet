@@ -124,18 +124,23 @@ mod bundle_naming_pins {
         for (name, source) in [
             (
                 "refresh_signed_bundles",
-                include_str!("refresh_signed_bundles.rs"),
+                crate::vm_lab::implementation_source_slice(include_str!(
+                    "refresh_signed_bundles.rs"
+                ))
+                .expect("refresh_signed_bundles.rs implementation slice must parse"),
             ),
             (
                 "distribute_dns_zone",
-                include_str!("distribute_dns_zone.rs"),
+                crate::vm_lab::implementation_source_slice(include_str!("distribute_dns_zone.rs"))
+                    .expect("distribute_dns_zone.rs implementation slice must parse"),
             ),
             (
                 "distribute_traversal",
-                include_str!("distribute_traversal.rs"),
+                crate::vm_lab::implementation_source_slice(include_str!("distribute_traversal.rs"))
+                    .expect("distribute_traversal.rs implementation slice must parse"),
             ),
         ] {
-            let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+            let production = source;
             for literal in [
                 "\"dns-zone\"",
                 "\"dns_zone\"",
