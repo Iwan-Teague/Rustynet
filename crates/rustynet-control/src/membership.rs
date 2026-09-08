@@ -529,7 +529,22 @@ impl MembershipOperation {
                     None => true,
                 }
             }
-            _ => false,
+            // Deliberately EXHAUSTIVE, with no `_` arm (review, 2026-09-08).
+            // A catch-all here is a fail-open by default: a future operation
+            // variant would silently match it, become quorum-sufficient, and
+            // the compiler would say nothing, because the match is already
+            // exhaustive via `_`. Listing the quorum-sufficient operations by
+            // name costs one line each and turns the next added operation
+            // into a compile error that forces an explicit decision about
+            // whether it needs the owner.
+            //
+            // These four are quorum-sufficient by design: `RevokeNode` and
+            // `RestoreNode` move a node between Active and Revoked WITHOUT
+            // touching capabilities or the pubkey, which is the distinction
+            // the guard is drawn on.
+            MembershipOperation::RevokeNode { .. } | MembershipOperation::RestoreNode { .. } => {
+                false
+            }
         }
     }
 }
