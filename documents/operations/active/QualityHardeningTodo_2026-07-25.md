@@ -6645,6 +6645,36 @@ binaries rather than a silent fall back to the default path. Audit the other
 
 **Disposition: OPEN, filed 2026-09-07.**
 
+### QH-79 — the stale-environment-override hazard is bounded to the relay, checked 2026-09-08
+
+**Severity: informational (no open defect). Confidence: VERIFIED on a live guest.**
+
+The relay defect fixed on 2026-09-07 was a systemd unit sourcing
+`EnvironmentFile=-/etc/default/rustynet-relay`, a file a previous run had written with a bind
+ADDRESS that no longer existed on the guest. Since UTM reassigns guest addresses by VM start
+order, that made the relay role unrecoverable across runs until the deploy stage was taught to
+clear the override first.
+
+Swept for the same shape. Four other units source an override the same way —
+`rustynetd-managed-dns`, `rustynetd-assignment-refresh`, `rustynetd-privileged-helper` and
+`rustynetd-anchor` read `/etc/default/rustynetd`, and the `nas`, `llm-gateway` and `anchor`
+units read their own files. Read live from `debian-headless-4` during run
+`live-lab-linux-relay-fwd11-20260908-005016`: `/etc/default/rustynetd` holds only node id, role,
+socket and file paths, and booleans — **no addresses**, so a stale copy cannot pin a service to
+a dead endpoint the way the relay's did. The relay's was the only override carrying an address,
+and it is now removed before every install. No other override file was present on the guest at
+all.
+
+**Disposition: CLOSED as bounded, 2026-09-08.** Re-open if any future override file gains an
+address-shaped value; the rule to keep is that a deploy stage owns its override file and must
+rewrite or remove it, never inherit one.
+
+**Observation logged while checking, not yet a finding:** on that run the node assigned the
+`relay` role carried `RUSTYNET_NODE_ROLE=client` in `/etc/default/rustynetd`. That is plausibly
+correct, since the relay is a sibling service and `serves_relay` is a membership capability
+rather than the daemon's own role, but nobody has confirmed it deliberately. Worth one
+confirming read before it is assumed.
+
 ### QH-77 — `vm_lab::tests::local_utm_process_present_uses_wide_ps_output` fails under heavy host load (observed once, 2026-09-07)
 **Severity: low (test flake, no product bearing). Confidence: OBSERVED once during `cargo test -p rustynet-cli --lib --all-features` on the merged tree while two other cargo jobs and a secrets-hygiene gate contended for the same target dir; the same test passed 3/3 in isolation immediately afterwards (4–15 s each, i.e. slow), and the full workspace gate on the same tree had passed it minutes earlier.**
 
