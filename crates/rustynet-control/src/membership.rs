@@ -502,10 +502,19 @@ impl MembershipOperation {
                 // `Client`: the reducer refuses a duplicate `node_id`, but
                 // nothing there looks at the pubkey, so a different id
                 // carrying a known key would otherwise pass unsigned.
-                state
-                    .nodes
-                    .iter()
-                    .any(|existing| existing.node_pubkey_hex == node.node_pubkey_hex)
+                //
+                // Compared case-INSENSITIVELY (review F1, 2026-09-08). Hex is
+                // not canonical here: `decode_hex_nibble` accepts `A-F` as
+                // well as `a-f`, so `decode_hex_to_fixed::<32>` — the only
+                // pubkey validation the reducer performs — admits an
+                // upper-cased spelling of a key already in state. A raw
+                // string compare therefore missed it, and re-uppercasing a
+                // known key was a one-character bypass of this whole clause.
+                state.nodes.iter().any(|existing| {
+                    existing
+                        .node_pubkey_hex
+                        .eq_ignore_ascii_case(&node.node_pubkey_hex)
+                })
             }
             MembershipOperation::RemoveNode { node_id } => {
                 match state
@@ -4470,6 +4479,92 @@ mod tests {
         let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
             .expect_err("re-using a known node pubkey must need the owner");
         assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Review F1: hex is not canonical on this path, so the pubkey-reuse
+    /// clause must not be a raw string compare. Re-uppercasing a key already
+    /// in state was a one-character bypass of the whole clause.
+    #[test]
+    fn readmitting_a_known_pubkey_in_a_different_hex_case_still_requires_the_owner() {
+        let mut state = base_state();
+        // The default fixture key is all decimal digits, so upper-casing it is
+        // a no-op and the test would pass without proving anything. Use a byte
+        // whose hex spelling actually carries letters.
+        state.nodes[0].node_pubkey_hex = hex_encode(&[0xab; 32]);
+        let mut impostor = active_node("node-b", 11);
+        impostor.node_pubkey_hex = state.nodes[0].node_pubkey_hex.to_ascii_uppercase();
+        assert_ne!(
+            impostor.node_pubkey_hex, state.nodes[0].node_pubkey_hex,
+            "the fixture key must actually differ as a string for this test to bite"
+        );
+        impostor.capabilities = vec![RoleCapability::Client];
+        let mut candidate = state.clone();
+        candidate.nodes.push(impostor.clone());
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-readmit-upper",
+            "node-b",
+            MembershipOperation::AddNode(impostor),
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("an upper-cased spelling of a known key must still need the owner");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Review F4: the fail-closed `None` arm had no test, so reverting it to
+    /// `false` left all 583 lib tests green. Removing a node the state does
+    /// not contain must ask for the owner rather than being waved through on
+    /// the grounds that the reducer will reject it later.
+    #[test]
+    fn removing_an_unknown_node_requires_the_owner() {
+        let state = base_state();
+        let mut candidate = state.clone();
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-remove-unknown",
+            "ghost",
+            MembershipOperation::RemoveNode {
+                node_id: "ghost".to_owned(),
+            },
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        let err = apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect_err("an unevaluable removal target must fail closed to the owner");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Review F5: the non-goal's REMOVE half was untested — only the add half
+    /// proved the gate had not been widened to every operation. Retiring a
+    /// plain client must stay owner-free.
+    #[test]
+    fn retiring_a_plain_client_stays_owner_free() {
+        let mut state = base_state();
+        let mut client = active_node("node-c", 12);
+        client.capabilities = vec![RoleCapability::Client];
+        state.nodes.push(client);
+        let mut candidate = state.clone();
+        candidate.nodes.retain(|n| n.node_id != "node-c");
+        candidate.epoch += 1;
+        let signed = signed_update_for(
+            &state,
+            &candidate,
+            "update-remove-client",
+            "node-c",
+            MembershipOperation::RemoveNode {
+                node_id: "node-c".to_owned(),
+            },
+            &[("guardian-1", 2), ("guardian-2", 3)],
+        );
+
+        apply_signed_update(&state, &signed, 150, &mut MembershipReplayCache::default())
+            .expect("a guardian quorum must still be able to retire a plain client");
     }
 
     /// Default-deny on the odd shape: an empty capability set grants nothing,
