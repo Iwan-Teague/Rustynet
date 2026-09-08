@@ -1578,7 +1578,8 @@ mod tests {
     /// valid and survive into the next install.
     #[test]
     fn egress_pin_reset_runs_after_the_interface_reset() {
-        let source = include_str!("linux_traffic.rs");
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
         let body = source
             .split_once("pub fn cleanup_runtime_state")
             .expect("cleanup_runtime_state must exist")

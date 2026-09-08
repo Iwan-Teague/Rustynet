@@ -1578,7 +1578,9 @@ tcp 10.0.0.2:49152 -> 10.0.0.1:22       ESTABLISHED:ESTABLISHED
             "the baseline command must contain no file read step: {rendered}"
         );
 
-        let source = include_str!("macos_exit_traffic.rs");
+        let source =
+            crate::vm_lab::implementation_source_slice(include_str!("macos_exit_traffic.rs"))
+                .expect("macos_exit_traffic.rs implementation slice must parse");
         assert!(
             !source.contains(&path_needle),
             "this module must hold no reference to the fixed artifact path"

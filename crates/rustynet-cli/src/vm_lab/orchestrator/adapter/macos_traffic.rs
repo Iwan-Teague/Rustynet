@@ -1255,7 +1255,8 @@ mod tests {
     /// the contract.
     #[test]
     fn cleanup_rm_batch_includes_durable_state_sibling_markers() {
-        let source = include_str!("macos_traffic.rs");
+        let source = crate::vm_lab::implementation_source_slice(include_str!("macos_traffic.rs"))
+            .expect("macos_traffic.rs implementation slice must parse");
         let fn_at = source
             .find("pub fn cleanup_runtime_state(")
             .expect("cleanup_runtime_state must exist");
