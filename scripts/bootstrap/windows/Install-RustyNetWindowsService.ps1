@@ -8,6 +8,12 @@ param(
     # capabilities: a node enrolled as a client fails reconcile closed if the
     # daemon runs as `admin` (which is the daemon default when the flag is
     # omitted). Threaded explicitly so it can never be dropped on this platform.
+    # H3 (2026-09-08 review): the set is the roles the Windows daemon actually
+    # implements. `blind_exit` is deliberately absent — the role is
+    # irreversible and Windows has no blind posture, and the daemon refuses it
+    # at startup and at NAT apply; refusing it here keeps the operator from
+    # ever installing a service that can only fail.
+    [ValidateSet('client', 'admin', 'blind_relay')]
     [string]$NodeRole = 'client',
     # QH-62: comma-separated management SSH CIDRs for the daemon's fail-closed
     # SSH allow (`--fail-closed-ssh-allow true --fail-closed-ssh-allow-cidrs`).
