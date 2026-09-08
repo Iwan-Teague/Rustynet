@@ -161,7 +161,8 @@ pub enum StageEvidence {
 /// is not yet declared. Each such declaration is upgraded (usually to
 /// `File(...)`) in the per-suite QH-83 evidence batches tracked in
 /// `QualityHardeningTodo_2026-07-25.md`.
-pub const PHASE1_EVIDENCE_PENDING: &str = "phase-1 declaration: no on-disk witness is verified behind this verdict yet";
+pub const PHASE1_EVIDENCE_PENDING: &str =
+    "phase-1 declaration: no on-disk witness is verified behind this verdict yet";
 
 /// Teardown opt-out reason: residue-removal stages are release-critical and
 /// must never be blocked by the evidence-on-pass check.

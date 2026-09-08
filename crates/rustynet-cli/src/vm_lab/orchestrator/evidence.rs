@@ -177,7 +177,7 @@ fn registry_severity_str(stage: &str) -> &'static str {
     }
 }
 
-fn rust_native_stage_log_path(report_dir: &Path, stage: &str) -> PathBuf {
+pub(crate) fn rust_native_stage_log_path(report_dir: &Path, stage: &str) -> PathBuf {
     report_dir.join("logs").join(format!("{stage}.log"))
 }
 
@@ -398,7 +398,7 @@ pub(crate) fn write_rust_native_node_stage_plan(
     report_dir: &Path,
     stages: &[Box<dyn orchestrator::stage::OrchestrationStage>],
 ) -> Result<(), String> {
-    use orchestrator::stage::StageFanout;
+    use orchestrator::stage::{StageEvidence, StageFanout};
 
     let entries: Vec<serde_json::Value> = stages
         .iter()
@@ -406,6 +406,11 @@ pub(crate) fn write_rust_native_node_stage_plan(
             let fanout = match stage.fanout() {
                 StageFanout::Once => "once",
                 StageFanout::PerNode => "per_node",
+            };
+            let evidence = match stage.id().evidence() {
+                StageEvidence::StageLog => json!({"kind": "stage_log"}),
+                StageEvidence::File(relative) => json!({"kind": "file", "path": relative}),
+                StageEvidence::None { reason } => json!({"kind": "none", "reason": reason}),
             };
             serde_json::json!({
                 "stage": stage.id().as_str(),
@@ -415,9 +420,18 @@ pub(crate) fn write_rust_native_node_stage_plan(
                     .iter()
                     .map(orchestrator::role::NodeRole::as_str)
                     .collect::<Vec<_>>(),
+                "evidence": evidence,
             })
         })
         .collect();
+    // Schema stays at 1 for now: the ONLY reader of node_stage_plan.json
+    // (write_node_stage_result_ledgers in live_lab_run_matrix.rs, outside
+    // this job's path allowlist) still pins `schema_version == 1`, and its
+    // entries derive has no deny_unknown_fields, so the additive `evidence`
+    // field is ignored on read. Writing 2 here before that consumer learns
+    // 1|2 would fail-closed every real run's ledger append. The v2 bump +
+    // consumer acceptance land together as a QH-83 remainder item
+    // (QualityHardeningTodo_2026-07-25.md).
     let body = serde_json::to_vec_pretty(&serde_json::json!({
         "schema_version": 1,
         "source": "resolved Rust --node orchestration plan",

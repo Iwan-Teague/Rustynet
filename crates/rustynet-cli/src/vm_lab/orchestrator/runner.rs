@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
-use crate::vm_lab::orchestrator::error::StageOutcome;
-use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageId};
+use crate::vm_lab::orchestrator::error::{ReasonCode, StageOutcome};
+use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageEvidence, StageId};
 
 /// Notified as each stage starts and finishes so a caller can emit realtime
 /// per-stage status (the recorder's `running`/terminal `stages.tsv` rows)
@@ -182,6 +183,18 @@ impl StateMachineRunner {
                 };
             }
 
+            // QH-83 evidence-on-pass: a stage recording `Passed` must have
+            // written the on-disk witness its catalog row declares. The check
+            // runs HERE — after execute, before `stage_finished` — because the
+            // recorder truncates the log at `stage_started` and appends the
+            // verdict at `stage_finished`, so checking after the observer
+            // fires would read the verdict's own echo and always succeed. An
+            // absent/empty/unreadable witness demotes the outcome to
+            // `NotProven`, which is blocking like any failure.
+            if matches!(outcome, StageOutcome::Passed) {
+                outcome = verify_declared_evidence(&id, ctx, outcome);
+            }
+
             if outcome.is_blocking() {
                 blocked.insert(id.clone());
             }
@@ -275,6 +288,113 @@ impl StateMachineRunner {
     }
 }
 
+/// Verify the declared pass-verdict witness for a stage that just recorded
+/// `Passed`, demoting the outcome to `NotProven` when the witness is absent,
+/// empty, or unreadable (QH-83). `StageEvidence::None` rows carry a recorded
+/// opt-out reason and pass through unchanged.
+fn verify_declared_evidence(
+    id: &StageId,
+    ctx: &OrchestrationContext,
+    outcome: StageOutcome,
+) -> StageOutcome {
+    debug_assert!(matches!(outcome, StageOutcome::Passed));
+    match id.evidence() {
+        StageEvidence::None { .. } => outcome,
+        StageEvidence::StageLog => {
+            // Same path the recorder owns (`evidence.rs`), so the witness
+            // checked here is exactly the log a stage writes via
+            // `append_stage_evidence_line`.
+            let path = super::evidence::rust_native_stage_log_path(&ctx.report_dir, id.as_str());
+            verify_evidence_file_at(
+                path.as_path(),
+                &|state| {
+                    format!(
+                        "stage '{}' passed but its stage log {state} — no witness written during execute",
+                        id.as_str()
+                    )
+                },
+                outcome,
+            )
+        }
+        StageEvidence::File(relative) => verify_evidence_file_at(
+            ctx.report_dir.join(relative).as_path(),
+            &|state| format!("declared artifact '{relative}' {state}"),
+            outcome,
+        ),
+    }
+}
+
+/// One evidence-file check, parameterized only by how the failure message
+/// names the artifact. Absent/not-a-file/empty-after-trim are
+/// `MissingWitness` (the stage passed but nothing backs the verdict); an I/O
+/// error reading an existing witness is `UnreadableEvidence` (fail closed on
+/// a race we cannot adjudicate).
+fn verify_evidence_file_at(
+    path: &Path,
+    describe: &dyn Fn(&str) -> String,
+    outcome: StageOutcome,
+) -> StageOutcome {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return StageOutcome::NotProven {
+                reason: ReasonCode::MissingWitness,
+                detail: describe("not found"),
+            };
+        }
+        Err(err) => {
+            return StageOutcome::NotProven {
+                reason: ReasonCode::UnreadableEvidence,
+                detail: format!("{}: {err}", describe("could not be inspected")),
+            };
+        }
+    };
+    if !metadata.is_file() {
+        return StageOutcome::NotProven {
+            reason: ReasonCode::MissingWitness,
+            detail: describe("is not a regular file"),
+        };
+    }
+    match std::fs::read(path) {
+        Ok(bytes) if String::from_utf8_lossy(&bytes).trim().is_empty() => StageOutcome::NotProven {
+            reason: ReasonCode::MissingWitness,
+            detail: describe("is empty"),
+        },
+        Ok(_) => outcome,
+        Err(err) => StageOutcome::NotProven {
+            reason: ReasonCode::UnreadableEvidence,
+            detail: format!("{}: {err}", describe("could not be read")),
+        },
+    }
+}
+
+/// Fail-closed validation of a `File` evidence declaration: the path must be
+/// non-empty, report-dir relative, and free of `..` traversal so a malformed
+/// declaration can never silently point outside the report directory while
+/// the stage passes.
+fn validate_evidence_artifact_path(stage: &str, relative: &str) -> Result<(), String> {
+    if relative.trim().is_empty() {
+        return Err(format!(
+            "stage '{stage}' declares an empty File evidence path"
+        ));
+    }
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return Err(format!(
+            "stage '{stage}' declares an absolute File evidence path '{relative}' (must be report-dir relative)"
+        ));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "stage '{stage}' File evidence path '{relative}' escapes the report dir via '..'"
+        ));
+    }
+    Ok(())
+}
+
 /// Topological sort of stages by `dependencies()`.
 /// Returns indices into `stages` in dependency-first order.
 /// Stages with no dependency relationship preserve insertion order.
@@ -287,6 +407,14 @@ fn validate_plan(stages: &[Box<dyn OrchestrationStage>]) -> Result<(), String> {
                 "orchestration plan contains duplicate stage '{}'",
                 id.as_str()
             ));
+        }
+        // QH-83: reject malformed `File` evidence declarations up front so
+        // the runner's witness check can never be pointed outside the report
+        // dir by a typo'd catalog row. The stage catalog is compile-valid, so
+        // this is the belt-and-braces arm (and the only one unit-testable —
+        // see `evidence_declaration_validation_rejects_malformed_paths`).
+        if let StageEvidence::File(relative) = id.evidence() {
+            validate_evidence_artifact_path(id.as_str(), relative)?;
         }
     }
     for stage in stages {
@@ -383,6 +511,34 @@ mod tests {
         outcome: StageOutcome,
         always_run: bool,
         panics: bool,
+        /// When set, `execute` writes the pass-verdict witness declared by
+        /// this stage's catalog `evidence()` row (a `StageLog` line or a
+        /// `File` artifact) into `ctx.report_dir`, so a `Passed` outcome
+        /// satisfies the runner's QH-83 evidence check.
+        write_witness: bool,
+    }
+
+    impl MockStage {
+        fn write_declared_witness(&self, ctx: &OrchestrationContext) {
+            match self.id.evidence() {
+                StageEvidence::StageLog => {
+                    super::super::evidence::append_stage_evidence_line(
+                        &ctx.report_dir,
+                        self.id.as_str(),
+                        &format!("mock witness for {}", self.id.as_str()),
+                    )
+                    .expect("write mock stage-log witness");
+                }
+                StageEvidence::File(relative) => {
+                    let path = ctx.report_dir.join(relative);
+                    let parent = path.parent().expect("witness path has a parent");
+                    std::fs::create_dir_all(parent).expect("create witness parent dir");
+                    std::fs::write(&path, format!("mock witness for {}\n", self.id.as_str()))
+                        .expect("write mock file witness");
+                }
+                StageEvidence::None { .. } => {}
+            }
+        }
     }
 
     impl OrchestrationStage for MockStage {
@@ -404,12 +560,15 @@ mod tests {
         fn fanout(&self) -> StageFanout {
             StageFanout::Once
         }
-        fn execute(&self, _ctx: &mut OrchestrationContext) -> StageOutcome {
+        fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
             assert!(
                 !self.panics,
                 "mock stage '{}' panicking on purpose",
                 self.name
             );
+            if self.write_witness {
+                self.write_declared_witness(ctx);
+            }
             self.outcome.clone()
         }
         fn always_run(&self) -> bool {
@@ -426,6 +585,22 @@ mod tests {
             outcome: StageOutcome::Passed,
             always_run: false,
             panics: false,
+            write_witness: false,
+        })
+    }
+
+    /// A passing stage that writes the witness its catalog row declares —
+    /// the honest-pass fixture for the QH-83 evidence-on-pass tests.
+    fn witnessed_pass_stage(id: StageId, deps: Vec<StageId>) -> Box<dyn OrchestrationStage> {
+        Box::new(MockStage {
+            id,
+            name: "witnessed_pass",
+            deps,
+            ordering_after: vec![],
+            outcome: StageOutcome::Passed,
+            always_run: false,
+            panics: false,
+            write_witness: true,
         })
     }
 
@@ -438,6 +613,7 @@ mod tests {
             outcome: StageOutcome::Failed("test failure".to_owned()),
             always_run: false,
             panics: false,
+            write_witness: false,
         })
     }
 
@@ -452,6 +628,7 @@ mod tests {
             outcome: StageOutcome::Passed,
             always_run: true,
             panics: false,
+            write_witness: false,
         })
     }
 
@@ -466,6 +643,7 @@ mod tests {
             outcome: StageOutcome::Passed,
             always_run: false,
             panics: true,
+            write_witness: false,
         })
     }
 
@@ -484,6 +662,7 @@ mod tests {
             outcome,
             always_run: false,
             panics: false,
+            write_witness: false,
         })
     }
 
@@ -493,6 +672,15 @@ mod tests {
             PathBuf::from("/tmp/test-report"),
             "test-net".to_owned(),
         )
+    }
+
+    /// Report dir backed by a real tempdir so witness files can be written
+    /// and inspected. Keep the `TempDir` alive for the test's duration.
+    fn tempdir_ctx() -> (OrchestrationContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create report tempdir");
+        let ctx =
+            OrchestrationContext::new(vec![], dir.path().to_path_buf(), "test-net".to_owned());
+        (ctx, dir)
     }
 
     // ── §3.1 prerequisite/order split ─────────────────────────────────────────
@@ -1054,9 +1242,12 @@ mod tests {
 
     #[test]
     fn validated_reused_skip_does_not_cascade_or_claim_fresh_pass() {
+        // The dependent is a WITNESSED pass: TrafficTestMatrix declares a
+        // `File` evidence witness (QH-83), so a plain mock pass would demote
+        // to NotProven under the evidence check.
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
             pass_stage(StageId::ValidateBaselineRuntime, vec![]),
-            pass_stage(
+            witnessed_pass_stage(
                 StageId::TrafficTestMatrix,
                 vec![StageId::ValidateBaselineRuntime],
             ),
@@ -1064,7 +1255,7 @@ mod tests {
         let runner = StateMachineRunner::new(stages)
             .expect("valid plan")
             .with_reused_skips([StageId::ValidateBaselineRuntime], "abc123".to_owned());
-        let mut ctx = make_ctx();
+        let (mut ctx, _dir) = tempdir_ctx();
         let results = runner.run(&mut ctx).expect("run");
 
         let outcome_of = |id: &StageId| results.iter().find(|(i, _)| i == id).map(|(_, o)| o);
@@ -1117,5 +1308,268 @@ mod tests {
             .err()
             .expect("cycle must fail");
         assert!(err.contains("dependency cycle"));
+    }
+
+    // ── QH-83 evidence-on-pass ────────────────────────────────────────────────
+
+    /// Mutation caught: an evidence check that demotes EVERY `StageLog`
+    /// stage regardless of whether the witness exists. A stage that wrote
+    /// its log witness must keep its `Passed` verdict.
+    #[test]
+    fn stage_log_witness_upholds_pass() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![witnessed_pass_stage(StageId::MembershipInit, vec![])];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0].1, StageOutcome::Passed));
+    }
+
+    /// Mutation caught: removing the `verify_declared_evidence` call from
+    /// the run loop (or gating it on anything other than `Passed`). A pass
+    /// with no stage log behind it must demote to
+    /// `NotProven { MissingWitness }`.
+    #[test]
+    fn pass_without_stage_log_witness_is_demoted_to_not_proven() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::MembershipInit, vec![])];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(
+                    detail.contains("stage log"),
+                    "detail must name the stage log witness: {detail}"
+                );
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+    }
+
+    /// Mutation caught: a wrapper that checks only EXISTENCE of the log.
+    /// An existing-but-empty (whitespace-only) log is no witness — the
+    /// verdict still demotes to `NotProven { MissingWitness }`.
+    #[test]
+    fn empty_stage_log_witness_is_demoted_to_not_proven() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::MembershipInit, vec![])];
+        let (mut ctx, dir) = tempdir_ctx();
+        let log_path = crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+            dir.path(),
+            "membership_init",
+        );
+        std::fs::create_dir_all(log_path.parent().expect("log parent")).expect("create log dir");
+        std::fs::write(&log_path, "   \n\t\n").expect("write whitespace-only log");
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(
+                    detail.contains("is empty"),
+                    "detail must call out the empty witness: {detail}"
+                );
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+    }
+
+    /// Mutation caught: a missing `File` arm in `verify_declared_evidence`.
+    /// A pass whose declared file artifact was never written must demote to
+    /// `NotProven { MissingWitness }` naming the artifact.
+    #[test]
+    fn pass_without_declared_file_witness_is_demoted_to_not_proven() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(
+                    detail.contains(
+                        "declared artifact 'logs/traffic_test_matrix.pair_results.log' not found"
+                    ),
+                    "detail must name the declared artifact: {detail}"
+                );
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+    }
+
+    /// Mutation caught: a `File` check without the content check. An
+    /// existing-but-empty declared artifact is no witness.
+    #[test]
+    fn empty_declared_file_witness_is_demoted_to_not_proven() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
+        let (mut ctx, dir) = tempdir_ctx();
+        let artifact = dir.path().join("logs/traffic_test_matrix.pair_results.log");
+        std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
+            .expect("create artifact dir");
+        std::fs::write(&artifact, "\n").expect("write empty artifact");
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(
+                    detail.contains("is empty"),
+                    "detail must call out the empty artifact: {detail}"
+                );
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+    }
+
+    /// Mutation caught: a `File` arm that never upholds a real witness. A
+    /// stage that wrote its declared artifact keeps `Passed`.
+    #[test]
+    fn witnessed_file_evidence_upholds_pass() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![witnessed_pass_stage(StageId::TrafficTestMatrix, vec![])];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        assert!(matches!(results[0].1, StageOutcome::Passed));
+    }
+
+    /// Mutation caught: an evidence check applied to `StageEvidence::None`
+    /// rows (or to non-Passed outcomes). Opt-out rows — both the phase-1
+    /// pending bulk and the teardown exemption — must pass without any
+    /// on-disk witness.
+    #[test]
+    fn evidence_opt_out_stages_pass_without_witness() {
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::PrepareSourceArchive, vec![]),
+            always_run_stage(StageId::Cleanup, vec![]),
+        ];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        assert!(matches!(results[0].1, StageOutcome::Passed));
+        assert!(matches!(results[1].1, StageOutcome::Passed));
+    }
+
+    /// Design §9 test 5 (adapted): the stage catalog is compile-valid, so
+    /// malformed `File` declarations cannot exist in it — the validator is
+    /// exercised directly. Mutation caught: dropping the traversal/absolute/
+    /// empty rejection from `validate_evidence_artifact_path`.
+    #[test]
+    fn evidence_declaration_validation_rejects_malformed_paths() {
+        assert!(validate_evidence_artifact_path("traffic_test_matrix", "").is_err());
+        assert!(validate_evidence_artifact_path("traffic_test_matrix", "  ").is_err());
+        assert!(validate_evidence_artifact_path("traffic_test_matrix", "/etc/passwd").is_err());
+        assert!(validate_evidence_artifact_path("traffic_test_matrix", "a/../b.log").is_err());
+        assert!(
+            validate_evidence_artifact_path(
+                "traffic_test_matrix",
+                "logs/traffic_test_matrix.pair_results.log"
+            )
+            .is_ok()
+        );
+    }
+
+    /// Mutation caught: moving the evidence check AFTER
+    /// `observer.stage_finished`. The real recorder truncates the log at
+    /// `stage_started` and appends the terminal verdict at `stage_finished`;
+    /// this observer reproduces that shape. A stage that wrote no witness
+    /// must STILL demote — checking after the observer would read the
+    /// verdict's own echo and pass vacuously.
+    #[test]
+    fn demotion_fires_before_observer_appends_verdict() {
+        struct VerdictEchoObserver {
+            report_dir: PathBuf,
+        }
+        impl StageObserver for VerdictEchoObserver {
+            fn stage_started(&self, id: &StageId) {
+                let path = crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                    &self.report_dir,
+                    id.as_str(),
+                );
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&path, ""); // truncate, like the recorder
+            }
+            fn stage_finished(&self, id: &StageId, outcome: &StageOutcome) {
+                let verdict = if matches!(outcome, StageOutcome::Passed) {
+                    "pass"
+                } else {
+                    "not-pass"
+                };
+                let _ = crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(
+                    &self.report_dir,
+                    id.as_str(),
+                    &format!("terminal verdict recorded: {verdict}"),
+                );
+            }
+        }
+
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::MembershipInit, vec![])];
+        let (mut ctx, dir) = tempdir_ctx();
+        let observer = VerdictEchoObserver {
+            report_dir: dir.path().to_path_buf(),
+        };
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run_with_observer(&mut ctx, &observer)
+            .expect("run");
+        // The verdict echo observer appended a line at stage_finished — by
+        // which time the runner's check had already run and demoted.
+        assert!(matches!(
+            &results[0].1,
+            StageOutcome::NotProven { reason, .. }
+                if matches!(reason, super::ReasonCode::MissingWitness)
+        ));
+    }
+
+    /// Mutation caught: a demoted pass that is not treated as blocking (or
+    /// the wrapper skipping the `blocked` bookkeeping). An unwitnessed pass
+    /// must cascade-skip its dependents exactly like a failure.
+    #[test]
+    fn unwitnessed_pass_blocks_dependents() {
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![
+            pass_stage(StageId::MembershipInit, vec![]),
+            pass_stage(StageId::MeshStatusValidation, vec![StageId::MembershipInit]),
+        ];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        assert!(matches!(
+            &results[0].1,
+            StageOutcome::NotProven { reason, .. }
+                if matches!(reason, super::ReasonCode::MissingWitness)
+        ));
+        match &results[1].1 {
+            StageOutcome::Skipped(detail) => {
+                assert!(
+                    detail.contains("membership_init"),
+                    "skip detail must name the blocking dependency: {detail}"
+                );
+            }
+            other => panic!("expected Skipped dependent, got {other:?}"),
+        }
     }
 }
