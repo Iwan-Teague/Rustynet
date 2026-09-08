@@ -161,12 +161,39 @@ pub fn parse_guest_now_unix(stdout: &str) -> Result<u64, String> {
 ///
 /// `expected_live_peers == 0` (single-node run) skips the peer/handshake
 /// clauses; the required fields must still parse.
+///
+/// On success the accepted observation is returned (QH-70 follow-up): the
+/// stage records it as evidence so a reader can confirm from the artifact
+/// alone that the check ran with a non-zero expectation, rather than
+/// trusting the bare pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LiveHandshakeObservation {
+    pub alias: String,
+    pub path_live_peer_count: u64,
+    pub expected_live_peers: u32,
+    pub path_latest_live_handshake_unix: u64,
+    pub guest_now_unix: u64,
+    /// `guest_now_unix - path_latest_live_handshake_unix`, clamped at zero by
+    /// `saturating_sub` (review F6): a future-dated handshake therefore ALSO
+    /// reads `0`. Whether that value was ever ENFORCED against a freshness
+    /// bound is what [`Self::freshness_gate_enforced`] records — do not read
+    /// a small age alone as "freshness proven".
+    pub handshake_age_seconds: u64,
+    /// Whether the handshake freshness gates actually ran for this node
+    /// (review F6): true only when `expected_live_peers > 0`. On a
+    /// single-node run the gates are skipped, so `handshake_age_seconds` is
+    /// raw arithmetic off the status line — a `0` there may be a
+    /// future-dated handshake clamped by `saturating_sub`, not evidence of
+    /// freshness.
+    pub freshness_gate_enforced: bool,
+}
+
 pub fn evaluate_live_handshake_status(
     alias: &str,
     stdout: &str,
     expected_live_peers: u32,
     now_unix: u64,
-) -> Result<(), String> {
+) -> Result<LiveHandshakeObservation, String> {
     let tokens = status_tokens(stdout);
     if tokens.is_empty() {
         return Err(format!("{alias}: live handshake: empty status output"));
@@ -194,8 +221,21 @@ pub fn evaluate_live_handshake_status(
         field(&tokens, "relay_session_established_peers").unwrap_or("absent"),
     );
 
+    // Built before the expectation gates so every acceptance path (including
+    // the single-node early return) carries the observation for the stage to
+    // record as evidence.
+    let observation = LiveHandshakeObservation {
+        alias: alias.to_owned(),
+        path_live_peer_count: live,
+        expected_live_peers,
+        path_latest_live_handshake_unix: handshake,
+        guest_now_unix: now_unix,
+        handshake_age_seconds: now_unix.saturating_sub(handshake),
+        freshness_gate_enforced: expected_live_peers > 0,
+    };
+
     if expected_live_peers == 0 {
-        return Ok(());
+        return Ok(observation);
     }
     if live == 0 {
         return fail(format!(
@@ -228,13 +268,22 @@ pub fn evaluate_live_handshake_status(
              dataplane idle-dead ({relay_evidence})"
         ));
     }
-    Ok(())
+    Ok(observation)
 }
 
 /// Run the Linux mesh-status daemon self-check through the shell seam,
 /// applying the typed evaluator. Returns `Err` with detail on failure
 /// (fail-closed) or `Ok(())` on pass — where "pass" means the evaluator's full
 /// contract (schema, overall_ok), not merely the daemon's exit code.
+///
+/// Vacuous-pass disclosure (QH-81,
+/// `documents/operations/active/QualityHardeningTodo_2026-07-25.md`): the
+/// daemon populates `expected_peer_ids` from advertised route CIDRs, so on
+/// the current data model this consumer ACCEPTS a pass whose expectation is
+/// empty — the check cannot distinguish "no peers expected" from "the
+/// expectation was never expressed". It is kept for its schema /
+/// `overall_ok` / staleness contract only; LIVE peer visibility is proven by
+/// the `mesh_status_validation` stage's live-handshake poll, not here.
 pub fn validate_linux_mesh_status(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
@@ -618,6 +667,33 @@ mod tests {
     fn one_live_peer_with_fresh_handshake_passes() {
         evaluate_live_handshake_status("n1", LIVE_STATUS, 1, NOW)
             .unwrap_or_else(|err| panic!("live fresh peer must pass; got: {err}"));
+    }
+
+    /// QH-70 follow-up: an acceptance must CARRY the observation the stage
+    /// records as evidence — parsed counts, the guest clock it was judged on,
+    /// and the computed handshake age.
+    #[test]
+    fn pass_returns_observation_with_parsed_fields() {
+        let obs = evaluate_live_handshake_status("n1", LIVE_STATUS, 1, NOW)
+            .unwrap_or_else(|err| panic!("live fresh peer must pass; got: {err}"));
+        assert_eq!(obs.alias, "n1");
+        assert_eq!(obs.path_live_peer_count, 1);
+        assert_eq!(obs.expected_live_peers, 1);
+        assert_eq!(obs.path_latest_live_handshake_unix, 1_700_000_080);
+        assert_eq!(obs.guest_now_unix, NOW);
+        assert_eq!(obs.handshake_age_seconds, 20);
+    }
+
+    /// The single-node early return also carries its observation (with the
+    /// zero expectation visible), so a single-node run is still evidenced.
+    #[test]
+    fn single_node_pass_returns_zero_expectation_observation() {
+        let obs =
+            evaluate_live_handshake_status("n1", &status_with("path_live_peer_count", "0"), 0, NOW)
+                .unwrap_or_else(|err| panic!("single-node run must pass; got: {err}"));
+        assert_eq!(obs.expected_live_peers, 0);
+        assert_eq!(obs.path_live_peer_count, 0);
+        assert_eq!(obs.guest_now_unix, NOW);
     }
 
     /// Test 2: the handshake boundary discriminates at MAX_HANDSHAKE_AGE_SECONDS.
