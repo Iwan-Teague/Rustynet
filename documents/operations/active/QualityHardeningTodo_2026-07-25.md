@@ -7065,6 +7065,20 @@ read itself succeeded, so absence is proven, not assumed).
   on 2026-09-08; execution on a Windows guest is owed (the Windows stream is
   parked with `ubuntu-kvm-1`; `katana` is being onboarded as its replacement).
 
+**Follow-up landed the same day (GLM review of `a5cc3d37`, verdict
+MERGE-SAFE, flagged two availability cases the old blindness had hidden):**
+`add_os_route` now treats a non-zero `netsh … add route` as success only when a
+successful `show route` read proves the prefix is bound to THIS tunnel
+(present-is-success, the mirror of the delete case), and `start()` reconciles
+a tunnel service left behind by an unclean stop — a successful `wg show
+interfaces` read listing our tunnel triggers an uninstall before
+`/installtunnelservice`; an unreadable listing refuses to start. Tests:
+`windows_route_add_failure_is_success_only_when_show_route_proves_presence`
+(three arms, mutations as above) and
+`windows_start_reconciles_a_stale_tunnel_service_before_install` (mutation:
+skip the reconcile → no uninstall recorded before install; treat a failed read
+as absent → start succeeds on the read-failure arm).
+
 **Disposition: FIXED on main; Windows-guest execution of the runner tests
 OPEN until the next Windows lab campaign.**
 

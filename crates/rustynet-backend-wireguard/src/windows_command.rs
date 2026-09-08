@@ -250,7 +250,7 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
     fn add_os_route(&mut self, destination_cidr: &str) -> Result<(), BackendError> {
         validate_cidr(destination_cidr)?;
         let (family, next_hop) = route_family_and_next_hop(destination_cidr)?;
-        self.runner.run(
+        let result = self.runner.run(
             self.netsh_exe_path.to_string_lossy().as_ref(),
             &[
                 "interface".to_owned(),
@@ -268,7 +268,25 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
                 // traffic to bypass the WireGuard interface entirely.
                 "metric=1".to_owned(),
             ],
-        )
+        );
+        let Err(err) = result else {
+            return Ok(());
+        };
+        // `netsh … add route` exits non-zero when the route already exists
+        // (e.g. a restart after an unclean stop). Presence is accepted as
+        // success only when a separate, SUCCESSFUL `show route` read proves
+        // the prefix is bound to THIS tunnel; a failed read or a listing that
+        // does not show it keeps the original error.
+        match self.os_route_present(family, destination_cidr) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(BackendError::internal(format!(
+                "route add failed and {destination_cidr} is not bound to '{}': {err}",
+                self.tunnel_name
+            ))),
+            Err(verify_err) => Err(BackendError::internal(format!(
+                "route add failed ({err}) and presence could not be verified: {verify_err}"
+            ))),
+        }
     }
 
     fn delete_os_route(&mut self, destination_cidr: &str) -> Result<(), BackendError> {
@@ -510,6 +528,30 @@ impl<R: WireguardCommandRunner + Send + Sync + Clone> TunnelBackend for WindowsW
         self.ensure_prerequisites()?;
         self.context = Some(context);
         self.sync_persistent_config()?;
+        // A tunnel service left behind by an unclean stop makes
+        // `/installtunnelservice` fail. Reconcile explicitly: if a SUCCESSFUL
+        // read lists our tunnel, uninstall it first so the install below runs
+        // against the freshly written config rather than a stale one. A
+        // failed read fails closed (start refuses), never assumes absence.
+        match self.tunnel_interface_present() {
+            Ok(true) => {
+                if let Err(err) = self.uninstall_tunnel_service() {
+                    self.context = None;
+                    return Err(BackendError::internal(format!(
+                        "stale tunnel service '{}' could not be removed before start: {err}",
+                        self.tunnel_name
+                    )));
+                }
+            }
+            Ok(false) => {}
+            Err(err) => {
+                self.context = None;
+                return Err(BackendError::internal(format!(
+                    "could not determine whether tunnel '{}' already exists: {err}",
+                    self.tunnel_name
+                )));
+            }
+        }
         if let Err(err) = self.install_tunnel_service() {
             self.context = None;
             return Err(err);
@@ -1161,6 +1203,10 @@ mod tests {
                 self.handshake_output.lock().expect("handshake").clone()
             } else if args.iter().any(|arg| arg == "transfer") {
                 self.transfer_output.lock().expect("transfer").clone()
+            } else if args.iter().any(|arg| arg == "interfaces") {
+                // `wg show interfaces` — the stale-service reconcile read in
+                // `start()`; no tunnel exists by default.
+                String::new()
             } else if args.first().map(std::string::String::as_str) == Some("show") {
                 // Plain `wg show <tunnel>` — the tunnel-readiness probe.
                 self.show_interface_output
@@ -1260,21 +1306,28 @@ mod tests {
         assert!(written.contains("ListenPort = 51820"));
 
         let recorded = runner.recorded();
-        // start() emits two commands: install_tunnel_service (via run) then
-        // the first wait_for_tunnel_ready poll (via run_capture).
-        assert_eq!(recorded.len(), 2);
-        assert_eq!(recorded[0].0, wireguard_path.to_string_lossy());
+        // start() emits three commands: the stale-service reconcile read
+        // (`wg show interfaces`, via run_capture), install_tunnel_service
+        // (via run), then the first wait_for_tunnel_ready poll (via
+        // run_capture).
+        assert_eq!(recorded.len(), 3);
+        assert_eq!(recorded[0].0, wg_path.to_string_lossy());
         assert_eq!(
             recorded[0].1,
+            vec!["show".to_owned(), "interfaces".to_owned()]
+        );
+        assert_eq!(recorded[1].0, wireguard_path.to_string_lossy());
+        assert_eq!(
+            recorded[1].1,
             vec![
                 "/installtunnelservice".to_owned(),
                 config_path.display().to_string()
             ]
         );
-        // Second call must be the readiness probe: `wg show rustynet0`.
-        assert_eq!(recorded[1].0, wg_path.to_string_lossy());
+        // Third call must be the readiness probe: `wg show rustynet0`.
+        assert_eq!(recorded[2].0, wg_path.to_string_lossy());
         assert_eq!(
-            recorded[1].1,
+            recorded[2].1,
             vec!["show".to_owned(), "rustynet0".to_owned()]
         );
     }
@@ -2429,6 +2482,7 @@ mod tests {
     struct AbsenceScriptRunner {
         inner: RecordingRunner,
         fail_netsh_delete: Arc<Mutex<bool>>,
+        fail_netsh_add: Arc<Mutex<bool>>,
         fail_uninstall: Arc<Mutex<bool>>,
         show_route: Arc<Mutex<Result<String, String>>>,
         show_interfaces: Arc<Mutex<Result<String, String>>>,
@@ -2439,6 +2493,7 @@ mod tests {
             Self {
                 inner: RecordingRunner::default(),
                 fail_netsh_delete: Arc::new(Mutex::new(false)),
+                fail_netsh_add: Arc::new(Mutex::new(false)),
                 fail_uninstall: Arc::new(Mutex::new(false)),
                 show_route: Arc::new(Mutex::new(Ok(String::new()))),
                 show_interfaces: Arc::new(Mutex::new(Ok(String::new()))),
@@ -2455,6 +2510,11 @@ mod tests {
                 return Err(BackendError::internal(
                     "scripted netsh delete route failure",
                 ));
+            }
+            let is_netsh_add = args.iter().any(|a| a == "add") && args.iter().any(|a| a == "route");
+            if is_netsh_add && *self.fail_netsh_add.lock().expect("flag") {
+                self.inner.run(program, args)?;
+                return Err(BackendError::internal("scripted netsh add route failure"));
             }
             if args.iter().any(|a| a == "/uninstalltunnelservice")
                 && *self.fail_uninstall.lock().expect("flag")
@@ -2611,25 +2671,32 @@ mod tests {
     fn windows_uninstall_failure_is_success_only_when_interfaces_listing_proves_absence() {
         // H2 sibling: `/uninstalltunnelservice` exits non-zero when the
         // service is already gone. Same three mutations as the route test.
+        // Each arm uses a fresh runner: the scripted listing is installed
+        // AFTER start(), because start() itself reads the listing to
+        // reconcile a stale service.
         let temp_dir = TempDir::new().expect("temp dir");
-        let runner = AbsenceScriptRunner::new();
-        *runner.fail_uninstall.lock().expect("flag") = true;
 
         // (a) our tunnel is still listed -> error.
+        let runner = AbsenceScriptRunner::new();
         let mut backend = absence_backend(&runner, &temp_dir);
+        *runner.fail_uninstall.lock().expect("flag") = true;
         *runner.show_interfaces.lock().expect("s") = Ok("rustynet0 other0\n".to_owned());
         let err = backend.shutdown().expect_err("present tunnel must fail");
         assert!(err.to_string().contains("still present"), "{err}");
 
         // (b) only other tunnels listed -> absent -> success.
+        let runner = AbsenceScriptRunner::new();
         let mut backend = absence_backend(&runner, &temp_dir);
+        *runner.fail_uninstall.lock().expect("flag") = true;
         *runner.show_interfaces.lock().expect("s") = Ok("other0\n".to_owned());
         backend
             .shutdown()
             .expect("proven-absent tunnel must succeed");
 
         // (c) the listing read fails -> original error propagates.
+        let runner = AbsenceScriptRunner::new();
         let mut backend = absence_backend(&runner, &temp_dir);
+        *runner.fail_uninstall.lock().expect("flag") = true;
         *runner.show_interfaces.lock().expect("s") = Err("scripted wg show failure".to_owned());
         let err = backend
             .shutdown()
@@ -2655,6 +2722,104 @@ mod tests {
         assert!(
             backend.peers.contains_key(&peer.node_id),
             "peer must stay recorded while the tunnel may still serve it"
+        );
+    }
+
+    #[test]
+    fn windows_route_add_failure_is_success_only_when_show_route_proves_presence() {
+        // H2 follow-up: `netsh … add route` exits non-zero when the route
+        // already exists. Mutations caught: (1) reverting present-is-success
+        // makes the listed case Err; (2) accepting absence makes the
+        // not-listed case Ok; (3) treating a failed read as present makes the
+        // read-failure case Ok.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let runner = AbsenceScriptRunner::new();
+        let mut backend = absence_backend(&runner, &temp_dir);
+        let peer = sample_peer("peer-a");
+        backend.configure_peer(peer.clone()).expect("peer");
+        *runner.fail_netsh_add.lock().expect("flag") = true;
+
+        *runner.show_route.lock().expect("s") =
+            Ok("No  Manual  1  100.64.20.0/24  12  rustynet0\n".to_owned());
+        backend
+            .apply_routes(vec![mesh_route(&peer, "100.64.20.0/24")])
+            .expect("route proven present on our tunnel must succeed");
+
+        *runner.show_route.lock().expect("s") =
+            Ok("No  Manual  1  100.64.21.0/24  7  Ethernet\n".to_owned());
+        let err = backend
+            .apply_routes(vec![mesh_route(&peer, "100.64.21.0/24")])
+            .expect_err("route not bound to our tunnel must fail");
+        assert!(err.to_string().contains("is not bound"), "{err}");
+
+        *runner.show_route.lock().expect("s") = Err("scripted show route failure".to_owned());
+        let err = backend
+            .apply_routes(vec![mesh_route(&peer, "100.64.22.0/24")])
+            .expect_err("unverifiable presence must fail");
+        assert!(err.to_string().contains("could not be verified"), "{err}");
+    }
+
+    #[test]
+    fn windows_start_reconciles_a_stale_tunnel_service_before_install() {
+        // A tunnel left behind by an unclean stop must be uninstalled before
+        // `/installtunnelservice`; an unreadable listing refuses to start.
+        // Mutations caught: (1) skipping the reconcile -> no uninstall argv
+        // recorded before install; (2) treating a failed read as absent ->
+        // start succeeds on the read-failure case.
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = AbsenceScriptRunner::new();
+        *runner.show_interfaces.lock().expect("s") = Ok("rustynet0\n".to_owned());
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        backend
+            .start(runtime_context())
+            .expect("start must reconcile the stale service");
+        let recorded = runner.inner.recorded();
+        let uninstall = recorded
+            .iter()
+            .position(|(_, args)| args.iter().any(|a| a == "/uninstalltunnelservice"))
+            .expect("stale service must be uninstalled");
+        let install = recorded
+            .iter()
+            .position(|(_, args)| args.iter().any(|a| a == "/installtunnelservice"))
+            .expect("service must be installed");
+        assert!(uninstall < install, "uninstall must precede install");
+
+        let runner = AbsenceScriptRunner::new();
+        *runner.show_interfaces.lock().expect("s") = Err("scripted wg show failure".to_owned());
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        let err = backend
+            .start(runtime_context())
+            .expect_err("unreadable tunnel listing must refuse to start");
+        assert!(err.to_string().contains("could not determine"), "{err}");
+        assert!(
+            !runner
+                .inner
+                .recorded()
+                .iter()
+                .any(|(_, args)| args.iter().any(|a| a == "/installtunnelservice")),
+            "install must not run when the listing is unreadable"
         );
     }
 }
