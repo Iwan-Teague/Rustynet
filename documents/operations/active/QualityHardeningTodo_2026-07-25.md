@@ -6939,7 +6939,7 @@ while genuinely ambiguous names yield `None`; propagate through
 call sites explicitly. A naive None-without-Linux-hints variant would fail-closed every
 normal Linux guest (`debian-headless-4` contains no `linux` substring) and must not be
 shipped.
-### QH-83 — evidence-on-pass for `--node` stages (audit item 1 of "the smallest set of changes that makes a green run mean something") is a per-stage wiring job, not a wrapper change: filed 2026-09-08 after scoping, deliberately NOT landed
+### QH-83 — evidence-on-pass for `--node` stages (audit item 1 of "the smallest set of changes that makes a green run mean something") is a per-stage wiring job, not a wrapper change: filed 2026-09-08 after scoping; framework + declarations + H4 landed 2026-09-09, per-stage wiring remains open
 
 **Severity: high (evidence integrity — a stage can record `Passed` while writing
 nothing behind the verdict). Confidence: VERIFIED by reading the seam and
@@ -7007,11 +7007,48 @@ order:
    orchestration steps. The triage list must live in code as the `None`
    overrides, not in a doc, so the compiler sees every stage's answer.
 
-**Disposition: OPEN, deliberately not implemented.** Items 2 and 3 of the
-audit's minimal set (vacuous-filter kill; self-proof kill for source pins)
-are landed and gated; this item needs the staged per-stage wiring above and a
-reviewer per batch, and a wrapper landed without it would break every live run
-or lie by default — both worse than the honest gap this entry records.
+**Disposition: PARTIALLY LANDED 2026-09-09 — framework + initial declarations + the
+H4 collision/witness fix are in; the per-stage wiring (the bulk) remains OPEN.** Items
+2 and 3 of the audit's minimal set (vacuous-filter kill; self-proof kill for source
+pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0`
+(design: `EvidenceOnPassDesign_2026-09-08.md` §0 records the deviations):
+
+1. **Framework — LANDED.** The wrapper sits in the runner seam between
+   `catch_unwind` and `observer.stage_finished`, demoting an unwitnessed `Passed`
+   to `NotProven{MissingWitness,..}` (absent/empty) or
+   `NotProven{UnreadableEvidence,..}` (I/O); `validate_plan` rejects malformed
+   `File` declarations (empty/absolute/`..`). Declarations are NOT a trait method:
+   per the design review's blocking change, `StageId::evidence()` is generated as
+   a fourth column of `define_stage_catalog!`, so macro-generated stage families
+   (`cross_network.rs`, `chaos.rs`) cannot inherit a family-wide declaration and
+   the compiler totals all 81 rows. Initial declarations: 2 appenders →
+   `StageLog`, `traffic_test_matrix` → `File`, teardown pair → named opt-out,
+   remaining 76 → `PHASE1_EVIDENCE_PENDING` (the honest phase-1 `None`, visible
+   in every run's `node_stage_plan.json` evidence field).
+2. **Per-stage evidence wiring — OPEN (the bulk).** Upgrade the 76 pending
+   declarations suite by suite with a live-lab re-verify per batch: Setup (17) →
+   Live (35) → CrossNetwork (11) → Chaos (9) →
+   NegativeControl/Disruptive/Soak/Cleanup (9). The NegativeControl stages'
+   witness is their inversion record (`write_control_evidence` output), never a
+   lazy `None`. Each stage still needs the individual "what datum IS this
+   verdict" decision — a constant-line appeasement satisfies emptiness without
+   proving anything, which is the same defect one level up.
+3. **Opt-out triage — partially done.** Teardown family opted out in code with
+   `TEARDOWN_EVIDENCE_OPT_OUT`; the remaining opt-outs are re-judged per batch.
+
+Also LANDED with the framework (H4, folded): `traffic_test_matrix` now FAILS on
+mesh-IP collisions still present at the settle deadline (the old code accepted the
+duplicates and the matrix passed as a self-ping no-op) and writes
+`logs/traffic_test_matrix.pair_results.log` (assignments, per-pair results,
+deny-probes, collisions) behind every verdict after mesh-IP collection; a pass
+whose witness cannot be written is itself a failure.
+
+REMAINDER (blocked by the landing job's path allowlist, not by design):
+`node_stage_plan.json` stays at `schema_version` 1 with the `evidence` field added
+additively — the only consumer (`write_node_stage_result_ledgers` in
+`live_lab_run_matrix.rs`) still pins `== 1` and that file was outside the job's
+allowlist. The v2 bump + consumer 1|2 acceptance must land together from the main
+tree; until then the field is serde-ignored by the reader (additive, non-breaking).
 
 ### QH-84 — H2 (MultiAgentSecurityReview_2026-09-08): the Windows host command runner discarded process exit status, so every failed `wg`/`netsh`/`wireguard.exe` call reported success — FIXED 2026-09-08
 
