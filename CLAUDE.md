@@ -252,6 +252,27 @@ target/debug/deps`), a hung one has the nextest parent at 0% CPU with **nothing
 running beneath it**. The parent sitting at 0% is normal in both cases; only the
 children distinguish them.
 
+**A freshly-built binary can stall so long on exec that a bounded test FAILS,
+not merely runs slow.** Measured 2026-09-08: `rustynet-cli::rnq09_signal_cleanup`
+failed both of its cases at exactly their 30 s handshake budget, then passed in
+**0.11 s** running the same test binary directly on a quiet machine. Nothing in
+the code had changed. The spawned harness was stuck in the dynamic linker,
+never reaching `main`: `sample <pid>` showed a main-thread stack consisting
+solely of `_dyld_start`, while `syspolicyd` sat at 59.5% CPU with 94 minutes
+accumulated. Every test binary under the run showed the same shape — 0% CPU,
+alive for minutes, nothing beneath it.
+
+So the signature to recognise is: **children at 0% CPU whose stack is only
+`_dyld_start`, plus a hot `syspolicyd`.** That is macOS validating each newly
+written unsigned binary on first exec, and it scales with how many binaries the
+build just replaced. Ad-hoc `codesign -f -s -` does NOT clear it.
+
+Why this matters beyond patience: it turns any test that bounds a subprocess
+handshake with a wall clock into a phantom regression. Do not start bisecting
+such a failure until you have re-run the failing test binary alone on an idle
+machine. Re-running the whole suite is not the check — the second full run
+re-validates the same fresh binaries and reproduces the stall.
+
 Do not read progress from nextest's stdout during a run — it block-buffers when
 not attached to a TTY, so the log stays empty until the final summary. It also
 interleaves binaries across one global pool rather than finishing them in order,
