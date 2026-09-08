@@ -3961,13 +3961,10 @@ mod tests {
         );
         assert!(!PRIME_SUDOERS_REMOTE_COMMAND.contains("echo '"));
 
-        // Slice the file BEFORE its test module so the pin cannot be
-        // satisfied by the needles in these assertions.
-        let full = include_str!("macos_install.rs");
-        let cut = full
-            .find("#[cfg(test)]\nmod tests")
-            .expect("test module marker");
-        let source = &full[..cut];
+        // Route through the shared slicer so the pin cannot be satisfied by
+        // this test's own assertion text (source_pin self-include rule).
+        let source = crate::vm_lab::implementation_source_slice(include_str!("macos_install.rs"))
+            .expect("macos_install.rs implementation slice must parse");
         assert!(
             !source.contains("| sudo -S"),
             "no password may be echoed into sudo -S on the remote command line"

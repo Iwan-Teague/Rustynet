@@ -26,6 +26,7 @@ use std::time::Duration;
 const SECURITY_GATES: &[&str] = &[
     "secrets_hygiene_gates.sh",
     "check_backend_boundary_leakage.sh",
+    "check_platform_infer_tripwire.sh",
     "no_leak_dataplane_gate.sh",
     "security_regression_gates.sh",
     "supply_chain_integrity_gates.sh",
