@@ -539,21 +539,14 @@ pub fn start_daemon(conn: &NodeConnection) -> Result<(), AdapterError> {
 pub fn prime_remote_access(conn: &NodeConnection) -> Result<(), AdapterError> {
     match conn.ssh_parts() {
         Some((host, port, user, identity_file, Some(password))) => {
-            let user_flag = user.map(|u| format!("{u}@")).unwrap_or_default();
-            let mut cmd = std::process::Command::new("sshpass");
-            cmd.arg("-p")
-                .arg(password)
-                .arg("ssh")
-                .arg("-i")
-                .arg(identity_file)
-                .arg("-o")
-                .arg("StrictHostKeyChecking=yes")
-                .arg("-o")
-                .arg("ConnectTimeout=10")
-                .arg("-p")
-                .arg(port.to_string())
-                .arg(format!("{user_flag}{host}"))
-                .arg("sudo -n true 2>/dev/null && echo 'sudo-ok' || echo 'need-sudo'");
+            let mut cmd = sshpass_ssh_command(
+                password,
+                identity_file,
+                port,
+                user,
+                host,
+                "sudo -n true 2>/dev/null && echo 'sudo-ok' || echo 'need-sudo'",
+            );
             let output = cmd.output().map_err(|e| AdapterError::Protocol {
                 message: format!("sshpass prime check failed: {e}"),
             })?;
@@ -561,18 +554,39 @@ pub fn prime_remote_access(conn: &NodeConnection) -> Result<(), AdapterError> {
             if stdout.trim() == "sudo-ok" {
                 return Ok(());
             }
-            let mut push = std::process::Command::new("sshpass");
-            push.arg("-p").arg(password)
-                .arg("ssh")
-                .arg("-i").arg(identity_file)
-                .arg("-o").arg("StrictHostKeyChecking=yes")
-                .arg("-o").arg("ConnectTimeout=10")
-                .arg("-p").arg(port.to_string())
-                .arg(format!("{user_flag}{host}"))
-                .arg("echo 'tempo' | sudo -S bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/99-rustynet-lab && chmod 0440 /etc/sudoers.d/99-rustynet-lab'");
-            let status = push.status().map_err(|e| AdapterError::Protocol {
+            // The sudo password is delivered on the remote `sudo -S` stdin
+            // through the SSH channel: it never appears on the local argv,
+            // in this source, or on the guest's command line.
+            let mut push = sshpass_ssh_command(
+                password,
+                identity_file,
+                port,
+                user,
+                host,
+                PRIME_SUDOERS_REMOTE_COMMAND,
+            );
+            push.stdin(std::process::Stdio::piped());
+            push.stdout(std::process::Stdio::null());
+            let mut child = push.spawn().map_err(|e| AdapterError::Protocol {
+                message: format!("sshpass prime push spawn failed: {e}"),
+            })?;
+            let Some(mut stdin) = child.stdin.take() else {
+                let _ = child.kill();
+                return Err(AdapterError::Protocol {
+                    message: "sshpass prime push: stdin pipe was not created".to_owned(),
+                });
+            };
+            let write_result = std::io::Write::write_all(&mut stdin, password.as_bytes())
+                .and_then(|()| std::io::Write::write_all(&mut stdin, b"\n"));
+            drop(stdin);
+            let status = child.wait().map_err(|e| AdapterError::Protocol {
                 message: format!("sshpass prime push failed: {e}"),
             })?;
+            if let Err(e) = write_result {
+                return Err(AdapterError::Protocol {
+                    message: format!("sshpass prime push: writing the sudo password failed: {e}"),
+                });
+            }
             if !status.success() {
                 return Err(AdapterError::Protocol {
                     message: "failed to push temporary sudoers grant".to_owned(),
@@ -585,6 +599,44 @@ pub fn prime_remote_access(conn: &NodeConnection) -> Result<(), AdapterError> {
             Ok(())
         }
     }
+}
+
+/// Remote command that installs the temporary sudoers grant. `sudo -S` reads
+/// the password from stdin, which `prime_remote_access` pipes through the SSH
+/// channel; nothing in this string carries a credential.
+const PRIME_SUDOERS_REMOTE_COMMAND: &str = "sudo -S bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" \
+     > /etc/sudoers.d/99-rustynet-lab && chmod 0440 /etc/sudoers.d/99-rustynet-lab'";
+
+/// Build `sshpass -e ssh …` for the password-primed path. The password goes to
+/// sshpass through the `SSHPASS` environment variable (`-e`), never through
+/// `-p`, so it is not visible on the process argv to other users on the
+/// orchestrator host. The destination is guarded by `--` so an inventory
+/// `ssh_target`/`ssh_user` beginning with `-` can never be parsed as an option.
+fn sshpass_ssh_command(
+    password: &str,
+    identity_file: &std::path::Path,
+    port: u16,
+    user: Option<&str>,
+    host: &str,
+    remote_command: &str,
+) -> std::process::Command {
+    let user_flag = user.map(|u| format!("{u}@")).unwrap_or_default();
+    let mut cmd = std::process::Command::new("sshpass");
+    cmd.env("SSHPASS", password)
+        .arg("-e")
+        .arg("ssh")
+        .arg("-i")
+        .arg(identity_file)
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(format!("{user_flag}{host}"))
+        .arg(remote_command);
+    cmd
 }
 
 /// Stop the launchd service.
@@ -3865,5 +3917,65 @@ mod tests {
         let got = reviewed_relay_plist_bytes(&ws).expect("plist bytes");
         assert_eq!(got, body.to_vec());
         let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn sshpass_prime_commands_never_carry_the_password_in_argv_or_source() {
+        // F1/F2 of the 2026-09-08 privileged-exec audit: the lab password used
+        // to ride `sshpass -p <pw>` (visible in `ps`) and the sudo password was
+        // a literal in this file (committed to a public repo).
+        // Mutations caught: (1) `-p <password>` back on argv -> argv scan finds
+        // the literal; (2) dropping `-e`/`SSHPASS` -> env assertion fails;
+        // (3) an `echo '<literal>' | sudo -S` remote command -> source pin
+        // finds `echo '` before `sudo -S`; (4) removing `--` -> guard assert.
+        let cmd = sshpass_ssh_command(
+            "LAB-SECRET-9",
+            std::path::Path::new("/tmp/id"),
+            22,
+            Some("admin"),
+            "10.0.0.5",
+            PRIME_SUDOERS_REMOTE_COMMAND,
+        );
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|a| a.contains("LAB-SECRET-9")),
+            "password must never be on argv: {args:?}"
+        );
+        assert_eq!(args[0], "-e", "sshpass must read the password from SSHPASS");
+        assert!(
+            cmd.get_envs()
+                .any(|(k, v)| k == "SSHPASS" && v.map(|v| v == "LAB-SECRET-9").unwrap_or(false)),
+            "SSHPASS env must carry the password"
+        );
+        let dest = args
+            .iter()
+            .position(|a| a == "admin@10.0.0.5")
+            .expect("destination");
+        assert_eq!(args[dest - 1], "--", "destination must be guarded by --");
+        assert!(
+            PRIME_SUDOERS_REMOTE_COMMAND.starts_with("sudo -S"),
+            "sudo password must come from stdin, not the remote command"
+        );
+        assert!(!PRIME_SUDOERS_REMOTE_COMMAND.contains("echo '"));
+
+        // Slice the file BEFORE its test module so the pin cannot be
+        // satisfied by the needles in these assertions.
+        let full = include_str!("macos_install.rs");
+        let cut = full
+            .find("#[cfg(test)]\nmod tests")
+            .expect("test module marker");
+        let source = &full[..cut];
+        assert!(
+            !source.contains("| sudo -S"),
+            "no password may be echoed into sudo -S on the remote command line"
+        );
+        assert!(
+            !source.contains(".arg(\"-p\").arg(password)")
+                && !source.contains("arg(\"-p\")\n                .arg(password)"),
+            "sshpass -p <password> must not return"
+        );
     }
 }
