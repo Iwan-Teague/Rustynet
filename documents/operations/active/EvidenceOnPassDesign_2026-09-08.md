@@ -1,0 +1,303 @@
+# Evidence-on-Pass Design (QH-83) — 2026-09-08
+
+**Status:** DESIGN (docs-only, no code changed). Owner decision points in §8.
+**Scope:** the `--node` live-lab stage engine only (`crates/rustynet-cli/src/vm_lab/orchestrator/`).
+**Sources:** QH-83 (`QualityHardeningTodo_2026-07-25.md:6942-7014`), audit item 1 of
+"the smallest set of changes that makes a green run mean something"
+(`MultiAgentSecurityReviewAudit_2026-09-08.md` §3). Every file:line below was read in
+this tree on 2026-09-08.
+
+## 1. Decision
+
+Build ONE wrapper check in
+`StateMachineRunner::run_with_observer_and_pre_cleanup_hook`
+(`orchestrator/runner.rs:114`), applied between `stage.execute(ctx)` returning
+(`runner.rs:163-170`, the `catch_unwind`) and the pre-cleanup hook merge
+(`runner.rs:172`): when the outcome is `StageOutcome::Passed`, require the
+stage's declared witness; if it is absent/empty/unreadable, demote in place to
+`StageOutcome::NotProven { reason, detail }` using the existing
+`ReasonCode` vocabulary (`orchestrator/error.rs:246-260, 297-301`). No new
+outcome kind, no parallel mechanism, no per-stage runner changes.
+
+What the witness IS is declared by the stage itself, compile-forced, via a new
+**non-defaulted** trait method on `OrchestrationStage`
+(`orchestrator/stage/mod.rs:374-416`):
+
+```rust
+/// What on-disk datum proves this stage's `Passed` verdict. No default:
+/// adding a stage forces a declaration, and the only permissive answer
+/// (`None`) must name its reason in source.
+fn evidence(&self) -> StageEvidence;
+```
+
+```rust
+pub enum StageEvidence {
+    /// The verdict is proven by this stage's own per-stage log
+    /// (`<report_dir>/logs/<wire_name>.log`) being non-empty at check time.
+    StageLog,
+    /// The verdict is proven by this report-dir-relative artifact: it must
+    /// exist, be a regular file, and be non-empty after trim.
+    File(&'static str),
+    /// This stage legitimately writes no witness. The reason is mandatory
+    /// and is surfaced in the run's plan artifact (see §5), so the opt-out
+    /// is visible in evidence, not only in code.
+    None { reason: &'static str },
+}
+```
+
+### Alternatives, and why they lose
+
+- **The audit's literal shape — "non-empty per-stage log for every stage".**
+  Measured: 81 catalog stages (`stage/mod.rs:175-344`), and exactly **2**
+  append anything to their own log today (`append_stage_evidence_line` call
+  sites: `stage/membership_init.rs:135`, `stage/mesh_status_validation.rs:124`).
+  So **79 of 81 stages would demote to `NotProven` — a blocking non-pass whose
+  skip-cascade (`runner.rs:247-259`) fails every downstream stage — on the
+  first live run.** That is QH-83's flag day, correctly rejected there. It
+  also invites the constant-line appeasement QH-83 names ("a stage that
+  appeases the check by appending a constant satisfies emptiness without
+  proving anything").
+- **`Option<&str>` artifact path with a `None` default.** The zero-effort path
+  is permissive: a stage in a hurry returns `None` and is silently exempt.
+  This is exactly the shape cut from a recent proposal (omittable precondition
+  = "no declaration, no check, proceed"). Rejected on the repo's fail-closed
+  law (AGENTS.md §3).
+- **Default-`StageLog` trait method.** Fail-closed but a flag day (79 demote)
+  and hides the decision: a stage that needs an opt-out must override the
+  default, and nothing forces the override to carry a reason. The non-defaulted
+  method gets the same fail-closed property at the compiler level *and* forces
+  every stage's answer to exist as a reviewable line of code.
+- **A sidecar manifest (JSON listing stage→artifact) outside the trait.** A
+  second source of truth that can drift from the 81 impls; the trait puts the
+  answer where the compiler totals over `StageId`.
+
+## 2. Grounding — how the seam behaves today
+
+- **One production execution path.** The `--node` run enters through
+  `run_with_observer_and_pre_cleanup_hook` (`native.rs:969`); `run`/`run_with_observer`
+  delegate to it (`runner.rs:96-108`). Demoting at this one point covers every
+  production pass. (Test code constructs outcomes directly; irrelevant.)
+- **The check instant must be BEFORE `observer.stage_finished` (`runner.rs:189`).**
+  The recorder truncates the per-stage log at `stage_started`
+  (`evidence.rs:516` — `fs::write(&log_path, "")`, with truncate-failure
+  falling back to `fs::remove_file`, `evidence.rs:519-528`) and appends the
+  terminal verdict block at `stage_finished`. A check placed after
+  `stage_finished` would find the verdict line itself in the log and be
+  vacuous for every stage. Placed right after the `catch_unwind`, the log
+  contains exactly what `execute` wrote, nothing else.
+- **The runner can resolve paths.** `OrchestrationContext::report_dir` is
+  `pub` (`context.rs:75`, a `String`); `ctx` is already in scope at the seam.
+  Per-stage log path derivation is `rust_native_stage_log_path`
+  (`evidence.rs:180-182`): `report_dir/logs/<id.as_str()>.log` — the same
+  derivation the recorder and the artifacts list use (`evidence.rs:372-377`),
+  so StageLog needs no new convention.
+- **Demotion is already plumbed end to end.** `NotProven` is blocking
+  (`error.rs:304-309`), cascades to dependents via `skip_decision` rule 2
+  (`runner.rs:247-259`), maps to `VmLabStageStatus::NotProven` in evidence
+  (`evidence.rs:351`), and its TSV summary leads with the reason code
+  (`evidence.rs:566-569`; `missing_witness` token: `error.rs:251`).
+  `reason.as_str()` is pinned as a stable evidence token (`error.rs:247-249`).
+- **Measured catalog:** 81 stages; suites: Setup 17, Live 35, CrossNetwork 11,
+  Chaos 9, NegativeControl 4, Disruptive 2, Soak 1, Cleanup 2
+  (`stage/mod.rs:175-344`, counted by catalog row). 34 stage-tree files
+  contain `fs::write` (including shared `scenario/` helpers); 28 reference
+  `log_path`/`--log-path` (live-binary stages whose full output lands in a
+  named file).
+
+## 3. Exact check semantics
+
+At the seam, only when the outcome is `Passed`:
+
+| Declaration | Check | Failure |
+| --- | --- | --- |
+| `StageLog` | `logs/<id>.log` exists, is a file, and `content.trim()` is non-empty | `NotProven { MissingWitness, "stage '<id>' passed but its stage log is empty — no witness written during execute" }` |
+| `File(rel)` | `report_dir.join(rel)` exists, is a regular file, non-empty after trim | absent → `NotProven { MissingWitness, "declared artifact '<rel>' not found" }`; empty → `MissingWitness, "declared artifact '<rel>' is empty"` |
+| `File(rel)` | read fails (permissions, race) | `NotProven { UnreadableEvidence, "<io error>" }` — the existing code (`error.rs:254`), not `MissingWitness` |
+| `None { reason }` | no check | pass stands; the declaration is recorded (§5) |
+
+`Skipped`/`NotRun`/`Reused`/`Failed` are untouched: the wrapper reads `Passed`
+only. `Reused` already validates prior evidence by digest
+(`validate_rust_native_reuse_evidence`, `evidence.rs:283-336`); it must not
+double-gate.
+
+**Malformed declarations fail at plan construction, not mid-run.** Extend
+`validate_plan` (`runner.rs:281`): a `File` path that is empty, absolute, or
+contains a `..` component makes `StateMachineRunner::new` return `Err`. A bad
+declaration is a programming error; refusing to start is stricter and earlier
+than demoting whichever stage happened to run first.
+
+## 4. Fail-closed analysis (per introduction)
+
+- **Absent declaration (new stage):** does not compile. The trait method has
+  no default; `StageId`'s catalog is an exhaustive match, so the 82nd stage
+  forces an 82nd declaration. There is no zero-effort path.
+- **Absent artifact at run time:** `NotProven` (blocking; cascades). A pass is
+  never recorded without its witness.
+- **Malformed declaration:** plan construction refuses (`§3`). No
+  absolute-path or traversal escape from the report dir.
+- **Malformed artifact content:** out of scope by design (§7) — the wrapper
+  proves existence/non-emptiness, not schema. A stage whose witness is
+  structurally garbage still passes; see §7 for why that residual is accepted
+  and where it is caught instead.
+- **Stale artifact:** within a run, StageLog cannot be stale — truncated at
+  `stage_started` (`evidence.rs:516`), and if truncation fails the file is
+  removed and the recorder error fails evidence finalization
+  (`evidence.rs:519-528`), so foreign content can only survive inside a run
+  whose evidence is already void. Across runs, the report-dir lease stamps
+  every `stages.tsv` row with this invocation's `run_instance_id`
+  (`evidence.rs:390-394`), so a previous generation's non-empty log is not
+  readable as this run's witness. `File` declarations are written fresh during
+  `execute` by the same stage; the wrapper does not mtime-check (an mtime
+  comparison cannot distinguish "wrote the real artifact" from "touched a
+  file" and would add a false assurance — UNVERIFIED whether any stage
+  reuses a prior run's path, because the report dir is fresh per invocation).
+- **Set by someone who should not have set it:** every declaration is a
+  tracked-line diff in the stage impl — `None { reason }` in particular is
+  greppable and reviewable, and it is surfaced per run in the plan artifact
+  (§5), so an opt-out added without review is still visible in every
+  subsequent run's evidence. This is defense-in-depth for review, not a
+  substitute for it.
+- **What the check cannot be fooled by:** it cannot be fooled by ordering —
+  execute-time writes are the only content present (§2, truncation point).
+
+## 5. Visibility of the opt-out (not just grep)
+
+Extend `write_rust_native_node_stage_plan` (`evidence.rs:397-439`): each entry
+in `state/node_stage_plan.json` gains an `evidence` field —
+`{"kind":"stage_log"}` / `{"kind":"file","path":...}` /
+`{"kind":"none","reason":...}` — and `schema_version` bumps 1 → 2. Every run
+then carries a machine-readable answer to "which green stages had no
+witness", without reading source. Additive field; bump the version so any
+strict reader of the old shape fails loudly rather than silently ignoring it.
+
+## 6. Migration — counts, flag day vs phased
+
+**Would the naive wrapper break?** Yes: **79 of 81 stages** demote on day one
+(§1). Not shipped.
+
+**Does THIS design break anything on day one?** No — provided declarations are
+accurate. The compiler forces all 81 declarations in the framework commit; the
+mechanism is live for every stage immediately. A mis-declaration surfaces as a
+loud `NotProven` on the first run that exercises that stage — which is the
+mechanism working, not a regression.
+
+**Landing order (one commit can hold it all; per-suite upgrades follow):**
+
+1. Framework: trait method + enum + wrapper + `validate_plan` extension + plan
+   JSON field + tests. Initial declarations: the 2 append-capable stages →
+   `StageLog`; stages whose `execute` provably writes its verdict's artifact →
+   `File(...)` (candidates: the 34 `fs::write`-bearing files, judgment per
+   stage); teardown family and genuinely artifact-free stages → `None { reason }`.
+2. Per-suite upgrade batches — audit each declaration ("what datum IS this
+   verdict"), add `append_stage_evidence_line` calls where the verdict
+   currently rests on in-memory results, convert `File` → `StageLog` where the
+   stage log is the natural home. Batch order by blast radius and suite size:
+   Setup (17) → Live (35) → CrossNetwork (11) → Chaos (9) →
+   NegativeControl/Disruptive/Soak/Cleanup (9). One live-lab re-verify per
+   batch, per the operating method (`LiveLabExecutionEfficiencyPlan_2026-06-20.md`).
+3. Opt-out triage is part of step 1 and is re-checked in each batch; the
+   `None` reasons live in code (compiler-totaled), never in a doc.
+
+**Realistic opt-out family (to be confirmed per stage in step 1):** the
+Cleanup suite (`cleanup`, `cross_network_substrate_teardown` — teardown must
+never be blocked by evidence; residue removal is itself the release-critical
+act) and pure orchestration steps whose effect is fully visible in the next
+stage's witness. Uncertain middle ground flagged in §8.
+
+## 7. What this does NOT solve
+
+- **Meaningfulness.** A stage can append a constant line and satisfy
+  emptiness — the same defect one level up, exactly as QH-83 states. The
+  wrapper converts "no artifact" into a detectable state; it cannot judge
+  content. Content quality is the per-suite batch review in §6.2 and the
+  adversarial-review pattern this repo already uses; no wrapper can do it.
+- **Vacuous assertions inside the artifact.** A validator that checks nothing
+  and writes a well-formed "valid" JSON passes. That is the M8 class — audit
+  item 2's `run_logged_test` `N ≥ 1` fix, separate and already scoped.
+- **Skips.** `Skipped`/`NotRun` remain explained-by-reason with no artifact.
+  A stage that would otherwise be `NotProven` can still be dodged by a stage
+  bug that skips instead of executing — the skip-reason payload
+  (`error.rs:266-281`) is the existing control for that, not this one.
+- **Wrong-owner artifacts (QH-07/H4 contamination class at the data level).**
+  The wrapper proves an artifact exists behind THIS stage's verdict; it does
+  not prove the artifact's measurements belong to this run's nodes (the
+  collision/self-IP guards are audit item 5, separate).
+- **`Reused` freshness.** Covered by the existing digest seal
+  (`evidence.rs:229-336`); unchanged here.
+
+## 8. Owner decisions required
+
+1. **Whitespace-only artifact = empty?** Recommended: yes (`trim()` before the
+   emptiness test). Low stakes; confirm in review.
+2. **Are guest-mutation plumbing stages (`bootstrap_hosts`,
+   `distribute_membership`, `distribute_traversal`, `distribute_dns_zone`,
+   `distribute_assignments`, `collect_pubkeys`) "legitimately no artifact" or
+   must they record per-node receipts?** Recommended: receipts (a distribution
+   stage that proves nothing distributed is the exact silent-green shape this
+   item exists to kill), but that is real per-stage wiring in the bulk. If the
+   owner rules them opt-outs, say so per stage with a reason; do not let the
+   step-1 triage decide it silently.
+3. **Should a witnessed pass say so in the `stages.tsv` summary** (currently
+   `Passed` writes an empty summary, `evidence.rs:557`)? Recommended
+   eventually-yes (opt-outs visible per row), but it touches the 8-column TSV
+   contract that external parsers read positionally (the QH-07-class readers
+   warned about in AGENTS.md §12.3). Owner call on timing, not direction.
+4. **`schema_version` bump for `node_stage_plan.json` (§5):** recommended bump
+   to 2. Any consumer pinning version 1 must be updated in the same commit.
+
+## 9. Test plan — each test names its mutation
+
+Framework tests (in `runner.rs` / `stage/mod.rs` test modules, on a scratch
+`OrchestrationContext` with a temp `report_dir`):
+
+1. `passed_stage_with_nonempty_stage_log_stays_passed` — catches: inverted
+   demotion condition (demote when witness present), or any `!` dropped from
+   the emptiness test.
+2. `passed_stage_with_empty_stage_log_demotes_to_not_proven_missing_witness`
+   — catches: **reverting the whole wrapper** (the fix-deleted-still-green
+   failure class this repo has shipped); also catches demoting to
+   `Skipped`/`Failed` instead of `NotProven` (assert the exact
+   `ReasonCode::MissingWitness` and `is_blocking()`).
+3. `declared_file_artifact_absent_empty_and_whitespace_only_each_demote` —
+   three cases; catches: existence-only check (empty file passes), and
+   dropping the `trim()` (whitespace-only passes).
+4. `unreadable_declared_artifact_is_unreadable_evidence` — mode-0o000 file
+   (`#[cfg(unix)]`, skip when running as root); catches: collapsing every IO
+   error into `MissingWitness` (misclassifies operator-fixable evidence loss).
+5. `malformed_evidence_declaration_rejects_plan_construction` — `File("")`,
+   `File("/tmp/x")`, `File("../escape")` each make
+   `StateMachineRunner::new` return `Err`; catches: deferring validation to
+   check-time (runner constructs, run starts, stage demotes mid-run instead
+   of refusing to start).
+6. `evidence_declarations_are_recorded_in_node_stage_plan` — every declaration
+   kind serializes with its reason/path; catches: serializing `None` as a bare
+   null (reason lost from evidence) or forgetting the `schema_version` bump.
+7. `demoted_pass_blocks_dependents` — a dependent of the demoted stage records
+   `Skipped("dependency … did not pass …")`; catches: removing `NotProven` from
+   `is_blocking()` (`error.rs:304-309`) — the demotion would then be a
+   recorded annotation that still greens the rest of the run.
+8. `check_precedes_recorder_terminal_append` — invoke the recorder's
+   `stage_finished` before the wrapper's check in a test harness and assert
+   the demotion still fires on an execute-writeless log; catches: moving the
+   check after `observer.stage_finished` (the vacuous placement where the
+   recorder's own verdict line satisfies emptiness).
+
+The compiler is the totality test for the catalog: there is no runtime test
+for "every stage declared", because a missing declaration is a compile error
+by construction (§4). A `StageId::ALL` iteration asserting each declared
+`File` path is relative and `..`-free duplicates `validate_plan`; do not add
+one.
+
+## 10. Effort
+
+- **Mechanical (~1 day):** enum + trait method + wrapper + `validate_plan`
+  extension + plan JSON field + the eight tests above. No judgment.
+- **Judgment (~2.5–4 days):** the per-stage "what datum IS this verdict"
+  audit across all 81 stages — 79 are not yet `StageLog`-capable; each needs
+  its declaration chosen, ~the `fs::write`-bearing subset pointed at real
+  artifacts, and the rest given meaningful `append_stage_evidence_line`
+  lines or named opt-outs — plus five per-suite live-lab re-verify batches
+  (each 30–45 min wall, plus triage). Split: Setup 0.5 d, Live 1–1.5 d,
+  remaining suites 1 d, live re-verify overhead 0.5–1 d.
+- **Total: ~3.5–5 days.** The framework half is the audit's "one wrapper
+  change"; the judgment half is what QH-83 correctly refused to half-land.
