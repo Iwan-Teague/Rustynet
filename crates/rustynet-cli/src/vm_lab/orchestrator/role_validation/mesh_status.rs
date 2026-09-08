@@ -173,7 +173,19 @@ pub struct LiveHandshakeObservation {
     pub expected_live_peers: u32,
     pub path_latest_live_handshake_unix: u64,
     pub guest_now_unix: u64,
+    /// `guest_now_unix - path_latest_live_handshake_unix`, clamped at zero by
+    /// `saturating_sub` (review F6): a future-dated handshake therefore ALSO
+    /// reads `0`. Whether that value was ever ENFORCED against a freshness
+    /// bound is what [`Self::freshness_gate_enforced`] records — do not read
+    /// a small age alone as "freshness proven".
     pub handshake_age_seconds: u64,
+    /// Whether the handshake freshness gates actually ran for this node
+    /// (review F6): true only when `expected_live_peers > 0`. On a
+    /// single-node run the gates are skipped, so `handshake_age_seconds` is
+    /// raw arithmetic off the status line — a `0` there may be a
+    /// future-dated handshake clamped by `saturating_sub`, not evidence of
+    /// freshness.
+    pub freshness_gate_enforced: bool,
 }
 
 pub fn evaluate_live_handshake_status(
@@ -219,6 +231,7 @@ pub fn evaluate_live_handshake_status(
         path_latest_live_handshake_unix: handshake,
         guest_now_unix: now_unix,
         handshake_age_seconds: now_unix.saturating_sub(handshake),
+        freshness_gate_enforced: expected_live_peers > 0,
     };
 
     if expected_live_peers == 0 {
@@ -262,6 +275,15 @@ pub fn evaluate_live_handshake_status(
 /// applying the typed evaluator. Returns `Err` with detail on failure
 /// (fail-closed) or `Ok(())` on pass — where "pass" means the evaluator's full
 /// contract (schema, overall_ok), not merely the daemon's exit code.
+///
+/// Vacuous-pass disclosure (QH-81,
+/// `documents/operations/active/QualityHardeningTodo_2026-07-25.md`): the
+/// daemon populates `expected_peer_ids` from advertised route CIDRs, so on
+/// the current data model this consumer ACCEPTS a pass whose expectation is
+/// empty — the check cannot distinguish "no peers expected" from "the
+/// expectation was never expressed". It is kept for its schema /
+/// `overall_ok` / staleness contract only; LIVE peer visibility is proven by
+/// the `mesh_status_validation` stage's live-handshake poll, not here.
 pub fn validate_linux_mesh_status(
     shell: &dyn RemoteShellHost,
     daemon_path: &str,
