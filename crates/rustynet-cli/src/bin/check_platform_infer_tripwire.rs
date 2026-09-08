@@ -292,9 +292,11 @@ mod tests {
             &mut violations,
         );
         assert_eq!(violations.len(), 1, "R3 must fire on the bare fallback");
-        assert!(violations[0]
-            .reason
-            .contains("must not silently become Linux"));
+        assert!(
+            violations[0]
+                .reason
+                .contains("must not silently become Linux")
+        );
     }
 
     #[test]

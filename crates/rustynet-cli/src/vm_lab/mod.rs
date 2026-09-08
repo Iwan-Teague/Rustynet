@@ -249,7 +249,13 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             };
             let after_marker = i + "#[cfg(test)]".len();
             let j = skip_trivia(&chars, after_marker);
-            if is_keyword(&chars, j, "use") {
+            if is_keyword(&chars, j, "use")
+                || is_keyword(&chars, j, "static")
+                || is_keyword(&chars, j, "const")
+            {
+                // `use`/`static`/`const` test items run to the terminating
+                // `;` (string-aware, so a `&str` value cannot end the item
+                // early).
                 i = j;
                 while i < chars.len() && chars[i] != ';' {
                     if chars[i] == '"' {
@@ -259,7 +265,7 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
                     }
                 }
                 if i >= chars.len() {
-                    return Err("unterminated #[cfg(test)] use item".to_owned());
+                    return Err("unterminated #[cfg(test)] item".to_owned());
                 }
                 i += 1; // ';'
                 continue;
@@ -2326,14 +2332,22 @@ impl VmGuestPlatform {
         }
     }
 
+    /// Infers the guest platform from the entry's recorded names. Explicit
+    /// inventory `platform` always wins; otherwise the hint substrings are
+    /// matched against alias, os and utm_name in a fixed precedence order
+    /// (Windows → macOS → iOS → Android → Linux). The Linux hint set mirrors
+    /// `parse`'s Linux arm so a name `parse` cannot resolve cannot silently
+    /// infer either. Returns `None` when nothing matches — the caller must
+    /// resolve the unknown explicitly and must never coerce it back to Linux
+    /// (QH-82; enforced by the check_platform_infer_tripwire gate).
     fn infer(
         explicit: Option<Self>,
         os_name: Option<&str>,
         alias: &str,
         utm_name: Option<&str>,
-    ) -> Self {
+    ) -> Option<Self> {
         if let Some(platform) = explicit {
-            return platform;
+            return Some(platform);
         }
 
         let mut haystacks = vec![alias.to_ascii_lowercase()];
@@ -2347,22 +2361,30 @@ impl VmGuestPlatform {
         if haystacks.iter().any(|value| {
             value.contains("windows") || value.contains("win11") || value.contains("win10")
         }) {
-            Self::Windows
+            Some(Self::Windows)
         } else if haystacks.iter().any(|value| {
             value.contains("macos")
                 || value.contains("mac os")
                 || value.contains("os x")
                 || value.contains("darwin")
         }) {
-            Self::Macos
+            Some(Self::Macos)
         } else if haystacks.iter().any(|value| {
             value.contains("ios") || value.contains("iphone") || value.contains("ipad")
         }) {
-            Self::Ios
+            Some(Self::Ios)
         } else if haystacks.iter().any(|value| value.contains("android")) {
-            Self::Android
+            Some(Self::Android)
+        } else if haystacks.iter().any(|value| {
+            value.contains("linux")
+                || value.contains("debian")
+                || value.contains("ubuntu")
+                || value.contains("fedora")
+                || value.contains("mint")
+        }) {
+            Some(Self::Linux)
         } else {
-            Self::Linux
+            None
         }
     }
 
@@ -2510,6 +2532,10 @@ fn default_platform_profile(platform: VmGuestPlatform) -> VmPlatformProfile {
     }
 }
 
+/// Resolves a node's effective platform profile. Fails closed when the
+/// platform cannot be inferred: an unknown guest must never be dressed up as
+/// Linux (QH-82). The error names the alias so the operator can fix the
+/// inventory in one step.
 fn effective_platform_profile(
     explicit_platform: Option<VmGuestPlatform>,
     explicit_remote_shell: Option<VmRemoteShell>,
@@ -2518,20 +2544,25 @@ fn effective_platform_profile(
     os_name: Option<&str>,
     alias: &str,
     controller: Option<&VmController>,
-) -> VmPlatformProfile {
+) -> Result<VmPlatformProfile, String> {
     let platform = VmGuestPlatform::infer(
         explicit_platform,
         os_name,
         alias,
         controller_utm_name(controller),
-    );
+    )
+    .ok_or_else(|| {
+        format!(
+            "'{alias}': platform could not be inferred from alias/os; refusing to assume Linux — set the inventory 'platform' field"
+        )
+    })?;
     let defaults = default_platform_profile(platform);
-    VmPlatformProfile {
+    Ok(VmPlatformProfile {
         platform,
         remote_shell: explicit_remote_shell.unwrap_or(defaults.remote_shell),
         guest_exec_mode: explicit_guest_exec_mode.unwrap_or(defaults.guest_exec_mode),
         service_manager: explicit_service_manager.unwrap_or(defaults.service_manager),
-    }
+    })
 }
 
 fn default_rustynet_src_dir_for_profile(
@@ -2666,7 +2697,10 @@ pub(crate) struct VmInventoryEntry {
 }
 
 impl VmInventoryEntry {
-    fn platform_profile(&self) -> VmPlatformProfile {
+    /// Resolves this entry's effective platform profile, failing closed when
+    /// the platform cannot be inferred from the recorded names and no
+    /// explicit `platform` is set (QH-82). The error names the alias.
+    fn platform_profile(&self) -> Result<VmPlatformProfile, String> {
         effective_platform_profile(
             self.platform,
             self.remote_shell,
@@ -3361,7 +3395,18 @@ pub fn execute_ops_vm_lab_diagnose(config: VmLabDiagnoseConfig) -> Result<String
         .as_deref()
         .unwrap_or(entry.ssh_target.as_str())
         .to_owned();
-    let platform = entry.platform.unwrap_or(VmGuestPlatform::Linux);
+    // QH-82: the platform picks the adapter, so an unrecorded platform must
+    // NOT default to Linux — that ran Linux-shaped probes (bash paths,
+    // systemctl-adjacent commands) against a box of unknown OS, and even an
+    // alias literally named `...windows...` got the Linux adapter here.
+    // Explicit recorded platform ONLY: no inference fallback in a diagnostic
+    // tool. The cost to the operator is one inventory line.
+    let platform = entry.platform.ok_or_else(|| {
+        format!(
+            "'{}': no platform recorded; refusing to assume Linux",
+            entry.alias
+        )
+    })?;
 
     let conn = NodeConnection::ssh(
         host.clone(),
@@ -7421,7 +7466,11 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
         let mut inventory_controller_bundle_path = None;
         let mut inventory_controller_utm_name = None;
         let mut inventory_utm_staging_dir = None;
-        let discovery_platform_profile = if let Some(entry) = inventory_match {
+        // QH-82: the discovered record carries the platform as an Option.
+        // The profile is `None` when the platform is un-inferable, so no
+        // probe below can mint a platform-specific command from a guess.
+        let (discovery_platform, discovery_platform_profile) = if let Some(entry) = inventory_match
+        {
             matched_inventory_count += 1;
             inventory_alias = Some(entry.alias.clone());
             inventory_node_id = entry.node_id.clone();
@@ -7496,11 +7545,21 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
                     }
                 }
             }
-            entry.platform_profile()
+            let matched_profile = entry.platform_profile()?;
+            (Some(matched_profile.platform), Some(matched_profile))
         } else {
             let inferred_platform =
                 VmGuestPlatform::infer(None, None, utm_name.as_str(), Some(utm_name.as_str()));
-            let profile = default_platform_profile(inferred_platform);
+            // QH-82: no inventory entry exists to fix and discovery's job is
+            // to enumerate, not to gate — so an un-inferable platform does
+            // NOT error the run. It degrades to a profile-less record: no
+            // default_platform_profile, no Linux ssh user, no advisory
+            // target, and every exec-shaped probe below refuses through the
+            // `profile.is_none()` handling. The note names the cause.
+            let profile = inferred_platform.map(default_platform_profile);
+            if profile.is_none() {
+                discovery_notes.push("platform-not-inferable-from-utm-name".to_owned());
+            }
             if let Some(ip) = resolve_local_utm_live_host_via_utmctl(
                 utm_name.as_str(),
                 None,
@@ -7527,21 +7586,36 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
                 }
             }
             if let Some(ip) = live_ip.clone() {
-                ssh_target_source =
-                    format!("platform-aware-unmatched-{}", inferred_platform.as_str());
-                advisory_ssh_target =
-                    unmatched_local_utm_advisory_target(inferred_platform, ip.as_str());
-                if inferred_platform == VmGuestPlatform::Linux {
-                    ssh_user = Some("debian".to_owned());
-                } else {
-                    discovery_notes.push(
-                        "windows-utm-discovered-without-inventory-no-linux-user-assumed".to_owned(),
-                    );
+                match inferred_platform {
+                    Some(platform) => {
+                        ssh_target_source =
+                            format!("platform-aware-unmatched-{}", platform.as_str());
+                        advisory_ssh_target =
+                            unmatched_local_utm_advisory_target(platform, ip.as_str());
+                        if platform == VmGuestPlatform::Linux {
+                            ssh_user = Some("debian".to_owned());
+                        } else {
+                            discovery_notes.push(
+                                "windows-utm-discovered-without-inventory-no-linux-user-assumed"
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    None => {
+                        // No platform guess: record the raw address without
+                        // minting a platform-shaped ssh user or advisory
+                        // target from it.
+                        ssh_target_source = "platform-uninferable-unmatched".to_owned();
+                        advisory_ssh_target = Some(ip);
+                        discovery_notes.push(
+                            "windows-utm-discovered-without-inventory-no-linux-user-assumed"
+                                .to_owned(),
+                        );
+                    }
                 }
             }
-            profile
+            (inferred_platform, profile)
         };
-        let discovery_platform = discovery_platform_profile.platform;
 
         let live_ip_state = match live_ip.clone() {
             // "arp-by-mac" is a genuine live discovery (a fresh host ARP-table
@@ -7614,26 +7688,27 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
                     .unwrap_or_else(|| format!("ssh-port-status={value}")),
             },
         };
-        let windows_ssh_probe_state = if discovery_platform == VmGuestPlatform::Windows {
-            if !process_present {
-                Some(ProbeState::Missing {
-                    reason: "process-not-ready".to_owned(),
-                })
-            } else if live_ip.is_some() {
-                Some((probes.windows_ssh_readiness)(
-                    utm_name.as_str(),
-                    inventory_utm_staging_dir.as_deref(),
-                    timeout,
-                ))
+        let windows_ssh_probe_state =
+            if matches!(discovery_platform, Some(VmGuestPlatform::Windows)) {
+                if !process_present {
+                    Some(ProbeState::Missing {
+                        reason: "process-not-ready".to_owned(),
+                    })
+                } else if live_ip.is_some() {
+                    Some((probes.windows_ssh_readiness)(
+                        utm_name.as_str(),
+                        inventory_utm_staging_dir.as_deref(),
+                        timeout,
+                    ))
+                } else {
+                    Some(ProbeState::Missing {
+                        reason: "live-ip-not-authoritative".to_owned(),
+                    })
+                }
             } else {
-                Some(ProbeState::Missing {
-                    reason: "live-ip-not-authoritative".to_owned(),
-                })
-            }
-        } else {
-            None
-        };
-        let known_hosts_state = if discovery_platform == VmGuestPlatform::Windows {
+                None
+            };
+        let known_hosts_state = if matches!(discovery_platform, Some(VmGuestPlatform::Windows)) {
             windows_discovery_known_hosts_state(
                 authoritative_ssh_target.as_deref(),
                 live_ip.as_deref(),
@@ -7666,25 +7741,35 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
             // ssh-auth success is strictly stronger evidence than a raw socket
             // connect, so do NOT veto the auth probe on the raw-TCP result.
             (Some(_), Some(ssh_user), Some(ssh_target)) => {
-                match ssh_auth_probe_command(discovery_platform_profile) {
-                    Ok(probe_command) => match (probes.ssh_auth_shell)(
-                        ssh_target,
-                        Some(ssh_user),
-                        config.ssh_identity_file.as_deref(),
-                        config.known_hosts_path.as_deref(),
-                        probe_command,
-                        timeout,
-                    ) {
-                        Ok(status) if status.success() => ProbeState::Ok {
-                            value: "ok".to_owned(),
-                        },
-                        Ok(status) => ProbeState::Fallback {
-                            value: format!("failed-exit-{}", status_code(status)),
-                            reason: "ssh-auth-command-failed".to_owned(),
-                        },
-                        Err(err) => ProbeState::Error { reason: err },
+                let probe_command = discovery_platform_profile
+                    .as_ref()
+                    .map(|profile| ssh_auth_probe_command(*profile));
+                // QH-82: no inferable platform — no platform-shaped probe
+                // command. The auth probe errors instead of guessing.
+                match probe_command {
+                    None => ProbeState::Error {
+                        reason: "platform-not-inferable-from-utm-name".to_owned(),
                     },
-                    Err(err) => ProbeState::Error { reason: err },
+                    Some(Err(err)) => ProbeState::Error { reason: err },
+                    Some(Ok(probe_command)) => {
+                        match (probes.ssh_auth_shell)(
+                            ssh_target,
+                            Some(ssh_user),
+                            config.ssh_identity_file.as_deref(),
+                            config.known_hosts_path.as_deref(),
+                            probe_command,
+                            timeout,
+                        ) {
+                            Ok(status) if status.success() => ProbeState::Ok {
+                                value: "ok".to_owned(),
+                            },
+                            Ok(status) => ProbeState::Fallback {
+                                value: format!("failed-exit-{}", status_code(status)),
+                                reason: "ssh-auth-command-failed".to_owned(),
+                            },
+                            Err(err) => ProbeState::Error { reason: err },
+                        }
+                    }
                 }
             }
         };
@@ -7692,7 +7777,7 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
         // produced `ssh_auth_state`, so a key loss carries a timestamp+hash
         // correlatable against run history. Read-only observation only.
         let authorized_keys_fingerprint =
-            if authorized_keys_fingerprint_supported(discovery_platform) {
+            if discovery_platform.is_some_and(authorized_keys_fingerprint_supported) {
                 live_ip
                     .as_deref()
                     .zip(ssh_user.as_deref())
@@ -7734,7 +7819,7 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
             live_ip_state,
             ProbeState::Ok { .. } | ProbeState::Fallback { .. }
         );
-        let ready = if discovery_platform == VmGuestPlatform::Windows {
+        let ready = if matches!(discovery_platform, Some(VmGuestPlatform::Windows)) {
             readiness.execution_ready
         } else {
             discover_local_utm_target_ready(
@@ -7761,19 +7846,25 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
         // keep their strict meaning; only the write-eligibility set is widened.
         let ip_observed = process_present && live_ip_known && authoritative_target_present;
         if ip_observed && inventory_match.is_some() {
-            ready_inventory_states.push(LocalUtmReadyState {
-                alias: inventory_alias.clone().unwrap_or_else(|| utm_name.clone()),
-                utm_name: utm_name.clone(),
-                process_present,
-                live_ip: live_ip.clone(),
-                ssh_port_status: ssh_port_status.clone(),
-                ssh_auth_status: match &ssh_auth_state {
-                    ProbeState::Ok { value } | ProbeState::Fallback { value, .. } => value.clone(),
-                    ProbeState::Missing { reason } | ProbeState::Error { reason } => reason.clone(),
-                },
-                authorized_keys_fingerprint: authorized_keys_fingerprint.clone(),
-                platform: discovery_platform,
-            });
+            if let Some(profile) = discovery_platform_profile.as_ref() {
+                ready_inventory_states.push(LocalUtmReadyState {
+                    alias: inventory_alias.clone().unwrap_or_else(|| utm_name.clone()),
+                    utm_name: utm_name.clone(),
+                    process_present,
+                    live_ip: live_ip.clone(),
+                    ssh_port_status: ssh_port_status.clone(),
+                    ssh_auth_status: match &ssh_auth_state {
+                        ProbeState::Ok { value } | ProbeState::Fallback { value, .. } => {
+                            value.clone()
+                        }
+                        ProbeState::Missing { reason } | ProbeState::Error { reason } => {
+                            reason.clone()
+                        }
+                    },
+                    authorized_keys_fingerprint: authorized_keys_fingerprint.clone(),
+                    platform: profile.platform,
+                });
+            }
         }
 
         entries.push(json!({
@@ -7794,7 +7885,9 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
             "inventory_mesh_ip": inventory_mesh_ip,
             "inventory_controller_bundle_path": inventory_controller_bundle_path,
             "inventory_controller_utm_name": inventory_controller_utm_name,
-            "platform": discovery_platform.as_str(),
+            "platform": discovery_platform
+                .map(|platform| platform.as_str())
+                .unwrap_or("unknown"),
             "live_ip": live_ip,
             "live_ip_source": live_ip_source,
             "ssh_target": authoritative_ssh_target.clone().or_else(|| advisory_ssh_target.clone()),
@@ -11368,7 +11461,7 @@ fn issue_macos_dns_zone_bundle(
         .node_id
         .as_deref()
         .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
-    let exit_target = remote_target_from_inventory_entry(exit_entry, None);
+    let exit_target = remote_target_from_inventory_entry(exit_entry, None)?;
 
     let linux_env = report_dir.join("state").join("issue_dns_zone.env");
     if !linux_env.is_file() {
@@ -11546,10 +11639,11 @@ fn run_macos_orchestration_stages(
                 .find(|e| e.alias == macos_alias)
                 .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
                 .clone();
-            if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+            let macos_entry_profile = macos_entry.platform_profile()?;
+            if macos_entry_profile.platform != VmGuestPlatform::Macos {
                 return Err(format!(
                     "alias {macos_alias} resolved to non-macOS platform: {}",
-                    macos_entry.platform_profile().platform.as_str()
+                    macos_entry_profile.platform.as_str()
                 ));
             }
             let node_id = macos_entry
@@ -11557,7 +11651,7 @@ fn run_macos_orchestration_stages(
                 .as_deref()
                 .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?;
             validate_mesh_node_id(node_id)?;
-            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            let target = remote_target_from_inventory_entry(&macos_entry, None)?;
             let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
 
             // Locate and upload the source archive prepared for Linux.
@@ -11764,7 +11858,7 @@ fn run_macos_orchestration_stages(
                 .find(|e| e.alias == macos_alias)
                 .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
                 .clone();
-            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            let target = remote_target_from_inventory_entry(&macos_entry, None)?;
             // The bootstrap script writes wireguard.pub as raw base64 WireGuard key.
             // To get hex: read pub file and convert via Python (python3 is present on
             // macOS). `wg pubkey` output is base64; we decode and hexlify.
@@ -11882,7 +11976,7 @@ fn run_macos_orchestration_stages(
                 .node_id
                 .as_deref()
                 .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
-            let exit_target = remote_target_from_inventory_entry(&exit_entry, None);
+            let exit_target = remote_target_from_inventory_entry(&exit_entry, None)?;
 
             // Guaranteed Some by the upstream collect step, but resolve with
             // `ok_or_else` instead of `unwrap()` so a future stage-ordering
@@ -12018,7 +12112,7 @@ fn run_macos_orchestration_stages(
                 .as_deref()
                 .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?
                 .to_owned();
-            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            let target = remote_target_from_inventory_entry(&macos_entry, None)?;
             let timeout = timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS);
 
             // Membership snapshot (from amend stage or report state).
@@ -12281,7 +12375,7 @@ fn run_macos_orchestration_stages(
                 .find(|e| e.alias == macos_alias)
                 .ok_or_else(|| format!("macOS alias {macos_alias:?} not found in inventory"))?
                 .clone();
-            let target = remote_target_from_inventory_entry(&macos_entry, None);
+            let target = remote_target_from_inventory_entry(&macos_entry, None)?;
             // Merge stderr (`2>&1`) so a daemon-down diagnostic is captured and
             // detected, not silently dropped; `|| true` keeps a non-zero
             // peer-list exit from being treated as an SSH transport failure.
@@ -14184,15 +14278,29 @@ pub(crate) struct RelayForwardTestTopology {
 pub(crate) fn select_relay_forward_test_topology(
     inventory: &[VmInventoryEntry],
 ) -> Result<RelayForwardTestTopology, String> {
-    let is_linux = |e: &&VmInventoryEntry| {
-        e.platform.unwrap_or(VmGuestPlatform::Linux) == VmGuestPlatform::Linux
-    };
+    // QH-82: positive allowlist — ONLY entries with an explicit recorded
+    // Linux platform are selectable. A platform-less entry is excluded (it
+    // can never be minted into a Linux node) and its alias is surfaced
+    // through the existing error paths below. Hard-erroring inside the
+    // filter would abort every legitimate mixed topology (the standard lab
+    // holds Linux plus macOS/Windows guests); exclusion instead lands the
+    // failure in the already-tested relay-miss / peer-count errors with the
+    // cause named. Selecting nothing here is correct: the unacceptable
+    // outcome was never "no selection", it was "a selection made from a
+    // guess".
+    let unknown_platform: Vec<&str> = inventory
+        .iter()
+        .filter(|e| e.platform.is_none())
+        .map(|e| e.alias.as_str())
+        .collect();
+    let is_linux = |e: &&VmInventoryEntry| matches!(e.platform, Some(VmGuestPlatform::Linux));
+    let exclusion_note = unknown_platform_exclusion_note(unknown_platform.as_slice());
 
     let relay_entry = inventory
         .iter()
         .filter(is_linux)
         .find(|e| e.relay_capable == Some(true))
-        .ok_or_else(|| "no relay_capable Linux node in inventory".to_owned())?;
+        .ok_or_else(|| format!("no relay_capable Linux node in inventory{exclusion_note}"))?;
 
     let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
         .iter()
@@ -14212,8 +14320,9 @@ pub(crate) fn select_relay_forward_test_topology(
 
     if peer_candidates.len() < 2 {
         return Err(format!(
-            "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found {}",
-            peer_candidates.len()
+            "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found {}{}",
+            peer_candidates.len(),
+            exclusion_note
         ));
     }
     let sender = peer_candidates[0];
@@ -14259,16 +14368,23 @@ pub(crate) fn select_relay_forward_test_topology_for_run(
     relay_alias: &str,
     run_aliases: &[String],
 ) -> Result<RelayForwardTestTopology, String> {
-    let is_linux = |e: &&VmInventoryEntry| {
-        e.platform.unwrap_or(VmGuestPlatform::Linux) == VmGuestPlatform::Linux
-    };
+    // Same positive-allowlist treatment as `select_relay_forward_test_topology`
+    // (QH-82): only explicitly-Linux entries are selectable, excluded
+    // unknown-platform aliases are named through the existing error paths.
+    let unknown_platform: Vec<&str> = inventory
+        .iter()
+        .filter(|e| e.platform.is_none())
+        .map(|e| e.alias.as_str())
+        .collect();
+    let is_linux = |e: &&VmInventoryEntry| matches!(e.platform, Some(VmGuestPlatform::Linux));
+    let exclusion_note = unknown_platform_exclusion_note(unknown_platform.as_slice());
 
     let relay_entry = inventory
         .iter()
         .filter(is_linux)
         .find(|e| e.alias == relay_alias)
         .ok_or_else(|| {
-            format!("assigned relay node {relay_alias} is not a Linux entry in the inventory")
+            format!("assigned relay node {relay_alias} is not a Linux entry in the inventory{exclusion_note}")
         })?;
 
     let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
@@ -14289,8 +14405,9 @@ pub(crate) fn select_relay_forward_test_topology_for_run(
 
     if peer_candidates.len() < 2 {
         return Err(format!(
-            "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found {}",
-            peer_candidates.len()
+            "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found {}{}",
+            peer_candidates.len(),
+            exclusion_note
         ));
     }
     let sender = peer_candidates[0];
@@ -14313,6 +14430,22 @@ pub(crate) fn select_relay_forward_test_topology_for_run(
         receiver_alias: receiver.alias.clone(),
         receiver_mesh_ip,
     })
+}
+
+/// Renders the excluded-unknown-platform suffix appended to the relay
+/// topology selection errors (QH-82). Empty when every entry has a recorded
+/// platform, so the existing error strings stay byte-identical in the normal
+/// case.
+fn unknown_platform_exclusion_note(unknown_platform: &[&str]) -> String {
+    if unknown_platform.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; excluded {} entries with no recorded platform: [{}]",
+            unknown_platform.len(),
+            unknown_platform.join(", ")
+        )
+    }
 }
 
 fn relay_forward_test_peer_rank(entry: &VmInventoryEntry) -> u8 {
@@ -14960,13 +15093,14 @@ fn exercise_macos_blind_exit_live(
         .find(|entry| entry.alias == macos_alias)
         .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
         .clone();
-    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+    let macos_entry_profile = macos_entry.platform_profile()?;
+    if macos_entry_profile.platform != VmGuestPlatform::Macos {
         return Err(format!(
             "alias {macos_alias} resolved to non-macOS platform: {}",
-            macos_entry.platform_profile().platform.as_str()
+            macos_entry_profile.platform.as_str()
         ));
     }
-    let target = remote_target_from_inventory_entry(&macos_entry, None);
+    let target = remote_target_from_inventory_entry(&macos_entry, None)?;
 
     // `role set blind_exit --accept-irreversible` is intentionally blocked by
     // the planner (TransitionKind::Irreversible → RequiresStagedTransition
@@ -15077,10 +15211,11 @@ fn exercise_macos_admin_issue_live(
         .find(|entry| entry.alias == macos_alias)
         .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
         .clone();
-    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+    let macos_entry_profile = macos_entry.platform_profile()?;
+    if macos_entry_profile.platform != VmGuestPlatform::Macos {
         return Err(format!(
             "alias {macos_alias} resolved to non-macOS platform: {}",
-            macos_entry.platform_profile().platform.as_str()
+            macos_entry_profile.platform.as_str()
         ));
     }
     let node_id = macos_entry
@@ -15089,7 +15224,7 @@ fn exercise_macos_admin_issue_live(
         .ok_or_else(|| format!("inventory entry for {macos_alias:?} has no node_id"))?
         .to_owned();
     validate_mesh_node_id(node_id.as_str())?;
-    let target = remote_target_from_inventory_entry(&macos_entry, None);
+    let target = remote_target_from_inventory_entry(&macos_entry, None)?;
 
     let peer_alias = default_inventory_alias_for_lab_roles(inventory_path, &["client"])?
         .ok_or_else(|| "macOS admin peer proof needs a Linux client in inventory".to_owned())?;
@@ -15098,10 +15233,11 @@ fn exercise_macos_admin_issue_live(
         .find(|entry| entry.alias == peer_alias)
         .ok_or_else(|| format!("Linux peer alias {peer_alias:?} not found in inventory"))?
         .clone();
-    if peer_entry.platform_profile().platform != VmGuestPlatform::Linux {
+    let peer_entry_profile = peer_entry.platform_profile()?;
+    if peer_entry_profile.platform != VmGuestPlatform::Linux {
         return Err(format!(
             "macOS admin peer proof needs Linux peer; {peer_alias} is {}",
-            peer_entry.platform_profile().platform.as_str()
+            peer_entry_profile.platform.as_str()
         ));
     }
     let peer_node_id = peer_entry
@@ -15110,7 +15246,7 @@ fn exercise_macos_admin_issue_live(
         .ok_or_else(|| format!("inventory entry for {peer_alias:?} has no node_id"))?
         .to_owned();
     validate_mesh_node_id(peer_node_id.as_str())?;
-    let peer_target = remote_target_from_inventory_entry(&peer_entry, None);
+    let peer_target = remote_target_from_inventory_entry(&peer_entry, None)?;
     let peer_pubkey_hex = collect_public_key_hex_for_target(
         &peer_target,
         Some(ssh_identity_file),
@@ -15334,13 +15470,14 @@ pub fn exercise_macos_role_transition_live(
         .find(|entry| entry.alias == macos_alias)
         .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
         .clone();
-    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+    let macos_entry_profile = macos_entry.platform_profile()?;
+    if macos_entry_profile.platform != VmGuestPlatform::Macos {
         return Err(format!(
             "alias {macos_alias} resolved to non-macOS platform: {}",
-            macos_entry.platform_profile().platform.as_str()
+            macos_entry_profile.platform.as_str()
         ));
     }
-    let target = remote_target_from_inventory_entry(&macos_entry, None);
+    let target = remote_target_from_inventory_entry(&macos_entry, None)?;
 
     let (before_peer_count, before_mesh_summary) = macos_mesh_peer_count(
         macos_alias,
@@ -15519,13 +15656,14 @@ pub fn exercise_macos_reboot_recovery_with_recovery_actions(
         .find(|entry| entry.alias == macos_alias)
         .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
         .clone();
-    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+    let macos_entry_profile = macos_entry.platform_profile()?;
+    if macos_entry_profile.platform != VmGuestPlatform::Macos {
         return Err(format!(
             "alias {macos_alias} resolved to non-macOS platform: {}",
-            macos_entry.platform_profile().platform.as_str()
+            macos_entry_profile.platform.as_str()
         ));
     }
-    let target = remote_target_from_inventory_entry(&macos_entry, None);
+    let target = remote_target_from_inventory_entry(&macos_entry, None)?;
 
     // 1. Pre-reboot evidence. A single capture proves the backup, its mode,
     //    and the live loopback pinning BEFORE anything is disturbed.
@@ -15942,10 +16080,11 @@ pub(crate) fn exercise_macos_anchor_port_mapping_authority_live(
         .find(|entry| entry.alias == macos_alias)
         .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
         .clone();
-    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+    let macos_entry_profile = macos_entry.platform_profile()?;
+    if macos_entry_profile.platform != VmGuestPlatform::Macos {
         return Err(format!(
             "alias {macos_alias} resolved to non-macOS platform: {}",
-            macos_entry.platform_profile().platform.as_str()
+            macos_entry_profile.platform.as_str()
         ));
     }
     validate_mesh_node_id(membership_node_id)?;
@@ -15995,13 +16134,14 @@ pub(crate) fn deploy_macos_anchor_profile(
         .find(|entry| entry.alias == macos_alias)
         .ok_or_else(|| format!("inventory entry for {macos_alias:?} not found"))?
         .clone();
-    if macos_entry.platform_profile().platform != VmGuestPlatform::Macos {
+    let macos_entry_profile = macos_entry.platform_profile()?;
+    if macos_entry_profile.platform != VmGuestPlatform::Macos {
         return Err(format!(
             "alias {macos_alias} resolved to non-macOS platform: {}",
-            macos_entry.platform_profile().platform.as_str()
+            macos_entry_profile.platform.as_str()
         ));
     }
-    let target = remote_target_from_inventory_entry(&macos_entry, None);
+    let target = remote_target_from_inventory_entry(&macos_entry, None)?;
 
     // The anchor profile is the SAME daemon as the client (com.rustynet.daemon)
     // plus the loopback bundle-pull listener (the plist comment says exactly
@@ -16370,10 +16510,11 @@ fn validate_windows_anchor_bundle_pull_plan_contract(
         .iter()
         .find(|entry| entry.alias == windows_alias)
         .ok_or_else(|| format!("inventory entry for {windows_alias:?} not found"))?;
-    if entry.platform_profile().platform != VmGuestPlatform::Windows {
+    let entry_profile = entry.platform_profile()?;
+    if entry_profile.platform != VmGuestPlatform::Windows {
         return Err(format!(
             "alias {windows_alias} resolved to non-Windows platform: {}",
-            entry.platform_profile().platform.as_str()
+            entry_profile.platform.as_str()
         ));
     }
     let node_id = entry
@@ -16558,10 +16699,11 @@ fn deploy_windows_anchor_service(
         .find(|entry| entry.alias == windows_alias)
         .ok_or_else(|| format!("inventory entry for {windows_alias:?} not found"))?
         .clone();
-    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+    let windows_entry_profile = windows_entry.platform_profile()?;
+    if windows_entry_profile.platform != VmGuestPlatform::Windows {
         return Err(format!(
             "alias {windows_alias} resolved to non-Windows platform: {}",
-            windows_entry.platform_profile().platform.as_str()
+            windows_entry_profile.platform.as_str()
         ));
     }
     let node_id = windows_entry
@@ -16570,7 +16712,7 @@ fn deploy_windows_anchor_service(
         .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?
         .to_owned();
     validate_mesh_node_id(node_id.as_str())?;
-    let target = remote_target_from_inventory_entry(&windows_entry, None);
+    let target = remote_target_from_inventory_entry(&windows_entry, None)?;
 
     // node_id is a validated mesh id (ASCII alnum + [-_.]); passed as a single
     // -NodeId argument, never interpolated into script text. The reviewed,
@@ -16686,10 +16828,11 @@ fn exercise_windows_anchor_bundle_pull_live(
         .find(|entry| entry.alias == windows_alias)
         .ok_or_else(|| format!("inventory entry for {windows_alias:?} not found"))?
         .clone();
-    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+    let windows_entry_profile = windows_entry.platform_profile()?;
+    if windows_entry_profile.platform != VmGuestPlatform::Windows {
         return Err(format!(
             "alias {windows_alias} resolved to non-Windows platform: {}",
-            windows_entry.platform_profile().platform.as_str()
+            windows_entry_profile.platform.as_str()
         ));
     }
     let node_id = windows_entry
@@ -16698,7 +16841,7 @@ fn exercise_windows_anchor_bundle_pull_live(
         .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?
         .to_owned();
     validate_mesh_node_id(node_id.as_str())?;
-    let target = remote_target_from_inventory_entry(&windows_entry, None);
+    let target = remote_target_from_inventory_entry(&windows_entry, None)?;
 
     std::fs::create_dir_all(report_dir)
         .map_err(|err| format!("create report dir {} failed: {err}", report_dir.display()))?;
@@ -19338,10 +19481,11 @@ fn exercise_windows_admin_issue_live(
         .find(|entry| entry.alias == windows_alias)
         .ok_or_else(|| format!("Windows alias {windows_alias:?} not found in inventory"))?
         .clone();
-    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+    let windows_entry_profile = windows_entry.platform_profile()?;
+    if windows_entry_profile.platform != VmGuestPlatform::Windows {
         return Err(format!(
             "alias {windows_alias} resolved to non-Windows platform: {}",
-            windows_entry.platform_profile().platform.as_str()
+            windows_entry_profile.platform.as_str()
         ));
     }
     let node_id = windows_entry
@@ -19350,7 +19494,7 @@ fn exercise_windows_admin_issue_live(
         .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?
         .to_owned();
     validate_mesh_node_id(node_id.as_str())?;
-    let target = remote_target_from_inventory_entry(&windows_entry, None);
+    let target = remote_target_from_inventory_entry(&windows_entry, None)?;
 
     // node_id is a validated mesh id; the work dir/passphrase/secret live under
     // the per-invocation TEMP dir and are removed after. The PS script
@@ -19423,13 +19567,14 @@ fn exercise_windows_role_transition_live(
         .find(|entry| entry.alias == windows_alias)
         .ok_or_else(|| format!("Windows alias {windows_alias:?} not found in inventory"))?
         .clone();
-    if windows_entry.platform_profile().platform != VmGuestPlatform::Windows {
+    let windows_entry_profile = windows_entry.platform_profile()?;
+    if windows_entry_profile.platform != VmGuestPlatform::Windows {
         return Err(format!(
             "alias {windows_alias} resolved to non-Windows platform: {}",
-            windows_entry.platform_profile().platform.as_str()
+            windows_entry_profile.platform.as_str()
         ));
     }
-    let target = remote_target_from_inventory_entry(&windows_entry, None);
+    let target = remote_target_from_inventory_entry(&windows_entry, None)?;
 
     let (before_peer_count, before_mesh_summary) = windows_mesh_peer_count(
         windows_alias,
@@ -23135,7 +23280,7 @@ fn amend_membership_for_windows_node(
         .as_deref()
         .ok_or_else(|| format!("inventory entry for {windows_alias:?} has no node_id"))?;
     validate_mesh_node_id(windows_node_id)?;
-    let windows_target = remote_target_from_inventory_entry(&windows_entry, None);
+    let windows_target = remote_target_from_inventory_entry(&windows_entry, None)?;
     let exit_entry = inventory
         .iter()
         .find(|e| e.alias == exit_alias)
@@ -23145,7 +23290,7 @@ fn amend_membership_for_windows_node(
         .node_id
         .as_deref()
         .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
-    let exit_target = remote_target_from_inventory_entry(&exit_entry, None);
+    let exit_target = remote_target_from_inventory_entry(&exit_entry, None)?;
 
     // Collect the Windows WireGuard public key (base64 on disk → hex).
     // The key file is written by the daemon at startup.
@@ -23262,7 +23407,7 @@ fn issue_assignment_for_windows_node(
         .node_id
         .as_deref()
         .ok_or_else(|| format!("inventory entry for {exit_alias:?} has no node_id"))?;
-    let exit_target = remote_target_from_inventory_entry(&exit_entry, None);
+    let exit_target = remote_target_from_inventory_entry(&exit_entry, None)?;
 
     // Read and parse the base assignment env produced by the Linux bash orchestrator.
     let base_env_path = report_dir.join("state").join("issue_assignments.env");
@@ -28086,7 +28231,7 @@ fn resolve_live_lab_profile_remote_target(
                     profile_target.role, utm_name
                 )
             })?;
-        let mut remote_target = remote_target_from_inventory_entry(entry, None);
+        let mut remote_target = remote_target_from_inventory_entry(entry, None)?;
         remote_target.label = profile_target.role.clone();
         if remote_target.ssh_user.is_none() {
             remote_target.ssh_user =
@@ -28105,7 +28250,7 @@ fn resolve_live_lab_profile_remote_target(
             .map(|candidate| candidate == profile_target.target)
             .unwrap_or(false)
     }) {
-        let mut remote_target = remote_target_from_inventory_entry(entry, None);
+        let mut remote_target = remote_target_from_inventory_entry(entry, None)?;
         remote_target.label = profile_target.role.clone();
         return Ok(remote_target);
     }
@@ -28846,7 +28991,10 @@ fn build_windows_utm_reason_codes(
 }
 
 struct UtmReadinessInputs<'a> {
-    platform: VmGuestPlatform,
+    /// `None` when the discovered VM's platform is un-inferable (QH-82): the
+    /// unknown guest takes the generic (non-Windows) readiness reason codes
+    /// and is never treated as a Windows node.
+    platform: Option<VmGuestPlatform>,
     process_state: &'a ProbeState<bool>,
     live_ip_state: &'a ProbeState<String>,
     ssh_port_state: &'a ProbeState<PortStatus>,
@@ -28869,7 +29017,7 @@ fn build_utm_readiness(inputs: UtmReadinessInputs<'_>) -> VmLabReadiness {
         inputs.ssh_auth_state,
         ProbeState::Ok { value } if value == "ok" || value == "ready"
     );
-    let reason_codes = if inputs.platform == VmGuestPlatform::Windows {
+    let reason_codes = if inputs.platform == Some(VmGuestPlatform::Windows) {
         build_windows_utm_reason_codes(
             inputs.process_state,
             inputs.live_ip_state,
@@ -30274,7 +30422,7 @@ pub fn execute_ops_vm_lab_issue_and_distribute_state(
             )
         })?;
     let authority_target =
-        remote_target_from_inventory_entry(&authority_entry, config.ssh_user.as_deref());
+        remote_target_from_inventory_entry(&authority_entry, config.ssh_user.as_deref())?;
 
     let artifact_dir =
         std::env::temp_dir().join(format!("rustynet-vm-lab-state-{}", unique_suffix()));
@@ -30403,7 +30551,7 @@ $SUDO rm -f {assignment_env} {traversal_env}",
             .cloned()
             .ok_or_else(|| format!("topology node missing from inventory: {}", node.alias))?;
         let target =
-            remote_target_from_inventory_entry(&inventory_entry, config.ssh_user.as_deref());
+            remote_target_from_inventory_entry(&inventory_entry, config.ssh_user.as_deref())?;
         let assignment_local =
             artifact_dir.join(format!("rn-assignment-{}.assignment", node.node_id));
         let traversal_local = artifact_dir.join(format!("rn-traversal-{}.traversal", node.node_id));
@@ -30655,7 +30803,7 @@ fn resolve_start_targets(
     let chosen = select_inventory_entries(&inventory, aliases, select_all)?;
     let mut results = Vec::new();
     for entry in chosen {
-        let platform_profile = entry.platform_profile();
+        let platform_profile = entry.platform_profile()?;
         let Some(controller) = entry.controller else {
             return Err(format!(
                 "VM alias {} does not declare a local start controller; only local UTM-backed entries can be started here",
@@ -31206,7 +31354,7 @@ fn resolve_remote_targets(
                 entry.ssh_target
             );
             if seen.insert(key) {
-                resolved.push(remote_target_from_inventory_entry(&entry, None));
+                resolved.push(remote_target_from_inventory_entry(&entry, None)?);
             }
         }
     }
@@ -31278,7 +31426,7 @@ fn resolve_role_target_from_inventory(
         entry.ssh_user.as_deref(),
         role_label,
     )?;
-    let platform_profile = entry.platform_profile();
+    let platform_profile = entry.platform_profile()?;
     let utm_name = entry
         .controller
         .as_ref()
@@ -31344,12 +31492,14 @@ fn normalized_ssh_target(
 fn remote_target_from_inventory_entry(
     entry: &VmInventoryEntry,
     ssh_user_override: Option<&str>,
-) -> RemoteTarget {
-    let platform_profile = entry.platform_profile();
+) -> Result<RemoteTarget, String> {
+    // QH-82: fails closed when the platform cannot be inferred; callers
+    // propagate the named error instead of receiving a Linux-dressed target.
+    let platform_profile = entry.platform_profile()?;
     let ssh_user = ssh_user_override
         .map(ToString::to_string)
         .or_else(|| entry.ssh_user.clone());
-    RemoteTarget {
+    Ok(RemoteTarget {
         label: entry.alias.clone(),
         ssh_target: resolved_inventory_ssh_target(entry),
         ssh_user: ssh_user.clone(),
@@ -31369,7 +31519,7 @@ fn remote_target_from_inventory_entry(
             .utm_staging_dir
             .clone()
             .or_else(|| default_utm_staging_dir_for_profile(platform_profile, ssh_user.as_deref())),
-    }
+    })
 }
 
 fn remote_target_from_raw_target(label: String, ssh_target: String) -> RemoteTarget {
@@ -37885,7 +38035,7 @@ fn build_nodes_spec(
             .find(|entry| entry.alias == node.alias)
             .cloned()
             .ok_or_else(|| format!("topology alias missing from inventory: {}", node.alias))?;
-        let target = remote_target_from_inventory_entry(&inventory_entry, ssh_user_override);
+        let target = remote_target_from_inventory_entry(&inventory_entry, ssh_user_override)?;
         let pubkey_hex = collect_public_key_hex_for_target(
             &target,
             ssh_identity_file,
@@ -38227,7 +38377,7 @@ fn ensure_suite_topology_linux_only(
                     node.alias
                 )
             })?;
-        let platform_profile = inventory_entry.platform_profile();
+        let platform_profile = inventory_entry.platform_profile()?;
         if platform_profile.platform != VmGuestPlatform::Linux {
             blocked.push(format!(
                 "role={} alias={} target={} platform={} remote_shell={} guest_exec_mode={} service_manager={}",
@@ -40720,7 +40870,10 @@ fn kept_after() {}\n\
             Some(r"C:\Rustynet")
         );
         assert_eq!(
-            inventory[0].platform_profile().platform,
+            inventory[0]
+                .platform_profile()
+                .expect("windows inventory entry must resolve")
+                .platform,
             VmGuestPlatform::Windows
         );
         cleanup_temp_inventory(path.as_path());
@@ -41274,6 +41427,7 @@ fn kept_after() {}\n\
   "entries": [
     {{
       "alias": "alpha",
+      "platform": "linux",
       "ssh_target": "alpha-host",
       "ssh_user": "debian",
       "node_id": "alpha-1",
@@ -41368,6 +41522,7 @@ fn kept_after() {}\n\
   "entries": [
     {{
       "alias": "alpha",
+      "platform": "linux",
       "ssh_target": "alpha-host",
       "ssh_user": "debian",
       "last_known_ip": "192.168.64.20",
@@ -43124,6 +43279,7 @@ fn kept_after() {}\n\
   "entries": [
     {{
       "alias": "alpha",
+      "platform": "linux",
       "ssh_target": "alpha-host.invalid",
       "ssh_user": "debian",
       "last_known_ip": "192.0.2.20",
@@ -43240,6 +43396,7 @@ fn kept_after() {}\n\
   "entries": [
     {{
       "alias": "alpha",
+      "platform": "linux",
       "ssh_target": "alpha-host",
       "ssh_user": "debian",
       "last_known_ip": "192.168.64.20",
@@ -43898,9 +44055,9 @@ directory = "vendor"
             r#"{
   "version": 1,
   "entries": [
-    {"alias": "exit-vm", "ssh_target": "debian@192.168.64.3", "lab_role": "exit", "network_group": "lan-a"},
-    {"alias": "client-vm", "ssh_target": "debian@192.168.64.4", "lab_role": "client", "network_group": "lan-a"},
-    {"alias": "aux-vm", "ssh_target": "debian@192.168.64.5", "lab_role": "aux", "network_group": "lan-a"}
+    {"alias": "exit-vm", "platform": "linux", "ssh_target": "debian@192.168.64.3", "lab_role": "exit", "network_group": "lan-a"},
+    {"alias": "client-vm", "platform": "linux", "ssh_target": "debian@192.168.64.4", "lab_role": "client", "network_group": "lan-a"},
+    {"alias": "aux-vm", "platform": "linux", "ssh_target": "debian@192.168.64.5", "lab_role": "aux", "network_group": "lan-a"}
   ]
 }"#,
         );
@@ -44151,7 +44308,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
     #[test]
     fn utm_readiness_requires_auth_for_execution_ready() {
         let readiness = build_utm_readiness(UtmReadinessInputs {
-            platform: VmGuestPlatform::Linux,
+            platform: Some(VmGuestPlatform::Linux),
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Ok {
                 value: "192.168.64.3".to_owned(),
@@ -44348,7 +44505,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
     #[test]
     fn windows_utm_readiness_classifies_precise_access_ladder() {
         let readiness = build_utm_readiness(UtmReadinessInputs {
-            platform: VmGuestPlatform::Windows,
+            platform: Some(VmGuestPlatform::Windows),
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Fallback {
                 value: "192.168.64.14".to_owned(),
@@ -44395,7 +44552,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
     #[test]
     fn windows_utm_readiness_classifies_auth_timeout_and_host_key_gap() {
         let readiness = build_utm_readiness(UtmReadinessInputs {
-            platform: VmGuestPlatform::Windows,
+            platform: Some(VmGuestPlatform::Windows),
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Ok {
                 value: "192.168.64.14".to_owned(),
@@ -44433,7 +44590,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
     #[test]
     fn windows_utm_readiness_requires_ssh_for_execution_ready() {
         let readiness = build_utm_readiness(UtmReadinessInputs {
-            platform: VmGuestPlatform::Windows,
+            platform: Some(VmGuestPlatform::Windows),
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Ok {
                 value: "192.168.64.14".to_owned(),
@@ -44470,7 +44627,7 @@ validate_baseline_runtime\thard\tfail\t1\t{}/logs/validate_baseline_runtime.log\
     #[test]
     fn windows_utm_readiness_keeps_host_transport_reason_when_guest_ssh_is_ready() {
         let readiness = build_utm_readiness(UtmReadinessInputs {
-            platform: VmGuestPlatform::Windows,
+            platform: Some(VmGuestPlatform::Windows),
             process_state: &ProbeState::Ok { value: true },
             live_ip_state: &ProbeState::Ok {
                 value: "192.168.64.14".to_owned(),
