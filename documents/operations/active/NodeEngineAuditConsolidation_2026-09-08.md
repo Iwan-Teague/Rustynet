@@ -145,7 +145,11 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    depends on QH-83 landing first (same runner seam).
 7. **C: I1, I3, I4** small fixes (GLM-flash), then the `PlatformCapabilities`
    table (L) after QH-82.
-8. **D: pattern G parity** on the four Linux evaluators (GLM-flash, S).
+8. **D: pattern G parity** — DONE (this commit): `evaluate_linux_runtime_acls_report`,
+   `evaluate_linux_key_custody_report`, `evaluate_macos_key_custody_report`,
+   `evaluate_macos_service_hardening_report` now reject `overall_ok=true`
+   when a row or `drift_reasons` disagrees, as the Windows siblings do;
+   one test per evaluator (`evaluators_reject_overall_ok_true_when_rows_disagree`).
 9. **B4, B5** (S/M). B2 done (see item 2).
 
 ## 4) Method notes
