@@ -124,7 +124,9 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
 1. **PF-05 wiring** — `phase10.rs` macOS `assert_killswitch` calls
    `evaluate_macos_killswitch_rules` on the captured anchor rules; negative
    test with a `pass out quick all` above the terminator; ledger row corrected
-   (DONE → the real commit). Manager. **In progress.**
+   (DONE → the real commit). Manager. **DONE `ee3ffdd8`**; the Linux-gated
+   scripted-helper test was executed on lenovo-bot (1 passed) because the
+   harness is `#[cfg(target_os = "linux")]`.
 2. **B3 blind_exit NAT probe** — DONE `07cfb057` (QH-86): judges the
    rustynet nft tables for the blind_exit forward rules and rejects any
    masquerade; macOS reads the blind_exit anchor and requires the exit NAT
