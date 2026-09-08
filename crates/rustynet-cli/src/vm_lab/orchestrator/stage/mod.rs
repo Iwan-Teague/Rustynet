@@ -133,8 +133,42 @@ pub enum StageSuite {
     Cleanup,
 }
 
+/// QH-83 evidence-on-pass: the on-disk witness a stage MUST have written for
+/// a `Passed` verdict to stand. The wrapper in
+/// `orchestrator::runner::StateMachineRunner` checks the declaration after
+/// `execute` returns `Passed` and demotes the verdict to
+/// `StageOutcome::NotProven` when the witness is absent or empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StageEvidence {
+    /// The stage's own log (`logs/<id>.log`) must exist and be non-empty
+    /// after trimming. Use only for stages that genuinely append
+    /// stage-scoped evidence lines during `execute` via
+    /// `append_stage_evidence_line`.
+    StageLog,
+    /// A stage-declared data artifact, relative to the run's report
+    /// directory. Malformed declarations (empty, absolute, or
+    /// parent-escaping) are rejected at plan validation
+    /// (`StateMachineRunner::new`), never silently honored.
+    File(&'static str),
+    /// Explicit named opt-out for stages whose contract genuinely produces
+    /// no on-disk witness. The reason string is recorded in the plan
+    /// artifact so audits can distinguish a deliberate, reviewable opt-out
+    /// from an unreviewed default.
+    None { reason: &'static str },
+}
+
+/// Phase-1 placeholder reason carried by stages whose pass-verdict witness
+/// is not yet declared. Each such declaration is upgraded (usually to
+/// `File(...)`) in the per-suite QH-83 evidence batches tracked in
+/// `QualityHardeningTodo_2026-07-25.md`.
+pub const PHASE1_EVIDENCE_PENDING: &str = "phase-1 declaration: no on-disk witness is verified behind this verdict yet";
+
+/// Teardown opt-out reason: residue-removal stages are release-critical and
+/// must never be blocked by the evidence-on-pass check.
+pub const TEARDOWN_EVIDENCE_OPT_OUT: &str = "teardown opt-out: residue removal is release-critical and must not be blocked by the evidence-on-pass check";
+
 macro_rules! define_stage_catalog {
-    ($($variant:ident => $name:literal @ $suite:ident / $tier:ident),+ $(,)?) => {
+    ($($variant:ident => $name:literal @ $suite:ident / $tier:ident / $evidence:expr),+ $(,)?) => {
         #[derive(Debug, Clone, PartialEq, Eq, Hash)]
         pub enum StageId { $($variant),+ }
 
@@ -164,117 +198,131 @@ macro_rules! define_stage_catalog {
                 use crate::live_lab_stage_registry::Tier;
                 match self { $(StageId::$variant => Tier::$tier),+ }
             }
+
+            /// QH-83 evidence-on-pass declaration for this stage — the
+            /// on-disk witness a `Passed` verdict requires. The evidence
+            /// token is a REQUIRED part of every catalog row — a row
+            /// without one fails to parse — so this map is total over
+            /// `StageId` by construction: the 82nd stage forces its own
+            /// conscious witness-or-opt-out decision at the catalog row,
+            /// with the compiler as the totality gate. Purely additive
+            /// metadata: verdicts stay owned by each stage's `execute`.
+            pub fn evidence(&self) -> StageEvidence {
+                match self { $(StageId::$variant => $evidence),+ }
+            }
         }
     };
 }
 
 // Single authority for the typed ID, canonical pipeline order, wire name,
-// suite membership (RNQ-16), and acceptance tier (A1). Row shape:
-// `Variant => "wire_name" @ Suite / Tier`. Tier calls that involve judgment
-// carry a one-line comment on the row so a reviewer can check the call.
+// suite membership (RNQ-16), acceptance tier (A1), and QH-83 evidence
+// declaration. Row shape: `Variant => "wire_name" @ Suite / Tier / Evidence`.
+// Tier calls that involve judgment carry a one-line comment on the row so a
+// reviewer can check the call; evidence declarations other than
+// PHASE1_EVIDENCE_PENDING carry one too.
 define_stage_catalog! {
-    Preflight => "preflight" @ Setup / T0Core,
-    PrepareSourceArchive => "prepare_source_archive" @ Setup / T0Core,
-    VerifySshReachability => "verify_ssh_reachability" @ Setup / T0Core,
-    CleanupHosts => "cleanup_hosts" @ Setup / T0Core,
-    BootstrapHosts => "bootstrap_hosts" @ Setup / T0Core,
+    Preflight => "preflight" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    PrepareSourceArchive => "prepare_source_archive" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    VerifySshReachability => "verify_ssh_reachability" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CleanupHosts => "cleanup_hosts" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    BootstrapHosts => "bootstrap_hosts" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // TOPOLOGY-LEVEL substrate seam (spec §0.5, 2026-08-27): must run BEFORE
     // collect_pubkeys so overlay addresses — not raw cross-LAN-unroutable
     // underlay IPs — are what land in ctx.endpoints. A no-op pass unless an
     // overlay-provisioning substrate (vxlan) is selected. Substrate
     // correctness is T0 like the nat_classification/matrix rows below.
-    CrossNetworkSubstrateSetup => "cross_network_substrate_setup" @ Setup / T0Core,
-    CollectPubkeys => "collect_pubkeys" @ Setup / T0Core,
-    MembershipInit => "membership_init" @ Setup / T0Core,
-    DistributeMembership => "distribute_membership" @ Setup / T0Core,
-    AnchorValidation => "anchor_validation" @ Setup / T1Role,
-    AdminIssue => "admin_issue" @ Setup / T1Role,
-    DistributeAssignments => "distribute_assignments" @ Setup / T0Core,
-    DistributeTraversal => "distribute_traversal" @ Setup / T0Core,
-    DistributeDnsZone => "distribute_dns_zone" @ Setup / T0Core,
-    EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup / T0Core,
+    CrossNetworkSubstrateSetup => "cross_network_substrate_setup" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CollectPubkeys => "collect_pubkeys" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    MembershipInit => "membership_init" @ Setup / T0Core / StageEvidence::StageLog,
+    DistributeMembership => "distribute_membership" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    AnchorValidation => "anchor_validation" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    AdminIssue => "admin_issue" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    DistributeAssignments => "distribute_assignments" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    DistributeTraversal => "distribute_traversal" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    DistributeDnsZone => "distribute_dns_zone" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // blind_exit ACTIVATES the blind_exit role posture (role capability),
     // not baseline plumbing — T1 like the other role-lifecycle stages.
-    BlindExit => "blind_exit" @ Setup / T1Role,
-    ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup / T0Core,
-    SecurityAuditValidation => "security_audit_validation" @ Live / T4Security,
-    DnsFailclosedValidation => "dns_failclosed_validation" @ Live / T4Security,
+    BlindExit => "blind_exit" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    SecurityAuditValidation => "security_audit_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    DnsFailclosedValidation => "dns_failclosed_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Live default-deny ACL enforcement — a wrong GREEN is fail-open, so
     // security tier rather than core plumbing.
-    RuntimeAclsValidation => "runtime_acls_validation" @ Live / T4Security,
-    ServiceHardeningValidation => "service_hardening_validation" @ Live / T4Security,
-    KeyCustodyValidation => "key_custody_validation" @ Live / T4Security,
+    RuntimeAclsValidation => "runtime_acls_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ServiceHardeningValidation => "service_hardening_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    KeyCustodyValidation => "key_custody_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Mesh-status self-check: peers visible, no stale state — core mesh
     // health / reachability evidence, not a role capability.
-    MeshStatusValidation => "mesh_status_validation" @ Live / T0Core,
+    MeshStatusValidation => "mesh_status_validation" @ Live / T0Core / StageEvidence::StageLog,
     // Gossip peer convergence: registered, accepting signed bundles, no
     // unknown-source rejections. Core mesh health like mesh_status, not a role
     // capability — a wrong GREEN here means the epidemic is silently dead.
-    GossipConvergenceValidation => "gossip_convergence_validation" @ Live / T0Core,
+    GossipConvergenceValidation => "gossip_convergence_validation" @ Live / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Windows binary-signing (Authenticode) verification — binary-trust
     // control, so security tier.
-    AuthenticodeValidation => "authenticode_validation" @ Live / T4Security,
-    Ipv6LeakValidation => "ipv6_leak_validation" @ Live / T4Security,
-    DeployRelayService => "deploy_relay_service" @ Live / T1Role,
-    RelayValidation => "relay_validation" @ Live / T1Role,
-    TrafficTestMatrix => "traffic_test_matrix" @ Live / T0Core,
+    AuthenticodeValidation => "authenticode_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    Ipv6LeakValidation => "ipv6_leak_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    DeployRelayService => "deploy_relay_service" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    RelayValidation => "relay_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    TrafficTestMatrix => "traffic_test_matrix" @ Live / T0Core / StageEvidence::File("logs/traffic_test_matrix.pair_results.log"),
     // Live role-transition matrix (admin<->client flips) — role-capability
     // lifecycle; the cross-OS half is the bash-dialect cross_os_role_switch
     // aggregate, not this stage.
-    RoleSwitchMatrix => "role_switch_matrix" @ Live / T1Role,
-    ExitHandoff => "exit_handoff" @ Live / T1Role,
-    ActiveExit => "active_exit" @ Live / T1Role,
+    RoleSwitchMatrix => "role_switch_matrix" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ExitHandoff => "exit_handoff" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ActiveExit => "active_exit" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Spec §3 places the EXIT-scoped dns-failclosed inside the exit role's
     // T1 list ("exit→NAT+handoff+dns-failclosed+demotion-residue"); the
     // standalone dns_failclosed_validation above is the T4 family member.
-    ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role,
-    ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role,
-    ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role,
-    BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role,
-    LiveAnchor => "live_anchor" @ Live / T1Role,
+    ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveAnchor => "live_anchor" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // MAC-D3: macOS anchor validators, previously registry-only (bash era).
     // Wire names match the legacy registry vocabulary so run-matrix evidence
     // stays comparable. Gated Live: skipped-with-reason unless the macOS
     // anchor validators are elected (--anchor-platform macos) and a macOS
     // anchor node is assigned.
-    MacosAnchorProfileDeploy => "deploy_macos_anchor_profile" @ Live / T1Role,
-    MacosAnchorBundlePullValidation => "validate_macos_anchor_bundle_pull" @ Live / T1Role,
-    MacosAnchorPortMappingAuthorityValidation => "validate_macos_anchor_port_mapping_authority" @ Live / T1Role,
+    MacosAnchorProfileDeploy => "deploy_macos_anchor_profile" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    MacosAnchorBundlePullValidation => "validate_macos_anchor_bundle_pull" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    MacosAnchorPortMappingAuthorityValidation => "validate_macos_anchor_port_mapping_authority" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // C6: live macOS role-transition validator, previously the legacy
     // vm_lab hub block `validate_macos_role_transition` that never
     // dispatched under the Rust engine (W5.7). Wire name matches the
     // legacy registry vocabulary so run-matrix evidence stays comparable.
     // Gated Live: skipped-with-reason unless the run elects macOS for
     // role transition (--role-switch-platform macos).
-    MacosRoleTransitionValidation => "validate_macos_role_transition" @ Live / T1Role,
-    LiveTwoHopValidation => "live_two_hop_validation" @ Live / T1Role,
-    LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role,
-    LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience,
-    LiveRebootRecoveryValidation => "live_reboot_recovery_validation" @ Live / T2Resilience,
+    MacosRoleTransitionValidation => "validate_macos_role_transition" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveTwoHopValidation => "live_two_hop_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveRebootRecoveryValidation => "live_reboot_recovery_validation" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // C7: live macOS reboot-with-protection validator
     // (MacosDnsBackupRebootSurvivalPlan_2026-09-02.md). Wire name matches the
     // registry vocabulary so run-matrix evidence stays comparable. Gated
     // Live: skipped-with-reason unless the run elects macOS for reboot
     // recovery (--reboot-platform macos).
-    MacosRebootRecoveryValidation => "validate_macos_reboot_recovery" @ Live / T2Resilience,
-    LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation" @ Live / T4Security,
-    LiveKeyCustodyValidation => "live_key_custody_validation" @ Live / T4Security,
+    MacosRebootRecoveryValidation => "validate_macos_reboot_recovery" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveKeyCustodyValidation => "live_key_custody_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Daemon killed MID-enrollment, then trust state must be consistent
     // (token consumed ⟺ member) — restart/fault-recovery family; the
     // anchor's enrollment-SERVING capability is live_anchor's T1 scope.
-    LiveEnrollmentRestartValidation => "live_enrollment_restart_validation" @ Live / T2Resilience,
+    LiveEnrollmentRestartValidation => "live_enrollment_restart_validation" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Asserts the killswitch + blind-exit posture HOLD through LAN-access
     // toggling — the map's "killswitch" T4 family member. Its registry spec
     // feeds the `cross_os_lan_toggle` schema column, the same cell the
     // bash-dialect `live_lan_toggle` wrapper historically fed.
-    LiveLanToggleValidation => "live_lan_toggle_validation" @ Live / T4Security,
+    LiveLanToggleValidation => "live_lan_toggle_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Requires Linux+macOS+Windows ALL present (skips otherwise) and proves
     // one signed membership view + fresh WireGuard handshakes across the
     // three OSes — the `--node` dialect's carrier of cross-OS
     // membership-convergence + peer-visibility coverage today.
-    LiveMixedTopologyValidation => "live_mixed_topology_validation" @ Live / T3CrossOs,
+    LiveMixedTopologyValidation => "live_mixed_topology_validation" @ Live / T3CrossOs / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // HELLO-flood rate-limiter adversarial probe (DOS-1) — security tier.
-    LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation" @ Live / T4Security,
+    LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // HP-3 relay-frame-forwarding opt-in proof: asserts the relay actually
     // FORWARDS ciphertext between two peers (not just accepts registrations)
     // by blocking direct peer↔peer nft paths and routing a counter-probe
@@ -288,59 +336,59 @@ define_stage_catalog! {
     // TRAVERSAL_TTL_SECS stay as configured; this stage never lengthens
     // them). Gated by the same --enable-relay-forwarding-validation flag;
     // skipped (fail-closed) otherwise. Role-capability proof: T1.
-    RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role,
-    RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role,
-    LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience,
+    RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Cross-NETWORK ≠ cross-OS: this suite exercises NAT/netns traversal
     // between simulated networks (spec §3 has no cross-network tier), so
     // each stage tiers by its SUBJECT — substrate correctness (T0), role
     // capability reached across networks (T1), roaming/failover (T2),
     // adversarial (T4) — never T3CrossOs.
-    CrossNetworkPreflight => "cross_network_preflight" @ CrossNetwork / T0Core,
-    CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit" @ CrossNetwork / T1Role,
-    CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch" @ CrossNetwork / T2Resilience,
-    CrossNetworkRelayRemoteExit => "cross_network_relay_remote_exit" @ CrossNetwork / T1Role,
-    CrossNetworkFailbackRoaming => "cross_network_failback_roaming" @ CrossNetwork / T2Resilience,
-    CrossNetworkControllerSwitch => "cross_network_controller_switch" @ CrossNetwork / T2Resilience,
-    CrossNetworkTraversalAdversarial => "cross_network_traversal_adversarial" @ CrossNetwork / T4Security,
-    CrossNetworkRemoteExitDns => "cross_network_remote_exit_dns" @ CrossNetwork / T1Role,
-    CrossNetworkRemoteExitSoak => "cross_network_remote_exit_soak" @ CrossNetwork / T2Resilience,
+    CrossNetworkPreflight => "cross_network_preflight" @ CrossNetwork / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit" @ CrossNetwork / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkRelayRemoteExit => "cross_network_relay_remote_exit" @ CrossNetwork / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkFailbackRoaming => "cross_network_failback_roaming" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkControllerSwitch => "cross_network_controller_switch" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkTraversalAdversarial => "cross_network_traversal_adversarial" @ CrossNetwork / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkRemoteExitDns => "cross_network_remote_exit_dns" @ CrossNetwork / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkRemoteExitSoak => "cross_network_remote_exit_soak" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // NAT classification/matrix validate the traversal SUBSTRATE every
     // cross-network capability rests on (not a role, not a disturbance) —
     // core-correctness tier.
-    CrossNetworkNatClassification => "cross_network_nat_classification" @ CrossNetwork / T0Core,
-    CrossNetworkNatMatrix => "cross_network_nat_matrix" @ CrossNetwork / T0Core,
+    CrossNetworkNatClassification => "cross_network_nat_classification" @ CrossNetwork / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkNatMatrix => "cross_network_nat_matrix" @ CrossNetwork / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // The chaos suite splits by SUBJECT: adversarial-input stages targeting
     // trust/security controls are T4 (spec §3 T4 is "as tagged in the map";
     // chaos_privileged_boundary IS the map's privileged-helper-allowlist
     // member); fault/impairment stages are T2 (spec §3 T2 lists "chaos").
     // Clock rollback vs freshness/anti-replay protection — adversarial.
-    ChaosClockAttack => "chaos_clock_attack" @ Chaos / T4Security,
-    ChaosCrashRecovery => "chaos_crash_recovery" @ Chaos / T2Resilience,
-    ChaosDaemonFault => "chaos_daemon_fault" @ Chaos / T2Resilience,
-    ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont" @ Chaos / T2Resilience,
-    ChaosMembershipAdversarial => "chaos_membership_adversarial" @ Chaos / T4Security,
-    ChaosNetworkImpairment => "chaos_network_impairment" @ Chaos / T2Resilience,
-    ChaosPrivilegedBoundary => "chaos_privileged_boundary" @ Chaos / T4Security,
+    ChaosClockAttack => "chaos_clock_attack" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosCrashRecovery => "chaos_crash_recovery" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosDaemonFault => "chaos_daemon_fault" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosMembershipAdversarial => "chaos_membership_adversarial" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosNetworkImpairment => "chaos_network_impairment" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosPrivilegedBoundary => "chaos_privileged_boundary" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Resource exhaustion = availability disturbance + recovery, closer to
     // impairment than to a trust-control bypass — resilience tier.
-    ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos / T2Resilience,
-    ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos / T4Security,
+    ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // T5 negative-control / adjudication suite (spec §3-T5 / §5) — the four
     // injected-fault controls, each of which PASSES iff its targeted operation
     // fails for the specific named reason (the inversion). All T5NegativeControl
     // by definition; opt-in, out of the default plan (like chaos). Impl +
     // adjudication in `stage/negative_control.rs`.
-    NegativeControlSignedBundleRejection => "negative_control_signed_bundle_rejection" @ NegativeControl / T5NegativeControl,
-    NegativeControlPlantedResidue => "negative_control_planted_residue" @ NegativeControl / T5NegativeControl,
-    NegativeControlWrongNodeSubstitution => "negative_control_wrong_node_substitution" @ NegativeControl / T5NegativeControl,
-    NegativeControlDaemonKillMidStage => "negative_control_daemon_kill_mid_stage" @ NegativeControl / T5NegativeControl,
+    NegativeControlSignedBundleRejection => "negative_control_signed_bundle_rejection" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    NegativeControlPlantedResidue => "negative_control_planted_residue" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    NegativeControlWrongNodeSubstitution => "negative_control_wrong_node_substitution" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    NegativeControlDaemonKillMidStage => "negative_control_daemon_kill_mid_stage" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Always-run overlay teardown (FinalCleanupStage pattern): vxlan link
     // residue on a guest is release-blocking exactly like exit-NAT residue,
     // so this must survive skip-cascade and run just before cleanup.
-    CrossNetworkSubstrateTeardown => "cross_network_substrate_teardown" @ Cleanup / T0Core,
+    CrossNetworkSubstrateTeardown => "cross_network_substrate_teardown" @ Cleanup / T0Core / StageEvidence::None { reason: TEARDOWN_EVIDENCE_OPT_OUT },
     // Clean teardown, residue-asserted — named in spec §3's T0 list.
-    Cleanup => "cleanup" @ Cleanup / T0Core,
+    Cleanup => "cleanup" @ Cleanup / T0Core / StageEvidence::None { reason: TEARDOWN_EVIDENCE_OPT_OUT },
 }
 
 impl std::fmt::Display for StageId {
