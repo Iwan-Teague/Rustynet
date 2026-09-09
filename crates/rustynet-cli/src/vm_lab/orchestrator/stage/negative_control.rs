@@ -233,7 +233,19 @@ impl OrchestrationStage for NegativeControlPlantedResidueStage {
                  (fail closed)"
             ));
         };
-        planted_residue::run_planted_residue_control(&dir, &target, adapter.as_ref())
+        let outcome = planted_residue::run_planted_residue_control(&dir, &target, adapter.as_ref());
+        // QH-83: witness the inversion exactly on the pass verdict — the pass
+        // arm is `DetectedNamingPlant`, so a witness line appended here records
+        // the sabotage-plant + clean-assert-detection inversion with the real
+        // target alias. A witness write failure fails the control.
+        if matches!(outcome, StageOutcome::Passed) {
+            if let Err(err) = write_planted_residue_witness(&ctx.report_dir, &target) {
+                return StageOutcome::Failed(format!(
+                    "planted-residue negative control: witness write failed: {err}"
+                ));
+            }
+        }
+        outcome
     }
 }
 
@@ -276,6 +288,23 @@ impl OrchestrationStage for NegativeControlDaemonKillMidStageStage {
 /// Per-control scratch directory under the run's report dir.
 fn control_workdir(ctx: &OrchestrationContext, stage_name: &str) -> PathBuf {
     ctx.report_dir.join("negative_control").join(stage_name)
+}
+
+/// QH-83: the planted-residue control's on-disk pass witness. No single
+/// `write_control_evidence` artifact covers BOTH the sabotage (the planted
+/// nft table) and its detection (the adapter's clean-assert rejecting that
+/// state while naming the plant), so the pass verdict appends one stage-log
+/// line recording the inversion instead of declaring a partial File witness.
+fn write_planted_residue_witness(report_dir: &Path, target: &str) -> Result<(), String> {
+    crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(
+        report_dir,
+        StageId::NegativeControlPlantedResidue.as_str(),
+        &format!(
+            "negative_control=planted_residue target={target} \
+             sabotage=nft_table_inet_rustynet_planted \
+             detection=clean_assert_rejected_planted_state_naming_the_plant teardown=verified"
+        ),
+    )
 }
 
 // ── Live-guest control target selection (shared by (a) and (c)) ─────────────
@@ -2873,6 +2902,109 @@ mod tests {
             assert!(deps.is_empty());
             assert_eq!(fanout, StageFanout::Once);
         }
+    }
+
+    #[test]
+    fn negative_control_inversion_witnesses_are_declared_and_unique() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+        use std::collections::HashSet;
+
+        // The three controls with a single inversion-record transcript declare
+        // that transcript as their File witness; the names must stay in sync
+        // with the writers inside the control modules.
+        assert_eq!(
+            signed_bundle::SIGNED_BUNDLE_TRANSCRIPT_FILE,
+            "verifier_transcript.json"
+        );
+        assert_eq!(
+            signed_bundle::WRONG_NODE_TRANSCRIPT_FILE,
+            "wrong_node_transcript.json"
+        );
+        let expected = [
+            (
+                NegativeControlSignedBundleRejectionStage.id(),
+                "negative_control/negative_control_signed_bundle_rejection/verifier_transcript.json",
+            ),
+            (
+                NegativeControlWrongNodeSubstitutionStage.id(),
+                "negative_control/negative_control_wrong_node_substitution/wrong_node_transcript.json",
+            ),
+            (
+                NegativeControlDaemonKillMidStageStage.id(),
+                "negative_control/negative_control_daemon_kill_mid_stage/kill_window_transcript.txt",
+            ),
+        ];
+        let mut declared: HashSet<String> = HashSet::new();
+        for (id, expected_path) in expected {
+            match id.evidence() {
+                StageEvidence::File(relative) => {
+                    assert_eq!(relative, expected_path);
+                    assert!(declared.insert(relative.to_owned()));
+                }
+                other => panic!(
+                    "stage {} must declare its transcript witness, got {other:?}",
+                    id.as_str()
+                ),
+            }
+        }
+        // planted_residue has no single inversion artifact — it is the
+        // stage-log witness row.
+        assert_eq!(
+            StageId::NegativeControlPlantedResidue.evidence(),
+            StageEvidence::StageLog
+        );
+        assert_eq!(declared.len(), 3);
+    }
+
+    fn planted_witness_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "planted_residue_witness_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn planted_residue_witness_line_names_control_target_and_detection() {
+        let dir = planted_witness_temp_dir("content");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_planted_residue_witness(&dir, "linux-x86-exit-1")
+            .expect("the planted-residue witness must append");
+        let log_path = crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+            &dir,
+            StageId::NegativeControlPlantedResidue.as_str(),
+        );
+        let contents = std::fs::read_to_string(&log_path).unwrap();
+        assert!(
+            contents.contains("negative_control=planted_residue"),
+            "{contents}"
+        );
+        assert!(contents.contains("target=linux-x86-exit-1"), "{contents}");
+        assert!(
+            contents.contains("sabotage=nft_table_inet_rustynet_planted"),
+            "{contents}"
+        );
+        assert!(
+            contents.contains("detection=clean_assert_rejected_planted_state_naming_the_plant"),
+            "{contents}"
+        );
+        assert!(contents.contains("teardown=verified"), "{contents}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn planted_residue_witness_write_failure_is_propagated() {
+        // A regular file used as the report dir makes the stage-log append
+        // fail, and the control must see that error instead of passing.
+        let blocker = planted_witness_temp_dir("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let err = write_planted_residue_witness(&blocker, "linux-x86-exit-1")
+            .expect_err("a witness write failure must propagate");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_file(&blocker);
     }
 
     // ── (a) planted-residue adjudication ─────────────────────────────────────
