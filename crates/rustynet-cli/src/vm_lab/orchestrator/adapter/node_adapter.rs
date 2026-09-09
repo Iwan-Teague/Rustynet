@@ -2,8 +2,6 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::vm_lab::DaemonProbeOp;
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{
     AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
@@ -13,6 +11,8 @@ use crate::vm_lab::orchestrator::error::{
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+use crate::vm_lab::DaemonProbeOp;
+use crate::vm_lab::VmGuestPlatform;
 
 /// Extract the daemon's own failure reason from a tail of its `rustynetd.log`,
 /// so a stage failure can report the *cause* (e.g. a fail-closed membership
@@ -296,6 +296,21 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         expected_dns_posture: Option<&str>,
     ) -> Result<(), AdapterError> {
         run_typed_role_validator(self, kind, expected_node_id, expected_dns_posture)
+    }
+
+    /// Run the Linux authenticode validator and return the daemon's RAW report
+    /// JSON on success. The Linux authenticode producer is a known
+    /// non-attesting stub (`applicable: false, overall_ok: true`, zero I/O), so
+    /// the authenticode stage must capture the raw report as evidence and
+    /// report a skip — never a Passed outcome minted from a constant. The §4.7
+    /// node-identity challenge runs first, exactly as in
+    /// [`Self::run_role_validator`]. Linux-only: every other platform fails
+    /// closed with `UnsupportedPlatform`.
+    fn run_linux_authenticode_validator_with_report(
+        &self,
+        expected_node_id: Option<&str>,
+    ) -> Result<String, AdapterError> {
+        run_linux_authenticode_report_validator(self, expected_node_id)
     }
 
     fn supports_role_validator(&self, kind: RoleValidatorKind) -> bool {
@@ -681,6 +696,43 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
     result.map_err(|message| AdapterError::Protocol { message })
 }
 
+/// Shared implementation of
+/// [`NodeAdapter::run_linux_authenticode_validator_with_report`]: identity
+/// challenge first, then the Linux raw-report wrapper. Non-Linux platforms
+/// fail closed — the raw-capture path exists only for the Linux non-attesting
+/// stub, whose pass must surface as a stage skip.
+fn run_linux_authenticode_report_validator<T: NodeAdapter + ?Sized>(
+    adapter: &T,
+    expected_node_id: Option<&str>,
+) -> Result<String, AdapterError> {
+    use crate::vm_lab::orchestrator::role_validation::authenticode;
+    let platform = adapter.platform();
+    if platform != VmGuestPlatform::Linux {
+        return Err(AdapterError::UnsupportedPlatform {
+            platform,
+            message: "raw authenticode report capture is only implemented for the Linux \
+                      non-attesting stub"
+                .to_owned(),
+        });
+    }
+    let shell = adapter.shell_host()?;
+    let alias = adapter.alias();
+    enforce_identity_challenge(
+        adapter.collect_live_identity(),
+        expected_node_id,
+        RoleValidatorKind::Authenticode,
+        alias,
+    )?;
+    authenticode::validate_linux_authenticode_report(
+        &*shell,
+        crate::vm_lab::LINUX_RUSTYNETD_PATH,
+        alias,
+    )
+    .map_err(|message| AdapterError::Protocol {
+        message: format!("authenticode report validation on {alias:?}: {message}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::extract_daemon_failure_reason;
@@ -747,7 +799,7 @@ mod tests {
 
     // ── §4.7 identity-challenge gate (the wiring in run_typed_role_validator) ──
 
-    use super::{RoleValidatorKind, enforce_identity_challenge};
+    use super::{enforce_identity_challenge, RoleValidatorKind};
     use crate::vm_lab::orchestrator::error::AdapterError;
     use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
 
@@ -824,14 +876,12 @@ mod tests {
     fn challenge_gate_admits_matching_live_identity() {
         // The positive control: a live self-report matching the expected id
         // passes the gate, so the validator's own check proceeds.
-        assert!(
-            enforce_identity_challenge(
-                Ok(IdentityEvidence::live("real-node")),
-                Some("real-node"),
-                RoleValidatorKind::ServiceHardening,
-                "deb-1",
-            )
-            .is_ok()
-        );
+        assert!(enforce_identity_challenge(
+            Ok(IdentityEvidence::live("real-node")),
+            Some("real-node"),
+            RoleValidatorKind::ServiceHardening,
+            "deb-1",
+        )
+        .is_ok());
     }
 }
