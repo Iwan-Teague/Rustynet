@@ -83,7 +83,15 @@ Fixes applied before merge:
   unwitnessed fixtures. Every test now gets its own report dir and the
   fixtures that assert a Setup pass write the declared witness.
 
-Still declared `None { reason: PHASE1_EVIDENCE_PENDING }` in the Setup phase:
-anchor_validation and validate_baseline_runtime (next batch). Flag-day check:
-a live 2-node Linux run on lenovo-bot after the merge, before any evidence
-claim is made against the new declarations.
+Second half (same day, job `edit-1788967408531-2246-0`, flash review
+MERGE-SAFE, one NIT applied — anchor_validation grades first and witnesses
+exactly the `Passed` verdict): anchor_validation now appends one
+`anchor_validated=yes alias=… validated=…` line per validated anchor (its
+reported-skips note write is fatal too) and validate_baseline_runtime appends
+`validated_nodes=N (aliases)`. Every Setup row now declares a real witness;
+none is left on `PHASE1_EVIDENCE_PENDING`. Reviewer's blast-radius note: the
+reuse seal now binds the two new stage logs, so report dirs sealed by a
+pre-batch binary are refused for `--run-only`/`--resume-from`/`--rerun-stage`
+— fail-closed; start a fresh run. Flag-day check: a live 2-node Linux run on
+lenovo-bot after each merge, before any evidence claim is made against the
+new declarations.
