@@ -36,11 +36,38 @@ pub(crate) struct BundleWitnessEntry {
     pub install_dst: String,
 }
 
-/// The report-dir-relative witness path for a bundle kind — the single
-/// spelling shared by the writer and the catalog's `StageEvidence::File`
-/// declarations.
-pub(crate) fn bundle_evidence_relative_path(kind: &BundleKind) -> String {
-    format!("logs/distribute_{kind}.bundle_evidence.json")
+/// Which stage is writing the witness. The runner deletes a stage's declared
+/// File witness at `stage_started`, so two stages must never share one path:
+/// `refresh_signed_bundles` re-distributing traversal mid-run would otherwise
+/// erase `distribute_traversal`'s pass witness (and a failed refresh would
+/// leave the run unsealable). Each scope owns its own file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BundleWitnessScope<'a> {
+    /// The Setup-phase `distribute_*` stages: the full-fleet generation.
+    Setup,
+    /// `refresh_signed_bundles`: the HP-3 re-mint of traversal + dns-zone.
+    Refresh,
+    /// A single-alias redistribution (macOS reboot recovery); the artifact is
+    /// alias-qualified so it never overwrites the Setup generation's record.
+    Scoped { alias: &'a str },
+}
+
+/// The report-dir-relative witness path for a bundle kind under `scope` —
+/// the single spelling shared by the writer and the catalog's
+/// `StageEvidence::File` declarations.
+pub(crate) fn bundle_evidence_relative_path(
+    kind: &BundleKind,
+    scope: BundleWitnessScope,
+) -> String {
+    match scope {
+        BundleWitnessScope::Setup => format!("logs/distribute_{kind}.bundle_evidence.json"),
+        BundleWitnessScope::Refresh => {
+            format!("logs/refresh_signed_bundles.{kind}.bundle_evidence.json")
+        }
+        BundleWitnessScope::Scoped { alias } => {
+            format!("logs/distribute_{kind}.scoped.{alias}.bundle_evidence.json")
+        }
+    }
 }
 
 /// Write the per-kind bundle-distribution witness to the report directory.
@@ -48,6 +75,7 @@ pub(crate) fn bundle_evidence_relative_path(kind: &BundleKind) -> String {
 pub(crate) fn write_bundle_evidence(
     report_dir: &std::path::Path,
     kind: &BundleKind,
+    scope: BundleWitnessScope,
     entries: &[BundleWitnessEntry],
 ) -> Result<(), String> {
     let body = serde_json::json!({
@@ -67,7 +95,7 @@ pub(crate) fn write_bundle_evidence(
     });
     let text = serde_json::to_vec_pretty(&body)
         .map_err(|err| format!("serialize {kind} bundle evidence: {err}"))?;
-    let path = report_dir.join(bundle_evidence_relative_path(kind));
+    let path = report_dir.join(bundle_evidence_relative_path(kind, scope));
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|err| format!("create bundle evidence dir {}: {err}", parent.display()))?;
@@ -134,6 +162,7 @@ mod tests {
         write_bundle_evidence(
             &dir,
             &BundleKind::Traversal,
+            BundleWitnessScope::Setup,
             &[entry(
                 "client-1",
                 "node-abc",
@@ -142,7 +171,10 @@ mod tests {
         )
         .expect("witness write");
 
-        let path = dir.join(bundle_evidence_relative_path(&BundleKind::Traversal));
+        let path = dir.join(bundle_evidence_relative_path(
+            &BundleKind::Traversal,
+            BundleWitnessScope::Setup,
+        ));
         let text = std::fs::read_to_string(&path).expect("witness readable");
         assert!(text.contains("\"kind\": \"traversal\""), "{text}");
         assert!(text.contains("\"alias\": \"client-1\""), "{text}");
@@ -171,6 +203,7 @@ mod tests {
         let err = write_bundle_evidence(
             &blocker,
             &BundleKind::Assignment,
+            BundleWitnessScope::Setup,
             &[entry(
                 "client-1",
                 "node-abc",
@@ -188,22 +221,58 @@ mod tests {
     /// disagree (the `dns-zone` vs `dns_zone` divergence class).
     #[test]
     fn evidence_path_follows_the_kind_wire_spelling() {
+        let setup = BundleWitnessScope::Setup;
         assert_eq!(
-            bundle_evidence_relative_path(&BundleKind::Membership),
+            bundle_evidence_relative_path(&BundleKind::Membership, setup),
             "logs/distribute_membership.bundle_evidence.json"
         );
         assert_eq!(
-            bundle_evidence_relative_path(&BundleKind::Assignment),
+            bundle_evidence_relative_path(&BundleKind::Assignment, setup),
             "logs/distribute_assignment.bundle_evidence.json"
         );
         assert_eq!(
-            bundle_evidence_relative_path(&BundleKind::Traversal),
+            bundle_evidence_relative_path(&BundleKind::Traversal, setup),
             "logs/distribute_traversal.bundle_evidence.json"
         );
         assert_eq!(
-            bundle_evidence_relative_path(&BundleKind::DnsZone),
+            bundle_evidence_relative_path(&BundleKind::DnsZone, setup),
             "logs/distribute_dns-zone.bundle_evidence.json"
         );
+    }
+
+    /// Every scope owns a distinct file per kind: the runner's clear-at-start
+    /// of one stage's witness must never be able to erase another's. The
+    /// refresh spelling is the one the `RefreshSignedBundles` catalog row
+    /// declares.
+    #[test]
+    fn each_witness_scope_owns_a_distinct_path() {
+        assert_eq!(
+            bundle_evidence_relative_path(&BundleKind::Traversal, BundleWitnessScope::Refresh),
+            "logs/refresh_signed_bundles.traversal.bundle_evidence.json"
+        );
+        assert_eq!(
+            bundle_evidence_relative_path(&BundleKind::DnsZone, BundleWitnessScope::Refresh),
+            "logs/refresh_signed_bundles.dns-zone.bundle_evidence.json"
+        );
+        assert_eq!(
+            bundle_evidence_relative_path(
+                &BundleKind::Traversal,
+                BundleWitnessScope::Scoped {
+                    alias: "macos-utm-1"
+                }
+            ),
+            "logs/distribute_traversal.scoped.macos-utm-1.bundle_evidence.json"
+        );
+        let mut all = std::collections::BTreeSet::new();
+        for kind in [BundleKind::Traversal, BundleKind::DnsZone] {
+            for scope in [
+                BundleWitnessScope::Setup,
+                BundleWitnessScope::Refresh,
+                BundleWitnessScope::Scoped { alias: "n1" },
+            ] {
+                assert!(all.insert(bundle_evidence_relative_path(&kind, scope)));
+            }
+        }
     }
 
     /// The install destination comes from the same table the adapter's

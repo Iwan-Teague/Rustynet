@@ -239,6 +239,33 @@ pub(crate) fn distribute_bundle_kind(
         max_parallel_node_workers,
         shutdown_flag,
         None,
+        super::bundle_evidence::BundleWitnessScope::Setup,
+    )
+}
+
+/// `refresh_signed_bundles` variant of [`distribute_bundle_kind`]: the same
+/// full-fleet distribution, but the witness lands under the refresh stage's
+/// own path so the runner's clear-at-start of THIS stage's witness cannot
+/// erase the Setup-phase `distribute_traversal` / `distribute_dns_zone`
+/// records (and a failed refresh leaves those records intact and the run
+/// sealable).
+pub(crate) fn distribute_bundle_kind_for_refresh(
+    ctx: &mut OrchestrationContext,
+    kind: BundleKind,
+    file_prefix: &str,
+    file_ext: &str,
+    max_parallel_node_workers: usize,
+    shutdown_flag: &std::sync::atomic::AtomicBool,
+) -> StageOutcome {
+    distribute_bundle_kind_inner(
+        ctx,
+        kind,
+        file_prefix,
+        file_ext,
+        max_parallel_node_workers,
+        shutdown_flag,
+        None,
+        super::bundle_evidence::BundleWitnessScope::Refresh,
     )
 }
 
@@ -268,9 +295,11 @@ pub(crate) fn distribute_bundle_kind_scoped(
         max_parallel_node_workers,
         shutdown_flag,
         Some(scope_alias),
+        super::bundle_evidence::BundleWitnessScope::Scoped { alias: scope_alias },
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn distribute_bundle_kind_inner(
     ctx: &mut OrchestrationContext,
     kind: BundleKind,
@@ -279,6 +308,7 @@ fn distribute_bundle_kind_inner(
     max_parallel_node_workers: usize,
     shutdown_flag: &std::sync::atomic::AtomicBool,
     scope_alias: Option<&str>,
+    witness_scope: super::bundle_evidence::BundleWitnessScope<'_>,
 ) -> StageOutcome {
     let exit_alias = match ctx.assignments.iter().find(|a| a.role == NodeRole::Exit) {
         Some(a) => a.alias.clone(),
@@ -404,6 +434,7 @@ fn distribute_bundle_kind_inner(
         match super::bundle_evidence::write_bundle_evidence(
             &ctx.report_dir,
             &kind,
+            witness_scope,
             &witness_entries,
         ) {
             Ok(()) => StageOutcome::Passed,

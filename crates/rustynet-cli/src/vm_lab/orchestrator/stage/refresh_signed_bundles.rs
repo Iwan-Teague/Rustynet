@@ -59,9 +59,9 @@ impl OrchestrationStage for RefreshSignedBundlesStage {
         }
         use crate::vm_lab::orchestrator::stage::distribute_assignments::{
             DNS_ZONE_BUNDLE_FILE_EXT, DNS_ZONE_BUNDLE_FILE_PREFIX, TRAVERSAL_BUNDLE_FILE_EXT,
-            TRAVERSAL_BUNDLE_FILE_PREFIX, distribute_bundle_kind,
+            TRAVERSAL_BUNDLE_FILE_PREFIX, distribute_bundle_kind_for_refresh,
         };
-        let traversal = distribute_bundle_kind(
+        let traversal = distribute_bundle_kind_for_refresh(
             ctx,
             BundleKind::Traversal,
             TRAVERSAL_BUNDLE_FILE_PREFIX,
@@ -75,7 +75,7 @@ impl OrchestrationStage for RefreshSignedBundlesStage {
         if let StageOutcome::Failed(_) = traversal {
             return traversal;
         }
-        let dns_zone = distribute_bundle_kind(
+        let dns_zone = distribute_bundle_kind_for_refresh(
             ctx,
             BundleKind::DnsZone,
             DNS_ZONE_BUNDLE_FILE_PREFIX,
@@ -87,7 +87,7 @@ impl OrchestrationStage for RefreshSignedBundlesStage {
             return dns_zone;
         }
         // NOTE: no Skipped arm on dns_zone (or traversal) by design —
-        // distribute_bundle_kind only ever returns Passed or Failed (a
+        // distribute_bundle_kind_for_refresh only ever returns Passed or Failed (a
         // missing exit node is Failed, never Skipped), so a Skipped outcome
         // here would be unreachable defensive code.
         traversal
