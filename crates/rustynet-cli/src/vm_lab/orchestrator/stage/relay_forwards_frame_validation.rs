@@ -77,12 +77,17 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
             .map(|a| a.alias.clone())
             .collect();
 
-        // No Relay nodes in this lab → nothing to prove. Skip-noop
-        // (`Skipped`, never `Passed`) so the run goes Partial and the gap
-        // stays visible — the stage was not exercised.
+        // This stage is operator-elected (`--enable-relay-forwarding-validation`,
+        // Disruptive suite): the topology cannot supply the elected proof is a
+        // FAILED stage, never a skip — the same rule the topology pre-check
+        // below enforces. A skip here would dissolve the operator's explicit
+        // election into a non-blocking Partial and leave the Disruptive cell
+        // silently unexercised (skip-semantics review F2).
         if relay_aliases.is_empty() {
-            return StageOutcome::Skipped(
-                "no node in this topology is assigned the relay role".to_owned(),
+            return StageOutcome::Failed(
+                "relay forwarding validation was elected (--enable-relay-forwarding-validation) \
+                 but no node in this topology is assigned the relay role"
+                    .to_owned(),
             );
         }
         // The fanout is Once, so exactly one relay is expected; more than
@@ -272,17 +277,26 @@ mod tests {
         assert_eq!(stage.applies_to_roles(), &[NodeRole::Relay]);
     }
 
+    /// An operator-elected proof with no relay node in the topology must FAIL,
+    /// never skip: the stage only reaches the plan via
+    /// `--enable-relay-forwarding-validation`, so reaching this arm means the
+    /// election was made and the topology cannot satisfy it — the stage's own
+    /// unsatisfiable-election rule (skip-semantics review F2). Mutation caught:
+    /// reverting this arm to `StageOutcome::Skipped` (the
+    /// elected-proof-silent-skip mutation).
     #[test]
-    fn no_relay_role_skips_skip_noop() {
+    fn elected_frame_forwarding_without_relay_node_fails_never_skips() {
         let mut ctx = empty_ctx();
-        assert!(
-            matches!(
-                RelayForwardsFrameValidationStage.execute(&mut ctx),
-                StageOutcome::Skipped(_)
-            ),
-            "expected a skip; got {:?}",
-            RelayForwardsFrameValidationStage.execute(&mut ctx)
-        );
+        ctx.relay_forwarding_validation_elected = true;
+        match RelayForwardsFrameValidationStage.execute(&mut ctx) {
+            StageOutcome::Failed(msg) => {
+                assert!(
+                    msg.contains("elected") && msg.contains("relay role"),
+                    "failure must name the election and the missing relay role; got: {msg}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     #[test]

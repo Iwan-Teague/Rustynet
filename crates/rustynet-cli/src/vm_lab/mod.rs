@@ -39772,6 +39772,166 @@ fn kept_after() {}\n\
         );
     }
 
+    /// Source tripwire for the vacuous-pass class (skip-semantics review
+    /// NodeEngineSkipSemanticsReview_2026-09-09 F1): an `is_empty()` guard whose
+    /// body returns `StageOutcome::Passed` validates zero nodes yet records a
+    /// green ledger row — the "pass by construction" false green. The honest
+    /// arms return `Skipped(...)` (nothing was validated; the run stays
+    /// Partial) or `Failed(...)` (an operator-elected proof the topology
+    /// cannot supply). ZERO allowlist: after the F1 fixes no such guard may
+    /// exist anywhere under `orchestrator/stage/`, including nested
+    /// scenario modules.
+    ///
+    /// Heuristic by design: it flags a `.is_empty()` condition line whose
+    /// brace scope (tracked by brace counting) contains a
+    /// `return StageOutcome::Passed` before the scope closes. Expression-form
+    /// `StageOutcome::Passed` (the `outcome_for` helpers' final arm) is not a
+    /// guard return and is not matched; guards of other shapes
+    /// (`is_some()`, `let ... else`) were reviewed and are out of scope —
+    /// this gate pins exactly the class the review found.
+    fn scan_for_vacuous_pass_guards(dir: &Path) -> (usize, Vec<String>) {
+        // Recursive walk, fail-closed on unreadable entries (B2 precedent):
+        // a flat read_dir skipped cross_network/scenario/ once already, and a
+        // silently-skipped unreadable file is fail-open for a gate.
+        fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap_or_else(|err| {
+                panic!("tripwire scan root {} must read: {err}", dir.display())
+            }) {
+                let path = entry.expect("tripwire scan dir entry must read").path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut sources = Vec::new();
+        collect_rs_files(dir, &mut sources);
+        sources.sort();
+        let mut offenders = Vec::new();
+        for path in &sources {
+            let body = fs::read_to_string(path).unwrap_or_else(|err| {
+                panic!(
+                    "tripwire-scanned source {} must read: {err}",
+                    path.display()
+                )
+            });
+            let lines: Vec<&str> = body.lines().collect();
+            for (idx, line) in lines.iter().enumerate() {
+                if !line.contains("is_empty()") {
+                    continue;
+                }
+                let line_no = idx + 1;
+                // Same-line form: `if x.is_empty() { return StageOutcome::Passed; }`
+                if line.contains("return StageOutcome::Passed") {
+                    offenders.push(format!("{}:{line_no}", path.display()));
+                    continue;
+                }
+                let mut depth = line.matches('{').count() as i64 - line.matches('}').count() as i64;
+                let mut probe = idx + 1;
+                while probe < lines.len() && depth > 0 {
+                    let candidate = lines[probe];
+                    if candidate.contains("return StageOutcome::Passed") {
+                        offenders.push(format!("{}:{line_no}", path.display()));
+                        break;
+                    }
+                    depth += candidate.matches('{').count() as i64
+                        - candidate.matches('}').count() as i64;
+                    probe += 1;
+                }
+            }
+        }
+        (sources.len(), offenders)
+    }
+
+    /// The stage tree must contain no `is_empty()` guard whose body returns
+    /// `StageOutcome::Passed` (review F1's vacuous-pass class). Zero
+    /// allowlist — a new occurrence fails here at CI time, not in a live
+    /// ledger.
+    #[test]
+    fn stage_sources_have_no_is_empty_guard_returning_passed() {
+        let stage_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vm_lab/orchestrator/stage");
+        let (files_scanned, offenders) = scan_for_vacuous_pass_guards(&stage_dir);
+        // Exact pin, not a floor (the bin-launcher precedent): a floor with
+        // slack absorbs files losing their scan coverage silently. Measured
+        // 2026-09-09: 88 stage sources. Bump this number deliberately when a
+        // stage source is added or removed.
+        assert_eq!(
+            files_scanned, 88,
+            "expected exactly 88 stage sources under the scan root; found \
+             {files_scanned} — the tree moved, or the walk went blind. Re-measure \
+             and pin the new count on purpose."
+        );
+        assert!(
+            offenders.is_empty(),
+            "vacuous-pass guards in the stage tree: an `is_empty()` arm returning \
+             `StageOutcome::Passed` validates zero nodes yet records a green ledger \
+             row (review F1). Return `Skipped(...)` — nothing was validated — or \
+             `Failed(...)` for an operator-elected proof the topology cannot \
+             supply:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// Self-proof of the tripwire (the scanner's own blindness is the failure
+    /// mode of a gate that scans source): a fixture carrying the vacuous-pass
+    /// pattern — at the scan root AND in a nested subdirectory — must be
+    /// flagged, and an honest `Skipped` fixture must not be. Mutation caught:
+    /// the walk degrading to a flat `read_dir` (the nested fixture goes
+    /// unflagged), or the needle losing the pattern (both fixtures go
+    /// unflagged / the count assertion fires).
+    #[test]
+    fn vacuous_pass_tripwire_flags_a_fixture_including_subdirectories() {
+        let root = std::env::temp_dir().join(format!(
+            "rn-vacuous-pass-tripwire-{}",
+            crate::vm_lab::unique_suffix()
+        ));
+        std::fs::create_dir_all(root.join("nested/deep")).expect("fixture dirs");
+        let vacuous = "\
+fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+    let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+    if aliases.is_empty() {
+        return StageOutcome::Passed;
+    }
+    StageOutcome::Skipped(\"nothing validated\".to_owned())
+}
+";
+        let honest = "\
+fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+    if ctx.assignments.is_empty() {
+        return StageOutcome::Skipped(\"nothing validated\".to_owned());
+    }
+    StageOutcome::Passed
+}
+";
+        std::fs::write(root.join("root_stage.rs"), vacuous).expect("fixture write");
+        std::fs::write(root.join("nested/deep/deep_stage.rs"), vacuous).expect("fixture write");
+        std::fs::write(root.join("honest_stage.rs"), honest).expect("fixture write");
+
+        let (files_scanned, offenders) = scan_for_vacuous_pass_guards(&root);
+
+        assert_eq!(
+            files_scanned, 3,
+            "the walk must see every fixture file, including the nested one"
+        );
+        assert_eq!(
+            offenders.len(),
+            2,
+            "both vacuous fixtures must be flagged and the honest one must not: {offenders:#?}"
+        );
+        assert!(
+            offenders.iter().any(|o| o.contains("root_stage.rs:3")),
+            "the root fixture's vacuous guard must be flagged: {offenders:#?}"
+        );
+        assert!(
+            offenders.iter().any(|o| o.contains("deep_stage.rs:3")),
+            "the scanner must walk subdirectories; a flat read_dir misses the \
+             nested fixture: {offenders:#?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     pub(super) fn cleanup_temp_inventory(path: &Path) {
         if let Some(parent) = path.parent() {
             // Same fail-closed guard as cleanup_temp_path: every current
@@ -53565,6 +53725,201 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         let err = super::validate_rust_native_reuse_evidence(&tmp, &[StageId::Preflight])
             .expect_err("tamper must fail");
         assert!(err.contains("digest mismatch"), "{err}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Audit F3 fixture: a passing run whose plan includes a `File`-witness
+    /// stage (traffic_test_matrix), sealed for reuse.
+    fn reuse_fixture_with_file_witness(
+        tmp: &Path,
+        witness_bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use super::orchestrator::error::StageOutcome;
+        use super::orchestrator::runner::StageObserver;
+        use super::orchestrator::stage::StageId;
+
+        fs::create_dir_all(tmp.join("state"))?;
+        super::write_rust_native_report_state_initial(tmp, "working-tree", None)?;
+        let mut active = std::collections::HashSet::new();
+        active.insert(StageId::Preflight.as_str().to_owned());
+        active.insert(StageId::TrafficTestMatrix.as_str().to_owned());
+        let manifest = crate::live_lab_stage_manifest::build_stage_manifest(
+            "test",
+            "live_suite",
+            &crate::live_lab_stage_registry::TargetSelectors::default(),
+            &active,
+        );
+        crate::live_lab_stage_manifest::write_stage_manifest(tmp, &manifest)?;
+        fs::write(
+            tmp.join("state/orchestration_context.json"),
+            b"bound-context",
+        )?;
+        fs::create_dir_all(tmp.join("logs"))?;
+        fs::write(
+            tmp.join("logs/traffic_test_matrix.pair_results.log"),
+            witness_bytes,
+        )?;
+        let recorder = super::RustNativeStageRecorder {
+            report_dir: tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+            errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
+        };
+        for id in [StageId::Preflight, StageId::TrafficTestMatrix] {
+            recorder.stage_started(&id);
+            recorder.stage_finished(&id, &StageOutcome::Passed);
+        }
+        assert!(recorder.take_errors().is_empty());
+        super::write_rust_native_report_state_final(
+            tmp,
+            true,
+            "working-tree",
+            None,
+            false,
+            true,
+            true,
+        )?;
+        super::write_rust_native_reuse_evidence_seal(tmp)?;
+        Ok(())
+    }
+
+    /// Review of runner-edge F3: a planned `File`-declared stage that was
+    /// reported-SKIPPED leaves no witness by contract; the seal must not
+    /// demand one. Mutation caught: hashing witnesses for every planned
+    /// stage regardless of status (the seal write then fails on the absent
+    /// artifact and no skip-run is ever reusable).
+    #[test]
+    fn a_skipped_file_declared_stage_needs_no_witness_in_the_reuse_seal() {
+        use super::orchestrator::error::StageOutcome;
+        use super::orchestrator::runner::StageObserver;
+        use super::orchestrator::stage::StageId;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-skip-{}.dir",
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(tmp.join("state")).expect("state dir");
+        super::write_rust_native_report_state_initial(&tmp, "working-tree", None)
+            .expect("initial state");
+        let mut active = std::collections::HashSet::new();
+        active.insert(StageId::Preflight.as_str().to_owned());
+        active.insert(StageId::TrafficTestMatrix.as_str().to_owned());
+        let manifest = crate::live_lab_stage_manifest::build_stage_manifest(
+            "test",
+            "live_suite",
+            &crate::live_lab_stage_registry::TargetSelectors::default(),
+            &active,
+        );
+        crate::live_lab_stage_manifest::write_stage_manifest(&tmp, &manifest).expect("manifest");
+        fs::write(
+            tmp.join("state/orchestration_context.json"),
+            b"bound-context",
+        )
+        .expect("context");
+        let recorder = super::RustNativeStageRecorder {
+            report_dir: &tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+            errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
+        };
+        recorder.stage_started(&StageId::Preflight);
+        recorder.stage_finished(&StageId::Preflight, &StageOutcome::Passed);
+        recorder.stage_finished(
+            &StageId::TrafficTestMatrix,
+            &StageOutcome::Skipped("no mesh peers in this topology".to_owned()),
+        );
+        assert!(recorder.take_errors().is_empty());
+        super::write_rust_native_report_state_final(
+            &tmp,
+            true,
+            "working-tree",
+            None,
+            false,
+            true,
+            true,
+        )
+        .expect("final state");
+        // No logs/traffic_test_matrix.pair_results.log exists — by contract.
+        super::write_rust_native_reuse_evidence_seal(&tmp)
+            .expect("a skipped File-declared stage must not block the seal");
+        super::validate_rust_native_reuse_evidence(&tmp, &[StageId::Preflight])
+            .expect("reusing the passed stage must validate");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tampering_a_declared_file_witness_fails_reuse_validation() {
+        // Audit F3 mutation target: a digest that does NOT hash the declared
+        // File witnesses would still match the seal after the rewrite below,
+        // and this test would fail.
+        use super::orchestrator::stage::StageId;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-tamper-{}.dir",
+            super::unique_suffix()
+        ));
+        let tmp = PathBuf::from(&tmp);
+        reuse_fixture_with_file_witness(&tmp, b"pair results v1").expect("fixture");
+        super::validate_rust_native_reuse_evidence(
+            &tmp,
+            &[StageId::Preflight, StageId::TrafficTestMatrix],
+        )
+        .expect("sealed evidence");
+
+        fs::write(
+            tmp.join("logs/traffic_test_matrix.pair_results.log"),
+            b"tampered",
+        )
+        .expect("tamper witness");
+        let err = super::validate_rust_native_reuse_evidence(
+            &tmp,
+            &[StageId::Preflight, StageId::TrafficTestMatrix],
+        )
+        .expect_err("witness tamper must fail");
+        assert!(err.contains("digest mismatch"), "{err}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn reuse_validation_rejects_missing_or_empty_declared_witness() {
+        // Audit F3 mutation target: dropping the witness presence check (or
+        // its emptiness arm) from validate_rust_native_reuse_evidence would
+        // let a prior run replay a pass whose proof vanished or was never
+        // written, and these assertions would fail.
+        use super::orchestrator::stage::StageId;
+
+        let ids = &[StageId::Preflight, StageId::TrafficTestMatrix];
+
+        // (a) witness deleted after sealing: the seal's own digest recompute
+        // must fail on the absent artifact.
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-missing-{}.dir",
+            super::unique_suffix()
+        ));
+        let tmp = PathBuf::from(&tmp);
+        reuse_fixture_with_file_witness(&tmp, b"pair results").expect("fixture");
+        fs::remove_file(tmp.join("logs/traffic_test_matrix.pair_results.log")).expect("remove");
+        let err = super::validate_rust_native_reuse_evidence(&tmp, ids)
+            .expect_err("missing witness must fail");
+        // The per-stage witness presence check trips before the seal's
+        // digest recompute — both would fail; the message names the file.
+        assert!(
+            err.contains("declared witness") && err.contains("unreadable"),
+            "{err}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+
+        // (b) witness present but whitespace-only: accepted bytes, refused
+        // by the emptiness arm.
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-empty-{}.dir",
+            super::unique_suffix()
+        ));
+        let tmp = PathBuf::from(&tmp);
+        reuse_fixture_with_file_witness(&tmp, b"  \n\t ").expect("fixture");
+        let err = super::validate_rust_native_reuse_evidence(&tmp, ids)
+            .expect_err("empty witness must fail");
+        assert!(err.contains("is empty"), "{err}");
         fs::remove_dir_all(&tmp).ok();
     }
 
