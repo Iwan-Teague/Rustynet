@@ -1031,9 +1031,8 @@ fn write_file_atomic(path: &Path, body: &str, what: &str) -> Result<(), String> 
         os.push(".tmp");
         PathBuf::from(os)
     };
-    fs::write(tmp_path.as_path(), body).map_err(|err| {
-        format!("write {what} tmp failed ({}): {err}", tmp_path.display())
-    })?;
+    fs::write(tmp_path.as_path(), body)
+        .map_err(|err| format!("write {what} tmp failed ({}): {err}", tmp_path.display()))?;
     fs::rename(tmp_path.as_path(), path)
         .map_err(|err| format!("replace {what} failed ({}): {err}", path.display()))
 }
@@ -6680,9 +6679,7 @@ mod conclusion_barrier_tests {
     fn sabotage_tmp_write(path: &std::path::Path) {
         fs::create_dir_all(path.with_file_name(format!(
             "{}.tmp",
-            path.file_name()
-                .expect("file name")
-                .to_string_lossy()
+            path.file_name().expect("file name").to_string_lossy()
         )))
         .expect("tmp sabotage dir");
     }
@@ -6741,13 +6738,26 @@ mod conclusion_barrier_tests {
         let ledger_path = super::default_live_lab_node_run_matrix_path();
         let body = fs::read_to_string(&ledger_path).expect("ledger readable");
         let rows = matrix_data_rows(&body);
-        assert_eq!(rows.len(), 1, "exactly one row for one started run: {body:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one row for one started run: {body:?}"
+        );
         assert_eq!(rows[0][0], super::path_display(&report_dir), "report_dir");
         assert_eq!(rows[0][1], "", "run_started_utc stays degenerate (empty)");
-        assert_eq!(rows[0][2], "", "run_finished_utc must be empty: never finished");
-        assert_eq!(rows[0][3], "in_progress", "overall_result marks the run unfinished");
+        assert_eq!(
+            rows[0][2], "",
+            "run_finished_utc must be empty: never finished"
+        );
+        assert_eq!(
+            rows[0][3], "in_progress",
+            "overall_result marks the run unfinished"
+        );
         assert_eq!(rows[0][4], "interim", "row_role marks the row interim");
-        assert!(body.contains(&run_id), "row carries the minted run_id {run_id}");
+        assert!(
+            body.contains(&run_id),
+            "row carries the minted run_id {run_id}"
+        );
     }
 
     /// D1: the finalize row must REPLACE the start marker — never duplicate
