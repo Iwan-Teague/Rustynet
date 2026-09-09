@@ -45,7 +45,7 @@ pub struct StateMachineRunner {
     stages: Vec<Box<dyn OrchestrationStage>>,
     /// Stage IDs explicitly requested to skip via `--skip-stage`.
     explicit_skips: HashSet<StageId>,
-    reused_skips: HashMap<StageId, String>,
+    reused_skips: HashMap<StageId, super::evidence::ReuseDigest>,
     /// When set, the runner checks this flag before each stage. On true, it
     /// skips non-`always_run` stages and runs teardown stages so the guest
     /// killswitch/NAT residue is cleaned up even after a SIGTERM/SIGINT.
@@ -69,12 +69,15 @@ impl StateMachineRunner {
     }
 
     /// Mark selected skips as satisfied by validated prior evidence. The
-    /// digest binds every reused outcome to that evidence; unlisted explicit
-    /// skips remain `NotRun` and block their dependents.
+    /// digest is a pre-validated [`super::evidence::ReuseDigest`] — only
+    /// `validate_rust_native_reuse_evidence` can mint one, so an arbitrary
+    /// string cannot enter a `Reused` outcome (audit F2). The digest binds
+    /// every reused outcome to that evidence; unlisted explicit skips remain
+    /// `NotRun` and block their dependents.
     pub fn with_reused_skips(
         mut self,
         skips: impl IntoIterator<Item = StageId>,
-        evidence_sha256: String,
+        evidence_sha256: super::evidence::ReuseDigest,
     ) -> Self {
         for id in skips {
             self.explicit_skips.insert(id.clone());
@@ -188,7 +191,6 @@ impl StateMachineRunner {
                 }
             }
 
-
             // Guard `execute` so a panicking stage becomes a `Failed` outcome
             // instead of unwinding out of the runner — otherwise a panic would
             // abort past finalize AND skip the always-run cleanup, the worst
@@ -276,7 +278,7 @@ impl StateMachineRunner {
                 .reused_skips
                 .get(&id)
                 .map_or(StageOutcome::NotRun, |digest| StageOutcome::Reused {
-                    evidence_sha256: digest.clone(),
+                    evidence_sha256: digest.as_str().to_owned(),
                 });
             let mark_blocked =
                 outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped(..));
@@ -1295,9 +1297,15 @@ mod tests {
                 vec![StageId::ValidateBaselineRuntime],
             ),
         ];
+        // Audit F2: the digest must arrive pre-validated — a placeholder like
+        // "abc123" is unrepresentable at the type level, so this test mints
+        // its binding through `ReuseDigest::parse` exactly like the
+        // production `--run-only`/`--resume-from`/`--rerun-stage` paths do.
+        let digest = crate::vm_lab::orchestrator::evidence::ReuseDigest::parse(&"a".repeat(64))
+            .expect("valid digest");
         let runner = StateMachineRunner::new(stages)
             .expect("valid plan")
-            .with_reused_skips([StageId::ValidateBaselineRuntime], "abc123".to_owned());
+            .with_reused_skips([StageId::ValidateBaselineRuntime], digest);
         let (mut ctx, _dir) = tempdir_ctx();
         let results = runner.run(&mut ctx).expect("run");
 
@@ -1306,7 +1314,7 @@ mod tests {
         assert_eq!(
             outcome_of(&StageId::ValidateBaselineRuntime),
             Some(&StageOutcome::Reused {
-                evidence_sha256: "abc123".to_owned()
+                evidence_sha256: "a".repeat(64)
             }),
             "reused setup dependency must retain its evidence binding"
         );
