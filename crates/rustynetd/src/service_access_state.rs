@@ -359,6 +359,7 @@ mod tests {
             approver_set: vec![],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 

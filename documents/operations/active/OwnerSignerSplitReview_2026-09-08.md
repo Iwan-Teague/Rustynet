@@ -119,7 +119,7 @@ Mental single-clause reverts, with the expected failure:
 | F5 | Low | No test that removing a plain-`{Client}` node stays owner-free (remove half of the non-goal). | tests, `membership.rs:4432-4461` |
 | — | Info | Empty-set guard arm is unreachable-in-success (`state.validate` rejects Active empty-cap nodes); helper doc slightly overstates. | `membership.rs:2780-2784` |
 | — | Info | `AddNode` reducer does not canonicalize the capability vector (`[Client, Client]` can enter state non-canonical, owner-free, granting nothing extra). Pre-existing. | `membership.rs:2158` vs `:2190` |
-| — | Info (accepted) | Tombstone residual: removed identities re-mintable as `{Client}` owner-free until durable tombstoning lands. Disclosed in the commit. | commit message, §1.5 |
+| — | Info (accepted) → CLOSED 2026-09-09 | Tombstone residual: removed identities re-mintable as `{Client}` owner-free until durable tombstoning lands. Disclosed in the commit. **Closed by the tombstone build** (`MembershipTombstoneDesign_2026-09-08.md` status header). | commit message, §1.5 |
 
 ## VERDICT: SAFE-WITH-FIXES
 

@@ -19725,6 +19725,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 
@@ -20491,6 +20492,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 
@@ -20509,6 +20511,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 
@@ -21740,6 +21743,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 
@@ -23721,6 +23725,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         persist_membership_snapshot(snapshot_path, &state)
             .expect("membership snapshot should be written");
@@ -23817,6 +23822,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         persist_membership_snapshot(snapshot_path, &state)
             .expect("membership snapshot should be written");
@@ -23881,6 +23887,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         persist_membership_snapshot(snapshot_path, &state)
             .expect("membership snapshot should be written");
@@ -37609,6 +37616,7 @@ mod tests {
             ],
             quorum_threshold: 2,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         persist_membership_snapshot(&snapshot_path, &state).expect("test snapshot should persist");
 

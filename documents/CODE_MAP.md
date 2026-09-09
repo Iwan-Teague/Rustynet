@@ -42,7 +42,8 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 | Type | Location | Purpose |
 |---|---|---|
 | `SignedMembershipUpdate` | `src/membership.rs` | Signed membership change — the core state object (replaced the former `MembershipBundle`) |
-| `MembershipState` | `src/membership.rs` | The verified signed membership snapshot |
+| `MembershipState` | `src/membership.rs` | The verified signed membership snapshot (carries `tombstones`, always canonicalised, required on parse) |
+| `MembershipTombstoneRecord`, `TombstoneAuthority` | `src/membership.rs` | Retired identity `(node_id, pubkey)` + who retired it; `AddNode` of a tombstoned id/key is owner-gated; only the owner-only `MembershipOperation::PruneTombstones` removes rows (`MembershipTombstoneDesign_2026-09-08.md`) |
 | `MembershipSignature` | `src/membership.rs` | Ed25519 signature carried by a signed update |
 | `MembershipUpdateRecord` | `src/membership.rs` | Proposed change to membership (add/remove peer, change capabilities) |
 | `NodeId` | `rustynet-backend-api/src/lib.rs` | Unique node identifier (there is **no** `control/src/node_id.rs`) |

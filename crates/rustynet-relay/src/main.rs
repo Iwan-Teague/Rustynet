@@ -6100,6 +6100,7 @@ mod daemon {
                 ],
                 quorum_threshold: 2,
                 metadata_hash: None,
+                tombstones: Vec::new(),
             };
             let path = dir.join("membership.snapshot");
             persist_membership_snapshot(&path, &state).expect("snapshot should persist");

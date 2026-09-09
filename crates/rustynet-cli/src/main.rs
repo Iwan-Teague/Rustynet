@@ -5947,6 +5947,17 @@ fn parse_membership_command(args: &[String]) -> Result<MembershipCommand, String
                 )?,
             })
         }
+        "propose-prune-tombstones" => {
+            let older_than_unix = parser.parse_u64_required("--older-than-unix")?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    &parser,
+                    paths,
+                    MembershipOperation::PruneTombstones { older_than_unix },
+                    "tombstones".to_owned(),
+                )?,
+            })
+        }
         "propose-rotate-approver" => {
             let approver_id = parser.required("--approver-id")?;
             let approver_pubkey_hex = parser.required("--approver-pubkey")?;
@@ -6123,6 +6134,17 @@ fn parse_membership_generic_proposal(
                     paths,
                     MembershipOperation::SetQuorum { threshold },
                     "quorum".to_owned(),
+                )?,
+            })
+        }
+        "prune-tombstones" => {
+            let older_than_unix = parser.parse_u64_required("--older-than-unix")?;
+            Ok(MembershipCommand::Propose {
+                config: proposal_config(
+                    parser,
+                    paths,
+                    MembershipOperation::PruneTombstones { older_than_unix },
+                    "tombstones".to_owned(),
                 )?,
             })
         }
@@ -16818,6 +16840,7 @@ impl MembershipOperationName for MembershipOperation {
             MembershipOperation::RotateNodeKey { .. } => "rotate_node_key",
             MembershipOperation::RotateApprover(_) => "rotate_approver",
             MembershipOperation::SetQuorum { .. } => "set_quorum",
+            MembershipOperation::PruneTombstones { .. } => "prune_tombstones",
         }
     }
 }
@@ -16885,6 +16908,13 @@ impl OptionParser {
                 .map_err(|err| format!("invalid value for {key}: {err}"));
         }
         Ok(default)
+    }
+
+    fn parse_u64_required(&self, key: &str) -> Result<u64, String> {
+        let raw = self.required(key)?;
+        raw.trim()
+            .parse::<u64>()
+            .map_err(|_| format!("invalid {key}: expected an unsigned integer, got {raw}"))
     }
 
     fn parse_u8_required(&self, key: &str) -> Result<u8, String> {
@@ -20415,6 +20445,7 @@ fn help_text() -> String {
         "  membership propose-rotate-key --node-id <id> --new-pubkey <hex> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-set-capabilities --node-id <id> --capabilities <csv> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership propose-set-quorum --threshold <n> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
+        "  membership propose-prune-tombstones --older-than-unix <unix> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]  (owner-signed only)",
         "  membership propose-rotate-approver --approver-id <id> --approver-pubkey <hex> --role <owner|guardian> --status <active|revoked> --output <path> [--reason <code>] [--expires-in <secs>] [--snapshot <path>] [--log <path>]",
         "  membership sign-update --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
         "  membership sign --record <path> --approver-id <id> --signing-key <path> --signing-key-passphrase-file <path> --output <path> [--merge-from <signed-update-path>]",
@@ -22284,6 +22315,7 @@ mod pin_authority_tests {
             approver_set: Vec::new(),
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 
@@ -24034,6 +24066,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 

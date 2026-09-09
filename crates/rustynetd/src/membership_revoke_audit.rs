@@ -129,6 +129,7 @@ fn synthetic_state(node_status: MembershipNodeStatus) -> MembershipState {
         ],
         quorum_threshold: 2,
         metadata_hash: None,
+        tombstones: Vec::new(),
     }
 }
 

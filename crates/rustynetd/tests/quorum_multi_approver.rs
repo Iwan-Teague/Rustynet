@@ -74,6 +74,7 @@ fn three_approver_state() -> MembershipState {
         ],
         quorum_threshold: 2,
         metadata_hash: None,
+        tombstones: Vec::new(),
     };
     state
         .validate()
@@ -209,6 +210,7 @@ fn quorum_threshold_exceeds_active_approvers_fails_validate() {
         ],
         quorum_threshold: 3, // exceeds active approver count of 2
         metadata_hash: None,
+        tombstones: Vec::new(),
     };
     let err = state
         .validate()
@@ -272,6 +274,7 @@ fn revoked_approver_does_not_count_toward_quorum() {
         ],
         quorum_threshold: 2, // still requires 2 active signatures
         metadata_hash: None,
+        tombstones: Vec::new(),
     };
     state_with_revoked
         .validate()

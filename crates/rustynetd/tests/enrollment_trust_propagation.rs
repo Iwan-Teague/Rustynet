@@ -85,6 +85,7 @@ fn base_state() -> MembershipState {
         }],
         quorum_threshold: 1,
         metadata_hash: None,
+        tombstones: Vec::new(),
     };
     state.validate().expect("base state must validate");
     state

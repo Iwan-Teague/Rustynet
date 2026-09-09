@@ -263,7 +263,7 @@ material, bounded by the five minting rules in the design), then the production 
 producer gap is **release-blocking**: the relay role is unusable end-to-end today, and a green lab
 stage must be annotated *lab-producer-only* so it is never read as a working feature.
 
-**7. Tombstones** — per D3.
+**7. Tombstones** — per D3. **BUILT 2026-09-09** (`MembershipTombstoneDesign_2026-09-08.md` status header).
 
 Designs and their reviews for every item are in `documents/operations/active/*_2026-09-08.md`;
 `README.md` in that directory indexes them.

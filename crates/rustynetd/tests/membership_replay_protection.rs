@@ -57,6 +57,7 @@ fn single_approver_state(epoch: u64) -> MembershipState {
         }],
         quorum_threshold: 1,
         metadata_hash: None,
+        tombstones: Vec::new(),
     }
 }
 

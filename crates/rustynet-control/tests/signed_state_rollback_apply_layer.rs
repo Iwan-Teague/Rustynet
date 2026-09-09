@@ -71,6 +71,7 @@ fn base_state() -> MembershipState {
         ],
         quorum_threshold: 2,
         metadata_hash: None,
+        tombstones: Vec::new(),
     }
 }
 
