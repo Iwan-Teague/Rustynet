@@ -33,6 +33,32 @@ pub mod signed_state_rollback_eval;
 
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
+/// Shared fail-closed exit-status gate for the `<platform>-*-check`
+/// role-validation wrappers: a non-zero daemon exit must fail the check even
+/// when stdout still parses as a report. If the evaluator rejects the report,
+/// its error (the drift reasons) surfaces — that is the more actionable
+/// message; a non-zero exit with a PASSING report is unproducible by the real
+/// producer, so it fails with an explicit exit-status message instead of
+/// being forgiven.
+pub(crate) fn require_daemon_success(
+    exit_code: i32,
+    subcommand: &str,
+    alias: &str,
+    stdout: &str,
+    evaluate: impl FnOnce(&str) -> Result<String, String>,
+) -> Result<(), String> {
+    if exit_code == 0 {
+        return evaluate(stdout).map(|_| ());
+    }
+    match evaluate(stdout) {
+        Err(eval_err) => Err(eval_err),
+        Ok(_) => Err(format!(
+            "`{subcommand}` on {alias} exited non-zero (code {exit_code}) while emitting a \
+             passing report; failing closed"
+        )),
+    }
+}
+
 /// Discover exactly one generation-rotated nftables table (`prefix<N>`) in a
 /// fixed family. Zero tables makes active-state proof vacuous; multiple tables
 /// means stale security-sensitive residue. Both fail closed.
