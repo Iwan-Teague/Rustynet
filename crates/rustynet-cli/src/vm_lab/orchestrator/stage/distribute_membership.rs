@@ -153,6 +153,7 @@ fn write_membership_bundle_evidence(
     super::bundle_evidence::write_bundle_evidence(
         &ctx.report_dir,
         &BundleKind::Membership,
+        super::bundle_evidence::BundleWitnessScope::Setup,
         &entries,
     )
 }
@@ -437,7 +438,10 @@ mod tests {
         );
 
         let path = dir.join(
-            super::super::bundle_evidence::bundle_evidence_relative_path(&BundleKind::Membership),
+            super::super::bundle_evidence::bundle_evidence_relative_path(
+                &BundleKind::Membership,
+                super::super::bundle_evidence::BundleWitnessScope::Setup,
+            ),
         );
         let text = std::fs::read_to_string(&path).expect("witness artifact readable");
         assert!(text.contains("\"kind\": \"membership\""), "{text}");

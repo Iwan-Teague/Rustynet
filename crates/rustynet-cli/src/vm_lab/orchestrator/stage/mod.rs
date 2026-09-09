@@ -417,10 +417,13 @@ define_stage_catalog! {
     // them). Gated by the same --enable-relay-forwarding-validation flag;
     // skipped (fail-closed) otherwise. Role-capability proof: T1.
     // QH-83 F1b: the pass distributes BOTH the traversal and the dns-zone
-    // bundle and writes both witnesses; the runner checks the traversal one
-    // (the outcome this stage returns), and the dns-zone witness is pinned
-    // by the stage's own test.
-    RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role / StageEvidence::File("logs/distribute_traversal.bundle_evidence.json"),
+    // bundle and writes both witnesses under this stage's OWN paths
+    // (bundle_evidence::BundleWitnessScope::Refresh — the Setup rows above
+    // keep theirs, so the runner's clear-at-start here cannot erase them);
+    // the runner checks the traversal one (the outcome this stage returns).
+    // Both spellings are pinned by bundle_evidence.rs's
+    // `each_witness_scope_owns_a_distinct_path`.
+    RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role / StageEvidence::File("logs/refresh_signed_bundles.traversal.bundle_evidence.json"),
     RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Cross-NETWORK ≠ cross-OS: this suite exercises NAT/netns traversal

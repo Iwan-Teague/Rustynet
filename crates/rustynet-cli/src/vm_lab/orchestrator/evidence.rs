@@ -1855,6 +1855,21 @@ mod finalize_tests {
         crate::live_lab_stage_manifest::write_stage_manifest(report_dir, &manifest)
             .expect("stage manifest");
         for (id, outcome) in emitted {
+            // QH-83: a Passed stage whose catalog row declares a File
+            // witness must leave that artifact, or the reuse seal (which
+            // reads every declared witness) refuses to finalize the run.
+            if let (
+                StageOutcome::Passed,
+                crate::vm_lab::orchestrator::stage::StageEvidence::File(relative),
+            ) = (outcome, id.evidence())
+            {
+                let path = report_dir.join(relative);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).expect("witness parent dir");
+                }
+                fs::write(&path, format!("fixture witness for {}\n", id.as_str()))
+                    .expect("fixture witness");
+            }
             emit_stage(report_dir, id, outcome);
         }
     }
