@@ -7108,8 +7108,9 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    `bundle_evidence.json` File witnesses, preflight / prepare_source_archive
    declare the files they write, the rest append count-bearing stage-log lines;
    `refresh_signed_bundles` moved to its own witness path; disposition in
-   `NodeEngineSetupWitnessAudit_2026-09-09.md`). Still pending in Setup:
-   anchor_validation, validate_baseline_runtime. The NegativeControl stages'
+   `NodeEngineSetupWitnessAudit_2026-09-09.md`). The last two Setup rows
+   (anchor_validation, validate_baseline_runtime) landed the same day —
+   **Setup phase complete: 17 of 17.** Next batch: Live (35). The NegativeControl stages'
    witness is their inversion record (`write_control_evidence` output), never a
    lazy `None`. Each stage still needs the individual "what datum IS this
    verdict" decision — a constant-line appeasement satisfies emptiness without
