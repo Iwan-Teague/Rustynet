@@ -63,8 +63,8 @@ impl ValidateBaselineRuntimeStage {
 /// visibility is proven by the dedicated `mesh_status_validation` stage's
 /// live-handshake poll instead, not by this dispatch.
 fn probe_expectations(op: crate::vm_lab::DaemonProbeOp) -> Vec<String> {
-    use crate::vm_lab::orchestrator::role_validation::mesh_status::SNAPSHOT_MAX_AGE_SECONDS;
     use crate::vm_lab::DaemonProbeOp;
+    use crate::vm_lab::orchestrator::role_validation::mesh_status::SNAPSHOT_MAX_AGE_SECONDS;
 
     match op {
         DaemonProbeOp::MeshStatus => vec![
@@ -285,7 +285,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn empty_assignments_passes() {
+    /// Setup provenance F3: an empty scope validated nothing, so the stage
+    /// fails closed instead of passing vacuously. Mutation caught: reverting
+    /// the guard to `return StageOutcome::Passed`.
+    fn empty_assignments_fails_closed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -312,14 +315,14 @@ mod tests {
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
         };
-        assert_eq!(
+        assert!(matches!(
             ValidateBaselineRuntimeStage::new(
                 1,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .execute(&mut ctx),
-            StageOutcome::Passed
-        );
+            StageOutcome::Failed(_)
+        ));
     }
 
     // ----- QH-39: the baseline mesh-status dispatch must assert something --
