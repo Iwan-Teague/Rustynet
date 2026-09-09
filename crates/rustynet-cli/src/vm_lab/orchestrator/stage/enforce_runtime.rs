@@ -1,8 +1,24 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+
+/// Writes the QH-83 witness line for an enforce_baseline_runtime PASS: the
+/// enforced node count travels with the verdict so an empty scope could not
+/// pass invisibly (and the F3 guard keeps it from passing at all).
+fn write_enforce_witness(report_dir: &std::path::Path, aliases: &[String]) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::EnforceBaselineRuntime.as_str(),
+        &format!(
+            "enforced_nodes={} ({}) auto_tunnel_enforce=true",
+            aliases.len(),
+            aliases.join(",")
+        ),
+    )
+}
 
 pub struct EnforceBaselineRuntimeStage {
     max_parallel_node_workers: usize,
@@ -80,7 +96,13 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
             .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
             .collect();
         if errors.is_empty() {
-            StageOutcome::Passed
+            // QH-83: the witness is written on EVERY pass path and a write
+            // failure fails the stage — an unwitnessed enforce pass must
+            // not stand.
+            match write_enforce_witness(&ctx.report_dir, &aliases) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("enforce witness write failed: {e}")),
+            }
         } else {
             StageOutcome::Failed(errors.join("; "))
         }
@@ -131,5 +153,54 @@ mod tests {
             .execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
+    }
+
+    // QH-83: a PASS verdict must leave a durable stage-log line naming the
+    // enforced node count. Mutation caught: dropping the witness write or
+    // demoting it to best-effort.
+    #[test]
+    fn enforce_witness_line_names_the_enforced_node_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "enforce_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let aliases = vec!["exit-1".to_owned(), "client-1".to_owned()];
+        write_enforce_witness(&dir, &aliases).expect("witness write");
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::EnforceBaselineRuntime.as_str(),
+            ),
+        )
+        .expect("stage log readable");
+        assert!(
+            log.contains("enforced_nodes=2 (exit-1,client-1) auto_tunnel_enforce=true"),
+            "{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as
+    /// an error the stage turns into a failure (never a silent pass).
+    #[test]
+    fn enforce_witness_write_failure_is_propagated() {
+        let blocker =
+            std::env::temp_dir().join(format!("enforce_witness_blocker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let err = write_enforce_witness(&blocker, &["exit-1".to_owned()])
+            .expect_err("write into a regular file path must fail");
+        assert!(!err.is_empty());
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }
