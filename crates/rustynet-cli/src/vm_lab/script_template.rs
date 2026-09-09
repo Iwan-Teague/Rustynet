@@ -916,6 +916,11 @@ cat > "$RUNNER" <<'RUNNER_EOF'
 #!/bin/bash
 cd __REPO_DIR__ || exit 1
 echo $$ > 'state/host-lab-runs/__LAUNCH_ID__.pid'
+# The runner is a non-login shell: ~/.profile is never sourced, so rustup's
+# shim directory is not on PATH and `exec cargo` dies with "cargo: not found"
+# (observed live on lenovo-bot, 2026-09-09). Prepend it explicitly rather than
+# depend on the host having linked the shims into /usr/local/bin.
+export PATH="$HOME/.cargo/bin:$PATH"
 exec cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab --report-dir __REPORT_DIR__ --ssh-identity-file __ORCH_IDENTITY__ --known-hosts-file __ORCH_KNOWN_HOSTS__ __ORCH_ARGS__
 RUNNER_EOF
 
@@ -2675,6 +2680,11 @@ cat > "$RUNNER" <<'RUNNER_EOF'
 #!/bin/bash
 cd '/home/u/Rustynet' || exit 1
 echo $$ > 'state/host-lab-runs/launch-1-2.pid'
+# The runner is a non-login shell: ~/.profile is never sourced, so rustup's
+# shim directory is not on PATH and `exec cargo` dies with "cargo: not found"
+# (observed live on lenovo-bot, 2026-09-09). Prepend it explicitly rather than
+# depend on the host having linked the shims into /usr/local/bin.
+export PATH="$HOME/.cargo/bin:$PATH"
 exec cargo run --quiet -p rustynet-cli --features vm-lab -- ops vm-lab-orchestrate-live-lab --report-dir 'artifacts/live_lab/x' --ssh-identity-file "$HOME/.ssh/id_ed25519" --known-hosts-file "$HOME/.ssh/known_hosts" '--node' 'linux-x86-client-1:client'
 RUNNER_EOF
 
