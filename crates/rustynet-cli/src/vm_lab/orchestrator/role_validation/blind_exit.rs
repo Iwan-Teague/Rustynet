@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
 pub fn blind_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
