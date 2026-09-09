@@ -7110,7 +7110,15 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    `refresh_signed_bundles` moved to its own witness path; disposition in
    `NodeEngineSetupWitnessAudit_2026-09-09.md`). The last two Setup rows
    (anchor_validation, validate_baseline_runtime) landed the same day —
-   **Setup phase complete: 17 of 17.** Next batch: Live (35). The NegativeControl stages'
+   **Setup phase complete: 17 of 17.** **Live phase landed 2026-09-09
+   (32 rows, two flash jobs, both reviewed MERGE-SAFE; merges `e4b91aee` and
+   `2bc34fab`):** the 16 security/exit/relay validators declare `StageLog`
+   with per-run count+alias lines; 12 live-suite rows declare `File` on the
+   report JSON each Linux test binary writes through `--report-path`, made
+   fatal via `verify_report_artifact`; 4 macOS cells declare `StageLog`.
+   role_switch_matrix additionally gained the empty-fleet skip guard the other
+   validators had. Remaining pending: 11 CrossNetwork, 9 Chaos,
+   4 NegativeControl, RelayForwardsFrame, ExtendedSoak (26) — in flight. The NegativeControl stages'
    witness is their inversion record (`write_control_evidence` output), never a
    lazy `None`. Each stage still needs the individual "what datum IS this
    verdict" decision — a constant-line appeasement satisfies emptiness without
