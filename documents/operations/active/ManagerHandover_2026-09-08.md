@@ -107,8 +107,11 @@ divergence between two places that should agree", "disagreeing is a valid outcom
 manufacture findings to look thorough". For a *design* review, add: verify the problem statement
 first, because a design built on a misread is worthless however good its reasoning.
 
-Then **verify the reviewer yourself** on anything that changes a decision. Two of this session's
-review claims were subtly wrong and I only caught them by reading the code (§6).
+**Owner decision 2026-09-09 (supersedes the paragraph this replaced):** GLM-5.3 and
+glm-5.3-flash are trusted reviewers — act on their grounded findings without a
+mandatory re-verification round. Brief reviewers to verify the problem statement
+first (the premise slips in §6 are what that catches); keep gates and the live
+re-verify on every landing.
 
 ---
 
