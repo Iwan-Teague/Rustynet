@@ -48,6 +48,15 @@ impl OrchestrationStage for DistributeMembershipStage {
             .filter(|a| a.role != NodeRole::Exit)
             .map(|a| a.alias.clone())
             .collect();
+        // Setup provenance F3: a membership distribution that reaches no
+        // node distributed nothing; the bundle family already fails closed
+        // on a missing exit, and this stage must not pass vacuously.
+        if non_exit.is_empty() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return StageOutcome::Failed(
+                "no non-exit node in assignments; membership snapshot reached nobody".to_owned(),
+            );
+        }
 
         let errors: Vec<String> = non_exit
             .iter()
@@ -113,7 +122,10 @@ mod tests {
     }
 
     #[test]
-    fn no_non_exit_nodes_passes_trivially() {
+    /// Setup provenance F3: an exit-only topology distributes the snapshot to
+    /// nobody, so the stage must fail closed. Mutation caught: reverting the
+    /// empty-non-exit guard (the stage passes with zero distributions).
+    fn no_non_exit_nodes_fails_closed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![NodeRoleAssignment {
                 alias: "exit-1".to_owned(),
@@ -144,9 +156,9 @@ mod tests {
             relay_forwarding_validation_elected: false,
         };
         // Only exit node — nothing to distribute to
-        assert_eq!(
+        assert!(matches!(
             DistributeMembershipStage.execute(&mut ctx),
-            StageOutcome::Passed
-        );
+            StageOutcome::Failed(_)
+        ));
     }
 }

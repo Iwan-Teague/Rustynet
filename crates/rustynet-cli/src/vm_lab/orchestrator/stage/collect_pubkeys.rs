@@ -248,7 +248,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn empty_assignments_passes() {
+    /// Setup provenance F3: an empty scope validated nothing, so the stage
+    /// fails closed instead of passing vacuously. Mutation caught: reverting
+    /// the guard to `return StageOutcome::Passed`.
+    fn empty_assignments_fails_closed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -275,7 +278,10 @@ mod tests {
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
         };
-        assert_eq!(CollectPubkeysStage.execute(&mut ctx), StageOutcome::Passed);
+        assert!(matches!(
+            CollectPubkeysStage.execute(&mut ctx),
+            StageOutcome::Failed(_)
+        ));
     }
 
     use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
