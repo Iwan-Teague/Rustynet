@@ -180,9 +180,14 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         }
 
         if ctx.mesh_ips.is_empty() {
-            return StageOutcome::Failed(
-                "no mesh IPs available; cannot run traffic tests".to_owned(),
-            );
+            evidence.push("result: no mesh IPs available".to_owned());
+            let message = "no mesh IPs available; cannot run traffic tests".to_owned();
+            return match write_pair_results(&ctx.report_dir, &evidence) {
+                Ok(()) => StageOutcome::Failed(message),
+                Err(write_err) => StageOutcome::Failed(format!(
+                    "{message}; ALSO failed to write the pair-results witness: {write_err}"
+                )),
+            };
         }
 
         let mesh_ips = ctx.mesh_ips.clone();

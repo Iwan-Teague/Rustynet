@@ -141,6 +141,17 @@ impl OrchestrationStage for MembershipInitStage {
                     }
                     eprintln!("[stage:membership_init] {line}");
                 }
+                // QH-83 witness on EVERY pass path (the F1 line above is
+                // macOS-exit-only; without this a Linux-exit run would pass
+                // with an empty stage log and be demoted to NotProven).
+                let line = snapshot_evidence_line(snap.data.len(), &exit_alias);
+                if let Err(err) =
+                    append_stage_evidence_line(&ctx.report_dir, "membership_init", &line)
+                {
+                    return StageOutcome::Failed(format!(
+                        "could not record the membership_init witness ({line}): {err}"
+                    ));
+                }
                 ctx.membership_snapshot = Some(snap.data);
                 StageOutcome::Passed
             }
@@ -262,6 +273,17 @@ pub(crate) fn build_membership_peers(
             })
         })
         .collect()
+}
+
+/// The platform-independent evidence line behind a `membership_init` pass:
+/// the signed genesis snapshot was minted, naming the exit that minted it and
+/// the snapshot's size in bytes. Single-line and greppable; the value is only
+/// ever what the stage measured.
+pub(crate) fn snapshot_evidence_line(snapshot_bytes: usize, exit_alias: &str) -> String {
+    let exit_alias: String = exit_alias.chars().filter(|ch| !ch.is_control()).collect();
+    format!(
+        "membership_snapshot_minted=true snapshot_bytes={snapshot_bytes} exit_alias={exit_alias}"
+    )
 }
 
 #[cfg(test)]
@@ -796,5 +818,18 @@ mod tests {
         assert!(
             owner_key_evidence_line(false, "x").starts_with("owner_signing_key_present=false ")
         );
+    }
+
+    /// Mutation caught: dropping the snapshot witness append on the pass path
+    /// (the runner then demotes every non-macOS `membership_init` pass to
+    /// NotProven); and a multi-line alias smuggling a second record.
+    #[test]
+    fn snapshot_evidence_line_is_single_line_and_names_the_exit() {
+        let line = snapshot_evidence_line(412, "debian-exit\n-1");
+        assert_eq!(
+            line,
+            "membership_snapshot_minted=true snapshot_bytes=412 exit_alias=debian-exit-1"
+        );
+        assert!(!line.contains('\n'));
     }
 }

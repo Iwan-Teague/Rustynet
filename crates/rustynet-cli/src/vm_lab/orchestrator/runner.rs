@@ -334,7 +334,16 @@ fn verify_evidence_file_at(
     describe: &dyn Fn(&str) -> String,
     outcome: StageOutcome,
 ) -> StageOutcome {
-    let metadata = match std::fs::metadata(path) {
+    // symlink_metadata, not metadata: a symlink to some other regular file
+    // (another run's artifact, another stage's log) must not stand in for
+    // the witness this stage was supposed to write.
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return StageOutcome::NotProven {
+                reason: ReasonCode::MissingWitness,
+                detail: describe("is a symlink, not a regular file"),
+            };
+        }
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return StageOutcome::NotProven {
@@ -1431,6 +1440,65 @@ mod tests {
                     detail.contains("is empty"),
                     "detail must call out the empty artifact: {detail}"
                 );
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+    }
+
+    /// Mutation caught: `fs::metadata` (follows symlinks) instead of
+    /// `symlink_metadata` — a symlink to a real, non-empty file would then
+    /// uphold the pass.
+    #[test]
+    fn symlinked_file_witness_is_demoted_to_not_proven() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
+        let (mut ctx, dir) = tempdir_ctx();
+        let real = dir.path().join("elsewhere.log");
+        std::fs::write(&real, "real content\n").expect("write real file");
+        let artifact = dir.path().join("logs/traffic_test_matrix.pair_results.log");
+        std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
+            .expect("create artifact dir");
+        std::os::unix::fs::symlink(&real, &artifact).expect("symlink witness");
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(detail.contains("symlink"), "{detail}");
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+    }
+
+    /// Mutation caught: mapping a read error to `Ok`/pass, or dropping the
+    /// `UnreadableEvidence` arm. Skipped (with a note) when running as root,
+    /// where mode 0o000 does not deny the read.
+    #[test]
+    fn unreadable_file_witness_is_demoted_to_unreadable_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
+        let (mut ctx, dir) = tempdir_ctx();
+        let artifact = dir.path().join("logs/traffic_test_matrix.pair_results.log");
+        std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
+            .expect("create artifact dir");
+        std::fs::write(&artifact, "content\n").expect("write artifact");
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 000");
+        if std::fs::read(&artifact).is_ok() {
+            eprintln!("running with read access despite mode 000 (root?); skipping");
+            return;
+        }
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::UnreadableEvidence));
+                assert!(detail.contains("could not be read"), "{detail}");
             }
             other => panic!("expected NotProven, got {other:?}"),
         }
