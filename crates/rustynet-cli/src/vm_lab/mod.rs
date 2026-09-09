@@ -24383,6 +24383,17 @@ pub(crate) fn evaluate_linux_authenticode_report(
             report.reason
         ))
     } else {
+        // Fail-closed: "not applicable" only excuses a MISSING attestation, never
+        // a producer that says it could not do its job (overall_ok=false). A
+        // non-applicable report that also reports failure means the producer
+        // itself hit an error (e.g. stat failed); passing it would mint a green
+        // from a broken run.
+        if !report.overall_ok {
+            return Err(format!(
+                "Linux authenticode check failed while not applicable: overall_ok=false ({})",
+                report.reason
+            ));
+        }
         Ok(format!(
             "Linux authenticode not applicable on {linux_alias} (runtime binary signature \
              attestation is Windows-specific; Linux relies on dpkg/rpm install-time signature \
@@ -51902,6 +51913,27 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .expect("not-applicable must pass through");
         assert!(summary.contains("not applicable on debian-utm-1"));
         assert!(summary.contains("dpkg/rpm"));
+    }
+
+    // Mutation coverage for the not-applicable guard: deleting the
+    // `overall_ok` rejection in the `applicable == false` arm of
+    // `evaluate_linux_authenticode_report` turns this test red, because a
+    // producer that failed its own work (stat failed) must never pass just
+    // because attestation is not applicable on Linux.
+    #[test]
+    fn evaluate_linux_authenticode_report_rejects_overall_ok_false_when_not_applicable() {
+        let raw = r#"{
+            "schema_version": 1,
+            "overall_ok": false,
+            "applicable": false,
+            "reason": "stat failed"
+        }"#;
+        let err = super::evaluate_linux_authenticode_report("debian-utm-1", raw)
+            .expect_err("not-applicable must still reject an overall_ok=false report");
+        assert!(
+            err.contains("overall_ok=false"),
+            "error must name the failing verdict, got: {err}"
+        );
     }
 
     #[test]

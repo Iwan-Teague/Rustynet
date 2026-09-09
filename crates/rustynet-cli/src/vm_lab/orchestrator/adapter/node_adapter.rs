@@ -298,6 +298,21 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         run_typed_role_validator(self, kind, expected_node_id, expected_dns_posture)
     }
 
+    /// Run the Linux authenticode validator and return the daemon's RAW report
+    /// JSON on success. The Linux authenticode producer is a known
+    /// non-attesting stub (`applicable: false, overall_ok: true`, zero I/O), so
+    /// the authenticode stage must capture the raw report as evidence and
+    /// report a skip — never a Passed outcome minted from a constant. The §4.7
+    /// node-identity challenge runs first, exactly as in
+    /// [`Self::run_role_validator`]. Linux-only: every other platform fails
+    /// closed with `UnsupportedPlatform`.
+    fn run_linux_authenticode_validator_with_report(
+        &self,
+        expected_node_id: Option<&str>,
+    ) -> Result<String, AdapterError> {
+        run_linux_authenticode_report_validator(self, expected_node_id)
+    }
+
     fn supports_role_validator(&self, kind: RoleValidatorKind) -> bool {
         // The answer depends on BOTH the platform and the validator kind: most
         // validators run on every desktop platform, but gossip convergence is
@@ -697,6 +712,43 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
         )),
     };
     result.map_err(|message| AdapterError::Protocol { message })
+}
+
+/// Shared implementation of
+/// [`NodeAdapter::run_linux_authenticode_validator_with_report`]: identity
+/// challenge first, then the Linux raw-report wrapper. Non-Linux platforms
+/// fail closed — the raw-capture path exists only for the Linux non-attesting
+/// stub, whose pass must surface as a stage skip.
+fn run_linux_authenticode_report_validator<T: NodeAdapter + ?Sized>(
+    adapter: &T,
+    expected_node_id: Option<&str>,
+) -> Result<String, AdapterError> {
+    use crate::vm_lab::orchestrator::role_validation::authenticode;
+    let platform = adapter.platform();
+    if platform != VmGuestPlatform::Linux {
+        return Err(AdapterError::UnsupportedPlatform {
+            platform,
+            message: "raw authenticode report capture is only implemented for the Linux \
+                      non-attesting stub"
+                .to_owned(),
+        });
+    }
+    let shell = adapter.shell_host()?;
+    let alias = adapter.alias();
+    enforce_identity_challenge(
+        adapter.collect_live_identity(),
+        expected_node_id,
+        RoleValidatorKind::Authenticode,
+        alias,
+    )?;
+    authenticode::validate_linux_authenticode_report(
+        &*shell,
+        crate::vm_lab::LINUX_RUSTYNETD_PATH,
+        alias,
+    )
+    .map_err(|message| AdapterError::Protocol {
+        message: format!("authenticode report validation on {alias:?}: {message}"),
+    })
 }
 
 #[cfg(test)]
