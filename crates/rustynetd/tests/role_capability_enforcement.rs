@@ -61,6 +61,7 @@ fn state_with_node_caps(
         }],
         quorum_threshold: 1,
         metadata_hash: None,
+        tombstones: Vec::new(),
     };
     state.validate()
 }

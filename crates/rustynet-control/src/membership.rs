@@ -69,6 +69,11 @@ pub const MAX_MEMBERSHIP_LOG_BYTES: usize = 64 * 1024 * 1024;
 /// size-capped IPC path.
 pub const MAX_MEMBERSHIP_NODE_COUNT: usize = 65_536;
 pub const MAX_MEMBERSHIP_APPROVER_COUNT: usize = 4_096;
+/// Upper bound on retired-identity records a state may carry
+/// (`MembershipTombstoneDesign_2026-09-08.md` §4.4). At the cap a removal,
+/// revocation, or key rotation is REFUSED rather than silently dropping
+/// protection; only an owner-signed `PruneTombstones` makes room.
+pub const MAX_MEMBERSHIP_TOMBSTONE_COUNT: usize = 65_536;
 pub const MAX_MEMBERSHIP_SIGNATURE_COUNT: usize = 4_096;
 
 /// Upper bound on any free-form operator-supplied string that
@@ -181,6 +186,53 @@ pub struct MembershipApprover {
     pub created_at_unix: u64,
 }
 
+/// Who authorised the governance decision a tombstone records. Derived at
+/// reduce time from `requires_owner_signer` over the signed operation — never
+/// read from message content — so the proposer's previewed root and the
+/// applier's recomputed root agree, and a drafter cannot relabel a
+/// quorum-only removal as the owner's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneAuthority {
+    Owner,
+    Quorum,
+}
+
+impl TombstoneAuthority {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TombstoneAuthority::Owner => "owner",
+            TombstoneAuthority::Quorum => "quorum",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, MembershipError> {
+        match value {
+            "owner" => Ok(TombstoneAuthority::Owner),
+            "quorum" => Ok(TombstoneAuthority::Quorum),
+            other => Err(MembershipError::InvalidFormat(format!(
+                "unknown tombstone authority {other}"
+            ))),
+        }
+    }
+}
+
+/// A durable record of a retired identity (`MembershipTombstoneDesign_2026-09-08.md`).
+///
+/// Written by `RemoveNode`, `RevokeNode`, and `RotateNodeKey` (the retired
+/// key). While a row exists, re-admitting its `node_id` OR its pubkey (compared
+/// case-insensitively) through `AddNode` requires the owner's signature — the
+/// same authority removal of a privileged node already demands. Rows never
+/// expire on their own; only an owner-signed `PruneTombstones` removes them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MembershipTombstoneRecord {
+    pub node_id: String,
+    /// Stored canonical lowercase; compared case-insensitively regardless.
+    pub node_pubkey_hex: String,
+    /// `created_at_unix` of the signed update that wrote the row.
+    pub removed_at_unix: u64,
+    pub authority: TombstoneAuthority,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MembershipState {
     pub schema_version: u8,
@@ -190,6 +242,10 @@ pub struct MembershipState {
     pub approver_set: Vec<MembershipApprover>,
     pub quorum_threshold: u8,
     pub metadata_hash: Option<String>,
+    /// Retired identities. Always written by `canonical_payload` (even when
+    /// empty) and REQUIRED by the parser — absence is refused, never
+    /// inferred as "no tombstones" (the `capabilities` precedent).
+    pub tombstones: Vec<MembershipTombstoneRecord>,
 }
 
 impl MembershipState {
@@ -197,6 +253,7 @@ impl MembershipState {
         if self.schema_version != MEMBERSHIP_SCHEMA_VERSION {
             return Err(MembershipError::UnsupportedVersion(self.schema_version));
         }
+        self.validate_tombstones()?;
         if self.network_id.trim().is_empty() {
             return Err(MembershipError::InvalidFormat(
                 "network id must not be empty".to_owned(),
@@ -362,7 +419,78 @@ impl MembershipState {
             );
         }
 
+        let mut tombstones: Vec<&MembershipTombstoneRecord> = self.tombstones.iter().collect();
+        tombstones.sort_by(|left, right| {
+            left.node_id
+                .cmp(&right.node_id)
+                .then_with(|| left.node_pubkey_hex.cmp(&right.node_pubkey_hex))
+        });
+        let _ = writeln!(out, "tombstone_count={}", tombstones.len());
+        for (index, tombstone) in tombstones.iter().enumerate() {
+            let _ = writeln!(out, "tombstone.{index}.node_id={}", tombstone.node_id);
+            let _ = writeln!(
+                out,
+                "tombstone.{index}.node_pubkey_hex={}",
+                tombstone.node_pubkey_hex
+            );
+            let _ = writeln!(
+                out,
+                "tombstone.{index}.removed_at_unix={}",
+                tombstone.removed_at_unix
+            );
+            let _ = writeln!(
+                out,
+                "tombstone.{index}.authority={}",
+                tombstone.authority.as_str()
+            );
+        }
+
         Ok(out)
+    }
+
+    /// Every tombstone row must be well-formed and unique on its
+    /// `(node_id, pubkey)` key; a malformed row rejects the whole state, the
+    /// same way one bad node does.
+    fn validate_tombstones(&self) -> Result<(), MembershipError> {
+        if self.tombstones.len() > MAX_MEMBERSHIP_TOMBSTONE_COUNT {
+            return Err(MembershipError::InvalidFormat(format!(
+                "tombstone count {} exceeds maximum {MAX_MEMBERSHIP_TOMBSTONE_COUNT}",
+                self.tombstones.len()
+            )));
+        }
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for tombstone in &self.tombstones {
+            if tombstone.node_id.trim().is_empty() {
+                return Err(MembershipError::InvalidFormat(
+                    "tombstone node id must not be empty".to_owned(),
+                ));
+            }
+            decode_hex_to_fixed::<32>(&tombstone.node_pubkey_hex)?;
+            if tombstone.node_pubkey_hex != tombstone.node_pubkey_hex.to_ascii_lowercase() {
+                return Err(MembershipError::InvalidFormat(
+                    "tombstone pubkey must be canonical lowercase hex".to_owned(),
+                ));
+            }
+            if !seen.insert((tombstone.node_id.clone(), tombstone.node_pubkey_hex.clone())) {
+                return Err(MembershipError::InvalidFormat(format!(
+                    "duplicate tombstone for node {}",
+                    tombstone.node_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Does a tombstone bind this identity? Either coordinate matches: the
+    /// exact `node_id`, or the pubkey compared case-insensitively (review F1
+    /// discipline — hex is not canonical on the AddNode path).
+    pub fn tombstone_binds(&self, node_id: &str, node_pubkey_hex: &str) -> bool {
+        self.tombstones.iter().any(|tombstone| {
+            tombstone.node_id == node_id
+                || tombstone
+                    .node_pubkey_hex
+                    .eq_ignore_ascii_case(node_pubkey_hex)
+        })
     }
 
     pub fn state_root_hex(&self) -> Result<String, MembershipError> {
@@ -422,6 +550,13 @@ pub enum MembershipOperation {
     SetQuorum {
         threshold: u8,
     },
+    /// Owner-only: drop tombstones whose `removed_at_unix` is strictly
+    /// before `older_than_unix`. Pruning is a signed state transition, never
+    /// an automatic expiry, so the guard consults rows with no age exemption
+    /// and an attacker cannot simply wait a tombstone out.
+    PruneTombstones {
+        older_than_unix: u64,
+    },
 }
 
 impl MembershipOperation {
@@ -435,6 +570,7 @@ impl MembershipOperation {
             MembershipOperation::RotateNodeKey { .. } => "rotate_node_key",
             MembershipOperation::RotateApprover(_) => "rotate_approver",
             MembershipOperation::SetQuorum { .. } => "set_quorum",
+            MembershipOperation::PruneTombstones { .. } => "prune_tombstones",
         }
     }
 
@@ -493,8 +629,22 @@ impl MembershipOperation {
             | MembershipOperation::SetQuorum { .. }
             | MembershipOperation::SetNodeCapabilities { .. }
             | MembershipOperation::RotateNodeKey { .. } => true,
+            // Pruning is the only way a tombstone ever stops binding, so it
+            // is owner-only by construction: the owner is the one actor who
+            // can weaken identity protection. Listed explicitly — a `_`
+            // catch-all would have made this quorum-sufficient silently
+            // (review 2026-09-08 §2.6).
+            MembershipOperation::PruneTombstones { .. } => true,
             MembershipOperation::AddNode(node) => {
                 if !is_unprivileged_capability_set(&node.capabilities) {
+                    return true;
+                }
+                // A retired identity comes back only with the owner's key:
+                // re-minting a removed node id, or its pubkey under a new
+                // id, is exactly the substitution the present-node clause
+                // below exists for, extended past removal
+                // (`MembershipTombstoneDesign_2026-09-08.md` §3).
+                if state.tombstone_binds(&node.node_id, &node.node_pubkey_hex) {
                     return true;
                 }
                 // Re-admitting an identity the mesh already knows is an
@@ -720,6 +870,9 @@ impl MembershipUpdateRecord {
             }
             MembershipOperation::SetQuorum { threshold } => {
                 let _ = writeln!(out, "op.threshold={threshold}");
+            }
+            MembershipOperation::PruneTombstones { older_than_unix } => {
+                let _ = writeln!(out, "op.older_than_unix={older_than_unix}");
             }
         }
 
@@ -2156,6 +2309,15 @@ fn reduce_membership_state(
     op_created_at_unix: u64,
 ) -> Result<MembershipState, MembershipError> {
     let mut next = state.clone();
+    // Tombstone authority is a pure function of (operation, pre-state) — the
+    // same input the signature verifier evaluates — so proposer preview and
+    // applier recompute agree on the root, and the tag is never
+    // drafter-settable.
+    let authority = if operation.requires_owner_signer(state) {
+        TombstoneAuthority::Owner
+    } else {
+        TombstoneAuthority::Quorum
+    };
     match operation {
         MembershipOperation::AddNode(node) => {
             if next
@@ -2215,11 +2377,22 @@ fn reduce_membership_state(
             node.updated_at_unix = op_created_at_unix;
         }
         MembershipOperation::RemoveNode { node_id } => {
-            let before = next.nodes.len();
+            let removed = next
+                .nodes
+                .iter()
+                .find(|candidate| candidate.node_id == *node_id)
+                .cloned()
+                .ok_or_else(|| MembershipError::NotFound(format!("node {node_id}")))?;
             next.nodes.retain(|candidate| candidate.node_id != *node_id);
-            if next.nodes.len() == before {
-                return Err(MembershipError::NotFound(format!("node {node_id}")));
-            }
+            // The identity leaves a trace: "removed" means removed, not
+            // "removed until someone re-types the id and key".
+            push_tombstone(
+                &mut next,
+                &removed.node_id,
+                &removed.node_pubkey_hex,
+                op_created_at_unix,
+                authority,
+            )?;
         }
         MembershipOperation::RevokeNode { node_id } => {
             let node = next
@@ -2232,6 +2405,18 @@ fn reduce_membership_state(
             }
             node.status = MembershipNodeStatus::Revoked;
             node.updated_at_unix = op_created_at_unix;
+            let (revoked_id, revoked_key) = (node.node_id.clone(), node.node_pubkey_hex.clone());
+            // Belt-and-braces for the revoke → remove → re-add chain: the
+            // node is still present (so the duplicate-id check already
+            // blocks a re-add), but the record is written now so a later
+            // status-shape change cannot silently reopen the door.
+            push_tombstone(
+                &mut next,
+                &revoked_id,
+                &revoked_key,
+                op_created_at_unix,
+                authority,
+            )?;
         }
         MembershipOperation::RestoreNode { node_id } => {
             let node = next
@@ -2255,8 +2440,19 @@ fn reduce_membership_state(
                 .iter_mut()
                 .find(|candidate| candidate.node_id == *node_id)
                 .ok_or_else(|| MembershipError::NotFound(format!("node {node_id}")))?;
-            node.node_pubkey_hex = new_pubkey_hex.clone();
+            let retired_key = std::mem::replace(&mut node.node_pubkey_hex, new_pubkey_hex.clone());
             node.updated_at_unix = op_created_at_unix;
+            let rotated_id = node.node_id.clone();
+            // The retired key is recorded so its bytes cannot later be
+            // minted onto a fresh id owner-free. Rotation is owner-gated
+            // unconditionally, so `authority` is always Owner here.
+            push_tombstone(
+                &mut next,
+                &rotated_id,
+                &retired_key,
+                op_created_at_unix,
+                authority,
+            )?;
         }
         MembershipOperation::RotateApprover(approver) => {
             decode_hex_to_fixed::<32>(&approver.approver_pubkey_hex)?;
@@ -2278,8 +2474,50 @@ fn reduce_membership_state(
             }
             next.quorum_threshold = *threshold;
         }
+        MembershipOperation::PruneTombstones { older_than_unix } => {
+            // A cutoff in the future (beyond the skew the signed record is
+            // already held to) is malformed: it would prune rows written by
+            // this very update's contemporaries.
+            if *older_than_unix > op_created_at_unix.saturating_add(MEMBERSHIP_CLOCK_SKEW_SECS) {
+                return Err(MembershipError::InvalidTransition(
+                    "tombstone prune cutoff must not be in the future",
+                ));
+            }
+            next.tombstones
+                .retain(|tombstone| tombstone.removed_at_unix >= *older_than_unix);
+        }
     }
     Ok(next)
+}
+
+/// Record a retired identity. Refuses at the cap rather than dropping a row:
+/// a full tombstone table freezes removals until the owner prunes, which is
+/// visible, where silently forgetting the oldest identity would not be.
+/// Re-tombstoning an identical `(node_id, pubkey)` pair replaces the row —
+/// latest removal wins.
+fn push_tombstone(
+    next: &mut MembershipState,
+    node_id: &str,
+    node_pubkey_hex: &str,
+    removed_at_unix: u64,
+    authority: TombstoneAuthority,
+) -> Result<(), MembershipError> {
+    let node_pubkey_hex = node_pubkey_hex.to_ascii_lowercase();
+    next.tombstones.retain(|tombstone| {
+        !(tombstone.node_id == node_id && tombstone.node_pubkey_hex == node_pubkey_hex)
+    });
+    if next.tombstones.len() >= MAX_MEMBERSHIP_TOMBSTONE_COUNT {
+        return Err(MembershipError::InvalidTransition(
+            "tombstone table is full; the owner must prune tombstones before retiring another identity",
+        ));
+    }
+    next.tombstones.push(MembershipTombstoneRecord {
+        node_id: node_id.to_owned(),
+        node_pubkey_hex,
+        removed_at_unix,
+        authority,
+    });
+    Ok(())
 }
 
 fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, MembershipError> {
@@ -2357,6 +2595,45 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
         };
         approver_set.push(approver);
     }
+    // REQUIRED, never inferred: a snapshot with no tombstone section is
+    // refused with a named diagnostic. Defaulting an absent section to
+    // "no tombstones" would let a pre-upgrade snapshot silently strip the
+    // identity protection this section carries (the `capabilities`
+    // precedent, `parse_node_capabilities`).
+    let tombstone_count = match fields.get("tombstone_count") {
+        Some(_) => bounded_count(
+            "tombstone_count",
+            parse_usize_field(&fields, "tombstone_count")?,
+            MAX_MEMBERSHIP_TOMBSTONE_COUNT,
+            fields.len(),
+        )?,
+        None => {
+            return Err(MembershipError::InvalidFormat(
+                "tombstone_count is missing; tombstones are never inferred — \
+                 re-issue the membership snapshot with an explicit tombstone section"
+                    .to_owned(),
+            ));
+        }
+    };
+    let mut tombstones = Vec::with_capacity(tombstone_count);
+    for index in 0..tombstone_count {
+        tombstones.push(MembershipTombstoneRecord {
+            node_id: required_field(&fields, &format!("tombstone.{index}.node_id"))?.to_owned(),
+            node_pubkey_hex: required_field(
+                &fields,
+                &format!("tombstone.{index}.node_pubkey_hex"),
+            )?
+            .to_owned(),
+            removed_at_unix: parse_u64_field(
+                &fields,
+                &format!("tombstone.{index}.removed_at_unix"),
+            )?,
+            authority: TombstoneAuthority::parse(required_field(
+                &fields,
+                &format!("tombstone.{index}.authority"),
+            )?)?,
+        });
+    }
 
     Ok(MembershipState {
         schema_version: version,
@@ -2366,6 +2643,7 @@ fn parse_membership_state_payload(payload: &str) -> Result<MembershipState, Memb
         approver_set,
         quorum_threshold,
         metadata_hash,
+        tombstones,
     })
 }
 
@@ -2453,6 +2731,9 @@ fn parse_membership_update_payload(
         }),
         "set_quorum" => MembershipOperation::SetQuorum {
             threshold: parse_u8_field(&fields, "op.threshold")?,
+        },
+        "prune_tombstones" => MembershipOperation::PruneTombstones {
+            older_than_unix: parse_u64_field(&fields, "op.older_than_unix")?,
         },
         _ => {
             return Err(MembershipError::InvalidFormat(format!(
@@ -3017,17 +3298,19 @@ fn sha256_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_REPLAY_CACHE_ENTRIES, MEMBERSHIP_CLOCK_SKEW_SECS, MEMBERSHIP_SCHEMA_VERSION,
-        MembershipApprover, MembershipApproverRole, MembershipApproverStatus, MembershipError,
-        MembershipNode, MembershipNodeStatus, MembershipOperation, MembershipReplayCache,
-        MembershipSignature, MembershipState, MembershipUpdateRecord, MembershipWatermark,
-        SignedMembershipUpdate, append_membership_log_entry, apply_signed_update,
-        decode_membership_state, decode_update_record, encode_membership_state, hex_encode,
-        load_membership_log, load_membership_snapshot, load_membership_watermark,
-        persist_membership_snapshot, persist_membership_watermark, preview_next_state,
-        reduce_membership_state, replay_membership_snapshot_and_log, sha256_hex,
-        sign_update_record, snapshot_bytes_have_bundle_pull_capability,
-        snapshot_bytes_have_capability, write_membership_audit_log,
+        MAX_MEMBERSHIP_TOMBSTONE_COUNT, MAX_REPLAY_CACHE_ENTRIES, MEMBERSHIP_CLOCK_SKEW_SECS,
+        MEMBERSHIP_SCHEMA_VERSION, MembershipApprover, MembershipApproverRole,
+        MembershipApproverStatus, MembershipError, MembershipNode, MembershipNodeStatus,
+        MembershipOperation, MembershipReplayCache, MembershipSignature, MembershipState,
+        MembershipTombstoneRecord, MembershipUpdateRecord, MembershipWatermark,
+        SignedMembershipUpdate, TombstoneAuthority, append_membership_log_entry,
+        apply_signed_update, decode_membership_state, decode_update_record,
+        encode_membership_state, hex_encode, load_membership_log, load_membership_snapshot,
+        load_membership_watermark, parse_membership_state_payload, persist_membership_snapshot,
+        persist_membership_watermark, preview_next_state, reduce_membership_state,
+        replay_membership_snapshot_and_log, sha256_hex, sign_update_record,
+        snapshot_bytes_have_bundle_pull_capability, snapshot_bytes_have_capability,
+        write_membership_audit_log,
     };
     // The size-cap constants are only exercised by the `#[cfg(unix)]` oversized-file
     // tests below; gate the import to match so Windows does not see them as unused.
@@ -3073,6 +3356,7 @@ mod tests {
             ],
             quorum_threshold: 2,
             metadata_hash: None,
+            tombstones: Vec::new(),
         }
     }
 
@@ -3291,6 +3575,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         genesis.validate().expect("genesis validates");
         let target = crate::roles::canonicalize_role_capabilities([
@@ -4470,6 +4755,431 @@ mod tests {
             .expect("a guardian quorum must still be able to enrol a plain client");
     }
 
+    // ── Membership tombstones (MembershipTombstoneDesign_2026-09-08.md §7) ──
+    // Every test names the mutation it kills. `apply_op` drives the real
+    // apply path (signatures, guard, reducer, root recompute) so a refusal is
+    // the verifier's, not a hand-built fixture's.
+
+    fn apply_op(
+        state: &MembershipState,
+        update_id: &str,
+        operation: MembershipOperation,
+        signers: &[(&str, u8)],
+    ) -> Result<MembershipState, MembershipError> {
+        let candidate = preview_next_state(state, &operation, 140).expect("preview");
+        let signed = signed_update_for(state, &candidate, update_id, "target", operation, signers);
+        apply_signed_update(state, &signed, 150, &mut MembershipReplayCache::default())
+    }
+
+    const GUARDIANS: &[(&str, u8)] = &[("guardian-1", 2), ("guardian-2", 3)];
+    const OWNER_AND_GUARDIAN: &[(&str, u8)] = &[("owner-1", 1), ("guardian-1", 2)];
+
+    fn plain_client(node_id: &str, key_byte: u8) -> MembershipNode {
+        let mut node = active_node(node_id, key_byte);
+        node.capabilities = vec![RoleCapability::Client];
+        node
+    }
+
+    /// A state holding one quorum-admitted plain client `node-b` that the
+    /// same quorum then removed: the exact pre-fix hole.
+    fn state_after_quorum_removed_client() -> (MembershipState, MembershipNode) {
+        let client = plain_client("node-b", 0xab);
+        let with_client = apply_op(
+            &base_state(),
+            "add-b",
+            MembershipOperation::AddNode(client.clone()),
+            GUARDIANS,
+        )
+        .expect("quorum admits a plain client");
+        let removed = apply_op(
+            &with_client,
+            "remove-b",
+            MembershipOperation::RemoveNode {
+                node_id: "node-b".to_owned(),
+            },
+            GUARDIANS,
+        )
+        .expect("quorum removes a plain client");
+        assert!(removed.nodes.iter().all(|node| node.node_id != "node-b"));
+        (removed, client)
+    }
+
+    /// THE test: fails on the exact pre-fix code (delete the tombstone write
+    /// from `RemoveNode` and the quorum re-mint applies again).
+    #[test]
+    fn removed_identity_cannot_be_reminted_without_owner() {
+        let (state, client) = state_after_quorum_removed_client();
+        assert_eq!(state.tombstones.len(), 1);
+        assert_eq!(state.tombstones[0].authority, TombstoneAuthority::Quorum);
+        let err = apply_op(
+            &state,
+            "readd-b",
+            MembershipOperation::AddNode(client),
+            GUARDIANS,
+        )
+        .expect_err("a removed identity must not come back owner-free");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Mutation: guard matches `node_id` only → the removed KEY under a fresh
+    /// id would pass.
+    #[test]
+    fn removed_key_on_new_id_requires_owner() {
+        let (state, client) = state_after_quorum_removed_client();
+        let mut fresh_id = plain_client("node-c", 0x01);
+        fresh_id.node_pubkey_hex = client.node_pubkey_hex.clone();
+        let err = apply_op(
+            &state,
+            "readd-key",
+            MembershipOperation::AddNode(fresh_id),
+            GUARDIANS,
+        )
+        .expect_err("a removed key under a new id must need the owner");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Mutation: the tombstone compare reverted to `==` → an upper-cased
+    /// spelling of the retired key slips through (review F1 discipline).
+    #[test]
+    fn tombstoned_pubkey_bypass_by_hex_case_is_refused() {
+        let (state, client) = state_after_quorum_removed_client();
+        let mut upper = plain_client("node-c", 0x01);
+        upper.node_pubkey_hex = client.node_pubkey_hex.to_ascii_uppercase();
+        assert_ne!(
+            upper.node_pubkey_hex, client.node_pubkey_hex,
+            "the fixture key must carry hex letters for this test to bite"
+        );
+        let err = apply_op(
+            &state,
+            "readd-upper",
+            MembershipOperation::AddNode(upper),
+            GUARDIANS,
+        )
+        .expect_err("hex case must not bypass a tombstone");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Mutation: override arm deleted (the owner is refused too).
+    #[test]
+    fn owner_signed_add_overrides_tombstone() {
+        let (state, client) = state_after_quorum_removed_client();
+        let next = apply_op(
+            &state,
+            "readd-owner",
+            MembershipOperation::AddNode(client),
+            OWNER_AND_GUARDIAN,
+        )
+        .expect("the owner's signature is the path back in");
+        assert!(next.nodes.iter().any(|node| node.node_id == "node-b"));
+        // The tombstone row is not consumed by the override: a later
+        // quorum-only removal + re-add still needs the owner.
+        assert_eq!(next.tombstones.len(), 1);
+    }
+
+    /// Mutation: tombstone write deleted from `RevokeNode`. The chain here
+    /// also exercises remove-after-revoke, so the RemoveNode write must be
+    /// deleted as well for the test to observe a RevokeNode-only mutation —
+    /// hence the direct assertion on the revoked state's tombstone.
+    #[test]
+    fn revoke_then_remove_then_readd_requires_owner() {
+        let client = plain_client("node-b", 0xab);
+        let with_client = apply_op(
+            &base_state(),
+            "add-b",
+            MembershipOperation::AddNode(client.clone()),
+            GUARDIANS,
+        )
+        .expect("admit");
+        let revoked = apply_op(
+            &with_client,
+            "revoke-b",
+            MembershipOperation::RevokeNode {
+                node_id: "node-b".to_owned(),
+            },
+            GUARDIANS,
+        )
+        .expect("quorum revokes");
+        assert_eq!(
+            revoked.tombstones.len(),
+            1,
+            "RevokeNode must write the tombstone while the node is still present"
+        );
+        let removed = apply_op(
+            &revoked,
+            "remove-b",
+            MembershipOperation::RemoveNode {
+                node_id: "node-b".to_owned(),
+            },
+            GUARDIANS,
+        )
+        .expect("quorum removes a revoked plain client");
+        assert_eq!(
+            removed.tombstones.len(),
+            1,
+            "same (id, key) pair replaces the row"
+        );
+        let err = apply_op(
+            &removed,
+            "readd-b",
+            MembershipOperation::AddNode(client),
+            GUARDIANS,
+        )
+        .expect_err("re-add after revoke+remove must need the owner");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Mutation: tombstone write deleted from `RotateNodeKey`.
+    #[test]
+    fn rotate_node_key_retires_the_old_key() {
+        let state = base_state();
+        let old_key = state.nodes[0].node_pubkey_hex.clone();
+        let rotated = apply_op(
+            &state,
+            "rotate-a",
+            MembershipOperation::RotateNodeKey {
+                node_id: "node-a".to_owned(),
+                new_pubkey_hex: hex_encode(&[0x5c; 32]),
+            },
+            OWNER_AND_GUARDIAN,
+        )
+        .expect("owner rotates");
+        assert_eq!(rotated.tombstones.len(), 1);
+        assert_eq!(rotated.tombstones[0].node_pubkey_hex, old_key);
+        assert_eq!(rotated.tombstones[0].authority, TombstoneAuthority::Owner);
+        let mut reuse = plain_client("node-c", 0x01);
+        reuse.node_pubkey_hex = old_key;
+        let err = apply_op(
+            &rotated,
+            "reuse-old",
+            MembershipOperation::AddNode(reuse),
+            GUARDIANS,
+        )
+        .expect_err("a retired key must not be re-minted owner-free");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Mutation: `requires_owner_signer` returns false for `PruneTombstones`
+    /// (the `_ => false` catch-all trap named in the 2026-09-08 review §2.6).
+    #[test]
+    fn prune_tombstones_requires_owner() {
+        let (state, _) = state_after_quorum_removed_client();
+        let err = apply_op(
+            &state,
+            "prune",
+            MembershipOperation::PruneTombstones {
+                older_than_unix: 141,
+            },
+            GUARDIANS,
+        )
+        .expect_err("a quorum must never prune");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+    }
+
+    /// Mutation: prune ignores the cutoff (removes everything), or the guard
+    /// gains an age exemption.
+    #[test]
+    fn prune_is_age_bounded_and_recent_tombstones_still_bind() {
+        let (state, client) = state_after_quorum_removed_client();
+        // The fixture tombstone was written at created_at 140. A cutoff below
+        // it keeps the row; the identity still binds.
+        let kept = apply_op(
+            &state,
+            "prune-none",
+            MembershipOperation::PruneTombstones {
+                older_than_unix: 140,
+            },
+            OWNER_AND_GUARDIAN,
+        )
+        .expect("owner prunes");
+        assert_eq!(kept.tombstones.len(), 1);
+        let err = apply_op(
+            &kept,
+            "readd-still-bound",
+            MembershipOperation::AddNode(client.clone()),
+            GUARDIANS,
+        )
+        .expect_err("an unpruned tombstone binds regardless of age");
+        assert_eq!(err, MembershipError::OwnerSignatureRequired);
+        // A cutoff above it removes the row: the documented consequence is
+        // that the identity is owner-free again.
+        let pruned = apply_op(
+            &kept,
+            "prune-old",
+            MembershipOperation::PruneTombstones {
+                older_than_unix: 141,
+            },
+            OWNER_AND_GUARDIAN,
+        )
+        .expect("owner prunes");
+        assert!(pruned.tombstones.is_empty());
+        apply_op(
+            &pruned,
+            "readd-after-prune",
+            MembershipOperation::AddNode(client),
+            GUARDIANS,
+        )
+        .expect("after an owner-signed prune the identity is re-mintable");
+    }
+
+    /// A cutoff in the future (beyond the record's own skew allowance) is
+    /// malformed, never applied.
+    #[test]
+    fn prune_refuses_a_future_cutoff() {
+        let (state, _) = state_after_quorum_removed_client();
+        let err = reduce_membership_state(
+            &state,
+            &MembershipOperation::PruneTombstones {
+                older_than_unix: 140 + MEMBERSHIP_CLOCK_SKEW_SECS + 1,
+            },
+            140,
+        )
+        .expect_err("future cutoff must be refused");
+        assert!(
+            matches!(err, MembershipError::InvalidTransition(_)),
+            "{err:?}"
+        );
+    }
+
+    /// Mutation: parser defaults an absent section to an empty vec.
+    #[test]
+    fn parse_refuses_snapshot_without_tombstone_section() {
+        let (state, _) = state_after_quorum_removed_client();
+        let payload = state.canonical_payload().expect("payload");
+        assert!(payload.contains("tombstone_count=1\n"));
+        let stripped: String = payload
+            .lines()
+            .filter(|line| !line.starts_with("tombstone"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        let err = parse_membership_state_payload(&stripped)
+            .expect_err("a snapshot with no tombstone section must be refused");
+        match err {
+            MembershipError::InvalidFormat(message) => {
+                assert!(message.contains("tombstone_count is missing"), "{message}");
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+        // The full payload round-trips, tombstones included (rosters are
+        // canonically sorted on the way out, so compare canonical forms).
+        let parsed = parse_membership_state_payload(&payload).expect("round trip");
+        assert_eq!(parsed.tombstones, state.tombstones);
+        assert_eq!(parsed.canonical_payload().expect("payload"), payload);
+    }
+
+    /// Mutation: any validation branch skipped.
+    #[test]
+    fn validate_rejects_malformed_and_duplicate_tombstones() {
+        let (state, _) = state_after_quorum_removed_client();
+        let row = state.tombstones[0].clone();
+
+        let mut bad_hex = state.clone();
+        bad_hex.tombstones[0].node_pubkey_hex = "zz".to_owned();
+        assert!(
+            bad_hex.validate().is_err(),
+            "undecodable pubkey must reject"
+        );
+
+        let mut empty_id = state.clone();
+        empty_id.tombstones[0].node_id = "  ".to_owned();
+        assert!(empty_id.validate().is_err(), "empty node id must reject");
+
+        let mut upper = state.clone();
+        upper.tombstones[0].node_pubkey_hex = row.node_pubkey_hex.to_ascii_uppercase();
+        assert!(
+            upper.validate().is_err(),
+            "non-canonical hex case must reject"
+        );
+
+        let mut duplicate = state.clone();
+        duplicate.tombstones.push(row);
+        assert!(
+            duplicate.validate().is_err(),
+            "duplicate (id, key) row must reject"
+        );
+
+        let mut unknown_authority = state.canonical_payload().expect("payload");
+        unknown_authority = unknown_authority.replace("authority=quorum", "authority=anyone");
+        assert!(parse_membership_state_payload(&unknown_authority).is_err());
+
+        assert!(state.validate().is_ok());
+    }
+
+    /// Mutation: unsorted iteration or field reorder in the section.
+    #[test]
+    fn canonical_payload_is_deterministic_with_tombstones() {
+        let (state, _) = state_after_quorum_removed_client();
+        let mut shuffled = state.clone();
+        shuffled.tombstones.push(MembershipTombstoneRecord {
+            node_id: "node-0".to_owned(),
+            node_pubkey_hex: hex_encode(&[0x11; 32]),
+            removed_at_unix: 5,
+            authority: TombstoneAuthority::Owner,
+        });
+        let mut reversed = shuffled.clone();
+        reversed.tombstones.reverse();
+        assert_eq!(
+            shuffled.canonical_payload().expect("payload"),
+            reversed.canonical_payload().expect("payload")
+        );
+        assert_eq!(
+            shuffled.state_root_hex().expect("root"),
+            reversed.state_root_hex().expect("root")
+        );
+        assert_ne!(
+            state.state_root_hex().expect("root"),
+            shuffled.state_root_hex().expect("root"),
+            "a tombstone row must move the root"
+        );
+    }
+
+    /// Owner-signed removals stamp Owner; the tag is derived from the guard,
+    /// not from the drafter (base_state's node-a is an anchor, so its
+    /// removal is owner-gated).
+    #[test]
+    fn owner_gated_removal_stamps_owner_authority() {
+        let removed = apply_op(
+            &base_state(),
+            "remove-a",
+            MembershipOperation::RemoveNode {
+                node_id: "node-a".to_owned(),
+            },
+            OWNER_AND_GUARDIAN,
+        )
+        .expect("owner removes the anchor");
+        assert_eq!(removed.tombstones.len(), 1);
+        assert_eq!(removed.tombstones[0].authority, TombstoneAuthority::Owner);
+        assert_eq!(removed.tombstones[0].removed_at_unix, 140);
+    }
+
+    /// Mutation: the cap check dropped (the table grows without bound) or
+    /// inverted into silent eviction of the oldest row.
+    #[test]
+    fn tombstone_table_at_cap_refuses_another_removal() {
+        let mut state = base_state();
+        state.nodes.push(plain_client("node-b", 0xab));
+        for index in 0..MAX_MEMBERSHIP_TOMBSTONE_COUNT {
+            state.tombstones.push(MembershipTombstoneRecord {
+                node_id: format!("gone-{index}"),
+                node_pubkey_hex: hex_encode(&[0x22; 32]),
+                removed_at_unix: 1,
+                authority: TombstoneAuthority::Quorum,
+            });
+        }
+        assert!(state.validate().is_ok());
+        let err = reduce_membership_state(
+            &state,
+            &MembershipOperation::RemoveNode {
+                node_id: "node-b".to_owned(),
+            },
+            140,
+        )
+        .expect_err("a full tombstone table must refuse the removal");
+        assert!(
+            matches!(err, MembershipError::InvalidTransition(_)),
+            "{err:?}"
+        );
+    }
+
     /// Re-admitting a key the mesh already knows is an identity substitution
     /// even when the capability set offered is plain `Client`: the reducer
     /// only refuses a duplicate `node_id`, never a duplicate pubkey.
@@ -4564,17 +5274,19 @@ mod tests {
         let mut client = active_node("node-c", 12);
         client.capabilities = vec![RoleCapability::Client];
         state.nodes.push(client);
-        let mut candidate = state.clone();
-        candidate.nodes.retain(|n| n.node_id != "node-c");
-        candidate.epoch += 1;
+        // Preview through the reducer: a removal now also writes the
+        // node's tombstone, and a hand-built candidate would miss it.
+        let operation = MembershipOperation::RemoveNode {
+            node_id: "node-c".to_owned(),
+        };
+        let candidate = preview_next_state(&state, &operation, 140).expect("preview");
+        assert!(candidate.nodes.iter().all(|n| n.node_id != "node-c"));
         let signed = signed_update_for(
             &state,
             &candidate,
             "update-remove-client",
             "node-c",
-            MembershipOperation::RemoveNode {
-                node_id: "node-c".to_owned(),
-            },
+            operation,
             &[("guardian-1", 2), ("guardian-2", 3)],
         );
 
@@ -4708,19 +5420,21 @@ mod tests {
     fn owner_signed_rotate_node_key_is_accepted() {
         let state = base_state();
         let replacement = hex_encode(SigningKey::from_bytes(&[11; 32]).verifying_key().as_bytes());
-        let mut candidate = state.clone();
-        candidate.nodes[0].node_pubkey_hex = replacement.clone();
-        candidate.nodes[0].updated_at_unix = 140;
-        candidate.epoch += 1;
+        // Preview through the reducer: rotation now also tombstones the
+        // retired key, and a hand-built candidate would miss that row.
+        let operation = MembershipOperation::RotateNodeKey {
+            node_id: "node-a".to_owned(),
+            new_pubkey_hex: replacement.clone(),
+        };
+        let candidate = preview_next_state(&state, &operation, 140).expect("preview");
+        assert_eq!(candidate.nodes[0].node_pubkey_hex, replacement);
+        assert_eq!(candidate.nodes[0].updated_at_unix, 140);
         let signed = signed_update_for(
             &state,
             &candidate,
             "update-rotate-node-key-owner",
             "node-a",
-            MembershipOperation::RotateNodeKey {
-                node_id: "node-a".to_owned(),
-                new_pubkey_hex: replacement.clone(),
-            },
+            operation,
             &[("owner-1", 1), ("guardian-1", 2)],
         );
 

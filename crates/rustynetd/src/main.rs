@@ -4539,6 +4539,7 @@ fn run_membership_init(args: &[String]) -> Result<(), String> {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
 
         // A4: mint the genesis head attestation immediately — the owner

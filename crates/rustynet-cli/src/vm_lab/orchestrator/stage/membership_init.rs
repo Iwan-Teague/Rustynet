@@ -724,6 +724,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         // The exact bytes `persist_membership_snapshot` writes, rendered in
         // memory (the persist path chmods its parent directory, which the

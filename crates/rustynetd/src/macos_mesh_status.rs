@@ -290,6 +290,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         let snapshot = dir.join("membership.snapshot");
         persist_membership_snapshot(&snapshot, &state).expect("persist membership fixture");
@@ -747,6 +748,7 @@ mod tests {
             }],
             quorum_threshold: 1,
             metadata_hash: None,
+            tombstones: Vec::new(),
         };
         let membership_snapshot_path = dir.join("membership.snapshot");
         persist_membership_snapshot(&membership_snapshot_path, &state)
