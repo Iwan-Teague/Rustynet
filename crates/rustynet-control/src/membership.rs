@@ -73,7 +73,14 @@ pub const MAX_MEMBERSHIP_APPROVER_COUNT: usize = 4_096;
 /// (`MembershipTombstoneDesign_2026-09-08.md` §4.4). At the cap a removal,
 /// revocation, or key rotation is REFUSED rather than silently dropping
 /// protection; only an owner-signed `PruneTombstones` makes room.
-pub const MAX_MEMBERSHIP_TOMBSTONE_COUNT: usize = 65_536;
+///
+/// Sized against `MAX_MEMBERSHIP_SNAPSHOT_BYTES`, not against the node cap:
+/// a row is ~200 canonical bytes, hex-doubled on disk, so 8_192 rows cost
+/// ~3.3 MiB of an 8 MiB budget. The design's 65_536 would have let the
+/// table push a snapshot past the byte limit — persisted fine, refused on
+/// the next load — which bricks the node instead of refusing the removal
+/// (flash review F1, 2026-09-09).
+pub const MAX_MEMBERSHIP_TOMBSTONE_COUNT: usize = 8_192;
 pub const MAX_MEMBERSHIP_SIGNATURE_COUNT: usize = 4_096;
 
 /// Upper bound on any free-form operator-supplied string that
@@ -465,6 +472,10 @@ impl MembershipState {
                     "tombstone node id must not be empty".to_owned(),
                 ));
             }
+            // Same payload-field discipline as node ids: a row id is only
+            // ever sourced from a validated node today, but the check must
+            // not depend on that staying true.
+            validate_membership_payload_field("tombstone node id", &tombstone.node_id)?;
             decode_hex_to_fixed::<32>(&tombstone.node_pubkey_hex)?;
             if tombstone.node_pubkey_hex != tombstone.node_pubkey_hex.to_ascii_lowercase() {
                 return Err(MembershipError::InvalidFormat(
@@ -482,8 +493,12 @@ impl MembershipState {
     }
 
     /// Does a tombstone bind this identity? Either coordinate matches: the
-    /// exact `node_id`, or the pubkey compared case-insensitively (review F1
-    /// discipline — hex is not canonical on the AddNode path).
+    /// exact `node_id` (node ids are case-SENSITIVE everywhere in this
+    /// module, including the reducer's duplicate-id check, so `Node-A` and
+    /// `node-a` are distinct identities — a case-variant id carrying the
+    /// retired KEY still binds via the pubkey coordinate), or the pubkey
+    /// compared case-insensitively (review F1 discipline — hex is not
+    /// canonical on the AddNode path).
     pub fn tombstone_binds(&self, node_id: &str, node_pubkey_hex: &str) -> bool {
         self.tombstones.iter().any(|tombstone| {
             tombstone.node_id == node_id
