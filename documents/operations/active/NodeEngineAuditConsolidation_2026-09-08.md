@@ -222,6 +222,24 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
 `_ => "linux"` class in its `--platform` argv builder; now routed through
 `desktop_platform_tag` (Ios/Android → `Failed`).
 
+## 3b) Live re-verify (2026-09-09)
+
+Two 2-node Linux runs launched ON lenovo-bot (`lenovo-client-1:client`,
+`lenovo-exit-1:exit`) via `launch_live_lab_on_host` — the first runs ever
+driven from that host, which surfaced three host-provisioning gaps (no cargo
+on the non-login PATH → launcher fix `014a7bd7`; umask-002 checkout refused
+by the workspace-mode check; no SSH key on the host):
+
+| Run | Commit | Result | Meaning |
+|---|---|---|---|
+| `livelab-1788916793` | `3bfc99e6` | 34 pass / **1 fail** / 62 skip | `key_custody_validation` failed on BOTH nodes: the pattern-G row check counted the producer's healthy `AbsentAsExpected` as drift. The design-review caveat ("did not verify the producer can emit the shape") was the tell; fixed `36c7017f` with the real shape as the fixture. |
+| `livelab-1788919346` | `36c7017f` | **39 pass / 0 fail** / 54 skip | First Linux run under the QH-83 evidence gate: `membership_init`, `traffic_test_matrix`, `active_exit` all passed WITH witnesses, no `NotProven` demotion. Skips are the 2-node topology (no anchor/relay/entry/second client). |
+
+Both rows are in `live_lab_node_run_matrix.csv` / `live_lab_node_stage_results.csv`
+(copied from the host's own ledger). The QH-83 "Linux live re-verify OWED" is
+discharged for the phase-1 witness set; the blind_exit cell (QH-86) still
+needs a topology that assigns `blind_exit`.
+
 ## 4) Method notes
 
 - Probe runs: two of five came back EMPTY on the first launch (0 bytes, no
