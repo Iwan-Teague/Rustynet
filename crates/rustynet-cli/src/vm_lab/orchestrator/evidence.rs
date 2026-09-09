@@ -297,6 +297,15 @@ fn rust_native_reuse_evidence_digest(report_dir: &Path) -> Result<String, String
     }
     let mut records = parse_live_lab_stage_records(report_dir)?;
     records.sort_by(|a, b| a.name.cmp(&b.name));
+    // Only a pass (or a validated reuse of one) was required to carry a
+    // witness at execute time; a reported skip legitimately leaves none, and
+    // hashing its absent artifact would make every honest skip-run
+    // unreusable (review of runner-edge F3).
+    let witnessed: std::collections::BTreeSet<String> = records
+        .iter()
+        .filter(|record| record.status == "pass" || record.status == "reused")
+        .map(|record| record.name.clone())
+        .collect();
     for record in records {
         let bytes = fs::read(&record.log_path).map_err(|err| {
             format!(
@@ -308,7 +317,7 @@ fn rust_native_reuse_evidence_digest(report_dir: &Path) -> Result<String, String
         hasher.update([0]);
         hasher.update(bytes);
     }
-    // Runner-edge audit F3: bind every PLANNED stage's declared pass witness
+    // Runner-edge audit F3: bind every PASSED planned stage's declared witness
     // into the seal, not just manifests/logs/context. Without this a witness
     // file could be rewritten (or a passed `File`-declared stage could lose
     // its artifact entirely) and reuse validation would still accept the
@@ -324,6 +333,9 @@ fn rust_native_reuse_evidence_digest(report_dir: &Path) -> Result<String, String
     planned.sort_unstable();
     planned.dedup();
     for name in planned {
+        if !witnessed.contains(name) {
+            continue;
+        }
         let id = orchestrator::stage::StageId::ALL
             .iter()
             .find(|id| id.as_str() == name)
