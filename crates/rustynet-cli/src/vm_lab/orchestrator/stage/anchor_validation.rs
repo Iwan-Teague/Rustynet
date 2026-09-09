@@ -290,18 +290,18 @@ impl OrchestrationStage for AnchorValidationStage {
                     "anchor validation reported-skips note write failed: {e}"
                 ));
             }
-            // QH-83: on the pass path (no failures, no reported runtime
-            // skips — outcome_for will grade Passed) the witness naming each
-            // validated anchor must land, or the stage fails.
-            if runtime_skips.is_empty()
-                && let Err(e) = write_anchor_validation_witness(&ctx.report_dir, &validated)
-            {
-                return StageOutcome::Failed(format!(
-                    "anchor validation witness write failed: {e}"
-                ));
-            }
         }
-        outcome_for(&failures, &runtime_skips)
+        // QH-83: grade FIRST, then witness exactly the Passed verdict — the
+        // gate reads the grader's own answer rather than re-deriving its
+        // predicate, so the two cannot drift apart. The witness naming each
+        // validated anchor must land, or the stage fails.
+        let outcome = outcome_for(&failures, &runtime_skips);
+        if matches!(outcome, StageOutcome::Passed)
+            && let Err(e) = write_anchor_validation_witness(&ctx.report_dir, &validated)
+        {
+            return StageOutcome::Failed(format!("anchor validation witness write failed: {e}"));
+        }
+        outcome
     }
 }
 
