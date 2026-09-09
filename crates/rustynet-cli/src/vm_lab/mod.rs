@@ -53728,6 +53728,201 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Audit F3 fixture: a passing run whose plan includes a `File`-witness
+    /// stage (traffic_test_matrix), sealed for reuse.
+    fn reuse_fixture_with_file_witness(
+        tmp: &Path,
+        witness_bytes: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use super::orchestrator::error::StageOutcome;
+        use super::orchestrator::runner::StageObserver;
+        use super::orchestrator::stage::StageId;
+
+        fs::create_dir_all(tmp.join("state"))?;
+        super::write_rust_native_report_state_initial(tmp, "working-tree", None)?;
+        let mut active = std::collections::HashSet::new();
+        active.insert(StageId::Preflight.as_str().to_owned());
+        active.insert(StageId::TrafficTestMatrix.as_str().to_owned());
+        let manifest = crate::live_lab_stage_manifest::build_stage_manifest(
+            "test",
+            "live_suite",
+            &crate::live_lab_stage_registry::TargetSelectors::default(),
+            &active,
+        );
+        crate::live_lab_stage_manifest::write_stage_manifest(tmp, &manifest)?;
+        fs::write(
+            tmp.join("state/orchestration_context.json"),
+            b"bound-context",
+        )?;
+        fs::create_dir_all(tmp.join("logs"))?;
+        fs::write(
+            tmp.join("logs/traffic_test_matrix.pair_results.log"),
+            witness_bytes,
+        )?;
+        let recorder = super::RustNativeStageRecorder {
+            report_dir: tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+            errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
+        };
+        for id in [StageId::Preflight, StageId::TrafficTestMatrix] {
+            recorder.stage_started(&id);
+            recorder.stage_finished(&id, &StageOutcome::Passed);
+        }
+        assert!(recorder.take_errors().is_empty());
+        super::write_rust_native_report_state_final(
+            tmp,
+            true,
+            "working-tree",
+            None,
+            false,
+            true,
+            true,
+        )?;
+        super::write_rust_native_reuse_evidence_seal(tmp)?;
+        Ok(())
+    }
+
+    /// Review of runner-edge F3: a planned `File`-declared stage that was
+    /// reported-SKIPPED leaves no witness by contract; the seal must not
+    /// demand one. Mutation caught: hashing witnesses for every planned
+    /// stage regardless of status (the seal write then fails on the absent
+    /// artifact and no skip-run is ever reusable).
+    #[test]
+    fn a_skipped_file_declared_stage_needs_no_witness_in_the_reuse_seal() {
+        use super::orchestrator::error::StageOutcome;
+        use super::orchestrator::runner::StageObserver;
+        use super::orchestrator::stage::StageId;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-skip-{}.dir",
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(tmp.join("state")).expect("state dir");
+        super::write_rust_native_report_state_initial(&tmp, "working-tree", None)
+            .expect("initial state");
+        let mut active = std::collections::HashSet::new();
+        active.insert(StageId::Preflight.as_str().to_owned());
+        active.insert(StageId::TrafficTestMatrix.as_str().to_owned());
+        let manifest = crate::live_lab_stage_manifest::build_stage_manifest(
+            "test",
+            "live_suite",
+            &crate::live_lab_stage_registry::TargetSelectors::default(),
+            &active,
+        );
+        crate::live_lab_stage_manifest::write_stage_manifest(&tmp, &manifest).expect("manifest");
+        fs::write(
+            tmp.join("state/orchestration_context.json"),
+            b"bound-context",
+        )
+        .expect("context");
+        let recorder = super::RustNativeStageRecorder {
+            report_dir: &tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+            errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
+        };
+        recorder.stage_started(&StageId::Preflight);
+        recorder.stage_finished(&StageId::Preflight, &StageOutcome::Passed);
+        recorder.stage_finished(
+            &StageId::TrafficTestMatrix,
+            &StageOutcome::Skipped("no mesh peers in this topology".to_owned()),
+        );
+        assert!(recorder.take_errors().is_empty());
+        super::write_rust_native_report_state_final(
+            &tmp,
+            true,
+            "working-tree",
+            None,
+            false,
+            true,
+            true,
+        )
+        .expect("final state");
+        // No logs/traffic_test_matrix.pair_results.log exists — by contract.
+        super::write_rust_native_reuse_evidence_seal(&tmp)
+            .expect("a skipped File-declared stage must not block the seal");
+        super::validate_rust_native_reuse_evidence(&tmp, &[StageId::Preflight])
+            .expect("reusing the passed stage must validate");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tampering_a_declared_file_witness_fails_reuse_validation() {
+        // Audit F3 mutation target: a digest that does NOT hash the declared
+        // File witnesses would still match the seal after the rewrite below,
+        // and this test would fail.
+        use super::orchestrator::stage::StageId;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-tamper-{}.dir",
+            super::unique_suffix()
+        ));
+        let tmp = PathBuf::from(&tmp);
+        reuse_fixture_with_file_witness(&tmp, b"pair results v1").expect("fixture");
+        super::validate_rust_native_reuse_evidence(
+            &tmp,
+            &[StageId::Preflight, StageId::TrafficTestMatrix],
+        )
+        .expect("sealed evidence");
+
+        fs::write(
+            tmp.join("logs/traffic_test_matrix.pair_results.log"),
+            b"tampered",
+        )
+        .expect("tamper witness");
+        let err = super::validate_rust_native_reuse_evidence(
+            &tmp,
+            &[StageId::Preflight, StageId::TrafficTestMatrix],
+        )
+        .expect_err("witness tamper must fail");
+        assert!(err.contains("digest mismatch"), "{err}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn reuse_validation_rejects_missing_or_empty_declared_witness() {
+        // Audit F3 mutation target: dropping the witness presence check (or
+        // its emptiness arm) from validate_rust_native_reuse_evidence would
+        // let a prior run replay a pass whose proof vanished or was never
+        // written, and these assertions would fail.
+        use super::orchestrator::stage::StageId;
+
+        let ids = &[StageId::Preflight, StageId::TrafficTestMatrix];
+
+        // (a) witness deleted after sealing: the seal's own digest recompute
+        // must fail on the absent artifact.
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-missing-{}.dir",
+            super::unique_suffix()
+        ));
+        let tmp = PathBuf::from(&tmp);
+        reuse_fixture_with_file_witness(&tmp, b"pair results").expect("fixture");
+        fs::remove_file(tmp.join("logs/traffic_test_matrix.pair_results.log")).expect("remove");
+        let err = super::validate_rust_native_reuse_evidence(&tmp, ids)
+            .expect_err("missing witness must fail");
+        // The per-stage witness presence check trips before the seal's
+        // digest recompute — both would fail; the message names the file.
+        assert!(
+            err.contains("declared witness") && err.contains("unreadable"),
+            "{err}"
+        );
+        fs::remove_dir_all(&tmp).ok();
+
+        // (b) witness present but whitespace-only: accepted bytes, refused
+        // by the emptiness arm.
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-empty-{}.dir",
+            super::unique_suffix()
+        ));
+        let tmp = PathBuf::from(&tmp);
+        reuse_fixture_with_file_witness(&tmp, b"  \n\t ").expect("fixture");
+        let err = super::validate_rust_native_reuse_evidence(&tmp, ids)
+            .expect_err("empty witness must fail");
+        assert!(err.contains("is empty"), "{err}");
+        fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn shutdown_registration_failure_prevents_following_readiness_work() {
         let readiness_calls = std::cell::Cell::new(0usize);
