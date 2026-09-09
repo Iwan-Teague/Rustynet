@@ -259,4 +259,186 @@ mod tests {
         assert!(s.contains("schema_version") && s.contains("applicable"));
         assert!(s.contains("non-attesting stub"));
     }
+
+    // Stage-level Linux wiring (review of this branch, blocking fix): with a
+    // Linux adapter whose producer returns the constant non-attesting report,
+    // `execute` must return Skipped AND write the raw report artifact.
+    // Mutations caught: deleting the `platform == Linux` branch (the stage
+    // would call run_role_validator → Ok → Passed); dropping the artifact
+    // write (file missing); reverting outcome_for's stub arm (Passed).
+    #[test]
+    fn linux_stub_producer_yields_skipped_with_report_artifact() {
+        use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+        use crate::vm_lab::orchestrator::error::{
+            AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+            MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+            ValidatorReport, WireguardPublicKey,
+        };
+        use crate::vm_lab::orchestrator::role::NodeRole;
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+        use std::collections::HashMap;
+        use std::path::Path;
+
+        #[derive(Debug)]
+        struct FakeLinuxStubAdapter;
+        impl NodeAdapter for FakeLinuxStubAdapter {
+            fn platform(&self) -> VmGuestPlatform {
+                VmGuestPlatform::Linux
+            }
+            fn alias(&self) -> &str {
+                "deb-1"
+            }
+            fn run_linux_authenticode_validator_with_report(
+                &self,
+                _expected_node_id: Option<&str>,
+            ) -> Result<String, AdapterError> {
+                Ok(r#"{"schema_version":1,"overall_ok":true,"applicable":false,"reason":"Linux does not enforce binary signatures"}"#.to_owned())
+            }
+            fn collect_artifacts(&self, _dst: &Path) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn start_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn stop_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn restart_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+                unimplemented!()
+            }
+            fn run_validator(
+                &self,
+                _op: crate::vm_lab::DaemonProbeOp,
+                _extra_args: &[String],
+            ) -> Result<ValidatorReport, AdapterError> {
+                unimplemented!()
+            }
+            fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {
+                unimplemented!()
+            }
+            fn probe_denied_peer(&self, _ip: &str) -> Result<TrafficTestResult, AdapterError> {
+                unimplemented!()
+            }
+            fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+                unimplemented!()
+            }
+            fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn endpoint(&self) -> String {
+                unimplemented!()
+            }
+            fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+                unimplemented!()
+            }
+            fn install_daemon(
+                &self,
+                _source: &SourceArchive,
+                _ctx: &OrchestrationContext,
+            ) -> Result<InstallReport, AdapterError> {
+                unimplemented!()
+            }
+            fn init_membership_snapshot(
+                &self,
+                _owner_key: &MembershipOwnerKey,
+                _peers: &[NodeMembershipPeer],
+            ) -> Result<MembershipSnapshot, AdapterError> {
+                unimplemented!()
+            }
+            fn distribute_signed_bundle(
+                &self,
+                _kind: BundleKind,
+                _bundle_path: &Path,
+            ) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn distribute_verifier_key(
+                &self,
+                _kind: BundleKind,
+                _pub_key_path: &Path,
+            ) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+            fn issue_bundles_to_dir(
+                &self,
+                _kind: BundleKind,
+                _env_content: &str,
+                _local_out_dir: &Path,
+            ) -> Result<(), AdapterError> {
+                unimplemented!()
+            }
+        }
+
+        let report_dir = std::env::temp_dir().join(format!(
+            "authenticode-stage-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&report_dir).expect("temp report dir");
+        let mut adapters: HashMap<String, Box<dyn NodeAdapter>> = HashMap::new();
+        adapters.insert("deb-1".to_owned(), Box::new(FakeLinuxStubAdapter));
+        let mut ctx = OrchestrationContext {
+            assignments: vec![NodeRoleAssignment {
+                alias: "deb-1".to_owned(),
+                role: NodeRole::Client,
+            }],
+            adapters,
+            source_archive: None,
+            report_dir: report_dir.clone(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
+            linux_backend: None,
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
+        };
+        let outcome = AuthenticodeValidationStage.execute(&mut ctx);
+        assert!(
+            matches!(&outcome, StageOutcome::Skipped(m) if m.contains("non-attesting stub")),
+            "Linux stub producer must yield a named skip, got {outcome:?}"
+        );
+        let artifact = report_dir.join(REPORT_FILENAME);
+        let body = std::fs::read_to_string(&artifact).expect("raw report artifact must exist");
+        assert!(
+            body.contains("\"applicable\":false") || body.contains("applicable"),
+            "{body}"
+        );
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
 }
