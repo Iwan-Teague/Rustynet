@@ -63,8 +63,8 @@ impl ValidateBaselineRuntimeStage {
 /// visibility is proven by the dedicated `mesh_status_validation` stage's
 /// live-handshake poll instead, not by this dispatch.
 fn probe_expectations(op: crate::vm_lab::DaemonProbeOp) -> Vec<String> {
-    use crate::vm_lab::DaemonProbeOp;
     use crate::vm_lab::orchestrator::role_validation::mesh_status::SNAPSHOT_MAX_AGE_SECONDS;
+    use crate::vm_lab::DaemonProbeOp;
 
     match op {
         DaemonProbeOp::MeshStatus => vec![
@@ -151,6 +151,14 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         use crate::vm_lab::DaemonProbeOp;
+
+        // F3 fail-closed: an empty scope must not vacuously pass — this
+        // stage is the six-validator posture proof, and an empty assignments
+        // list here means a skip/reuse path bypassed planning. Fail loudly
+        // instead of green-lighting nothing.
+        if ctx.assignments.is_empty() {
+            return StageOutcome::Failed("no assignments in scope".to_owned());
+        }
 
         const OPS: &[DaemonProbeOp] = &[
             DaemonProbeOp::RuntimeAcls,

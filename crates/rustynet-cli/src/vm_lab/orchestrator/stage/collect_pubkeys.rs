@@ -32,6 +32,14 @@ impl OrchestrationStage for CollectPubkeysStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         use crate::vm_lab::orchestrator::error::WireguardPublicKey;
 
+        // F3 fail-closed: an empty scope is not a trivial pass — every
+        // downstream stage keys on the identity this stage records, so
+        // reaching it with no assignments means a skip/reuse path produced
+        // an empty plan and must fail loudly, not vacuously pass.
+        if ctx.assignments.is_empty() {
+            return StageOutcome::Failed("no assignments in scope".to_owned());
+        }
+
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
 
         struct NodeData {
