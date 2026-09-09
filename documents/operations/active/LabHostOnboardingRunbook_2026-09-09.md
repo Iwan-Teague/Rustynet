@@ -67,7 +67,8 @@ tooling, host entries are declared):
 
 ```json
 { "host_id": "katana", "kind": "libvirt",
-  "connect_uri": "qemu+ssh://debian@100.122.143.29/system",
+  "connect_uri": "qemu+ssh://debian@192.168.18.44/system",
+  "alt_ssh_endpoints": ["debian@100.122.143.29"],
   "guest_subnet": "192.168.122.0/24", "repo_dir": "/home/debian/Rustynet",
   "notes": "…hardware, LAN, virt capability, how it is reached…" }
 ```
@@ -120,9 +121,13 @@ Expected: a cargo path, `0022`, `644`, the key, the pushed commit. Then
 
 ## 5) Cross-network note
 
-`lenovo-bot` (192.168.0.0/24, guests bridged) and `katana` (192.168.18.0/24
-Wi-Fi, guests NAT'd on virbr0) are on different physical LANs and reach each
-other only over the tailnet. A lenovo↔katana cross-network run therefore needs
-the katana guests exposed through the host (port-forward or a tailscale subnet
-route on katana) — no Mac host-networking change (CP-1) is involved, which is
-why this pair replaces the Mac-vmnet cross-network topology.
+`lenovo-bot` (192.168.0.0/24, guests bridged onto that LAN) and `katana`
+(192.168.18.0/24 Wi-Fi, guests NAT'd on virbr0) are on different physical
+LANs. Measured 2026-09-09 from the Mac (itself on 192.168.18.16): the two
+LANs are ROUTED — `192.168.0.29` answers in ~110 ms and the bridged lenovo
+guests (`192.168.0.30/.31`) are reachable, no tailnet involved (the Mac's
+Tailscale client was stopped at the time). Katana's own guests sit behind its
+virbr0 NAT, so a lenovo↔katana cross-network run needs them exposed through
+the host (libvirt port-forward / a routed guest network on katana) — but no
+Mac host-networking change (CP-1) is involved, which is why this pair replaces
+the Mac-vmnet cross-network topology.
