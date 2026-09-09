@@ -168,6 +168,21 @@ pub(crate) fn execute_rust_native_orchestration(
     let run_lease = orchestrator::run_instance::acquire_report_dir_lease(report_dir.as_path())?;
     let run_instance_id = run_lease.run_instance_id().as_str().to_owned();
 
+    // D1 (NodeEngineLedgerConsumerAudit 2026-09-09): record the run's START in
+    // the shared run-matrix ledger so a crashed or killed run still leaves a
+    // row saying it never finished; the finalize row replaces it via the
+    // upsert's Final-over-empty-started match. Dry-run writes no row (its
+    // report dir is removed afterwards). A ledger failure warns but never
+    // aborts the run — the finalize path treats matrix failures the same way.
+    if !dry_run {
+        if let Err(err) = crate::live_lab_run_matrix::record_live_lab_run_matrix_run_start(
+            report_dir.as_path(),
+            Some("vm-lab-orchestrate-live-lab"),
+        ) {
+            eprintln!("warning: live-lab run-matrix start row failed: {err}");
+        }
+    }
+
     // The run's network profile is resolved and recorded (or, on resume,
     // digest-verified against the manifests) before anything else runs;
     // profile drift after launch fails closed (rulebook §15.4).
