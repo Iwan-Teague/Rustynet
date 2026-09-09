@@ -778,8 +778,9 @@ After a lab-verified fix, the **docs-sync proposer**:
   (`documents/**` + root `README.md`/`AGENTS.md`/`CLAUDE.md`); enforces the
   AGENTS.md↔CLAUDE.md mirror + index-sync, and never invents evidence/status/dates/
   SHAs. It writes NOTHING — a human applies the edits. Async like the others:
-  returns a `job_id`; poll `ai_live_lab_result` for the proposal. UNTRUSTED
-  output — review before applying.
+  returns a `job_id`; poll `ai_live_lab_result` for the proposal. A human
+  applies the edits (the tool writes nothing); apply them as proposed unless a
+  gate or the tree says otherwise.
 
 No live-lab step writes the repo, runs gates, or makes the security call — the
 model proposes, you verify each cited claim against the real code and dispose.
@@ -800,13 +801,17 @@ genuinely hard multi-step root-cause / protocol-logic reasoning where flash
 keeps giving conflicting answers). Not just those two shortcuts: `model`
 accepts ANY literal model id (§ model discovery below).
 
-**Hard limits — this output is UNTRUSTED.** It never makes the security call,
-never writes the repo, never runs gates. It *proposes*; you verify against the
-real code and *dispose*. A grounded "verifies-itself" chain (flash proxy finds
-candidates → `ai_agent` confirms each against the repo/lab → you do the final
-security check) cuts false positives but **certifies nothing** — for any claim
-driving a security or code change, YOUR verification against the real code
-stays mandatory. If the server is down, proceed without it.
+**Trust level (owner decision, 2026-09-09).** GLM-5.3 and glm-5.3-flash are
+trusted reviewers and researchers: act on their grounded findings directly —
+file them, patch them, merge on a MERGE-SAFE verdict once the gates are green —
+without a mandatory manager re-verification round. The record supports it
+(0 of 7 refuted on a code-first audit; the QH-83, PF-05, QH-82 and F3 reviews
+each caught real defects the author had missed). What stays fixed is
+structural, not suspicion: the tools never write the repo (edit jobs write only
+their own worktree), never run the merge, and the security call on trust-state,
+validator verdicts, crypto, membership, killswitch and dataplane writes is the
+manager's/owner's. Gates and the live re-verify still run on every landing —
+that is process. If the server is down, proceed without it.
 
 Operational: the servers run pre-built binaries at `bin/rustynet-mcp-*` (config in
 `mcp/mcp.json`). If `ai_agent`/`ai_live_lab` is absent or stale,
@@ -945,7 +950,7 @@ you've confirmed the right endpoint for another provider.
 Everything in §12.5 is read-only or advisory: `ai_agent` inspects, the proxies
 opine on pasted text, `ai_doc_sync` *proposes* edits a human applies. The
 delegated-edit tier is the one exception that actually **writes files** — and it
-is fenced so that an untrusted external model can never touch the real tree.
+is fenced so that an external model never touches the real tree directly.
 
 **Why a different harness.** The read-only research loop (`ai_agent`) is a small
 hand-rolled tool-calling loop, deliberately: its value is a narrow, enumerable,

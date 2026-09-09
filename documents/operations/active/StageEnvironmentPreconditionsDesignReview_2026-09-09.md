@@ -1,9 +1,10 @@
 # Review of `StageEnvironmentPreconditionsDesign_2026-09-09.md` — 2026-09-09
 
-**UNTRUSTED adversarial review (GLM-5.3-flash, read-only grounded agent, 12
-steps), docs-only.** Verdict: **BUILD-WITH-CHANGES** — five required changes,
-listed at the end. The manager has NOT yet independently re-verified every
-citation below; treat file:line claims as the reviewer's observations.
+**Adversarial review (GLM-5.3-flash, read-only grounded agent, 12 steps),
+docs-only.** Verdict: **BUILD-WITH-CHANGES** — five required changes, listed
+at the end, all applied to the design in the same day. GLM-flash reviews are
+trusted inputs (owner decision 2026-09-09); file:line claims below are the
+reviewer's grounded observations.
 
 ## Findings
 
