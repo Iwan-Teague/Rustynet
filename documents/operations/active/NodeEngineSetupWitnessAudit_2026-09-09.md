@@ -95,3 +95,12 @@ pre-batch binary are refused for `--run-only`/`--resume-from`/`--rerun-stage`
 — fail-closed; start a fresh run. Flag-day check: a live 2-node Linux run on
 lenovo-bot after each merge, before any evidence claim is made against the
 new declarations.
+
+**Live re-verify of the first batch (2026-09-09, lenovo-bot, commit
+`a8bafe81`, run `livelab-1788969514-a8bafe81b576`, report
+`artifacts/live_lab/setup-witness-reverify-a8bafe81` on the host):** 38 pass /
+0 fail / 28 skipped, `run_passed=true`; every flipped Setup row graded `pass`
+(none demoted to NotProven), the four `bundle_evidence.json` witnesses and
+the count-bearing stage-log lines are present. The second half
+(anchor_validation, validate_baseline_runtime) still owes its own live
+re-verify on the merged commit.
