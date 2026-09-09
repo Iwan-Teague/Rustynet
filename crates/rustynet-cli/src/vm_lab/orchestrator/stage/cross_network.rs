@@ -35,6 +35,30 @@ fn default_nat_profile() -> substrate::NatProfileId {
 // stage writes.
 const NAT_GATE_REPORT_FILE: &str = "cross_network_nat_gates.txt";
 
+/// QH-83 pass-witness artifacts: the relative paths (against the report dir)
+/// whose existence the runner enforces once a stage's catalog row declares
+/// `StageEvidence::File`. Each is written on EVERY `Passed` path of its stage.
+const PREFLIGHT_REPORT_RELATIVE: &str =
+    "cross_network_preflight/cross_network_preflight_report.json";
+const NAT_CLASSIFICATION_REPORT_RELATIVE: &str =
+    "cross_network_nat_classification/cross_network_nat_gates.txt";
+const NAT_MATRIX_REPORT_RELATIVE: &str = "cross_network_nat_matrix_validation.md";
+
+/// QH-83: verify a declared file witness is a present, non-empty regular file
+/// before a stage may record `Passed`. Fail closed, naming the artifact.
+fn verify_report_artifact(report_dir: &Path, relative: &str) -> Result<(), String> {
+    let path = report_dir.join(relative);
+    match fs::metadata(&path) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!(
+            "witness artifact {relative} is not a non-empty regular file"
+        )),
+        Err(err) => Err(format!(
+            "witness artifact {relative} missing or unreadable: {err}"
+        )),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrossNetworkOptions {
     pub enable_suite: bool,
@@ -336,7 +360,18 @@ fn run_preflight(ctx: &OrchestrationContext, stage_name: &str) -> StageOutcome {
         .arg("86400")
         .arg("--signed-artifact-max-age-secs")
         .arg("86400");
-    run_command(cmd, "write-cross-network-preflight-report")
+    // QH-83: the child's exit status gates the run, and the declared File
+    // witness is the report it writes — verify it landed before recording
+    // the pass.
+    match run_command(cmd, "write-cross-network-preflight-report") {
+        StageOutcome::Passed => {
+            match verify_report_artifact(&ctx.report_dir, PREFLIGHT_REPORT_RELATIVE) {
+                Ok(()) => StageOutcome::Passed,
+                Err(err) => StageOutcome::Failed(err),
+            }
+        }
+        other => other,
+    }
 }
 
 fn run_nat_classification(
@@ -411,11 +446,15 @@ fn run_nat_classification(
         // unreachable). That is a stage failure, and it is deliberately NOT
         // the same thing as a NAT that misbehaved.
         Err(err) => {
-            write_nat_gate_report(&stage_dir, &[], Some(err.as_str()));
+            if let Err(write_err) = write_nat_gate_report(&stage_dir, &[], Some(err.as_str())) {
+                return StageOutcome::Failed(write_err);
+            }
             StageOutcome::Failed(format!("netns NAT gate could not run: {err}"))
         }
         Ok(checks) => {
-            write_nat_gate_report(&stage_dir, &checks, None);
+            if let Err(write_err) = write_nat_gate_report(&stage_dir, &checks, None) {
+                return StageOutcome::Failed(write_err);
+            }
             let failed: Vec<String> = checks
                 .iter()
                 .filter(|check| !check.passed)
@@ -427,7 +466,12 @@ fn run_nat_classification(
                 })
                 .collect();
             if failed.is_empty() {
-                StageOutcome::Passed
+                // QH-83: the declared File witness is the gate report this
+                // stage itself just wrote; re-verify it stands before the pass.
+                match verify_report_artifact(&ctx.report_dir, NAT_CLASSIFICATION_REPORT_RELATIVE) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(err) => StageOutcome::Failed(err),
+                }
             } else {
                 StageOutcome::Failed(format!(
                     "{} of {} netns NAT checks misbehaved: {}",
@@ -441,10 +485,14 @@ fn run_nat_classification(
 }
 
 /// Write every gate row, pass or fail, so the evidence says WHICH profile
-/// misbehaved rather than only that one did. Best-effort: a report we could
-/// not write must not turn a green gate red, and the stage outcome already
-/// carries the verdict.
-fn write_nat_gate_report(stage_dir: &Path, checks: &[netns::GateCheck], error: Option<&str>) {
+/// misbehaved rather than only that one did. QH-83: this file is the stage's
+/// declared pass witness, so a write failure is FATAL — the stage fails and
+/// names the file rather than recording a pass it cannot evidence.
+fn write_nat_gate_report(
+    stage_dir: &Path,
+    checks: &[netns::GateCheck],
+    error: Option<&str>,
+) -> Result<(), String> {
     let mut body = String::from("== netns NAT mapping + filtering gates ==\n");
     for check in checks {
         body.push_str(&check.render());
@@ -453,7 +501,8 @@ fn write_nat_gate_report(stage_dir: &Path, checks: &[netns::GateCheck], error: O
     if let Some(error) = error {
         body.push_str(&format!("GATE COULD NOT RUN: {error}\n"));
     }
-    let _ = fs::write(stage_dir.join(NAT_GATE_REPORT_FILE), body);
+    fs::write(stage_dir.join(NAT_GATE_REPORT_FILE), body)
+        .map_err(|err| format!("writing {NAT_GATE_REPORT_FILE} failed: {err}"))
 }
 
 /// The NAT-matrix gate: it grades the matrix evidence the six scenario suites
@@ -495,7 +544,18 @@ fn run_nat_matrix(ctx: &OrchestrationContext, options: &CrossNetworkOptions) -> 
     if let Ok(commit) = git_head_commit() {
         cmd.arg("--expected-git-commit").arg(commit);
     }
-    run_command(cmd, "validate-cross-network-nat-matrix")
+    // QH-83: the validator writes the declared File witness on its success
+    // path; its exit status gates the run, and the artifact is re-verified
+    // before the pass is recorded.
+    match run_command(cmd, "validate-cross-network-nat-matrix") {
+        StageOutcome::Passed => {
+            match verify_report_artifact(&ctx.report_dir, NAT_MATRIX_REPORT_RELATIVE) {
+                Ok(()) => StageOutcome::Passed,
+                Err(err) => StageOutcome::Failed(err),
+            }
+        }
+        other => other,
+    }
 }
 
 /// Whether this topology can dispatch the cross-network scenario suites at all,
@@ -600,8 +660,44 @@ fn run_ported_scenario_stage(
         if !matches!(outcome, StageOutcome::Passed) {
             return outcome;
         }
+        // QH-83: the scenario stages carry multiple per-profile report paths,
+        // so no single File witness can cover them — the declared witness is a
+        // StageLog line per passed profile, carrying a real datum (profile,
+        // index, report location). The write is fatal: a pass without its
+        // witness line must be impossible.
+        if let Err(err) = write_scenario_profile_witness(
+            &ctx.report_dir,
+            spec.id.as_str(),
+            profile.as_str(),
+            idx,
+            report_path.as_path(),
+        ) {
+            return StageOutcome::Failed(format!("scenario witness write failed: {err}"));
+        }
     }
     StageOutcome::Passed
+}
+
+/// QH-83: append the per-profile pass-witness line for one scenario stage to
+/// that stage's rust-native stage log. The line names the passed profile, its
+/// index in the run, and the report artifact that profile wrote.
+fn write_scenario_profile_witness(
+    report_dir: &Path,
+    stage: &str,
+    profile: &str,
+    idx: usize,
+    report_path: &Path,
+) -> Result<(), String> {
+    let report_relative = format!(
+        "{}/{}",
+        stage,
+        report_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<unnamed>")
+    );
+    let line = format!("scenario_pass profile={profile} idx={idx} report={report_relative}");
+    crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(report_dir, stage, &line)
 }
 
 /// One NAT profile's run of a ported scenario.
@@ -1874,5 +1970,212 @@ mod tests {
             "192.168.65.10".parse().unwrap(),
             24
         ));
+    }
+
+    // ---- QH-83 evidence-on-pass witnesses ---------------------------------
+    //
+    // Each stage's declared witness must match the artifact its `Passed`
+    // verdict actually rests on, and the write must be fatal. These tests pin
+    // both halves: the catalog declaration and the fail-closed verifier.
+
+    fn unique_witness_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cn_witness_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp witness dir");
+        dir
+    }
+
+    /// QH-83 macro: for one scenario stage, pin the StageLog declaration and
+    /// prove the per-profile witness line lands in that stage's own log, then
+    /// prove the write failure propagates instead of degrading to best-effort.
+    macro_rules! scenario_witness_tests {
+        ($stage_id:ident, $content_test:ident, $failure_test:ident) => {
+            #[test]
+            fn $content_test() {
+                use crate::vm_lab::orchestrator::stage::StageEvidence;
+                assert_eq!(
+                    StageId::$stage_id.evidence(),
+                    StageEvidence::StageLog,
+                    "the catalog row must declare StageLog for this scenario stage"
+                );
+                let dir = unique_witness_dir(stringify!($stage_id));
+                let stage = StageId::$stage_id.as_str();
+                let report_relative = format!("{stage}/{stage}_report.json");
+                super::write_scenario_profile_witness(
+                    &dir,
+                    stage,
+                    "baseline_lan",
+                    0,
+                    Path::new(&report_relative),
+                )
+                .expect("witness line must write");
+                let log = std::fs::read_to_string(
+                    crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(&dir, stage),
+                )
+                .expect("stage log must exist");
+                assert!(
+                    log.contains(&format!(
+                        "scenario_pass profile=baseline_lan idx=0 report={report_relative}"
+                    )),
+                    "witness line must carry profile, index, and report path: {log}"
+                );
+                std::fs::remove_dir_all(&dir).expect("cleanup");
+            }
+
+            #[test]
+            fn $failure_test() {
+                let dir = unique_witness_dir(stringify!($stage_id));
+                // A regular file where the log's parent directory must be
+                // makes the append fail; the helper must surface that error
+                // (the stage then fails) instead of swallowing it.
+                std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+                let stage = StageId::$stage_id.as_str();
+                let err = super::write_scenario_profile_witness(
+                    &dir,
+                    stage,
+                    "baseline_lan",
+                    0,
+                    Path::new(&format!("{stage}/{stage}_report.json")),
+                )
+                .expect_err("witness write failure must propagate");
+                assert!(!err.is_empty());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+        };
+    }
+
+    scenario_witness_tests!(
+        CrossNetworkDirectRemoteExit,
+        cross_network_direct_remote_exit_witness_line_carries_profile_and_report_path,
+        cross_network_direct_remote_exit_witness_write_failure_is_propagated
+    );
+    scenario_witness_tests!(
+        CrossNetworkNodeNetworkSwitch,
+        cross_network_node_network_switch_witness_line_carries_profile_and_report_path,
+        cross_network_node_network_switch_witness_write_failure_is_propagated
+    );
+    scenario_witness_tests!(
+        CrossNetworkRelayRemoteExit,
+        cross_network_relay_remote_exit_witness_line_carries_profile_and_report_path,
+        cross_network_relay_remote_exit_witness_write_failure_is_propagated
+    );
+    scenario_witness_tests!(
+        CrossNetworkFailbackRoaming,
+        cross_network_failback_roaming_witness_line_carries_profile_and_report_path,
+        cross_network_failback_roaming_witness_write_failure_is_propagated
+    );
+    scenario_witness_tests!(
+        CrossNetworkControllerSwitch,
+        cross_network_controller_switch_witness_line_carries_profile_and_report_path,
+        cross_network_controller_switch_witness_write_failure_is_propagated
+    );
+    scenario_witness_tests!(
+        CrossNetworkTraversalAdversarial,
+        cross_network_traversal_adversarial_witness_line_carries_profile_and_report_path,
+        cross_network_traversal_adversarial_witness_write_failure_is_propagated
+    );
+    scenario_witness_tests!(
+        CrossNetworkRemoteExitDns,
+        cross_network_remote_exit_dns_witness_line_carries_profile_and_report_path,
+        cross_network_remote_exit_dns_witness_write_failure_is_propagated
+    );
+    scenario_witness_tests!(
+        CrossNetworkRemoteExitSoak,
+        cross_network_remote_exit_soak_witness_line_carries_profile_and_report_path,
+        cross_network_remote_exit_soak_witness_write_failure_is_propagated
+    );
+
+    #[test]
+    fn cross_network_preflight_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+        assert_eq!(
+            StageId::CrossNetworkPreflight.evidence(),
+            StageEvidence::File(PREFLIGHT_REPORT_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn cross_network_preflight_pass_without_report_artifact_is_fatal() {
+        let dir = unique_witness_dir("preflight_missing");
+        let err =
+            super::verify_report_artifact(&dir, PREFLIGHT_REPORT_RELATIVE).expect_err("missing");
+        assert!(err.contains(PREFLIGHT_REPORT_RELATIVE), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn cross_network_nat_classification_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+        assert_eq!(
+            StageId::CrossNetworkNatClassification.evidence(),
+            StageEvidence::File(NAT_CLASSIFICATION_REPORT_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn cross_network_nat_classification_pass_without_report_artifact_is_fatal() {
+        let dir = unique_witness_dir("nat_class_missing");
+        let err = super::verify_report_artifact(&dir, NAT_CLASSIFICATION_REPORT_RELATIVE)
+            .expect_err("missing");
+        assert!(err.contains(NAT_CLASSIFICATION_REPORT_RELATIVE), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn cross_network_nat_matrix_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+        assert_eq!(
+            StageId::CrossNetworkNatMatrix.evidence(),
+            StageEvidence::File(NAT_MATRIX_REPORT_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn cross_network_nat_matrix_pass_without_report_artifact_is_fatal() {
+        let dir = unique_witness_dir("nat_matrix_missing");
+        let err =
+            super::verify_report_artifact(&dir, NAT_MATRIX_REPORT_RELATIVE).expect_err("missing");
+        assert!(err.contains(NAT_MATRIX_REPORT_RELATIVE), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn verify_report_artifact_rejects_an_empty_file() {
+        let dir = unique_witness_dir("empty_artifact");
+        std::fs::create_dir_all(dir.join("cross_network_preflight")).expect("stage dir");
+        std::fs::write(dir.join(PREFLIGHT_REPORT_RELATIVE), b"").expect("empty artifact");
+        let err =
+            super::verify_report_artifact(&dir, PREFLIGHT_REPORT_RELATIVE).expect_err("empty");
+        assert!(err.contains(PREFLIGHT_REPORT_RELATIVE), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn write_nat_gate_report_failure_names_the_file() {
+        // A directory where the report file must be written makes fs::write
+        // fail; the fatal helper surfaces the error naming the witness file.
+        let dir = unique_witness_dir("nat_gate_write_fail");
+        std::fs::create_dir_all(dir.join(NAT_GATE_REPORT_FILE)).expect("blocker dir");
+        let err = super::write_nat_gate_report(&dir, &[], None).expect_err("write must fail");
+        assert!(err.contains(NAT_GATE_REPORT_FILE), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn write_nat_gate_report_writes_rows_and_gate_error() {
+        let dir = unique_witness_dir("nat_gate_write_ok");
+        super::write_nat_gate_report(&dir, &[], Some("gate unavailable"))
+            .expect("write must succeed");
+        let body =
+            std::fs::read_to_string(dir.join(NAT_GATE_REPORT_FILE)).expect("report readable");
+        assert!(body.contains("== netns NAT mapping + filtering gates =="));
+        assert!(body.contains("GATE COULD NOT RUN: gate unavailable"));
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }
