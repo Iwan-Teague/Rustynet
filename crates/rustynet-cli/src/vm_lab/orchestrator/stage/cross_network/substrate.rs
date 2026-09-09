@@ -3036,10 +3036,12 @@ mod tests {
         }
         // A 256-byte name exceeds the /var/run/netns filename bound.
         let runner = mock::MockLeafRunner::default();
-        assert!(runner
-            .in_netns(&"a".repeat(256), &["ip", "addr"])
-            .expect_err("over-long namespace name must be rejected")
-            .contains("exceeds"));
+        assert!(
+            runner
+                .in_netns(&"a".repeat(256), &["ip", "addr"])
+                .expect_err("over-long namespace name must be rejected")
+                .contains("exceeds")
+        );
         assert!(runner.recorded().is_empty());
     }
 
@@ -3047,14 +3049,18 @@ mod tests {
     #[test]
     fn in_netns_rejects_empty_and_control_char_argv() {
         let runner = mock::MockLeafRunner::default();
-        assert!(runner
-            .in_netns("ns0", &[])
-            .expect_err("empty argv must be rejected")
-            .contains("must not be empty"));
-        assert!(runner
-            .in_netns("ns0", &["ip", "addr\n; reboot"])
-            .expect_err("control chars must be rejected")
-            .contains("control characters"));
+        assert!(
+            runner
+                .in_netns("ns0", &[])
+                .expect_err("empty argv must be rejected")
+                .contains("must not be empty")
+        );
+        assert!(
+            runner
+                .in_netns("ns0", &["ip", "addr\n; reboot"])
+                .expect_err("control chars must be rejected")
+                .contains("control characters")
+        );
         assert!(runner.recorded().is_empty());
     }
 
@@ -3075,10 +3081,12 @@ mod tests {
             transport_error_on: vec![0],
             ..mock::MockLeafRunner::default()
         };
-        assert!(unreachable
-            .in_netns("ns0", &["ip", "addr"])
-            .expect_err("transport failure is the Err arm")
-            .contains("mock transport failure"));
+        assert!(
+            unreachable
+                .in_netns("ns0", &["ip", "addr"])
+                .expect_err("transport failure is the Err arm")
+                .contains("mock transport failure")
+        );
     }
 
     #[test]
