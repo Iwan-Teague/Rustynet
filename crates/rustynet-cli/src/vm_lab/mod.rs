@@ -24271,11 +24271,16 @@ pub(crate) fn evaluate_linux_key_custody_report(
         };
         return Err(format!("Linux key custody drift detected: {summary}"));
     }
+    // `Ok` is the healthy status for a required artifact and
+    // `AbsentAsExpected` for a forbidden one; both are consistent with
+    // overall_ok=true. (Live run livelab-1788916793 on lenovo-bot failed both
+    // nodes when this check counted AbsentAsExpected as drift.)
     if !report.drift_reasons.is_empty()
         || report.entries.iter().any(|entry| {
             !matches!(
                 entry.status,
                 rustynetd::linux_key_custody::LinuxKeyCustodyEntryStatus::Ok { .. }
+                    | rustynetd::linux_key_custody::LinuxKeyCustodyEntryStatus::AbsentAsExpected
             )
         })
     {
@@ -24320,11 +24325,16 @@ pub(crate) fn evaluate_macos_key_custody_report(
         };
         return Err(format!("macOS key custody drift detected: {summary}"));
     }
+    // `Ok` is the healthy status for a required artifact and
+    // `AbsentAsExpected` for a forbidden one; both are consistent with
+    // overall_ok=true. (Live run livelab-1788916793 on lenovo-bot failed both
+    // nodes when this check counted AbsentAsExpected as drift.)
     if !report.drift_reasons.is_empty()
         || report.entries.iter().any(|entry| {
             !matches!(
                 entry.status,
                 rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::Ok { .. }
+                    | rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::AbsentAsExpected
             )
         })
     {
@@ -51462,6 +51472,43 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     /// is the exact input its Windows sibling already refuses. Mutation
     /// caught by each: deleting the post-`overall_ok` row check in that
     /// evaluator makes its case return Ok.
+    /// The REAL clean producer shape: a required artifact `ok` plus a forbidden
+    /// artifact `absent_as_expected` (what every healthy node reports). Mutation
+    /// caught: counting `AbsentAsExpected` as a non-Ok row — which failed
+    /// `key_custody_validation` on both nodes of live run
+    /// livelab-1788916793 (lenovo-bot, 2026-09-09).
+    #[test]
+    fn key_custody_evaluators_accept_absent_as_expected_rows() {
+        let linux = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {"label": "keys directory", "path": "/var/lib/rustynet/keys",
+                 "requirement": "present", "status": "ok",
+                 "mode": 16832, "uid": 998, "gid": 998},
+                {"label": "plaintext WireGuard private key (legacy)",
+                 "path": "/var/lib/rustynet/keys/wireguard.key",
+                 "requirement": "absent", "status": "absent_as_expected"}
+            ],
+            "drift_reasons": []
+        }"#;
+        super::evaluate_linux_key_custody_report("debian-utm-1", linux)
+            .expect("absent_as_expected is a healthy row");
+        let macos = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {"label": "keys directory", "path": "/Library/Application Support/rustynet/keys",
+                 "expected": "present", "status": "ok", "mode": 16832, "uid": 0, "gid": 0},
+                {"label": "plaintext passphrase", "path": "/Library/Application Support/rustynet/keys/wireguard.passphrase",
+                 "expected": "absent", "status": "absent_as_expected"}
+            ],
+            "drift_reasons": []
+        }"#;
+        super::evaluate_macos_key_custody_report("macos-utm-1", macos)
+            .expect("absent_as_expected is a healthy row");
+    }
+
     #[test]
     fn evaluators_reject_overall_ok_true_when_rows_disagree() {
         let runtime_acls = r#"{
