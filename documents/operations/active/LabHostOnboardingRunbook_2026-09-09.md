@@ -52,6 +52,32 @@ Three things the generic install does not do, each of which broke a launch **(bi
    (`ssh-keyscan -t ed25519 <guest-ip> >> ~/.ssh/known_hosts`). The
    orchestrator uses `StrictHostKeyChecking=yes`; an unpinned guest fails closed.
 
+Two more, learned provisioning katana's first guests **(bit us)**:
+
+4. **Passwordless sudo for the lab user** (`/etc/sudoers.d/90-rustynet-lab`:
+   `<user> ALL=(ALL) NOPASSWD: ALL`, mode 0440) — the lab convention on every
+   host and guest; `sudo -n` is what the tooling runs.
+5. **The pool directory must be writable by the lab user WITHOUT sudo**:
+   `provision_guest` deliberately runs `qemu-img create`, the cloud-init seed
+   and `virt-install` with no sudo, so a root-owned `/var/lib/libvirt/images`
+   fails with `qemu-img create failed`. `sudo chgrp libvirt
+   /var/lib/libvirt/images && sudo chmod 2775 /var/lib/libvirt/images` (the
+   lab user is in `libvirt`). Note `provision_guest`'s `authorized_key` is a
+   path ON THE HOST (default the host's own `~/.ssh/id_ed25519.pub`), not on
+   the Mac — seed with the host key, then append the Mac's
+   `rustynet_lab_ed25519.pub` and `id_ed25519.pub` to each guest.
+6. **Base images travel host-to-host, not from the internet**: lenovo-bot's
+   pool already held `debian-13-generic-amd64.qcow2`; stream it
+   `ssh lenovo 'sudo cat img' | ssh katana 'cat > ~/img'` then `sudo mv` —
+   never pipe into a remote `echo pw | sudo -S tee`, the password pipe steals
+   stdin and you get an empty file (sha256 `e3b0c442…`). Verify the digest.
+
+Guests on a NAT'd libvirt network (`virbr0`, 192.168.122.0/24) are reachable
+from the HOST only: run `provision_guest_toolchain` / `bootstrap_vm` on the
+host (`cargo build --release -p rustynet-cli --features vm-lab` there) and
+launch runs with `launch_live_lab_on_host`; the Mac drives the host, not the
+guests.
+
 Clone the public repo (`git clone https://github.com/Iwan-Teague/Rustynet.git
 ~/Rustynet`) — the host reads its own checkout for run provenance, so it must be
 a real clone, not a copy. libvirt: `virsh -c qemu:///system pool-define-as
