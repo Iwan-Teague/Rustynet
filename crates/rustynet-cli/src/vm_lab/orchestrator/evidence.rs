@@ -228,6 +228,55 @@ pub(crate) fn append_stage_evidence_line(
 
 const RUST_NATIVE_REUSE_SEAL_RELATIVE_PATH: &str = "state/reuse_evidence.sha256";
 
+/// A reuse-evidence digest that has passed structural validation (exactly 64
+/// hex characters). The field is private and the only constructor is
+/// [`ReuseDigest::parse`] (crate-visible), so a caller cannot mint one from an
+/// arbitrary `String` — a placeholder like `"abc123"` is unrepresentable at
+/// the type level, and the runner's `Reused` outcome can never carry an
+/// unvalidated digest (runner-edge audit F2). The sovereign producer is
+/// [`validate_rust_native_reuse_evidence`], which returns the digest it just
+/// re-derived and checked against the run's seal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReuseDigest(String);
+
+impl ReuseDigest {
+    /// Accept only a 64-hex-character seal body; everything else is refused.
+    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
+        let raw = raw.trim();
+        if raw.len() != 64 || !raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "reuse evidence digest must be exactly 64 hex characters (got {})",
+                raw.len()
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The on-disk pass-verdict witness a stage declares (QH-83), resolved
+/// against a report directory — the same file the runner's
+/// `verify_declared_evidence` checks after a `Passed` verdict. `None` for
+/// stages carrying a recorded `StageEvidence::None` opt-out (runner-edge
+/// audit F3: reuse validation and the reuse digest must see the SAME
+/// witness set the runner demanded at execute time, so a seal cannot vouch
+/// for a pass whose witness was lost or rewritten).
+pub(crate) fn declared_witness_path(
+    id: &orchestrator::stage::StageId,
+    report_dir: &Path,
+) -> Option<PathBuf> {
+    match id.evidence() {
+        orchestrator::stage::StageEvidence::None { .. } => None,
+        orchestrator::stage::StageEvidence::StageLog => {
+            Some(rust_native_stage_log_path(report_dir, id.as_str()))
+        }
+        orchestrator::stage::StageEvidence::File(relative) => Some(report_dir.join(relative)),
+    }
+}
+
 fn rust_native_reuse_evidence_digest(report_dir: &Path) -> Result<String, String> {
     let mut hasher = Sha256::new();
     for relative in [
@@ -259,6 +308,40 @@ fn rust_native_reuse_evidence_digest(report_dir: &Path) -> Result<String, String
         hasher.update([0]);
         hasher.update(bytes);
     }
+    // Runner-edge audit F3: bind every PLANNED stage's declared pass witness
+    // into the seal, not just manifests/logs/context. Without this a witness
+    // file could be rewritten (or a passed `File`-declared stage could lose
+    // its artifact entirely) and reuse validation would still accept the
+    // seal — replaying a pass whose proof was tampered with or vanished.
+    let manifest = crate::live_lab_stage_manifest::read_stage_manifest(report_dir)?
+        .ok_or_else(|| "reuse digest requires orchestration/stage_manifest.json".to_owned())?;
+    let mut planned: Vec<&str> = manifest
+        .stages
+        .iter()
+        .filter(|stage| stage.enabled)
+        .map(|stage| stage.name.as_str())
+        .collect();
+    planned.sort_unstable();
+    planned.dedup();
+    for name in planned {
+        let id = orchestrator::stage::StageId::ALL
+            .iter()
+            .find(|id| id.as_str() == name)
+            .ok_or_else(|| {
+                format!("reuse digest: manifest stage '{name}' is not in the stage catalog")
+            })?;
+        if let Some(witness) = declared_witness_path(id, report_dir) {
+            let bytes = fs::read(&witness).map_err(|err| {
+                format!(
+                    "read reuse evidence witness '{}' failed: {err}",
+                    witness.display()
+                )
+            })?;
+            hasher.update(id.as_str().as_bytes());
+            hasher.update([0]);
+            hasher.update(bytes);
+        }
+    }
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -278,12 +361,14 @@ pub(crate) fn write_rust_native_reuse_evidence_seal(report_dir: &Path) -> Result
 
 /// Validate every stage selected for reuse against terminal evidence from the
 /// prior invocation, then return one digest binding the manifest, stage rows,
-/// and persisted orchestration context. Missing, non-pass, or tampered inputs
-/// fail before the runner can mutate a guest.
+/// persisted orchestration context, and every planned stage's declared pass
+/// witness. Missing, non-pass, tampered, or witness-less inputs fail before
+/// the runner can mutate a guest. The returned [`ReuseDigest`] is the only
+/// form a reuse binding may take at the runner boundary (audit F2).
 pub(crate) fn validate_rust_native_reuse_evidence(
     report_dir: &Path,
     stage_ids: &[orchestrator::stage::StageId],
-) -> Result<String, String> {
+) -> Result<ReuseDigest, String> {
     let state = read_report_state(report_dir)?;
     if !state.run_complete || !state.run_passed {
         return Err("reuse requires a prior completed, passing run state".to_owned());
@@ -318,6 +403,23 @@ pub(crate) fn validate_rust_native_reuse_evidence(
                 record.log_path.display()
             ));
         }
+        // Runner-edge audit F3: the runner demanded a pass-verdict witness at
+        // execute time, so reuse must not accept a prior run whose witness is
+        // now missing or empty — the pass it would replay is unproven.
+        if let Some(witness) = declared_witness_path(id, report_dir) {
+            let bytes = fs::read(&witness).map_err(|err| {
+                format!(
+                    "cannot reuse stage '{name}': declared witness {} unreadable: {err}",
+                    witness.display()
+                )
+            })?;
+            if bytes.iter().all(|byte| byte.is_ascii_whitespace()) {
+                return Err(format!(
+                    "cannot reuse stage '{name}': declared witness {} is empty",
+                    witness.display()
+                ));
+            }
+        }
     }
 
     let sealed = fs::read_to_string(report_dir.join(RUST_NATIVE_REUSE_SEAL_RELATIVE_PATH))
@@ -332,7 +434,9 @@ pub(crate) fn validate_rust_native_reuse_evidence(
             "reuse evidence digest mismatch: sealed={sealed} actual={actual}"
         ));
     }
-    Ok(actual)
+    // Single constructor choke point: the computed digest is trivially
+    // 64-hex, but ReuseDigest is only ever minted through `parse`.
+    ReuseDigest::parse(&actual)
 }
 
 pub(crate) fn rust_native_vm_lab_stage_outcome(
@@ -2204,5 +2308,39 @@ mod finalize_tests {
             "a prior recorder error must abort before the matrix append"
         );
         assert!(!read_report_state(dir).expect("state").run_passed);
+    }
+}
+
+/// Runner-edge audit F2: the digest boundary type. Mutation target — a
+/// `parse` that accepts a raw `String` (no length/hex check) makes the
+/// placeholder `"abc123"` representable and these assertions fail.
+#[cfg(test)]
+mod reuse_digest_parse_tests {
+    use super::ReuseDigest;
+
+    #[test]
+    fn reuse_digest_parse_rejects_short_and_non_hex_input() {
+        assert!(
+            ReuseDigest::parse("abc123").is_err(),
+            "a short placeholder digest must be refused"
+        );
+        assert!(
+            ReuseDigest::parse(&"g".repeat(64)).is_err(),
+            "a non-hex body must be refused"
+        );
+        assert!(
+            ReuseDigest::parse(&"a".repeat(63)).is_err(),
+            "a 63-char body must be refused"
+        );
+        assert!(
+            ReuseDigest::parse(&"a".repeat(65)).is_err(),
+            "a 65-char body must be refused"
+        );
+        let ok = ReuseDigest::parse(&"ab".repeat(32)).expect("64 hex chars are accepted");
+        assert_eq!(ok.as_str(), "ab".repeat(32));
+        assert!(
+            ReuseDigest::parse(&format!("  {}\n", "ab".repeat(32))).is_ok(),
+            "surrounding whitespace is trimmed before the check"
+        );
     }
 }
