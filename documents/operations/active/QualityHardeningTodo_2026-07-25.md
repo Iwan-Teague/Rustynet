@@ -7126,13 +7126,63 @@ remote command → source pin (sliced BEFORE the test module) finds `| sudo -S`;
 
 **Owner actions OWED:** rotate the lab password shared by the five affected
 guests (it is in public git history and cannot be unpublished), then update
-the untracked sidecar. **Follow-ups (open):** F3 — replace the denylist
-`ensure_ssh_target`/`ensure_ssh_user`/`last_known_ip` validators in
-`vm_lab/mod.rs` with allowlists (reuse `validated_args::connection_user`,
-require `last_known_ip` to parse as `IpAddr`) and add the sink-side gate
-(every `ssh`/`scp` spawn under `vm_lab/**` carries `--` before the
-destination; `sshpass` never carries `-p`); extend
-`secrets_hygiene_gates` to reject `| sudo -S` fed by an echo literal and
-`sshpass -p` anywhere under `crates/`.
+the untracked sidecar. **F3 + gate extension FIXED 2026-09-09** (worktree
+branch `ai-edit/edit-1788908852677-30071-0`, commits `8c4dd6f1`, `efe73099`,
+`f7254653`):
 
-**Disposition: FIXED on main (F1/F2); rotation + F3 + gate extension OPEN.**
+- **Allowlists at the inventory parse boundary** (`vm_lab/mod.rs`):
+  `ensure_ssh_target` is the alphabet allowlist `[A-Za-z0-9._:@-]` (non-empty,
+  no leading `-`; IPv6 literals via `:`, `user@host` via `@`, trailing-dot
+  hostnames and `..` accepted — inert as single argv elements after `--`);
+  `ensure_ssh_user` delegates to `validated_args::connection_user` (QH-01
+  seam); `last_known_ip` must parse as `std::net::IpAddr`; the same
+  destination allowlist now covers `alt_ssh_endpoints` entries and the
+  `qemu+ssh://` authority `ssh_endpoint` extracts from `connect_uri`.
+  `required_string_field` still owns the absent-field case (unchanged; note it
+  trims, so `\"host\\n\"` normalises to `\"host\"` before validation —
+  documented in the tests).
+- **Sink-side source scanner** (`vm_lab::tests::
+  ssh_sinks_carry_the_destination_guard_and_sshpass_never_takes_a_password_
+  flag`): every `ssh`/`scp` spawn under `vm_lab/**` must carry a literal `--`
+  before its destination, `sshpass` must never take `.arg(\"-p\")` before its
+  wrapped ssh, and `.arg(\"ssh\")` wrappers must carry `--`; fail-closed on
+  unreadable files, floor-counted so a spawn-style change cannot silence it,
+  one commented allowlist entry (`stage/preflight.rs` `ssh -V` version probe —
+  no destination argument exists). The scan caught and fixed the
+  `recover_guest_network.rs` sinks, whose `--` was hidden in a shared arg vec.
+- **secrets_hygiene_gates extended** (`secrets_hygiene_gates.rs`; the wrapper
+  `scripts/ci/secrets_hygiene_gates.sh` just execs the bin and needed no
+  change): a positive scan over every tracked file under `crates/` and
+  `scripts/` rejects an `echo <literal>` line piped into `sudo -S`, the
+  `sshpass -p` shell form, and `.arg(\"-p\")` between an `sshpass` spawn and
+  its wrapped ssh (PolicyReject); Rust test modules are cut from the scan
+  (fixtures deliberately quote the defect shape) and all needles are assembled
+  from parts so the gate never matches its own source. Negative tests use the
+  shapes captured from `6908f20d` with the live password redacted —
+  `gate_rejects_the_captured_sudoers_echo_literal`,
+  `gate_rejects_the_captured_sshpass_shell_flag`,
+  `gate_rejects_the_captured_sshpass_rust_arg_list`, plus the negative control
+  `gate_accepts_the_env_var_and_stdin_channel_shapes`. The gate also RUNS the
+  new vm_lab scanner/allowlist tests via a new extra-cargo-args column in
+  `REQUIRED_TESTS` (`--all-features`; without it cargo runs zero tests for a
+  `vm-lab`-gated filter and the output verifier rejects the run).
+- **Hostile-input tests** (`vm_lab::inventory_ssh_destination_allowlist_tests`):
+  `ssh_target` in {-oProxyCommand=x, -F/tmp/x, host; rm, ho\\nst, héte, \"\"},
+  `ssh_user` in {-oFoo, a b, a\\nb, \"\"→normalises-to-absent},
+  `last_known_ip` in {-4, 10.0.0.1 -oX, not an ip} — each rejection asserts the
+  field name; each test's doc comment names the mutation it catches;
+  `real_lab_inventory_still_parses_under_the_allowlist` proves the tracked
+  fleet (IPv4 + hostname targets, libvirt `qemu+ssh://` URIs) still parses.
+- **Pre-existing failures on this base, OUTSIDE this change's scope (verified
+  present on HEAD with this work stashed):**
+  `vm_lab::tests::source_pin_self_includes_must_search_the_implementation_
+  slice` — `macos_install.rs:3966` pins its own file without
+  `implementation_source_slice` (the F1/F2 commit added the pin un-routed;
+  macos_install.rs was outside this job's edit allowlist); and clippy
+  `-D warnings` fails on untouched code (`rustynetd` collapsible_if ×3, and 10
+  lints across `vm_lab/orchestrator/stage/{distribute_assignments,preflight,
+  validate_runtime}.rs` + `workspace_root.rs`). The F3 work itself is
+  fmt/clippy/test-clean.
+
+**Disposition: FIXED on main (F1/F2); rotation OWED; F3 + gate extension
+FIXED 2026-09-09 pending merge.**
