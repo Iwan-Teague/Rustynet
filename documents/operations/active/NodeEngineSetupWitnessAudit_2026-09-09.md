@@ -48,3 +48,42 @@ Live-run grounding: run `livelab-1788919346` @ `36c7017f` is `partial`, `passed=
 | distribute_traversal | same shared fn, `BundleKind::Traversal` (`distribute_traversal.rs:44-54`) | none | `StageLog
 
 ## Tools used (63 call(s); step budget of 40 reached)
+
+## Review disposition (2026-09-09, GLM-flash, MERGE-SAFE with two should-fixes → merged)
+
+The Setup batch landed on the `--node` engine: preflight and
+prepare_source_archive declare the files they already write
+(`File("logs/cross_bridge_preflight.txt")`,
+`File("state/source_archive_provenance.json")`), verify_ssh_reachability /
+cleanup_hosts / bootstrap_hosts / cross_network_substrate_setup /
+collect_pubkeys / admin_issue / enforce_baseline_runtime declare `StageLog`
+and append a count-bearing witness line on every pass path (write failure =
+`Failed`), and the four distribute rows declare their per-alias
+`bundle_evidence.json` witnesses (F1b, `stage/bundle_evidence.rs`). The
+reviewer enumerated every `Passed` return site in the flipped stages and
+found each witnessed; F2 (prepare_source_archive reuse path) and F3 (vacuous
+passes now read as `nodes=0` in the stage log) are closed by construction.
+
+Fixes applied before merge:
+- preflight kept walking the fleet after a remediated clock instead of
+  returning `Passed` from inside the loop (which skipped the cross-bridge
+  check and the witness), and its report write is now fatal.
+- prepare_source_archive's early pass for an archive already in context now
+  fails when the provenance pin is absent (the runner clears File witnesses
+  at stage start), instead of returning an unwitnessed `Passed`.
+- `refresh_signed_bundles` shared `distribute_traversal`'s witness path, so
+  the runner's clear-at-start for the refresh stage erased the Setup-phase
+  record and a failed refresh left the run unsealable. Witness paths now
+  carry a `BundleWitnessScope` (Setup / Refresh / Scoped{alias}); the refresh
+  row declares `logs/refresh_signed_bundles.traversal.bundle_evidence.json`
+  and the single-alias reboot-recovery redistribution writes an
+  alias-qualified file rather than overwriting the fleet generation.
+- Runner tests shared one `/tmp/test-report` dir across nextest's
+  concurrent processes; stale witnesses from other tests had been masking
+  unwitnessed fixtures. Every test now gets its own report dir and the
+  fixtures that assert a Setup pass write the declared witness.
+
+Still declared `None { reason: PHASE1_EVIDENCE_PENDING }` in the Setup phase:
+anchor_validation and validate_baseline_runtime (next batch). Flag-day check:
+a live 2-node Linux run on lenovo-bot after the merge, before any evidence
+claim is made against the new declarations.

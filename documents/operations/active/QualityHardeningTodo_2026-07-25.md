@@ -7100,10 +7100,16 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    demoted every Linux-exit run; `mesh_status_validation` appends per node), `traffic_test_matrix` → `File`, teardown pair → named opt-out,
    remaining 76 → `PHASE1_EVIDENCE_PENDING` (the honest phase-1 `None`, visible
    in every run's `node_stage_plan.json` evidence field).
-2. **Per-stage evidence wiring — OPEN (the bulk).** Upgrade the 76 pending
+2. **Per-stage evidence wiring — IN PROGRESS (the bulk).** Upgrade the 76 pending
    declarations suite by suite with a live-lab re-verify per batch: Setup (17) →
    Live (35) → CrossNetwork (11) → Chaos (9) →
-   NegativeControl/Disruptive/Soak/Cleanup (9). The NegativeControl stages'
+   NegativeControl/Disruptive/Soak/Cleanup (9). **Setup batch LANDED
+   2026-09-09** (15 of 17 rows: the four distribute rows carry per-alias
+   `bundle_evidence.json` File witnesses, preflight / prepare_source_archive
+   declare the files they write, the rest append count-bearing stage-log lines;
+   `refresh_signed_bundles` moved to its own witness path; disposition in
+   `NodeEngineSetupWitnessAudit_2026-09-09.md`). Still pending in Setup:
+   anchor_validation, validate_baseline_runtime. The NegativeControl stages'
    witness is their inversion record (`write_control_evidence` output), never a
    lazy `None`. Each stage still needs the individual "what datum IS this
    verdict" decision — a constant-line appeasement satisfies emptiness without
