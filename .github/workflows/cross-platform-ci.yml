@@ -171,6 +171,13 @@ jobs:
         # workspace build it piggybacks on.
         run: |
           ./scripts/ci/delegated_edit_marker_gate.sh
+      - name: Platform-infer tripwire (QH-82)
+        # Fails when any `.rs` under crates/ composes VmGuestPlatform::infer
+        # with an unwrap_or/unwrap_or_else fallback to Linux, or carries a
+        # bare unwrap_or(VmGuestPlatform::Linux). The migration to
+        # Option-returning infer is only a gate if CI runs this.
+        run: |
+          ./scripts/ci/check_platform_infer_tripwire.sh
       - name: Shipped-binary feature gate
         # Everything above builds --all-features, so nothing here ever compiles
         # the CLI the way it actually ships. That gap is not cosmetic: features
