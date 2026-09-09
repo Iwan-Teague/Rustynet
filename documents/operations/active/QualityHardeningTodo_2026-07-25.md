@@ -7117,8 +7117,12 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    report JSON each Linux test binary writes through `--report-path`, made
    fatal via `verify_report_artifact`; 4 macOS cells declare `StageLog`.
    role_switch_matrix additionally gained the empty-fleet skip guard the other
-   validators had. Remaining pending: 11 CrossNetwork, 9 Chaos,
-   4 NegativeControl, RelayForwardsFrame, ExtendedSoak (26) — in flight. The NegativeControl stages'
+   validators had. **Live-batch flag-day re-verified live on both hosts at
+   `301495cf`** (lenovo-bot + katana, 2-node Linux, each 38 pass / 0 fail /
+   28 skipped, no NotProven; the File rows exercised in a 2-node topology —
+   managed_dns, network_flap, reboot_recovery — produced their report
+   witnesses). Remaining pending: 11 CrossNetwork, 9 Chaos, 4 NegativeControl,
+   RelayForwardsFrame, ExtendedSoak (26) — branches gated, under review. The NegativeControl stages'
    witness is their inversion record (`write_control_evidence` output), never a
    lazy `None`. Each stage still needs the individual "what datum IS this
    verdict" decision — a constant-line appeasement satisfies emptiness without
