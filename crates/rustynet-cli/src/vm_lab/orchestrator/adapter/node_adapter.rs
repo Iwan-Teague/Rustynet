@@ -314,18 +314,28 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
     }
 
     fn supports_role_validator(&self, kind: RoleValidatorKind) -> bool {
-        // Most validators run on every desktop platform, so the default is
-        // platform-only. GossipConvergence is the exception and must consult
-        // `kind`: gossip is unix-only, so claiming support on Windows would turn
-        // a reported-skip into a hard failure.
-        if matches!(kind, RoleValidatorKind::GossipConvergence) {
-            return crate::vm_lab::orchestrator::role_validation::gossip_convergence::
-                gossip_convergence_runtime_implemented(self.platform());
-        }
-        matches!(
+        // The answer depends on BOTH the platform and the validator kind: most
+        // validators run on every desktop platform, but gossip convergence is
+        // unix-only. The match is exhaustive over `kind` so adding a variant is
+        // a compile error here rather than a silently permissive default.
+        let desktop = matches!(
             self.platform(),
             VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
-        )
+        );
+        match kind {
+            RoleValidatorKind::RuntimeAcls
+            | RoleValidatorKind::ServiceHardening
+            | RoleValidatorKind::KeyCustody
+            | RoleValidatorKind::Authenticode
+            | RoleValidatorKind::MeshStatus
+            | RoleValidatorKind::DnsFailclosed => desktop,
+            // Gossip is unix-only, so claiming support on Windows would turn a
+            // reported-skip into a hard failure.
+            RoleValidatorKind::GossipConvergence => {
+                crate::vm_lab::orchestrator::role_validation::gossip_convergence::
+                    gossip_convergence_runtime_implemented(self.platform())
+            }
+        }
     }
 
     // ── Traffic tests ─────────────────────────────────────────────
@@ -570,20 +580,21 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
 
     const WINDOWS_DAEMON: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
     let platform = adapter.platform();
-    if !matches!(
-        platform,
-        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows
-    ) {
-        return Err(AdapterError::UnsupportedPlatform {
-            platform,
-            message: format!("typed role validator {kind:?} is desktop-only"),
-        });
-    }
     let daemon_path = match platform {
         VmGuestPlatform::Linux => crate::vm_lab::LINUX_RUSTYNETD_PATH,
         VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
         VmGuestPlatform::Windows => WINDOWS_DAEMON,
-        _ => unreachable!("desktop platform checked above"),
+        // Fail closed with a typed error instead of panicking: an uncovered
+        // platform must surface as Err so stages report it, never abort the
+        // orchestrator.
+        _ => {
+            return Err(AdapterError::UnsupportedPlatform {
+                platform,
+                message: format!(
+                    "typed role validator {kind:?} has no daemon path on this platform"
+                ),
+            });
+        }
     };
     let shell = adapter.shell_host()?;
     let alias = adapter.alias();
@@ -691,7 +702,14 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
         (RoleValidatorKind::DnsFailclosed, VmGuestPlatform::Windows) => {
             dns_failclosed::validate_windows_dns_failclosed(&*shell, daemon_path, alias)
         }
-        (_, _) => unreachable!("desktop platform checked above"),
+        // Fail closed instead of panicking: any kind/platform pair the
+        // dispatcher does not cover surfaces as Err so stages report it, never
+        // abort the orchestrator. (Uncovered platforms already fail closed
+        // earlier at the daemon-path match with a typed
+        // AdapterError::UnsupportedPlatform.)
+        (_, _) => Err(format!(
+            "typed role validator {kind:?} is not dispatched for {platform:?}"
+        )),
     };
     result.map_err(|message| AdapterError::Protocol { message })
 }
@@ -799,9 +817,77 @@ mod tests {
 
     // ── §4.7 identity-challenge gate (the wiring in run_typed_role_validator) ──
 
-    use super::{RoleValidatorKind, enforce_identity_challenge};
+    use super::{NodeAdapter, RoleValidatorKind, enforce_identity_challenge};
+    use crate::vm_lab::orchestrator::adapter::android::AndroidNodeAdapter;
+    use crate::vm_lab::orchestrator::connection::NodeConnection;
     use crate::vm_lab::orchestrator::error::AdapterError;
     use crate::vm_lab::orchestrator::role_validation::identity_challenge::IdentityEvidence;
+    use std::path::PathBuf;
+
+    fn android_adapter() -> AndroidNodeAdapter {
+        let conn = NodeConnection::Ssh {
+            host: "ad-1".to_string(),
+            port: 22,
+            user: None,
+            identity_file: PathBuf::from("/tmp/id"),
+            known_hosts: PathBuf::from("/tmp/known_hosts"),
+            ssh_password: None,
+        };
+        AndroidNodeAdapter::new("ad-1", conn)
+    }
+
+    /// Every RoleValidatorKind, enumerated so a new variant must be added here
+    /// (and therefore considered) when it is introduced.
+    const ALL_ROLE_VALIDATOR_KINDS: [RoleValidatorKind; 7] = [
+        RoleValidatorKind::RuntimeAcls,
+        RoleValidatorKind::GossipConvergence,
+        RoleValidatorKind::ServiceHardening,
+        RoleValidatorKind::KeyCustody,
+        RoleValidatorKind::Authenticode,
+        RoleValidatorKind::MeshStatus,
+        RoleValidatorKind::DnsFailclosed,
+    ];
+
+    /// Mutation guard: `run_typed_role_validator` must fail closed with a typed
+    /// error for any kind/platform pair its dispatcher does not cover. If an
+    /// arm is restored to `unreachable!` (or a panic path reintroduced), this
+    /// test panics instead of observing the Err — a mobile adapter reaching a
+    /// desktop-only dispatcher must surface as UnsupportedPlatform, never abort
+    /// the orchestrator.
+    #[test]
+    fn run_role_validator_on_uncovered_platform_fails_closed_for_every_kind() {
+        let adapter = android_adapter();
+        for kind in ALL_ROLE_VALIDATOR_KINDS {
+            let err = adapter
+                .run_role_validator(kind, None, None)
+                .expect_err("uncovered platform must yield Err, never panic");
+            match err {
+                AdapterError::UnsupportedPlatform { platform, message } => {
+                    assert_eq!(platform, crate::vm_lab::VmGuestPlatform::Android);
+                    assert!(
+                        message.contains(format!("{kind:?}").as_str()),
+                        "error must name the validator kind, got: {message}"
+                    );
+                }
+                other => panic!("expected UnsupportedPlatform for {kind:?}, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Mutation guard: supports_role_validator must answer false for EVERY
+    /// validator kind on a platform with no validator runtime, so stages
+    /// reported-skip instead of attempting a live check. A wildcard arm that
+    /// silently answers true for a new kind is caught here.
+    #[test]
+    fn supports_role_validator_false_for_every_kind_on_mobile_platform() {
+        let adapter = android_adapter();
+        for kind in ALL_ROLE_VALIDATOR_KINDS {
+            assert!(
+                !adapter.supports_role_validator(kind),
+                "{kind:?} must not claim support on Android"
+            );
+        }
+    }
 
     fn protocol_message(err: AdapterError) -> String {
         match err {

@@ -3966,4 +3966,24 @@ mod tests {
         // guard against a new `echo '<literal>' | sudo -S` anywhere else.
         assert!(!PRIME_SUDOERS_REMOTE_COMMAND.contains('|'));
     }
+
+    /// N4 flag-parity (NodeEngineAdapterParityManifest 2026-09-09 F3): every
+    /// required daemon launch flag must appear in the macOS install script's
+    /// launchd ProgramArguments, so the macOS daemon can never silently drop
+    /// `--node-role` (defaulting to admin) or any other identity/posture
+    /// flag the way the Windows N4 failure did. The plist renders each argv
+    /// element as `<string>--flag</string>`, so that is the form pinned here.
+    /// Mutation: remove one `<string>--node-role</string>` pair from
+    /// `Install-RustyNetMacosService.sh` — this test must fail.
+    #[test]
+    fn macos_daemon_args_include_every_required_launch_flag() {
+        for flag in crate::vm_lab::orchestrator::adapter::node_adapter::REQUIRED_DAEMON_LAUNCH_FLAGS
+        {
+            assert!(
+                INSTALL_SERVICE_SCRIPT.contains(&format!("<string>{flag}</string>")),
+                "macOS daemon-args builder (launchd plist) is missing required \
+                 launch flag {flag}"
+            );
+        }
+    }
 }

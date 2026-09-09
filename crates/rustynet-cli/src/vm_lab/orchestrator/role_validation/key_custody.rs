@@ -86,6 +86,17 @@ mod tests {
         assert!(key_custody_runtime_implemented(VmGuestPlatform::Windows));
     }
 
+    /// Mutation guard: the key-custody stage consults this gate to decide its
+    /// reported-skip branch. If the gate ever returns true for a platform with
+    /// no live validator (mobile stubs), that branch becomes unreachable and a
+    /// stub platform would silently attempt a live check — so pin the false
+    /// arms explicitly.
+    #[test]
+    fn runtime_implemented_false_on_mobile_platforms() {
+        assert!(!key_custody_runtime_implemented(VmGuestPlatform::Android));
+        assert!(!key_custody_runtime_implemented(VmGuestPlatform::Ios));
+    }
+
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
 
     const TEST_DAEMON: &str = "/usr/local/bin/rustynetd";
