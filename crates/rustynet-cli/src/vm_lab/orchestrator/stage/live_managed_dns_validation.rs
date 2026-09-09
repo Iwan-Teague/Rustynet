@@ -7,7 +7,21 @@ use crate::vm_lab::orchestrator::stage::{
     OrchestrationStage, StageFanout, StageId, desktop_platform_tag,
 };
 
-const REPORT_FILENAME: &str = "live_managed_dns_report.json";
+/// QH-83 F1: the managed-DNS stage's pass witness. The `live_managed_dns`
+/// binary writes this report on every success path, so a Passed verdict is
+/// only proven when this artifact exists and is non-empty.
+pub(crate) const MANAGED_DNS_REPORT_RELATIVE: &str = "live_managed_dns_report.json";
+
+/// QH-83 F1: fail a success exit whose pass witness artifact is missing or
+/// empty instead of declaring Passed without evidence on disk.
+fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
+    let path = report_dir.join(MANAGED_DNS_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
 
 pub struct LiveManagedDnsValidationStage;
 
@@ -47,7 +61,7 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
             None => return StageOutcome::Failed("client node_id not found".into()),
         };
 
-        let report_path = ctx.report_dir.join(REPORT_FILENAME);
+        let report_path = ctx.report_dir.join(MANAGED_DNS_REPORT_RELATIVE);
         let log_path = ctx.report_dir.join("live_managed_dns.log");
 
         // The managed-dns binary never enforces this value onto a node (it
@@ -125,7 +139,10 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
         match result {
             Ok(output) => {
                 if output.status.success() {
-                    StageOutcome::Passed
+                    match verify_report_artifact(&ctx.report_dir) {
+                        Ok(()) => StageOutcome::Passed,
+                        Err(e) => StageOutcome::Failed(e),
+                    }
                 } else {
                     StageOutcome::Failed(
                         // QH-09: name the binary's own complete log (--log-path
@@ -364,5 +381,41 @@ mod managed_peer_selection_tests {
         let aliases = ["a", "dup", "dup"];
         let selected = managed_peer_aliases(aliases.iter().copied(), "a", "none");
         assert_eq!(selected, vec!["dup", "dup"], "selection must not dedupe");
+    }
+}
+
+#[cfg(test)]
+mod qh83_witness_tests {
+    use super::*;
+
+    #[test]
+    fn live_managed_dns_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+
+        assert_eq!(
+            StageId::LiveManagedDnsValidation.evidence(),
+            StageEvidence::File(MANAGED_DNS_REPORT_RELATIVE),
+            "the catalog must declare the managed-DNS report as the pass witness"
+        );
+    }
+
+    #[test]
+    fn live_managed_dns_pass_without_report_artifact_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "managed_dns_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let result = verify_report_artifact(&dir);
+        assert!(result.is_err(), "an empty report dir must not pass");
+        assert!(
+            result.unwrap_err().contains(MANAGED_DNS_REPORT_RELATIVE),
+            "the failure must name the missing witness artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

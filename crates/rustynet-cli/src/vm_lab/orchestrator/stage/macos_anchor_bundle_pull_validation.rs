@@ -12,6 +12,23 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 use std::path::Path;
 
+/// QH-83 F1: the macOS anchor bundle-pull stage's pass witness.
+/// `exercise_macos_anchor_bundle_pull_live` reads and validates this report
+/// (fatal on absence) before returning Ok, so a Passed verdict is only
+/// proven when this artifact exists and is non-empty.
+pub(crate) const BUNDLE_PULL_REPORT_RELATIVE: &str = "live_macos_anchor_bundle_pull_report.json";
+
+/// QH-83 F1: fail a success exit whose pass witness artifact is missing or
+/// empty instead of declaring Passed without evidence on disk.
+fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
+    let path = report_dir.join(BUNDLE_PULL_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
+
 pub struct MacosAnchorBundlePullValidationStage;
 
 impl OrchestrationStage for MacosAnchorBundlePullValidationStage {
@@ -83,7 +100,10 @@ impl OrchestrationStage for MacosAnchorBundlePullValidationStage {
             Some(known_hosts_path.as_path()),
             &ctx.report_dir,
         ) {
-            Ok(_detail) => StageOutcome::Passed,
+            Ok(_detail) => match verify_report_artifact(&ctx.report_dir) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(e),
+            },
             Err(err) => StageOutcome::Failed(format!("{macos_alias}: {err}")),
         }
     }
@@ -152,5 +172,36 @@ mod tests {
             MacosAnchorBundlePullValidationStage.fanout(),
             StageFanout::Once
         );
+    }
+
+    #[test]
+    fn macos_anchor_bundle_pull_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+
+        assert_eq!(
+            StageId::MacosAnchorBundlePullValidation.evidence(),
+            StageEvidence::File(BUNDLE_PULL_REPORT_RELATIVE),
+            "the catalog must declare the bundle-pull report as the pass witness"
+        );
+    }
+
+    #[test]
+    fn macos_anchor_bundle_pull_pass_without_report_artifact_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "bundle_pull_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let result = verify_report_artifact(&dir);
+        assert!(result.is_err(), "an empty report dir must not pass");
+        assert!(
+            result.unwrap_err().contains(BUNDLE_PULL_REPORT_RELATIVE),
+            "the failure must name the missing witness artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

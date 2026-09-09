@@ -8,6 +8,7 @@
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 use std::path::Path;
@@ -82,10 +83,39 @@ impl OrchestrationStage for MacosAnchorProfileDeployStage {
             &ssh_identity_file,
             Some(known_hosts_path.as_path()),
         ) {
-            Ok(_detail) => StageOutcome::Passed,
+            Ok(detail) => {
+                // QH-83 evidence-on-pass: the deploy proof (alias + helper
+                // detail) must land in the stage's rust-native evidence log;
+                // a write failure fails the stage instead of passing
+                // unwitnessed.
+                match write_profile_deploy_witness(&ctx.report_dir, &macos_alias, &detail) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => StageOutcome::Failed(format!(
+                        "{macos_alias}: profile deploy witness write failed: {e}"
+                    )),
+                }
+            }
             Err(err) => StageOutcome::Failed(format!("{macos_alias}: {err}")),
         }
     }
+}
+
+/// Append one single-line witness record (`<alias>: <detail>`) for a
+/// successful profile deploy to the stage's rust-native evidence log. The
+/// helper detail is single-line by contract, but any embedded newline is
+/// flattened first so it cannot forge extra evidence lines.
+fn write_profile_deploy_witness(
+    report_dir: &Path,
+    alias: &str,
+    detail: &str,
+) -> Result<(), String> {
+    let detail = detail.replace(['\n', '\r'], " ");
+    let line = format!("{alias}: {detail}");
+    append_stage_evidence_line(
+        report_dir,
+        StageId::MacosAnchorProfileDeploy.as_str(),
+        &line,
+    )
 }
 
 /// Resolve the single macOS anchor node alias, or fail with a skip reason.
@@ -118,6 +148,7 @@ fn macos_anchor_alias(ctx: &OrchestrationContext) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path;
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 
     fn empty_ctx() -> OrchestrationContext {
@@ -127,6 +158,54 @@ mod tests {
             report_dir,
             "net".to_owned(),
         )
+    }
+
+    #[test]
+    fn profile_deploy_witness_line_carries_alias_and_detail() {
+        // The witness record must carry the real deploy datum (alias +
+        // helper detail) as one line, with any embedded newline flattened.
+        let report_dir = std::env::temp_dir().join(format!(
+            "profile_deploy_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&report_dir).expect("create temp report dir");
+        write_profile_deploy_witness(&report_dir, "macos-anchor-1", "deployed\nlabel")
+            .expect("witness write must succeed");
+        let log = std::fs::read_to_string(rust_native_stage_log_path(
+            &report_dir,
+            StageId::MacosAnchorProfileDeploy.as_str(),
+        ))
+        .expect("evidence log must exist");
+        assert!(
+            log.contains("macos-anchor-1: deployed label"),
+            "witness line must carry alias + flattened detail: {log:?}"
+        );
+        assert!(!log.contains("\nlabel"), "newline must be flattened");
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn profile_deploy_witness_write_failure_is_propagated() {
+        // A report_dir that cannot host the evidence log (a regular file
+        // occupies the path) must surface as an error the stage turns into a
+        // failure, not a silent pass.
+        let blocker = std::env::temp_dir().join(format!(
+            "profile_deploy_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        let err = write_profile_deploy_witness(&blocker, "macos-anchor-1", "deployed")
+            .expect_err("witness write into a file must fail");
+        assert!(!err.is_empty(), "error must explain the failure: {err}");
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]
