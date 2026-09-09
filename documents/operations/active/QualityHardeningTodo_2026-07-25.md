@@ -7022,7 +7022,10 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    a fourth column of `define_stage_catalog!`, so macro-generated stage families
    (`cross_network.rs`, `chaos.rs`) cannot inherit a family-wide declaration and
    the compiler totals all 81 rows. Initial declarations: 2 appenders →
-   `StageLog`, `traffic_test_matrix` → `File`, teardown pair → named opt-out,
+   `StageLog` (`membership_init` writes a platform-independent
+   `membership_snapshot_minted=…` line on every pass path — the review of this
+   branch found its only append was the macOS-exit F1 line, which would have
+   demoted every Linux-exit run; `mesh_status_validation` appends per node), `traffic_test_matrix` → `File`, teardown pair → named opt-out,
    remaining 76 → `PHASE1_EVIDENCE_PENDING` (the honest phase-1 `None`, visible
    in every run's `node_stage_plan.json` evidence field).
 2. **Per-stage evidence wiring — OPEN (the bulk).** Upgrade the 76 pending
