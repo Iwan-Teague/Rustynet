@@ -18,6 +18,7 @@
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 use std::path::Path;
 
@@ -95,9 +96,16 @@ impl OrchestrationStage for MacosRoleTransitionValidationStage {
             Some(params.known_hosts.as_path()),
         ) {
             // `Passed` carries no payload (the sibling MAC-D3 validator has
-            // the same shape), so the human-readable proof line stays in the
-            // helper's Ok value and is intentionally not duplicated here.
-            Ok(_) => StageOutcome::Passed,
+            // the same shape). QH-83 evidence-on-pass: the transition proof
+            // (alias + helper summary) must land in the stage's rust-native
+            // evidence log; a write failure fails the stage instead of
+            // passing unwitnessed.
+            Ok(summary) => match write_role_transition_witness(&ctx.report_dir, &alias, &summary) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!(
+                    "{alias}: role transition witness write failed: {e}"
+                )),
+            },
             Err(err) => StageOutcome::Failed(format!("{alias}: {err}")),
         }
     }
@@ -130,9 +138,28 @@ fn macos_role_transition_alias(ctx: &OrchestrationContext) -> Result<String, Str
     }
 }
 
+/// Append one single-line witness record (`<alias>: <summary>`) for a
+/// successful live role transition to the stage's rust-native evidence log.
+/// The helper summary is single-line by contract, but any embedded newline is
+/// flattened first so it cannot forge extra evidence lines.
+fn write_role_transition_witness(
+    report_dir: &Path,
+    alias: &str,
+    summary: &str,
+) -> Result<(), String> {
+    let summary = summary.replace(['\n', '\r'], " ");
+    let line = format!("{alias}: {summary}");
+    append_stage_evidence_line(
+        report_dir,
+        StageId::MacosRoleTransitionValidation.as_str(),
+        &line,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path;
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 
     fn empty_ctx() -> OrchestrationContext {
@@ -141,6 +168,54 @@ mod tests {
             std::env::temp_dir().join("macos-role-transition-stage-tests"),
             "net".to_owned(),
         )
+    }
+
+    #[test]
+    fn role_transition_witness_line_carries_alias_and_summary() {
+        // The witness record must carry the real transition datum (alias +
+        // helper summary) as one line, with any embedded newline flattened.
+        let report_dir = std::env::temp_dir().join(format!(
+            "role_transition_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&report_dir).expect("create temp report dir");
+        write_role_transition_witness(&report_dir, "macos-1", "client -> relay proven\nx")
+            .expect("witness write must succeed");
+        let log = std::fs::read_to_string(rust_native_stage_log_path(
+            &report_dir,
+            StageId::MacosRoleTransitionValidation.as_str(),
+        ))
+        .expect("evidence log must exist");
+        assert!(
+            log.contains("macos-1: client -> relay proven x"),
+            "witness line must carry alias + flattened summary: {log:?}"
+        );
+        assert!(!log.contains("\nx"), "newline must be flattened");
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn role_transition_witness_write_failure_is_propagated() {
+        // A report_dir that cannot host the evidence log (a regular file
+        // occupies the path) must surface as an error the stage turns into a
+        // failure, not a silent pass.
+        let blocker = std::env::temp_dir().join(format!(
+            "role_transition_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        let err = write_role_transition_witness(&blocker, "macos-1", "client -> relay proven")
+            .expect_err("witness write into a file must fail");
+        assert!(!err.is_empty(), "error must explain the failure: {err}");
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]

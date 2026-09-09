@@ -5,7 +5,22 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-const REPORT_FILENAME: &str = "live_reboot_recovery_report.json";
+/// QH-83 F1: the reboot-recovery stage's pass witness. The
+/// `live_reboot_recovery` binary writes this report on every success path,
+/// so a Passed verdict is only proven when this artifact exists and is
+/// non-empty.
+pub(crate) const REBOOT_RECOVERY_REPORT_RELATIVE: &str = "live_reboot_recovery_report.json";
+
+/// QH-83 F1: fail a success exit whose pass witness artifact is missing or
+/// empty instead of declaring Passed without evidence on disk.
+fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
+    let path = report_dir.join(REBOOT_RECOVERY_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
 
 pub struct LiveRebootRecoveryValidationStage;
 
@@ -45,7 +60,7 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
             None => return StageOutcome::Failed("client node_id not found".into()),
         };
 
-        let report_path = ctx.report_dir.join(REPORT_FILENAME);
+        let report_path = ctx.report_dir.join(REBOOT_RECOVERY_REPORT_RELATIVE);
         let log_path = ctx.report_dir.join("live_reboot_recovery.log");
 
         let exit_target = format!("{}@{}", exit_params.user, exit_params.host);
@@ -92,7 +107,10 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
         match result {
             Ok(output) => {
                 if output.status.success() {
-                    StageOutcome::Passed
+                    match verify_report_artifact(&ctx.report_dir) {
+                        Ok(()) => StageOutcome::Passed,
+                        Err(e) => StageOutcome::Failed(e),
+                    }
                 } else {
                     StageOutcome::Failed(
                         // QH-09: name the binary's own complete log (--log-path
@@ -188,5 +206,38 @@ mod tests {
             LiveRebootRecoveryValidationStage.fanout(),
             StageFanout::Once
         );
+    }
+
+    #[test]
+    fn live_reboot_recovery_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+
+        assert_eq!(
+            StageId::LiveRebootRecoveryValidation.evidence(),
+            StageEvidence::File(REBOOT_RECOVERY_REPORT_RELATIVE),
+            "the catalog must declare the reboot-recovery report as the pass witness"
+        );
+    }
+
+    #[test]
+    fn live_reboot_recovery_pass_without_report_artifact_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "reboot_recovery_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let result = verify_report_artifact(&dir);
+        assert!(result.is_err(), "an empty report dir must not pass");
+        assert!(
+            result
+                .unwrap_err()
+                .contains(REBOOT_RECOVERY_REPORT_RELATIVE),
+            "the failure must name the missing witness artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

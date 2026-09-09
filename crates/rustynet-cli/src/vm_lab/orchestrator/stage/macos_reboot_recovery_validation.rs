@@ -58,6 +58,27 @@ const RECOVERY_POLL_INTERVAL: Duration = Duration::from_secs(10);
 const RECOVERED_STATE_DATAPLANE_APPLIED: &str = "DataplaneApplied";
 const RECOVERED_STATE_EXIT_ACTIVE: &str = "ExitActive";
 
+/// Declared pass-witness artifact (QH-83): the reboot-recovery proof is only
+/// recorded when the live helper writes its evidence JSON under the run's
+/// report directory. The helper
+/// (`exercise_macos_reboot_recovery_with_recovery_actions`) writes it via
+/// `write_macos_reboot_recovery_evidence` immediately before its only `Ok`,
+/// and this stage always supplies `Some(report_dir)`, so a pass without the
+/// artifact means the recorded proof was lost — treat that as a stage
+/// failure rather than an unwitnessed pass.
+const MACOS_REBOOT_RECOVERY_EVIDENCE_RELATIVE: &str = "logs/validate_macos_reboot_recovery.json";
+
+/// Fatal pass-witness check: the declared `StageEvidence::File` artifact must
+/// exist and be non-empty by the time the stage would return `Passed`.
+fn verify_report_artifact(report_dir: &Path) -> Result<(), String> {
+    let path = report_dir.join(MACOS_REBOOT_RECOVERY_EVIDENCE_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
+
 pub struct MacosRebootRecoveryValidationStage {
     max_parallel_node_workers: usize,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -162,9 +183,14 @@ impl OrchestrationStage for MacosRebootRecoveryValidationStage {
             &mut recovery_actions,
         ) {
             // `Passed` carries no payload (the sibling C6 validator has the
-            // same shape), so the human-readable proof line stays in the
-            // helper's Ok value and is intentionally not duplicated here.
-            Ok(_) => StageOutcome::Passed,
+            // same shape). The proof line lives in the helper's Ok value and
+            // in the evidence JSON it writes; the stage re-checks that
+            // artifact here so a pass without a recorded proof fails loudly
+            // (QH-83 evidence-on-pass).
+            Ok(_) => match verify_report_artifact(Path::new(&report_dir)) {
+                Ok(()) => StageOutcome::Passed,
+                Err(err) => StageOutcome::Failed(format!("{alias}: {err}")),
+            },
             Err(err) => StageOutcome::Failed(format!("{alias}: {err}")),
         }
     }
@@ -388,6 +414,7 @@ mod tests {
     use crate::vm_lab::orchestrator::role::NodeRole;
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
     use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+    use crate::vm_lab::orchestrator::stage::StageEvidence;
     use std::sync::Mutex;
 
     fn empty_ctx() -> OrchestrationContext {
@@ -435,6 +462,39 @@ mod tests {
         assert_eq!(stage.name(), "validate_macos_reboot_recovery");
         assert_eq!(stage.fanout(), StageFanout::Once);
         assert_eq!(stage.dependencies(), &[StageId::ValidateBaselineRuntime]);
+    }
+
+    #[test]
+    fn macos_reboot_recovery_declared_witness_matches_its_artifact_path() {
+        // QH-83: the catalog row and the stage's own witness check must name
+        // the same artifact, or the runner's evidence verification would
+        // police a file the stage never looks at.
+        assert_eq!(
+            StageId::MacosRebootRecoveryValidation.evidence(),
+            StageEvidence::File(MACOS_REBOOT_RECOVERY_EVIDENCE_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn macos_reboot_recovery_pass_without_evidence_artifact_is_fatal() {
+        // An empty report directory has no evidence JSON, so the pass-witness
+        // check must fail (and name the missing path) rather than wave the
+        // stage through.
+        let unique = std::env::temp_dir().join(format!(
+            "macos_reboot_recovery_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&unique).expect("create temp report dir");
+        let err = verify_report_artifact(&unique).expect_err("missing witness must fail");
+        assert!(
+            err.contains(MACOS_REBOOT_RECOVERY_EVIDENCE_RELATIVE),
+            "error must name the missing artifact: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&unique);
     }
 
     fn test_shutdown_flag() -> Arc<std::sync::atomic::AtomicBool> {
