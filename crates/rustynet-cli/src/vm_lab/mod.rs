@@ -39855,11 +39855,12 @@ fn kept_after() {}\n\
         let (files_scanned, offenders) = scan_for_vacuous_pass_guards(&stage_dir);
         // Exact pin, not a floor (the bin-launcher precedent): a floor with
         // slack absorbs files losing their scan coverage silently. Measured
-        // 2026-09-09: 88 stage sources. Bump this number deliberately when a
-        // stage source is added or removed.
+        // 2026-09-09: 88 stage sources; 89 after the QH-83 F1b
+        // bundle_evidence.rs witness module joined the tree. Bump this
+        // number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 88,
-            "expected exactly 88 stage sources under the scan root; found \
+            files_scanned, 89,
+            "expected exactly 89 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );

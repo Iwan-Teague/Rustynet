@@ -349,6 +349,11 @@ fn distribute_bundle_kind_inner(
         let _ = std::fs::remove_dir_all(&tmp_dir);
         return StageOutcome::Failed(format!("issued {kind} verifier key invalid: {err}"));
     }
+    // QH-83 F1b: every successful per-alias install records its witness
+    // entry (minted file name + host-side digest + remote install
+    // destination) so the pass verdict carries a durable per-alias record.
+    let witness: std::sync::Mutex<Vec<super::bundle_evidence::BundleWitnessEntry>> =
+        std::sync::Mutex::new(Vec::new());
     let errors = run_verifier_barrier(
         &aliases,
         max_parallel_node_workers,
@@ -375,16 +380,74 @@ fn distribute_bundle_kind_inner(
                     None => Err(format!("no adapter for '{alias}'")),
                 }
             };
-            r.map_err(|err| format!("{alias}: {err}"))
+            if let Err(err) = r {
+                return Err(format!("{alias}: {err}"));
+            }
+            record_bundle_witness_entry(ctx, &kind, alias, node_id, &fname, &bundle_path, &witness)
         },
     );
 
+    let witness_entries = match witness.into_inner() {
+        Ok(entries) => entries,
+        Err(_) => {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return StageOutcome::Failed(format!(
+                "{kind} bundle witness collector poisoned; refusing to pass unwitnessed"
+            ));
+        }
+    };
     let _ = std::fs::remove_dir_all(&tmp_dir);
     if errors.is_empty() {
-        StageOutcome::Passed
+        // QH-83 F1b: the pass witness is written on EVERY pass path and a
+        // write failure fails the stage — an unwitnessed distribution pass
+        // must not stand (the runner demotes it via the File declaration).
+        match super::bundle_evidence::write_bundle_evidence(
+            &ctx.report_dir,
+            &kind,
+            &witness_entries,
+        ) {
+            Ok(()) => StageOutcome::Passed,
+            Err(err) => StageOutcome::Failed(format!("{kind} bundle evidence write failed: {err}")),
+        }
     } else {
         StageOutcome::Failed(errors.join("; "))
     }
+}
+
+/// Build one per-alias witness record for a bundle that was just installed:
+/// the host-side digest of the exact distributed bytes (the same digest the
+/// adapter's install script re-verified on the guest) and the remote
+/// install destination from the adapter's own path table. Any failure here
+/// fails the distribution rather than passing unwitnessed.
+fn record_bundle_witness_entry(
+    ctx: &OrchestrationContext,
+    kind: &BundleKind,
+    alias: &str,
+    node_id: &str,
+    fname: &str,
+    bundle_path: &std::path::Path,
+    witness: &std::sync::Mutex<Vec<super::bundle_evidence::BundleWitnessEntry>>,
+) -> Result<(), String> {
+    let sha256 =
+        crate::vm_lab::orchestrator::adapter::verifier_key::sha256_hex_of_file(bundle_path)
+            .map_err(|err| format!("{alias}: bundle digest for witness: {err}"))?;
+    let platform = match ctx.adapters.get(alias) {
+        Some(adapter) => adapter.platform(),
+        None => return Err(format!("no adapter for '{alias}'")),
+    };
+    let install_dst = super::bundle_evidence::bundle_install_dst_for_platform(platform, kind)
+        .map_err(|err| format!("{alias}: {err}"))?;
+    let mut entries = witness
+        .lock()
+        .map_err(|_| format!("{alias}: bundle witness collector poisoned"))?;
+    entries.push(super::bundle_evidence::BundleWitnessEntry {
+        alias: alias.to_owned(),
+        node_id: node_id.to_owned(),
+        file: fname.to_owned(),
+        sha256,
+        install_dst,
+    });
+    Ok(())
 }
 
 /// Execute a strict two-phase barrier: every verifier precondition must pass
