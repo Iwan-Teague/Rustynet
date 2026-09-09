@@ -3,6 +3,7 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -65,6 +66,10 @@ impl OrchestrationStage for AuthenticodeValidationStage {
         let mut failures: Vec<String> = Vec::new();
         let mut reported_skips: Vec<(String, String)> = Vec::new();
         let mut linux_stub_reports: Vec<(String, String)> = Vec::new();
+        // Aliases whose real (non-stub) authenticode validator actually ran
+        // and passed — the witness names them so a PASS is never backed by
+        // nothing.
+        let mut validated: Vec<String> = Vec::new();
         for alias in &aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
@@ -90,10 +95,13 @@ impl OrchestrationStage for AuthenticodeValidationStage {
                 }
                 continue;
             }
-            if let Err(e) =
-                adapter.run_role_validator(RoleValidatorKind::Authenticode, expected_node_id, None)
-            {
-                failures.push(format!("{alias}: {e}"));
+            match adapter.run_role_validator(
+                RoleValidatorKind::Authenticode,
+                expected_node_id,
+                None,
+            ) {
+                Ok(()) => validated.push(alias.clone()),
+                Err(e) => failures.push(format!("{alias}: {e}")),
             }
         }
 
@@ -111,8 +119,37 @@ impl OrchestrationStage for AuthenticodeValidationStage {
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
         }
-        outcome_for(&failures, &reported_skips, linux_stub_reports.len())
+        // QH-83: the witness is written on the single pass path and a write
+        // failure fails the stage — an unwitnessed authenticode pass must
+        // never be recorded (the runner would demote it).
+        match outcome_for(&failures, &reported_skips, linux_stub_reports.len()) {
+            StageOutcome::Passed => match write_authenticode_witness(&ctx.report_dir, &validated) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("authenticode witness write failed: {e}")),
+            },
+            other => other,
+        }
     }
+}
+
+/// Writes the QH-83 witness line for an authenticode PASS: the attested node
+/// count plus each alias whose binary-signature verdict was actually proven
+/// by the real (non-stub) producer, so a bare PASS can never be recorded
+/// without the on-disk evidence behind it. An unwritable witness fails the
+/// stage — fail closed.
+fn write_authenticode_witness(
+    report_dir: &std::path::Path,
+    validated: &[String],
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::AuthenticodeValidation.as_str(),
+        &format!(
+            "authenticode=yes attested_nodes={} ({})",
+            validated.len(),
+            validated.join(",")
+        ),
+    )
 }
 
 fn outcome_for(
@@ -464,5 +501,56 @@ mod tests {
             "{body}"
         );
         let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    // QH-83: the pass witness must name the attested node count and the
+    // aliases — a bare "pass" line would be appeasement, not evidence.
+    // Mutation caught: dropping the witness write or demoting it to
+    // best-effort.
+    #[test]
+    fn authenticode_witness_line_names_the_attested_node_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "acode_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_authenticode_witness(&dir, &["win-1".to_owned(), "win-2".to_owned()])
+            .expect("witness write");
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::AuthenticodeValidation.as_str(),
+            ),
+        )
+        .expect("stage log");
+        assert!(log.contains("authenticode=yes"), "{log}");
+        assert!(log.contains("attested_nodes=2"), "{log}");
+        assert!(log.contains("win-1") && log.contains("win-2"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as an
+    /// error the execute path turns into `Failed` — never a silent pass.
+    #[test]
+    fn authenticode_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "acode_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+        let err = write_authenticode_witness(&dir, &["win-1".to_owned()])
+            .expect_err("witness write must fail when the logs path is a regular file");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
