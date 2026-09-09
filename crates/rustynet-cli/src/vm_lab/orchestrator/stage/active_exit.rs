@@ -76,6 +76,38 @@ impl OrchestrationStage for ActiveExitStage {
             }
         };
 
+        // Audit B4: topology consistency BEFORE the platform gate. An
+        // exit-only topology can never produce the egress proof on any
+        // platform, so it is reported-skipped with a named artifact instead
+        // of the former silent fall-through to a bare `Passed` with neither
+        // proof nor artifact; a client assignment without an adapter is an
+        // internal error and fails closed.
+        let client_alias = match client_alias {
+            Some(client_alias) => {
+                if !ctx.adapters.contains_key(client_alias.as_str()) {
+                    return StageOutcome::Failed(format!(
+                        "active_exit: no adapter for egress client '{client_alias}'"
+                    ));
+                }
+                client_alias
+            }
+            None => {
+                // Fail-closed write: this artifact is the only record of WHY
+                // the run skipped, so an unwritable one must not silently
+                // downgrade the skip.
+                if let Err(e) = write_missing_client_note(ctx, &exit_alias) {
+                    return StageOutcome::Failed(format!(
+                        "active_exit: missing-client skip artifact unwritable: {e}"
+                    ));
+                }
+                return StageOutcome::Skipped(format!(
+                    "active-exit egress proof skipped: topology has no non-Exit \
+                     client node to drive egress traffic through '{exit_alias}' \
+                     (named in {MISSING_CLIENT_FILENAME})"
+                ));
+            }
+        };
+
         // The macOS exit adapter now IMPLEMENTS the exit-serving methods
         // (assert-not-actuate over the daemon's own lifecycle verifier, with
         // the A2 pre-activation killswitch-precedence baseline), but the
@@ -128,8 +160,16 @@ impl OrchestrationStage for ActiveExitStage {
         //    Match the bash orchestrator: report-skip the egress proof rather
         //    than hard-failing, so the run goes Partial instead of blocking on a
         //    topology constraint outside the engine's control.
-        if let Some(client_alias) = client_alias
-            && let Some(client_adapter) = ctx.adapters.get(client_alias.as_str())
+        // The consistency gate above proved the adapter exists; a miss here
+        // is a concurrent-context mutation and fails closed anyway.
+        let client_adapter = match ctx.adapters.get(client_alias.as_str()) {
+            Some(adapter) => adapter,
+            None => {
+                return StageOutcome::Failed(format!(
+                    "active_exit: egress client '{client_alias}' adapter vanished"
+                ));
+            }
+        };
         {
             // QH-25: the NAT-session assertion is an identity check when the
             // client's mesh address is known — "THE probed client's session was
@@ -159,13 +199,21 @@ impl OrchestrationStage for ActiveExitStage {
                 Ok(session) => {
                     let identity_proven = expected_client_mesh_addr
                         .is_some_and(|expected| *expected == session.client_source);
-                    write_egress_evidence(
+                    // QH-83: this artifact is the declared pass witness for
+                    // the stage (catalog row ActiveExit), so an unwritable
+                    // write fails the stage here rather than leaving a
+                    // witness-less Passed for the runner to demote.
+                    if let Err(e) = write_egress_evidence(
                         ctx,
                         &exit_alias,
                         client_alias.as_str(),
                         &session,
                         identity_proven,
-                    );
+                    ) {
+                        return StageOutcome::Failed(format!(
+                            "active_exit: egress evidence artifact unwritable: {e}"
+                        ));
+                    }
                 }
             }
         }
@@ -248,6 +296,35 @@ fn write_reported_skip_note_egress(
 
 const EGRESS_EVIDENCE_FILENAME: &str = "active_exit.egress_evidence.json";
 
+/// Audit B4: the artifact that names WHY an exit-only topology skipped —
+/// the former fall-through wrote nothing and still returned `Passed`.
+const MISSING_CLIENT_FILENAME: &str = "active_exit.reported_skips_missing_client.json";
+
+/// Serialize the missing-client skip note. Pure (no I/O) so a unit test can
+/// assert the content without an adapter.
+fn missing_client_json_bytes(exit_alias: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "stage": "active_exit",
+        "reported_skipped_missing_client": [{
+            "exit_alias": exit_alias,
+            "reason": "topology has no non-Exit client node; the egress proof \
+                       (client traffic translated by the exit's NAT) cannot run",
+        }],
+        "note": "audit B4: an exit-only topology is a named SKIP with this \
+                 artifact, never a bare Passed without egress evidence",
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+/// Write the missing-client skip note. Unlike the reported-skip siblings
+/// this is fail-closed: the artifact is the only record of why the stage
+/// skipped, so an unwritable write must fail the stage.
+fn write_missing_client_note(ctx: &OrchestrationContext, exit_alias: &str) -> Result<(), String> {
+    let path = ctx.report_dir.join(MISSING_CLIENT_FILENAME);
+    std::fs::write(&path, missing_client_json_bytes(exit_alias))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
 /// Serialize the PASS-side egress evidence: the concrete observed address pair
 /// from the NAT-session assertion (QH-25: the pair is the checkable evidence,
 /// not a bare verdict). `identity_proven` records whether the observed source
@@ -286,20 +363,22 @@ fn egress_evidence_json_bytes(
 }
 
 /// Write the egress evidence to
-/// `<report_dir>/active_exit.egress_evidence.json`. Best-effort: a write
-/// failure does not change the stage outcome.
+/// `<report_dir>/active_exit.egress_evidence.json`. Fail-closed (audit B4):
+/// this artifact is the stage's declared QH-83 pass witness, so a write
+/// failure is returned and the stage fails instead of passing unwitnessed.
 fn write_egress_evidence(
     ctx: &OrchestrationContext,
     exit_alias: &str,
     client_alias: &str,
     session: &MeshClientNatSession,
     identity_proven: bool,
-) {
+) -> Result<(), String> {
     let path = ctx.report_dir.join(EGRESS_EVIDENCE_FILENAME);
-    let _ = std::fs::write(
+    std::fs::write(
         &path,
         egress_evidence_json_bytes(exit_alias, client_alias, session, identity_proven),
-    );
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -342,6 +421,25 @@ mod tests {
         > = Box::new(MacosNodeAdapter::new("macos-utm-1", conn, None));
         assert_eq!(macos_adapter.platform(), VmGuestPlatform::Macos);
 
+        // Audit B4 moved the topology checks ahead of the platform gate, so
+        // this predicate-false fixture needs a client for the gate skip to
+        // be the outcome under test (an exit-only topology now skips earlier,
+        // with the missing-client artifact).
+        let mut client_identity = NamedTempFile::new().unwrap();
+        writeln!(client_identity, "# placeholder").unwrap();
+        let client_conn = NodeConnection::ssh(
+            "10.0.0.2",
+            22,
+            Some("admin".to_owned()),
+            std::path::PathBuf::from("/id_rsa"),
+            client_identity.path().to_path_buf(),
+            None,
+        )
+        .unwrap();
+        let client_adapter: Box<
+            dyn crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter,
+        > = Box::new(MacosNodeAdapter::new("macos-client", client_conn, None));
+
         let report_dir = std::env::temp_dir().join(format!(
             "active_exit_skip_proof_{}_{}",
             std::process::id(),
@@ -353,11 +451,20 @@ mod tests {
         std::fs::create_dir_all(&report_dir).unwrap();
 
         let mut ctx = OrchestrationContext {
-            assignments: vec![NodeRoleAssignment {
-                alias: "macos-utm-1".to_owned(),
-                role: NodeRole::Exit,
-            }],
-            adapters: HashMap::from([("macos-utm-1".to_owned(), macos_adapter)]),
+            assignments: vec![
+                NodeRoleAssignment {
+                    alias: "macos-utm-1".to_owned(),
+                    role: NodeRole::Exit,
+                },
+                NodeRoleAssignment {
+                    alias: "macos-client".to_owned(),
+                    role: NodeRole::Client,
+                },
+            ],
+            adapters: HashMap::from([
+                ("macos-utm-1".to_owned(), macos_adapter),
+                ("macos-client".to_owned(), client_adapter),
+            ]),
             source_archive: None,
             report_dir: report_dir.clone(),
             stage_outcomes: HashMap::new(),
@@ -525,5 +632,193 @@ mod tests {
             ActiveExitStage.execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
+    }
+
+    /// Test context builder for the audit-B4 topology cases: an Android exit
+    /// adapter is a real `NodeAdapter` whose platform sits outside the
+    /// `active_exit_runtime_implemented` gate, so nothing here can reach the
+    /// network.
+    fn ctx_with_adapters(
+        assignments: Vec<crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment>,
+        adapters: HashMap<
+            String,
+            Box<dyn crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter>,
+        >,
+        report_dir: std::path::PathBuf,
+    ) -> OrchestrationContext {
+        OrchestrationContext {
+            assignments,
+            adapters,
+            source_archive: None,
+            report_dir,
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
+            linux_backend: None,
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
+        }
+    }
+
+    fn android_adapter(
+        alias: &str,
+    ) -> Box<dyn crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter> {
+        use crate::vm_lab::orchestrator::adapter::android::AndroidNodeAdapter;
+        use crate::vm_lab::orchestrator::connection::NodeConnection;
+        Box::new(AndroidNodeAdapter::new(
+            alias,
+            NodeConnection::Ssh {
+                host: "10.0.0.9".to_owned(),
+                port: 22,
+                user: None,
+                identity_file: std::path::PathBuf::from("/tmp/id"),
+                known_hosts: std::path::PathBuf::from("/tmp/known_hosts"),
+                ssh_password: None,
+            },
+        ))
+    }
+
+    fn exit_only_assignments(
+        alias: &str,
+    ) -> Vec<crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment> {
+        vec![
+            crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment {
+                alias: alias.to_owned(),
+                role: NodeRole::Exit,
+            },
+        ]
+    }
+
+    /// Audit B4: an exit-only topology used to fall through to a bare
+    /// `Passed` with neither egress proof nor artifact. Mutation caught:
+    /// deleting the missing-client arm makes this stage return `Passed`
+    /// again and the test fails on both the outcome and the artifact.
+    #[test]
+    fn exit_only_topology_reports_skip_with_missing_client_artifact() {
+        let report_dir = std::env::temp_dir().join(format!(
+            "active_exit_b4_skip_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&report_dir).unwrap();
+        let mut ctx = ctx_with_adapters(
+            exit_only_assignments("ad-exit-1"),
+            HashMap::from([("ad-exit-1".to_owned(), android_adapter("ad-exit-1"))]),
+            report_dir.clone(),
+        );
+
+        match ActiveExitStage.execute(&mut ctx) {
+            StageOutcome::Skipped(reason) => {
+                assert!(
+                    reason.contains("no non-Exit client"),
+                    "skip must name the missing client: {reason}"
+                );
+                assert!(
+                    reason.contains("ad-exit-1"),
+                    "skip must name the exit: {reason}"
+                );
+            }
+            other => panic!("exit-only topology must report-skip, got {other:?}"),
+        }
+        let note = std::fs::read_to_string(report_dir.join(MISSING_CLIENT_FILENAME))
+            .expect("missing-client artifact must exist");
+        assert!(
+            note.contains("ad-exit-1"),
+            "artifact must name the exit alias: {note}"
+        );
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    /// Audit B4 fail-closed: the missing-client artifact is the only record
+    /// of why the stage skipped, so an unwritable write must fail the stage
+    /// instead of silently downgrading it. Mutation caught: making the note
+    /// best-effort (`let _ =`) turns this `Failed` back into a `Skipped`
+    /// with no artifact.
+    #[test]
+    fn missing_client_artifact_write_failure_fails_closed() {
+        // A report "dir" that is a regular file: every write under it fails.
+        let file_report_dir = tempfile::NamedTempFile::new().unwrap();
+        let mut ctx = ctx_with_adapters(
+            exit_only_assignments("ad-exit-1"),
+            HashMap::from([("ad-exit-1".to_owned(), android_adapter("ad-exit-1"))]),
+            file_report_dir.path().to_path_buf(),
+        );
+
+        match ActiveExitStage.execute(&mut ctx) {
+            StageOutcome::Failed(reason) => {
+                assert!(
+                    reason.contains("missing-client skip artifact unwritable"),
+                    "failure must name the unwritable artifact: {reason}"
+                );
+            }
+            other => panic!("unwritable skip artifact must fail closed, got {other:?}"),
+        }
+    }
+
+    /// Audit B4 fail-closed: a client assignment without an adapter is an
+    /// internal error, not a skip — the former fall-through would have
+    /// ignored it. Mutation caught: deleting the adapter-presence check lets
+    /// this case fall through to the platform gate's `Skipped`.
+    #[test]
+    fn egress_client_without_adapter_fails_closed() {
+        let mut assignments = exit_only_assignments("ad-exit-1");
+        assignments.push(
+            crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment {
+                alias: "ghost-client".to_owned(),
+                role: NodeRole::Client,
+            },
+        );
+        let mut ctx = ctx_with_adapters(
+            assignments,
+            HashMap::from([("ad-exit-1".to_owned(), android_adapter("ad-exit-1"))]),
+            std::env::temp_dir(),
+        );
+
+        match ActiveExitStage.execute(&mut ctx) {
+            StageOutcome::Failed(reason) => {
+                assert!(
+                    reason.contains("no adapter for egress client 'ghost-client'"),
+                    "failure must name the adapter-less client: {reason}"
+                );
+            }
+            other => panic!("adapter-less egress client must fail closed, got {other:?}"),
+        }
+    }
+
+    /// Audit B4: the skip note names the exit and the reason it cannot run.
+    /// Mutation caught: an empty or misnamed payload fails the content
+    /// assertions.
+    #[test]
+    fn missing_client_note_names_exit_and_reason() {
+        let bytes = missing_client_json_bytes("ad-exit-1");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["stage"], "active_exit");
+        assert_eq!(
+            v["reported_skipped_missing_client"][0]["exit_alias"],
+            "ad-exit-1"
+        );
+        assert!(
+            v["note"]
+                .as_str()
+                .unwrap_or("")
+                .contains("never a bare Passed")
+        );
     }
 }
