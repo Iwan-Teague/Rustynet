@@ -1,8 +1,27 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+
+/// Writes the QH-83 witness line for a bootstrap_hosts PASS: installed vs
+/// reused-validated counts travel with the verdict, so a rebuild-only run
+/// (or an empty scope) stays auditable instead of passing invisibly.
+fn write_bootstrap_witness(
+    report_dir: &std::path::Path,
+    installed: usize,
+    reused_validated: usize,
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::BootstrapHosts.as_str(),
+        &format!(
+            "bootstrap_hosts installed={installed} reused_validated={reused_validated} total={}",
+            installed + reused_validated
+        ),
+    )
+}
 
 /// Pure predicate: is `alias` part of this run's active build set?
 ///
@@ -106,7 +125,18 @@ impl OrchestrationStage for BootstrapHostsStage {
             .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
             .collect();
         if errors.is_empty() {
-            StageOutcome::Passed
+            // QH-83: the witness is written on EVERY pass path and a write
+            // failure fails the stage — an unwitnessed bootstrap pass must
+            // not stand.
+            let installed = aliases
+                .iter()
+                .filter(|alias| node_in_rebuild_set(rebuild_only, alias))
+                .count();
+            let reused_validated = aliases.len() - installed;
+            match write_bootstrap_witness(&ctx.report_dir, installed, reused_validated) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("bootstrap witness write failed: {e}")),
+            }
         } else {
             StageOutcome::Failed(errors.join("; "))
         }
@@ -249,5 +279,53 @@ mod tests {
             unreachable!("checked above");
         };
         assert!(message.contains("cannot validate daemon readiness"));
+    }
+
+    // QH-83: a PASS verdict must leave a durable stage-log line naming the
+    // installed vs reused counts (vacuity auditable). Mutation caught:
+    // dropping the witness write or demoting it to best-effort.
+    #[test]
+    fn bootstrap_witness_line_names_installed_and_reused_counts() {
+        let dir = std::env::temp_dir().join(format!(
+            "bootstrap_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_bootstrap_witness(&dir, 2, 1).expect("witness write");
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::BootstrapHosts.as_str(),
+            ),
+        )
+        .expect("stage log readable");
+        assert!(
+            log.contains("bootstrap_hosts installed=2 reused_validated=1 total=3"),
+            "{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as
+    /// an error the stage turns into a failure (never a silent pass).
+    #[test]
+    fn bootstrap_witness_write_failure_is_propagated() {
+        let blocker =
+            std::env::temp_dir().join(format!("bootstrap_witness_blocker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let err = write_bootstrap_witness(&blocker, 1, 0)
+            .expect_err("write into a regular file path must fail");
+        assert!(!err.is_empty());
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }

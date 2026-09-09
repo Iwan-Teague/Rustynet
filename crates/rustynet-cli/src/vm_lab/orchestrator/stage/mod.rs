@@ -281,29 +281,38 @@ macro_rules! define_stage_catalog {
 // reviewer can check the call; evidence declarations other than
 // PHASE1_EVIDENCE_PENDING carry one too.
 define_stage_catalog! {
-    Preflight => "preflight" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    PrepareSourceArchive => "prepare_source_archive" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    VerifySshReachability => "verify_ssh_reachability" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CleanupHosts => "cleanup_hosts" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    BootstrapHosts => "bootstrap_hosts" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 Setup batch: the Setup rows carry real witnesses — preflight and
+    // prepare_source_archive declare the artifacts they already write (with
+    // fatal write failures), the per-node probe/bootstrap stages append
+    // count-bearing stage-log lines, and the bundle-distribution rows declare
+    // their per-alias bundle_evidence.json witnesses (F1b). MembershipInit
+    // was the reference StageLog row.
+    Preflight => "preflight" @ Setup / T0Core / StageEvidence::File("logs/cross_bridge_preflight.txt"),
+    PrepareSourceArchive => "prepare_source_archive" @ Setup / T0Core / StageEvidence::File("state/source_archive_provenance.json"),
+    VerifySshReachability => "verify_ssh_reachability" @ Setup / T0Core / StageEvidence::StageLog,
+    CleanupHosts => "cleanup_hosts" @ Setup / T0Core / StageEvidence::StageLog,
+    BootstrapHosts => "bootstrap_hosts" @ Setup / T0Core / StageEvidence::StageLog,
     // TOPOLOGY-LEVEL substrate seam (spec §0.5, 2026-08-27): must run BEFORE
     // collect_pubkeys so overlay addresses — not raw cross-LAN-unroutable
     // underlay IPs — are what land in ctx.endpoints. A no-op pass unless an
-    // overlay-provisioning substrate (vxlan) is selected. Substrate
+    // overlay-provisioning substrate is selected. Substrate
     // correctness is T0 like the nat_classification/matrix rows below.
-    CrossNetworkSubstrateSetup => "cross_network_substrate_setup" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CollectPubkeys => "collect_pubkeys" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    CrossNetworkSubstrateSetup => "cross_network_substrate_setup" @ Setup / T0Core / StageEvidence::StageLog,
+    CollectPubkeys => "collect_pubkeys" @ Setup / T0Core / StageEvidence::StageLog,
     MembershipInit => "membership_init" @ Setup / T0Core / StageEvidence::StageLog,
     // QH-83 F1b: every bundle-distribution pass writes a per-alias witness
     // (alias, node_id, minted file, sha256, remote install destination) via
     // stage/bundle_evidence.rs; the runner demotes an unwitnessed pass.
     DistributeMembership => "distribute_membership" @ Setup / T0Core / StageEvidence::File("logs/distribute_membership.bundle_evidence.json"),
     AnchorValidation => "anchor_validation" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    AdminIssue => "admin_issue" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 Setup batch: admin_issue appends a per-validated-node witness
+    // line (status role=admin + peer-list exit 0).
+    AdminIssue => "admin_issue" @ Setup / T1Role / StageEvidence::StageLog,
     DistributeAssignments => "distribute_assignments" @ Setup / T0Core / StageEvidence::File("logs/distribute_assignment.bundle_evidence.json"),
     DistributeTraversal => "distribute_traversal" @ Setup / T0Core / StageEvidence::File("logs/distribute_traversal.bundle_evidence.json"),
     DistributeDnsZone => "distribute_dns_zone" @ Setup / T0Core / StageEvidence::File("logs/distribute_dns-zone.bundle_evidence.json"),
-    EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 Setup batch: enforce appends an enforced_nodes=N witness line.
+    EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup / T0Core / StageEvidence::StageLog,
     // blind_exit ACTIVATES the blind_exit role posture (role capability),
     // not baseline plumbing — T1 like the other role-lifecycle stages.
     // QH-83/F4: a PASS verdict writes one witness line per validated node via
