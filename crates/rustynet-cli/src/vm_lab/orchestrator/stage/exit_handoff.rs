@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -44,7 +45,18 @@ impl OrchestrationStage for ExitHandoffStage {
         //    Fails closed if tunnels are absent or unverifiable.
         match adapter.collect_active_tunnels() {
             Ok(list) => match verify_tunnels_active(&list) {
-                Ok(()) => StageOutcome::Passed,
+                Ok(()) => {
+                    // QH-83: the witness is written on the single pass path
+                    // and a write failure fails the stage — an unwitnessed
+                    // exit-handoff pass must never be recorded (the runner
+                    // would demote it).
+                    match write_exit_handoff_witness(&ctx.report_dir, &exit_alias) {
+                        Ok(()) => StageOutcome::Passed,
+                        Err(e) => {
+                            StageOutcome::Failed(format!("exit-handoff witness write failed: {e}"))
+                        }
+                    }
+                }
                 Err(e) => StageOutcome::Failed(format!("exit handoff: exit '{exit_alias}' {e}")),
             },
             Err(e) => StageOutcome::Failed(format!(
@@ -52,6 +64,21 @@ impl OrchestrationStage for ExitHandoffStage {
             )),
         }
     }
+}
+
+/// Writes the QH-83 witness line for an exit-handoff PASS: the exit alias
+/// whose owner key was issued and whose active tunnel proved it is actually
+/// serving the mesh, so a bare PASS can never be recorded without the on-disk
+/// evidence behind it. An unwritable witness fails the stage — fail closed.
+fn write_exit_handoff_witness(
+    report_dir: &std::path::Path,
+    exit_alias: &str,
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::ExitHandoff.as_str(),
+        &format!("exit_handoff=yes exit={exit_alias} tunnels_active=true"),
+    )
 }
 
 #[cfg(test)]
@@ -91,5 +118,55 @@ mod tests {
             ExitHandoffStage.execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
+    }
+
+    // QH-83: the pass witness must name the exit alias and the tunnel-active
+    // verdict — a bare "pass" line would be appeasement, not evidence.
+    // Mutation caught: dropping the witness write or demoting it to
+    // best-effort.
+    #[test]
+    fn exit_handoff_witness_line_names_the_exit_alias() {
+        let dir = std::env::temp_dir().join(format!(
+            "handoff_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_exit_handoff_witness(&dir, "exit-a").expect("witness write");
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::ExitHandoff.as_str(),
+            ),
+        )
+        .expect("stage log");
+        assert!(log.contains("exit_handoff=yes"), "{log}");
+        assert!(log.contains("exit=exit-a"), "{log}");
+        assert!(log.contains("tunnels_active=true"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as an
+    /// error the execute path turns into `Failed` — never a silent pass.
+    #[test]
+    fn exit_handoff_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "handoff_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+        let err = write_exit_handoff_witness(&dir, "exit-a")
+            .expect_err("witness write must fail when the logs path is a regular file");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

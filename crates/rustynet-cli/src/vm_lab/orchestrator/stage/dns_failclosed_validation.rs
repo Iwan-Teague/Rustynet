@@ -2,6 +2,7 @@
 use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -51,6 +52,9 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
 
         let mut failures: Vec<String> = Vec::new();
         let mut reported_skips: Vec<(String, String)> = Vec::new();
+        // Aliases whose DNS-failclosed validator actually ran and passed —
+        // the witness names them so a PASS is never backed by nothing.
+        let mut validated: Vec<String> = Vec::new();
         // Does this topology have a primary exit that non-exit nodes route
         // through? distribute_assignments::build_bundle_env assigns every
         // non-exit node to the `NodeRole::Exit` node's id, so their
@@ -82,20 +86,53 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
             // an exit-topology is FULL-TUNNEL (FullyProtected), not a plain
             // scoped client — see expected_dns_posture_for.
             let expected_dns_posture = expected_dns_posture_for(&assignment.role, has_primary_exit);
-            if let Err(e) = adapter.run_role_validator(
+            match adapter.run_role_validator(
                 RoleValidatorKind::DnsFailclosed,
                 expected_node_id,
                 Some(expected_dns_posture),
             ) {
-                failures.push(format!("{alias}: {e}"));
+                Ok(()) => validated.push(alias.clone()),
+                Err(e) => failures.push(format!("{alias}: {e}")),
             }
         }
 
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
         }
-        outcome_for(&failures, &reported_skips)
+        // QH-83: the witness is written on the single pass path and a write
+        // failure fails the stage — an unwitnessed DNS-posture pass must
+        // never be recorded (the runner would demote it).
+        match outcome_for(&failures, &reported_skips) {
+            StageOutcome::Passed => {
+                match write_dns_failclosed_witness(&ctx.report_dir, &validated) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => {
+                        StageOutcome::Failed(format!("dns failclosed witness write failed: {e}"))
+                    }
+                }
+            }
+            other => other,
+        }
     }
+}
+
+/// Writes the QH-83 witness line for a DNS-failclosed PASS: the validated
+/// node count plus each alias whose fail-closed posture was actually proven,
+/// so a bare PASS can never be recorded without the on-disk evidence behind
+/// it. An unwritable witness fails the stage — fail closed.
+fn write_dns_failclosed_witness(
+    report_dir: &std::path::Path,
+    validated: &[String],
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::DnsFailclosedValidation.as_str(),
+        &format!(
+            "dns_failclosed=yes validated_nodes={} ({})",
+            validated.len(),
+            validated.join(",")
+        ),
+    )
 }
 
 /// The DNS posture the orchestrator EXPECTS a node to hold, from its planned
@@ -250,5 +287,56 @@ mod tests {
                 "scoped_resolver_only"
             );
         }
+    }
+
+    // QH-83: the pass witness must name the validated node count and the
+    // aliases — a bare "pass" line would be appeasement, not evidence.
+    // Mutation caught: dropping the witness write or demoting it to
+    // best-effort.
+    #[test]
+    fn dns_failclosed_witness_line_names_the_validated_node_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "dns_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_dns_failclosed_witness(&dir, &["deb-1".to_owned(), "deb-2".to_owned()])
+            .expect("witness write");
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::DnsFailclosedValidation.as_str(),
+            ),
+        )
+        .expect("stage log");
+        assert!(log.contains("dns_failclosed=yes"), "{log}");
+        assert!(log.contains("validated_nodes=2"), "{log}");
+        assert!(log.contains("deb-1") && log.contains("deb-2"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as an
+    /// error the execute path turns into `Failed` — never a silent pass.
+    #[test]
+    fn dns_failclosed_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "dns_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+        let err = write_dns_failclosed_witness(&dir, &["deb-1".to_owned()])
+            .expect_err("witness write must fail when the logs path is a regular file");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
