@@ -185,15 +185,23 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
                 // Rich evidence on disk (StageOutcome::Passed carries no
                 // payload by design): aliases, counter deltas, the
                 // ciphertext-only assertion and the relay-routed peer paths —
-                // the helper summary already contains all of it.
-                write_evidence_note(
+                // the helper summary already contains all of it. The write is
+                // FATAL (QH-83): a Passed verdict without its declared
+                // witness would be demoted to NotProven by the runner, so a
+                // failed write must fail the stage here instead of passing
+                // unwitnessed.
+                match write_evidence_note(
                     ctx,
                     &relay_alias,
                     &topology.sender_alias,
                     &topology.receiver_alias,
                     &summary,
-                );
-                StageOutcome::Passed
+                ) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => StageOutcome::Failed(format!(
+                        "relay forwarding validation evidence write failed: {e}"
+                    )),
+                }
             }
             Err(e) => StageOutcome::Failed(format!("{relay_alias}: {e}")),
         }
@@ -205,15 +213,16 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
 /// (counter deltas, ciphertext-only assertion, relay-routed peer paths).
 const EVIDENCE_FILENAME: &str = "relay_forwards_frame_validation.evidence.json";
 
-/// Write the success-evidence note. Pure serializer + best-effort write, the
-/// same shape as `relay_validation`'s reported-skips note.
+/// Write the success-evidence note. Pure serializer + write; the write is
+/// FATAL (QH-83): every error (serialization or I/O) is returned so the
+/// caller fails the stage instead of passing unwitnessed.
 fn write_evidence_note(
     ctx: &OrchestrationContext,
     relay_alias: &str,
     sender_alias: &str,
     receiver_alias: &str,
     summary: &str,
-) {
+) -> Result<(), String> {
     let body = serde_json::json!({
         "stage": "relay_forwards_frame_validation",
         "relay": relay_alias,
@@ -221,8 +230,10 @@ fn write_evidence_note(
         "receiver": receiver_alias,
         "summary": summary,
     });
+    let encoded = serde_json::to_vec_pretty(&body)
+        .map_err(|e| format!("serializing relay-forward evidence note failed: {e}"))?;
     let path = ctx.report_dir.join(EVIDENCE_FILENAME);
-    let _ = std::fs::write(&path, serde_json::to_vec_pretty(&body).unwrap_or_default());
+    std::fs::write(&path, encoded).map_err(|e| format!("writing {EVIDENCE_FILENAME} failed: {e}"))
 }
 
 #[cfg(test)]
@@ -382,5 +393,76 @@ mod tests {
             StageOutcome::Failed(msg) => assert!(msg.contains(reason)),
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// QH-83: the declared pass witness is the evidence note file, and the
+    /// note the stage writes carries the real probe data — relay/sender/
+    /// receiver aliases plus the helper's full summary.
+    #[test]
+    fn relay_forwards_frame_witness_note_carries_aliases_and_summary() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+
+        let dir = std::env::temp_dir().join(format!(
+            "rn-hp3-witness-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut ctx = empty_ctx();
+        ctx.report_dir = dir.clone();
+
+        let result = write_evidence_note(
+            &ctx,
+            "relay-1",
+            "client-1",
+            "client-2",
+            "frames forwarded; counters delta>0; ciphertext-only",
+        );
+        assert!(result.is_ok(), "witness write must succeed: {result:?}");
+        let path = dir.join(EVIDENCE_FILENAME);
+        assert!(path.is_file(), "witness file must exist");
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read witness")).expect("json");
+        assert_eq!(body["stage"], "relay_forwards_frame_validation");
+        assert_eq!(body["relay"], "relay-1");
+        assert_eq!(body["sender"], "client-1");
+        assert_eq!(body["receiver"], "client-2");
+        assert_eq!(
+            body["summary"],
+            "frames forwarded; counters delta>0; ciphertext-only"
+        );
+        assert_eq!(
+            StageId::RelayForwardsFrameValidation.evidence(),
+            StageEvidence::File(EVIDENCE_FILENAME)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// QH-83: the witness write is FATAL — an I/O failure must surface as an
+    /// Err (which the execute path turns into Failed), never a silent pass.
+    #[test]
+    fn relay_forwards_frame_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "rn-hp3-witness-fail-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        // A DIRECTORY at the witness path makes fs::write fail.
+        std::fs::create_dir_all(dir.join(EVIDENCE_FILENAME)).expect("blocker dir");
+        let mut ctx = empty_ctx();
+        ctx.report_dir = dir.clone();
+
+        let result = write_evidence_note(&ctx, "relay-1", "client-1", "client-2", "summary");
+        let err = result.expect_err("witness write failure must propagate");
+        assert!(!err.is_empty());
+        assert!(err.contains(EVIDENCE_FILENAME));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
