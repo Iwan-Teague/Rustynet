@@ -97,3 +97,15 @@ Implemented on branch `ai-edit/edit-1788950718573-70716-0` (worktree of HEAD `a5
 **Not yet done**: no live `--node` run has exercised the new start marker end-to-end (needs a real lab run; the upsert tests pin the replace semantics). The committed ledgers are untouched by this branch.
 
 ## Tools used (19 call(s) over 11 step(s))
+
+## Review disposition (2026-09-09, GLM-flash, MERGE-WITH-FIXES → merged)
+
+D1/D2/D3 CONFIRMED (upsert key is `(report_dir, run_started_utc)`; interim
+row is `in_progress` + `row_role=interim`, consumers treat anything non-final
+as not-final). All three non-blocking fixes applied before merge: the atomic
+writer fsyncs the tmp file and removes it on failure, with the comment scoped
+to process-crash atomicity; a run re-entering the same report_dir replaces
+its own stale start marker (the degenerate-key guard admits exactly that
+case; test `re_entering_the_same_report_dir_replaces_its_own_start_marker`).
+Flagged, untouched: `write_report_local_row` still uses a bare `fs::write`
+(report-local, out of D2/D3 scope).
