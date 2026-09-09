@@ -46,7 +46,9 @@ pub const PER_CONTROL_SCHEMA_VERSION_FIELD: &str = "schema_version";
 /// that admitting a platform is runtime support, not evidence — though macOS has
 /// in fact executed this stage and passed (2026-07-19, run
 /// `live-lab-direct-1784500192`); Windows has not yet reached it in a recorded
-/// `--node` run. A run with no nodes is a skip-noop pass.
+/// `--node` run. A run with no nodes is an honest skip (`Skipped`, never a
+/// vacuous pass): nothing was validated, so the run stays Partial and the gap
+/// stays visible.
 pub struct SecurityAuditValidationStage;
 
 impl OrchestrationStage for SecurityAuditValidationStage {
@@ -68,8 +70,14 @@ impl OrchestrationStage for SecurityAuditValidationStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        // A topology with no nodes validated NOTHING: a pass here would record
+        // a green ledger row for an unexercised control — the vacuous-pass
+        // false green (skip-semantics review F1). Skip so the run stays
+        // Partial and the gap stays visible; never `Passed`.
         if aliases.is_empty() {
-            return StageOutcome::Passed;
+            return StageOutcome::Skipped(
+                "no node assignments in this topology; nothing was validated".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -415,5 +423,23 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("mac-1") && s.contains("win-1"));
         assert!(s.contains("security_audit_validation"));
+    }
+
+    /// The empty-assignments guard must SKIP, never PASS: with zero nodes the
+    /// stage validated nothing, and a pass would record a green ledger row for
+    /// an unexercised control (skip-semantics review F1's vacuous pass).
+    /// Mutation caught: reverting the guard arm to `return StageOutcome::Passed;`
+    /// (the empty-assignments-vacuous-pass mutation).
+    #[test]
+    fn empty_assignments_is_skipped_never_passed() {
+        let mut ctx = OrchestrationContext::new(Vec::new(), std::env::temp_dir(), "net".to_owned());
+        assert!(
+            matches!(
+                SecurityAuditValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "an empty topology must skip, never pass; got {:?}",
+            SecurityAuditValidationStage.execute(&mut ctx)
+        );
     }
 }
