@@ -1137,7 +1137,11 @@ pub fn issue_bundles_to_dir(
     // zero-file or partial mint errors HERE, naming the missing
     // rn-<kind>-<node_id>.<kind> files, instead of deferring to a
     // distribution-shaped "bundle not found" per node later.
-    let missing = missing_bundle_files(kind, env_content, &listing);
+    let missing = missing_bundle_files(kind, env_content, &listing).map_err(|message| {
+        AdapterError::Protocol {
+            message: format!("issuer env for {kind} bundles is unusable: {message}"),
+        }
+    })?;
     if !missing.is_empty() {
         return Err(AdapterError::Protocol {
             message: format!(
@@ -1173,31 +1177,36 @@ pub fn issue_bundles_to_dir(
 /// fail-closed trigger in [`issue_bundles_to_dir`]. Mutation guard: dropping
 /// the completeness check in `issue_bundles_to_dir` flips
 /// `issue_bundles_errors_when_minter_mints_a_subset` red.
+/// Errors when the issuer env carries no usable `NODES_SPEC` (absent, or
+/// naming zero node ids): an expectation set that is empty by accident would
+/// let a zero-file mint pass vacuously, so absence denies.
 fn missing_bundle_files(
     kind: &crate::vm_lab::orchestrator::error::BundleKind,
     env_content: &str,
     listing: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     // Node ids come from NODES_SPEC (`node_id|endpoint|pubkey|caps;...`) —
     // the same spec the issuer was handed, so expectation and mint input
     // cannot drift.
-    let node_ids: Vec<&str> = env_content
+    let spec = env_content
         .lines()
         .find_map(|l| l.strip_prefix("NODES_SPEC="))
-        .map(|spec| {
-            spec.split(';')
-                .filter(|entry| !entry.is_empty())
-                .filter_map(|entry| entry.split('|').next())
-                .filter(|id| !id.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
+        .ok_or_else(|| "NODES_SPEC line not found in issuer env".to_owned())?;
+    let node_ids: Vec<&str> = spec
+        .split(';')
+        .filter(|entry| !entry.is_empty())
+        .filter_map(|entry| entry.split('|').next())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if node_ids.is_empty() {
+        return Err("NODES_SPEC names no node ids".to_owned());
+    }
     let listed: Vec<&str> = listing.lines().map(str::trim).collect();
-    node_ids
+    Ok(node_ids
         .iter()
         .map(|node_id| format!("rn-{kind}-{node_id}.{kind}"))
         .filter(|expected| !listed.contains(&expected.as_str()))
-        .collect()
+        .collect())
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -1523,29 +1532,67 @@ node-b|10.0.0.2:51820|b|client\nALLOW_SPEC=\n";
         // Full mint names every expected file — no error.
         let full = "rn-assignment-node-a.assignment\nrn-assignment-node-b.assignment\n";
         assert!(
-            missing_bundle_files(&BundleKind::Assignment, env, full).is_empty(),
+            missing_bundle_files(&BundleKind::Assignment, env, full)
+                .expect("spec present")
+                .is_empty(),
             "a complete mint must not be flagged"
         );
         // Partial mint: node-b's bundle absent.
         let partial = "rn-assignment-node-a.assignment\n";
         assert_eq!(
-            missing_bundle_files(&BundleKind::Assignment, env, partial),
+            missing_bundle_files(&BundleKind::Assignment, env, partial).expect("spec present"),
             vec!["rn-assignment-node-b.assignment".to_owned()],
             "a missing per-node bundle must be named exactly"
         );
         // Empty listing (minter minted nothing) flags everything.
         assert_eq!(
-            missing_bundle_files(&BundleKind::Assignment, env, "").len(),
+            missing_bundle_files(&BundleKind::Assignment, env, "")
+                .expect("spec present")
+                .len(),
             2,
             "a zero-file mint must flag every expected bundle"
         );
         // Traversal naming follows the same rn-<kind>-<node_id>.<kind> shape.
         assert_eq!(
-            missing_bundle_files(&BundleKind::Traversal, env, ""),
+            missing_bundle_files(&BundleKind::Traversal, env, "").expect("spec present"),
             vec![
                 "rn-traversal-node-a.traversal".to_owned(),
                 "rn-traversal-node-b.traversal".to_owned()
             ]
+        );
+    }
+
+    /// Review fix: an issuer env with no usable NODES_SPEC must DENY, not
+    /// yield an empty expectation set that a zero-file mint would satisfy.
+    /// Mutation caught: restoring `.unwrap_or_default()` on the spec lookup.
+    #[test]
+    fn missing_bundle_files_denies_without_a_node_spec() {
+        use crate::vm_lab::orchestrator::error::BundleKind;
+        assert!(missing_bundle_files(&BundleKind::Assignment, "OTHER=1\n", "").is_err());
+        assert!(missing_bundle_files(&BundleKind::Assignment, "NODES_SPEC=\n", "").is_err());
+        assert!(missing_bundle_files(&BundleKind::Assignment, "NODES_SPEC=;;\n", "").is_err());
+    }
+
+    /// Review fix: pin that the completeness gate is WIRED into
+    /// `issue_bundles_to_dir` ahead of the scp-back loop (the helper alone
+    /// could be orphaned silently). Mutation caught: deleting the gate call.
+    #[test]
+    fn issue_bundles_to_dir_wires_the_completeness_gate_before_copying_back() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
+        let start = source
+            .find("pub fn issue_bundles_to_dir(")
+            .expect("issue_bundles_to_dir present");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("fn end");
+        let body = &body[..end];
+        let gate = body
+            .find("missing_bundle_files(")
+            .expect("gate call present in issue_bundles_to_dir");
+        let copy = body.find("scp_from(").expect("scp-back present");
+        assert!(
+            gate < copy,
+            "the completeness gate must run before the scp-back loop"
         );
     }
 
