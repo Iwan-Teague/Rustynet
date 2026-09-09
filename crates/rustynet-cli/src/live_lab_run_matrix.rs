@@ -2848,12 +2848,10 @@ fn write_report_local_row(
         )
     })?;
     let body = format!("{}\n{}\n", schema.join(","), render_csv_row(schema, values));
-    fs::write(&path, body).map_err(|err| {
-        format!(
-            "write report-local matrix row failed ({}): {err}",
-            path.display()
-        )
-    })?;
+    // Same tmp+fsync+rename writer as the ledger itself: a crash mid-write
+    // must leave either the previous row or the new one, never a truncated
+    // half-row that a later consumer parses as a schema mismatch.
+    write_file_atomic(&path, &body, "report-local matrix row")?;
     Ok(path)
 }
 
@@ -6996,6 +6994,48 @@ mod conclusion_barrier_tests {
             after, old_body,
             "the previous per-run stage CSV must be intact after a failed rewrite"
         );
+    }
+
+    /// Report-local row: the per-run `live_lab_run_matrix_row.csv` copy is
+    /// written through the same tmp+fsync+rename writer as the ledger, so a
+    /// failed rewrite leaves the previous row intact and no tmp residue.
+    ///
+    /// Mutation: reverting `write_report_local_row` to a plain in-place
+    /// `fs::write` makes this fail — the write lands despite the sabotaged
+    /// tmp path.
+    #[test]
+    fn failed_report_local_row_write_leaves_the_previous_row_intact() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let report_dir =
+            std::env::temp_dir().join(format!("rustynet-local-row-{}-{stamp}", std::process::id()));
+        fs::create_dir_all(&report_dir).expect("report dir");
+        let path = super::report_local_row_path(&report_dir);
+        let schema = vec!["a".to_owned(), "b".to_owned()];
+        let mut values = BTreeMap::new();
+        values.insert("a".to_owned(), "1".to_owned());
+        values.insert("b".to_owned(), "x,y".to_owned());
+
+        let written =
+            super::write_report_local_row(&report_dir, &schema, &values).expect("first row write");
+        assert_eq!(written, path);
+        let first = fs::read_to_string(&path).expect("row readable");
+        assert_eq!(first, "a,b\n1,\"x,y\"\n");
+        assert!(
+            !path.with_extension("csv.tmp").exists(),
+            "no tmp residue after a successful write"
+        );
+
+        sabotage_tmp_write(&path);
+        values.insert("a".to_owned(), "2".to_owned());
+        let err = super::write_report_local_row(&report_dir, &schema, &values)
+            .expect_err("sabotaged tmp write must fail the rewrite");
+        assert!(err.contains("tmp"), "{err}");
+        let after = fs::read_to_string(&path).expect("row still readable");
+        assert_eq!(after, first, "previous row must survive a failed rewrite");
+        let _ = fs::remove_dir_all(&report_dir);
     }
 
     /// D3 ordering: the per-run node-stage ledgers must be written AFTER the
