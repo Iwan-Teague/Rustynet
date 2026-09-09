@@ -162,8 +162,39 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    literal. GLM-flash edit job, vm_lab only.
 6. **requires()/provisions()** per probe B — GLM-5.3 design-then-implement,
    depends on QH-83 landing first (same runner seam).
-7. **C: I1, I3** small fixes (GLM-flash, after QH-82 lands — same stage
-   files), then the `PlatformCapabilities` table (L). **I4 DONE** (this
+7. **C: I1, I3** — **DONE** (branch `ai-edit/edit-1788913765980-57053-0`,
+   glm-5.3). **I1 `daed6afc`**: the three exit role stages'
+   file-local `WINDOWS_RUSTYNETD_PATH` duplicates are gone — the daemon path
+   comes from one exhaustive `VmGuestPlatform::lab_daemon_path` table over the
+   adapter install constants — and every `_ => unreachable!("runtime
+   implementation gate accepts desktop platforms only")` dispatch arm in
+   `orchestrator/stage/` (exit_nat_lifecycle ×2, exit_dns_failclosed,
+   exit_demotion_residue) became an extracted, unit-testable kind table that
+   maps an uncovered platform to `None` so the stage returns
+   `StageOutcome::Failed` naming the gate/dispatch desync instead of panicking
+   the stage thread (tests: `validation_kind_never_panics_on_ungated_platforms`
+   ×3, `lab_daemon_path_covers_every_variant_with_installed_paths`). The
+   remaining `unreachable!`s in the stage tree are not platform matches
+   (`live_two_hop_validation.rs:59` logic guard, `install.rs:249` test
+   assert-else, `cross_network.rs:29` NAT-profile invariant) and stay; the
+   same phantom shape OUTSIDE the stage tree (`adapter/node_adapter.rs:556`
+   `WINDOWS_DAEMON` duplicate + `:571` unreachable, `role_validation/anchor.rs`
+   I1 sites) remains for the `PlatformCapabilities` item. **I3 `ac9ff2ae`**:
+   the three `_ => "linux"` evidence-label helpers
+   (`live_lan_toggle_validation`, `live_extended_soak_validation`,
+   `live_managed_dns_validation`) are replaced by one exhaustive
+   `VmGuestPlatform::evidence_tag` plus the shared
+   `stage::desktop_platform_tag`, which refuses Ios/Android with an `Err` the
+   spawner surfaces as `StageOutcome::Failed` and treats a missing adapter as
+   an error — never a silent linux stamp (tests:
+   `evidence_tag_covers_every_variant`,
+   `desktop_platform_tag_refuses_never_hosted_platforms`). The
+   `PlatformCapabilities` table (L) itself remains open. **Gate caveat:**
+   `cargo clippy -p rustynet-cli --all-targets --all-features --locked -- -D
+   warnings` is blocked by 3 PRE-EXISTING `collapsible_if` errors in
+   `crates/rustynetd/src/phase10.rs:4301/4911/4955` — present at the branch
+   base `3bfc99e6`, untouched by this branch (scoped clippy over the branch's
+   own crates shows zero warnings from its files). **I4 DONE** (this
    commit): the non-Linux arm of `validate_bundle_pull_log_redaction` is now
    `Err`, coverage decisions belong to the caller.
 8. **D: pattern G parity** — DONE (this commit): `evaluate_linux_runtime_acls_report`,
@@ -171,7 +202,21 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    `evaluate_macos_service_hardening_report` now reject `overall_ok=true`
    when a row or `drift_reasons` disagrees, as the Windows siblings do;
    one test per evaluator (`evaluators_reject_overall_ok_true_when_rows_disagree`).
-9. **B4, B5** (S/M). B2 done (see item 2).
+9. **B4, B5** (S/M). **B4 DONE `89e33dda`** (branch
+   `ai-edit/edit-1788913765980-57053-0`, glm-5.3): the exit-only topology no
+   longer falls through to a bare `Passed` — the topology checks run ahead of
+   the platform gate, an exit-only topology writes
+   `active_exit.reported_skips_missing_client.json` (fail-closed write) and
+   returns `Skipped` naming the missing client, a client assignment without
+   an adapter fails closed, the egress-evidence write is fail-closed, and the
+   QH-83 catalog row for `ActiveExit` now declares
+   `StageEvidence::File("active_exit.egress_evidence.json")` as its pass
+   witness so the runner demotes any witness-less `Passed` (tests:
+   `exit_only_topology_reports_skip_with_missing_client_artifact`,
+   `missing_client_artifact_write_failure_fails_closed`,
+   `egress_client_without_adapter_fails_closed`,
+   `missing_client_note_names_exit_and_reason`). B2 done (see item 2).
+   **B5 still open.**
 
 ## 4) Method notes
 
