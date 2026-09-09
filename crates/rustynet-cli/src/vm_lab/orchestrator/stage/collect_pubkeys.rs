@@ -32,6 +32,14 @@ impl OrchestrationStage for CollectPubkeysStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         use crate::vm_lab::orchestrator::error::WireguardPublicKey;
 
+        // F3 fail-closed: an empty scope is not a trivial pass — every
+        // downstream stage keys on the identity this stage records, so
+        // reaching it with no assignments means a skip/reuse path produced
+        // an empty plan and must fail loudly, not vacuously pass.
+        if ctx.assignments.is_empty() {
+            return StageOutcome::Failed("no assignments in scope".to_owned());
+        }
+
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
 
         struct NodeData {
@@ -240,7 +248,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn empty_assignments_passes() {
+    /// Setup provenance F3: an empty scope validated nothing, so the stage
+    /// fails closed instead of passing vacuously. Mutation caught: reverting
+    /// the guard to `return StageOutcome::Passed`.
+    fn empty_assignments_fails_closed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -267,7 +278,10 @@ mod tests {
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
         };
-        assert_eq!(CollectPubkeysStage.execute(&mut ctx), StageOutcome::Passed);
+        assert!(matches!(
+            CollectPubkeysStage.execute(&mut ctx),
+            StageOutcome::Failed(_)
+        ));
     }
 
     use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;

@@ -160,9 +160,33 @@ pub fn distribute_signed_bundle(
     bundle_path: &Path,
 ) -> Result<(), AdapterError> {
     let (remote_tmp, install_dst) = remote_bundle_paths(&kind);
+    // F1a digest read-back: hash the exact local bytes, then require the
+    // installed file to match on the guest — mirroring the verifier-key tail.
+    // A guest-local substitution/truncation between scp and install now fails
+    // the transport command instead of yielding a silent exit-0 pass.
+    let expected_sha256 =
+        crate::vm_lab::orchestrator::adapter::verifier_key::sha256_hex_of_file(bundle_path)?;
     // SCP bundle to temp path.
     ssh::scp_to(conn, bundle_path, &remote_tmp, MEDIUM_TIMEOUT)?;
-    // Install atomically with correct permissions.
+    let script = linux_bundle_install_script(&kind, &remote_tmp, &install_dst, &expected_sha256)?;
+    ssh::run_remote(conn, &script, SHORT_TIMEOUT)?;
+    Ok(())
+}
+
+/// Render the atomic install + digest read-back script for a signed bundle.
+///
+/// Pure so the script shape is unit-testable without a live connection: the
+/// digest tail (`sha256sum` compared to the host-side hash) is what turns a
+/// guest-local substitution between scp and install into a transport failure
+/// instead of a content-blind exit-0 pass (F1a). Mutation guard: deleting the
+/// tail from this builder flips
+/// `linux_bundle_install_script_carries_the_digest_read_back` red.
+fn linux_bundle_install_script(
+    kind: &BundleKind,
+    remote_tmp: &str,
+    install_dst: &str,
+    expected_sha256: &str,
+) -> Result<String, AdapterError> {
     let install_dir = install_dst
         .rsplit_once('/')
         .map_or("/var/lib/rustynet", |(dir, _)| dir);
@@ -186,16 +210,12 @@ pub fn distribute_signed_bundle(
     } else {
         String::new()
     };
-    ssh::run_remote(
-        conn,
-        &format!(
-            "sudo -n install -d -m 0700 -o rustynetd -g rustynetd {install_dir} && \
-             sudo -n install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
-             sudo -n rm -f '{remote_tmp}'{log_init}"
-        ),
-        SHORT_TIMEOUT,
-    )?;
-    Ok(())
+    Ok(format!(
+        "sudo -n install -d -m 0700 -o rustynetd -g rustynetd {install_dir} && \
+         sudo -n install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
+         sudo -n rm -f '{remote_tmp}'{log_init} && \
+         test \"$(sudo -n sha256sum '{install_dst}' | awk '{{print $1}}')\" = '{expected_sha256}'"
+    ))
 }
 
 /// Distribute the verifier public-key for `kind` to this Linux node.
@@ -239,7 +259,7 @@ fn linux_verifier_key_path(kind: &BundleKind) -> String {
     }
 }
 
-fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
+pub(crate) fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     match kind {
         BundleKind::Membership => (
             "/tmp/rn-membership.snapshot".to_owned(),
@@ -417,5 +437,56 @@ mod tests {
     #[test]
     fn membership_log_header_matches_control_schema() {
         assert_eq!(membership_log_header(), "version=1");
+    }
+
+    /// F1a pin: the install script must carry the remote digest read-back and
+    /// the host-side expected hex, for EVERY bundle kind. Mutation caught:
+    /// dropping the digest tail from `linux_bundle_install_script` (or the
+    /// host-side `sha256_hex_of_file` call in `distribute_signed_bundle`)
+    /// removes the assertion this test observes — back to the exit-0-only
+    /// install the provenance audit documented.
+    #[test]
+    fn linux_bundle_install_script_carries_the_digest_read_back() {
+        for kind in [
+            BundleKind::Membership,
+            BundleKind::Assignment,
+            BundleKind::Traversal,
+            BundleKind::DnsZone,
+        ] {
+            let (remote_tmp, install_dst) = remote_bundle_paths(&kind);
+            let expected = "cafebabe".repeat(8);
+            let script = linux_bundle_install_script(&kind, &remote_tmp, &install_dst, &expected)
+                .expect("script renders");
+            assert!(
+                script.contains("sudo -n sha256sum"),
+                "{kind:?}: script must read the installed digest back: {script}"
+            );
+            assert!(
+                script.contains(&format!("= '{expected}'")),
+                "{kind:?}: script must pin the host-side expected hex: {script}"
+            );
+            assert!(
+                script.contains(&install_dst),
+                "{kind:?}: digest must be taken over the install destination: {script}"
+            );
+        }
+    }
+
+    /// F1a: the host-side digest of the bundle handed to
+    /// `distribute_signed_bundle` is computed from the exact local bytes via
+    /// the shared helper; pin the composition so a swap to a constant (or a
+    /// dropped read) cannot reintroduce a content-blind pass.
+    #[test]
+    fn linux_bundle_digest_uses_the_exact_local_bytes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("rn-assignment-node-1.assignment");
+        std::fs::write(&bundle, b"signed-bundle-bytes").expect("write bundle");
+        let digest =
+            crate::vm_lab::orchestrator::adapter::verifier_key::sha256_hex_of_file(&bundle)
+                .expect("digest of exact bytes");
+        let mut expected = sha2::Sha256::new();
+        use sha2::Digest;
+        expected.update(b"signed-bundle-bytes");
+        assert_eq!(digest, format!("{:x}", expected.finalize()));
     }
 }

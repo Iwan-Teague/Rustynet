@@ -71,6 +71,21 @@ pub(crate) fn validated_verifier_key_sha256(path: &Path) -> Result<String, Adapt
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// SHA-256 of an arbitrary local file, hex-encoded — the host-side half of the
+/// bundle digest read-back (`NodeEngineSetupProvenanceAudit_2026-09-09.md`
+/// F1a). Unlike [`validated_verifier_key_sha256`] this imposes NO shape rules:
+/// signed bundles are opaque binary blobs, and the digest must attest the
+/// exact bytes shipped, so only readability is enforced (an unreadable file is
+/// an error, never an empty digest).
+pub(crate) fn sha256_hex_of_file(path: &Path) -> Result<String, AdapterError> {
+    let bytes = std::fs::read(path).map_err(|err| AdapterError::Io {
+        message: format!("read file for sha256 '{}': {err}", path.display()),
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +154,22 @@ mod tests {
         let mut expected = Sha256::new();
         expected.update(format!("{}\n", "ab".repeat(32)).as_bytes());
         assert_eq!(digest, format!("{:x}", expected.finalize()));
+    }
+
+    #[test]
+    fn sha256_hex_of_file_hashes_exact_bytes_and_fails_on_missing_file() {
+        // F1a helper pin: the digest must be over the EXACT on-disk bytes
+        // (binary-safe, no shape rules) and an unreadable file must Err —
+        // never an empty or defaulted digest that a remote compare could
+        // spuriously satisfy.
+        let mut file = tempfile::NamedTempFile::new().expect("tempfile");
+        let payload: &[u8] = &[0u8, 1, 2, 250, 251, 0xFF];
+        file.write_all(payload).expect("write payload");
+        let digest = sha256_hex_of_file(file.path()).expect("readable file hashes");
+        let mut expected = Sha256::new();
+        expected.update(payload);
+        assert_eq!(digest, format!("{:x}", expected.finalize()));
+
+        assert!(sha256_hex_of_file(&file.path().with_file_name("missing.bin")).is_err());
     }
 }
