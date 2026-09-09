@@ -3,7 +3,9 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+use crate::vm_lab::orchestrator::stage::{
+    OrchestrationStage, StageFanout, StageId, desktop_platform_tag,
+};
 
 const REPORT_FILENAME: &str = "live_managed_dns_report.json";
 
@@ -189,13 +191,12 @@ fn ssh_params_for_role(ctx: &OrchestrationContext, label: &str) -> Result<Resolv
     })
 }
 
-fn platform_str(platform: VmGuestPlatform) -> &'static str {
-    match platform {
-        VmGuestPlatform::Linux => "linux",
-        VmGuestPlatform::Macos => "macos",
-        VmGuestPlatform::Windows => "windows",
-        _ => "linux",
-    }
+/// The platform label stamped into the managed-DNS peer spec (audit I3):
+/// desktop platforms tag through the shared exhaustive
+/// [`desktop_platform_tag`]; a never-hosted platform is an `Err` the caller
+/// must fail on — never a silent `linux` stamp.
+fn platform_str(platform: VmGuestPlatform) -> Result<&'static str, String> {
+    desktop_platform_tag(platform, "managed-dns validation")
 }
 
 /// Pure selection, extracted so it is testable without an
@@ -273,7 +274,7 @@ fn managed_peer_args(
         peers.push(format!(
             "{node_id}|{user}@{}|{}",
             params.host,
-            platform_str(adapter.platform())
+            platform_str(adapter.platform())?
         ));
     }
     Ok(peers)

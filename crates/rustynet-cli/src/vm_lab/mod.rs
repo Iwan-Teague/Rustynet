@@ -2398,6 +2398,15 @@ impl VmGuestPlatform {
         }
     }
 
+    /// The canonical evidence/wire label for this platform. Exhaustive over
+    /// the enum (audit I3: the former per-stage `_ => "linux"` label helpers
+    /// stamped a new OS as Linux in the run ledger). Platforms that cannot
+    /// host a validation role must be refused at the use site, never
+    /// labelled; see `stage::desktop_platform_tag`.
+    pub fn evidence_tag(self) -> &'static str {
+        self.as_str()
+    }
+
     /// Filesystem path of the deployed `rustynetd` daemon binary for this
     /// platform in the live lab, drawn from the adapter install modules so
     /// they stay the single source of the per-platform path (audit I1
@@ -2443,6 +2452,26 @@ mod vm_guest_platform_lab_paths_tests {
         );
         assert_eq!(VmGuestPlatform::Ios.lab_daemon_path(), None);
         assert_eq!(VmGuestPlatform::Android.lab_daemon_path(), None);
+    }
+}
+
+#[cfg(test)]
+mod vm_guest_platform_evidence_tag_tests {
+    use super::*;
+
+    /// Audit I3: the evidence tag is exhaustive over every variant and each
+    /// label names its own platform. Mutation caught: reintroducing a
+    /// `_ => "linux"` fallback (in `as_str`/`evidence_tag` or a stage-side
+    /// label helper) makes the Ios/Android entries read "linux" and fails
+    /// this test; adding a variant without an arm fails compilation because
+    /// neither match carries a wildcard.
+    #[test]
+    fn evidence_tag_covers_every_variant() {
+        assert_eq!(VmGuestPlatform::Linux.evidence_tag(), "linux");
+        assert_eq!(VmGuestPlatform::Macos.evidence_tag(), "macos");
+        assert_eq!(VmGuestPlatform::Windows.evidence_tag(), "windows");
+        assert_eq!(VmGuestPlatform::Ios.evidence_tag(), "ios");
+        assert_eq!(VmGuestPlatform::Android.evidence_tag(), "android");
     }
 }
 

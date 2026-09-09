@@ -27,6 +27,64 @@ pub(crate) fn resolve_ssh_user(inventory_user: Option<&str>, platform: VmGuestPl
     .to_owned()
 }
 
+/// The evidence/wire label for a node's platform, refused for the platforms
+/// that cannot host the lab validation runtime. Shared by the standalone
+/// validation-binary spawners (audit I3): each stage used to carry its own
+/// `_ => "linux"` label helper, so a missing adapter or a never-hosted
+/// platform (Ios/Android) was silently stamped `linux` into the `--platform`
+/// argv and the run's evidence. The desktop platforms tag through the
+/// exhaustive [`VmGuestPlatform::evidence_tag`]; everything else is an
+/// `Err` the caller must surface as a stage failure.
+pub(crate) fn desktop_platform_tag(
+    platform: VmGuestPlatform,
+    context: &str,
+) -> Result<&'static str, String> {
+    match platform {
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos | VmGuestPlatform::Windows => {
+            Ok(platform.evidence_tag())
+        }
+        VmGuestPlatform::Ios | VmGuestPlatform::Android => Err(format!(
+            "{context}: platform {platform:?} cannot host the lab validation \
+             runtime (refusing to label it linux)"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod desktop_platform_tag_tests {
+    use super::*;
+
+    /// Audit I3: the desktop platforms tag through the exhaustive
+    /// [`VmGuestPlatform::evidence_tag`] table and the never-hosted platforms
+    /// are refused instead of labelled. Mutation caught: reintroducing a
+    /// `_ => Ok("linux")` arm (or widening the desktop set) makes the
+    /// Ios/Android entries return `Ok("linux")` and fails this test; the
+    /// desktop labels come from `evidence_tag_covers_every_variant`.
+    #[test]
+    fn desktop_platform_tag_refuses_never_hosted_platforms() {
+        assert_eq!(
+            desktop_platform_tag(VmGuestPlatform::Linux, "t"),
+            Ok("linux")
+        );
+        assert_eq!(
+            desktop_platform_tag(VmGuestPlatform::Macos, "t"),
+            Ok("macos")
+        );
+        assert_eq!(
+            desktop_platform_tag(VmGuestPlatform::Windows, "t"),
+            Ok("windows")
+        );
+        for refused in [VmGuestPlatform::Ios, VmGuestPlatform::Android] {
+            let err = desktop_platform_tag(refused, "stage-x")
+                .expect_err("never-hosted platform must be refused, never labelled");
+            assert!(
+                err.contains("stage-x") && err.contains("refusing to label it linux"),
+                "refusal must name the context and the refusal: {err}"
+            );
+        }
+    }
+}
+
 pub mod active_exit;
 pub mod admin_issue;
 pub mod anchor_validation;
