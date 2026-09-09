@@ -6659,6 +6659,316 @@ mod conclusion_barrier_tests {
             "gate error must name the blocking stage: {err}"
         );
     }
+
+    /// Minimal D1 fixture: a copied workspace root with an EMPTY report dir —
+    /// exactly the state a `--node` run is in at START (no stages.tsv, no
+    /// nodes.tsv, no evidence), which is why the start marker is built
+    /// directly instead of through the full evidence-backed builder.
+    fn write_d1_copied_workspace(tag: &str) -> (PathBuf, PathBuf) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let copy_root = std::env::temp_dir().join(format!("rustynet-run-start-{tag}-{stamp}"));
+        fs::create_dir_all(copy_root.join("documents/operations")).expect("docs dir");
+        fs::write(copy_root.join("Cargo.toml"), "[workspace]\n").expect("marker file");
+        let report_dir = copy_root.join("state/report-run-start");
+        fs::create_dir_all(&report_dir).expect("report dir");
+        (copy_root, report_dir)
+    }
+
+    fn sabotage_tmp_write(path: &std::path::Path) {
+        fs::create_dir_all(path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name()
+                .expect("file name")
+                .to_string_lossy()
+        )))
+        .expect("tmp sabotage dir");
+    }
+
+    fn matrix_data_rows(ledger_body: &str) -> Vec<[String; 5]> {
+        let mut lines = ledger_body.lines();
+        let header = lines.next().expect("ledger header");
+        let columns = super::parse_csv_record(header).expect("parse header");
+        let index = |name: &str| {
+            columns
+                .iter()
+                .position(|column| column == name)
+                .unwrap_or_else(|| panic!("column {name} missing from header"))
+        };
+        let report_dir_index = index("report_dir");
+        let started_index = index("run_started_utc");
+        let finished_index = index("run_finished_utc");
+        let overall_index = index("overall_result");
+        let role_index = index("row_role");
+        lines
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let fields = super::parse_csv_record(line).expect("parse data row");
+                // Project onto the columns the assertions read, in a fixed
+                // order, so the assertions do not depend on schema width.
+                [
+                    fields[report_dir_index].clone(),
+                    fields[started_index].clone(),
+                    fields[finished_index].clone(),
+                    fields[overall_index].clone(),
+                    fields[role_index].clone(),
+                ]
+            })
+            .collect()
+    }
+
+    /// D1: a run that starts and then dies (crash, kill -9, host loss) BEFORE
+    /// finalize must still leave exactly one ledger row — an interim row that
+    /// says the run never finished.
+    ///
+    /// Mutation: dropping the `record_live_lab_run_matrix_run_start` call in
+    /// `vm_lab/orchestrator/native.rs` (or deleting the helper) leaves the
+    /// ledger EMPTY here, which is the defect this fixes.
+    #[test]
+    fn run_start_leaves_an_interim_row_when_the_run_never_finishes() {
+        let (copy_root, report_dir) = write_d1_copied_workspace("d1a");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
+        let _guard = Qh74RootGuard::force(&copy_root);
+
+        let run_id = super::record_live_lab_run_matrix_run_start(
+            report_dir.as_path(),
+            Some("vm-lab-orchestrate-live-lab"),
+        )
+        .expect("start row must append");
+
+        let ledger_path = super::default_live_lab_node_run_matrix_path();
+        let body = fs::read_to_string(&ledger_path).expect("ledger readable");
+        let rows = matrix_data_rows(&body);
+        assert_eq!(rows.len(), 1, "exactly one row for one started run: {body:?}");
+        assert_eq!(rows[0][0], super::path_display(&report_dir), "report_dir");
+        assert_eq!(rows[0][1], "", "run_started_utc stays degenerate (empty)");
+        assert_eq!(rows[0][2], "", "run_finished_utc must be empty: never finished");
+        assert_eq!(rows[0][3], "in_progress", "overall_result marks the run unfinished");
+        assert_eq!(rows[0][4], "interim", "row_role marks the row interim");
+        assert!(body.contains(&run_id), "row carries the minted run_id {run_id}");
+    }
+
+    /// D1: the finalize row must REPLACE the start marker — never duplicate
+    /// it — and must not touch other runs' markers.
+    ///
+    /// Mutation: reverting the Final-over-empty-started match extension in
+    /// `upsert_csv_row` (Final matches only the exact natural key again)
+    /// leaves the interim marker in place, so the first assertion here sees
+    /// TWO rows for one report_dir. VERIFIED: with the clause removed this
+    /// test fails on that assertion.
+    #[test]
+    fn final_row_replaces_the_start_marker_without_duplicating_it() {
+        let (copy_root, report_dir) = write_d1_copied_workspace("d1b");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
+        let _guard = Qh74RootGuard::force(&copy_root);
+
+        super::record_live_lab_run_matrix_run_start(report_dir.as_path(), None)
+            .expect("start row must append");
+
+        let matrix_path = super::default_live_lab_node_run_matrix_path();
+        let schema = super::ensure_matrix_schema(matrix_path.as_path()).expect("schema");
+        let mut final_values: std::collections::BTreeMap<String, String> = Default::default();
+        final_values.insert("run_id".to_owned(), "livelab-d1b-final".to_owned());
+        final_values.insert(
+            "run_started_utc".to_owned(),
+            "2026-09-09T10:00:00Z".to_owned(),
+        );
+        final_values.insert("report_dir".to_owned(), super::path_display(&report_dir));
+        final_values.insert("overall_result".to_owned(), "fail".to_owned());
+        final_values.insert(
+            "row_role".to_owned(),
+            super::LiveLabRunMatrixRowRole::Final.as_str().to_owned(),
+        );
+        let written = super::upsert_csv_row(
+            matrix_path.as_path(),
+            &schema,
+            &final_values,
+            super::LiveLabRunMatrixRowRole::Final,
+        )
+        .expect("final upsert");
+        assert!(written, "the final row must be written");
+
+        let body = fs::read_to_string(&matrix_path).expect("ledger readable");
+        let rows = matrix_data_rows(&body);
+        assert_eq!(
+            rows.len(),
+            1,
+            "the final row must replace the start marker, not duplicate it: {body:?}"
+        );
+        assert_eq!(rows[0][4], "final");
+        assert_eq!(rows[0][1], "2026-09-09T10:00:00Z");
+
+        // Negative control: a FINAL row for report_dir A must not consume a
+        // start marker belonging to report_dir B.
+        let other_dir = copy_root.join("state/report-other-run");
+        fs::create_dir_all(&other_dir).expect("other report dir");
+        super::record_live_lab_run_matrix_run_start(other_dir.as_path(), None)
+            .expect("other run's start row");
+        let written = super::upsert_csv_row(
+            matrix_path.as_path(),
+            &schema,
+            &final_values,
+            super::LiveLabRunMatrixRowRole::Final,
+        )
+        .expect("second final upsert");
+        assert!(written);
+        let body = fs::read_to_string(&matrix_path).expect("ledger readable");
+        let rows = matrix_data_rows(&body);
+        assert_eq!(rows.len(), 2, "other run's marker must survive: {body:?}");
+        let other_marker = rows
+            .iter()
+            .find(|row| row[0] == super::path_display(&other_dir))
+            .expect("other run's marker still present");
+        assert_eq!(other_marker[4], "interim", "other marker stays interim");
+    }
+
+    /// D2: a schema UPGRADE that fails mid-write must leave the previous
+    /// ledger byte-for-byte intact.
+    ///
+    /// Mutation: reverting `ensure_matrix_schema`'s upgrade rewrite to a
+    /// plain in-place `fs::write` (dropping `write_file_atomic`) makes this
+    /// fail — the write then succeeds in place even though the atomic path
+    /// failed. VERIFIED under that mutation.
+    #[test]
+    fn failed_schema_upgrade_leaves_the_previous_ledger_intact() {
+        let (copy_root, _report_dir) = write_d1_copied_workspace("d2-upgrade");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
+        let _guard = Qh74RootGuard::force(&copy_root);
+
+        let ledger_path = super::default_live_lab_node_run_matrix_path();
+        // An OLDER schema: every canonical column except the last-appended
+        // `row_role`, plus one data row. `ensure_matrix_schema` must detect
+        // the missing column and attempt the upgrade rewrite.
+        let old_columns: Vec<&str> = DEFAULT_MATRIX_COLUMNS
+            .iter()
+            .copied()
+            .take(DEFAULT_MATRIX_COLUMNS.len() - 1)
+            .collect();
+        let old_body = format!("{}\nold-run-1\n", old_columns.join(","));
+        fs::write(&ledger_path, &old_body).expect("seed old ledger");
+        // Sabotage the atomic tmp write: a directory where the tmp file must
+        // go makes fs::write(tmp) fail BEFORE any rename.
+        sabotage_tmp_write(&ledger_path);
+
+        let err = super::ensure_matrix_schema(ledger_path.as_path())
+            .expect_err("sabotaged tmp write must fail the upgrade");
+        assert!(
+            err.contains("tmp"),
+            "failure must come from the tmp write, not earlier: {err}"
+        );
+        let after = fs::read_to_string(&ledger_path).expect("ledger still readable");
+        assert_eq!(
+            after, old_body,
+            "the previous ledger must be byte-for-byte intact after a failed rewrite"
+        );
+    }
+
+    /// D2 companion: a schema INIT that fails mid-write must leave NO partial
+    /// ledger behind — the next writer must see "absent", not a truncated
+    /// header.
+    ///
+    /// Mutation: same as the upgrade test — reverting the init write to an
+    /// in-place `fs::write` makes this fail, because the file then exists
+    /// despite the sabotaged tmp write.
+    #[test]
+    fn failed_schema_init_leaves_no_partial_ledger() {
+        let (copy_root, _report_dir) = write_d1_copied_workspace("d2-init");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
+        let _guard = Qh74RootGuard::force(&copy_root);
+
+        let ledger_path = super::default_live_lab_node_run_matrix_path();
+        sabotage_tmp_write(&ledger_path);
+
+        super::ensure_matrix_schema(ledger_path.as_path())
+            .expect_err("sabotaged tmp write must fail the init");
+        assert!(
+            !ledger_path.exists(),
+            "no partial ledger may exist after a failed init"
+        );
+    }
+
+    /// D3: a per-run node-stage CSV rewrite that fails mid-write must leave
+    /// the previous file intact.
+    ///
+    /// Mutation: reverting `write_node_stage_csv` to a plain in-place
+    /// `fs::write` (dropping `write_file_atomic`) makes this fail — the
+    /// write lands in place despite the sabotaged tmp path. VERIFIED under
+    /// that mutation.
+    #[test]
+    fn failed_node_stage_csv_write_leaves_the_previous_file_intact() {
+        let (copy_root, report_dir) = write_d1_copied_workspace("d3-atomic");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
+        let _guard = Qh74RootGuard::force(&copy_root);
+
+        let stage_csv = report_dir.join(super::NODE_STAGE_RESULTS_RELATIVE_PATH);
+        let old_body = format!("{}\nold-stage-row\n", NODE_STAGE_COLUMNS.join(","));
+        if let Some(parent) = stage_csv.parent() {
+            fs::create_dir_all(parent).expect("stage csv parent");
+        }
+        fs::write(&stage_csv, &old_body).expect("seed old stage csv");
+        sabotage_tmp_write(&stage_csv);
+
+        let err = super::write_node_stage_csv(stage_csv.as_path(), &Vec::new())
+            .expect_err("sabotaged tmp write must fail the rewrite");
+        assert!(
+            err.contains("tmp"),
+            "failure must come from the tmp write, not earlier: {err}"
+        );
+        let after = fs::read_to_string(&stage_csv).expect("stage csv still readable");
+        assert_eq!(
+            after, old_body,
+            "the previous per-run stage CSV must be intact after a failed rewrite"
+        );
+    }
+
+    /// D3 ordering: the per-run node-stage ledgers must be written AFTER the
+    /// matrix upsert, so an upsert failure never strands stage-ledger rows
+    /// for a matrix row that was never written.
+    ///
+    /// Mutation: reverting the reorder in `append_live_lab_run_matrix_row`
+    /// (ledgers written BEFORE the upsert again) makes this fail — the
+    /// sabotaged upsert below then runs AFTER the ledger write, so the
+    /// per-run node-stage results file already exists when the append fails.
+    #[test]
+    fn node_stage_ledgers_are_skipped_when_the_matrix_upsert_never_happens() {
+        let (copy_root, report_dir, _profile) = write_qh74_copied_workspace("d3-order");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
+        let _guard = Qh74RootGuard::force(&copy_root);
+
+        // Sabotage the upsert SPECIFICALLY: the shared ledger exists with a
+        // CANONICAL header (so ensure_matrix_schema's init/upgrade no-op and
+        // succeed), but the upsert's tmp write fails because its tmp path is
+        // a directory.
+        let ledger_path = super::default_live_lab_node_run_matrix_path();
+        fs::write(
+            &ledger_path,
+            format!("{}\n", DEFAULT_MATRIX_COLUMNS.join(",")),
+        )
+        .expect("seed canonical ledger");
+        sabotage_tmp_write(&ledger_path);
+
+        let err = super::append_live_lab_run_matrix_row(super::LiveLabRunMatrixAppendConfig {
+            command_name: "vm-lab-orchestrate-live-lab",
+            report_dir: &report_dir,
+            profile_path: None,
+            inventory_path: None,
+            extra_stage_outcomes: &[],
+            notes: None,
+            row_role: super::LiveLabRunMatrixRowRole::Final,
+        })
+        .expect_err("the sabotaged upsert must fail the append");
+        assert!(
+            err.contains("tmp"),
+            "failure must come from the upsert's tmp write, not earlier: {err}"
+        );
+        let stage_csv = report_dir.join(super::NODE_STAGE_RESULTS_RELATIVE_PATH);
+        assert!(
+            !stage_csv.exists(),
+            "no per-run node-stage ledger may exist when the matrix upsert never happened"
+        );
+    }
 }
 
 #[test]
