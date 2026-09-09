@@ -198,3 +198,15 @@ Gate evidence on this branch (CARGO_TARGET_DIR=/Users/iwan/Desktop/Rustynet/targ
 - `cargo check -p rustynet-cli --all-targets --all-features`: exit 0.
 - `cargo clippy -p rustynet-cli --all-targets --all-features --locked --no-deps -- -D warnings`: exit 0 ONLY with `-A clippy::collapsible_if -A clippy::cloned_ref_to_slice_refs -A clippy::unnecessary_sort_by` — these three rust-1.97 lints fire on code this branch never touched (e.g. `rustynet-cli/src/vm_lab/mod.rs:7924`, `stage/preflight.rs:553`, `workspace_root.rs:239`), byte-identical to base `30f94393`.
 - BLOCKER (pre-existing, out of allowlist): `cargo clippy` with deps lints `rustynetd` and fails on 3 `collapsible_if` (`rustynetd/src/phase10.rs:4301/:4911/:4955`); `rustynetd` is byte-identical to base (0 diff lines) — toolchain-drift lint, not this branch's regression, and outside the permitted edit paths. Fix belongs to a rustynetd-scoped change: collapse the three `if`s.
+
+## Review disposition (2026-09-09, GLM-flash, MERGE-WITH-FIXES → merged)
+
+F2/F4 CONFIRMED, F1/F3 PARTIAL. F1: the File witness is REMOVED at
+`stage_started` (after the recorder truncates the log, before `execute()`);
+no generation stamp — wording corrected. F3 regression found by the review
+and fixed before merge: the reuse digest hashed the declared witness of EVERY
+enabled planned stage, so a legitimately reported-skipped `active_exit` with no
+artifact made the run unreusable; the digest now seals only stages recorded
+`pass`/`reused` (test `a_skipped_file_declared_stage_needs_no_witness_in_the_reuse_seal`).
+`ReuseDigest` is unconstructible outside `evidence.rs` (private field, only
+`pub(crate) parse` inside validation).
