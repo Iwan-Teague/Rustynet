@@ -75,4 +75,25 @@ D1 touches the runner exit path — re-run a live `--node` suite end-to-end and 
 - The current callers of `append_live_lab_run_matrix_row` (the Final append site in the `--node` finalizer) were not located — the caller grep was truncated; D1's patch point is therefore named by role ("runner abort/finalize path"), not by exact `file:line`.
 - Historical contamination counts (35/94 rows, commit `9cdd660f`) are quoted from the doc comments (`run_matrix.rs:454-461`, `registry.rs:961-968`), not re-counted from the CSV.
 
+## Implementation record — D1–D3 (2026-09-09, delegated edit job)
+
+Implemented on branch `ai-edit/edit-1788950718573-70716-0` (worktree of HEAD `a500e870`), commits `4e470955` (implementation), `fd14d115` (tests), `d1d3f187` (fmt). Files: `crates/rustynet-cli/src/live_lab_run_matrix.rs`, `crates/rustynet-cli/src/vm_lab/orchestrator/native.rs`. D4 untouched (separate job).
+
+**D1 — design deviation from the patch sketch above, deliberate.** The sketch hooked the abort/finalize path, but a `kill -9`/host-loss never reaches ANY in-process path, so the marker is emitted at run START instead: a new `pub fn record_live_lab_run_matrix_run_start(report_dir, run_command)` writes an Interim row right after the report-dir lease is acquired in `execute_rust_native_orchestration` (`native.rs`), guarded off for `--dry-run` (which removes the report dir afterwards) and non-fatal on ledger failure (warning, like the finalize path). The row deliberately carries a DEGENERATE key (`run_started_utc` empty — the real timestamp is only knowable from stage evidence at finalize), so it plain-appends and can never own/suppress a key. The replacement half moved into `upsert_csv_row`: a `Final` row additionally matches same-`report_dir` rows whose `run_started_utc` is EMPTY, so the finalize Final replaces the start marker (and any same-key Final), other runs' markers are untouched, and a run that dies before finalize leaves exactly one row whose `overall_result=in_progress` / empty `run_finished_utc` / `row_role=interim` says it never finished. `overall_result=in_progress` on an interim row is a new value — consumers that grep for pass/fail treat anything else as not-final, which is the intended reading.
+
+**D2** — `write_file_atomic(path, body, what)` factored (tmp = `path` + ".tmp", `fs::write`, `fs::rename`); `ensure_matrix_schema` now creates parent dirs, takes the SAME append lock the row path uses (`acquire_append_lock(lock_path_for(path))` — RAII, released before the caller's upsert takes it again, never nested), and routes both the init write and the schema-upgrade rewrite through the helper. `upsert_csv_row`'s tail now uses the same helper.
+
+**D3** — `write_node_stage_csv` routed through `write_file_atomic`, and the `Final`-gated `write_node_stage_result_ledgers` moved AFTER the matrix upsert in `append_live_lab_run_matrix_row` (both sides idempotent: upsert replaces by run key, ledger is a whole-file replace).
+
+**Tests** (all in `live_lab_run_matrix.rs` tests, QH-74 copied-workspace guards; each doc-comment names its mutation):
+- `run_start_leaves_an_interim_row_when_the_run_never_finishes` (mutation: drop the emit → empty ledger).
+- `final_row_replaces_the_start_marker_without_duplicating_it` (mutation: revert the Final-over-empty-started clause → two rows for one report_dir; **mutation-verified red**, then restored). Also pins the negative control: a Final for report_dir A never consumes report_dir B's marker.
+- `failed_schema_upgrade_leaves_the_previous_ledger_intact` + `failed_schema_init_leaves_no_partial_ledger` (sabotage: directory at the tmp path; mutation: in-place `fs::write` → **red, verified**).
+- `failed_node_stage_csv_write_leaves_the_previous_file_intact` (same sabotage; mutation → **red, verified**).
+- `node_stage_ledgers_are_skipped_when_the_matrix_upsert_never_happens` (sabotages the upsert's tmp write specifically so `ensure_matrix_schema` succeeds first; mutation: revert to ledgers-before-upsert → **red, verified**).
+
+**Gates**: `cargo fmt --all -- --check` ✅; `cargo test -p rustynet-cli --all-features --lib -- live_lab_run_matrix` ✅ 92/92 (86 pre-existing + 6 new). `cargo clippy -p rustynet-cli --all-targets --all-features --locked -- -D warnings` ❌ — **pre-existing, out of scope**: 3 `collapsible_if` errors in `rustynetd` (a linted path dependency), reproduced identically at the base commit `a500e870` (`rustynetd/**` is outside this job's path allowlist, so not fixable here); zero clippy errors attribute to `rustynet-cli` or the touched files.
+
+**Not yet done**: no live `--node` run has exercised the new start marker end-to-end (needs a real lab run; the upsert tests pin the replace semantics). The committed ledgers are untouched by this branch.
+
 ## Tools used (19 call(s) over 11 step(s))
