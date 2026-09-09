@@ -1,6 +1,16 @@
 # Platform Infer Migration Design — QH-82 root cause (2026-09-08)
 
-**Status:** DESIGN, not landed. Read-only job; no code changed.
+**Status:** IMPLEMENTED 2026-09-09 (commits `568d1aaf` tripwire, `a4475c53`
+migration, `1ef841b2` tests; ledger: QH-82 in `QualityHardeningTodo_2026-07-25.md`).
+Corrections from the review applied: true `.platform_profile()` counts are 34 raw lines
+(32 in `vm_lab/mod.rs`, 1 each in `overnight/executor.rs` / `overnight/mod.rs`); the
+"35 raw hits include the definition/impl" sentence in §1 was wrong (`.platform_profile()`
+never matches the definition). The review's blocking CI-tripwire change landed as
+`scripts/ci/check_platform_infer_tripwire.sh` + `crates/rustynet-cli/src/bin/check_platform_infer_tripwire.rs`,
+wired into the gate-runner security set. §4's "no zero-effort path" claim is scoped to
+the inference chain: direct `entry.platform.unwrap_or(Linux)` gates outside that chain
+(the audit's gate list) were NOT touched by this migration. Line numbers below cite the
+design tree (`702d9379`) and have drifted again on the implementation tree.
 **Verified against:** worktree at commit `702d9379` (`ai-edit/edit-1788876485177-62192-0`). Every `mod.rs` line number below was read on this tree. The audit's own line numbers (`PlatformBranchingAudit_2026-09-08.md`) were measured at an earlier commit and have **drifted** — e.g. the audit's `mod.rs:3019` diagnose site is `mod.rs:3364` here, and its `13843`/`13918` relay filters are `14188`/`14263`. Cite audit rows by row number; cite this doc for current lines.
 **Inputs:** QH-82 (`QualityHardeningTodo_2026-07-25.md:6869`), `PlatformBranchingAudit_2026-09-08.md`, and the six landed fail-closed sites of commit `f386b249`.
 
