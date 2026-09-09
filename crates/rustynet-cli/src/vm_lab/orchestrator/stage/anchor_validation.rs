@@ -2,6 +2,7 @@
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::anchor::{
     AnchorRuntimeParams, anchor_lab_runtime_implemented, validate_anchor_capability_advertisement,
@@ -74,6 +75,23 @@ pub const ANCHOR_REPORTED_SKIPS_NOTE: &str = concat!(
 /// File name (under `ctx.report_dir`) the reported-skip note is written
 /// to on a passing run.
 const REPORTED_SKIPS_FILENAME: &str = "anchor_validation.reported_skips.json";
+
+/// Writes the QH-83 witness lines for an anchor_validation PASS: one line
+/// per validated anchor node, naming the alias and the substage summary
+/// that actually ran on it, so an unwitnessed pass cannot stand.
+fn write_anchor_validation_witness(
+    report_dir: &std::path::Path,
+    validated: &[(String, String)],
+) -> Result<(), String> {
+    for (alias, summary) in validated {
+        append_stage_evidence_line(
+            report_dir,
+            StageId::AnchorValidation.as_str(),
+            &format!("anchor_validated=yes alias={alias} validated={summary}"),
+        )?;
+    }
+    Ok(())
+}
 
 /// Prove every Anchor node ADVERTISES its full anchor capability set —
 /// folding the capability-advertisement surface of the formerly
@@ -164,6 +182,11 @@ impl OrchestrationStage for AnchorValidationStage {
         // run (`--anchor-platform macos`) — recorded as evidence, never
         // counted as a skip (MAC-D1).
         let mut runtime_delegations: Vec<(String, String)> = Vec::new();
+        // (alias, substage summary) anchors FULLY validated in this run —
+        // capability advertisement green AND their runtime coverage ran
+        // inline or was validly delegated. This is what the QH-83 pass
+        // witness names.
+        let mut validated: Vec<(String, String)> = Vec::new();
         for alias in &anchor_aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
@@ -226,18 +249,31 @@ impl OrchestrationStage for AnchorValidationStage {
                             continue;
                         }
                     };
+                    let mut node_failures: Vec<String> = Vec::new();
                     if let Err(e) = validate_bundle_pull_loopback(&*shell, &params) {
-                        failures.push(format!("{alias}: {e}"));
+                        node_failures.push(format!("{alias}: {e}"));
                     }
                     if let Err(e) = validate_invalid_token_rejected(&*shell, &params) {
-                        failures.push(format!("{alias}: {e}"));
+                        node_failures.push(format!("{alias}: {e}"));
                     }
                     if let Err(e) = validate_bundle_pull_log_redaction(&*shell, &params) {
-                        failures.push(format!("{alias}: {e}"));
+                        node_failures.push(format!("{alias}: {e}"));
+                    }
+                    if node_failures.is_empty() {
+                        validated.push((
+                            alias.clone(),
+                            "capability_advertisement+bundle_pull_runtime".to_owned(),
+                        ));
+                    } else {
+                        failures.extend(node_failures);
                     }
                 }
                 AnchorRuntimeCoverage::DelegatedToMacosValidators => {
                     runtime_delegations.push((alias.clone(), format!("{platform:?}")));
+                    validated.push((
+                        alias.clone(),
+                        "capability_advertisement+runtime_delegated_to_macos_validators".to_owned(),
+                    ));
                 }
                 AnchorRuntimeCoverage::ReportedSkip => {
                     runtime_skips.push((alias.clone(), format!("{platform:?}")));
@@ -246,12 +282,24 @@ impl OrchestrationStage for AnchorValidationStage {
         }
 
         if failures.is_empty() {
-            // Record the deferred-substage note + any per-node runtime skips
-            // and validator-set delegations as evidence on a non-failing run.
-            // Best-effort: a write failure does not change the outcome (the
-            // proofs that ran already passed), but the common path leaves a
-            // machine-readable artifact behind.
-            write_reported_skips_note(ctx, &runtime_skips, &runtime_delegations);
+            // QH-83: the reported-skip note (deferrals + per-node runtime
+            // skips/delegations) is evidence — a write failure is fatal, not
+            // best-effort.
+            if let Err(e) = write_reported_skips_note(ctx, &runtime_skips, &runtime_delegations) {
+                return StageOutcome::Failed(format!(
+                    "anchor validation reported-skips note write failed: {e}"
+                ));
+            }
+            // QH-83: on the pass path (no failures, no reported runtime
+            // skips — outcome_for will grade Passed) the witness naming each
+            // validated anchor must land, or the stage fails.
+            if runtime_skips.is_empty()
+                && let Err(e) = write_anchor_validation_witness(&ctx.report_dir, &validated)
+            {
+                return StageOutcome::Failed(format!(
+                    "anchor validation witness write failed: {e}"
+                ));
+            }
         }
         outcome_for(&failures, &runtime_skips)
     }
@@ -385,18 +433,20 @@ fn reported_skips_json_bytes(
 
 /// Write the reported-skip note to `<report_dir>/anchor_validation.reported_skips.json`
 /// so the deferred substages (and any per-node runtime skips / validator-set
-/// delegations) are recorded as evidence. Best-effort: a write failure is
-/// ignored (the stage's own proofs already passed).
+/// delegations) are recorded as evidence. QH-83: the note IS evidence, so a
+/// write failure propagates — the caller turns it into a stage failure
+/// instead of passing silently.
 fn write_reported_skips_note(
     ctx: &OrchestrationContext,
     runtime_skips: &[(String, String)],
     runtime_delegations: &[(String, String)],
-) {
+) -> Result<(), String> {
     let path = ctx.report_dir.join(REPORTED_SKIPS_FILENAME);
-    let _ = std::fs::write(
+    std::fs::write(
         &path,
         reported_skips_json_bytes(runtime_skips, runtime_delegations),
-    );
+    )
+    .map_err(|e| format!("{}: {e}", path.display()))
 }
 
 #[cfg(test)]
@@ -700,5 +750,73 @@ mod tests {
             "expected a skip; got {:?}",
             AnchorValidationStage.execute(&mut ctx)
         );
+    }
+
+    // QH-83: a PASS verdict must leave a durable stage-log line per
+    // validated anchor node (alias + substage summary). Mutation caught:
+    // dropping the witness write or demoting it to best-effort.
+    #[test]
+    fn anchor_witness_lines_name_each_validated_node_and_substage() {
+        let dir = std::env::temp_dir().join(format!(
+            "anchor_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let validated = vec![
+            (
+                "anchor-1".to_owned(),
+                "capability_advertisement+bundle_pull_runtime".to_owned(),
+            ),
+            (
+                "anchor-mac".to_owned(),
+                "capability_advertisement+runtime_delegated_to_macos_validators".to_owned(),
+            ),
+        ];
+        write_anchor_validation_witness(&dir, &validated).expect("witness write");
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::AnchorValidation.as_str(),
+            ),
+        )
+        .expect("stage log readable");
+        assert!(
+            log.contains("anchor_validated=yes alias=anchor-1 validated=capability_advertisement+bundle_pull_runtime"),
+            "{log}"
+        );
+        assert!(
+            log.contains("anchor_validated=yes alias=anchor-mac validated=capability_advertisement+runtime_delegated_to_macos_validators"),
+            "{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as
+    /// an error the stage turns into a failure (never a silent pass).
+    #[test]
+    fn anchor_witness_write_failure_is_propagated() {
+        let blocker =
+            std::env::temp_dir().join(format!("anchor_witness_blocker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let err = write_anchor_validation_witness(
+            &blocker,
+            &[(
+                "anchor-1".to_owned(),
+                "capability_advertisement+bundle_pull_runtime".to_owned(),
+            )],
+        )
+        .expect_err("write into a regular file path must fail");
+        assert!(!err.is_empty());
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }

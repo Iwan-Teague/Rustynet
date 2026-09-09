@@ -1626,10 +1626,9 @@ mod tests {
     #[test]
     fn evidence_opt_out_stages_pass_without_witness() {
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
-            // validate_baseline_runtime is still a PHASE1_EVIDENCE_PENDING
-            // opt-out row (the Setup batch moved prepare_source_archive to
-            // a File witness).
-            pass_stage(StageId::ValidateBaselineRuntime, vec![]),
+            // Cleanup declares no evidence (the teardown exemption below);
+            // the QH-83 Setup batch moved validate_baseline_runtime to a
+            // StageLog witness, so it no longer appears here as an opt-out.
             always_run_stage(StageId::Cleanup, vec![]),
         ];
         let (mut ctx, _dir) = tempdir_ctx();
@@ -1638,7 +1637,30 @@ mod tests {
             .run(&mut ctx)
             .expect("run");
         assert!(matches!(results[0].1, StageOutcome::Passed));
-        assert!(matches!(results[1].1, StageOutcome::Passed));
+    }
+
+    /// QH-83 Setup batch mutation caught: a plain (unwitnessed) pass on a
+    /// row that NOW declares `StageEvidence::StageLog` —
+    /// validate_baseline_runtime was the last Setup-phase opt-out. Reverting
+    /// its catalog row to
+    /// `StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING }` re-arms
+    /// this test.
+    #[test]
+    fn validate_baseline_runtime_pass_without_witness_is_demoted() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::ValidateBaselineRuntime, vec![])];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(detail.contains("stage log"), "{detail}");
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
     }
 
     /// F4 mutation caught: reverting the BlindExit catalog row
