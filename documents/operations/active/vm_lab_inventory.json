@@ -393,6 +393,52 @@
       "mesh_ip": "100.64.0.14",
       "exit_capable": true,
       "relay_capable": false
+    },
+    {
+      "alias": "katana-client-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.122.45",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.122.45",
+      "last_known_network": "192.168.122.0/24",
+      "network_group": "libvirt-nat-192.168.122.0/24",
+      "node_id": "katana-client-1",
+      "lab_role": "linux_client",
+      "parent_device": "katana (x86_64 KVM host, Debian 13 laptop)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "katana-client-1",
+        "host_id": "katana"
+      },
+      "notes": "NAT'd on katana's virbr0: reachable from katana itself (runs are launched ON katana via vm-lab-launch-on-host), not from the Mac directly",
+      "mesh_ip": "100.64.0.3"
+    },
+    {
+      "alias": "katana-exit-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.122.222",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.122.222",
+      "last_known_network": "192.168.122.0/24",
+      "network_group": "libvirt-nat-192.168.122.0/24",
+      "node_id": "katana-exit-1",
+      "lab_role": "linux_exit",
+      "parent_device": "katana (x86_64 KVM host, Debian 13 laptop)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "katana-exit-1",
+        "host_id": "katana"
+      },
+      "notes": "NAT'd on katana's virbr0: reachable from katana itself (runs are launched ON katana via vm-lab-launch-on-host), not from the Mac directly",
+      "mesh_ip": "100.64.0.5",
+      "exit_capable": true,
+      "relay_capable": false
     }
   ]
 }
