@@ -140,9 +140,21 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    anchor empty; real-shaped negative fixtures. **B2** DONE in the same
    pass: the feature-guard scan walks the stage tree recursively, fails
    closed on an unreadable file, and pins the launcher count exactly (15).
-3. **QH-83** (in flight, relaunched `edit-1788908162525-23870-0` on glm-5.3
-   after the first attempt stalled 4 h with zero edits) — folds B1, pattern H.
-4. **QH-82** (in flight, relaunched `edit-1788908182590-23933-0`).
+3. **QH-83** — MERGED `0e7ab8c4` (branch `edit-1788908162525-23870-0`,
+   glm-5.3, after a first attempt stalled 4 h with zero edits). GLM review
+   verdict MERGE-WITH-FIXES; all five fixes applied before merge, the
+   load-bearing one being `membership_init`, whose only stage-log append was
+   the macOS-exit F1 line — the new gate would have demoted every Linux-exit
+   run. Only 3 of 81 stages are witnessed at landing; the 76
+   `PHASE1_EVIDENCE_PENDING` rows are the honest remainder. Live re-verify
+   of a Linux run under the new gate is OWED before the next evidence claim.
+4. **QH-82** — MERGED `778e1599` + `e6c0807e` (branch
+   `edit-1788908182590-23933-0`, flash). GLM review: MERGE-WITH-FIXES, the
+   required fix being that the tripwire script was never invoked by CI —
+   now a step in `cross-platform-ci.yml`. Non-blocking follow-up from the
+   review: `adapter/macos_traffic.rs:1940` includes `macos_install.rs`
+   without routing through `implementation_source_slice` (cross-file pin,
+   outside the self-pin scanner's fence).
 5. **F3 + gate** — allowlist validators at the inventory parse boundary
    (reuse `validated_args::connection_user`; `last_known_ip` must parse as
    `IpAddr`), sink-side spawn scanner (`ssh`/`scp` carry `--`; `sshpass` never
