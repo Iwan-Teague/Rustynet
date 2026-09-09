@@ -479,26 +479,51 @@ define_stage_catalog! {
     // chaos_privileged_boundary IS the map's privileged-helper-allowlist
     // member); fault/impairment stages are T2 (spec §3 T2 lists "chaos").
     // Clock rollback vs freshness/anti-replay protection — adversarial.
-    ChaosClockAttack => "chaos_clock_attack" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ChaosCrashRecovery => "chaos_crash_recovery" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ChaosDaemonFault => "chaos_daemon_fault" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ChaosMembershipAdversarial => "chaos_membership_adversarial" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ChaosNetworkImpairment => "chaos_network_impairment" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ChaosPrivilegedBoundary => "chaos_privileged_boundary" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    //
+    // QH-83 Live batch: every chaos bin writes `<stage>_report.json` into the
+    // run's report dir before it exits (live_chaos_support::run_category and
+    // the per-bin emitters), and `run_chaos_bin` (stage/chaos.rs) verifies the
+    // artifact exists and is non-empty on the exit-0 path — a success with no
+    // report is Failed, so a PASS verdict always has its witness on disk.
+    // Pinned by `chaos_report_witness_declared_per_stage_and_unique` +
+    // `chaos_report_witness_*` tests in stage/chaos.rs.
+    ChaosClockAttack => "chaos_clock_attack" @ Chaos / T4Security / StageEvidence::File("chaos_clock_attack_report.json"),
+    ChaosCrashRecovery => "chaos_crash_recovery" @ Chaos / T2Resilience / StageEvidence::File("chaos_crash_recovery_report.json"),
+    ChaosDaemonFault => "chaos_daemon_fault" @ Chaos / T2Resilience / StageEvidence::File("chaos_daemon_fault_report.json"),
+    ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont" @ Chaos / T2Resilience / StageEvidence::File("chaos_daemon_sigstop_sigcont_report.json"),
+    ChaosMembershipAdversarial => "chaos_membership_adversarial" @ Chaos / T4Security / StageEvidence::File("chaos_membership_adversarial_report.json"),
+    ChaosNetworkImpairment => "chaos_network_impairment" @ Chaos / T2Resilience / StageEvidence::File("chaos_network_impairment_report.json"),
+    ChaosPrivilegedBoundary => "chaos_privileged_boundary" @ Chaos / T4Security / StageEvidence::File("chaos_privileged_boundary_report.json"),
     // Resource exhaustion = availability disturbance + recovery, closer to
     // impairment than to a trust-control bypass — resilience tier.
-    ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos / T2Resilience / StageEvidence::File("chaos_resource_exhaustion_report.json"),
+    ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos / T4Security / StageEvidence::File("chaos_signed_state_adversarial_report.json"),
     // T5 negative-control / adjudication suite (spec §3-T5 / §5) — the four
     // injected-fault controls, each of which PASSES iff its targeted operation
     // fails for the specific named reason (the inversion). All T5NegativeControl
     // by definition; opt-in, out of the default plan (like chaos). Impl +
     // adjudication in `stage/negative_control.rs`.
-    NegativeControlSignedBundleRejection => "negative_control_signed_bundle_rejection" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    NegativeControlPlantedResidue => "negative_control_planted_residue" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    NegativeControlWrongNodeSubstitution => "negative_control_wrong_node_substitution" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    NegativeControlDaemonKillMidStage => "negative_control_daemon_kill_mid_stage" @ NegativeControl / T5NegativeControl / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    //
+    // QH-83 Live batch: each control's witness is its inversion record. Three
+    // controls write their transcript via `write_control_evidence` on every
+    // pass path (write failure already fails the control), so they declare the
+    // transcript under `negative_control/<stage>/`:
+    // signed-bundle → verifier_transcript.json (forgeries rejected + genuine
+    // accepted), wrong-node → wrong_node_transcript.json (substitution
+    // rejected + match accepted), daemon-kill → kill_window_transcript.txt
+    // (kill applied + probe failed under kill). planted_residue has no single
+    // artifact covering BOTH the plant and the clean-assert detection, so it
+    // appends a stage-log witness line on its DetectedNamingPlant pass arm
+    // naming control, target alias, sabotage table, and detection
+    // (`write_planted_residue_witness`, stage/negative_control.rs). Pinned by
+    // `negative_control_inversion_witnesses_are_declared_and_unique`,
+    // `planted_residue_witness_line_names_control_target_and_detection`, and
+    // `planted_residue_witness_write_failure_is_propagated` in
+    // stage/negative_control.rs.
+    NegativeControlSignedBundleRejection => "negative_control_signed_bundle_rejection" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_signed_bundle_rejection/verifier_transcript.json"),
+    NegativeControlPlantedResidue => "negative_control_planted_residue" @ NegativeControl / T5NegativeControl / StageEvidence::StageLog,
+    NegativeControlWrongNodeSubstitution => "negative_control_wrong_node_substitution" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_wrong_node_substitution/wrong_node_transcript.json"),
+    NegativeControlDaemonKillMidStage => "negative_control_daemon_kill_mid_stage" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_daemon_kill_mid_stage/kill_window_transcript.txt"),
     // Always-run overlay teardown (FinalCleanupStage pattern): vxlan link
     // residue on a guest is release-blocking exactly like exit-NAT residue,
     // so this must survive skip-cascade and run just before cleanup.
