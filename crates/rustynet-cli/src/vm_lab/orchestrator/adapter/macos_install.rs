@@ -2,7 +2,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
@@ -12,6 +11,7 @@ use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::host_cross_build;
+use crate::vm_lab::VmGuestPlatform;
 
 pub const MACOS_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 pub const MACOS_RUSTYNET_PATH: &str = "/usr/local/bin/rustynet";
@@ -99,7 +99,9 @@ pub fn install_daemon(
         .node_ids
         .get(alias)
         .cloned()
-        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+        // Install-time: no daemon exists yet to report its id, so the
+        // sanctioned bootstrap mint applies (adapter::mint_bootstrap_node_id).
+        .unwrap_or_else(|| super::mint_bootstrap_node_id(alias));
     if node_id.is_empty() {
         return Err(AdapterError::Protocol {
             message: "install_daemon: node_id must not be empty".to_owned(),
@@ -254,7 +256,9 @@ pub fn install_daemon_from_workdir(
         .node_ids
         .get(alias)
         .cloned()
-        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+        // Install-time: no daemon exists yet to report its id, so the
+        // sanctioned bootstrap mint applies (adapter::mint_bootstrap_node_id).
+        .unwrap_or_else(|| super::mint_bootstrap_node_id(alias));
     if node_id.is_empty() {
         return Err(AdapterError::Protocol {
             message: "install_daemon_from_workdir: node_id must not be empty".to_owned(),
@@ -604,7 +608,8 @@ pub fn prime_remote_access(conn: &NodeConnection) -> Result<(), AdapterError> {
 /// Remote command that installs the temporary sudoers grant. `sudo -S` reads
 /// the password from stdin, which `prime_remote_access` pipes through the SSH
 /// channel; nothing in this string carries a credential.
-const PRIME_SUDOERS_REMOTE_COMMAND: &str = "sudo -S bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" \
+const PRIME_SUDOERS_REMOTE_COMMAND: &str =
+    "sudo -S bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" \
      > /etc/sudoers.d/99-rustynet-lab && chmod 0440 /etc/sudoers.d/99-rustynet-lab'";
 
 /// Build `sshpass -e ssh …` for the password-primed path. The password goes to
@@ -850,8 +855,8 @@ fn privileged_helper_socket_present(conn: &NodeConnection) -> bool {
 /// in place — `launchctl bootstrap` of an already-loaded job fails, review
 /// §1), the `launchctl bootstrap` from the installed plist comes SECOND.
 /// Returned as an ordered pair so the ordering is pinned by test without SSH.
-fn privileged_helper_restore_commands()
--> Result<(ssh::RemoteCommand, ssh::RemoteCommand), AdapterError> {
+fn privileged_helper_restore_commands(
+) -> Result<(ssh::RemoteCommand, ssh::RemoteCommand), AdapterError> {
     let bootout = ssh::RemoteCommand::from_args(
         "macos privileged-helper bootout",
         &[
@@ -1103,11 +1108,20 @@ pub fn enforce_daemon(
         .map(|a| &a.role)
         .cloned()
         .unwrap_or(NodeRole::Client);
+    // F2 fail-closed: EnforceBaselineRuntime is transitively downstream of
+    // CollectPubkeys, so reaching enforce with no daemon-reported id means a
+    // skip/reuse path bypassed collection. Never mint a label-derived
+    // identity here (QH-68: the macOS anchor once ran as macos-utm-1-bootstrap).
     let node_id = ctx
         .node_ids
         .get(alias)
         .cloned()
-        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+        .ok_or_else(|| AdapterError::Protocol {
+            message: format!(
+                "{alias}: no daemon-reported node id recorded (collect_pubkeys must run \
+                 first); refusing to mint a '{alias}-bootstrap' identity for enforcement"
+            ),
+        })?;
     let daemon_node_role = role
         .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
         .map_err(|message| AdapterError::Protocol { message })?;
@@ -3985,5 +3999,47 @@ mod tests {
                  launch flag {flag}"
             );
         }
+    }
+
+    /// F2 pin (macOS twin): `enforce_daemon` must refuse to mint a
+    /// label-derived `{alias}-bootstrap` identity when the context carries no
+    /// daemon-reported node id. Mutation caught: restoring the
+    /// `unwrap_or_else(|| format!("{alias}-bootstrap"))` fallback flips this
+    /// test red (the call proceeds toward utun derivation instead of
+    /// erroring).
+    #[test]
+    fn enforce_daemon_refuses_to_mint_node_id_when_context_has_none() {
+        let conn = NodeConnection::Ssh {
+            host: "macos-refuses-mint".to_owned(),
+            port: 22,
+            user: None,
+            identity_file: std::path::PathBuf::from("/tmp/id"),
+            known_hosts: std::path::PathBuf::from("/tmp/known_hosts"),
+            ssh_password: None,
+        };
+        let ctx = make_ctx(NodeRole::Client);
+        let err = enforce_daemon(&conn, "macos-utm-1", &ctx)
+            .expect_err("enforce without a daemon-reported id must fail closed");
+        let AdapterError::Protocol { message } = err else {
+            panic!("expected Protocol error, got: {err:?}");
+        };
+        assert!(
+            message.contains("collect_pubkeys must run first"),
+            "error must name the prerequisite: {message}"
+        );
+        assert!(
+            message.contains("-bootstrap"),
+            "error must name the refused mint: {message}"
+        );
+    }
+
+    /// F2 positive control: the mint survives at INSTALL time only, behind
+    /// the named helper — the one sanctioned `-bootstrap` site on this path.
+    #[test]
+    fn install_daemon_still_mints_the_bootstrap_id_through_the_named_helper() {
+        assert_eq!(
+            crate::vm_lab::orchestrator::adapter::mint_bootstrap_node_id("macos-utm-1"),
+            "macos-utm-1-bootstrap"
+        );
     }
 }
