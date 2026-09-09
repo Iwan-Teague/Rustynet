@@ -104,3 +104,18 @@ F2/F3/F4/F5/F6: **S** each (doc line, two test loops, one catalog row + append l
 - **F4 DONE** — `stage/blind_exit.rs` writes a per-validated-node witness line on the PASS path (write failure fails the stage), the catalog row is `BlindExit => "blind_exit" @ Setup / T1Role / StageEvidence::StageLog` (`stage/mod.rs`), and the runner's `verify_declared_evidence` demotes an unwitnessed PASS to `NotProven { MissingWitness }`. Tests: `blind_exit_witness_line_is_written_per_validated_node`, `blind_exit_witness_write_failure_is_propagated` (stage), `pass_without_stage_log_witness_is_demoted_to_not_proven` / `empty_stage_log_witness_is_demoted_to_not_proven` / `stage_log_witness_upholds_pass` (runner.rs). Mutation: revert the catalog row to `StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING }` — the demotion test goes red.
 
 Gates on the landing commit: `cargo fmt --all -- --check` clean; `cargo test -p rustynet-cli --all-features --lib -- vm_lab` → **2764 passed, 0 failed**. Known pre-existing blocker, NOT introduced here (file untouched by this branch, identical on `main`): `cargo clippy -p rustynet-cli --all-targets --all-features --locked -- -D warnings` fails inside the dependency crate `rustynetd` — 3 `collapsible_if` lints in `crates/rustynetd/src/phase10.rs:4301/4911/4955` (newer rustc's extended `collapsible_if` over `if let`); outside this job's path allowlist, so left for an owner pass.
+
+## Review disposition (2026-09-09, GLM-flash, MERGE-WITH-FIXES → merged)
+
+All four claims CONFIRMED at file:line; both dispatcher arms are `Err`-shaped
+and `blind_exit` cannot return `Passed` without a witness (statically
+unreachable). Two corrections to the job's own §6 wording, applied here rather
+than re-running the job: the runner-demotion tests it cites
+(`pass_without_stage_log_witness_is_demoted_to_not_proven`,
+`empty_stage_log_witness_is_demoted_to_not_proven`) pre-exist on main; the
+tests this branch ADDS are `blind_exit_pass_without_witness_is_demoted` and
+`blind_exit_stage_log_witness_upholds_pass`; and F2's gates
+(`key_custody_runtime_implemented`, `runtime_acls_runtime_implemented`) already
+existed — what is new is that the two stages now consult them. Follow-up
+(non-blocking): a `BlindExitStage`-level test that `Passed` implies a
+non-empty stage log, to catch a deleted witness call.
