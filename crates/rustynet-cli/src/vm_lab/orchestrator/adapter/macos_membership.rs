@@ -2,6 +2,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_install::{
     MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH, MACOS_MEMBERSHIP_SNAPSHOT_PATH,
     MACOS_OWNER_SIGNING_KEY_PATH, MACOS_RUSTYNET_PATH, MACOS_STATE_ROOT,
@@ -14,12 +15,11 @@ use crate::vm_lab::orchestrator::error::{
     NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::VmGuestPlatform;
 use rustynet_control::membership::{
-    snapshot_bytes_node_capabilities, snapshot_bytes_state_identity, MEMBERSHIP_SCHEMA_VERSION,
+    MEMBERSHIP_SCHEMA_VERSION, snapshot_bytes_node_capabilities, snapshot_bytes_state_identity,
 };
 use rustynet_control::roles::{
-    canonicalize_role_capabilities, role_capability_csv, RoleCapability,
+    RoleCapability, canonicalize_role_capabilities, role_capability_csv,
 };
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1599,10 +1599,12 @@ mod exit_capability_rewrite_tests {
             post_genesis_commands("node-exit-1", &peers, &anchor_genesis_caps()).expect("plan");
         assert_eq!(post.len(), 2);
         assert_eq!(post[0].kind, PlanStepKind::ExitCapabilityRewrite);
-        assert!(post[0]
-            .command
-            .as_str()
-            .contains("e2e-membership-set-capabilities"));
+        assert!(
+            post[0]
+                .command
+                .as_str()
+                .contains("e2e-membership-set-capabilities")
+        );
         assert_eq!(post[1].kind, PlanStepKind::PeerAdd);
         assert!(post[1].command.as_str().contains("e2e-membership-add"));
         // Exactly one rewrite step, ever.
@@ -1640,11 +1642,13 @@ mod exit_capability_rewrite_tests {
         assert!(interpret_owner_key_presence(Ok(String::new())).expect("present"));
         // exit 1 → absent (test -e false), and ONLY after sudo was proven to
         // work by the preceding `sudo -n true` step in the probe.
-        assert!(!interpret_owner_key_presence(Err(AdapterError::Command {
-            exit_code: Some(1),
-            stderr: String::new(),
-        }))
-        .expect("absent"));
+        assert!(
+            !interpret_owner_key_presence(Err(AdapterError::Command {
+                exit_code: Some(1),
+                stderr: String::new(),
+            }))
+            .expect("absent")
+        );
         // Any other exit status is not an answer.
         let err = interpret_owner_key_presence(Err(AdapterError::Command {
             exit_code: Some(2),
@@ -1652,11 +1656,13 @@ mod exit_capability_rewrite_tests {
         }))
         .expect_err("exit 2 must not read as absent");
         assert!(err.to_string().contains("unexpected status"), "{err}");
-        assert!(interpret_owner_key_presence(Err(AdapterError::Command {
-            exit_code: None,
-            stderr: "killed".to_owned(),
-        }))
-        .is_err());
+        assert!(
+            interpret_owner_key_presence(Err(AdapterError::Command {
+                exit_code: None,
+                stderr: "killed".to_owned(),
+            }))
+            .is_err()
+        );
         // Transport failures propagate as themselves.
         let err = interpret_owner_key_presence(Err(AdapterError::Ssh {
             message: "connection reset".to_owned(),

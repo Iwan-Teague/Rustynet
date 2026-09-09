@@ -1,9 +1,33 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::install::node_in_rebuild_set;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+
+/// Writes the QH-83 witness line for a cleanup_hosts PASS: the asserted-clean
+/// node count travels with the verdict, so an empty or rebuild-only scope
+/// stays auditable instead of passing invisibly.
+fn write_cleanup_witness(
+    report_dir: &std::path::Path,
+    cleaned: &[String],
+    rebuild_only: Option<&[String]>,
+) -> Result<(), String> {
+    let scope = match rebuild_only {
+        Some(list) => list.join(","),
+        None => "none".to_owned(),
+    };
+    append_stage_evidence_line(
+        report_dir,
+        StageId::CleanupHosts.as_str(),
+        &format!(
+            "cleanup_asserted_nodes={} ({}) rebuild_only={scope}",
+            cleaned.len(),
+            cleaned.join(",")
+        ),
+    )
+}
 
 pub struct CleanupHostsStage {
     /// `--rebuild-nodes`: when `Some`, only these aliases are reset; any node
@@ -39,6 +63,11 @@ impl OrchestrationStage for CleanupHostsStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let rebuild_only = self.rebuild_only.as_deref();
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        let cleaned: Vec<String> = aliases
+            .iter()
+            .filter(|alias| node_in_rebuild_set(rebuild_only, alias))
+            .cloned()
+            .collect();
         let errors: Vec<String> = aliases
             .iter()
             .filter_map(|alias| {
@@ -79,7 +108,13 @@ impl OrchestrationStage for CleanupHostsStage {
             })
             .collect();
         if errors.is_empty() {
-            StageOutcome::Passed
+            // QH-83: the witness is written on EVERY pass path and a write
+            // failure fails the stage — an unwitnessed cleanup pass must
+            // not stand.
+            match write_cleanup_witness(&ctx.report_dir, &cleaned, rebuild_only) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("cleanup witness write failed: {e}")),
+            }
         } else {
             StageOutcome::Failed(errors.join("; "))
         }
@@ -175,5 +210,54 @@ mod tests {
             CleanupHostsStage::new(None).execute(&mut ctx),
             StageOutcome::Passed
         );
+    }
+
+    // QH-83: a PASS verdict must leave a durable stage-log line naming the
+    // asserted-clean node count (vacuity auditable). Mutation caught:
+    // dropping the witness write or demoting it to best-effort.
+    #[test]
+    fn cleanup_witness_line_names_the_asserted_clean_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "cleanup_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let cleaned = vec!["exit-1".to_owned(), "client-1".to_owned()];
+        write_cleanup_witness(&dir, &cleaned, None).expect("witness write");
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::CleanupHosts.as_str(),
+            ),
+        )
+        .expect("stage log readable");
+        assert!(
+            log.contains("cleanup_asserted_nodes=2 (exit-1,client-1) rebuild_only=none"),
+            "{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as
+    /// an error the stage turns into a failure (never a silent pass).
+    #[test]
+    fn cleanup_witness_write_failure_is_propagated() {
+        let blocker =
+            std::env::temp_dir().join(format!("cleanup_witness_blocker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let err = write_cleanup_witness(&blocker, &["exit-1".to_owned()], None)
+            .expect_err("write into a regular file path must fail");
+        assert!(!err.is_empty());
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }

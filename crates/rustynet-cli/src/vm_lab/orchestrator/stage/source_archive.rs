@@ -238,6 +238,17 @@ impl OrchestrationStage for PrepareSourceArchiveStage {
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         if ctx.source_archive.is_some() {
+            // QH-83: the catalog row declares the provenance record as this
+            // stage's File witness, and the runner clears File witnesses at
+            // stage start — so an archive already in context is only a pass
+            // while its pin is still on disk. Never pass unwitnessed.
+            let witness = ctx.report_dir.join("state/source_archive_provenance.json");
+            if !witness.is_file() {
+                return StageOutcome::Failed(
+                    "source archive already in context but its provenance witness is missing"
+                        .to_owned(),
+                );
+            }
             return StageOutcome::Passed;
         }
         let archive_path = {
@@ -388,7 +399,7 @@ mod tests {
             assignments: vec![],
             adapters: HashMap::new(),
             source_archive: Some(archive),
-            report_dir: std::env::temp_dir(),
+            report_dir: unique_report_dir("rn_src_archive_ctx"),
             stage_outcomes: HashMap::new(),
             collected_pubkeys: HashMap::new(),
             collected_gossip_identities: HashMap::new(),
@@ -413,12 +424,44 @@ mod tests {
         (ctx, f)
     }
 
+    fn unique_report_dir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("{tag}_{}_{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("unique report dir");
+        dir
+    }
+
+    /// An archive already in context passes only while its provenance pin
+    /// (the stage's declared File witness) is still on disk.
     #[test]
     fn already_present_archive_passes_immediately() {
         let (mut ctx, _f) = make_ctx_with_archive();
+        let witness = ctx.report_dir.join("state/source_archive_provenance.json");
+        std::fs::create_dir_all(witness.parent().expect("parent")).expect("state dir");
+        std::fs::write(&witness, b"{}").expect("provenance witness");
         let outcome =
             PrepareSourceArchiveStage::new(ArchiveSourceMode::Head, false).execute(&mut ctx);
         assert_eq!(outcome, StageOutcome::Passed);
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    /// QH-83: the early arm must never pass unwitnessed — with the
+    /// provenance pin gone (the runner clears File witnesses at stage start)
+    /// the stage fails instead of returning a Passed the runner would only
+    /// demote. Mutation caught: dropping the witness check in `execute`.
+    #[test]
+    fn already_present_archive_without_its_provenance_witness_fails() {
+        let (mut ctx, _f) = make_ctx_with_archive();
+        let outcome =
+            PrepareSourceArchiveStage::new(ArchiveSourceMode::Head, false).execute(&mut ctx);
+        match outcome {
+            StageOutcome::Failed(msg) => assert!(msg.contains("provenance witness"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
     }
 
     /// A context with NO archive yet and a report dir the test controls, so

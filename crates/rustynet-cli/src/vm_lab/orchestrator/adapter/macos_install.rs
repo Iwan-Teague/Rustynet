@@ -2,6 +2,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
@@ -11,7 +12,6 @@ use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::host_cross_build;
-use crate::vm_lab::VmGuestPlatform;
 
 pub const MACOS_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
 pub const MACOS_RUSTYNET_PATH: &str = "/usr/local/bin/rustynet";
@@ -608,8 +608,7 @@ pub fn prime_remote_access(conn: &NodeConnection) -> Result<(), AdapterError> {
 /// Remote command that installs the temporary sudoers grant. `sudo -S` reads
 /// the password from stdin, which `prime_remote_access` pipes through the SSH
 /// channel; nothing in this string carries a credential.
-const PRIME_SUDOERS_REMOTE_COMMAND: &str =
-    "sudo -S bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" \
+const PRIME_SUDOERS_REMOTE_COMMAND: &str = "sudo -S bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" \
      > /etc/sudoers.d/99-rustynet-lab && chmod 0440 /etc/sudoers.d/99-rustynet-lab'";
 
 /// Build `sshpass -e ssh …` for the password-primed path. The password goes to
@@ -855,8 +854,8 @@ fn privileged_helper_socket_present(conn: &NodeConnection) -> bool {
 /// in place — `launchctl bootstrap` of an already-loaded job fails, review
 /// §1), the `launchctl bootstrap` from the installed plist comes SECOND.
 /// Returned as an ordered pair so the ordering is pinned by test without SSH.
-fn privileged_helper_restore_commands(
-) -> Result<(ssh::RemoteCommand, ssh::RemoteCommand), AdapterError> {
+fn privileged_helper_restore_commands()
+-> Result<(ssh::RemoteCommand, ssh::RemoteCommand), AdapterError> {
     let bootout = ssh::RemoteCommand::from_args(
         "macos privileged-helper bootout",
         &[

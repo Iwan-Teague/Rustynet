@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    ps_quote, run_remote_ps, WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH,
-    WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
+    WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH, WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, WINDOWS_STAGING_DIR,
+    WINDOWS_STATE_ROOT, ps_quote, run_remote_ps,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
@@ -517,17 +517,19 @@ mod tests {
     #[test]
     fn add_peer_script_rejects_control_chars_in_node_id() {
         // ps_quote rejects CR/LF/NUL, so a node_id carrying them fails closed.
-        assert!(build_add_peer_script(
-            "x",
-            "node\ninjected",
-            "abcd",
-            "client",
-            "exit-1",
-            "exit-1-owner",
-            "k",
-            "p",
-        )
-        .is_err());
+        assert!(
+            build_add_peer_script(
+                "x",
+                "node\ninjected",
+                "abcd",
+                "client",
+                "exit-1",
+                "exit-1-owner",
+                "k",
+                "p",
+            )
+            .is_err()
+        );
     }
 
     #[test]

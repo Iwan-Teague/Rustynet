@@ -481,7 +481,12 @@ impl OrchestrationStage for PreflightStage {
                     }
                     parse_remote_unix_time(&status.stdout)
                 };
-                return clock_skew_failure_outcome(
+                // A remediated node is only THIS node's clock verdict: keep
+                // walking the fleet and still run the cross-bridge preflight
+                // below, whose report file is this stage's declared witness.
+                // Returning `Passed` here would skip both and the runner
+                // would demote the unwitnessed pass to NotProven.
+                match clock_skew_failure_outcome(
                     alias,
                     &err,
                     self.clock_remediation_enabled,
@@ -491,7 +496,10 @@ impl OrchestrationStage for PreflightStage {
                     MAX_LAB_CLOCK_SKEW_SECS,
                     &mut apply,
                     &mut remeasure,
-                );
+                ) {
+                    StageOutcome::Passed => continue,
+                    other => return other,
+                }
             }
         }
 
@@ -820,14 +828,23 @@ impl PreflightStage {
         };
         let _ = writeln!(report, "{decision_line}");
 
+        // QH-83: this report file is the stage's declared File witness, so a
+        // write failure is the stage's failure — never a stderr note beside
+        // a pass the runner would then demote to NotProven anyway.
         let log_path = ctx.report_dir.join("logs/cross_bridge_preflight.txt");
         if let Some(parent) = log_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("cross-bridge preflight: cannot create log dir: {e}");
+                return StageOutcome::Failed(format!(
+                    "cross-bridge preflight: cannot create witness log dir {}: {e}",
+                    parent.display()
+                ));
             }
         }
         if let Err(e) = std::fs::write(&log_path, &report) {
-            eprintln!("cross-bridge preflight: cannot write report: {e}");
+            return StageOutcome::Failed(format!(
+                "cross-bridge preflight: cannot write witness report {}: {e}",
+                log_path.display()
+            ));
         }
 
         match outcome {
