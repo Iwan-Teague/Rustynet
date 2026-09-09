@@ -177,3 +177,24 @@ F1 **S** (one block + one test). F2 **S** (newtype + parse test + one call-site)
 - I did not re-verify the sibling probes' own findings (vacuous-pass F1 of the skip-semantics review, the 16 unwitnessed Setup rows) — they are carried from `NodeEngineSkipSemanticsReview_2026-09-09.md` and `NodeEngineSetupWitnessAudit_2026-09-09.md`, not re-read line-by-line here.
 
 ## Tools used (56 call(s) over 34 step(s))
+
+## 6. Implementation status (2026-09-09, delegated-edit branch `ai-edit/edit-1788948550870-17439-0`)
+
+F1–F4 are IMPLEMENTED and GATED on this branch. Commits (this branch): `30f94393` (WIP checkpoint: F1 pre-execute witness clear + F4 trait-doc fix + F1 test retargets), `8e9d0a42` (F2 `ReuseDigest` boundary + F3 witness-in-seal + validation witness check), `aa6825b4` (F3 reuse-validation tests).
+
+| Finding | Status | Enforcement point | Verification tests (mutation in parens) |
+| --- | --- | --- | --- |
+| F1 | DONE | `runner.rs` pre-execute clear after `stage_started` (declared `File` witness removed; non-NotFound removal error ⇒ blocking `NotProven{StaleEvidence}`) | `file_witness_from_a_prior_generation_is_not_accepted`, `witnessed_file_evidence_replaces_a_prior_generations_artifact` (mutation: skip the clear) |
+| F2 | DONE | `evidence.rs::ReuseDigest` (private field, `parse` sole constructor: trim + 64-hex); `validate_rust_native_reuse_evidence` returns it; `with_reused_skips`/`skip_decision` accept only the newtype; `native.rs` binding typed | `reuse_digest_parse_rejects_short_and_non_hex_input` (mutation: accept a raw String); `validated_reused_skip_does_not_cascade_or_claim_fresh_pass` updated off `"abc123"` |
+| F3 | DONE | `evidence.rs::declared_witness_path` (same witness set the runner demands); digest hashes every PLANNED stage's declared witness; validation requires present + non-empty witness per reused id | `tampering_a_declared_file_witness_fails_reuse_validation` (mutation: drop artifacts from digest); `reuse_validation_rejects_missing_or_empty_declared_witness` (mutation: drop presence/emptiness check) |
+| F4 | DONE | `stage/mod.rs` trait doc matches runner (`always_run` NOT skippable by `--skip-stage`) | doc-only |
+| F5 | NOT DONE (remainder) | dead disjunct `runner.rs` `mark_blocked` (`outcome.is_blocking() \|\| matches!(..Skipped(..))` — branch 1 can only yield NotRun/Reused) — LOW, left as-is | — |
+| F6 | NOT DONE (remainder) | diagnostics trigger in `native.rs` should include `NotProven` in prior outcomes | — |
+| §3 gate | NOT DONE (remainder) | witness-generation gate layers 1+2 from §3 | — |
+
+Gate evidence on this branch (CARGO_TARGET_DIR=/Users/iwan/Desktop/Rustynet/target-glm-w7):
+- `cargo fmt --all -- --check`: exit 0.
+- `cargo test -p rustynet-cli --all-features --lib -- vm_lab`: 2758 passed / 0 failed.
+- `cargo check -p rustynet-cli --all-targets --all-features`: exit 0.
+- `cargo clippy -p rustynet-cli --all-targets --all-features --locked --no-deps -- -D warnings`: exit 0 ONLY with `-A clippy::collapsible_if -A clippy::cloned_ref_to_slice_refs -A clippy::unnecessary_sort_by` — these three rust-1.97 lints fire on code this branch never touched (e.g. `rustynet-cli/src/vm_lab/mod.rs:7924`, `stage/preflight.rs:553`, `workspace_root.rs:239`), byte-identical to base `30f94393`.
+- BLOCKER (pre-existing, out of allowlist): `cargo clippy` with deps lints `rustynetd` and fails on 3 `collapsible_if` (`rustynetd/src/phase10.rs:4301/:4911/:4955`); `rustynetd` is byte-identical to base (0 diff lines) — toolchain-drift lint, not this branch's regression, and outside the permitted edit paths. Fix belongs to a rustynetd-scoped change: collapse the three `if`s.
