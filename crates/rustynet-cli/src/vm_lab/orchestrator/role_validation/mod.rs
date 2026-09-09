@@ -51,7 +51,10 @@ pub(crate) fn require_daemon_success(
         return evaluate(stdout).map(|_| ());
     }
     match evaluate(stdout) {
-        Err(eval_err) => Err(eval_err),
+        Err(eval_err) => Err(format!(
+            "`{subcommand}` on {alias} exited non-zero (code {exit_code}; the daemon uses \
+             exit 78 to signal drift): {eval_err}"
+        )),
         Ok(_) => Err(format!(
             "`{subcommand}` on {alias} exited non-zero (code {exit_code}) while emitting a \
              passing report; failing closed"
@@ -153,5 +156,49 @@ mod generated_nft_table_tests {
         let err = discover_single_generated_nft_table(&multiple, "ip", "rustynet_nat_g", "NAT")
             .unwrap_err();
         assert!(err.contains("multiple") && err.contains("residual state"));
+    }
+
+    fn require_daemon_success_drift_evaluate(report: &str) -> Result<String, String> {
+        if report.contains("overall_ok\": false") {
+            Err(format!("drift detected in {report}"))
+        } else {
+            Ok(format!("accepted {report}"))
+        }
+    }
+
+    // Mutation targeted: without the exit-code gate the evaluator's Ok would
+    // return success for a daemon that exited non-zero while claiming a
+    // passing report.
+    #[test]
+    fn require_daemon_success_rejects_non_zero_exit_with_passing_report() {
+        let err = require_daemon_success(3, "linux-key-custody-check", "deb-1", "clean", |s| {
+            require_daemon_success_drift_evaluate(s)
+        })
+        .expect_err("a non-zero exit with a passing report must fail closed");
+        assert!(
+            err.contains("exited non-zero (code 3)") && err.contains("passing report"),
+            "should name the exit code and the passing report, got: {err}"
+        );
+    }
+
+    // Mutation targeted: without the drift-surfacing branch the drift report
+    // (evaluator error) would be replaced by a generic exit-status message,
+    // losing the actionable reasons.
+    #[test]
+    fn require_daemon_success_surfaces_drift_reasons_with_exit_code_note() {
+        let dirty_report = r#"{"overall_ok": false}"#;
+        let err = require_daemon_success(
+            78,
+            "linux-key-custody-check",
+            "deb-1",
+            dirty_report,
+            |s| require_daemon_success_drift_evaluate(s),
+        )
+        .expect_err("a non-zero exit with a failing report must surface the drift");
+        assert!(
+            err.contains("exited non-zero (code 78; the daemon uses exit 78 to signal drift)")
+                && err.contains("drift detected in"),
+            "should name the exit code, the drift taxonomy, and the drift reason, got: {err}"
+        );
     }
 }

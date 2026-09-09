@@ -8,8 +8,8 @@
 //! drift output — so a broken or vacuous DNS-failclosed check fails the stage
 //! rather than silently passing.
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::VmGuestPlatform;
 
 /// True where DNS-failclosed validation runs live (Linux, macOS, Windows).
 pub fn dns_failclosed_runtime_implemented(platform: VmGuestPlatform) -> bool {
@@ -34,7 +34,9 @@ pub fn validate_linux_dns_failclosed(
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::vm_lab::evaluate_linux_dns_failclosed_report(alias, &stdout)?;
+    super::require_daemon_success(out.code, SUBCOMMAND, alias, &stdout, |report| {
+        crate::vm_lab::evaluate_linux_dns_failclosed_report(alias, report)
+    })?;
     Ok(())
 }
 
@@ -65,7 +67,9 @@ pub fn validate_macos_dns_failclosed(
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::vm_lab::evaluate_macos_dns_failclosed_report(alias, &stdout, expected_dns_posture)?;
+    super::require_daemon_success(out.code, SUBCOMMAND, alias, &stdout, |report| {
+        crate::vm_lab::evaluate_macos_dns_failclosed_report(alias, report, expected_dns_posture)
+    })?;
     Ok(())
 }
 
@@ -80,7 +84,10 @@ pub fn validate_windows_dns_failclosed(
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::vm_lab::evaluate_windows_dns_failclosed_report(alias, &stdout)?;
+    super::require_daemon_success(out.code, SUBCOMMAND, alias, &stdout, |report| {
+        crate::vm_lab::evaluate_windows_dns_failclosed_report(alias, report)
+            .map(|_| "windows-dns-failclosed-check verified".to_owned())
+    })?;
     Ok(())
 }
 
@@ -138,6 +145,42 @@ mod tests {
         assert!(
             err.contains("unsupported schema_version"),
             "error must name schema mismatch: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_linux_fails_closed_when_daemon_exits_non_zero_despite_passing_report() {
+        // Mutation: removing the exit-code gate in `require_daemon_success`
+        // (or reverting this wrapper to trust the evaluator alone) turns this
+        // test green only by accepting a non-zero daemon exit as a pass.
+        let mock = MockShellHost::new();
+        let argv = audit_argv();
+        let clean_report = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "snapshot": {
+                "resolv_conf_path": "/etc/resolv.conf",
+                "resolv_conf_present": true,
+                "nameservers": ["127.0.0.53"],
+                "search_domains": [],
+                "loopback_resolver_advertised": true
+            },
+            "drift_reasons": []
+        })
+        .to_string();
+        mock.program_run_response(
+            &argv,
+            RemoteExitStatus {
+                code: 1,
+                stdout: clean_report.into_bytes(),
+                stderr: Vec::new(),
+            },
+        );
+        let err = validate_linux_dns_failclosed(&mock, TEST_DAEMON, "deb-1")
+            .expect_err("a non-zero daemon exit must fail the stage even with a passing report");
+        assert!(
+            err.contains("exited non-zero"),
+            "error must name the non-zero exit: {err}"
         );
     }
 
