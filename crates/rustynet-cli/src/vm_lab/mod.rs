@@ -53623,6 +53623,70 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         Ok(())
     }
 
+    /// Review of runner-edge F3: a planned `File`-declared stage that was
+    /// reported-SKIPPED leaves no witness by contract; the seal must not
+    /// demand one. Mutation caught: hashing witnesses for every planned
+    /// stage regardless of status (the seal write then fails on the absent
+    /// artifact and no skip-run is ever reusable).
+    #[test]
+    fn a_skipped_file_declared_stage_needs_no_witness_in_the_reuse_seal() {
+        use super::orchestrator::error::StageOutcome;
+        use super::orchestrator::runner::StageObserver;
+        use super::orchestrator::stage::StageId;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rustynet-witness-skip-{}.dir",
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(tmp.join("state")).expect("state dir");
+        super::write_rust_native_report_state_initial(&tmp, "working-tree", None)
+            .expect("initial state");
+        let mut active = std::collections::HashSet::new();
+        active.insert(StageId::Preflight.as_str().to_owned());
+        active.insert(StageId::TrafficTestMatrix.as_str().to_owned());
+        let manifest = crate::live_lab_stage_manifest::build_stage_manifest(
+            "test",
+            "live_suite",
+            &crate::live_lab_stage_registry::TargetSelectors::default(),
+            &active,
+        );
+        crate::live_lab_stage_manifest::write_stage_manifest(&tmp, &manifest).expect("manifest");
+        fs::write(
+            tmp.join("state/orchestration_context.json"),
+            b"bound-context",
+        )
+        .expect("context");
+        let recorder = super::RustNativeStageRecorder {
+            report_dir: &tmp,
+            started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
+            errors: std::cell::RefCell::new(Vec::new()),
+            run_instance_id: None,
+        };
+        recorder.stage_started(&StageId::Preflight);
+        recorder.stage_finished(&StageId::Preflight, &StageOutcome::Passed);
+        recorder.stage_finished(
+            &StageId::TrafficTestMatrix,
+            &StageOutcome::Skipped("no mesh peers in this topology".to_owned()),
+        );
+        assert!(recorder.take_errors().is_empty());
+        super::write_rust_native_report_state_final(
+            &tmp,
+            true,
+            "working-tree",
+            None,
+            false,
+            true,
+            true,
+        )
+        .expect("final state");
+        // No logs/traffic_test_matrix.pair_results.log exists — by contract.
+        super::write_rust_native_reuse_evidence_seal(&tmp)
+            .expect("a skipped File-declared stage must not block the seal");
+        super::validate_rust_native_reuse_evidence(&tmp, &[StageId::Preflight])
+            .expect("reusing the passed stage must validate");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn tampering_a_declared_file_witness_fails_reuse_validation() {
         // Audit F3 mutation target: a digest that does NOT hash the declared
