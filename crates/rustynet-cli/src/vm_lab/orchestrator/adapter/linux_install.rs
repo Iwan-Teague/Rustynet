@@ -1260,3 +1260,57 @@ mod tests {
         assert!(err.to_string().contains("not safe for shell embedding"));
     }
 }
+
+#[cfg(test)]
+mod daemon_launch_flag_parity_tests {
+    //! N4 flag-parity (NodeEngineAdapterParityManifest 2026-09-09 F3): the
+    //! Linux daemon's launch flags live in the systemd unit the bootstrap
+    //! installs, so that unit's ExecStart must carry every
+    //! [`REQUIRED_DAEMON_LAUNCH_FLAGS`] entry — a dropped `--node-role`
+    //! silently defaults the daemon to admin (the Windows N4 failure class).
+
+    /// The exact unit `ops install-systemd` renders to
+    /// /etc/systemd/system/rustynetd.service during bootstrap.
+    static LINUX_DAEMON_UNIT: &str =
+        include_str!("../../../../../../scripts/systemd/rustynetd.service");
+
+    /// Mutation: drop `--node-role ${RUSTYNET_NODE_ROLE}` from the unit's
+    /// ExecStart — this test must fail.
+    #[test]
+    fn linux_daemon_args_include_every_required_launch_flag() {
+        let exec_start = LINUX_DAEMON_UNIT
+            .lines()
+            .find(|line| line.trim_start().starts_with("ExecStart="))
+            .expect("rustynetd.service must declare an ExecStart line");
+        for flag in crate::vm_lab::orchestrator::adapter::node_adapter::REQUIRED_DAEMON_LAUNCH_FLAGS
+        {
+            assert!(
+                exec_start.contains(&format!("{flag} ${{")),
+                "Linux daemon ExecStart is missing required launch flag {flag}"
+            );
+        }
+    }
+
+    /// The bootstrap env file is the only carrier for ROLE/NODE_ID into the
+    /// unit's `--node-role`/`--node-id` values, so the two halves must stay
+    /// wired: build_bootstrap_env must keep emitting ROLE= and NODE_ID= and
+    /// the unit must keep consuming them. Mutation: rename ROLE= in
+    /// build_bootstrap_env — this test must fail.
+    #[test]
+    fn bootstrap_env_identity_keys_feed_the_unit_identity_flags() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
+        let start = source
+            .find("fn build_bootstrap_env(")
+            .expect("build_bootstrap_env must exist");
+        let body = &source[start..];
+        assert!(
+            body.contains("ROLE={role_str}") && body.contains("NODE_ID={node_id}"),
+            "bootstrap env must keep emitting ROLE= and NODE_ID= for the unit"
+        );
+        assert!(
+            LINUX_DAEMON_UNIT.contains("--node-role ${RUSTYNET_NODE_ROLE}"),
+            "unit must consume the node role env the bootstrap env provides"
+        );
+    }
+}
