@@ -504,17 +504,20 @@ pub fn validate_invalid_token_rejected(
 }
 
 /// Linux-only assertion that the daemon's journal contains only the
-/// token's SHA-256 thumbprint, never the raw token bytes. macOS/Windows
-/// return a `log_redaction_check=skipped` summary (journalctl is
-/// Linux-only; the per-OS log surface is a separate substage). Copied from
-/// the bin's `validate_bundle_pull_log_redaction`.
+/// token's SHA-256 thumbprint, never the raw token bytes. On any other
+/// platform this returns `Err`: a validator that cannot look must not answer
+/// "pass" (I4, NodeEngineAuditConsolidation_2026-09-08 §2-C). Whether the
+/// substage is covered on macOS/Windows is the CALLER's explicit coverage
+/// decision (`AnchorRuntimeCoverage`), never a skip hidden inside the
+/// verdict. Copied from the bin's `validate_bundle_pull_log_redaction`.
 pub fn validate_bundle_pull_log_redaction(
     shell: &dyn RemoteShellHost,
     params: &AnchorRuntimeParams,
 ) -> Result<String, String> {
     if params.platform != VmGuestPlatform::Linux {
-        return Ok(format!(
-            "log_redaction_check=skipped platform={:?} reason=journalctl-linux-only",
+        return Err(format!(
+            "log-redaction validation is not implemented for {:?} (journalctl is Linux-only); \
+             the caller must gate this substage explicitly rather than let the validator skip",
             params.platform
         ));
     }
@@ -1219,12 +1222,15 @@ mod tests {
     }
 
     #[test]
-    fn log_redaction_skips_on_non_linux() {
+    fn log_redaction_errs_on_non_linux_instead_of_skipping() {
+        // I4: fail-open polarity. Mutation caught: restoring the
+        // `Ok("log_redaction_check=skipped …")` arm.
         let params = AnchorRuntimeParams::for_platform(VmGuestPlatform::Macos).unwrap();
         let mock = MockShellHost::new();
-        let summary = validate_bundle_pull_log_redaction(&mock, &params).unwrap();
-        assert!(summary.contains("skipped"), "got: {summary}");
-        assert!(summary.contains("journalctl-linux-only"), "got: {summary}");
+        let err = validate_bundle_pull_log_redaction(&mock, &params)
+            .expect_err("a validator that cannot look must not pass");
+        assert!(err.contains("not implemented"), "got: {err}");
+        assert!(err.contains("journalctl"), "got: {err}");
     }
 
     #[test]

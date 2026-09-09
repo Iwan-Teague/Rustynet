@@ -5602,11 +5602,26 @@ impl DataplaneSystem for MacosCommandSystem {
                 output.status, output.stderr
             )));
         }
-        if !output.stdout.contains(MACOS_PF_TERMINAL_BLOCK_RULE) {
-            return Err(SystemError::KillSwitchAssertionFailed(
-                "pf killswitch rule missing".to_owned(),
-            ));
-        }
+        // PF-05: presence is not precedence. pf evaluates top-down and `quick`
+        // wins immediately, so a `pass out quick` ABOVE the terminator makes
+        // the block unreachable while its text is still in the dump. Walk the
+        // anchor's rules in evaluation order and credit the terminator only
+        // when it is reachable (the same evaluator the offline report uses).
+        // PF-01: when this daemon installed the egress-wide pass itself
+        // (`allow_egress_interface`, regular exit or full-tunnel client) it is
+        // passed as ACKNOWLEDGED, exactly as the Linux assertion passes its
+        // wide-open underlay accept — the rule stops masking anything beneath
+        // it while its own disposition stays with the owning finding.
+        let acknowledged_wide_open: Vec<&str> = if self.allow_egress_interface {
+            vec![self.egress_interface.as_str()]
+        } else {
+            Vec::new()
+        };
+        crate::macos_exit_killswitch_precedence::evaluate_macos_killswitch_rules_acknowledging(
+            &output.stdout,
+            &acknowledged_wide_open,
+        )
+        .map_err(SystemError::KillSwitchAssertionFailed)?;
         if self.dns_protected {
             if !Self::ruleset_contains_dns_rule(
                 &output.stdout,
@@ -14537,6 +14552,84 @@ mod tests {
         );
     }
 
+    /// PF-05 (AdversarialSecurityRemediation_2026-07-29 §S2; ledger-tick found
+    /// 2026-09-08): `assert_killswitch` used to be a substring search for the
+    /// terminal block, so a `pass out quick` ABOVE it — which pf honours first
+    /// — left the killswitch open while the assertion reported it verified.
+    /// The live assertion now walks the anchor rules through
+    /// `evaluate_macos_killswitch_rules`. Mutation caught: restoring the
+    /// `stdout.contains(MACOS_PF_TERMINAL_BLOCK_RULE)` check makes the
+    /// escaped ruleset pass this test's first arm.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn macos_assert_killswitch_rejects_a_quick_pass_above_the_terminator() {
+        fn assert_with_rules(tag: &str, rules: &str) -> Result<(), SystemError> {
+            assert_with_rules_acknowledging(tag, rules, false)
+        }
+
+        fn assert_with_rules_acknowledging(
+            tag: &str,
+            rules: &str,
+            allow_egress_interface: bool,
+        ) -> Result<(), SystemError> {
+            let socket_path = phase10_test_socket_path(tag);
+            let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![(
+                    "pfctl -a com.apple/rustynet_g1 -s rules".to_owned(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: rules.to_owned(),
+                        stderr: String::new(),
+                    },
+                )],
+            );
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system =
+                MacosCommandSystem::new("utun9", "en0", Some(client), false, Vec::new())
+                    .expect("macos command system should initialize");
+            system.anchor_name = Some("com.apple/rustynet_g1".to_owned());
+            system.allow_egress_interface = allow_egress_interface;
+            let result = system.assert_killswitch();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            result
+        }
+
+        // Escaped: the terminator's text is present, but an interface-wide
+        // quick pass above it wins first. The old substring check credited
+        // this; the precedence walk must not.
+        let escaped =
+            "pass quick on lo0 all\npass out quick on en0 all\nblock drop out quick all\n";
+        let err = assert_with_rules("pf05e", escaped).expect_err("escaped ruleset must fail");
+        match err {
+            SystemError::KillSwitchAssertionFailed(reason) => assert!(
+                reason.contains("quick") && reason.contains("above"),
+                "reason must name the precedence defect: {reason}"
+            ),
+            other => panic!("unexpected error kind: {other:?}"),
+        }
+
+        // Contained: tunnel-scoped and loopback quick passes above the
+        // terminator are how encrypted traffic legitimately leaves.
+        let contained =
+            "pass quick on lo0 all\npass out quick on utun9 all\nblock drop out quick all\n";
+        assert_with_rules("pf05c", contained).expect("contained ruleset must pass");
+
+        // Missing terminator: still rejected, as before.
+        let missing = "pass quick on lo0 all\npass out quick on utun9 all\n";
+        assert_with_rules("pf05m", missing).expect_err("missing terminator must fail");
+
+        // Acknowledged (PF-01): the same escaped ruleset passes ONLY when this
+        // daemon itself installed the egress-wide pass.
+        assert_with_rules_acknowledging("pf05a", escaped, true)
+            .expect("the daemon's own acknowledged egress pass must not fail the assertion");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn macos_reconcile_exit_nat_residue_flushes_fixed_anchor_only_when_not_serving() {
@@ -18126,6 +18219,31 @@ mod tests {
             ),
             "mutated action token must not match any rendered rule"
         );
+
+        // PF-05 precedence walk: the default posture must pass the STRICT
+        // matcher, and the exit / full-tunnel-client posture (which renders
+        // the PF-01 egress-wide pass) must pass ONLY with the daemon's own
+        // acknowledgment of its egress interface — pinning that the live
+        // assertion and the renderer agree for the posture that ships, and
+        // that the hole is detected, not silently credited.
+        crate::macos_exit_killswitch_precedence::evaluate_macos_killswitch_rules(&rules)
+            .expect("default posture must satisfy the strict precedence walk");
+        system.allow_egress_interface = true;
+        let exit_rules = system
+            .render_pf_rules(false)
+            .expect("rule render should succeed");
+        crate::macos_exit_killswitch_precedence::evaluate_macos_killswitch_rules(&exit_rules)
+            .expect_err("PF-01: the egress-wide pass must be DETECTED by the strict walk");
+        crate::macos_exit_killswitch_precedence::evaluate_macos_killswitch_rules_acknowledging(
+            &exit_rules,
+            &["en0"],
+        )
+        .expect("the live assertion acknowledges the daemon's own egress pass");
+        crate::macos_exit_killswitch_precedence::evaluate_macos_killswitch_rules_acknowledging(
+            &exit_rules,
+            &["en1"],
+        )
+        .expect_err("acknowledgment is per named interface, never blanket");
     }
 
     #[test]

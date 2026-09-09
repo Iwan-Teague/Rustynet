@@ -23786,6 +23786,20 @@ pub(crate) fn evaluate_linux_runtime_acls_report(
         };
         return Err(format!("Linux runtime ACL drift detected: {summary}"));
     }
+    // Pattern G (2026-09-08 review): validate the rows we consume, never
+    // the summary flag alone. The Windows sibling has had this since QH-51.
+    if report.roots.iter().any(|entry| {
+        !matches!(
+            entry.status,
+            rustynetd::linux_runtime_acls::LinuxRuntimeAclRootStatus::Ok
+        )
+    }) {
+        return Err(
+            "report set overall_ok=true but at least one per-root entry is not Ok; output is \
+             inconsistent"
+                .to_owned(),
+        );
+    }
     let inspected = report.roots.len();
     Ok(format!(
         "Linux runtime ACLs verified on {linux_alias}: {inspected} reviewed roots passed"
@@ -23879,6 +23893,12 @@ fn evaluate_macos_service_hardening_report(
             report.drift_reasons.join("; ")
         };
         return Err(format!("macOS service hardening drift detected: {reasons}"));
+    }
+    if !report.drift_reasons.is_empty() {
+        return Err(
+            "report set overall_ok=true but drift_reasons were recorded; output is inconsistent"
+                .to_owned(),
+        );
     }
     Ok(format!(
         "macOS service hardening verified on {macos_alias}: {} observed directives matched",
@@ -24030,6 +24050,20 @@ pub(crate) fn evaluate_linux_key_custody_report(
         };
         return Err(format!("Linux key custody drift detected: {summary}"));
     }
+    if !report.drift_reasons.is_empty()
+        || report.entries.iter().any(|entry| {
+            !matches!(
+                entry.status,
+                rustynetd::linux_key_custody::LinuxKeyCustodyEntryStatus::Ok { .. }
+            )
+        })
+    {
+        return Err(
+            "report set overall_ok=true but drift_reasons or a non-Ok entry disagree; output is \
+             inconsistent"
+                .to_owned(),
+        );
+    }
     Ok(format!(
         "Linux key custody verified on {linux_alias}: {} reviewed artifacts checked",
         report.entries.len()
@@ -24064,6 +24098,20 @@ pub(crate) fn evaluate_macos_key_custody_report(
             report.drift_reasons.join("; ")
         };
         return Err(format!("macOS key custody drift detected: {summary}"));
+    }
+    if !report.drift_reasons.is_empty()
+        || report.entries.iter().any(|entry| {
+            !matches!(
+                entry.status,
+                rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::Ok { .. }
+            )
+        })
+    {
+        return Err(
+            "report set overall_ok=true but drift_reasons or a non-Ok entry disagree; output is \
+             inconsistent"
+                .to_owned(),
+        );
     }
     Ok(format!(
         "macOS key custody verified on {macos_alias}: {} reviewed artifacts checked",
@@ -39185,14 +39233,29 @@ fn kept_after() {}\n\
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/vm_lab/orchestrator/stage");
         let mut offenders = Vec::new();
         let mut checked = 0usize;
-        for entry in fs::read_dir(&stage_dir).expect("read stage dir").flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
+        // Walk the WHOLE stage tree (B2, NodeEngineAuditConsolidation
+        // 2026-09-08): a flat read_dir skipped `cross_network/scenario/`,
+        // whose launcher was never scanned, and an unreadable file was
+        // silently skipped. Both are fail-open for a gate; walk recursively
+        // and refuse to continue past a file that cannot be read.
+        fn collect_stage_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in fs::read_dir(dir)
+                .unwrap_or_else(|err| panic!("stage dir {} must read: {err}", dir.display()))
+            {
+                let path = entry.expect("stage dir entry must read").path();
+                if path.is_dir() {
+                    collect_stage_sources(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    out.push(path);
+                }
             }
-            let Ok(body) = fs::read_to_string(&path) else {
-                continue;
-            };
+        }
+        let mut sources = Vec::new();
+        collect_stage_sources(&stage_dir, &mut sources);
+        sources.sort();
+        for path in sources {
+            let body = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("stage source {} must read: {err}", path.display()));
             // EVERY cargo invocation in the file must carry the feature, not
             // just one of them. The per-FILE check this replaced passed
             // vacuously on cross_network.rs: that file spawns cargo twice, the
@@ -39219,10 +39282,16 @@ fn kept_after() {}\n\
                 ));
             }
         }
-        assert!(
-            checked >= 12,
-            "expected many stage launchers spawning a bin; found {checked} — did the \
-             launch style change? This test would silently pass if so."
+        // Exact pin, not a floor: a floor with slack detects nothing (the old
+        // `>= 12` sat under a measured 15 and would have absorbed two files
+        // losing their launcher). Measured 2026-09-09: 14 files directly
+        // under stage/ plus cross_network/scenario/host.rs. Bump this number
+        // deliberately when a launcher is added or removed.
+        assert_eq!(
+            checked, 15,
+            "expected exactly 15 stage launchers spawning a bin; found {checked} — a \
+             launcher was added or removed, or the launch style changed. Re-measure and \
+             pin the new count on purpose."
         );
         assert!(
             offenders.is_empty(),
@@ -50862,6 +50931,83 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .expect_err("drift must reject");
         assert!(err.contains("state root drifted"));
         assert!(err.contains("0o755"));
+    }
+
+    /// Pattern G: a summary flag that disagrees with the rows it summarises
+    /// must be rejected, on the pass path as well as the fail path. Each case
+    /// is the exact input its Windows sibling already refuses. Mutation
+    /// caught by each: deleting the post-`overall_ok` row check in that
+    /// evaluator makes its case return Ok.
+    #[test]
+    fn evaluators_reject_overall_ok_true_when_rows_disagree() {
+        let runtime_acls = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "roots": [
+                {"label": "state root", "path": "/var/lib/rustynet", "status": "drifted",
+                 "reason": "state root mode is 0o755, expected 0o700"}
+            ]
+        }"#;
+        let err = super::evaluate_linux_runtime_acls_report("debian-utm-1", runtime_acls)
+            .expect_err("overall_ok=true with a drifted root must reject");
+        assert!(err.contains("inconsistent"), "{err}");
+
+        let linux_custody = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {"label": "keys directory", "path": "/var/lib/rustynet/keys",
+                 "requirement": "present", "status": "invalid",
+                 "reason": "mode 0o755", "mode": 16877, "uid": 0, "gid": 0}
+            ],
+            "drift_reasons": []
+        }"#;
+        let err = super::evaluate_linux_key_custody_report("debian-utm-1", linux_custody)
+            .expect_err("overall_ok=true with an invalid entry must reject");
+        assert!(err.contains("inconsistent"), "{err}");
+
+        let linux_custody_reasons = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {"label": "keys directory", "path": "/var/lib/rustynet/keys",
+                 "requirement": "present", "status": "ok",
+                 "mode": 16832, "uid": 998, "gid": 998}
+            ],
+            "drift_reasons": ["something drifted"]
+        }"#;
+        let err = super::evaluate_linux_key_custody_report("debian-utm-1", linux_custody_reasons)
+            .expect_err("overall_ok=true with drift_reasons must reject");
+        assert!(err.contains("inconsistent"), "{err}");
+
+        let macos_custody = r#"{
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {"label": "keys directory", "path": "/Library/Application Support/rustynet/keys",
+                 "expected": "present", "status": "missing", "reason": "absent"}
+            ],
+            "drift_reasons": []
+        }"#;
+        let err = super::evaluate_macos_key_custody_report("macos-utm-1", macos_custody)
+            .expect_err("overall_ok=true with a missing entry must reject");
+        assert!(err.contains("inconsistent"), "{err}");
+
+        let macos_hardening = r#"{
+            "schema_version": 1,
+            "service_label": "com.rustynet.daemon",
+            "plist_path": "/Library/LaunchDaemons/com.rustynet.daemon.plist",
+            "overall_ok": true,
+            "probed": true,
+            "probe_reason": null,
+            "drift_reasons": ["RunAtLoad is false"],
+            "observed": {"RunAtLoad": "false"},
+            "program_arguments": ["/usr/local/bin/rustynetd"],
+            "environment": {}
+        }"#;
+        let err = super::evaluate_macos_service_hardening_report("macos-utm-1", macos_hardening)
+            .expect_err("overall_ok=true with drift_reasons must reject");
+        assert!(err.contains("inconsistent"), "{err}");
     }
 
     #[test]

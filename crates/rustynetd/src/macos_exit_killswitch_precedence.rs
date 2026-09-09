@@ -185,20 +185,42 @@ pub fn build_macos_killswitch_assert_report(rules: &str) -> MacosKillswitchAsser
 /// false positive. Only a `quick` pass, positioned above the block, and broader
 /// than an allowlisted shape, actually breaks containment.
 pub fn evaluate_macos_killswitch_rules(rules: &str) -> Result<(), String> {
+    evaluate_macos_killswitch_rules_acknowledging(rules, &[])
+}
+
+/// [`evaluate_macos_killswitch_rules`] with the PF-01 acknowledgment the
+/// live daemon assertion needs — the exact mirror of the Linux S2 handling
+/// (`evaluate_linux_killswitch_chain_precedence`'s
+/// `acknowledged_wide_open_interfaces`).
+///
+/// When the daemon itself sets `allow_egress_interface` (a regular exit or a
+/// full-tunnel client), its own renderer emits `pass out quick on <egress>
+/// inet all keep state` above the terminator. That rule is a real killswitch
+/// hole tracked as PF-01 and closing it is not this assertion's call; passing
+/// it as ACKNOWLEDGED stops it masking anything beneath it while leaving its
+/// disposition to the owning finding. Only the named interface is
+/// acknowledged, only interface-wide passes on it, and only when the caller
+/// says the daemon installed it — a `quick` pass on any other interface still
+/// fails loudly. The offline report keeps the strict form (no
+/// acknowledgment) so PF-01 stays visible there.
+pub fn evaluate_macos_killswitch_rules_acknowledging(
+    rules: &str,
+    acknowledged_wide_open_interfaces: &[&str],
+) -> Result<(), String> {
     let contained = ContainedInterfaces::default();
     let lines: Vec<&str> = rules.lines().collect();
-    terminator_is_reachable(&lines, |rule| classify_pf_egress_rule(rule, &contained)).map_err(
-        |failure| match failure {
-            ContainmentFailure::NoTerminator(_) => {
-                "macOS pf killswitch verification failed: block drop out quick all missing"
-                    .to_owned()
-            }
-            ContainmentFailure::Escaped(violation) => format!(
-                "macOS pf killswitch verification failed: {violation}; a `quick` pass above \
+    terminator_is_reachable(&lines, |rule| {
+        classify_pf_egress_rule_acknowledging(rule, &contained, acknowledged_wide_open_interfaces)
+    })
+    .map_err(|failure| match failure {
+        ContainmentFailure::NoTerminator(_) => {
+            "macOS pf killswitch verification failed: block drop out quick all missing".to_owned()
+        }
+        ContainmentFailure::Escaped(violation) => format!(
+            "macOS pf killswitch verification failed: {violation}; a `quick` pass above \
                  `block drop out quick all` wins outright, so the block never fires"
-            ),
-        },
-    )
+        ),
+    })
 }
 
 /// Reduce one pf rule to its effect on general outbound traffic.
@@ -206,6 +228,19 @@ pub fn evaluate_macos_killswitch_rules(rules: &str) -> Result<(), String> {
 /// Fail-closed: a `quick` pass that cannot be proven narrow or tunnel-scoped is
 /// [`RuleDisposition::Escapes`].
 pub fn classify_pf_egress_rule(rule: &str, contained: &ContainedInterfaces) -> RuleDisposition {
+    classify_pf_egress_rule_acknowledging(rule, contained, &[])
+}
+
+/// [`classify_pf_egress_rule`] plus the acknowledged-interface arm described
+/// on [`evaluate_macos_killswitch_rules_acknowledging`]. An interface-wide
+/// quick pass on an acknowledged interface is [`RuleDisposition::NarrowAllow`]
+/// (reported, not credited as containment); on any other interface it is
+/// [`RuleDisposition::Escapes`].
+pub fn classify_pf_egress_rule_acknowledging(
+    rule: &str,
+    contained: &ContainedInterfaces,
+    acknowledged_wide_open_interfaces: &[&str],
+) -> RuleDisposition {
     let normalized = rule.split_whitespace().collect::<Vec<_>>().join(" ");
     let lowered = normalized.to_ascii_lowercase();
     if lowered.is_empty() || lowered.starts_with('#') {
@@ -247,6 +282,13 @@ pub fn classify_pf_egress_rule(rule: &str, contained: &ContainedInterfaces) -> R
         && contained.contains(interface)
     {
         return RuleDisposition::Contained;
+    }
+    // The known, deliberately installed wide-open pass on the daemon's own
+    // egress interface (PF-01). Acknowledged by the caller, never assumed.
+    if let Some(interface) = pf_rule_interface(&normalized)
+        && acknowledged_wide_open_interfaces.contains(&interface)
+    {
+        return RuleDisposition::NarrowAllow;
     }
     // A quick pass narrowed to one service or source range is an operator
     // allowlist entry, not a general escape. See RuleDisposition::NarrowAllow
@@ -771,4 +813,28 @@ mod tests {
     // The poll-budget bound invariant (0 < ATTEMPTS <= 60) is enforced as a
     // compile-time `const _` assertion at the constant's definition site above,
     // which is stronger than a runtime test and platform-independent.
+
+    /// PF-01 acknowledgment (mirror of the Linux S2 handling). Mutations
+    /// caught: (1) dropping the acknowledged arm → the acknowledged case
+    /// errs; (2) acknowledging every interface → the en1 case passes; (3)
+    /// acknowledgment leaking into the strict entry point → the strict case
+    /// passes.
+    #[test]
+    fn acknowledged_egress_wide_pass_is_reported_not_escaped() {
+        let rules = "pass quick on lo0 all\npass out quick on utun9 inet all keep state\n\
+                     pass out quick on en0 inet all keep state\nblock drop out quick all\n";
+        evaluate_macos_killswitch_rules_acknowledging(rules, &["en0"])
+            .expect("the daemon's own acknowledged egress pass must not fail the walk");
+        let err = evaluate_macos_killswitch_rules_acknowledging(rules, &["en1"])
+            .expect_err("a wide-open pass on an unacknowledged interface escapes");
+        assert!(err.contains("quick"), "{err}");
+        evaluate_macos_killswitch_rules(rules)
+            .expect_err("the strict entry point acknowledges nothing (offline report)");
+        // Acknowledgment never manufactures a terminator.
+        evaluate_macos_killswitch_rules_acknowledging(
+            "pass out quick on en0 inet all keep state\n",
+            &["en0"],
+        )
+        .expect_err("missing terminator still fails with an acknowledgment");
+    }
 }
