@@ -1020,21 +1020,35 @@ fn upsert_node_stage_csv(
 pub(crate) use crate::workspace_root::workspace_root_path;
 
 /// Atomic whole-file replace (D2/D3, NodeEngineLedgerConsumerAudit
-/// 2026-09-09): write to `path` + ".tmp", then rename over `path`. A crash
-/// between the write and the rename leaves the previous file intact instead
-/// of a truncated or half-written ledger. Same-directory rename is atomic on
-/// the supported filesystems, so a reader either sees the old file or the new
-/// one, never a partial body.
+/// 2026-09-09): write to `path` + ".tmp", fsync it, then rename over `path`.
+/// A PROCESS crash between the write and the rename leaves the previous file
+/// intact instead of a truncated or half-written ledger, and the tmp file is
+/// removed on any failure so it cannot dirty the tracked ledger directory.
+/// Same-directory rename is atomic on the supported filesystems, so a reader
+/// either sees the old file or the new one, never a partial body. Power loss
+/// is covered only to the extent the tmp `sync_all` reached the disk; the
+/// directory entry itself is not fsynced (these are telemetry ledgers, not a
+/// security gate).
 fn write_file_atomic(path: &Path, body: &str, what: &str) -> Result<(), String> {
     let tmp_path = {
         let mut os = path.as_os_str().to_os_string();
         os.push(".tmp");
         PathBuf::from(os)
     };
-    fs::write(tmp_path.as_path(), body)
-        .map_err(|err| format!("write {what} tmp failed ({}): {err}", tmp_path.display()))?;
-    fs::rename(tmp_path.as_path(), path)
-        .map_err(|err| format!("replace {what} failed ({}): {err}", path.display()))
+    let written = (|| -> Result<(), String> {
+        let mut file = fs::File::create(tmp_path.as_path())
+            .map_err(|err| format!("write {what} tmp failed ({}): {err}", tmp_path.display()))?;
+        std::io::Write::write_all(&mut file, body.as_bytes())
+            .map_err(|err| format!("write {what} tmp failed ({}): {err}", tmp_path.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync {what} tmp failed ({}): {err}", tmp_path.display()))?;
+        fs::rename(tmp_path.as_path(), path)
+            .map_err(|err| format!("replace {what} failed ({}): {err}", path.display()))
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(tmp_path.as_path());
+    }
+    written
 }
 
 fn ensure_matrix_schema(path: &Path) -> Result<Vec<String>, String> {
@@ -2761,6 +2775,13 @@ fn upsert_csv_row(
                         // report_dir is by construction this run's start
                         // marker.
                         same_report_dir && (same_started || field(started_index).is_empty())
+                    } else if key_started.is_empty() {
+                        // A start marker re-entering the same report_dir
+                        // (resume/rerun) replaces its own stale marker rather
+                        // than appending a second one; a row with a real
+                        // run_started_utc is a completed run and is never
+                        // matched by a marker.
+                        same_report_dir && field(started_index).is_empty()
                     } else {
                         same_report_dir && same_started
                     }
@@ -2770,11 +2791,16 @@ fn upsert_csv_row(
                 Err(_) => false,
             };
         if matches_key {
-            key_owned = true;
             if row_role == LiveLabRunMatrixRowRole::Final {
+                key_owned = true;
                 // Replaced by the new Final row below.
                 continue;
             }
+            if key_started.is_empty() {
+                // Stale start marker for this report_dir: replaced below.
+                continue;
+            }
+            key_owned = true;
         }
         retained.push(line);
     }
@@ -6757,6 +6783,39 @@ mod conclusion_barrier_tests {
         assert!(
             body.contains(&run_id),
             "row carries the minted run_id {run_id}"
+        );
+    }
+
+    /// D1 (review fix): a run that re-enters the same report_dir (resume or
+    /// rerun) must REPLACE its own stale start marker, not append a second
+    /// one. Mutation: reverting the empty-started Interim match arm in
+    /// `upsert_csv_row` leaves two interim rows for one report_dir.
+    #[test]
+    fn re_entering_the_same_report_dir_replaces_its_own_start_marker() {
+        let (copy_root, report_dir) = write_d1_copied_workspace("d1c");
+        let _fixture = Qh74FixtureGuard::keep(&copy_root);
+        let _guard = Qh74RootGuard::force(&copy_root);
+
+        let first = super::record_live_lab_run_matrix_run_start(
+            report_dir.as_path(),
+            Some("vm-lab-orchestrate-live-lab"),
+        )
+        .expect("first start row must append");
+        let second = super::record_live_lab_run_matrix_run_start(
+            report_dir.as_path(),
+            Some("vm-lab-orchestrate-live-lab"),
+        )
+        .expect("second start row must replace the first");
+
+        let ledger_path = super::default_live_lab_node_run_matrix_path();
+        let body = fs::read_to_string(&ledger_path).expect("ledger readable");
+        let rows = matrix_data_rows(&body);
+        assert_eq!(rows.len(), 1, "one marker per report_dir: {body:?}");
+        assert_eq!(rows[0][4], "interim");
+        assert!(body.contains(&second), "the newest marker survives");
+        assert!(
+            first == second || !body.contains(&first),
+            "the stale marker must be gone"
         );
     }
 
