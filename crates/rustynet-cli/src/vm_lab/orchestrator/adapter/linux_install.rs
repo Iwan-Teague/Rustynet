@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 use std::time::Duration;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
@@ -11,6 +10,7 @@ use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::host_cross_build;
+use crate::vm_lab::VmGuestPlatform;
 
 /// Canonical path of `rustynetd` on Linux targets.
 pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
@@ -63,7 +63,9 @@ pub fn install_daemon(
         .node_ids
         .get(alias)
         .cloned()
-        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+        // Install-time: no daemon exists yet to report its id, so the
+        // sanctioned bootstrap mint applies (adapter::mint_bootstrap_node_id).
+        .unwrap_or_else(|| super::mint_bootstrap_node_id(alias));
 
     // Write bootstrap script to a temp file.
     let script_tmp = write_temp_file("rn_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
@@ -210,11 +212,21 @@ pub fn enforce_daemon(
         .map(|a| &a.role)
         .cloned()
         .unwrap_or(NodeRole::Client);
+    // F2 fail-closed: EnforceBaselineRuntime is transitively downstream of
+    // CollectPubkeys, so reaching enforce with no daemon-reported id means a
+    // skip/reuse path bypassed collection. Never mint a label-derived
+    // identity here — a guessed `--node-id` is exactly the query-under-a-
+    // guessed-identity shape the macOS anchor stage refuses (QH-68 class).
     let node_id = ctx
         .node_ids
         .get(alias)
         .cloned()
-        .unwrap_or_else(|| format!("{alias}-bootstrap"));
+        .ok_or_else(|| AdapterError::Protocol {
+            message: format!(
+                "{alias}: no daemon-reported node id recorded (collect_pubkeys must run \
+                 first); refusing to mint a '{alias}-bootstrap' identity for enforcement"
+            ),
+        })?;
     let role_str = role
         .daemon_node_role_for_platform(&VmGuestPlatform::Linux)
         .map_err(|message| AdapterError::Protocol { message })?;
@@ -1143,10 +1155,8 @@ mod tests {
     #[test]
     fn bootstrap_uses_absolute_installed_cli_under_sudo_secure_path() {
         assert!(BOOTSTRAP_SCRIPT.contains("/usr/local/bin/rustynet ops e2e-bootstrap-host"));
-        assert!(
-            BOOTSTRAP_SCRIPT
-                .contains("PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin")
-        );
+        assert!(BOOTSTRAP_SCRIPT
+            .contains("PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"));
         assert!(
             !BOOTSTRAP_SCRIPT.contains("\n  rustynet ops e2e-bootstrap-host"),
             "Rocky sudo secure_path may exclude /usr/local/bin"
@@ -1311,6 +1321,75 @@ mod daemon_launch_flag_parity_tests {
         assert!(
             LINUX_DAEMON_UNIT.contains("--node-role ${RUSTYNET_NODE_ROLE}"),
             "unit must consume the node role env the bootstrap env provides"
+        );
+    }
+
+    /// F2 pin: `enforce_daemon` must refuse to mint a label-derived
+    /// `{alias}-bootstrap` identity when the context carries no
+    /// daemon-reported node id. Mutation caught: restoring the
+    /// `unwrap_or_else(|| format!("{alias}-bootstrap"))` fallback flips this
+    /// test red (the call proceeds toward SSH instead of erroring).
+    #[test]
+    fn enforce_daemon_refuses_to_mint_node_id_when_context_has_none() {
+        use super::{enforce_daemon, NodeConnection, OrchestrationContext};
+        use crate::vm_lab::orchestrator::error::AdapterError;
+        use std::collections::HashMap;
+        let conn = NodeConnection::Ssh {
+            host: "linux-refuses-mint".to_owned(),
+            port: 22,
+            user: None,
+            identity_file: std::path::PathBuf::from("/tmp/id"),
+            known_hosts: std::path::PathBuf::from("/tmp/known_hosts"),
+            ssh_password: None,
+        };
+        let ctx = OrchestrationContext {
+            assignments: vec![],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: "/tmp".into(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
+            linux_backend: None,
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
+        };
+        let err = enforce_daemon(&conn, "debian-9", &ctx)
+            .expect_err("enforce without a daemon-reported id must fail closed");
+        let AdapterError::Protocol { message } = err else {
+            panic!("expected Protocol error, got: {err:?}");
+        };
+        assert!(
+            message.contains("collect_pubkeys must run first"),
+            "error must name the prerequisite: {message}"
+        );
+        assert!(
+            message.contains("-bootstrap"),
+            "error must name the refused mint: {message}"
+        );
+    }
+
+    /// F2 positive control: the mint survives at INSTALL time only, behind
+    /// the named helper — the one sanctioned `-bootstrap` site on this path.
+    #[test]
+    fn install_daemon_still_mints_the_bootstrap_id_through_the_named_helper() {
+        assert_eq!(
+            crate::vm_lab::orchestrator::adapter::mint_bootstrap_node_id("debian-1"),
+            "debian-1-bootstrap"
         );
     }
 }

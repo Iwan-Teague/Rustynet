@@ -3,13 +3,13 @@ use std::time::Duration;
 
 use base64::prelude::*;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::VmGuestPlatform;
 
 pub const WINDOWS_SERVICE_NAME: &str = "RustyNet";
 pub const WINDOWS_INSTALL_ROOT: &str = r"C:\Program Files\RustyNet";
@@ -1044,7 +1044,11 @@ fn windows_lab_node_id(alias: &str, ctx: &OrchestrationContext) -> String {
     ctx.node_ids
         .get(alias)
         .cloned()
-        .unwrap_or_else(|| format!("{alias}-bootstrap"))
+        // Install-time (run_windows_e2e_bootstrap): the sanctioned bootstrap
+        // mint applies (adapter::mint_bootstrap_node_id). Windows has no
+        // enforce-time mint site; EnforceBaselineRuntime uses the trait
+        // default there.
+        .unwrap_or_else(|| super::mint_bootstrap_node_id(alias))
 }
 
 /// Generate `WireGuard` keys, membership state, and trust evidence for a Windows host.
@@ -1231,7 +1235,7 @@ fn run_windows_e2e_bootstrap(
 /// Returns `(verifier_key_file_content, trust_evidence_file_content)`.
 fn generate_local_trust_material() -> Result<(String, String), String> {
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::{TryRngCore, rngs::OsRng};
+    use rand::{rngs::OsRng, TryRngCore};
     use zeroize::Zeroize;
 
     let mut seed = [0u8; 32];
@@ -2336,11 +2340,9 @@ mod tests {
             .expect("status query script should render");
 
         assert!(script.as_str().contains("Get-Service -Name 'RustyNet'"));
-        assert!(
-            script
-                .as_str()
-                .contains("if ($svc) { $svc.Status.ToString() } else { 'Absent' }")
-        );
+        assert!(script
+            .as_str()
+            .contains("if ($svc) { $svc.Status.ToString() } else { 'Absent' }"));
         // A service name with a quote is spelled inertly by the PowerShell
         // quoting seam, never as syntax.
         let hostile = windows_daemon_status_query_script("Rusty'Net")
