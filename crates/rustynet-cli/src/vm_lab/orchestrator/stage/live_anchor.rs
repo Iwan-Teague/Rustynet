@@ -83,6 +83,19 @@ impl OrchestrationStage for LiveAnchorStage {
         let log_path = ctx.report_dir.join("live_linux_anchor.log");
         let owner_approver_id = format!("{anchor_node_id}-owner");
 
+        // I3 follow-up (STAGES review): route the `--platform` labels through
+        // the exhaustive desktop tag helper instead of a `_ => "linux"` arm.
+        let anchor_platform_tag =
+            match super::desktop_platform_tag(anchor.platform, "live_anchor anchor") {
+                Ok(tag) => tag,
+                Err(err) => return StageOutcome::Failed(err),
+            };
+        let leaf_platform_tag =
+            match super::desktop_platform_tag(leaf_client.platform, "live_anchor leaf client") {
+                Ok(tag) => tag,
+                Err(err) => return StageOutcome::Failed(err),
+            };
+
         let mut cmd = Command::new("cargo");
         cmd.args([
             "run",
@@ -95,7 +108,7 @@ impl OrchestrationStage for LiveAnchorStage {
             "live_linux_anchor_test",
             "--",
             "--platform",
-            platform_arg(anchor.platform),
+            anchor_platform_tag,
             "--ssh-identity-file",
         ])
         .arg(&anchor.identity_file)
@@ -114,7 +127,7 @@ impl OrchestrationStage for LiveAnchorStage {
         .arg("--leaf-client-node-id")
         .arg(&leaf_client_node_id)
         .arg("--leaf-client-platform")
-        .arg(platform_arg(leaf_client.platform))
+        .arg(leaf_platform_tag)
         .arg("--enrollee-host")
         .arg(&enrollee.target)
         .arg("--enrollee-node-id")
@@ -191,14 +204,6 @@ fn default_ssh_user(platform: VmGuestPlatform) -> &'static str {
         VmGuestPlatform::Windows => "administrator",
         VmGuestPlatform::Macos => "admin",
         _ => "debian",
-    }
-}
-
-fn platform_arg(platform: VmGuestPlatform) -> &'static str {
-    match platform {
-        VmGuestPlatform::Macos => "macos",
-        VmGuestPlatform::Windows => "windows",
-        _ => "linux",
     }
 }
 
