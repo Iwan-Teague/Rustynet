@@ -2,6 +2,7 @@
 use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -54,6 +55,10 @@ impl OrchestrationStage for GossipConvergenceValidationStage {
 
         let mut failures: Vec<String> = Vec::new();
         let mut reported_skips: Vec<(String, String)> = Vec::new();
+        // Aliases whose gossip-convergence validator actually ran and passed
+        // (all four criteria met) — the witness names them so a PASS is never
+        // backed by nothing.
+        let mut validated: Vec<String> = Vec::new();
         for alias in &aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
@@ -68,20 +73,53 @@ impl OrchestrationStage for GossipConvergenceValidationStage {
                 continue;
             }
             let expected_node_id = ctx.node_ids.get(alias.as_str()).map(String::as_str);
-            if let Err(e) = adapter.run_role_validator(
+            match adapter.run_role_validator(
                 RoleValidatorKind::GossipConvergence,
                 expected_node_id,
                 None,
             ) {
-                failures.push(format!("{alias}: {e}"));
+                Ok(()) => validated.push(alias.clone()),
+                Err(e) => failures.push(format!("{alias}: {e}")),
             }
         }
 
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
         }
-        outcome_for(&failures, &reported_skips)
+        // QH-83: the witness is written on the single pass path and a write
+        // failure fails the stage — an unwitnessed gossip-convergence pass
+        // must never be recorded (the runner would demote it).
+        match outcome_for(&failures, &reported_skips) {
+            StageOutcome::Passed => {
+                match write_gossip_convergence_witness(&ctx.report_dir, &validated) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => StageOutcome::Failed(format!(
+                        "gossip convergence witness write failed: {e}"
+                    )),
+                }
+            }
+            other => other,
+        }
     }
+}
+
+/// Writes the QH-83 witness line for a gossip-convergence PASS: the validated
+/// node count plus each alias whose four-criterion contract was actually
+/// proven, so a bare PASS can never be recorded without the on-disk evidence
+/// behind it. An unwritable witness fails the stage — fail closed.
+fn write_gossip_convergence_witness(
+    report_dir: &std::path::Path,
+    validated: &[String],
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::GossipConvergenceValidation.as_str(),
+        &format!(
+            "gossip_convergence=yes validated_nodes={} ({})",
+            validated.len(),
+            validated.join(",")
+        ),
+    )
 }
 
 /// A failure always wins. A run where every node was skipped is Skipped, never
@@ -179,5 +217,56 @@ mod tests {
             "an empty topology must skip, never pass; got {:?}",
             GossipConvergenceValidationStage.execute(&mut ctx)
         );
+    }
+
+    // QH-83: the pass witness must name the validated node count and the
+    // aliases — a bare "pass" line would be appeasement, not evidence.
+    // Mutation caught: dropping the witness write or demoting it to
+    // best-effort.
+    #[test]
+    fn gossip_convergence_witness_line_names_the_validated_node_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "gossip_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_gossip_convergence_witness(&dir, &["deb-1".to_owned(), "deb-2".to_owned()])
+            .expect("witness write");
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::GossipConvergenceValidation.as_str(),
+            ),
+        )
+        .expect("stage log");
+        assert!(log.contains("gossip_convergence=yes"), "{log}");
+        assert!(log.contains("validated_nodes=2"), "{log}");
+        assert!(log.contains("deb-1") && log.contains("deb-2"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as an
+    /// error the execute path turns into `Failed` — never a silent pass.
+    #[test]
+    fn gossip_convergence_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "gossip_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+        let err = write_gossip_convergence_witness(&dir, &["deb-1".to_owned()])
+            .expect_err("witness write must fail when the logs path is a regular file");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

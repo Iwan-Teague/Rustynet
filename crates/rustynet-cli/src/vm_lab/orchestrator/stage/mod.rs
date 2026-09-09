@@ -326,32 +326,39 @@ define_stage_catalog! {
     // QH-83 Setup batch: validate_baseline_runtime appends a
     // validated_nodes=N witness line (the F3 empty-scope guard stands).
     ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup / T0Core / StageEvidence::StageLog,
-    SecurityAuditValidation => "security_audit_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    DnsFailclosedValidation => "dns_failclosed_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 Live batch A: every row below appends a count-bearing stage-log
+    // witness line on its PASS verdict (stage-log, because each stage only
+    // writes its report artifacts on SOME paths — skips/failures keep their
+    // reported_skips.json side-cars), via
+    // append_stage_evidence_line with per-validated-node aliases; a witness
+    // write failure fails the stage, so the runner's verify_declared_evidence
+    // demotes any unwitnessed PASS to NotProven.
+    SecurityAuditValidation => "security_audit_validation" @ Live / T4Security / StageEvidence::StageLog,
+    DnsFailclosedValidation => "dns_failclosed_validation" @ Live / T4Security / StageEvidence::StageLog,
     // Live default-deny ACL enforcement — a wrong GREEN is fail-open, so
     // security tier rather than core plumbing.
-    RuntimeAclsValidation => "runtime_acls_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ServiceHardeningValidation => "service_hardening_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    KeyCustodyValidation => "key_custody_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    RuntimeAclsValidation => "runtime_acls_validation" @ Live / T4Security / StageEvidence::StageLog,
+    ServiceHardeningValidation => "service_hardening_validation" @ Live / T4Security / StageEvidence::StageLog,
+    KeyCustodyValidation => "key_custody_validation" @ Live / T4Security / StageEvidence::StageLog,
     // Mesh-status self-check: peers visible, no stale state — core mesh
     // health / reachability evidence, not a role capability.
     MeshStatusValidation => "mesh_status_validation" @ Live / T0Core / StageEvidence::StageLog,
     // Gossip peer convergence: registered, accepting signed bundles, no
     // unknown-source rejections. Core mesh health like mesh_status, not a role
     // capability — a wrong GREEN here means the epidemic is silently dead.
-    GossipConvergenceValidation => "gossip_convergence_validation" @ Live / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    GossipConvergenceValidation => "gossip_convergence_validation" @ Live / T0Core / StageEvidence::StageLog,
     // Windows binary-signing (Authenticode) verification — binary-trust
     // control, so security tier.
-    AuthenticodeValidation => "authenticode_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    Ipv6LeakValidation => "ipv6_leak_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    DeployRelayService => "deploy_relay_service" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    RelayValidation => "relay_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    AuthenticodeValidation => "authenticode_validation" @ Live / T4Security / StageEvidence::StageLog,
+    Ipv6LeakValidation => "ipv6_leak_validation" @ Live / T4Security / StageEvidence::StageLog,
+    DeployRelayService => "deploy_relay_service" @ Live / T1Role / StageEvidence::StageLog,
+    RelayValidation => "relay_validation" @ Live / T1Role / StageEvidence::StageLog,
     TrafficTestMatrix => "traffic_test_matrix" @ Live / T0Core / StageEvidence::File("logs/traffic_test_matrix.pair_results.log"),
     // Live role-transition matrix (admin<->client flips) — role-capability
     // lifecycle; the cross-OS half is the bash-dialect cross_os_role_switch
     // aggregate, not this stage.
-    RoleSwitchMatrix => "role_switch_matrix" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ExitHandoff => "exit_handoff" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    RoleSwitchMatrix => "role_switch_matrix" @ Live / T1Role / StageEvidence::StageLog,
+    ExitHandoff => "exit_handoff" @ Live / T1Role / StageEvidence::StageLog,
     // Audit B4: the ONLY pass path of this stage writes the egress NAT
     // session pair (client traffic translated by the exit) — declared as the
     // pass witness so a bare Passed with no proof is demoted by the runner.
@@ -361,10 +368,10 @@ define_stage_catalog! {
     // Spec §3 places the EXIT-scoped dns-failclosed inside the exit role's
     // T1 list ("exit→NAT+handoff+dns-failclosed+demotion-residue"); the
     // standalone dns_failclosed_validation above is the T4 family member.
-    ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role / StageEvidence::StageLog,
+    ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role / StageEvidence::StageLog,
+    ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role / StageEvidence::StageLog,
+    BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role / StageEvidence::StageLog,
     LiveAnchor => "live_anchor" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // MAC-D3: macOS anchor validators, previously registry-only (bash era).
     // Wire names match the legacy registry vocabulary so run-matrix evidence

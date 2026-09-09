@@ -4,6 +4,7 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::blind_exit_dataplane::{
     blind_exit_dataplane_runtime_implemented, validate_linux_blind_exit_dataplane,
@@ -69,6 +70,10 @@ impl OrchestrationStage for BlindExitDataplaneValidationStage {
 
         let mut failures: Vec<String> = Vec::new();
         let mut reported_skips: Vec<(String, String)> = Vec::new();
+        // Aliases whose blind-exit dataplane validator actually ran and
+        // passed — the witness names them so a PASS is never backed by
+        // nothing.
+        let mut validated: Vec<String> = Vec::new();
         for alias in &aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
                 Some(adapter) => adapter,
@@ -98,16 +103,50 @@ impl OrchestrationStage for BlindExitDataplaneValidationStage {
                     continue;
                 }
             };
-            if let Err(e) = validate_linux_blind_exit_dataplane(&*shell, daemon_path, alias) {
-                failures.push(format!("{alias}: {e}"));
+            match validate_linux_blind_exit_dataplane(&*shell, daemon_path, alias) {
+                Ok(()) => validated.push(alias.clone()),
+                Err(e) => failures.push(format!("{alias}: {e}")),
             }
         }
 
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
         }
-        outcome_for(&failures, &reported_skips)
+        // QH-83: the witness is written on the single pass path and a write
+        // failure fails the stage — an unwitnessed blind-exit-dataplane pass
+        // must never be recorded (the runner would demote it).
+        match outcome_for(&failures, &reported_skips) {
+            StageOutcome::Passed => {
+                match write_blind_exit_dataplane_witness(&ctx.report_dir, &validated) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => StageOutcome::Failed(format!(
+                        "blind exit dataplane witness write failed: {e}"
+                    )),
+                }
+            }
+            other => other,
+        }
     }
+}
+
+/// Writes the QH-83 witness line for a blind-exit-dataplane PASS: the
+/// validated node count plus each blind_exit alias whose hardened nft
+/// ruleset was actually proven, so a bare PASS can never be recorded without
+/// the on-disk evidence behind it. An unwritable witness fails the stage —
+/// fail closed.
+fn write_blind_exit_dataplane_witness(
+    report_dir: &std::path::Path,
+    validated: &[String],
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::BlindExitDataplaneValidation.as_str(),
+        &format!(
+            "blind_exit_dataplane=yes validated_nodes={} ({})",
+            validated.len(),
+            validated.join(",")
+        ),
+    )
 }
 
 fn outcome_for(failures: &[String], reported_skips: &[(String, String)]) -> StageOutcome {
@@ -237,5 +276,56 @@ mod tests {
             "expected a skip; got {:?}",
             BlindExitDataplaneValidationStage.execute(&mut ctx)
         );
+    }
+
+    // QH-83: the pass witness must name the validated node count and the
+    // aliases — a bare "pass" line would be appeasement, not evidence.
+    // Mutation caught: dropping the witness write or demoting it to
+    // best-effort.
+    #[test]
+    fn blind_exit_dataplane_witness_line_names_the_validated_node_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "bxdp_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_blind_exit_dataplane_witness(&dir, &["bexit-1".to_owned(), "bexit-2".to_owned()])
+            .expect("witness write");
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::BlindExitDataplaneValidation.as_str(),
+            ),
+        )
+        .expect("stage log");
+        assert!(log.contains("blind_exit_dataplane=yes"), "{log}");
+        assert!(log.contains("validated_nodes=2"), "{log}");
+        assert!(log.contains("bexit-1") && log.contains("bexit-2"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as an
+    /// error the execute path turns into `Failed` — never a silent pass.
+    #[test]
+    fn blind_exit_dataplane_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "bxdp_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+        let err = write_blind_exit_dataplane_witness(&dir, &["bexit-1".to_owned()])
+            .expect_err("witness write must fail when the logs path is a regular file");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
