@@ -3,6 +3,7 @@ use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::role_validation::key_custody::key_custody_runtime_implemented;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const REPORTED_SKIPS_FILENAME: &str = "key_custody_validation.reported_skips.json";
@@ -16,9 +17,11 @@ const REPORTED_SKIPS_FILENAME: &str = "key_custody_validation.reported_skips.jso
 /// Runs after `service_hardening_validation` and before the relay/traffic
 /// stages. This is a per-node posture check, so it applies to every node
 /// regardless of role. Accepted only on an explicit `overall_ok: true`
-/// (fail-closed). A macOS / Windows node is **reported-skipped** — named in
-/// `key_custody_validation.reported_skips.json`, never a silent pass — on
-/// the [`key_custody_runtime_implemented`] posture gate.
+/// (fail-closed). A platform the posture gate excludes is **reported-skipped**
+/// — named in `key_custody_validation.reported_skips.json`, never a silent
+/// pass — via the supports_role_validator check and the
+/// `key_custody_runtime_implemented` gate in
+/// `orchestrator/role_validation/key_custody.rs`.
 pub struct KeyCustodyValidationStage;
 
 impl OrchestrationStage for KeyCustodyValidationStage {
@@ -55,7 +58,9 @@ impl OrchestrationStage for KeyCustodyValidationStage {
                 }
             };
             let platform = adapter.platform();
-            if !adapter.supports_role_validator(RoleValidatorKind::KeyCustody) {
+            if !adapter.supports_role_validator(RoleValidatorKind::KeyCustody)
+                || !key_custody_runtime_implemented(platform)
+            {
                 reported_skips.push((alias.clone(), format!("{platform:?}")));
                 continue;
             }

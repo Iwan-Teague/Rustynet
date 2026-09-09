@@ -8,8 +8,8 @@
 //! or inconsistent per-root status — so a broken or vacuous check fails the
 //! stage rather than silently passing.
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::VmGuestPlatform;
 
 /// True where runtime-ACLs validation runs live (Linux, macOS, Windows).
 pub fn runtime_acls_runtime_implemented(platform: VmGuestPlatform) -> bool {
@@ -78,6 +78,17 @@ mod tests {
         assert!(runtime_acls_runtime_implemented(VmGuestPlatform::Linux));
         assert!(runtime_acls_runtime_implemented(VmGuestPlatform::Macos));
         assert!(runtime_acls_runtime_implemented(VmGuestPlatform::Windows));
+    }
+
+    /// Mutation guard: the runtime-acls stage consults this gate to decide its
+    /// reported-skip branch. If the gate ever returns true for a platform with
+    /// no live validator (mobile stubs), that branch becomes unreachable and a
+    /// stub platform would silently attempt a live check — so pin the false
+    /// arms explicitly.
+    #[test]
+    fn runtime_implemented_false_on_mobile_platforms() {
+        assert!(!runtime_acls_runtime_implemented(VmGuestPlatform::Android));
+        assert!(!runtime_acls_runtime_implemented(VmGuestPlatform::Ios));
     }
 
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
