@@ -7,6 +7,23 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 use std::path::PathBuf;
 use std::process::Command;
 
+/// QH-83 F1: the mixed-topology stage's pass witness. The
+/// `live_mixed_topology` binary writes this report on every success path,
+/// so a Passed verdict is only proven when this artifact exists and is
+/// non-empty.
+pub(crate) const MIXED_TOPOLOGY_REPORT_RELATIVE: &str = "live_mixed_topology_report.json";
+
+/// QH-83 F1: fail a success exit whose pass witness artifact is missing or
+/// empty instead of declaring Passed without evidence on disk.
+fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
+    let path = report_dir.join(MIXED_TOPOLOGY_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
+
 pub struct LiveMixedTopologyValidationStage;
 
 impl OrchestrationStage for LiveMixedTopologyValidationStage {
@@ -71,7 +88,7 @@ impl OrchestrationStage for LiveMixedTopologyValidationStage {
             .into_owned();
         let report_path = ctx
             .report_dir
-            .join("live_mixed_topology_report.json")
+            .join(MIXED_TOPOLOGY_REPORT_RELATIVE)
             .to_string_lossy()
             .into_owned();
         let log_path = ctx
@@ -118,7 +135,12 @@ impl OrchestrationStage for LiveMixedTopologyValidationStage {
         // `.output()` not `.status()`: `.status()` discards the binary's
         // stdout/stderr, so a failure could only ever report an exit code.
         match cmd.output() {
-            Ok(output) if output.status.success() => StageOutcome::Passed,
+            Ok(output) if output.status.success() => {
+                match verify_report_artifact(&ctx.report_dir) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => StageOutcome::Failed(e),
+                }
+            }
             Ok(output) => StageOutcome::Failed(
                 // QH-09: name the binary's own complete log (--log-path above)
                 // so the clip disclosure cannot read as evidence loss when the
@@ -206,5 +228,36 @@ mod tests {
     #[test]
     fn fanout_is_once() {
         assert_eq!(LiveMixedTopologyValidationStage.fanout(), StageFanout::Once);
+    }
+
+    #[test]
+    fn live_mixed_topology_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+
+        assert_eq!(
+            StageId::LiveMixedTopologyValidation.evidence(),
+            StageEvidence::File(MIXED_TOPOLOGY_REPORT_RELATIVE),
+            "the catalog must declare the mixed-topology report as the pass witness"
+        );
+    }
+
+    #[test]
+    fn live_mixed_topology_pass_without_report_artifact_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "mixed_topology_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let result = verify_report_artifact(&dir);
+        assert!(result.is_err(), "an empty report dir must not pass");
+        assert!(
+            result.unwrap_err().contains(MIXED_TOPOLOGY_REPORT_RELATIVE),
+            "the failure must name the missing witness artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -5,7 +5,19 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-const REPORT_FILENAME: &str = "live_two_hop_report.json";
+pub(crate) const TWO_HOP_REPORT_RELATIVE: &str = "live_two_hop_report.json";
+
+// A pass verdict is only trustworthy when the binary's report artifact exists:
+// the report carries the measured per-node two-hop outcomes, so a success exit
+// without it is unwitnessed and must fail the stage (QH-83).
+fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
+    let path = report_dir.join(TWO_HOP_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
 
 pub struct LiveTwoHopValidationStage;
 
@@ -94,7 +106,7 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
             None => return StageOutcome::Failed("second_client node_id not found".into()),
         };
 
-        let report_path = ctx.report_dir.join(REPORT_FILENAME);
+        let report_path = ctx.report_dir.join(TWO_HOP_REPORT_RELATIVE);
         let log_path = ctx.report_dir.join("live_two_hop.log");
 
         // Honour the run's `--ssh-allow-cidrs` rather than hardcoding a
@@ -201,7 +213,10 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
         match result {
             Ok(output) => {
                 if output.status.success() {
-                    StageOutcome::Passed
+                    match verify_report_artifact(&ctx.report_dir) {
+                        Ok(()) => StageOutcome::Passed,
+                        Err(e) => StageOutcome::Failed(e),
+                    }
                 } else {
                     StageOutcome::Failed(
                         // Name the binary's own complete log: the inline copy is
@@ -277,6 +292,7 @@ fn ssh_params_for_second_client(ctx: &OrchestrationContext) -> Result<ResolvedPa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::stage::StageEvidence;
 
     #[test]
     fn stage_id_is_live_two_hop() {
@@ -357,5 +373,29 @@ mod tests {
             "expected a skip; got {:?}",
             LiveTwoHopValidationStage.execute(&mut ctx)
         );
+    }
+
+    #[test]
+    fn live_two_hop_declared_witness_matches_its_artifact_path() {
+        assert_eq!(
+            StageId::LiveTwoHopValidation.evidence(),
+            StageEvidence::File(TWO_HOP_REPORT_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn live_two_hop_pass_without_report_artifact_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "live_two_hop_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = verify_report_artifact(&dir).expect_err("missing artifact must fail");
+        assert!(err.contains(TWO_HOP_REPORT_RELATIVE));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

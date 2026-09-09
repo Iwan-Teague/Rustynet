@@ -365,50 +365,66 @@ define_stage_catalog! {
     ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveAnchor => "live_anchor" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveAnchor => "live_anchor" @ Live / T1Role / StageEvidence::File("live_linux_anchor_report.json"),
+        // QH-83: pass witness = live_linux_anchor_report.json (fatal verify_report_artifact; tests live_anchor_declared_witness_matches_its_artifact_path / live_anchor_pass_without_report_artifact_is_fatal).
     // MAC-D3: macOS anchor validators, previously registry-only (bash era).
     // Wire names match the legacy registry vocabulary so run-matrix evidence
     // stays comparable. Gated Live: skipped-with-reason unless the macOS
     // anchor validators are elected (--anchor-platform macos) and a macOS
     // anchor node is assigned.
-    MacosAnchorProfileDeploy => "deploy_macos_anchor_profile" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    MacosAnchorBundlePullValidation => "validate_macos_anchor_bundle_pull" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    MacosAnchorPortMappingAuthorityValidation => "validate_macos_anchor_port_mapping_authority" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    MacosAnchorProfileDeploy => "deploy_macos_anchor_profile" @ Live / T1Role / StageEvidence::StageLog,
+        // QH-83: pass witness = StageLog line `<alias>: <detail>` (tests profile_deploy_witness_line_carries_alias_and_detail / profile_deploy_witness_write_failure_is_propagated).
+    MacosAnchorBundlePullValidation => "validate_macos_anchor_bundle_pull" @ Live / T1Role / StageEvidence::File("live_macos_anchor_bundle_pull_report.json"),
+        // QH-83: pass witness = live_macos_anchor_bundle_pull_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
+    MacosAnchorPortMappingAuthorityValidation => "validate_macos_anchor_port_mapping_authority" @ Live / T1Role / StageEvidence::StageLog,
+        // QH-83: pass witness = StageLog line `<alias>: <summary>` (tests port_mapping_witness_line_carries_alias_and_summary / port_mapping_witness_write_failure_is_propagated).
     // C6: live macOS role-transition validator, previously the legacy
     // vm_lab hub block `validate_macos_role_transition` that never
     // dispatched under the Rust engine (W5.7). Wire name matches the
     // legacy registry vocabulary so run-matrix evidence stays comparable.
     // Gated Live: skipped-with-reason unless the run elects macOS for
     // role transition (--role-switch-platform macos).
-    MacosRoleTransitionValidation => "validate_macos_role_transition" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveTwoHopValidation => "live_two_hop_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveRebootRecoveryValidation => "live_reboot_recovery_validation" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    MacosRoleTransitionValidation => "validate_macos_role_transition" @ Live / T1Role / StageEvidence::StageLog,
+        // QH-83: pass witness = StageLog line `<alias>: <summary>` (tests role_transition_witness_line_carries_alias_and_summary / role_transition_witness_write_failure_is_propagated).
+    LiveTwoHopValidation => "live_two_hop_validation" @ Live / T1Role / StageEvidence::File("live_two_hop_report.json"),
+        // QH-83: pass witness = live_two_hop_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
+    LiveManagedDnsValidation => "live_managed_dns_validation" @ Live / T1Role / StageEvidence::File("live_managed_dns_report.json"),
+        // QH-83: pass witness = live_managed_dns_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
+    LiveNetworkFlapValidation => "live_network_flap_validation" @ Live / T2Resilience / StageEvidence::File("live_network_flap_report.json"),
+        // QH-83: pass witness = live_network_flap_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
+    LiveRebootRecoveryValidation => "live_reboot_recovery_validation" @ Live / T2Resilience / StageEvidence::File("live_reboot_recovery_report.json"),
+        // QH-83: pass witness = live_reboot_recovery_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
     // C7: live macOS reboot-with-protection validator
     // (MacosDnsBackupRebootSurvivalPlan_2026-09-02.md). Wire name matches the
     // registry vocabulary so run-matrix evidence stays comparable. Gated
     // Live: skipped-with-reason unless the run elects macOS for reboot
     // recovery (--reboot-platform macos).
-    MacosRebootRecoveryValidation => "validate_macos_reboot_recovery" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveKeyCustodyValidation => "live_key_custody_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    MacosRebootRecoveryValidation => "validate_macos_reboot_recovery" @ Live / T2Resilience / StageEvidence::File("logs/validate_macos_reboot_recovery.json"),
+        // QH-83: pass witness = logs/validate_macos_reboot_recovery.json written by the helper before its only Ok (fatal verify_report_artifact; tests macos_reboot_recovery_declared_witness_matches_its_artifact_path / macos_reboot_recovery_pass_without_evidence_artifact_is_fatal).
+    LiveSecretsNotInLogsValidation => "live_secrets_not_in_logs_validation" @ Live / T4Security / StageEvidence::File("live_secrets_not_in_logs_report.json"),
+        // QH-83: pass witness = live_secrets_not_in_logs_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
+    LiveKeyCustodyValidation => "live_key_custody_validation" @ Live / T4Security / StageEvidence::File("live_key_custody_report.json"),
+        // QH-83: pass witness = live_key_custody_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
     // Daemon killed MID-enrollment, then trust state must be consistent
     // (token consumed ⟺ member) — restart/fault-recovery family; the
     // anchor's enrollment-SERVING capability is live_anchor's T1 scope.
-    LiveEnrollmentRestartValidation => "live_enrollment_restart_validation" @ Live / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveEnrollmentRestartValidation => "live_enrollment_restart_validation" @ Live / T2Resilience / StageEvidence::File("live_enrollment_restart_report.json"),
+        // QH-83: pass witness = live_enrollment_restart_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
     // Asserts the killswitch + blind-exit posture HOLD through LAN-access
     // toggling — the map's "killswitch" T4 family member. Its registry spec
     // feeds the `cross_os_lan_toggle` schema column, the same cell the
     // bash-dialect `live_lan_toggle` wrapper historically fed.
-    LiveLanToggleValidation => "live_lan_toggle_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveLanToggleValidation => "live_lan_toggle_validation" @ Live / T4Security / StageEvidence::File("live_lan_toggle_report.json"),
+        // QH-83: pass witness = live_lan_toggle_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
     // Requires Linux+macOS+Windows ALL present (skips otherwise) and proves
     // one signed membership view + fresh WireGuard handshakes across the
     // three OSes — the `--node` dialect's carrier of cross-OS
     // membership-convergence + peer-visibility coverage today.
-    LiveMixedTopologyValidation => "live_mixed_topology_validation" @ Live / T3CrossOs / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveMixedTopologyValidation => "live_mixed_topology_validation" @ Live / T3CrossOs / StageEvidence::File("live_mixed_topology_report.json"),
+        // QH-83: pass witness = live_mixed_topology_report.json (fatal verify_report_artifact; tests *_declared_witness_matches_its_artifact_path / *_pass_without_report_artifact_is_fatal).
     // HELLO-flood rate-limiter adversarial probe (DOS-1) — security tier.
-    LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    LiveHelloLimiterFloodValidation => "live_hello_limiter_flood_validation" @ Live / T4Security / StageEvidence::StageLog,
+        // QH-83: pass witness = per-node StageLog line `<alias>: <summary>` (tests hello_limiter_witness_line_carries_alias_and_summary / hello_limiter_witness_write_failure_is_propagated).
     // HP-3 relay-frame-forwarding opt-in proof: asserts the relay actually
     // FORWARDS ciphertext between two peers (not just accepts registrations)
     // by blocking direct peer↔peer nft paths and routing a counter-probe

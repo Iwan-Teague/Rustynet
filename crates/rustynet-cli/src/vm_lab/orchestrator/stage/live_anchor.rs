@@ -7,6 +7,27 @@ use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageI
 use std::path::PathBuf;
 use std::process::Command;
 
+/// QH-83 pass witness for `LiveAnchor`: the `live_linux_anchor_test` binary
+/// writes this JSON report on EVERY success path (both its dry-run and its
+/// real run write the report immediately before returning `Ok`), and logger
+/// failures propagate as a non-zero exit. The runner deletes a declared
+/// File witness at stage start, so a `Passed` verdict is only honest when
+/// this artifact exists and is non-empty from THIS execute — verify it
+/// before declaring victory; absence is fatal, never best-effort.
+pub(crate) const ANCHOR_REPORT_RELATIVE: &str = "live_linux_anchor_report.json";
+
+/// Fail-closed artifact check for the declared pass witness. A stage pass
+/// whose witness cannot be read back must fail the stage instead of
+/// standing as an unwitnessed green.
+fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
+    let path = report_dir.join(ANCHOR_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
+
 pub struct LiveAnchorStage;
 
 impl OrchestrationStage for LiveAnchorStage {
@@ -79,7 +100,7 @@ impl OrchestrationStage for LiveAnchorStage {
             Err(err) => return StageOutcome::Failed(err),
         };
 
-        let report_path = ctx.report_dir.join("live_linux_anchor_report.json");
+        let report_path = ctx.report_dir.join(ANCHOR_REPORT_RELATIVE);
         let log_path = ctx.report_dir.join("live_linux_anchor.log");
         let owner_approver_id = format!("{anchor_node_id}-owner");
 
@@ -142,7 +163,12 @@ impl OrchestrationStage for LiveAnchorStage {
         .arg(&log_path);
 
         match cmd.output() {
-            Ok(output) if output.status.success() => StageOutcome::Passed,
+            Ok(output) if output.status.success() => {
+                match verify_report_artifact(&ctx.report_dir) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => StageOutcome::Failed(e),
+                }
+            }
             Ok(output) => StageOutcome::Failed(format!(
                 "live_linux_anchor_test exited with {}: {}",
                 output.status,
@@ -220,6 +246,7 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::stage::StageEvidence;
 
     #[test]
     fn live_anchor_stage_metadata_matches_registry_name() {
@@ -231,5 +258,29 @@ mod tests {
             &[StageId::LiveMixedTopologyValidation]
         );
         assert_eq!(stage.fanout(), StageFanout::Once);
+    }
+
+    #[test]
+    fn live_anchor_declared_witness_matches_its_artifact_path() {
+        assert_eq!(
+            StageId::LiveAnchor.evidence(),
+            StageEvidence::File(ANCHOR_REPORT_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn live_anchor_pass_without_report_artifact_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "live_anchor_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = verify_report_artifact(&dir).expect_err("missing artifact must fail");
+        assert!(err.contains(ANCHOR_REPORT_RELATIVE));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
