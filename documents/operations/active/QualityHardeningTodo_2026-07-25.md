@@ -7131,9 +7131,12 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    `wrong_node_transcript.json`, `kill_window_transcript.txt`) and the
    planted-residue control a sabotage+detection stage-log line. **Every
    catalog row now declares real evidence — zero `PHASE1_EVIDENCE_PENDING`
-   rows remain.** Live re-verify of these phases needs the cross-network /
-   chaos / negative-control plans (not the default 2-node Linux run) and is
-   owed per phase before an evidence claim. The NegativeControl stages'
+   rows remain.** Regression check of the final merges: the default 2-node
+   Linux run at `eb87f078` on lenovo-bot and katana, each 38 pass / 0 fail /
+   28 skipped, no NotProven (rows in both ledgers). Live re-verify of the
+   cross-network / chaos / negative-control phases themselves needs their
+   own plans (the five-node two-LAN topology; not the default 2-node run)
+   and is owed per phase before an evidence claim. The NegativeControl stages'
    witness is their inversion record (`write_control_evidence` output), never a
    lazy `None`. Each stage still needs the individual "what datum IS this
    verdict" decision — a constant-line appeasement satisfies emptiness without
