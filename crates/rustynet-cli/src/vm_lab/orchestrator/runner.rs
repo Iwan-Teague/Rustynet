@@ -155,6 +155,40 @@ impl StateMachineRunner {
             }
 
             observer.stage_started(&id);
+
+            // QH-83 freshness: a declared `File` witness must be produced by
+            // THIS execute, never inherited from a prior invocation in the
+            // same report directory (--run-only / --resume-from /
+            // --rerun-stage reuse the dir, unlike a fresh run whose report
+            // dir is required empty). The recorder truncates the stage log at
+            // `stage_started` for exactly this reason; the `File` arm needs
+            // the same clear or the witness check below could read a
+            // generation-N artifact and uphold a pass this run never earned.
+            // If the stale file cannot be removed the stage must NOT execute
+            // (its verdict could not be trusted either way): fail closed as
+            // blocking `NotProven { StaleEvidence }` so dependents cascade.
+            if let StageEvidence::File(relative) = id.evidence() {
+                let witness = ctx.report_dir.join(relative);
+                if let Err(err) = std::fs::remove_file(&witness)
+                    && err.kind() != std::io::ErrorKind::NotFound
+                {
+                    let outcome = StageOutcome::NotProven {
+                        reason: ReasonCode::StaleEvidence,
+                        detail: format!(
+                            "stage '{}': stale witness '{}' from a prior generation could not be cleared before execute: {err}",
+                            id.as_str(),
+                            witness.display()
+                        ),
+                    };
+                    blocked.insert(id.clone());
+                    observer.stage_finished(&id, &outcome);
+                    ctx.record_outcome(id.clone(), outcome.clone());
+                    results.push((id, outcome));
+                    continue;
+                }
+            }
+
+
             // Guard `execute` so a panicking stage becomes a `Failed` outcome
             // instead of unwinding out of the runner — otherwise a panic would
             // abort past finalize AND skip the always-run cleanup, the worst
@@ -1419,21 +1453,18 @@ mod tests {
     }
 
     /// Mutation caught: a `File` check without the content check. An
-    /// existing-but-empty declared artifact is no witness.
+    /// existing-but-empty declared artifact is no witness. Exercised
+    /// directly on the predicate — the runner clears a pre-existing `File`
+    /// artifact before execute (QH-83 freshness), so an empty artifact can
+    /// only reach this check on the `StageLog` path or via a direct call.
     #[test]
     fn empty_declared_file_witness_is_demoted_to_not_proven() {
-        let stages: Vec<Box<dyn OrchestrationStage>> =
-            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
-        let (mut ctx, dir) = tempdir_ctx();
+        let (ctx, dir) = tempdir_ctx();
         let artifact = dir.path().join("logs/traffic_test_matrix.pair_results.log");
         std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
             .expect("create artifact dir");
         std::fs::write(&artifact, "\n").expect("write empty artifact");
-        let results = StateMachineRunner::new(stages)
-            .expect("valid plan")
-            .run(&mut ctx)
-            .expect("run");
-        match &results[0].1 {
+        match verify_declared_evidence(&StageId::TrafficTestMatrix, &ctx, StageOutcome::Passed) {
             StageOutcome::NotProven { reason, detail } => {
                 assert!(matches!(reason, super::ReasonCode::MissingWitness));
                 assert!(
@@ -1447,23 +1478,18 @@ mod tests {
 
     /// Mutation caught: `fs::metadata` (follows symlinks) instead of
     /// `symlink_metadata` — a symlink to a real, non-empty file would then
-    /// uphold the pass.
+    /// uphold the pass. Exercised directly on the predicate (see
+    /// `empty_declared_file_witness_is_demoted_to_not_proven` for why).
     #[test]
     fn symlinked_file_witness_is_demoted_to_not_proven() {
-        let stages: Vec<Box<dyn OrchestrationStage>> =
-            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
-        let (mut ctx, dir) = tempdir_ctx();
+        let (ctx, dir) = tempdir_ctx();
         let real = dir.path().join("elsewhere.log");
         std::fs::write(&real, "real content\n").expect("write real file");
         let artifact = dir.path().join("logs/traffic_test_matrix.pair_results.log");
         std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
             .expect("create artifact dir");
         std::os::unix::fs::symlink(&real, &artifact).expect("symlink witness");
-        let results = StateMachineRunner::new(stages)
-            .expect("valid plan")
-            .run(&mut ctx)
-            .expect("run");
-        match &results[0].1 {
+        match verify_declared_evidence(&StageId::TrafficTestMatrix, &ctx, StageOutcome::Passed) {
             StageOutcome::NotProven { reason, detail } => {
                 assert!(matches!(reason, super::ReasonCode::MissingWitness));
                 assert!(detail.contains("symlink"), "{detail}");
@@ -1474,13 +1500,13 @@ mod tests {
 
     /// Mutation caught: mapping a read error to `Ok`/pass, or dropping the
     /// `UnreadableEvidence` arm. Skipped (with a note) when running as root,
-    /// where mode 0o000 does not deny the read.
+    /// where mode 0o000 does not deny the read. Exercised directly on the
+    /// predicate (see `empty_declared_file_witness_is_demoted_to_not_proven`
+    /// for why).
     #[test]
     fn unreadable_file_witness_is_demoted_to_unreadable_evidence() {
         use std::os::unix::fs::PermissionsExt;
-        let stages: Vec<Box<dyn OrchestrationStage>> =
-            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
-        let (mut ctx, dir) = tempdir_ctx();
+        let (ctx, dir) = tempdir_ctx();
         let artifact = dir.path().join("logs/traffic_test_matrix.pair_results.log");
         std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
             .expect("create artifact dir");
@@ -1491,11 +1517,7 @@ mod tests {
             eprintln!("running with read access despite mode 000 (root?); skipping");
             return;
         }
-        let results = StateMachineRunner::new(stages)
-            .expect("valid plan")
-            .run(&mut ctx)
-            .expect("run");
-        match &results[0].1 {
+        match verify_declared_evidence(&StageId::TrafficTestMatrix, &ctx, StageOutcome::Passed) {
             StageOutcome::NotProven { reason, detail } => {
                 assert!(matches!(reason, super::ReasonCode::UnreadableEvidence));
                 assert!(detail.contains("could not be read"), "{detail}");
@@ -1516,6 +1538,69 @@ mod tests {
             .run(&mut ctx)
             .expect("run");
         assert!(matches!(results[0].1, StageOutcome::Passed));
+    }
+
+    /// Mutation caught: skipping the pre-execute witness clear (revert the
+    /// `remove_file` block in the run loop). A `File` witness left in the
+    /// report dir by a PRIOR generation — reachable via `--run-only` /
+    /// `--resume-from` / `--rerun-stage`, which reuse an existing report
+    /// dir — must not back this run's `Passed` when this execute writes
+    /// nothing. The runner must clear it at stage start; the pass then
+    /// demotes to `NotProven { MissingWitness }` and the stale artifact is
+    /// gone.
+    #[test]
+    fn file_witness_from_a_prior_generation_is_not_accepted() {
+        let (mut ctx, dir) = tempdir_ctx();
+        let witness = dir.path().join("logs/traffic_test_matrix.pair_results.log");
+        std::fs::create_dir_all(witness.parent().expect("witness parent"))
+            .expect("create witness dir");
+        std::fs::write(&witness, b"generation-N artifact\n").expect("write stale witness");
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![pass_stage(StageId::TrafficTestMatrix, vec![])];
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(
+                    detail.contains("not found"),
+                    "stale witness must have been cleared before the check: {detail}"
+                );
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+        assert!(
+            !witness.exists(),
+            "the prior generation's artifact must have been removed before execute"
+        );
+    }
+
+    /// Mutation caught: a pre-execute clear so aggressive the honest path
+    /// cannot recover (e.g. clearing without letting the stage rewrite, or
+    /// failing the stage because an artifact existed). A stage that writes
+    /// its declared artifact during execute still earns `Passed` even when
+    /// a prior generation's artifact was present at stage start.
+    #[test]
+    fn witnessed_file_evidence_replaces_a_prior_generations_artifact() {
+        let (mut ctx, dir) = tempdir_ctx();
+        let witness = dir.path().join("logs/traffic_test_matrix.pair_results.log");
+        std::fs::create_dir_all(witness.parent().expect("witness parent"))
+            .expect("create witness dir");
+        std::fs::write(&witness, b"generation-N artifact\n").expect("write stale witness");
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![witnessed_pass_stage(StageId::TrafficTestMatrix, vec![])];
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        assert!(matches!(results[0].1, StageOutcome::Passed));
+        let fresh = std::fs::read_to_string(&witness).expect("read this generation's artifact");
+        assert!(
+            fresh.contains("traffic_test_matrix"),
+            "the artifact on disk must be THIS execute's witness, not generation N: {fresh}"
+        );
     }
 
     /// Mutation caught: an evidence check applied to `StageEvidence::None`

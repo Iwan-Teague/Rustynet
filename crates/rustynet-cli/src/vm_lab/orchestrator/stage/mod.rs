@@ -516,12 +516,13 @@ pub trait OrchestrationStage: Send + Sync {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome;
 
     /// Teardown stages that MUST run even when an earlier stage failed —
-    /// exempt from dependency skip-cascade so this run's own killswitch / exit
-    /// NAT residue is always removed from the guests (leaving residue is a
-    /// release-blocker per the operating contract). An `always_run` stage is
-    /// still ordered after its [`dependencies`](Self::dependencies) and is
-    /// still honored by an explicit `--skip-stage`; it is only exempt from
-    /// being *cascade*-skipped because a dependency failed. Default `false`.
+    /// exempt from dependency skip-cascade AND from explicit skips
+    /// (`--skip-stage`, the `--rerun-stage` tail) and from the shutdown flag,
+    /// so this run's own killswitch / exit-NAT residue is always removed from
+    /// the guests (leaving residue is a release-blocker per the operating
+    /// contract). The runner checks `always_run` ahead of every skip source
+    /// in `skip_decision` (`orchestrator::runner`), so a skip source added
+    /// later cannot reintroduce the residue fail-open. Default `false`.
     fn always_run(&self) -> bool {
         false
     }
