@@ -53706,6 +53706,14 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             run_instance_id: None,
         };
         recorder.stage_started(&StageId::Preflight);
+        // QH-83 Setup batch: preflight declares a File witness now, so a
+        // PASS in the fixture must leave the report file the seal reads.
+        fs::create_dir_all(tmp.join("logs")).expect("logs dir");
+        fs::write(
+            tmp.join("logs/cross_bridge_preflight.txt"),
+            b"# cross-bridge preflight\ndecision: no subnet split; cross-bridge check not applicable\n",
+        )
+        .expect("preflight witness");
         recorder.stage_finished(&StageId::Preflight, &StageOutcome::Passed);
         assert!(recorder.take_errors().is_empty());
         super::write_rust_native_report_state_final(
@@ -53759,6 +53767,11 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         fs::write(
             tmp.join("logs/traffic_test_matrix.pair_results.log"),
             witness_bytes,
+        )?;
+        // QH-83 Setup batch: preflight is a File-witness stage too.
+        fs::write(
+            tmp.join("logs/cross_bridge_preflight.txt"),
+            b"# cross-bridge preflight\ndecision: no subnet split; cross-bridge check not applicable\n",
         )?;
         let recorder = super::RustNativeStageRecorder {
             report_dir: tmp,
@@ -53824,6 +53837,14 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             run_instance_id: None,
         };
         recorder.stage_started(&StageId::Preflight);
+        // QH-83 Setup batch: preflight declares a File witness now, so a
+        // PASS in the fixture must leave the report file the seal reads.
+        fs::create_dir_all(tmp.join("logs")).expect("logs dir");
+        fs::write(
+            tmp.join("logs/cross_bridge_preflight.txt"),
+            b"# cross-bridge preflight\ndecision: no subnet split; cross-bridge check not applicable\n",
+        )
+        .expect("preflight witness");
         recorder.stage_finished(&StageId::Preflight, &StageOutcome::Passed);
         recorder.stage_finished(
             &StageId::TrafficTestMatrix,
