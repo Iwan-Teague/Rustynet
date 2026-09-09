@@ -38,12 +38,12 @@
     {
       "host_id": "katana",
       "kind": "libvirt",
-      "connect_uri": "qemu+ssh://debian@100.122.143.29/system",
+      "connect_uri": "qemu+ssh://debian@192.168.18.44/system",
       "guest_subnet": "192.168.122.0/24",
-      "notes": "Katana laptop, Debian 13, i7-11800H 8C/16T, 15GiB, RTX 3070, 413G free NVMe; nested virt ON (kvm_intel nested=Y), swtpm+ovmf+virtio-win present so a Windows 11 x64 guest is possible; Wi-Fi-only uplink (wlo1 192.168.18.44/24, its own LAN distinct from lenovo-bot's 192.168.0.0/24) so guests are NAT'd on virbr0, not bridged; reached over tailnet (100.122.143.29, tailscale name 'debian')",
+      "notes": "Katana laptop, Debian 13, i7-11800H 8C/16T, 15GiB, RTX 3070, 413G free NVMe; nested virt ON (kvm_intel nested=Y), swtpm+ovmf+virtio-win present so a Windows 11 x64 guest is possible; Wi-Fi-only uplink (wlo1 192.168.18.44/24, its own LAN distinct from lenovo-bot's 192.168.0.0/24) so guests are NAT'd on virbr0, not bridged; reached on its own Wi-Fi LAN 192.168.18.0/24 (the Mac sits on that LAN too as 192.168.18.16) or over the tailnet (100.122.143.29, tailscale name 'debian') when the Mac's Tailscale client is running",
       "repo_dir": "/home/debian/Rustynet",
       "alt_ssh_endpoints": [
-        "debian@192.168.18.44"
+        "debian@100.122.143.29"
       ]
     }
   ],
