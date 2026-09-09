@@ -487,10 +487,16 @@ pub fn append_live_lab_run_matrix_row(
     let matrix_path = default_live_lab_node_run_matrix_path();
     let schema = ensure_matrix_schema(matrix_path.as_path())?;
     let values = build_live_lab_run_matrix_values(&schema, &config)?;
+    let written = upsert_csv_row(matrix_path.as_path(), &schema, &values, config.row_role)?;
     if config.row_role == LiveLabRunMatrixRowRole::Final {
+        // D3 (NodeEngineLedgerConsumerAudit 2026-09-09): the per-run node-stage
+        // ledgers are written AFTER the matrix upsert. The upsert is idempotent
+        // (replace-by-run-key) and the ledger rewrite is a whole-file replace,
+        // so a crash here is repaired by the retry; the previous order (ledgers
+        // first) let a crash strand ledger rows for a matrix row that was never
+        // written.
         write_node_stage_result_ledgers(config.report_dir, &values)?;
     }
-    let written = upsert_csv_row(matrix_path.as_path(), &schema, &values, config.row_role)?;
     let report_row_path = if written {
         write_report_local_row(config.report_dir, &schema, &values)?
     } else {
@@ -504,6 +510,64 @@ pub fn append_live_lab_run_matrix_row(
         report_row_path,
         run_id,
     })
+}
+
+/// D1 (NodeEngineLedgerConsumerAudit 2026-09-09): record a `--node` run's
+/// START in the shared run-matrix ledger, BEFORE any stage runs.
+///
+/// Previously the only matrix writer ran at finalize, so a crashed or killed
+/// run left NO row at all — the ledger silently claimed nothing happened.
+/// This emits an Interim "started, not finished" row through the same locked
+/// upsert path; the Final row at finalize replaces it (the upsert's Final
+/// match treats an empty-`run_started_utc` row for the same report_dir as
+/// replaceable), so a run that dies before finalize leaves exactly one row
+/// that says it never finished.
+///
+/// The row deliberately carries a DEGENERATE natural key (`run_started_utc`
+/// empty): the real start timestamp is only knowable once stage evidence
+/// exists, and a guessed one would never match the Final row's derived key.
+/// Degenerate keys plain-append without owning the key, so this marker can
+/// never suppress a real row.
+///
+/// Fields are intentionally minimal: at run start there is no stage evidence,
+/// no node table, and no target evidence to validate — the full builder
+/// (`build_live_lab_run_matrix_values`) would fail closed on their absence.
+/// `run_id` is a fresh stamp (it is not the upsert key; the Final row mints
+/// its own from the stage evidence).
+pub fn record_live_lab_run_matrix_run_start(
+    report_dir: &Path,
+    run_command: Option<&str>,
+) -> Result<String, String> {
+    let matrix_path = default_live_lab_node_run_matrix_path();
+    let schema = ensure_matrix_schema(matrix_path.as_path())?;
+    let commit = current_git_commit().unwrap_or_else(|| "unknown".to_owned());
+    let short_commit: String = commit.chars().take(12).collect();
+    let run_id = format!("livelab-{}-{}", unix_now(), short_commit);
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
+    values.insert("run_id".to_owned(), run_id.clone());
+    values.insert("run_started_utc".to_owned(), String::new());
+    values.insert("run_finished_utc".to_owned(), String::new());
+    values.insert("git_commit".to_owned(), commit);
+    values.insert("report_dir".to_owned(), path_display(report_dir));
+    if let Some(command) = run_command {
+        values.insert("run_command".to_owned(), command.to_owned());
+    }
+    values.insert("overall_result".to_owned(), "in_progress".to_owned());
+    values.insert(
+        "notes".to_owned(),
+        "run started; if this row is never replaced by a final row, the run crashed or was killed before finalize".to_owned(),
+    );
+    values.insert(
+        "row_role".to_owned(),
+        LiveLabRunMatrixRowRole::Interim.as_str().to_owned(),
+    );
+    upsert_csv_row(
+        matrix_path.as_path(),
+        &schema,
+        &values,
+        LiveLabRunMatrixRowRole::Interim,
+    )?;
+    Ok(run_id)
 }
 
 pub fn default_live_lab_node_stage_matrix_path() -> PathBuf {
@@ -770,8 +834,9 @@ fn write_node_stage_csv(path: &Path, rows: &[BTreeMap<String, String>]) -> Resul
         body.push_str(&render_named_csv_row(NODE_STAGE_COLUMNS, row));
         body.push('\n');
     }
-    fs::write(path, body)
-        .map_err(|err| format!("write node-stage CSV failed ({}): {err}", path.display()))
+    // D3: whole-file atomic replace — a crash mid-write leaves the previous
+    // per-run ledger intact instead of a truncated CSV.
+    write_file_atomic(path, &body, "node-stage CSV")
 }
 
 fn render_named_csv_row(columns: &[&str], values: &BTreeMap<String, String>) -> String {
@@ -954,23 +1019,45 @@ fn upsert_node_stage_csv(
 /// `env!("CARGO_MANIFEST_DIR")`. Single derivation by construction.
 pub(crate) use crate::workspace_root::workspace_root_path;
 
+/// Atomic whole-file replace (D2/D3, NodeEngineLedgerConsumerAudit
+/// 2026-09-09): write to `path` + ".tmp", then rename over `path`. A crash
+/// between the write and the rename leaves the previous file intact instead
+/// of a truncated or half-written ledger. Same-directory rename is atomic on
+/// the supported filesystems, so a reader either sees the old file or the new
+/// one, never a partial body.
+fn write_file_atomic(path: &Path, body: &str, what: &str) -> Result<(), String> {
+    let tmp_path = {
+        let mut os = path.as_os_str().to_os_string();
+        os.push(".tmp");
+        PathBuf::from(os)
+    };
+    fs::write(tmp_path.as_path(), body).map_err(|err| {
+        format!("write {what} tmp failed ({}): {err}", tmp_path.display())
+    })?;
+    fs::rename(tmp_path.as_path(), path)
+        .map_err(|err| format!("replace {what} failed ({}): {err}", path.display()))
+}
+
 fn ensure_matrix_schema(path: &Path) -> Result<Vec<String>, String> {
-    if !path.exists() {
-        let parent = path
-            .parent()
-            .ok_or_else(|| format!("matrix path has no parent: {}", path.display()))?;
+    if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|err| {
             format!(
                 "create live-lab run matrix directory failed ({}): {err}",
                 parent.display()
             )
         })?;
-        fs::write(path, format!("{}\n", DEFAULT_MATRIX_COLUMNS.join(","))).map_err(|err| {
-            format!(
-                "initialize live-lab run matrix failed ({}): {err}",
-                path.display()
-            )
-        })?;
+    }
+    // D2: schema init and upgrade run under the SAME append lock the row
+    // path uses, so a concurrent writer cannot interleave a header migration
+    // with a row append. The lock is RAII and released when this fn returns,
+    // before the caller's row upsert takes it again — never held nested.
+    let _lock = acquire_append_lock(lock_path_for(path).as_path(), "run-matrix")?;
+    if !path.exists() {
+        write_file_atomic(
+            path,
+            &format!("{}\n", DEFAULT_MATRIX_COLUMNS.join(",")),
+            "live-lab run matrix",
+        )?;
     }
     let body = fs::read_to_string(path).map_err(|err| {
         format!(
@@ -997,12 +1084,7 @@ fn ensure_matrix_schema(path: &Path) -> Result<Vec<String>, String> {
             .unwrap_or_default();
         let mut upgraded_body = format!("{}\n", schema.join(","));
         upgraded_body.push_str(rest);
-        fs::write(path, upgraded_body).map_err(|err| {
-            format!(
-                "upgrade live-lab run matrix schema failed ({}): {err}",
-                path.display()
-            )
-        })?;
+        write_file_atomic(path, &upgraded_body, "live-lab run matrix schema")?;
     }
     for required in [
         "run_id",
@@ -2619,7 +2701,9 @@ fn earliest_stage_time_from_rows(_stages: &[StageEvidence], _started: bool) -> O
 /// a Final row replaces every earlier row for the key, an Interim row
 /// lands only when the key is not yet owned. A degenerate key (either
 /// component empty) falls back to plain append — never guess ownership.
-/// Returns whether the row was written.
+/// Exception (D1): a Final row ALSO replaces a degenerate-key row (the
+/// Interim-at-start marker) for the same report_dir. Returns whether the
+/// row was written.
 fn upsert_csv_row(
     path: &Path,
     schema: &[String],
@@ -2665,7 +2749,22 @@ fn upsert_csv_row(
                             .map(String::as_str)
                             .unwrap_or("")
                     };
-                    field(report_dir_index) == key_report_dir && field(started_index) == key_started
+                    let same_report_dir = field(report_dir_index) == key_report_dir;
+                    let same_started = field(started_index) == key_started;
+                    if row_role == LiveLabRunMatrixRowRole::Final {
+                        // D1 (NodeEngineLedgerConsumerAudit 2026-09-09): a
+                        // Final row also replaces the Interim-at-start row,
+                        // whose degenerate (empty) run_started_utc can never
+                        // own the natural key — see
+                        // `record_live_lab_run_matrix_run_start`. Rows for
+                        // OTHER report_dirs never match (report_dir is part
+                        // of every match), and an empty-started row for this
+                        // report_dir is by construction this run's start
+                        // marker.
+                        same_report_dir && (same_started || field(started_index).is_empty())
+                    } else {
+                        same_report_dir && same_started
+                    }
                 }
                 // A malformed row is never treated as a match — and never
                 // destroyed.
@@ -2695,23 +2794,7 @@ fn upsert_csv_row(
     }
     out.push_str(render_csv_row(schema, values).as_str());
     out.push('\n');
-    let tmp_path = {
-        let mut os = path.as_os_str().to_os_string();
-        os.push(".tmp");
-        PathBuf::from(os)
-    };
-    fs::write(tmp_path.as_path(), out).map_err(|err| {
-        format!(
-            "write live-lab run matrix tmp failed ({}): {err}",
-            tmp_path.display()
-        )
-    })?;
-    fs::rename(tmp_path.as_path(), path).map_err(|err| {
-        format!(
-            "replace live-lab run matrix failed ({}): {err}",
-            path.display()
-        )
-    })?;
+    write_file_atomic(path, &out, "live-lab run matrix")?;
     Ok(true)
 }
 fn report_local_row_path(report_dir: &Path) -> PathBuf {
