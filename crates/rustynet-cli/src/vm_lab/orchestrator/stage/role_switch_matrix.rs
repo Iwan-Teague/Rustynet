@@ -49,6 +49,13 @@ impl OrchestrationStage for RoleSwitchMatrixStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         // Verify each node's tunnels are active (daemon responsive after role distribution).
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
+        // An empty fleet exercises nothing: report a skip, never a witnessed
+        // `nodes=0` pass (the same guard every other Live validator carries).
+        if aliases.is_empty() {
+            return StageOutcome::Skipped(
+                "no assignments in scope; role-switch matrix has nothing to verify".to_owned(),
+            );
+        }
         let results: Vec<(String, Result<(), String>)> = aliases
             .iter()
             .map(|alias| {
@@ -108,7 +115,7 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn empty_assignments_passes() {
+    fn empty_assignments_is_skipped_never_passed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -135,9 +142,12 @@ mod tests {
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
         };
-        assert_eq!(
-            RoleSwitchMatrixStage.execute(&mut ctx),
-            StageOutcome::Passed
+        assert!(
+            matches!(
+                RoleSwitchMatrixStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "an empty fleet must skip, never record a witnessed nodes=0 pass"
         );
     }
 
