@@ -2,7 +2,6 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_install::{
     MACOS_MEMBERSHIP_OWNER_PUBKEY_PATH, MACOS_MEMBERSHIP_SNAPSHOT_PATH,
     MACOS_OWNER_SIGNING_KEY_PATH, MACOS_RUSTYNET_PATH, MACOS_STATE_ROOT,
@@ -15,11 +14,12 @@ use crate::vm_lab::orchestrator::error::{
     NodeMembershipPeer,
 };
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::VmGuestPlatform;
 use rustynet_control::membership::{
-    MEMBERSHIP_SCHEMA_VERSION, snapshot_bytes_node_capabilities, snapshot_bytes_state_identity,
+    snapshot_bytes_node_capabilities, snapshot_bytes_state_identity, MEMBERSHIP_SCHEMA_VERSION,
 };
 use rustynet_control::roles::{
-    RoleCapability, canonicalize_role_capabilities, role_capability_csv,
+    canonicalize_role_capabilities, role_capability_csv, RoleCapability,
 };
 
 const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -722,6 +722,26 @@ pub fn distribute_signed_bundle(
     let mkdir_script = ssh::RemoteCommand::from_args("macos staging dir", &mkdir_args)?;
     ssh::run_remote(conn, mkdir_script.as_str(), SHORT_TIMEOUT)?;
     ssh::scp_to(conn, bundle_path, &remote_tmp, MEDIUM_TIMEOUT)?;
+    // F1a digest read-back: require the installed file to match the exact
+    // local bytes, mirroring the verifier-key tail.
+    let expected_sha256 =
+        crate::vm_lab::orchestrator::adapter::verifier_key::sha256_hex_of_file(bundle_path)?;
+    let script = macos_bundle_install_script(&kind, &remote_tmp, &install_dst, &expected_sha256)?;
+    ssh::run_remote(conn, &script, SHORT_TIMEOUT)?;
+    Ok(())
+}
+
+/// Render the atomic install + digest read-back script for a signed bundle on
+/// macOS (`shasum -a 256` tail, verbatim style of `distribute_verifier_key`).
+/// Pure so the script shape is unit-testable without a live connection; the
+/// digest tail is what turns a guest-local substitution between scp and
+/// install into a transport failure instead of a content-blind pass (F1a).
+fn macos_bundle_install_script(
+    kind: &BundleKind,
+    remote_tmp: &str,
+    install_dst: &str,
+    expected_sha256: &str,
+) -> Result<String, AdapterError> {
     let install_dir = install_dst
         .rsplit_once('/')
         .map_or(MACOS_STATE_ROOT, |(dir, _)| dir);
@@ -741,16 +761,12 @@ pub fn distribute_signed_bundle(
     } else {
         String::new()
     };
-    ssh::run_remote(
-        conn,
-        &format!(
-            "sudo -n install -d -m 0700 -o rustynetd -g rustynetd '{install_dir}' && \
-             sudo -n install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
-             sudo -n rm -f '{remote_tmp}'{log_init}"
-        ),
-        SHORT_TIMEOUT,
-    )?;
-    Ok(())
+    Ok(format!(
+        "sudo -n install -d -m 0700 -o rustynetd -g rustynetd '{install_dir}' && \
+         sudo -n install -m {mode} -o {owner} -g rustynetd '{remote_tmp}' '{install_dst}' && \
+         sudo -n rm -f '{remote_tmp}'{log_init} && \
+         test \"$(sudo shasum -a 256 '{install_dst}' | awk '{{print $1}}')\" = '{expected_sha256}'"
+    ))
 }
 
 /// Distribute the verifier public-key for `kind` to this macOS node.
@@ -805,7 +821,7 @@ fn macos_verifier_key_path(kind: &BundleKind) -> String {
     }
 }
 
-fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
+pub(crate) fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     let staging = MACOS_STAGING_DIR;
     let state = MACOS_STATE_ROOT;
     match kind {
@@ -882,6 +898,38 @@ fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F1a pin (macOS twin of the Linux digest read-back): the install script
+    /// must carry the `shasum -a 256` read-back and the host-side expected
+    /// hex, for EVERY bundle kind. Mutation caught: dropping the digest tail
+    /// from `macos_bundle_install_script` removes the assertion this test
+    /// observes.
+    #[test]
+    fn macos_bundle_install_script_carries_the_digest_read_back() {
+        for kind in [
+            BundleKind::Membership,
+            BundleKind::Assignment,
+            BundleKind::Traversal,
+            BundleKind::DnsZone,
+        ] {
+            let (remote_tmp, install_dst) = remote_bundle_paths(&kind);
+            let expected = "cafebabe".repeat(8);
+            let script = macos_bundle_install_script(&kind, &remote_tmp, &install_dst, &expected)
+                .expect("script renders");
+            assert!(
+                script.contains("sudo shasum -a 256"),
+                "{kind:?}: script must read the installed digest back: {script}"
+            );
+            assert!(
+                script.contains(&format!("= '{expected}'")),
+                "{kind:?}: script must pin the host-side expected hex: {script}"
+            );
+            assert!(
+                script.contains(&install_dst),
+                "{kind:?}: digest must be taken over the install destination: {script}"
+            );
+        }
+    }
     use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_MEMBERSHIP_DIR;
 
     #[test]
@@ -1551,12 +1599,10 @@ mod exit_capability_rewrite_tests {
             post_genesis_commands("node-exit-1", &peers, &anchor_genesis_caps()).expect("plan");
         assert_eq!(post.len(), 2);
         assert_eq!(post[0].kind, PlanStepKind::ExitCapabilityRewrite);
-        assert!(
-            post[0]
-                .command
-                .as_str()
-                .contains("e2e-membership-set-capabilities")
-        );
+        assert!(post[0]
+            .command
+            .as_str()
+            .contains("e2e-membership-set-capabilities"));
         assert_eq!(post[1].kind, PlanStepKind::PeerAdd);
         assert!(post[1].command.as_str().contains("e2e-membership-add"));
         // Exactly one rewrite step, ever.
@@ -1594,13 +1640,11 @@ mod exit_capability_rewrite_tests {
         assert!(interpret_owner_key_presence(Ok(String::new())).expect("present"));
         // exit 1 → absent (test -e false), and ONLY after sudo was proven to
         // work by the preceding `sudo -n true` step in the probe.
-        assert!(
-            !interpret_owner_key_presence(Err(AdapterError::Command {
-                exit_code: Some(1),
-                stderr: String::new(),
-            }))
-            .expect("absent")
-        );
+        assert!(!interpret_owner_key_presence(Err(AdapterError::Command {
+            exit_code: Some(1),
+            stderr: String::new(),
+        }))
+        .expect("absent"));
         // Any other exit status is not an answer.
         let err = interpret_owner_key_presence(Err(AdapterError::Command {
             exit_code: Some(2),
@@ -1608,13 +1652,11 @@ mod exit_capability_rewrite_tests {
         }))
         .expect_err("exit 2 must not read as absent");
         assert!(err.to_string().contains("unexpected status"), "{err}");
-        assert!(
-            interpret_owner_key_presence(Err(AdapterError::Command {
-                exit_code: None,
-                stderr: "killed".to_owned(),
-            }))
-            .is_err()
-        );
+        assert!(interpret_owner_key_presence(Err(AdapterError::Command {
+            exit_code: None,
+            stderr: "killed".to_owned(),
+        }))
+        .is_err());
         // Transport failures propagate as themselves.
         let err = interpret_owner_key_presence(Err(AdapterError::Ssh {
             message: "connection reset".to_owned(),
