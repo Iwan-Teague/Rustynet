@@ -72,3 +72,18 @@ F1 = M (three adapter tails + evidence write + catalog flip + tests). F2, F3, F4
 - Windows/macOS `install` scripts were verified digest-free via grep context, not full-file reads.
 
 ## Tools used (53 call(s); step budget of 40 reached)
+
+## Review disposition (2026-09-09, GLM-flash, MERGE-WITH-FIXES → merged)
+
+F1a CONFIRMED on all three platforms (host-side sha256 + remote read-back
+chained into the install; mismatch/unreadable → Err; hex-only digest
+interpolation), F2 CONFIRMED (Linux/macOS refuse to mint `<alias>-bootstrap`
+at enforce time; Windows never had the fallback; the install-time mint is
+the one named helper), F4 CONFIRMED (gate runs BEFORE the scp-back — safer
+than the audit's wording). Fixes applied before merge: `missing_bundle_files`
+denies on an absent/empty `NODES_SPEC` instead of yielding an empty
+expectation set; a source pin proves the gate is wired ahead of the scp-back;
+F3 (empty-scope guards in collect_pubkeys / enforce_baseline_runtime /
+validate_baseline_runtime / distribute_membership) landed with their tests
+flipped to `Failed`. **F1b (bundle witness files + catalog rows) is carried
+by the Setup witness batch job.**
