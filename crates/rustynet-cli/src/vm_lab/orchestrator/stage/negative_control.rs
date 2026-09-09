@@ -1115,6 +1115,10 @@ exit 0
     }
 
     /// Parse the script's `nc_*` token transcript, fail-closed at every hole.
+    /// The inversion record the daemon-kill control declares as its File
+    /// witness; the catalog row must end with this exact name.
+    pub(crate) const KILL_WINDOW_TRANSCRIPT_FILE: &str = "kill_window_transcript.txt";
+
     pub(crate) fn parse_kill_window_transcript(
         exit_code: i32,
         transcript: &str,
@@ -1321,7 +1325,7 @@ exit 0
         let stderr = String::from_utf8_lossy(&status.stderr).into_owned();
         if let Err(err) = write_control_evidence(
             workdir,
-            "kill_window_transcript.txt",
+            KILL_WINDOW_TRANSCRIPT_FILE,
             &format!(
                 "exit={}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}\n",
                 status.code
@@ -2919,6 +2923,10 @@ mod tests {
         assert_eq!(
             signed_bundle::WRONG_NODE_TRANSCRIPT_FILE,
             "wrong_node_transcript.json"
+        );
+        assert_eq!(
+            super::daemon_kill::KILL_WINDOW_TRANSCRIPT_FILE,
+            "kill_window_transcript.txt"
         );
         let expected = [
             (

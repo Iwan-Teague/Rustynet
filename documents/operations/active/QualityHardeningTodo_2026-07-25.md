@@ -7121,8 +7121,19 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    `301495cf`** (lenovo-bot + katana, 2-node Linux, each 38 pass / 0 fail /
    28 skipped, no NotProven; the File rows exercised in a 2-node topology —
    managed_dns, network_flap, reboot_recovery — produced their report
-   witnesses). Remaining pending: 11 CrossNetwork, 9 Chaos, 4 NegativeControl,
-   RelayForwardsFrame, ExtendedSoak (26) — branches gated, under review. The NegativeControl stages'
+   witnesses). **The last 26 rows landed the same night** (CrossNetwork/Disruptive/Soak
+   merge `c519288a`, Chaos/NegativeControl merge `5cdbdc13`; both flash
+   reviews MERGE-SAFE): the 9 chaos bins' `<stage>_report.json` and the
+   cross-network preflight/NAT reports are `File` witnesses verified fatally
+   after each child exits; the 8 ported cross-network scenarios append one
+   `scenario_pass profile=… report=…` line per profile; the negative
+   controls declare their INVERSION transcripts (`verifier_transcript.json`,
+   `wrong_node_transcript.json`, `kill_window_transcript.txt`) and the
+   planted-residue control a sabotage+detection stage-log line. **Every
+   catalog row now declares real evidence — zero `PHASE1_EVIDENCE_PENDING`
+   rows remain.** Live re-verify of these phases needs the cross-network /
+   chaos / negative-control plans (not the default 2-node Linux run) and is
+   owed per phase before an evidence claim. The NegativeControl stages'
    witness is their inversion record (`write_control_evidence` output), never a
    lazy `None`. Each stage still needs the individual "what datum IS this
    verdict" decision — a constant-line appeasement satisfies emptiness without
