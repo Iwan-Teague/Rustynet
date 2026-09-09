@@ -10,58 +10,105 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const REQUIRED_COMMANDS: &[&str] = &["cargo", "git"];
-const REQUIRED_TESTS: &[(&str, &str)] = &[
+/// (package, test filter, extra cargo args). The extra args exist for tests
+/// behind default-off cargo features: the vm_lab surface (RNQ-17) only
+/// compiles under `--features vm-lab`, so its required tests pass
+/// `--all-features` — without it cargo silently runs ZERO tests for the
+/// filter and the fail-closed output verifier rejects the run.
+const REQUIRED_TESTS: &[(&str, &str, &[&str])] = &[
     (
         "rustynet-control",
         "operations::tests::redaction_covers_all_ingestion_paths",
+        &[],
     ),
     (
         "rustynet-control",
         "operations::tests::structured_logger_never_writes_cleartext_secrets",
+        &[],
     ),
     (
         "rustynet-control",
         "token_claims_debug_redacts_sensitive_fields",
+        &[],
     ),
     (
         "rustynet-control",
         "throwaway_credential_debug_redacts_sensitive_fields",
+        &[],
     ),
     (
         "rustynetd",
         "daemon::tests::validate_file_security_rejects_group_writable_parent_directory",
+        &[],
     ),
     (
         "rustynetd",
         "daemon::tests::validate_file_security_rejects_symlink_parent_directory",
+        &[],
     ),
     (
         "rustynetd",
         "daemon::tests::passphrase_permission_mask_accepts_systemd_runtime_credential_mode",
+        &[],
     ),
     (
         "rustynetd",
         "key_material::tests::remove_file_if_present_removes_target_file",
+        &[],
     ),
     (
         "rustynetd",
         "key_material::tests::remove_file_if_present_rejects_directory",
+        &[],
     ),
     (
         "rustynetd",
         "key_material::tests::remove_file_if_present_removes_symlink_without_following_target",
+        &[],
     ),
     (
         "rustynet-cli",
         "signing_key_loader_rejects_group_readable_file",
+        &[],
     ),
-    ("rustynet-cli", "signing_key_loader_rejects_symlink_path"),
-    ("rustynet-cli", "signing_key_loader_accepts_owner_only_file"),
-    ("rustynet-cli", "secure_remove_file_rejects_directory"),
-    ("rustynet-cli", "secure_remove_file_removes_target_file"),
+    (
+        "rustynet-cli",
+        "signing_key_loader_rejects_symlink_path",
+        &[],
+    ),
+    (
+        "rustynet-cli",
+        "signing_key_loader_accepts_owner_only_file",
+        &[],
+    ),
+    ("rustynet-cli", "secure_remove_file_rejects_directory", &[]),
+    (
+        "rustynet-cli",
+        "secure_remove_file_removes_target_file",
+        &[],
+    ),
     (
         "rustynet-cli",
         "create_secure_temp_file_sets_owner_only_mode",
+        &[],
+    ),
+    // QH-85 F3: the sink-side spawn scanner and the inventory destination
+    // allowlist are part of this gate's proof — the gate must RUN them, not
+    // merely rely on their existence in the test suite.
+    (
+        "rustynet-cli",
+        "vm_lab::tests::ssh_sinks_carry_the_destination_guard_and_sshpass_never_takes_a_password_flag",
+        &["--all-features"],
+    ),
+    (
+        "rustynet-cli",
+        "vm_lab::inventory_ssh_destination_allowlist_tests::ssh_target_allowlist_rejects_hostile_destinations",
+        &["--all-features"],
+    ),
+    (
+        "rustynet-cli",
+        "vm_lab::inventory_ssh_destination_allowlist_tests::last_known_ip_must_parse_as_an_ip_address",
+        &["--all-features"],
     ),
 ];
 
@@ -129,9 +176,9 @@ fn run() -> Result<(), i32> {
     let mut failures: Vec<GateFailure> = Vec::new();
     let mut checks_run: usize = 0;
 
-    for (package, test_filter) in REQUIRED_TESTS {
+    for (package, test_filter, test_features) in REQUIRED_TESTS {
         checks_run += 1;
-        if let Err(code) = run_required_test(package, test_filter) {
+        if let Err(code) = run_required_test(package, test_filter, test_features) {
             failures.push(GateFailure {
                 name: format!("required test: {package} :: {test_filter}"),
                 code,
@@ -151,6 +198,18 @@ fn run() -> Result<(), i32> {
     if let Err(code) = run_check_no_tracked_lab_passwords(&root_dir) {
         failures.push(GateFailure {
             name: "repo scan: no inline ssh_password in tracked inventories".to_owned(),
+            code,
+        });
+    }
+
+    checks_run += 1;
+    if let Err(code) = run_check_no_privileged_exec_literals(&root_dir) {
+        failures.push(GateFailure {
+            name: concat!(
+                "repo scan: no sudo-echo literals or sshpass password flags ",
+                "under crates/ and scripts/"
+            )
+            .to_owned(),
             code,
         });
     }
@@ -257,6 +316,150 @@ fn run_check_no_tracked_lab_passwords(root_dir: &Path) -> Result<(), i32> {
     Ok(())
 }
 
+/// QH-85 F3: scan every tracked file under `crates/` and `scripts/` for the two
+/// privileged-execution shapes the 2026-09-08 lab-robot audit found in a public
+/// repository:
+///
+/// 1. a guest sudo password fed to `sudo -S` as a source literal — an
+///    `echo <literal>` shell line piped into `sudo -S`;
+/// 2. a lab SSH password on the local argv — the sshpass password flag in a
+///    shell line, or `.arg("-p")` between an `sshpass` spawn and the `ssh` it
+///    wraps (after the wrapped `ssh`, `-p` is the legitimate port flag).
+///
+/// Every needle is assembled from parts so this gate's own source — which lives
+/// under `crates/` and IS scanned by its own rule — never contains the raw
+/// pattern it searches for (the same self-proof discipline as the vm_lab
+/// source-pin scanner). Fail closed: a tracked file that cannot be read as
+/// UTF-8 text is a config error, never a skip.
+fn privileged_exec_offenders(rel_path: &str, body: &str) -> Vec<String> {
+    let q = '"';
+    let sudo_pipe = format!("| sudo -{s}", s = "S");
+    let echo_single = "echo '";
+    let echo_double = "echo \"";
+    let shell_sshpass_password = format!("sshpass -{p}", p = "p");
+    let rust_sshpass_spawn = format!("Command::new({q}sshpass{q})");
+    let rust_password_arg = format!(".arg({q}-p{q})");
+    let rust_wrapped_ssh = format!(".arg({q}ssh{q})");
+
+    let mut offenders = Vec::new();
+    // Watching is set by a `Command::new("sshpass")` line and ends at the
+    // wrapped `.arg("ssh")`: only a `-p` INSIDE that window carries the
+    // password — after the wrapped ssh, `-p` is the port flag.
+    let mut watching_sshpass = false;
+    for (idx, line) in body.lines().enumerate() {
+        let line_no = idx + 1;
+        if line.contains(&sudo_pipe) && (line.contains(echo_single) || line.contains(echo_double)) {
+            offenders.push(format!(
+                "{rel_path}:{line_no}: an echo literal feeds `sudo -S` on the same line — \
+                 a guest sudo password published in source; deliver it over a stdin channel \
+                 from the secrets sidecar instead"
+            ));
+        }
+        if line.contains(&shell_sshpass_password) {
+            offenders.push(format!(
+                "{rel_path}:{line_no}: `sshpass {p}` puts the lab SSH password on the \
+                 process argv; use `sshpass -e` with the SSHPASS environment variable",
+                p = "-p"
+            ));
+        }
+        if line.contains(&rust_sshpass_spawn) {
+            watching_sshpass = true;
+        } else if watching_sshpass {
+            if line.contains(&rust_password_arg) {
+                offenders.push(format!(
+                    "{rel_path}:{line_no}: `.arg(\"-p\")` between an sshpass spawn and its \
+                     wrapped ssh puts the password on the argv; use `-e` + SSHPASS"
+                ));
+            }
+            if line.contains(&rust_wrapped_ssh) {
+                watching_sshpass = false;
+            }
+        }
+    }
+    offenders
+}
+
+fn run_check_no_privileged_exec_literals(root_dir: &Path) -> Result<(), i32> {
+    let output = Command::new("git")
+        .args(["ls-files", "-z", "--", "crates", "scripts"])
+        .current_dir(root_dir)
+        .stdin(Stdio::null())
+        .output();
+    let output = match output {
+        Ok(out) if out.status.success() => out,
+        Ok(out) => {
+            eprintln!(
+                "error [{}]: git ls-files failed: {}",
+                ExitCode::ConfigError,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            return Err(ExitCode::ConfigError.as_i32());
+        }
+        Err(err) => {
+            eprintln!(
+                "error [{}]: git ls-files failed: {err}",
+                ExitCode::ConfigError
+            );
+            return Err(ExitCode::ConfigError.as_i32());
+        }
+    };
+
+    let mut offenders = Vec::new();
+    for rel in String::from_utf8_lossy(&output.stdout)
+        .split('\0')
+        .filter(|s| !s.is_empty())
+    {
+        // Fail closed: an unreadable or non-UTF-8 tracked file stops the scan
+        // with a config error. A scan that skips files it cannot read is a
+        // gate that lies about what it covered.
+        let body = match fs::read_to_string(root_dir.join(rel)) {
+            Ok(body) => body,
+            Err(err) => {
+                eprintln!(
+                    "error [{}]: tracked file {rel} cannot be read as text ({err}); \
+                     refusing to scan past it",
+                    ExitCode::ConfigError
+                );
+                return Err(ExitCode::ConfigError.as_i32());
+            }
+        };
+        // Rust test modules are CUT from the scan, not exempted wholesale: a
+        // negative test's fixture deliberately quotes the defect shape it
+        // proves against (the QH-85 F1/F2 fixtures in
+        // macos_install.rs::sshpass_prime_commands… are the reason this scan
+        // exists), so scanning test code would make every honest fixture an
+        // offender. Production code — where a leak would actually ship — is
+        // what this rule covers, and the cut starts at the first
+        // `#[cfg(test)]`, the same implementation/test slice discipline the
+        // vm_lab source-pin scanner enforces. The gate's own source stays
+        // fully scanned: it is production code.
+        let body: &str = if rel.ends_with(".rs") {
+            body.split("#[cfg(test)]").next().unwrap_or(&body)
+        } else {
+            &body
+        };
+        offenders.extend(privileged_exec_offenders(rel, body));
+    }
+
+    if !offenders.is_empty() {
+        eprintln!(
+            "error [{}]: privileged-execution literal(s) found under crates/ or scripts/:",
+            ExitCode::PolicyReject
+        );
+        for offender in &offenders {
+            eprintln!("  {offender}");
+        }
+        eprintln!(
+            "  sshpass must take the password via `-e` + the SSHPASS environment var;\n  \
+             a guest sudo password must reach `sudo -S` over a stdin channel from the\n  \
+             untracked secrets sidecar — never as a source literal."
+        );
+        return Err(ExitCode::PolicyReject.as_i32());
+    }
+    println!("  no sudo-echo literals or sshpass -p under crates/ and scripts/: ok");
+    Ok(())
+}
+
 fn find_root_dir() -> Result<PathBuf, String> {
     let exe =
         env::current_exe().map_err(|err| format!("failed to resolve current executable: {err}"))?;
@@ -303,7 +506,7 @@ fn require_command(cmd: &str) -> Result<(), i32> {
     }
 }
 
-fn run_required_test(package: &str, test_filter: &str) -> Result<(), i32> {
+fn run_required_test(package: &str, test_filter: &str, extra_args: &[&str]) -> Result<(), i32> {
     let tmp_output = TempOutputGuard::create().map_err(|err| {
         eprintln!("error [{}]: {err}", ExitCode::ConfigError);
         ExitCode::ConfigError.as_i32()
@@ -321,6 +524,7 @@ fn run_required_test(package: &str, test_filter: &str) -> Result<(), i32> {
         })?;
     let status = Command::new("cargo")
         .args(["test", "-p", package, test_filter])
+        .args(extra_args)
         .args(["--", "--nocapture"])
         .stdin(Stdio::null())
         .stdout(Stdio::from(output_file.try_clone().map_err(|err| {
@@ -650,5 +854,105 @@ mod tests {
             code: 42,
         }];
         assert_ne!(worst_exit_code(&failures), 0);
+    }
+
+    // ── QH-85 F3: the privileged-execution literal scan must be a POSITIVE
+    //    scan — a fixture carrying the pattern is REJECTED, and the accepted
+    //    (env-var + stdin-channel) shapes pass clean. The fixtures below are
+    //    the shapes captured verbatim from commit 6908f20d, with the live
+    //    password value REDACTED (rotation is still owed; the value must never
+    //    be re-published here). The needles are assembled from parts so this
+    //    test source is never itself an offender of the scan it proves.
+
+    /// The captured sudoers-priming remote command: an echo literal piped into
+    /// `sudo -S`. MUTATION CAUGHT: reintroducing any `echo '<literal>' |
+    /// sudo -S` line under crates/ or scripts/ fails the gate.
+    #[test]
+    fn gate_rejects_the_captured_sudoers_echo_literal() {
+        let captured = format!(
+            r#".arg("echo '{REDACTED}' | sudo -{s} bash -c 'echo \"%admin ALL=(ALL) NOPASSWD: ALL\" > /etc/sudoers.d/99-rustynet-lab && chmod 0440 /etc/sudoers.d/99-rustynet-lab'");"#,
+            REDACTED = "<live-password-redacted-rotation-owed>",
+            s = "S",
+        );
+        let offenders = super::privileged_exec_offenders("fixture.rs", &captured);
+        assert!(
+            offenders.iter().any(|o| o.contains("echo literal feeds")),
+            "the captured echo-literal shape must be rejected, got: {offenders:?}"
+        );
+    }
+
+    /// The captured `sshpass -p` argv shape. MUTATION CAUGHT: a shell line (or
+    /// error message) spawning sshpass with the password flag again passes.
+    #[test]
+    fn gate_rejects_the_captured_sshpass_shell_flag() {
+        let captured = format!(
+            "sshpass -{p} \"$LAB_PASSWORD\" ssh -o StrictHostKeyChecking=yes admin@10.0.0.5",
+            p = "p",
+        );
+        let offenders = super::privileged_exec_offenders("fixture.sh", &captured);
+        assert!(
+            offenders.iter().any(|o| o.contains("process argv")),
+            "the captured `sshpass -p` shell shape must be rejected, got: {offenders:?}"
+        );
+    }
+
+    /// The captured Rust arg-list shape: `.arg("-p").arg(password)` between the
+    /// sshpass spawn and the wrapped ssh. MUTATION CAUGHT: reverting the
+    /// builder to `cmd.arg("-p").arg(password)` before `.arg("ssh")`.
+    #[test]
+    fn gate_rejects_the_captured_sshpass_rust_arg_list() {
+        let q = '"';
+        let captured = format!(
+            r#"let mut cmd = std::process::Command::new({q}sshpass{q});
+            cmd.arg({q}-p{q})
+                .arg(password)
+                .arg({q}ssh{q})
+                .arg({q}-i{q})
+                .arg(identity_file);"#,
+            q = q,
+        );
+        let offenders = super::privileged_exec_offenders("fixture.rs", &captured);
+        assert!(
+            offenders
+                .iter()
+                .any(|o| o.contains("between an sshpass spawn")),
+            "the captured `.arg(\"-p\")` arg-list shape must be rejected, got: {offenders:?}"
+        );
+    }
+
+    /// The ACCEPTED shape — the current `sshpass_ssh_command` builder lines:
+    /// `-e` + SSHPASS env, `--` before the destination, and `.arg("-p")` only
+    /// AFTER the wrapped ssh (the port flag). Must produce no offenders.
+    #[test]
+    fn gate_accepts_the_env_var_and_stdin_channel_shapes() {
+        let q = '"';
+        let current_builder = format!(
+            r#"let mut cmd = std::process::Command::new({q}sshpass{q});
+    cmd.env("SSHPASS", password)
+        .arg("-e")
+        .arg("ssh")
+        .arg("-i")
+        .arg(identity_file)
+        .arg("-p")
+        .arg(port.to_string())
+        .arg("--")
+        .arg(format!("{{user_flag}}{{host}}"));"#,
+            q = q,
+        );
+        // The accepted sudo path: the password crosses on stdin, not in the
+        // remote command string.
+        let stdin_channel = concat!(
+            "const PRIME_SUDOERS_REMOTE_COMMAND: &str = ",
+            "\"sudo -S bash -c 'echo \\\"%admin ALL=(ALL) NOPASSWD: ALL\\\" ",
+            "> /etc/sudoers.d/99-rustynet-lab'\";",
+        );
+        let offenders = super::privileged_exec_offenders(
+            "fixture.rs",
+            &format!("{current_builder}\n{stdin_channel}"),
+        );
+        assert!(
+            offenders.is_empty(),
+            "accepted shapes must pass clean, got: {offenders:?}"
+        );
     }
 }

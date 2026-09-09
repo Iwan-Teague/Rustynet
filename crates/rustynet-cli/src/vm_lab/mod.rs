@@ -38718,13 +38718,13 @@ mod tests {
                         // Arm 3: the wrapped ssh must still guard its
                         // destination before the next spawn boundary.
                         let wrapped = &content[start..window_end];
-                        if let Some(ssh_at) = wrapped.find(arg_ssh.as_str()) {
-                            if !wrapped[ssh_at..].contains(destination_guard.as_str()) {
-                                offenders.push(format!(
-                                    "{rel}:{line} sshpass-wrapped ssh has no {destination_guard} \
-                                     before its destination"
-                                ));
-                            }
+                        if let Some(ssh_at) = wrapped.find(arg_ssh.as_str())
+                            && !wrapped[ssh_at..].contains(destination_guard.as_str())
+                        {
+                            offenders.push(format!(
+                                "{rel}:{line} sshpass-wrapped ssh has no {destination_guard} \
+                                 before its destination"
+                            ));
                         }
                         continue;
                     }
@@ -38733,8 +38733,7 @@ mod tests {
                     let exempt = allowlist.iter().any(|(path, allowed_needle, _)| {
                         rel.ends_with(path) && *allowed_needle == needle
                     });
-                    if !exempt && !content[start..window_end].contains(destination_guard.as_str())
-                    {
+                    if !exempt && !content[start..window_end].contains(destination_guard.as_str()) {
                         offenders.push(format!(
                             "{rel}:{line} {kind} spawn has no {destination_guard} argument \
                              before its destination; a destination beginning with '-' would \
@@ -53273,7 +53272,11 @@ mod inventory_ssh_destination_allowlist_tests {
     /// the trim cannot hide.
     #[test]
     fn ssh_user_allowlist_rejects_hostile_users() {
-        for (hostile, field_class) in [("-oFoo", "SSH user"), ("a b", "SSH user"), ("a\nb", "SSH user")] {
+        for (hostile, field_class) in [
+            ("-oFoo", "SSH user"),
+            ("a b", "SSH user"),
+            ("a\nb", "SSH user"),
+        ] {
             let temp = tempfile::TempDir::new().expect("tempdir");
             let inv = write_entry_inventory(temp.path(), Some("10.0.0.9"), Some(hostile), None);
             let err = load_inventory_with_hosts(&inv)
@@ -53323,15 +53326,18 @@ mod inventory_ssh_destination_allowlist_tests {
     fn real_lab_inventory_still_parses_under_the_allowlist() {
         let real = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../documents/operations/active/vm_lab_inventory.json");
-        let (entries, hosts) = load_inventory_with_hosts(&real)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "tracked vm_lab_inventory.json must still parse under the \
+        let (entries, hosts) = load_inventory_with_hosts(&real).unwrap_or_else(|err| {
+            panic!(
+                "tracked vm_lab_inventory.json must still parse under the \
                      destination allowlist: {err}"
-                )
-            });
-        assert!(entries.len() >= 10, "fleet entries vanished: {}", entries.len());
-        assert!(hosts.len() >= 1, "hosts vanished: {}", hosts.len());
+            )
+        });
+        assert!(
+            entries.len() >= 10,
+            "fleet entries vanished: {}",
+            entries.len()
+        );
+        assert!(!hosts.is_empty(), "hosts vanished: {}", hosts.len());
     }
 
     /// Positive unit cases the denylist could not express: an IPv6 literal
@@ -53340,7 +53346,12 @@ mod inventory_ssh_destination_allowlist_tests {
     /// single argv element after `--`, never a shell word or path segment.
     #[test]
     fn allowlist_still_accepts_ipv6_user_host_and_trailing_dot_forms() {
-        for target in ["2001:db8::1", "user@host.example.com", "host.example.com.", "a..b"] {
+        for target in [
+            "2001:db8::1",
+            "user@host.example.com",
+            "host.example.com.",
+            "a..b",
+        ] {
             let temp = tempfile::TempDir::new().expect("tempdir");
             let inv = write_entry_inventory(temp.path(), Some(target), None, Some("fe80::1"));
             load_inventory_with_hosts(&inv)
