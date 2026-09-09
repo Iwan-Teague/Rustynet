@@ -6868,6 +6868,78 @@ deliberately not landed on its own.
 
 ### QH-82 — six orchestrator platform-resolution sites silently substituted Linux for an unrecorded platform; the root-cause `VmGuestPlatform::infer` else-Linux default remains open, checked 2026-09-08
 
+**RESOLVED 2026-09-09 — root cause landed (commits `568d1aaf`, `a4475c53`, `1ef841b2`,
+reviewed design `PlatformInferMigrationDesign_2026-09-08.md` verdict BUILD-WITH-CHANGES,
+implemented as corrected). The pre-2026-09-09 record below is retained for the R7 half
+(`f386b249`) and because the eventual-fix section predicted the shape that landed.**
+
+**What the root-cause fix changed.**
+
+- `VmGuestPlatform::infer` returns `Option<Self>` with the mandatory Linux hint arm
+  (`linux|debian|ubuntu|fedora|mint`, mirroring `parse`'s Linux arm — a name `parse`
+  cannot resolve cannot silently infer either); precedence preserved
+  Windows > macOS > iOS > Android > Linux. The unconditional `else { Self::Linux }`
+  residue is gone.
+- `effective_platform_profile` and `VmInventoryEntry::platform_profile()` return
+  `Result<VmPlatformProfile, String>` naming the alias; the compiler forced every
+  `.platform_profile()` caller to name the unknown.
+- **Corrected site counts** (re-measured on the implementation tree; the design said
+  33-in-mod.rs / 35-raw and the review said 34-raw — the true numbers are **34 raw
+  `.platform_profile()` call lines: 32 in `vm_lab/mod.rs`, 1 in
+  `overnight/executor.rs:492`, 1 in `overnight/mod.rs:97`**; the "definition/impl
+  included in raw hits" claim in the design was wrong — `.platform_profile()` never
+  matched the definition). `infer` call sites: 3, exact
+  (`effective_platform_profile`, the unmatched-local-UTM discovery branch,
+  `topology.rs` `platform_for_entry`).
+- Per-site dispositions: assertion sites (13 pairs) bind the profile once and `?`;
+  data builders (`resolve_start_targets`, `resolve_role_target_from_inventory`,
+  `ensure_suite_topology_linux_only`, `remote_target_from_inventory_entry` — the last
+  now returns `Result<RemoteTarget, String>` so no caller receives a Linux-dressed
+  target) `?` into their enclosing Results; the two overnight sites are SELECTION
+  filters and therefore EXCLUDE un-inferable entries (never error, never guess —
+  `role_matches_entry` returns false; `resolve_platforms` keeps only resolvable
+  entries).
+- The three remaining silent sites from the task brief (audit `3019`/`13843`/`13918`,
+  this tree `3392`/`14265`/`14340` at implementation time):
+  diagnose FAILS CLOSED explicit-platform-only (error names the alias; no inference
+  fallback in a diagnostic tool — the platform picks the adapter); both relay-topology
+  filters become positive allowlists `matches!(e.platform, Some(Linux))` with the
+  excluded-unknown aliases appended to the pre-existing relay-miss/peer-count errors
+  (hard-erroring inside the filter would abort every legitimate mixed topology —
+  selecting nothing is correct there; the unacceptable outcome was a selection made
+  from a guess).
+- Discovery's unmatched-local-UTM branch degrades honestly: un-inferable UTM name →
+  profile-less record, serialized `"platform": "unknown"`, note
+  `platform-not-inferable-from-utm-name`, no debian ssh user, raw-address
+  `ssh_target_source=platform-uninferable-unmatched`, auth probe refuses, readiness
+  inputs carry `Option<VmGuestPlatform>` so an unknown never takes Windows handling.
+- `topology.rs platform_for_entry` maps `infer`'s `None` onto its `Option` return; the
+  quarantine comment pins None → hard-error for the G2 re-wire.
+
+**The review's blocking change — the CI tripwire — landed FIRST** (`568d1aaf`):
+`scripts/ci/check_platform_infer_tripwire.sh` →
+`crates/rustynet-cli/src/bin/check_platform_infer_tripwire.rs`, wired into the
+gate-runner security set (`SECURITY_GATES`). It fails on `infer(` composed with
+`unwrap_or`/`unwrap_or_else` yielding `VmGuestPlatform::Linux` (one line or spread
+across a statement) and on any bare `unwrap_or(VmGuestPlatform::Linux)` /
+`unwrap_or_else(.. Linux)` / `Self::Linux` spelling under `crates/`, skipping comments
+and its own fixture-carrying source; 7 self-tests pin the detector. Verified red on the
+pre-migration tree (named exactly the 3 sites) and green after.
+
+**Verification.** Nine behaviour tests added (`1ef841b2`), each naming its caught
+mutation; mutation-checked live: re-adding the infer Linux residue,
+dropping the hint arm, chain `unwrap_or`, diagnose `unwrap_or(Linux)`, and relay-filter
+`unwrap_or(Linux)` each make the corresponding test FAIL. Gates at landing:
+`cargo fmt --all -- --check` exit 0; `cargo clippy -p rustynet-cli --all-targets
+--all-features -- -D warnings` exit 0; `cargo check -p rustynet-cli --all-targets
+--all-features` exit 0; `cargo test -p rustynet-cli --lib --all-features` 3151 passed /
+0 failed; tripwire PASS (553 files). Known accepted consequence: hint-arm asymmetry —
+a platform-less Rocky/Alma/RHEL guest fails closed at every resolution site until the
+inventory gains `platform` (deliberate; current inventory has no such entry).
+
+--- (original 2026-09-08 record follows) ---
+
+
 **The defect.** Six resolution sites read a node's platform as
 `adapter.platform()` / `entry.platform` and ended in
 `unwrap_or(VmGuestPlatform::Linux)`. A node whose adapter was not yet registered, or whose

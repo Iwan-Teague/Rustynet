@@ -91,10 +91,13 @@ pub struct VmLabOvernightConfig {
 /// Resolve the lab's platforms: the desktop platforms present in the inventory,
 /// or all three if the inventory is unreadable or names none.
 fn resolve_platforms(inventory_path: &Path) -> Vec<VmGuestPlatform> {
+    // QH-82: an un-inferable entry claims no platform at all — it is never
+    // coerced into the Linux/desktop set.
     let present: Vec<VmGuestPlatform> = match super::load_inventory(inventory_path) {
         Ok(entries) => entries
             .iter()
-            .map(|e| e.platform_profile().platform)
+            .filter_map(|e| e.platform_profile().ok())
+            .map(|profile| profile.platform)
             .collect(),
         Err(_) => Vec::new(),
     };
