@@ -8,8 +8,8 @@
 //! `overall_ok=false`, or inconsistent per-entry status — so a broken or
 //! vacuous check fails the stage rather than silently passing.
 
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::VmGuestPlatform;
 
 /// True where key-custody validation runs live (Linux, macOS, Windows).
 pub fn key_custody_runtime_implemented(platform: VmGuestPlatform) -> bool {
@@ -35,7 +35,9 @@ pub fn validate_linux_key_custody(
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::vm_lab::evaluate_linux_key_custody_report(alias, &stdout)?;
+    super::require_daemon_success(out.code, SUBCOMMAND, alias, &stdout, |report| {
+        crate::vm_lab::evaluate_linux_key_custody_report(alias, report)
+    })?;
     Ok(())
 }
 
@@ -50,7 +52,9 @@ pub fn validate_macos_key_custody(
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::vm_lab::evaluate_macos_key_custody_report(alias, &stdout)?;
+    super::require_daemon_success(out.code, SUBCOMMAND, alias, &stdout, |report| {
+        crate::vm_lab::evaluate_macos_key_custody_report(alias, report)
+    })?;
     Ok(())
 }
 
@@ -65,7 +69,9 @@ pub fn validate_windows_key_custody(
         .run_argv(&argv, &[], &[])
         .map_err(|err| format!("dispatch of `{SUBCOMMAND}` failed: {err}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
-    crate::vm_lab::evaluate_windows_key_custody_report(alias, &stdout)?;
+    super::require_daemon_success(out.code, SUBCOMMAND, alias, &stdout, |report| {
+        crate::vm_lab::evaluate_windows_key_custody_report(alias, report)
+    })?;
     Ok(())
 }
 
@@ -154,6 +160,46 @@ mod tests {
         assert!(
             err.contains("dispatch") && err.contains("failed"),
             "should report dispatch failure, got: {err}"
+        );
+    }
+
+    // Mutation targeted: without the exit-code gate in `require_daemon_success`
+    // this report (evaluator-accepted, overall_ok=true) would pass despite the
+    // daemon exiting non-zero.
+    #[test]
+    fn validate_linux_fails_closed_when_daemon_exits_non_zero_with_passing_report() {
+        let mock = MockShellHost::new();
+        let argv = probe_argv();
+        let clean_report = serde_json::json!({
+            "schema_version": 1,
+            "overall_ok": true,
+            "entries": [
+                {
+                    "label": "keys directory",
+                    "path": "/var/lib/rustynet/keys",
+                    "requirement": "present",
+                    "status": "ok",
+                    "mode": 33152,
+                    "uid": 998,
+                    "gid": 998
+                }
+            ],
+            "drift_reasons": []
+        })
+        .to_string();
+        mock.program_run_response(
+            &argv,
+            RemoteExitStatus {
+                code: 1,
+                stdout: clean_report.into_bytes(),
+                stderr: Vec::new(),
+            },
+        );
+        let err = validate_linux_key_custody(&mock, TEST_DAEMON, "deb-1")
+            .expect_err("a non-zero exit must fail the stage even with a passing report");
+        assert!(
+            err.contains("exited non-zero"),
+            "should name the non-zero exit, got: {err}"
         );
     }
 }
