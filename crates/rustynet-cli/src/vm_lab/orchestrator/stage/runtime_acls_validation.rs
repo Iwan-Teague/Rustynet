@@ -3,6 +3,7 @@ use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::role_validation::runtime_acls::runtime_acls_runtime_implemented;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const REPORTED_SKIPS_FILENAME: &str = "runtime_acls_validation.reported_skips.json";
@@ -16,8 +17,9 @@ const REPORTED_SKIPS_FILENAME: &str = "runtime_acls_validation.reported_skips.js
 /// This is a per-node posture check, so it applies to every node regardless of
 /// role. Accepted only on an explicit `overall_ok: true` (fail-closed). A macOS /
 /// Windows node is **reported-skipped** — named in
-/// `runtime_acls_validation.reported_skips.json`, never a silent pass — on the
-/// [`runtime_acls_runtime_implemented`] posture gate.
+/// `runtime_acls_validation.reported_skips.json`, never a silent pass — via
+/// the supports_role_validator check and the `runtime_acls_runtime_implemented`
+/// gate in `orchestrator/role_validation/runtime_acls.rs`.
 pub struct RuntimeAclsValidationStage;
 
 impl OrchestrationStage for RuntimeAclsValidationStage {
@@ -54,7 +56,9 @@ impl OrchestrationStage for RuntimeAclsValidationStage {
                 }
             };
             let platform = adapter.platform();
-            if !adapter.supports_role_validator(RoleValidatorKind::RuntimeAcls) {
+            if !adapter.supports_role_validator(RoleValidatorKind::RuntimeAcls)
+                || !runtime_acls_runtime_implemented(platform)
+            {
                 reported_skips.push((alias.clone(), format!("{platform:?}")));
                 continue;
             }
