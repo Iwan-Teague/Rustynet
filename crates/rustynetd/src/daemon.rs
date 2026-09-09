@@ -13667,8 +13667,17 @@ fn validate_node_role_backend_capabilities(
                 && capabilities.supports_lan_routes)
         }
         NodeRole::Client => !capabilities.supports_exit_client,
+        // H3 (MultiAgentSecurityReviewAudit_2026-09-08): `blind_exit` is not
+        // implemented on Windows and the role is irreversible. The Windows
+        // NAT stage already refuses at apply time (88adebe6); refuse here too,
+        // at startup, so a daemon launched with `--node-role blind_exit
+        // --backend windows-wireguard-nt` never reaches the dataplane at all.
         NodeRole::BlindExit => {
             !(capabilities.supports_exit_nodes && capabilities.supports_exit_serving)
+                || matches!(
+                    backend_mode,
+                    DaemonBackendMode::WindowsWireguardNt | DaemonBackendMode::WindowsUnsupported
+                )
         }
         // blind_relay forwards mesh frames via the relay sibling
         // service; it serves no exit and selects no exit client,
@@ -21434,6 +21443,22 @@ mod tests {
             DaemonBackendMode::InMemory,
         )
         .expect("in-memory backend advertises blind-exit capabilities");
+        // H3: Windows declares exit capabilities but does not implement the
+        // irreversible blind_exit posture; the gate must refuse it at startup.
+        // Mutation caught: dropping the backend_mode arm (Windows advertises
+        // supports_exit_nodes + supports_exit_serving, so the capability test
+        // alone accepts it).
+        let err = super::validate_node_role_backend_capabilities(
+            NodeRole::BlindExit,
+            DaemonBackendMode::WindowsWireguardNt,
+        )
+        .expect_err("blind_exit must be refused on windows-wireguard-nt");
+        assert!(format!("{err}").contains("node_role blind_exit is not supported"));
+        super::validate_node_role_backend_capabilities(
+            NodeRole::Admin,
+            DaemonBackendMode::WindowsWireguardNt,
+        )
+        .expect("a regular exit-capable role stays accepted on windows-wireguard-nt");
 
         let userspace_caps = super::backend_mode_declared_capabilities(
             DaemonBackendMode::MacosWireguardUserspaceShared,
