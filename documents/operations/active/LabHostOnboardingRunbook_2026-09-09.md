@@ -73,8 +73,15 @@ tooling, host entries are declared):
 ```
 
 Passwords never go in the inventory (public repo): `sshpass` priming reads the
-untracked sidecar `vm_lab_inventory.secrets.json` (mode 600). Prime the Mac's
-key once: `sshpass -p … ssh-copy-id -i ~/.ssh/id_ed25519.pub user@host`.
+untracked sidecar `vm_lab_inventory.secrets.json` (mode 600). Prime the LAB
+key once — the tooling's default identity is `~/.ssh/rustynet_lab_ed25519`
+(`default_lab_ssh_identity_path`), NOT `id_ed25519`; a host that only trusts
+your personal key answers ad-hoc ssh but fails `host_preflight` gate 5 with
+`Permission denied (publickey)` **(bit us)**:
+`sshpass -p … ssh-copy-id -i ~/.ssh/rustynet_lab_ed25519.pub user@host`.
+On a umask-002 host the Debian default `~/.profile` carries a commented
+`#umask 022`, so a `grep -q "umask 022" || echo …` idempotency check matches
+the comment and appends nothing — write the line unconditionally.
 
 Then, in order (MCP tool → CLI equivalent):
 
