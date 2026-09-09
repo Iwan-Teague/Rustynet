@@ -2023,7 +2023,14 @@ impl CrossNetworkSubstrateSetupStage {
             Ok(handle) => {
                 ctx.substrate_record = Some(handle.record.clone());
                 ctx.substrate = Some(handle);
-                StageOutcome::Passed
+                // QH-83: the witness is written on EVERY pass path and a
+                // write failure fails the stage.
+                match Self::write_provision_witness(&ctx.report_dir, provider.id(), runners.len()) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(err) => {
+                        StageOutcome::Failed(format!("substrate witness write failed: {err}"))
+                    }
+                }
             }
             Err(failure) => {
                 // Keep the partial state so the always-run teardown removes
@@ -2037,6 +2044,37 @@ impl CrossNetworkSubstrateSetupStage {
                 ))
             }
         }
+    }
+    /// QH-83 witness for the no-overlay pass path: the runner demotes a
+    /// declared StageLog stage whose log is empty, so the seam's no-op pass
+    /// still records what it checked (record/request match, zero overlay
+    /// nodes) and the scope stays auditable.
+    fn write_no_overlay_witness(
+        report_dir: &std::path::Path,
+        assignments: usize,
+    ) -> Result<(), String> {
+        crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(
+            report_dir,
+            StageId::CrossNetworkSubstrateSetup.as_str(),
+            &format!(
+                "substrate_setup=no-overlay record_match=ok overlay_nodes=0 assignments={assignments}"
+            ),
+        )
+    }
+
+    /// QH-83 witness for the overlay-provisioning pass path.
+    fn write_provision_witness(
+        report_dir: &std::path::Path,
+        provider_id: &str,
+        overlay_nodes: usize,
+    ) -> Result<(), String> {
+        crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(
+            report_dir,
+            StageId::CrossNetworkSubstrateSetup.as_str(),
+            &format!(
+                "substrate_setup={provider_id} provisioned=true overlay_nodes={overlay_nodes}"
+            ),
+        )
     }
 }
 
@@ -2067,7 +2105,17 @@ impl OrchestrationStage for CrossNetworkSubstrateSetupStage {
                 // closed.
                 return match check_record_against_request(ctx.substrate_record.as_ref(), None, None)
                 {
-                    Ok(()) => StageOutcome::Passed,
+                    Ok(()) => {
+                        // QH-83: the witness is written on EVERY pass path
+                        // and a write failure fails the stage.
+                        match Self::write_no_overlay_witness(&ctx.report_dir, ctx.assignments.len())
+                        {
+                            Ok(()) => StageOutcome::Passed,
+                            Err(err) => StageOutcome::Failed(format!(
+                                "substrate witness write failed: {err}"
+                            )),
+                        }
+                    }
                     Err(err) => StageOutcome::Failed(err),
                 };
             }
@@ -3661,5 +3709,63 @@ mod tests {
         let calls = runner.recorded();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], ["ip", "link", "show"]);
+    }
+
+    // QH-83: both pass paths of cross_network_substrate_setup must leave a
+    // durable stage-log line (the catalog declares this stage StageLog and
+    // the runner demotes an unwitnessed PASS). Mutation caught: dropping a
+    // witness write or demoting it to best-effort.
+    #[test]
+    fn substrate_witness_lines_name_the_pass_path_and_scope() {
+        let dir = std::env::temp_dir().join(format!(
+            "substrate_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        CrossNetworkSubstrateSetupStage::write_no_overlay_witness(&dir, 4)
+            .expect("no-overlay witness write");
+        CrossNetworkSubstrateSetupStage::write_provision_witness(&dir, "vxlan", 3)
+            .expect("provision witness write");
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::CrossNetworkSubstrateSetup.as_str(),
+            ),
+        )
+        .expect("stage log readable");
+        assert!(
+            log.contains(
+                "substrate_setup=no-overlay record_match=ok overlay_nodes=0 assignments=4"
+            ),
+            "{log}"
+        );
+        assert!(
+            log.contains("substrate_setup=vxlan provisioned=true overlay_nodes=3"),
+            "{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as
+    /// an error the stage turns into a failure (never a silent pass).
+    #[test]
+    fn substrate_witness_write_failure_is_propagated() {
+        let blocker =
+            std::env::temp_dir().join(format!("substrate_witness_blocker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let err = CrossNetworkSubstrateSetupStage::write_no_overlay_witness(&blocker, 1)
+            .expect_err("write into a regular file path must fail");
+        assert!(!err.is_empty());
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }

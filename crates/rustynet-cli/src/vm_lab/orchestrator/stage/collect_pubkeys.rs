@@ -1,9 +1,29 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{GossipIdentity, StageOutcome};
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::cross_network::substrate::EndpointPlane;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+
+/// Writes the QH-83 witness line for a collect_pubkeys PASS: the collected
+/// identity counts travel with the verdict (the values themselves are
+/// public — WireGuard pubkeys and gossip identities — and are already in
+/// the ctx), so the scope of what was collected stays auditable.
+fn write_collection_witness(
+    report_dir: &std::path::Path,
+    pubkeys: usize,
+    gossip_identities: usize,
+    node_ids: usize,
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::CollectPubkeys.as_str(),
+        &format!(
+            "pubkeys_collected={pubkeys} gossip_identities={gossip_identities} node_ids={node_ids}"
+        ),
+    )
+}
 
 pub struct CollectPubkeysStage;
 
@@ -221,7 +241,18 @@ impl OrchestrationStage for CollectPubkeysStage {
         }
 
         if errors.is_empty() {
-            StageOutcome::Passed
+            // QH-83: the witness is written on EVERY pass path and a write
+            // failure fails the stage — an unwitnessed collection pass
+            // must not stand.
+            match write_collection_witness(
+                &ctx.report_dir,
+                ctx.collected_pubkeys.len(),
+                ctx.collected_gossip_identities.len(),
+                ctx.node_ids.len(),
+            ) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("collection witness write failed: {e}")),
+            }
         } else {
             StageOutcome::Failed(errors.join("; "))
         }
@@ -665,5 +696,55 @@ mod tests {
         );
         assert!(override_endpoint_host("192.168.64.10", "172.20.20.2").is_err());
         assert!(override_endpoint_host("host:", "172.20.20.2").is_err());
+    }
+
+    // QH-83: a PASS verdict must leave a durable stage-log line naming the
+    // collected identity counts (vacuity auditable). Mutation caught:
+    // dropping the witness write or demoting it to best-effort.
+    #[test]
+    fn collection_witness_line_names_the_collected_counts() {
+        let dir = std::env::temp_dir().join(format!(
+            "collect_pubkeys_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        write_collection_witness(&dir, 2, 2, 2).expect("witness write");
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::CollectPubkeys.as_str(),
+            ),
+        )
+        .expect("stage log readable");
+        assert!(
+            log.contains("pubkeys_collected=2 gossip_identities=2 node_ids=2"),
+            "{log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as
+    /// an error the stage turns into a failure (never a silent pass).
+    #[test]
+    fn collection_witness_write_failure_is_propagated() {
+        let blocker = std::env::temp_dir().join(format!(
+            "collect_pubkeys_witness_blocker_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let err = write_collection_witness(&blocker, 1, 1, 1)
+            .expect_err("write into a regular file path must fail");
+        assert!(!err.is_empty());
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }
