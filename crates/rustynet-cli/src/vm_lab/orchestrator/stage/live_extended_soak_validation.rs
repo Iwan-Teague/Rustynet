@@ -6,7 +6,7 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{
     OrchestrationStage, StageFanout, StageId, desktop_platform_tag,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 pub struct LiveExtendedSoakValidationStage;
@@ -48,9 +48,32 @@ impl OrchestrationStage for LiveExtendedSoakValidationStage {
             );
         }
         match run_extended_soak(ctx) {
-            Ok(()) => StageOutcome::Passed,
+            Ok(()) => match verify_report_artifact(&ctx.report_dir) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(e),
+            },
             Err(err) => StageOutcome::Failed(err),
         }
+    }
+}
+
+/// QH-83: the soak's pass verdict rests on the final substep's report, the
+/// reboot-recovery JSON. Substeps are sequential and exit-gated, so on every
+/// `Passed` path that artifact exists; verify it is present and non-empty
+/// before recording the pass, and fail the stage (never a best-effort note)
+/// when it is not.
+const REBOOT_RECOVERY_REPORT_RELATIVE: &str = "live_linux_reboot_recovery_report.json";
+
+fn verify_report_artifact(report_dir: &Path) -> Result<(), String> {
+    let path = report_dir.join(REBOOT_RECOVERY_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_file() && meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!(
+            "extended soak witness artifact {REBOOT_RECOVERY_REPORT_RELATIVE} is not a non-empty regular file"
+        )),
+        Err(err) => Err(format!(
+            "extended soak witness artifact {REBOOT_RECOVERY_REPORT_RELATIVE} missing or unreadable: {err}"
+        )),
     }
 }
 
@@ -429,6 +452,36 @@ mod tests {
     #[test]
     fn fanout_is_once() {
         assert_eq!(LiveExtendedSoakValidationStage.fanout(), StageFanout::Once);
+    }
+
+    #[test]
+    fn live_extended_soak_declared_witness_matches_its_artifact_path() {
+        // QH-83: the catalog row must declare exactly the artifact the pass
+        // verdict is verified against, so the runner's witness check and the
+        // stage's own fatality cannot drift apart.
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+        assert_eq!(
+            StageId::LiveExtendedSoakValidation.evidence(),
+            StageEvidence::File(REBOOT_RECOVERY_REPORT_RELATIVE)
+        );
+    }
+
+    #[test]
+    fn live_extended_soak_pass_without_report_artifact_is_fatal() {
+        // QH-83: a `Passed` verdict with no reboot-recovery report must be
+        // impossible — the verifier fails closed and names the artifact.
+        let dir = std::env::temp_dir().join(format!(
+            "soak_witness_missing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let err = super::verify_report_artifact(&dir).expect_err("missing artifact must fail");
+        assert!(err.contains(REBOOT_RECOVERY_REPORT_RELATIVE), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

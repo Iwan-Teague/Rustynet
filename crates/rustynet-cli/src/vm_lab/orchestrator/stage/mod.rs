@@ -453,27 +453,71 @@ define_stage_catalog! {
     // Both spellings are pinned by bundle_evidence.rs's
     // `each_witness_scope_owns_a_distinct_path`.
     RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role / StageEvidence::File("logs/refresh_signed_bundles.traversal.bundle_evidence.json"),
-    RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83: pass witness = the evidence note this stage writes on its only
+    // Passed path (fatal write; tests relay_forwards_frame_witness_note_carries_aliases_and_summary
+    // / relay_forwards_frame_witness_write_failure_is_propagated).
+    RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role / StageEvidence::File("relay_forwards_frame_validation.evidence.json"),
+    // QH-83: pass witness = the reboot-recovery report the final sequential
+    // substep writes (fatal verify_report_artifact; tests
+    // live_extended_soak_declared_witness_matches_its_artifact_path /
+    // live_extended_soak_pass_without_report_artifact_is_fatal).
+    LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience / StageEvidence::File("live_linux_reboot_recovery_report.json"),
     // Cross-NETWORK ≠ cross-OS: this suite exercises NAT/netns traversal
     // between simulated networks (spec §3 has no cross-network tier), so
     // each stage tiers by its SUBJECT — substrate correctness (T0), role
     // capability reached across networks (T1), roaming/failover (T2),
     // adversarial (T4) — never T3CrossOs.
-    CrossNetworkPreflight => "cross_network_preflight" @ CrossNetwork / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit" @ CrossNetwork / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkRelayRemoteExit => "cross_network_relay_remote_exit" @ CrossNetwork / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkFailbackRoaming => "cross_network_failback_roaming" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkControllerSwitch => "cross_network_controller_switch" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkTraversalAdversarial => "cross_network_traversal_adversarial" @ CrossNetwork / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkRemoteExitDns => "cross_network_remote_exit_dns" @ CrossNetwork / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkRemoteExitSoak => "cross_network_remote_exit_soak" @ CrossNetwork / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83: pass witness = the preflight report the child validator writes
+    // (exit-gated + fatal verify_report_artifact; tests
+    // cross_network_preflight_declared_witness_matches_its_artifact_path /
+    // cross_network_preflight_pass_without_report_artifact_is_fatal).
+    CrossNetworkPreflight => "cross_network_preflight" @ CrossNetwork / T0Core / StageEvidence::File("cross_network_preflight/cross_network_preflight_report.json"),
+    // QH-83: pass witness = per-profile StageLog line `scenario_pass
+    // profile=<p> idx=<i> report=<rel>` written inside the scenario loop
+    // (fatal write; tests cross_network_direct_remote_exit_witness_line_carries_profile_and_report_path
+    // / cross_network_direct_remote_exit_witness_write_failure_is_propagated).
+    CrossNetworkDirectRemoteExit => "cross_network_direct_remote_exit" @ CrossNetwork / T1Role / StageEvidence::StageLog,
+    // QH-83: per-profile StageLog witness as above (tests
+    // cross_network_node_network_switch_witness_line_carries_profile_and_report_path
+    // / cross_network_node_network_switch_witness_write_failure_is_propagated).
+    CrossNetworkNodeNetworkSwitch => "cross_network_node_network_switch" @ CrossNetwork / T2Resilience / StageEvidence::StageLog,
+    // QH-83: per-profile StageLog witness as above (tests
+    // cross_network_relay_remote_exit_witness_line_carries_profile_and_report_path
+    // / cross_network_relay_remote_exit_witness_write_failure_is_propagated).
+    CrossNetworkRelayRemoteExit => "cross_network_relay_remote_exit" @ CrossNetwork / T1Role / StageEvidence::StageLog,
+    // QH-83: per-profile StageLog witness as above (tests
+    // cross_network_failback_roaming_witness_line_carries_profile_and_report_path
+    // / cross_network_failback_roaming_witness_write_failure_is_propagated).
+    CrossNetworkFailbackRoaming => "cross_network_failback_roaming" @ CrossNetwork / T2Resilience / StageEvidence::StageLog,
+    // QH-83: per-profile StageLog witness as above (tests
+    // cross_network_controller_switch_witness_line_carries_profile_and_report_path
+    // / cross_network_controller_switch_witness_write_failure_is_propagated).
+    CrossNetworkControllerSwitch => "cross_network_controller_switch" @ CrossNetwork / T2Resilience / StageEvidence::StageLog,
+    // QH-83: per-profile StageLog witness as above (tests
+    // cross_network_traversal_adversarial_witness_line_carries_profile_and_report_path
+    // / cross_network_traversal_adversarial_witness_write_failure_is_propagated).
+    CrossNetworkTraversalAdversarial => "cross_network_traversal_adversarial" @ CrossNetwork / T4Security / StageEvidence::StageLog,
+    // QH-83: per-profile StageLog witness as above (tests
+    // cross_network_remote_exit_dns_witness_line_carries_profile_and_report_path
+    // / cross_network_remote_exit_dns_witness_write_failure_is_propagated).
+    CrossNetworkRemoteExitDns => "cross_network_remote_exit_dns" @ CrossNetwork / T1Role / StageEvidence::StageLog,
+    // QH-83: per-profile StageLog witness as above (tests
+    // cross_network_remote_exit_soak_witness_line_carries_profile_and_report_path
+    // / cross_network_remote_exit_soak_witness_write_failure_is_propagated).
+    CrossNetworkRemoteExitSoak => "cross_network_remote_exit_soak" @ CrossNetwork / T2Resilience / StageEvidence::StageLog,
     // NAT classification/matrix validate the traversal SUBSTRATE every
     // cross-network capability rests on (not a role, not a disturbance) —
     // core-correctness tier.
-    CrossNetworkNatClassification => "cross_network_nat_classification" @ CrossNetwork / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    CrossNetworkNatMatrix => "cross_network_nat_matrix" @ CrossNetwork / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83: pass witness = the NAT gate report this stage writes itself on
+    // every path (fatal write + verify; tests
+    // cross_network_nat_classification_declared_witness_matches_its_artifact_path
+    // / cross_network_nat_classification_pass_without_report_artifact_is_fatal).
+    CrossNetworkNatClassification => "cross_network_nat_classification" @ CrossNetwork / T0Core / StageEvidence::File("cross_network_nat_classification/cross_network_nat_gates.txt"),
+    // QH-83: pass witness = the validation markdown the child validator
+    // writes (exit-gated + fatal verify_report_artifact; tests
+    // cross_network_nat_matrix_declared_witness_matches_its_artifact_path /
+    // cross_network_nat_matrix_pass_without_report_artifact_is_fatal).
+    CrossNetworkNatMatrix => "cross_network_nat_matrix" @ CrossNetwork / T0Core / StageEvidence::File("cross_network_nat_matrix_validation.md"),
     // The chaos suite splits by SUBJECT: adversarial-input stages targeting
     // trust/security controls are T4 (spec §3 T4 is "as tagged in the map";
     // chaos_privileged_boundary IS the map's privileged-helper-allowlist
