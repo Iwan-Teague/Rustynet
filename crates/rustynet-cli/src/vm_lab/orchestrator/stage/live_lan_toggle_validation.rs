@@ -9,6 +9,22 @@ use crate::vm_lab::orchestrator::stage::{
 use std::path::PathBuf;
 use std::process::Command;
 
+/// QH-83 F1: the LAN-toggle stage's pass witness. The `live_lan_toggle`
+/// binary writes this report on every success path, so a Passed verdict is
+/// only proven when this artifact exists and is non-empty.
+pub(crate) const LAN_TOGGLE_REPORT_RELATIVE: &str = "live_lan_toggle_report.json";
+
+/// QH-83 F1: fail a success exit whose pass witness artifact is missing or
+/// empty instead of declaring Passed without evidence on disk.
+fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
+    let path = report_dir.join(LAN_TOGGLE_REPORT_RELATIVE);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.len() > 0 => Ok(()),
+        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+    }
+}
+
 pub struct LiveLanToggleValidationStage;
 
 impl OrchestrationStage for LiveLanToggleValidationStage {
@@ -64,7 +80,7 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
         let identity_file = exit_params.identity_file.to_string_lossy().into_owned();
         let report_path = ctx
             .report_dir
-            .join("live_lan_toggle_report.json")
+            .join(LAN_TOGGLE_REPORT_RELATIVE)
             .to_string_lossy()
             .into_owned();
         let log_path = ctx
@@ -123,7 +139,12 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
         // is what produced "exited with exit status: 1" beside a 0-byte log, with
         // the actual reason unrecoverable from the run's own evidence.
         match cmd.output() {
-            Ok(output) if output.status.success() => StageOutcome::Passed,
+            Ok(output) if output.status.success() => {
+                match verify_report_artifact(&ctx.report_dir) {
+                    Ok(()) => StageOutcome::Passed,
+                    Err(e) => StageOutcome::Failed(e),
+                }
+            }
             Ok(output) => StageOutcome::Failed(
                 // QH-09: name the binary's own complete log (--log-path above)
                 // so the clip disclosure cannot read as evidence loss when the
@@ -338,5 +359,36 @@ mod tests {
             resolve_ssh_user(Some("  fedora \n"), VmGuestPlatform::Linux),
             "fedora"
         );
+    }
+
+    #[test]
+    fn live_lan_toggle_declared_witness_matches_its_artifact_path() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+
+        assert_eq!(
+            StageId::LiveLanToggleValidation.evidence(),
+            StageEvidence::File(LAN_TOGGLE_REPORT_RELATIVE),
+            "the catalog must declare the LAN-toggle report as the pass witness"
+        );
+    }
+
+    #[test]
+    fn live_lan_toggle_pass_without_report_artifact_is_fatal() {
+        let dir = std::env::temp_dir().join(format!(
+            "lan_toggle_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let result = verify_report_artifact(&dir);
+        assert!(result.is_err(), "an empty report dir must not pass");
+        assert!(
+            result.unwrap_err().contains(LAN_TOGGLE_REPORT_RELATIVE),
+            "the failure must name the missing witness artifact"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -75,7 +76,15 @@ impl OrchestrationStage for LiveHelloLimiterFloodValidationStage {
             let stdout = String::from_utf8_lossy(&out.stdout);
             match crate::vm_lab::evaluate_hello_limiter_flood_report(alias, stdout.trim()) {
                 Ok(summary) => {
-                    eprintln!("{alias}: {summary}");
+                    // QH-83 evidence-on-pass: the per-node verdict must land
+                    // in the stage's rust-native evidence log with the real
+                    // datum (alias + evaluator summary); a write failure is a
+                    // node failure, never a silent green.
+                    if let Err(e) =
+                        write_hello_limiter_witness(&ctx.report_dir, alias, summary.as_str())
+                    {
+                        failures.push(format!("{alias}: {e}"));
+                    }
                 }
                 Err(e) => {
                     failures.push(format!("{alias}: {e}"));
@@ -108,9 +117,28 @@ impl OrchestrationStage for LiveHelloLimiterFloodValidationStage {
     }
 }
 
+/// Append one single-line witness record (`<alias>: <summary>`) to the
+/// stage's rust-native evidence log. Evaluator summaries are single-line by
+/// contract, but any embedded newline is flattened first so a hostile or
+/// multi-line report cannot forge extra evidence lines.
+fn write_hello_limiter_witness(
+    report_dir: &std::path::Path,
+    alias: &str,
+    summary: &str,
+) -> Result<(), String> {
+    let summary = summary.replace(['\n', '\r'], " ");
+    let line = format!("{alias}: {summary}");
+    append_stage_evidence_line(
+        report_dir,
+        StageId::LiveHelloLimiterFloodValidation.as_str(),
+        &line,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path;
     use std::collections::HashMap;
 
     fn empty_ctx() -> OrchestrationContext {
@@ -169,5 +197,53 @@ mod tests {
             "expected a skip; got {:?}",
             LiveHelloLimiterFloodValidationStage.execute(&mut ctx)
         );
+    }
+    #[test]
+    fn hello_limiter_witness_line_carries_alias_and_summary() {
+        // The witness record must carry the real per-node datum (alias +
+        // evaluator summary) as exactly one line, with any embedded newline
+        // flattened so it cannot forge a second evidence line.
+        let report_dir = std::env::temp_dir().join(format!(
+            "hello_limiter_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&report_dir).expect("create temp report dir");
+        write_hello_limiter_witness(&report_dir, "relay-1", "audit ok\nsecond line")
+            .expect("witness write must succeed");
+        let log = std::fs::read_to_string(rust_native_stage_log_path(
+            &report_dir,
+            StageId::LiveHelloLimiterFloodValidation.as_str(),
+        ))
+        .expect("evidence log must exist");
+        assert!(
+            log.contains("relay-1: audit ok second line"),
+            "witness line must carry alias + flattened summary: {log:?}"
+        );
+        assert!(!log.contains("\nsecond"), "newline must be flattened");
+        let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn hello_limiter_witness_write_failure_is_propagated() {
+        // A report_dir path that cannot host the evidence log (a regular
+        // file occupies it) must surface as an error the stage turns into a
+        // node failure, not a silent pass.
+        let blocker = std::env::temp_dir().join(format!(
+            "hello_limiter_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(&blocker, b"not a directory").expect("create blocker file");
+        let err = write_hello_limiter_witness(&blocker, "relay-1", "audit ok")
+            .expect_err("witness write into a file must fail");
+        assert!(!err.is_empty(), "error must explain the failure: {err}");
+        let _ = std::fs::remove_file(&blocker);
     }
 }
