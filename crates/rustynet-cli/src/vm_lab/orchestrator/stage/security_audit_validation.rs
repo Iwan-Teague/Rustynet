@@ -4,6 +4,7 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::security_audit::{
     AuditResult, run_security_audits, security_audit_runtime_implemented, security_audits_ok,
@@ -143,8 +144,46 @@ impl OrchestrationStage for SecurityAuditValidationStage {
         if let Err(e) = write_per_control_evidence(ctx, &per_control) {
             failures.push(format!("per-control security evidence not written: {e}"));
         }
-        outcome_for(&failures, &reported_skips)
+        // (alias, platform tag) for every node whose audits actually ran —
+        // the witness names them so a PASS is never backed by nothing.
+        let audited: Vec<(String, &'static str)> = per_control
+            .iter()
+            .map(|(alias, tag, _)| (alias.clone(), *tag))
+            .collect();
+        // QH-83: the witness is written on the single pass path and a write
+        // failure fails the stage — an unwitnessed security-audit pass must
+        // never be recorded (the runner would demote it).
+        match outcome_for(&failures, &reported_skips) {
+            StageOutcome::Passed => match write_security_audit_witness(&ctx.report_dir, &audited) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("security audit witness write failed: {e}")),
+            },
+            other => other,
+        }
     }
+}
+
+/// Writes the QH-83 witness line for a security-audit PASS: the audited node
+/// count plus each validated node's alias and run-matrix platform tag, so a
+/// bare PASS can never be recorded without the on-disk evidence behind it.
+/// An unwritable witness fails the stage — fail closed.
+fn write_security_audit_witness(
+    report_dir: &std::path::Path,
+    audited: &[(String, &'static str)],
+) -> Result<(), String> {
+    let nodes: Vec<String> = audited
+        .iter()
+        .map(|(alias, tag)| format!("{alias}:{tag}"))
+        .collect();
+    append_stage_evidence_line(
+        report_dir,
+        StageId::SecurityAuditValidation.as_str(),
+        &format!(
+            "security_audit=yes audited_nodes={} ({})",
+            nodes.len(),
+            nodes.join(",")
+        ),
+    )
 }
 
 /// Fail iff any node failed; else Skipped iff every node that did not fail was
@@ -441,5 +480,62 @@ mod tests {
             "an empty topology must skip, never pass; got {:?}",
             SecurityAuditValidationStage.execute(&mut ctx)
         );
+    }
+
+    // QH-83: the pass witness must name the audited node count and each
+    // node's platform tag — a bare "pass" line would be appeasement, not
+    // evidence. Mutation caught: dropping the witness write or demoting it
+    // to best-effort.
+    #[test]
+    fn security_audit_witness_line_names_the_audited_node_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "secaudit_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_security_audit_witness(
+            &dir,
+            &[("deb-1".to_owned(), "linux"), ("deb-2".to_owned(), "linux")],
+        )
+        .expect("witness write");
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::SecurityAuditValidation.as_str(),
+            ),
+        )
+        .expect("stage log");
+        assert!(log.contains("security_audit=yes"), "{log}");
+        assert!(log.contains("audited_nodes=2"), "{log}");
+        assert!(
+            log.contains("deb-1:linux") && log.contains("deb-2:linux"),
+            "{log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as an
+    /// error the execute path turns into `Failed` — never a silent pass.
+    #[test]
+    fn security_audit_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "secaudit_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+        let err = write_security_audit_witness(&dir, &[("deb-1".to_owned(), "linux")])
+            .expect_err("witness write must fail when the logs path is a regular file");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

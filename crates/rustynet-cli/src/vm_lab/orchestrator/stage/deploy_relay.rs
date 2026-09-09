@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::relay::relay_lab_runtime_implemented;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
@@ -100,6 +101,9 @@ impl OrchestrationStage for DeployRelayServiceStage {
         // (alias, platform) pairs that were reported-skipped because relay
         // runtime deploy is not yet live-supported on their platform.
         let mut reported_skips: Vec<(String, String)> = Vec::new();
+        // Aliases whose relay service actually deployed — the witness names
+        // them so a PASS is never backed by nothing.
+        let mut deployed: Vec<String> = Vec::new();
 
         for alias in &relay_aliases {
             let adapter = match ctx.adapters.get(alias.as_str()) {
@@ -125,8 +129,9 @@ impl OrchestrationStage for DeployRelayServiceStage {
                 continue;
             }
 
-            if let Err(e) = adapter.deploy_relay_service() {
-                failures.push(format!("{alias}: {e}"));
+            match adapter.deploy_relay_service() {
+                Ok(()) => deployed.push(alias.clone()),
+                Err(e) => failures.push(format!("{alias}: {e}")),
             }
         }
 
@@ -137,8 +142,36 @@ impl OrchestrationStage for DeployRelayServiceStage {
             write_reported_skips_note(ctx, &reported_skips);
         }
 
-        outcome_for(&failures, &reported_skips)
+        // QH-83: the witness is written on the single pass path and a write
+        // failure fails the stage — an unwitnessed relay-deploy pass must
+        // never be recorded (the runner would demote it).
+        match outcome_for(&failures, &reported_skips) {
+            StageOutcome::Passed => match write_relay_deploy_witness(&ctx.report_dir, &deployed) {
+                Ok(()) => StageOutcome::Passed,
+                Err(e) => StageOutcome::Failed(format!("relay deploy witness write failed: {e}")),
+            },
+            other => other,
+        }
     }
+}
+
+/// Writes the QH-83 witness line for a relay-deploy PASS: the deployed node
+/// count plus each Relay alias whose service was actually installed and
+/// started, so a bare PASS can never be recorded without the on-disk evidence
+/// behind it. An unwritable witness fails the stage — fail closed.
+fn write_relay_deploy_witness(
+    report_dir: &std::path::Path,
+    deployed: &[String],
+) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::DeployRelayService.as_str(),
+        &format!(
+            "relay_deploy=yes deployed_nodes={} ({})",
+            deployed.len(),
+            deployed.join(",")
+        ),
+    )
 }
 
 /// Decide the stage outcome from the per-node tally — a pure function so the
@@ -352,5 +385,56 @@ mod tests {
                 .iter()
                 .any(|v| v["alias"] == "relay-win" && v["platform"] == "Windows")
         );
+    }
+
+    // QH-83: the pass witness must name the deployed node count and the
+    // aliases — a bare "pass" line would be appeasement, not evidence.
+    // Mutation caught: dropping the witness write or demoting it to
+    // best-effort.
+    #[test]
+    fn relay_deploy_witness_line_names_the_deployed_node_count() {
+        let dir = std::env::temp_dir().join(format!(
+            "rdeploy_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        write_relay_deploy_witness(&dir, &["relay-1".to_owned(), "relay-2".to_owned()])
+            .expect("witness write");
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::DeployRelayService.as_str(),
+            ),
+        )
+        .expect("stage log");
+        assert!(log.contains("relay_deploy=yes"), "{log}");
+        assert!(log.contains("deployed_nodes=2"), "{log}");
+        assert!(log.contains("relay-1") && log.contains("relay-2"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fail-closed check: a witness write that cannot land must surface as an
+    /// error the execute path turns into `Failed` — never a silent pass.
+    #[test]
+    fn relay_deploy_witness_write_failure_is_propagated() {
+        let dir = std::env::temp_dir().join(format!(
+            "rdeploy_witness_blocker_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+        std::fs::write(dir.join("logs"), b"not a directory").expect("blocker file");
+        let err = write_relay_deploy_witness(&dir, &["relay-1".to_owned()])
+            .expect_err("witness write must fail when the logs path is a regular file");
+        assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
