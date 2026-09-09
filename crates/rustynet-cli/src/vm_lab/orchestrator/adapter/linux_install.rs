@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use std::time::Duration;
 
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::validated_args::ValidatedArg;
 use crate::vm_lab::orchestrator::adapter::verifier_key::decode_assignment_pubkey_hex;
@@ -10,7 +11,6 @@ use crate::vm_lab::orchestrator::error::{AdapterError, InstallReport};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::source_archive::SourceArchive;
 use crate::vm_lab::orchestrator::stage::host_cross_build;
-use crate::vm_lab::VmGuestPlatform;
 
 /// Canonical path of `rustynetd` on Linux targets.
 pub const LINUX_RUSTYNETD_PATH: &str = "/usr/local/bin/rustynetd";
@@ -1155,8 +1155,10 @@ mod tests {
     #[test]
     fn bootstrap_uses_absolute_installed_cli_under_sudo_secure_path() {
         assert!(BOOTSTRAP_SCRIPT.contains("/usr/local/bin/rustynet ops e2e-bootstrap-host"));
-        assert!(BOOTSTRAP_SCRIPT
-            .contains("PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"));
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin")
+        );
         assert!(
             !BOOTSTRAP_SCRIPT.contains("\n  rustynet ops e2e-bootstrap-host"),
             "Rocky sudo secure_path may exclude /usr/local/bin"
@@ -1331,7 +1333,7 @@ mod daemon_launch_flag_parity_tests {
     /// test red (the call proceeds toward SSH instead of erroring).
     #[test]
     fn enforce_daemon_refuses_to_mint_node_id_when_context_has_none() {
-        use super::{enforce_daemon, NodeConnection, OrchestrationContext};
+        use super::{NodeConnection, OrchestrationContext, enforce_daemon};
         use crate::vm_lab::orchestrator::error::AdapterError;
         use std::collections::HashMap;
         let conn = NodeConnection::Ssh {
