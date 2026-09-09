@@ -187,14 +187,11 @@ mod generated_nft_table_tests {
     #[test]
     fn require_daemon_success_surfaces_drift_reasons_with_exit_code_note() {
         let dirty_report = r#"{"overall_ok": false}"#;
-        let err = require_daemon_success(
-            78,
-            "linux-key-custody-check",
-            "deb-1",
-            dirty_report,
-            |s| require_daemon_success_drift_evaluate(s),
-        )
-        .expect_err("a non-zero exit with a failing report must surface the drift");
+        let err =
+            require_daemon_success(78, "linux-key-custody-check", "deb-1", dirty_report, |s| {
+                require_daemon_success_drift_evaluate(s)
+            })
+            .expect_err("a non-zero exit with a failing report must surface the drift");
         assert!(
             err.contains("exited non-zero (code 78; the daemon uses exit 78 to signal drift)")
                 && err.contains("drift detected in"),

@@ -9,8 +9,8 @@
 //! For now only Linux is live; macOS / Windows are reported-skipped until their
 //! per-OS authenticode probes are proven through the Rust engine.
 
-use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
 /// True where authenticode validation runs live (Linux, macOS, Windows).
 pub fn authenticode_runtime_implemented(platform: VmGuestPlatform) -> bool {

@@ -1,10 +1,10 @@
 #![allow(dead_code)]
+use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::node_adapter::RoleValidatorKind;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
-use crate::vm_lab::VmGuestPlatform;
 
 const REPORTED_SKIPS_FILENAME: &str = "authenticode_validation.reported_skips.json";
 

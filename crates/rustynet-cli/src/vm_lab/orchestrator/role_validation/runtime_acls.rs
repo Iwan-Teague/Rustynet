@@ -8,8 +8,8 @@
 //! or inconsistent per-root status — so a broken or vacuous check fails the
 //! stage rather than silently passing.
 
-use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::VmGuestPlatform;
+use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 
 /// True where runtime-ACLs validation runs live (Linux, macOS, Windows).
 pub fn runtime_acls_runtime_implemented(platform: VmGuestPlatform) -> bool {
