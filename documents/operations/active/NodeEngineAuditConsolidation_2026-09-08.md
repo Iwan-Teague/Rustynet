@@ -218,6 +218,10 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    `missing_client_note_names_exit_and_reason`). B2 done (see item 2).
    **B5 still open.**
 
+**I3 follow-up (STAGES review, 2026-09-09):** `live_anchor.rs` carried the same
+`_ => "linux"` class in its `--platform` argv builder; now routed through
+`desktop_platform_tag` (Ios/Android → `Failed`).
+
 ## 4) Method notes
 
 - Probe runs: two of five came back EMPTY on the first launch (0 bytes, no
