@@ -175,11 +175,11 @@ pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), Stri
     let mut masquerade = false;
     for raw in ruleset.lines() {
         let line = raw.trim();
-        if depth == 0 {
-            if let Some(rest) = line.strip_prefix("table ") {
-                let name = rest.split_whitespace().nth(1).unwrap_or_default();
-                in_rustynet_table = name.starts_with("rustynet");
-            }
+        if depth == 0
+            && let Some(rest) = line.strip_prefix("table ")
+        {
+            let name = rest.split_whitespace().nth(1).unwrap_or_default();
+            in_rustynet_table = name.starts_with("rustynet");
         }
         if in_rustynet_table {
             // A `chain <name>` header starts a new chain context; `hook
@@ -197,17 +197,16 @@ pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), Stri
             if tokens.contains(&"masquerade") {
                 masquerade = true;
             }
-            if in_forward_chain {
-                if tokens.contains(&"iifname")
-                    && tokens.contains(&"oifname")
-                    && tokens.contains(&"saddr")
-                    && tokens.last() == Some(&"accept")
-                {
-                    forward_rule = true;
-                }
-                if line.contains("ct state established,related accept") {
-                    established_rule = true;
-                }
+            if in_forward_chain
+                && tokens.contains(&"iifname")
+                && tokens.contains(&"oifname")
+                && tokens.contains(&"saddr")
+                && tokens.last() == Some(&"accept")
+            {
+                forward_rule = true;
+            }
+            if in_forward_chain && line.contains("ct state established,related accept") {
+                established_rule = true;
             }
         }
         depth += line.matches('{').count();
