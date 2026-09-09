@@ -18,9 +18,11 @@ step below has a command and the failure it prevents; the three marked
 | Host can drive | it can run `ops vm-lab-orchestrate-live-lab` on its own guests | `launch_live_lab_on_host` + a run row |
 | Guests ready | ≥1 registered guest running with an IP and the guest toolchain | `host_preflight` gate 7 `guests_ready`, `provision_guest_toolchain --verify-only` |
 
-`katana` is at "host can drive, zero guests" — it needs base images (Debian
-cloud image for Linux guests; a Windows 11 x64 ISO for the Windows cell).
-`lenovo-bot` is fully onboarded (two Debian guests; run `livelab-1788919346`).
+Both hosts are fully onboarded: `lenovo-bot` (two Debian guests; run
+`livelab-1788919346`, 39/0/54) and `katana` (two Debian guests provisioned
+2026-09-09 from lenovo-bot's base image; first self-driven run
+`livelab-1788951987` at `aaa8c661`, 39/0/54). `katana` still lacks a Windows
+11 x64 ISO for the Windows cell.
 
 ## 1) Host-side prerequisites (once per host, as the lab user)
 
