@@ -39,8 +39,14 @@ impl OrchestrationStage for DnsFailclosedValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // A topology with no nodes validated NOTHING: a pass here would record
+        // a green ledger row for an unexercised control — the vacuous-pass
+        // false green (skip-semantics review F1). Skip so the run stays
+        // Partial and the gap stays visible; never `Passed`.
         if ctx.assignments.is_empty() {
-            return StageOutcome::Passed;
+            return StageOutcome::Skipped(
+                "no node assignments in this topology; nothing was validated".to_owned(),
+            );
         }
 
         let mut failures: Vec<String> = Vec::new();
@@ -189,6 +195,24 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("mac-1") && s.contains("win-1"));
         assert!(s.contains("dns_failclosed_validation"));
+    }
+
+    /// The empty-assignments guard must SKIP, never PASS: with zero nodes the
+    /// stage validated nothing, and a pass would record a green ledger row for
+    /// an unexercised control (skip-semantics review F1's vacuous pass).
+    /// Mutation caught: reverting the guard arm to `return StageOutcome::Passed;`
+    /// (the empty-assignments-vacuous-pass mutation).
+    #[test]
+    fn empty_assignments_is_skipped_never_passed() {
+        let mut ctx = OrchestrationContext::new(Vec::new(), std::env::temp_dir(), "net".to_owned());
+        assert!(
+            matches!(
+                DnsFailclosedValidationStage.execute(&mut ctx),
+                StageOutcome::Skipped(_)
+            ),
+            "an empty topology must skip, never pass; got {:?}",
+            DnsFailclosedValidationStage.execute(&mut ctx)
+        );
     }
 
     #[test]
