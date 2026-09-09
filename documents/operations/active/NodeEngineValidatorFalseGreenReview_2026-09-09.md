@@ -81,3 +81,14 @@ All changes confined to `crates/rustynet-cli/src/vm_lab/**` (+ this doc). Commit
 **F7 — verdict bound to the producer and to the forward hook.** `linux_blind_exit_ruleset_verdict` now tracks chain context: entering a `chain …` header resets it, and only a header declaring `hook forward` re-arms forward/established rule detection (the masquerade scan stays chain-agnostic). Tests: `linux_accepts_ruleset_rendered_from_daemon_producer_commands` (renders `rustynetd::linux_blind_exit::build_linux_blind_exit_forward_commands(&LinuxBlindExitConfig::new("rustynet0","enp0s1","100.64.0.0/10"), "rustynet_g3")` back into `nft list ruleset` shape — quoting `iifname`/`oifname` values — and requires `Ok`; mutation: any producer/validator shape drift → red) and `linux_fails_closed_when_forward_rules_sit_outside_a_forward_chain` (producer-shaped rules parked in the killswitch `hook output` chain must be rejected; mutation: count rules anywhere in a rustynet table → red). All pre-existing blind_exit linux/macos/windows tests stay green.
 
 **Gate evidence.** `CARGO_TARGET_DIR=/Users/iwan/Desktop/Rustynet/target-glm-w3 cargo test -p rustynet-cli --all-features --lib -- vm_lab` → **2766 passed, 0 failed** (was 2764 pre-F7). `cargo fmt --all -- --check` → clean. **Clippy blocker (pre-existing, outside this job's allowlist):** `cargo clippy -p rustynet-cli --all-targets --all-features --locked -- -D warnings` fails with 3 `collapsible_if` errors in `crates/rustynetd/src/phase10.rs:4301,4911,4955` plus the same lint family in already-committed `vm_lab` files this job did not author (`stage/distribute_assignments.rs:330`, `stage/preflight.rs:516,553,648,824`, `stage/validate_runtime.rs:257`) — the toolchain's clippy 1.97 let-chain style postdates the last lint pass on those files; zero commits in this branch touch them (`git log 338b2c45..HEAD -- crates/rustynetd` is empty). Verified with `RUSTFLAGS="--cap-lints=warn"` that this branch introduces **no** new clippy diagnostics: every file this job touched (`role_validation/{blind_exit,key_custody,runtime_acls,dns_failclosed,service_hardening,mod}.rs`, `stage/authenticode_validation.rs`) is clippy-clean. Fixing `phase10.rs` is out of this job's allowlist and is left as an explicit follow-up.
+
+## Review disposition (2026-09-09, GLM-flash, MERGE-WITH-FIXES → merged)
+
+F1/F2/F3/F7 CONFIRMED at file:line; every non-zero daemon exit yields `Err`
+(drift reasons surfaced verbatim after the exit-78 note). Blocking fix
+applied before merge: the stage-level Linux test
+`linux_stub_producer_yields_skipped_with_report_artifact` (deleting the Linux
+branch would have fallen through to a vacuous `Passed`). Non-blocking
+follow-ups: pin the `comment`-after-`accept` coupling in the F7 forward-rule
+check; align authenticode's failing-report message with
+`require_daemon_success`'s exit-code prefix.
