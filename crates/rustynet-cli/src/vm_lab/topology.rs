@@ -218,11 +218,17 @@ fn ensure_topology_alias_value(role: TopologyRole, alias: &str) -> Result<(), St
 /// Derive the topology platform for a single inventory entry. Reuses
 /// the existing [`VmGuestPlatform::infer`] heuristic so behaviour
 /// matches what the orchestrator already writes into the profile env
-/// file (`EXIT_PLATFORM=linux` for entries whose explicit
-/// `platform` field is absent and whose `os` string starts with
-/// "Debian/Linux" today). Mobile guests are reported as
-/// [`TopologyPlatform::Linux`] only when the inference defaults to
+/// file (`EXIT_PLATFORM=linux` for entries whose `os` string starts
+/// with "Debian/Linux" today). Mobile guests are reported as
+/// [`TopologyPlatform::Linux`] only when the inference yields
 /// Linux; otherwise [`platform_for_entry`] returns `None`.
+///
+/// QH-82: `infer` returns `None` for a platform-less entry whose names carry
+/// no hint; that `None` maps onto this function's existing `Option` return —
+/// i.e. "no match" — and [`select_alias_by_platform`]'s caller turns a missed
+/// selection into a hard error. The G2 re-wire must preserve that
+/// None → hard-error contract: an un-inferable entry must never be silently
+/// selectable.
 #[allow(dead_code)] // W5.7 quarantine: unreachable since the bash-branch deletion; retained for the G2 native re-wire (BashRetirementDispositions_2026-08-22.md B2/B3).
 pub(crate) fn platform_for_entry(entry: &VmInventoryEntry) -> Option<TopologyPlatform> {
     let utm_name = entry.controller.as_ref().map(controller_utm_name);
@@ -231,7 +237,7 @@ pub(crate) fn platform_for_entry(entry: &VmInventoryEntry) -> Option<TopologyPla
         entry.os.as_deref(),
         entry.alias.as_str(),
         utm_name.as_deref(),
-    );
+    )?;
     TopologyPlatform::try_from(inferred).ok()
 }
 

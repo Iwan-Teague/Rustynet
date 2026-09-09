@@ -489,7 +489,13 @@ fn march_role_to_node_role(role: MarchRole) -> Option<NodeRole> {
 }
 
 fn role_matches_entry(entry: &VmInventoryEntry, platform: VmGuestPlatform, role: NodeRole) -> bool {
-    if entry.platform_profile().platform != platform {
+    // QH-82: a selection filter must exclude, never guess. An entry whose
+    // platform cannot be inferred does not match any role — the same
+    // default-deny treatment the relay-topology filters apply.
+    let Ok(profile) = entry.platform_profile() else {
+        return false;
+    };
+    if profile.platform != platform {
         return false;
     }
     let role_name = role.as_str();
