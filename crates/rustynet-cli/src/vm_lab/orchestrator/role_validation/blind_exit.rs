@@ -1,6 +1,6 @@
 #![allow(dead_code)]
-use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::VmGuestPlatform;
 
 pub fn blind_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
@@ -158,8 +158,17 @@ pub(crate) const MACOS_EXIT_NAT_ANCHOR_PROBE: &str = "sudo pfctl -a com.rustynet
 /// Only rustynet-owned tables are judged, so a host's own docker/libvirt
 /// masquerade cannot fail a correct node, and a foreign table cannot pass a
 /// node that installed nothing.
+///
+/// F7 (NodeEngineValidatorFalseGreenReview_2026-09-09): the forward and
+/// established rules only count inside a chain whose header declares
+/// `hook forward`. A rule parked in an unrelated chain of a rustynet table
+/// (say the killswitch's `hook output` chain) does not forward anything, so
+/// blessing it would green-light a node that cannot actually pass mesh
+/// traffic; entering a new chain resets the context, and only the chain
+/// header's `hook forward` declaration re-arms it.
 pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), String> {
     let mut in_rustynet_table = false;
+    let mut in_forward_chain = false;
     let mut depth = 0usize;
     let mut forward_rule = false;
     let mut established_rule = false;
@@ -173,25 +182,39 @@ pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), Stri
             }
         }
         if in_rustynet_table {
+            // A `chain <name>` header starts a new chain context; `hook
+            // forward` (on the header itself or on the following `type …
+            // hook forward …` line) is what re-arms rule detection. The
+            // masquerade scan intentionally stays chain-agnostic: any
+            // translation inside a rustynet table disqualifies the node.
+            if line.starts_with("chain ") {
+                in_forward_chain = false;
+            }
+            if line.contains("hook forward") {
+                in_forward_chain = true;
+            }
             let tokens: Vec<&str> = line.split_whitespace().collect();
             if tokens.contains(&"masquerade") {
                 masquerade = true;
             }
-            if tokens.contains(&"iifname")
-                && tokens.contains(&"oifname")
-                && tokens.contains(&"saddr")
-                && tokens.last() == Some(&"accept")
-            {
-                forward_rule = true;
-            }
-            if line.contains("ct state established,related accept") {
-                established_rule = true;
+            if in_forward_chain {
+                if tokens.contains(&"iifname")
+                    && tokens.contains(&"oifname")
+                    && tokens.contains(&"saddr")
+                    && tokens.last() == Some(&"accept")
+                {
+                    forward_rule = true;
+                }
+                if line.contains("ct state established,related accept") {
+                    established_rule = true;
+                }
             }
         }
         depth += line.matches('{').count();
         depth = depth.saturating_sub(line.matches('}').count());
         if depth == 0 && line.contains('}') {
             in_rustynet_table = false;
+            in_forward_chain = false;
         }
     }
     if masquerade {
@@ -403,6 +426,87 @@ mod tests {
         let err = validate_blind_exit_runtime(&shell, VmGuestPlatform::Linux, "node1")
             .expect_err("nft failure must fail closed");
         assert!(err.contains("exited non-zero"), "{err}");
+    }
+
+    #[test]
+    fn linux_accepts_ruleset_rendered_from_daemon_producer_commands() {
+        // F7 producer-shape pin: the verdict must accept exactly what the
+        // daemon installs (`build_linux_blind_exit_forward_commands`),
+        // rendered back into `nft list ruleset` shape. Mutation caught: any
+        // drift between the producer's rule shape and the validator's
+        // accepted shape (producer and validator can only stay honest
+        // together).
+        let config = rustynetd::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "enp0s1",
+            "100.64.0.0/10",
+        )
+        .expect("valid blind_exit config");
+        let commands = rustynetd::linux_blind_exit::build_linux_blind_exit_forward_commands(
+            &config,
+            "rustynet_g3",
+        )
+        .expect("valid nft command sequences");
+        let mut rendered: Vec<String> = Vec::new();
+        for argv in &commands {
+            // Skip the `flush chain` sequence; only `add rule` sequences
+            // correspond to ruleset lines.
+            if argv.first().map(String::as_str) != Some("add") {
+                continue;
+            }
+            assert_eq!(
+                argv.get(4).map(String::as_str),
+                Some("forward"),
+                "producer must target the forward chain"
+            );
+            let mut line = String::new();
+            let mut quote_next = false;
+            for token in argv.iter().skip(5) {
+                if !line.is_empty() {
+                    line.push(' ');
+                }
+                if quote_next {
+                    line.push('"');
+                    line.push_str(token);
+                    line.push('"');
+                } else {
+                    line.push_str(token);
+                }
+                // nft ruleset output quotes interface-match values.
+                quote_next = token == "iifname" || token == "oifname";
+            }
+            rendered.push(line);
+        }
+        assert_eq!(
+            rendered.len(),
+            2,
+            "producer emits the established and mesh-forward accepts: {rendered:?}"
+        );
+        let ruleset = format!(
+            "table inet rustynet_g3 {{\n\tchain forward {{\n\t\ttype filter hook forward \
+             priority filter; policy drop;\n\t\t{}\n\t}}\n}}\n",
+            rendered.join("\n\t\t")
+        );
+        linux_blind_exit_ruleset_verdict(&ruleset)
+            .expect("verdict must accept the daemon producer's own rule shape");
+    }
+
+    #[test]
+    fn linux_fails_closed_when_forward_rules_sit_outside_a_forward_chain() {
+        // F7 mutation caught: counting the accept rules anywhere inside a
+        // rustynet table. The exact producer-shaped rules parked in the
+        // killswitch's `hook output` chain forward nothing, so blessing them
+        // would green-light a node that cannot pass mesh traffic.
+        let misplaced = "table inet rustynet_ks_g3 {\n\
+         \tchain killswitch {\n\
+         \t\ttype filter hook output priority filter; policy drop;\n\
+         \t\tct state established,related accept\n\
+         \t\tiifname \"rustynet0\" oifname \"enp0s1\" ip saddr 100.64.0.0/10 accept\n\
+         \t}\n\
+         }\n";
+        let err = linux_blind_exit_ruleset_verdict(misplaced)
+            .expect_err("forward rules outside a `hook forward` chain must fail closed");
+        assert!(err.contains("no blind_exit forward rules"), "{err}");
     }
 
     const MACOS_BLIND_EXIT_RULES: &str = "pass quick on lo0 all\n\
