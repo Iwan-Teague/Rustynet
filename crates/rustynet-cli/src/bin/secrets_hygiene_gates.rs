@@ -909,7 +909,6 @@ mod tests {
                 .arg({q}ssh{q})
                 .arg({q}-i{q})
                 .arg(identity_file);"#,
-            q = q,
         );
         let offenders = super::privileged_exec_offenders("fixture.rs", &captured);
         assert!(
@@ -937,7 +936,6 @@ mod tests {
         .arg(port.to_string())
         .arg("--")
         .arg(format!("{{user_flag}}{{host}}"));"#,
-            q = q,
         );
         // The accepted sudo path: the password crosses on stdin, not in the
         // remote command string.
