@@ -3,7 +3,9 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
-use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+use crate::vm_lab::orchestrator::stage::{
+    OrchestrationStage, StageFanout, StageId, desktop_platform_tag,
+};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -145,7 +147,7 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
             "live_linux_exit_handoff_test",
             vec![
                 "--platform".to_owned(),
-                platform_for_node(ctx, &exit.alias).to_owned(),
+                platform_for_node(ctx, &exit.alias)?.to_owned(),
                 "--ssh-identity-file".to_owned(),
                 identity_file.clone(),
                 "--known-hosts".to_owned(),
@@ -191,7 +193,7 @@ fn run_extended_soak(ctx: &OrchestrationContext) -> Result<(), String> {
             "live_linux_lan_toggle_test",
             vec![
                 "--platform".to_owned(),
-                platform_for_node(ctx, &exit.alias).to_owned(),
+                platform_for_node(ctx, &exit.alias)?.to_owned(),
                 "--ssh-identity-file".to_owned(),
                 identity_file.clone(),
                 "--exit-host".to_owned(),
@@ -318,12 +320,17 @@ fn node_id_for_alias(ctx: &OrchestrationContext, alias: &str) -> Result<String, 
         .ok_or_else(|| format!("{alias}: node_id not found"))
 }
 
-fn platform_for_node(ctx: &OrchestrationContext, alias: &str) -> &'static str {
-    match ctx.adapters.get(alias).map(|adapter| adapter.platform()) {
-        Some(VmGuestPlatform::Macos) => "macos",
-        Some(VmGuestPlatform::Windows) => "windows",
-        _ => "linux",
-    }
+/// The platform label fed to the soak substep binaries' `--platform` argv
+/// (audit I3): desktop platforms tag through the shared exhaustive
+/// [`desktop_platform_tag`]; a missing adapter or a never-hosted platform is
+/// an `Err` propagated into the substep failure — never a silent `linux`
+/// stamp.
+fn platform_for_node(ctx: &OrchestrationContext, alias: &str) -> Result<&'static str, String> {
+    let adapter = ctx
+        .adapters
+        .get(alias)
+        .ok_or_else(|| format!("{alias}: no adapter for platform labelling"))?;
+    desktop_platform_tag(adapter.platform(), "extended-soak validation")
 }
 
 fn ssh_params_for_role(ctx: &OrchestrationContext, label: &str) -> Result<ResolvedParams, String> {

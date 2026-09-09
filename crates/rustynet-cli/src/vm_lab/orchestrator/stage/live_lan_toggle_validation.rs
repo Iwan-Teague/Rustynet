@@ -4,7 +4,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{
-    OrchestrationStage, StageFanout, StageId, resolve_ssh_user,
+    OrchestrationStage, StageFanout, StageId, desktop_platform_tag, resolve_ssh_user,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,7 +51,10 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
                 );
             }
         };
-        let platform = platform_for_node(ctx, &exit_params.alias);
+        let platform = match platform_for_node(ctx, &exit_params.alias) {
+            Ok(tag) => tag,
+            Err(reason) => return StageOutcome::Failed(reason),
+        };
         let exit_node_id = node_id_for_alias(ctx, &exit_params.alias);
         let client_node_id = node_id_for_alias(ctx, &client_params.alias);
         let blind_exit_node_id = node_id_for_alias(ctx, &blind_exit_params.alias);
@@ -222,13 +225,16 @@ fn find_blind_exit(ctx: &OrchestrationContext) -> Result<ResolvedParams, String>
     Err("no Linux node found for blind_exit role among aux/extra/entry".to_owned())
 }
 
-fn platform_for_node(ctx: &OrchestrationContext, alias: &str) -> &'static str {
-    let adapter = ctx.adapters.get(alias);
-    match adapter.map(|a| a.platform()) {
-        Some(VmGuestPlatform::Macos) => "macos",
-        Some(VmGuestPlatform::Windows) => "windows",
-        _ => "linux",
-    }
+/// The platform label fed to the validation binary's `--platform` argv
+/// (audit I3): desktop platforms tag through the shared exhaustive
+/// [`desktop_platform_tag`]; a missing adapter or a never-hosted platform is
+/// an `Err` the caller must fail the stage on — never a silent `linux` stamp.
+fn platform_for_node(ctx: &OrchestrationContext, alias: &str) -> Result<&'static str, String> {
+    let adapter = ctx
+        .adapters
+        .get(alias)
+        .ok_or_else(|| format!("{alias}: no adapter for platform labelling"))?;
+    desktop_platform_tag(adapter.platform(), "lan-toggle validation")
 }
 
 fn node_id_for_alias(ctx: &OrchestrationContext, alias: &str) -> String {
