@@ -1630,6 +1630,43 @@ mod tests {
         assert!(matches!(results[1].1, StageOutcome::Passed));
     }
 
+    /// F4 mutation caught: reverting the BlindExit catalog row
+    /// (stage::mod `BlindExit => ...`) from `StageEvidence::StageLog` back to
+    /// `StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING }` re-arms this
+    /// test — the stage would then PASS with no witness on disk and never be
+    /// demoted, which is exactly the gap the blind_exit witness work closes.
+    #[test]
+    fn blind_exit_pass_without_witness_is_demoted() {
+        let stages: Vec<Box<dyn OrchestrationStage>> = vec![pass_stage(StageId::BlindExit, vec![])];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        match &results[0].1 {
+            StageOutcome::NotProven { reason, detail } => {
+                assert!(matches!(reason, super::ReasonCode::MissingWitness));
+                assert!(detail.contains("stage log"), "{detail}");
+            }
+            other => panic!("expected NotProven, got {other:?}"),
+        }
+    }
+
+    /// F4: a blind_exit PASS whose stage log carries the per-node witness
+    /// lines upholds `Passed` — the demotion above only fires on missing
+    /// evidence, not on legitimate proofs.
+    #[test]
+    fn blind_exit_stage_log_witness_upholds_pass() {
+        let stages: Vec<Box<dyn OrchestrationStage>> =
+            vec![witnessed_pass_stage(StageId::BlindExit, vec![])];
+        let (mut ctx, _dir) = tempdir_ctx();
+        let results = StateMachineRunner::new(stages)
+            .expect("valid plan")
+            .run(&mut ctx)
+            .expect("run");
+        assert!(matches!(results[0].1, StageOutcome::Passed));
+    }
+
     /// Design §9 test 5 (adapted): the stage catalog is compile-valid, so
     /// malformed `File` declarations cannot exist in it — the validator is
     /// exercised directly. Mutation caught: dropping the traversal/absolute/

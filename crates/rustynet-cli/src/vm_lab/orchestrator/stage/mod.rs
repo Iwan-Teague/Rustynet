@@ -302,7 +302,10 @@ define_stage_catalog! {
     EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // blind_exit ACTIVATES the blind_exit role posture (role capability),
     // not baseline plumbing — T1 like the other role-lifecycle stages.
-    BlindExit => "blind_exit" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83/F4: a PASS verdict writes one witness line per validated node via
+    // append_stage_evidence_line (stage/blind_exit.rs), so the runner's
+    // verify_declared_evidence can demote an unwitnessed PASS to NotProven.
+    BlindExit => "blind_exit" @ Setup / T1Role / StageEvidence::StageLog,
     ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     SecurityAuditValidation => "security_audit_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     DnsFailclosedValidation => "dns_failclosed_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
