@@ -1,7 +1,5 @@
 #![allow(dead_code)]
-use crate::vm_lab::LINUX_RUSTYNETD_PATH;
 use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
@@ -9,8 +7,6 @@ use crate::vm_lab::orchestrator::role_validation::exit_dns_failclosed::{
     exit_dns_failclosed_runtime_implemented, validate_linux_exit_dns_failclosed,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
-
-const WINDOWS_RUSTYNETD_PATH: &str = r"C:\Program Files\RustyNet\rustynetd.exe";
 
 const REPORTED_SKIPS_FILENAME: &str = "exit_dns_failclosed_validation.reported_skips.json";
 
@@ -89,23 +85,61 @@ impl OrchestrationStage for ExitDnsFailclosedValidationStage {
                 return StageOutcome::Failed(format!("{alias}: shell host unavailable: {e}"));
             }
         };
-        let daemon_path = match platform {
-            VmGuestPlatform::Linux => LINUX_RUSTYNETD_PATH,
-            VmGuestPlatform::Macos => MACOS_RUSTYNETD_PATH,
-            VmGuestPlatform::Windows => WINDOWS_RUSTYNETD_PATH,
-            _ => unreachable!("runtime implementation gate accepts desktop platforms only"),
+        let daemon_path = match platform.lab_daemon_path() {
+            Some(path) => path,
+            None => {
+                return StageOutcome::Failed(format!(
+                    "{alias}: no rustynetd daemon path for platform {platform:?} \
+                     (gate/dispatch desync: the runtime gate accepted a platform \
+                     the adapter path table cannot serve)"
+                ));
+            }
         };
-        let failures = match validate_linux_exit_dns_failclosed(
-            &*shell,
-            daemon_path,
-            &alias,
-            &mesh_hostname,
-        ) {
-            Ok(()) => Vec::new(),
-            Err(e) => vec![format!("{alias}: {e}")],
+        let validation = match validation_kind_for(platform) {
+            Some(kind) => kind,
+            None => {
+                return StageOutcome::Failed(format!(
+                    "{alias}: exit DNS fail-closed gate accepted {platform:?} but \
+                     no validator dispatches it (gate/dispatch desync)"
+                ));
+            }
+        };
+        let failures = match validation {
+            ExitDnsFailclosedValidationKind::Linux => {
+                match validate_linux_exit_dns_failclosed(
+                    &*shell,
+                    daemon_path,
+                    &alias,
+                    &mesh_hostname,
+                ) {
+                    Ok(()) => Vec::new(),
+                    Err(e) => vec![format!("{alias}: {e}")],
+                }
+            }
         };
         let reported_skips = Vec::new();
         outcome_for(&failures, &reported_skips)
+    }
+}
+
+/// The validator the exit DNS fail-closed proof dispatches. Extracted from
+/// `execute` so the dispatch table is unit-testable: the former
+/// `_ => unreachable!("runtime implementation gate accepts desktop platforms
+/// only")` arm panicked the stage thread whenever the runtime gate and this
+/// table drifted (audit I1). An uncovered platform now maps to `None` and
+/// the stage fails closed naming the desync instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitDnsFailclosedValidationKind {
+    Linux,
+}
+
+fn validation_kind_for(platform: VmGuestPlatform) -> Option<ExitDnsFailclosedValidationKind> {
+    match platform {
+        VmGuestPlatform::Linux => Some(ExitDnsFailclosedValidationKind::Linux),
+        VmGuestPlatform::Macos
+        | VmGuestPlatform::Windows
+        | VmGuestPlatform::Ios
+        | VmGuestPlatform::Android => None,
     }
 }
 
@@ -207,5 +241,30 @@ mod tests {
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("mac-1") && s.contains("win-1"));
         assert!(s.contains("exit_dns_failclosed_validation"));
+    }
+
+    /// Mutation caught: restoring the `_ => unreachable!("runtime
+    /// implementation gate accepts desktop platforms only")` dispatch arm
+    /// (in `validation_kind_for` or the `lab_daemon_path` call site) makes
+    /// this test panic on an uncovered platform instead of observing the
+    /// fail-closed `None` mapping (audit I1).
+    #[test]
+    fn validation_kind_never_panics_on_ungated_platforms() {
+        assert_eq!(
+            validation_kind_for(VmGuestPlatform::Linux),
+            Some(ExitDnsFailclosedValidationKind::Linux)
+        );
+        for uncovered in [
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+            VmGuestPlatform::Ios,
+            VmGuestPlatform::Android,
+        ] {
+            assert_eq!(
+                validation_kind_for(uncovered),
+                None,
+                "platform {uncovered:?} must map to None, never a panic"
+            );
+        }
     }
 }

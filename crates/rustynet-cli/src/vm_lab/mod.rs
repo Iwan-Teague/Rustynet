@@ -2397,6 +2397,53 @@ impl VmGuestPlatform {
             Self::Android => "android",
         }
     }
+
+    /// Filesystem path of the deployed `rustynetd` daemon binary for this
+    /// platform in the live lab, drawn from the adapter install modules so
+    /// they stay the single source of the per-platform path (audit I1
+    /// removed the per-stage duplicate constants). `None` for platforms the
+    /// lab cannot host a daemon on; the caller must fail closed naming the
+    /// platform, never substitute a guessed path.
+    pub fn lab_daemon_path(self) -> Option<&'static str> {
+        match self {
+            Self::Linux => Some(LINUX_RUSTYNETD_PATH),
+            Self::Macos => {
+                Some(crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH)
+            }
+            Self::Windows => {
+                Some(crate::vm_lab::orchestrator::adapter::windows_install::WINDOWS_RUSTYNETD_PATH)
+            }
+            Self::Ios | Self::Android => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod vm_guest_platform_lab_paths_tests {
+    use super::*;
+
+    /// Audit I1: the per-platform daemon path table is exhaustive over the
+    /// enum and the Linux/macOS/Windows entries name the adapter-installed
+    /// binaries. Mutation caught: reintroducing a `_ => unreachable!(...)`
+    /// arm (or swapping a path) in `lab_daemon_path` fails this test instead
+    /// of panicking a live stage thread.
+    #[test]
+    fn lab_daemon_path_covers_every_variant_with_installed_paths() {
+        assert_eq!(
+            VmGuestPlatform::Linux.lab_daemon_path(),
+            Some(LINUX_RUSTYNETD_PATH)
+        );
+        assert_eq!(
+            VmGuestPlatform::Macos.lab_daemon_path(),
+            Some(crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNETD_PATH)
+        );
+        assert_eq!(
+            VmGuestPlatform::Windows.lab_daemon_path(),
+            Some(crate::vm_lab::orchestrator::adapter::windows_install::WINDOWS_RUSTYNETD_PATH)
+        );
+        assert_eq!(VmGuestPlatform::Ios.lab_daemon_path(), None);
+        assert_eq!(VmGuestPlatform::Android.lab_daemon_path(), None);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
