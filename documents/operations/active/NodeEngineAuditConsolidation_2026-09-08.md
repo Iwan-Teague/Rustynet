@@ -9,8 +9,10 @@ scoped to one systemic pattern from the two 2026-09-08 reports
 (`MultiAgentSecurityReview_2026-09-08.md` §3 A–H;
 `LiveLabExtensibilityAssessment_2026-09-08.md` §8–§9). Every claim below was
 either re-verified by the manager in the tree (marked **verified**) or is
-carried as the probe's claim (marked *probe*). Probe output is UNTRUSTED
-until verified; nothing here was merged on a probe's word alone.
+carried as the probe's claim (marked *probe*). Per the owner's 2026-09-09
+decision, GLM-5.3/flash findings are trusted inputs: the *probe* items are
+actionable as written; the *verified* marks record where the manager also
+read the code, not a precondition for acting.
 
 ## 1) What was fixed today because of this pass
 
