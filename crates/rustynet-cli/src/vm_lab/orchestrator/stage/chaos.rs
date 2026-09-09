@@ -4,7 +4,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Clone, Copy)]
@@ -179,7 +179,12 @@ fn run_chaos_bin(ctx: &OrchestrationContext, spec: &ChaosBinSpec) -> StageOutcom
     }
 
     match cmd.output() {
-        Ok(output) if output.status.success() => StageOutcome::Passed,
+        Ok(output) if output.status.success() => {
+            match verify_chaos_report_artifact(&ctx.report_dir, spec.name) {
+                Ok(()) => StageOutcome::Passed,
+                Err(err) => StageOutcome::Failed(format!("{}: {err}", spec.bin)),
+            }
+        }
         Ok(output) => StageOutcome::Failed(format!(
             "{} exited with {}: {}",
             spec.bin,
@@ -188,6 +193,31 @@ fn run_chaos_bin(ctx: &OrchestrationContext, spec: &ChaosBinSpec) -> StageOutcom
         )),
         Err(err) => StageOutcome::Failed(format!("failed to run {}: {err}", spec.bin)),
     }
+}
+
+/// QH-83: the on-disk witness behind a chaos PASS verdict. Every chaos bin
+/// writes `<stage>_report.json` (a non-empty pretty JSON document) into the
+/// run's report dir before it exits, so an exit-0 run with no artifact means
+/// the bin never actually produced evidence — fail the stage instead of
+/// passing on the runner's post-hoc demotion alone.
+fn chaos_report_relative_path(stage_name: &str) -> String {
+    format!("{stage_name}_report.json")
+}
+
+fn verify_chaos_report_artifact(report_dir: &Path, stage_name: &str) -> Result<(), String> {
+    let path = report_dir.join(chaos_report_relative_path(stage_name));
+    let metadata = std::fs::metadata(&path)
+        .map_err(|err| format!("chaos report witness {}: {err}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "chaos report witness {} is not a regular file",
+            path.display()
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(format!("chaos report witness {} is empty", path.display()));
+    }
+    Ok(())
 }
 
 fn add_single_target_args(cmd: &mut Command, params: &ResolvedParams) {
@@ -284,6 +314,87 @@ mod tests {
         assert_eq!(
             ChaosSignedStateAdversarialStage::SPEC.extra_args,
             &[("--scenario", "all")]
+        );
+    }
+
+    fn chaos_witness_temp_dir(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "chaos_witness_{label}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn chaos_report_witness_missing_artifact_is_rejected() {
+        let dir = chaos_witness_temp_dir("missing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = verify_chaos_report_artifact(&dir, "chaos_clock_attack")
+            .expect_err("a pass with no report artifact must be rejected");
+        assert!(err.contains("chaos_clock_attack_report.json"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chaos_report_witness_empty_artifact_is_rejected() {
+        let dir = chaos_witness_temp_dir("empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("chaos_clock_attack_report.json"), b"").unwrap();
+        let err = verify_chaos_report_artifact(&dir, "chaos_clock_attack")
+            .expect_err("an empty report artifact must be rejected");
+        assert!(err.contains("is empty"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chaos_report_witness_present_artifact_passes() {
+        let dir = chaos_witness_temp_dir("present");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("chaos_signed_state_adversarial_report.json"),
+            b"{\"overall_status\":\"fail\"}\n",
+        )
+        .unwrap();
+        verify_chaos_report_artifact(&dir, "chaos_signed_state_adversarial")
+            .expect("a non-empty report artifact must verify");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chaos_report_witness_declared_per_stage_and_unique() {
+        use crate::vm_lab::orchestrator::stage::StageEvidence;
+        use std::collections::HashSet;
+
+        let stages: [&dyn OrchestrationStage; 9] = [
+            &ChaosClockAttackStage,
+            &ChaosCrashRecoveryStage,
+            &ChaosDaemonFaultStage,
+            &ChaosDaemonSigstopSigcontStage,
+            &ChaosMembershipAdversarialStage,
+            &ChaosNetworkImpairmentStage,
+            &ChaosPrivilegedBoundaryStage,
+            &ChaosResourceExhaustionStage,
+            &ChaosSignedStateAdversarialStage,
+        ];
+        let mut declared: HashSet<String> = HashSet::new();
+        for stage in stages {
+            let id = stage.id();
+            let name = id.as_str();
+            match id.evidence() {
+                StageEvidence::File(relative) => {
+                    assert_eq!(relative, chaos_report_relative_path(name));
+                    assert!(declared.insert(relative.to_owned()));
+                }
+                other => panic!("stage {name} must declare its report File witness, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            declared.len(),
+            9,
+            "each chaos stage needs its own report file"
         );
     }
 }
