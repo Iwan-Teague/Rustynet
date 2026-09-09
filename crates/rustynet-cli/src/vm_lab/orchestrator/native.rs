@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::vm_lab::orchestrator;
 use crate::vm_lab::orchestrator::evidence::{
-    RustNativeFinalizeInputs, RustNativeStageRecorder, finalize_rust_native_run,
+    ReuseDigest, RustNativeFinalizeInputs, RustNativeStageRecorder, finalize_rust_native_run,
     validate_collected_os_version, validate_rust_native_reuse_evidence,
     write_rust_native_node_stage_plan, write_rust_native_report_state_initial,
 };
@@ -486,7 +486,10 @@ pub(crate) fn execute_rust_native_orchestration(
     ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation
         && plan_stage_ids.contains(&orchestrator::stage::StageId::RefreshSignedBundles);
 
-    let reuse_binding: Option<(Vec<orchestrator::stage::StageId>, String)> = if run_only {
+    // Audit F2: the binding is a validated `ReuseDigest`, not a raw String —
+    // it can only be produced by `validate_rust_native_reuse_evidence`, so an
+    // unvalidated digest can never reach `with_reused_skips`.
+    let reuse_binding: Option<(Vec<orchestrator::stage::StageId>, ReuseDigest)> = if run_only {
         Some((
             setup_stage_ids.clone(),
             validate_rust_native_reuse_evidence(report_dir.as_path(), &setup_stage_ids)?,
