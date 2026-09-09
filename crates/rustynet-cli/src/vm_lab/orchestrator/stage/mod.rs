@@ -286,7 +286,8 @@ define_stage_catalog! {
     // fatal write failures), the per-node probe/bootstrap stages append
     // count-bearing stage-log lines, and the bundle-distribution rows declare
     // their per-alias bundle_evidence.json witnesses (F1b). MembershipInit
-    // was the reference StageLog row.
+    // was the reference StageLog row; anchor_validation and
+    // validate_baseline_runtime append per-validated-node witnesses too.
     Preflight => "preflight" @ Setup / T0Core / StageEvidence::File("logs/cross_bridge_preflight.txt"),
     PrepareSourceArchive => "prepare_source_archive" @ Setup / T0Core / StageEvidence::File("state/source_archive_provenance.json"),
     VerifySshReachability => "verify_ssh_reachability" @ Setup / T0Core / StageEvidence::StageLog,
@@ -304,7 +305,10 @@ define_stage_catalog! {
     // (alias, node_id, minted file, sha256, remote install destination) via
     // stage/bundle_evidence.rs; the runner demotes an unwitnessed pass.
     DistributeMembership => "distribute_membership" @ Setup / T0Core / StageEvidence::File("logs/distribute_membership.bundle_evidence.json"),
-    AnchorValidation => "anchor_validation" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 Setup batch: anchor_validation appends one witness line per
+    // validated anchor node (alias + substage summary); the
+    // reported_skips.json side-car write is fatal on failure too.
+    AnchorValidation => "anchor_validation" @ Setup / T1Role / StageEvidence::StageLog,
     // QH-83 Setup batch: admin_issue appends a per-validated-node witness
     // line (status role=admin + peer-list exit 0).
     AdminIssue => "admin_issue" @ Setup / T1Role / StageEvidence::StageLog,
@@ -319,7 +323,9 @@ define_stage_catalog! {
     // append_stage_evidence_line (stage/blind_exit.rs), so the runner's
     // verify_declared_evidence can demote an unwitnessed PASS to NotProven.
     BlindExit => "blind_exit" @ Setup / T1Role / StageEvidence::StageLog,
-    ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 Setup batch: validate_baseline_runtime appends a
+    // validated_nodes=N witness line (the F3 empty-scope guard stands).
+    ValidateBaselineRuntime => "validate_baseline_runtime" @ Setup / T0Core / StageEvidence::StageLog,
     SecurityAuditValidation => "security_audit_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     DnsFailclosedValidation => "dns_failclosed_validation" @ Live / T4Security / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Live default-deny ACL enforcement — a wrong GREEN is fail-open, so
