@@ -101,6 +101,10 @@ new declarations.
 `artifacts/live_lab/setup-witness-reverify-a8bafe81` on the host):** 38 pass /
 0 fail / 28 skipped, `run_passed=true`; every flipped Setup row graded `pass`
 (none demoted to NotProven), the four `bundle_evidence.json` witnesses and
-the count-bearing stage-log lines are present. The second half
-(anchor_validation, validate_baseline_runtime) still owes its own live
-re-verify on the merged commit.
+the count-bearing stage-log lines are present. **Second half re-verified live on BOTH hosts at `89ed48ba`
+(2026-09-09):** lenovo-bot `livelab-1788971102`-era run and katana
+`livelab-1788972499-89ed48ba4f35`, each 38 pass / 0 fail / 28 skipped,
+`validate_baseline_runtime` graded `pass` with its
+`validated_nodes=2 (<client>,<exit>)` line on both, `anchor_validation`
+`skipped` (no anchor in a 2-node topology — no witness owed). Rows fetched
+into both ledgers. The Setup phase is complete and live-proven.
