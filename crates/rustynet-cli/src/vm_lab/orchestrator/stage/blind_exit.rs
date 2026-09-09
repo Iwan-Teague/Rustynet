@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
+use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::blind_exit::{
     blind_exit_runtime_implemented, validate_blind_exit_runtime,
@@ -8,6 +9,19 @@ use crate::vm_lab::orchestrator::role_validation::blind_exit::{
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const REPORTED_SKIPS_FILENAME: &str = "blind_exit.reported_skips.json";
+
+/// Writes the per-validated-node witness line for a blind_exit PASS verdict.
+///
+/// Fail-closed: the caller turns any error into a stage failure, so a PASS
+/// without a durable witness line can never be recorded (the runner demotes
+/// a declared StageLog stage whose log is missing or empty to NotProven).
+fn write_blind_exit_witness(report_dir: &std::path::Path, alias: &str) -> Result<(), String> {
+    append_stage_evidence_line(
+        report_dir,
+        StageId::BlindExit.as_str(),
+        &format!("{alias}: blind_exit role confirmed; forward rules judged; masquerade=none"),
+    )
+}
 
 pub struct BlindExitStage;
 
@@ -66,6 +80,10 @@ impl OrchestrationStage for BlindExitStage {
             };
             if let Err(e) = validate_blind_exit_runtime(&*shell, platform, alias) {
                 failures.push(format!("{alias}: {e}"));
+                continue;
+            }
+            if let Err(e) = write_blind_exit_witness(&ctx.report_dir, alias) {
+                failures.push(format!("{alias}: evidence write failed: {e}"));
             }
         }
 
@@ -133,5 +151,47 @@ mod tests {
             BlindExitStage.execute(&mut ctx),
             StageOutcome::Skipped(_)
         ));
+    }
+
+    // F4 witness proof: a validated node must leave a durable stage-log line,
+    // because the catalog declares BlindExit as StageLog evidence (see
+    // stage::mod BlindExit row) and the runner demotes an unwitnessed PASS.
+    #[test]
+    fn blind_exit_witness_line_is_written_per_validated_node() {
+        let dir =
+            std::env::temp_dir().join(format!("blind_exit_witness_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp report dir");
+
+        write_blind_exit_witness(&dir, "blind-exit-a").expect("witness write");
+        write_blind_exit_witness(&dir, "blind-exit-b").expect("witness write");
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::BlindExit.as_str(),
+            ),
+        )
+        .expect("stage log readable");
+        assert!(log.contains("blind-exit-a: blind_exit role confirmed"));
+        assert!(log.contains("blind-exit-b: blind_exit role confirmed"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Fail-closed check: a witness write that cannot land must surface as an
+    // error the stage turns into a failure (never swallowed into a bare PASS).
+    #[test]
+    fn blind_exit_witness_write_failure_is_propagated() {
+        let blocker =
+            std::env::temp_dir().join(format!("blind_exit_witness_blocker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&blocker);
+        std::fs::write(&blocker, b"not a directory").expect("blocker file");
+
+        let err = write_blind_exit_witness(&blocker, "blind-exit-a")
+            .expect_err("write into a regular file path must fail");
+        assert!(!err.is_empty());
+
+        let _ = std::fs::remove_file(&blocker);
     }
 }
