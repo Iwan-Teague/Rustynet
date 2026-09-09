@@ -2746,6 +2746,12 @@ fn upsert_csv_row(
         .map(String::as_str)
         .unwrap_or("");
     let degenerate_key = key_report_dir.is_empty() || key_started.is_empty();
+    // A start marker carries an empty run_started_utc by construction; it
+    // may match ONLY its own stale marker for the same report_dir (review of
+    // D1), never a completed run's row.
+    let start_marker = row_role == LiveLabRunMatrixRowRole::Interim
+        && !key_report_dir.is_empty()
+        && key_started.is_empty();
 
     let mut retained: Vec<&str> = Vec::new();
     let mut key_owned = false;
@@ -2753,7 +2759,7 @@ fn upsert_csv_row(
         if line.trim().is_empty() {
             continue;
         }
-        let matches_key = !degenerate_key
+        let matches_key = (!degenerate_key || start_marker)
             && match parse_csv_record(line) {
                 Ok(fields) => {
                     let field = |index: Option<usize>| {
