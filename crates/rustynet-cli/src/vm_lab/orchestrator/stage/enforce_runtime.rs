@@ -39,6 +39,13 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // F3 fail-closed: an empty scope must not vacuously pass — enforce
+        // is the stage that flips daemons to auto_tunnel_enforce=true, and
+        // an empty assignments list here means a skip/reuse path bypassed
+        // planning. Fail loudly instead.
+        if ctx.assignments.is_empty() {
+            return StageOutcome::Failed("no assignments in scope".to_owned());
+        }
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results = crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
             &aliases,
