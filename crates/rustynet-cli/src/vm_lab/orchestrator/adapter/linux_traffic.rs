@@ -1133,6 +1133,21 @@ pub fn issue_bundles_to_dir(
         SHORT_TIMEOUT,
     )?;
 
+    // F4 completeness gate: the minter's output is asserted, not trusted. A
+    // zero-file or partial mint errors HERE, naming the missing
+    // rn-<kind>-<node_id>.<kind> files, instead of deferring to a
+    // distribution-shaped "bundle not found" per node later.
+    let missing = missing_bundle_files(kind, env_content, &listing);
+    if !missing.is_empty() {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "issuer did not mint {missing:?} for {kind} bundles \
+                 (issue dir listed {} file(s)); refusing to distribute a partial mint",
+                listing.lines().filter(|l| !l.trim().is_empty()).count()
+            ),
+        });
+    }
+
     std::fs::create_dir_all(local_out_dir).map_err(|e| AdapterError::Io {
         message: format!("create local out dir: {e}"),
     })?;
@@ -1150,6 +1165,39 @@ pub fn issue_bundles_to_dir(
     );
 
     Ok(())
+}
+
+/// F4: which `rn-<kind>-<node_id>.<kind>` bundle files the issuer was
+/// expected to mint are ABSENT from the issue-dir listing. Pure so the
+/// completeness contract is unit-testable; a returned non-empty Vec is the
+/// fail-closed trigger in [`issue_bundles_to_dir`]. Mutation guard: dropping
+/// the completeness check in `issue_bundles_to_dir` flips
+/// `issue_bundles_errors_when_minter_mints_a_subset` red.
+fn missing_bundle_files(
+    kind: &crate::vm_lab::orchestrator::error::BundleKind,
+    env_content: &str,
+    listing: &str,
+) -> Vec<String> {
+    // Node ids come from NODES_SPEC (`node_id|endpoint|pubkey|caps;...`) —
+    // the same spec the issuer was handed, so expectation and mint input
+    // cannot drift.
+    let node_ids: Vec<&str> = env_content
+        .lines()
+        .find_map(|l| l.strip_prefix("NODES_SPEC="))
+        .map(|spec| {
+            spec.split(';')
+                .filter(|entry| !entry.is_empty())
+                .filter_map(|entry| entry.split('|').next())
+                .filter(|id| !id.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let listed: Vec<&str> = listing.lines().map(str::trim).collect();
+    node_ids
+        .iter()
+        .map(|node_id| format!("rn-{kind}-{node_id}.{kind}"))
+        .filter(|expected| !listed.iter().any(|l| *l == expected.as_str()))
+        .collect()
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -1464,6 +1512,43 @@ mod gossip_export_tests {
 mod tests {
     use super::*;
 
+    /// F4 pin: a partial or empty mint must be named, not trusted. Mutation
+    /// caught: dropping the completeness check in `issue_bundles_to_dir`
+    /// makes the empty-listing arm pass, flipping this test red.
+    #[test]
+    fn issue_bundles_errors_when_minter_mints_a_subset() {
+        use crate::vm_lab::orchestrator::error::BundleKind;
+        let env = "NODES_SPEC=node-a|10.0.0.1:51820|a|client;\
+node-b|10.0.0.2:51820|b|client\nALLOW_SPEC=\n";
+        // Full mint names every expected file — no error.
+        let full = "rn-assignment-node-a.assignment\nrn-assignment-node-b.assignment\n";
+        assert!(
+            missing_bundle_files(&BundleKind::Assignment, env, full).is_empty(),
+            "a complete mint must not be flagged"
+        );
+        // Partial mint: node-b's bundle absent.
+        let partial = "rn-assignment-node-a.assignment\n";
+        assert_eq!(
+            missing_bundle_files(&BundleKind::Assignment, env, partial),
+            vec!["rn-assignment-node-b.assignment".to_owned()],
+            "a missing per-node bundle must be named exactly"
+        );
+        // Empty listing (minter minted nothing) flags everything.
+        assert_eq!(
+            missing_bundle_files(&BundleKind::Assignment, env, "").len(),
+            2,
+            "a zero-file mint must flag every expected bundle"
+        );
+        // Traversal naming follows the same rn-<kind>-<node_id>.<kind> shape.
+        assert_eq!(
+            missing_bundle_files(&BundleKind::Traversal, env, ""),
+            vec![
+                "rn-traversal-node-a.traversal".to_owned(),
+                "rn-traversal-node-b.traversal".to_owned()
+            ]
+        );
+    }
+
     #[test]
     fn ping_diagnostic_reports_reachability_only_on_zero_exit() {
         let result = parse_ping_result(
@@ -1640,10 +1725,9 @@ mod tests {
     fn parse_node_clean_probe_reports_running_daemon() {
         let err = parse_node_clean_probe("nft=- daemon=up iface=-")
             .expect_err("running daemon must fail");
-        assert!(
-            err.to_string()
-                .contains("rustynetd or rustynet-relay still running")
-        );
+        assert!(err
+            .to_string()
+            .contains("rustynetd or rustynet-relay still running"));
     }
 
     #[test]
@@ -1887,12 +1971,10 @@ table ip other_nat {
             dport=443 [UNREPLIED] src=1.1.1.1 dst=203.0.113.7 sport=443 dport=54321 use=1";
         assert!(conntrack_line_mesh_nat_session(non_mesh).is_none());
         // Single tuple / empty => None.
-        assert!(
-            conntrack_line_mesh_nat_session(
-                "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443"
-            )
-            .is_none()
-        );
+        assert!(conntrack_line_mesh_nat_session(
+            "tcp 6 117 SYN_SENT src=100.64.0.3 dst=1.1.1.1 sport=1 dport=443"
+        )
+        .is_none());
         assert!(conntrack_line_mesh_nat_session("").is_none());
     }
 
