@@ -20,6 +20,22 @@ pub mod windows_install;
 pub mod windows_membership;
 pub mod windows_traffic;
 
+/// The ONLY sanctioned `<alias>-bootstrap` node-id mint (QH-68 class;
+/// `NodeEngineSetupProvenanceAudit_2026-09-09.md` F2).
+///
+/// At INSTALL time no daemon exists yet to ask for its identity, so the
+/// label-derived bootstrap id is unavoidable; the install adapters call this
+/// named helper so the mint is explicit and greppable instead of an inline
+/// `unwrap_or_else` fallback. At ENFORCE time it is NOT unavoidable —
+/// `EnforceBaselineRuntime` is transitively downstream of `CollectPubkeys`,
+/// so reaching enforce with `ctx.node_ids` empty means a skip/reuse path
+/// bypassed collection — and the enforce paths must fail closed instead of
+/// inventing an identity (see `linux_install::enforce_daemon`,
+/// `macos_install::enforce_daemon`).
+pub(crate) fn mint_bootstrap_node_id(alias: &str) -> String {
+    format!("{alias}-bootstrap")
+}
+
 /// Create a collision-free, owner-only temporary file for parallel adapter
 /// workers. The caller removes the persisted path after transfer.
 pub(super) fn write_secure_temp_file(

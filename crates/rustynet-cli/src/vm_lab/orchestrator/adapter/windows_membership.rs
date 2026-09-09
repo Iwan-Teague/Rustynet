@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::adapter::windows_install::{
-    WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH, WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, WINDOWS_STAGING_DIR,
-    WINDOWS_STATE_ROOT, ps_quote, run_remote_ps,
+    ps_quote, run_remote_ps, WINDOWS_MEMBERSHIP_OWNER_PUBKEY_PATH,
+    WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, WINDOWS_STAGING_DIR, WINDOWS_STATE_ROOT,
 };
 use crate::vm_lab::orchestrator::connection::NodeConnection;
 use crate::vm_lab::orchestrator::error::{
@@ -160,6 +160,26 @@ pub fn distribute_signed_bundle(
         MEDIUM_TIMEOUT,
     )?;
 
+    // F1a digest read-back: require the installed file to match the exact
+    // local bytes (Get-FileHash tail, verbatim style of distribute_verifier_key).
+    let expected_sha256 =
+        crate::vm_lab::orchestrator::adapter::verifier_key::sha256_hex_of_file(bundle_path)?;
+    let install_script = windows_bundle_install_script(&kind, &expected_sha256)?;
+    run_remote_ps(conn, &install_script, SHORT_TIMEOUT)?;
+
+    Ok(())
+}
+
+/// Render the atomic `Move-Item` install + SHA-256 read-back script for a
+/// signed bundle on Windows. Pure so the script shape is unit-testable
+/// without a live connection; the digest tail is what turns a guest-local
+/// substitution between scp and install into a thrown PowerShell error
+/// instead of a content-blind exit-0 pass (F1a).
+fn windows_bundle_install_script(
+    kind: &BundleKind,
+    expected_sha256: &str,
+) -> Result<String, AdapterError> {
+    let (remote_staging, remote_dst) = remote_bundle_paths(kind);
     let log_init_script = if matches!(kind, BundleKind::Membership) {
         let log_header = membership_log_header();
         format!(
@@ -173,16 +193,16 @@ pub fn distribute_signed_bundle(
     } else {
         String::new()
     };
-    let install_script = format!(
+    Ok(format!(
         "Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; \
          $ProgressPreference = 'SilentlyContinue'; \
-         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force{log_init_script}",
+         Move-Item -LiteralPath {src_q} -Destination {dst_q} -Force{log_init_script}; \
+         $actual = (Get-FileHash -LiteralPath {dst_q} -Algorithm SHA256).Hash.ToLowerInvariant(); \
+         if ($actual -ne {expected_q}) {{ throw ('bundle digest mismatch: ' + $actual) }}",
         src_q = ps_quote(&remote_staging)?,
         dst_q = ps_quote(&remote_dst)?,
-    );
-    run_remote_ps(conn, &install_script, SHORT_TIMEOUT)?;
-
-    Ok(())
+        expected_q = ps_quote(expected_sha256)?,
+    ))
 }
 
 /// Distribute the verifier public-key for `kind` to this Windows node.
@@ -254,7 +274,7 @@ fn windows_verifier_key_paths(kind: &BundleKind) -> (String, String) {
     }
 }
 
-fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
+pub(crate) fn remote_bundle_paths(kind: &BundleKind) -> (String, String) {
     let staging = WINDOWS_STAGING_DIR;
     let state = WINDOWS_STATE_ROOT;
     match kind {
@@ -372,6 +392,38 @@ fn base64_std_decode(encoded: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// F1a pin (Windows twin of the digest read-back): the install script
+    /// must carry the Get-FileHash comparison and the ps_quoted host-side
+    /// expected hex, for EVERY bundle kind. Mutation caught: dropping the
+    /// digest tail from `windows_bundle_install_script` removes the
+    /// assertion this test observes.
+    #[test]
+    fn windows_bundle_install_script_carries_the_digest_read_back() {
+        for kind in [
+            BundleKind::Membership,
+            BundleKind::Assignment,
+            BundleKind::Traversal,
+            BundleKind::DnsZone,
+        ] {
+            let expected = "cafebabe".repeat(8);
+            let script = windows_bundle_install_script(&kind, &expected).expect("script renders");
+            assert!(
+                script.contains("Get-FileHash"),
+                "{kind:?}: script must read the installed digest back: {script}"
+            );
+            assert!(
+                script.contains("bundle digest mismatch"),
+                "{kind:?}: mismatch must throw a named error: {script}"
+            );
+            // The expected hex is ps_quoted (single quotes doubled if any);
+            // plain lowercase hex passes through verbatim inside the literal.
+            assert!(
+                script.contains(&format!("''{expected}''")) || script.contains(&expected),
+                "{kind:?}: script must pin the host-side expected hex: {script}"
+            );
+        }
+    }
+
     #[test]
     fn remote_bundle_paths_contain_expected_filenames() {
         let (staging, dst) = remote_bundle_paths(&BundleKind::Membership);
@@ -465,19 +517,17 @@ mod tests {
     #[test]
     fn add_peer_script_rejects_control_chars_in_node_id() {
         // ps_quote rejects CR/LF/NUL, so a node_id carrying them fails closed.
-        assert!(
-            build_add_peer_script(
-                "x",
-                "node\ninjected",
-                "abcd",
-                "client",
-                "exit-1",
-                "exit-1-owner",
-                "k",
-                "p",
-            )
-            .is_err()
-        );
+        assert!(build_add_peer_script(
+            "x",
+            "node\ninjected",
+            "abcd",
+            "client",
+            "exit-1",
+            "exit-1-owner",
+            "k",
+            "p",
+        )
+        .is_err());
     }
 
     #[test]

@@ -39,6 +39,13 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        // F3 fail-closed: an empty scope must not vacuously pass — enforce
+        // is the stage that flips daemons to auto_tunnel_enforce=true, and
+        // an empty assignments list here means a skip/reuse path bypassed
+        // planning. Fail loudly instead.
+        if ctx.assignments.is_empty() {
+            return StageOutcome::Failed("no assignments in scope".to_owned());
+        }
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results = crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
             &aliases,
@@ -86,7 +93,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn empty_assignments_passes() {
+    /// Setup provenance F3: an empty scope validated nothing, so the stage
+    /// fails closed instead of passing vacuously. Mutation caught: reverting
+    /// the guard to `return StageOutcome::Passed`.
+    fn empty_assignments_fails_closed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -113,13 +123,13 @@ mod tests {
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
         };
-        assert_eq!(
+        assert!(matches!(
             EnforceBaselineRuntimeStage::new(
                 1,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .execute(&mut ctx),
-            StageOutcome::Passed
-        );
+            StageOutcome::Failed(_)
+        ));
     }
 }

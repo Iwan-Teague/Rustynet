@@ -152,6 +152,14 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         use crate::vm_lab::DaemonProbeOp;
 
+        // F3 fail-closed: an empty scope must not vacuously pass — this
+        // stage is the six-validator posture proof, and an empty assignments
+        // list here means a skip/reuse path bypassed planning. Fail loudly
+        // instead of green-lighting nothing.
+        if ctx.assignments.is_empty() {
+            return StageOutcome::Failed("no assignments in scope".to_owned());
+        }
+
         const OPS: &[DaemonProbeOp] = &[
             DaemonProbeOp::RuntimeAcls,
             DaemonProbeOp::ServiceHardening,
@@ -277,7 +285,10 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn empty_assignments_passes() {
+    /// Setup provenance F3: an empty scope validated nothing, so the stage
+    /// fails closed instead of passing vacuously. Mutation caught: reverting
+    /// the guard to `return StageOutcome::Passed`.
+    fn empty_assignments_fails_closed() {
         let mut ctx = OrchestrationContext {
             assignments: vec![],
             adapters: HashMap::new(),
@@ -304,14 +315,14 @@ mod tests {
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
         };
-        assert_eq!(
+        assert!(matches!(
             ValidateBaselineRuntimeStage::new(
                 1,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             )
             .execute(&mut ctx),
-            StageOutcome::Passed
-        );
+            StageOutcome::Failed(_)
+        ));
     }
 
     // ----- QH-39: the baseline mesh-status dispatch must assert something --
