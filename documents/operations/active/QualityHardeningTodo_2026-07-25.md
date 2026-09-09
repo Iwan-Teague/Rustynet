@@ -7238,56 +7238,63 @@ remote command → source pin (sliced BEFORE the test module) finds `| sudo -S`;
 
 **Owner actions OWED:** rotate the lab password shared by the five affected
 guests (it is in public git history and cannot be unpublished), then update
-the untracked sidecar. **Follow-ups (open):** F3 — replace the denylist
-`ensure_ssh_target`/`ensure_ssh_user`/`last_known_ip` validators in
-`vm_lab/mod.rs` with allowlists (reuse `validated_args::connection_user`,
-require `last_known_ip` to parse as `IpAddr`) and add the sink-side gate
-(every `ssh`/`scp` spawn under `vm_lab/**` carries `--` before the
-destination; `sshpass` never carries `-p`); extend
-`secrets_hygiene_gates` to reject `| sudo -S` fed by an echo literal and
-`sshpass -p` anywhere under `crates/`.
+the untracked sidecar. **F3 + gate extension FIXED 2026-09-09** (worktree
+branch `ai-edit/edit-1788908852677-30071-0`, commits `8c4dd6f1`, `efe73099`,
+`f7254653`):
 
-**Disposition: FIXED on main (F1/F2); rotation + F3 + gate extension OPEN.**
+- **Allowlists at the inventory parse boundary** (`vm_lab/mod.rs`):
+  `ensure_ssh_target` is the alphabet allowlist `[A-Za-z0-9._:@-]` (non-empty,
+  no leading `-`; IPv6 literals via `:`, `user@host` via `@`, trailing-dot
+  hostnames and `..` accepted — inert as single argv elements after `--`);
+  `ensure_ssh_user` delegates to `validated_args::connection_user` (QH-01
+  seam); `last_known_ip` must parse as `std::net::IpAddr`; the same
+  destination allowlist now covers `alt_ssh_endpoints` entries and the
+  `qemu+ssh://` authority `ssh_endpoint` extracts from `connect_uri`.
+  `required_string_field` still owns the absent-field case (unchanged; note it
+  trims, so `\"host\\n\"` normalises to `\"host\"` before validation —
+  documented in the tests).
+- **Sink-side source scanner** (`vm_lab::tests::
+  ssh_sinks_carry_the_destination_guard_and_sshpass_never_takes_a_password_
+  flag`): every `ssh`/`scp` spawn under `vm_lab/**` must carry a literal `--`
+  before its destination, `sshpass` must never take `.arg(\"-p\")` before its
+  wrapped ssh, and `.arg(\"ssh\")` wrappers must carry `--`; fail-closed on
+  unreadable files, floor-counted so a spawn-style change cannot silence it,
+  one commented allowlist entry (`stage/preflight.rs` `ssh -V` version probe —
+  no destination argument exists). The scan caught and fixed the
+  `recover_guest_network.rs` sinks, whose `--` was hidden in a shared arg vec.
+- **secrets_hygiene_gates extended** (`secrets_hygiene_gates.rs`; the wrapper
+  `scripts/ci/secrets_hygiene_gates.sh` just execs the bin and needed no
+  change): a positive scan over every tracked file under `crates/` and
+  `scripts/` rejects an `echo <literal>` line piped into `sudo -S`, the
+  `sshpass -p` shell form, and `.arg(\"-p\")` between an `sshpass` spawn and
+  its wrapped ssh (PolicyReject); Rust test modules are cut from the scan
+  (fixtures deliberately quote the defect shape) and all needles are assembled
+  from parts so the gate never matches its own source. Negative tests use the
+  shapes captured from `6908f20d` with the live password redacted —
+  `gate_rejects_the_captured_sudoers_echo_literal`,
+  `gate_rejects_the_captured_sshpass_shell_flag`,
+  `gate_rejects_the_captured_sshpass_rust_arg_list`, plus the negative control
+  `gate_accepts_the_env_var_and_stdin_channel_shapes`. The gate also RUNS the
+  new vm_lab scanner/allowlist tests via a new extra-cargo-args column in
+  `REQUIRED_TESTS` (`--all-features`; without it cargo runs zero tests for a
+  `vm-lab`-gated filter and the output verifier rejects the run).
+- **Hostile-input tests** (`vm_lab::inventory_ssh_destination_allowlist_tests`):
+  `ssh_target` in {-oProxyCommand=x, -F/tmp/x, host; rm, ho\\nst, héte, \"\"},
+  `ssh_user` in {-oFoo, a b, a\\nb, \"\"→normalises-to-absent},
+  `last_known_ip` in {-4, 10.0.0.1 -oX, not an ip} — each rejection asserts the
+  field name; each test's doc comment names the mutation it catches;
+  `real_lab_inventory_still_parses_under_the_allowlist` proves the tracked
+  fleet (IPv4 + hostname targets, libvirt `qemu+ssh://` URIs) still parses.
+- **Pre-existing failures on this base, OUTSIDE this change's scope (verified
+  present on HEAD with this work stashed):**
+  `vm_lab::tests::source_pin_self_includes_must_search_the_implementation_
+  slice` — `macos_install.rs:3966` pins its own file without
+  `implementation_source_slice` (the F1/F2 commit added the pin un-routed;
+  macos_install.rs was outside this job's edit allowlist); and clippy
+  `-D warnings` fails on untouched code (`rustynetd` collapsible_if ×3, and 10
+  lints across `vm_lab/orchestrator/stage/{distribute_assignments,preflight,
+  validate_runtime}.rs` + `workspace_root.rs`). The F3 work itself is
+  fmt/clippy/test-clean.
 
-### QH-86 — the blind_exit runtime validator passed on ANY output: `iptables -t nat -L` prints a chain header and `pfctl -s nat` prints every host NAT, so a blind_exit that installed nothing was blessed — FIXED 2026-09-09
-
-**Severity: high for ledger integrity (this validator is the whole runtime
-proof behind `BlindExitStage`; vm-lab is default-off so no shipped-code
-impact). Confidence: VERIFIED — B3 of
-`NodeEngineAuditConsolidation_2026-09-08.md` §2-A, re-read against
-`linux_blind_exit::build_linux_blind_exit_forward_commands` and
-`macos_blind_exit::render`, which define what a blind_exit actually installs.**
-
-`role_validation/blind_exit.rs` probed `iptables -t nat -L POSTROUTING || nft
-list ruleset` and `pfctl -s nat` and accepted any non-empty stdout. Both
-commands print something on every host (the iptables chain header; a
-libvirt/docker/Internet-Sharing NAT), so the only failing fixture the old
-test used (`stdout: Vec::new()`) was one the real producer cannot emit
-(pattern B of the 2026-09-08 review). Worse, a blind_exit installs NO
-masquerade — it forwards mesh-sourced traffic without translating — so the
-old probe was looking for the wrong thing entirely.
-
-**Fix.** Linux: read `nft list ruleset` (exit status checked, stderr folded
-in), then judge only `rustynet*` tables: the forward chain must carry
-`ct state established,related accept` and an `iifname … oifname … saddr …
-accept` rule, and NO rustynet table may hold `masquerade` (a masquerade means a
-regular exit is wearing the role). Foreign tables are ignored in both
-directions (a docker masquerade cannot fail a correct node; a foreign forward
-rule cannot pass an empty one). macOS: `pfctl -a com.rustynet/blind_exit -s
-rules` must show the mesh-sourced inbound pass on the tunnel and outbound
-pass on the egress, and `pfctl -a com.rustynet/nat -s nat` must be empty.
-Windows unchanged, annotated: H3 (silent NAT downgrade) owns it — H3 itself is closed: `88adebe6` refuses `blind_exit` in the Windows NAT stage, and the follow-up on 2026-09-09 refuses it at daemon startup (`validate_node_role_backend_capabilities` rejects `blind_exit` on `windows-wireguard-nt`, test `node_role_backend_capability_gate_rejects_unsupported_backend`) and in the installer (`[ValidateSet]` on `-NodeRole` without `blind_exit`).
-
-**Tests, each naming the mutation it catches:**
-`linux_fails_closed_when_no_forwarding_rules` (three REAL fixtures: killswitch
-table without forward rules, the iptables chain header, empty — mutation:
-revert to `stdout.trim().is_empty()`), `linux_fails_closed_when_rustynet_table_masquerades`
-(drop the masquerade check), `linux_ignores_foreign_tables_in_both_directions`
-(judge every table), `linux_fails_closed_when_nft_exits_non_zero` (drop
-`is_success()`), `macos_fails_closed_on_empty_or_foreign_anchor_output`
-(revert to non-empty stdout), `macos_fails_closed_when_exit_nat_anchor_translates`
-(drop the NAT-anchor check), `macos_fails_closed_when_pfctl_exits_non_zero`.
-
-**Disposition: FIXED on main; live re-proof of the Linux blind_exit cell owed
-(the validator now demands the real rule shape, so the next run is the
-first honest one).**
+**Disposition: FIXED on main (F1/F2); rotation OWED; F3 + gate extension
+FIXED 2026-09-09 pending merge.**

@@ -318,7 +318,13 @@ fn host_bridges() -> Vec<String> {
         .collect()
 }
 
-fn ssh_common_args(identity: &str, ssh_target: &str) -> Vec<String> {
+/// Option list for the recovery-only SSH sinks. The destination is NOT part of
+/// this vec: each spawn site must append `--` and `ssh_target` itself, so the
+/// destination guard (`--`) is a literal at the sink where the scanner test
+/// (`ssh_sinks_carry_the_destination_guard_and_sshpass_never_takes_a_password_
+/// flag`) can see it — a guard buried in a shared vec is invisible to the scan
+/// and one refactor away from silently dropping out of one caller.
+fn ssh_common_args(identity: &str) -> Vec<String> {
     // Recovery reaches a possibly-reinstalled guest over the host-local
     // link-local L2, where the guest host key may have changed after a rebuild
     // and the path is host-adjacent. Host-key pinning is intentionally disabled
@@ -337,7 +343,6 @@ fn ssh_common_args(identity: &str, ssh_target: &str) -> Vec<String> {
         "GlobalKnownHostsFile=/dev/null".to_owned(),
         "-o".to_owned(),
         format!("ConnectTimeout={RECOVER_SSH_CONNECT_TIMEOUT_SECS}"),
-        ssh_target.to_owned(),
     ]
 }
 
@@ -346,9 +351,12 @@ fn run_ssh_capture(
     ssh_target: &str,
     remote_command: &str,
 ) -> Result<String, String> {
-    let mut args = ssh_common_args(identity, ssh_target);
+    let mut args = ssh_common_args(identity);
     args.push(remote_command.to_owned());
     let output = Command::new("ssh")
+        // QH-85 F3 sink guard: `--` so ssh_target can never parse as an option.
+        .arg("--")
+        .arg(ssh_target)
         .args(args.iter().map(String::as_str))
         .output()
         .map_err(|err| format!("ssh invocation failed: {err}"))?;
@@ -366,11 +374,14 @@ fn run_ssh_capture(
 /// The script is a fixed template with only a validated interface name
 /// substituted, and is passed on stdin — never assembled into a shell string.
 fn run_ssh_script_with_sudo(identity: &str, ssh_target: &str, script: &str) -> Result<(), String> {
-    let mut args = ssh_common_args(identity, ssh_target);
+    let mut args = ssh_common_args(identity);
     args.push("sudo".to_owned());
     args.push("bash".to_owned());
     args.push("-s".to_owned());
     let mut child = Command::new("ssh")
+        // QH-85 F3 sink guard: `--` so ssh_target can never parse as an option.
+        .arg("--")
+        .arg(ssh_target)
         .args(args.iter().map(String::as_str))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
