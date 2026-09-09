@@ -330,7 +330,12 @@ define_stage_catalog! {
     // aggregate, not this stage.
     RoleSwitchMatrix => "role_switch_matrix" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     ExitHandoff => "exit_handoff" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    ActiveExit => "active_exit" @ Live / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // Audit B4: the ONLY pass path of this stage writes the egress NAT
+    // session pair (client traffic translated by the exit) — declared as the
+    // pass witness so a bare Passed with no proof is demoted by the runner.
+    // Skips (unimplemented platform, no client, offline egress) carry their
+    // own reported-skip artifacts and are not gated on this witness.
+    ActiveExit => "active_exit" @ Live / T1Role / StageEvidence::File("active_exit.egress_evidence.json"),
     // Spec §3 places the EXIT-scoped dns-failclosed inside the exit role's
     // T1 list ("exit→NAT+handoff+dns-failclosed+demotion-residue"); the
     // standalone dns_failclosed_validation above is the T4 family member.
