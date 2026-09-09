@@ -91,6 +91,7 @@ pub mod anchor_validation;
 pub mod authenticode_validation;
 pub mod blind_exit;
 pub mod blind_exit_dataplane_validation;
+pub mod bundle_evidence;
 pub mod chaos;
 pub mod cleanup;
 pub mod collect_pubkeys;
@@ -293,12 +294,15 @@ define_stage_catalog! {
     CrossNetworkSubstrateSetup => "cross_network_substrate_setup" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     CollectPubkeys => "collect_pubkeys" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     MembershipInit => "membership_init" @ Setup / T0Core / StageEvidence::StageLog,
-    DistributeMembership => "distribute_membership" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 F1b: every bundle-distribution pass writes a per-alias witness
+    // (alias, node_id, minted file, sha256, remote install destination) via
+    // stage/bundle_evidence.rs; the runner demotes an unwitnessed pass.
+    DistributeMembership => "distribute_membership" @ Setup / T0Core / StageEvidence::File("logs/distribute_membership.bundle_evidence.json"),
     AnchorValidation => "anchor_validation" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     AdminIssue => "admin_issue" @ Setup / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    DistributeAssignments => "distribute_assignments" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    DistributeTraversal => "distribute_traversal" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
-    DistributeDnsZone => "distribute_dns_zone" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    DistributeAssignments => "distribute_assignments" @ Setup / T0Core / StageEvidence::File("logs/distribute_assignment.bundle_evidence.json"),
+    DistributeTraversal => "distribute_traversal" @ Setup / T0Core / StageEvidence::File("logs/distribute_traversal.bundle_evidence.json"),
+    DistributeDnsZone => "distribute_dns_zone" @ Setup / T0Core / StageEvidence::File("logs/distribute_dns-zone.bundle_evidence.json"),
     EnforceBaselineRuntime => "enforce_baseline_runtime" @ Setup / T0Core / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // blind_exit ACTIVATES the blind_exit role posture (role capability),
     // not baseline plumbing — T1 like the other role-lifecycle stages.
@@ -403,7 +407,11 @@ define_stage_catalog! {
     // TRAVERSAL_TTL_SECS stay as configured; this stage never lengthens
     // them). Gated by the same --enable-relay-forwarding-validation flag;
     // skipped (fail-closed) otherwise. Role-capability proof: T1.
-    RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
+    // QH-83 F1b: the pass distributes BOTH the traversal and the dns-zone
+    // bundle and writes both witnesses; the runner checks the traversal one
+    // (the outcome this stage returns), and the dns-zone witness is pinned
+    // by the stage's own test.
+    RefreshSignedBundles => "refresh_signed_bundles" @ Disruptive / T1Role / StageEvidence::File("logs/distribute_traversal.bundle_evidence.json"),
     RelayForwardsFrameValidation => "relay_forwards_frame_validation" @ Disruptive / T1Role / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     LiveExtendedSoakValidation => "extended_soak" @ Soak / T2Resilience / StageEvidence::None { reason: PHASE1_EVIDENCE_PENDING },
     // Cross-NETWORK ≠ cross-OS: this suite exercises NAT/netns traversal
