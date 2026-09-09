@@ -707,16 +707,24 @@ mod tests {
             outcome,
             always_run: false,
             panics: false,
-            write_witness: false,
+            write_witness: true,
         })
     }
 
+    /// Every test gets its own report dir: nextest runs tests as concurrent
+    /// processes, and a shared `/tmp/test-report` let one test's runner
+    /// clear the File witness another test's stage had just written.
     fn make_ctx() -> OrchestrationContext {
-        OrchestrationContext::new(
-            vec![],
-            PathBuf::from("/tmp/test-report"),
-            "test-net".to_owned(),
-        )
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rustynet-runner-test-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create per-test report dir");
+        OrchestrationContext::new(vec![], dir, "test-net".to_owned())
     }
 
     /// Report dir backed by a real tempdir so witness files can be written
@@ -807,9 +815,9 @@ mod tests {
     fn skip_cascade_blocks_dependents_of_failing_stage() {
         // A (pass) → B (fail) → C (should be skipped)
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
-            pass_stage(StageId::Preflight, vec![]),
+            witnessed_pass_stage(StageId::Preflight, vec![]),
             fail_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
-            pass_stage(
+            witnessed_pass_stage(
                 StageId::VerifySshReachability,
                 vec![StageId::PrepareSourceArchive],
             ),
@@ -846,7 +854,7 @@ mod tests {
         // cleanup must STILL run (Passed), not be cascade-skipped — otherwise a
         // mid-pipeline failure leaves killswitch/NAT residue on the guests.
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
-            pass_stage(StageId::Preflight, vec![]),
+            witnessed_pass_stage(StageId::Preflight, vec![]),
             fail_stage(StageId::ExitHandoff, vec![StageId::Preflight]),
             always_run_stage(StageId::Cleanup, vec![StageId::ExitHandoff]),
         ];
@@ -1205,7 +1213,7 @@ mod tests {
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
             fail_stage(StageId::Preflight, vec![]),
             pass_stage(StageId::PrepareSourceArchive, vec![StageId::Preflight]),
-            pass_stage(StageId::CleanupHosts, vec![]),
+            witnessed_pass_stage(StageId::CleanupHosts, vec![]),
         ];
         let runner = StateMachineRunner::new(stages).expect("valid plan");
         let mut ctx = make_ctx();
@@ -1239,9 +1247,9 @@ mod tests {
         // Insert in order: C (depends on A), B (no deps), A (no deps)
         // Expected execution order: A and B before C (A before C, B anywhere)
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
-            pass_stage(StageId::VerifySshReachability, vec![StageId::Preflight]),
-            pass_stage(StageId::PrepareSourceArchive, vec![]),
-            pass_stage(StageId::Preflight, vec![]),
+            witnessed_pass_stage(StageId::VerifySshReachability, vec![StageId::Preflight]),
+            witnessed_pass_stage(StageId::PrepareSourceArchive, vec![]),
+            witnessed_pass_stage(StageId::Preflight, vec![]),
         ];
         let runner = StateMachineRunner::new(stages).expect("valid plan");
         let mut ctx = make_ctx();
@@ -1618,7 +1626,10 @@ mod tests {
     #[test]
     fn evidence_opt_out_stages_pass_without_witness() {
         let stages: Vec<Box<dyn OrchestrationStage>> = vec![
-            pass_stage(StageId::PrepareSourceArchive, vec![]),
+            // validate_baseline_runtime is still a PHASE1_EVIDENCE_PENDING
+            // opt-out row (the Setup batch moved prepare_source_archive to
+            // a File witness).
+            pass_stage(StageId::ValidateBaselineRuntime, vec![]),
             always_run_stage(StageId::Cleanup, vec![]),
         ];
         let (mut ctx, _dir) = tempdir_ctx();
