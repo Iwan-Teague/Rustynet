@@ -217,7 +217,23 @@ fn verify_chaos_report_artifact(report_dir: &Path, stage_name: &str) -> Result<(
     if metadata.len() == 0 {
         return Err(format!("chaos report witness {} is empty", path.display()));
     }
-    Ok(())
+    // The witness must be the bin's scenario report, not merely bytes: a
+    // JSON object carrying the verdict field (review NIT, 2026-09-10).
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|err| format!("chaos report witness {}: {err}", path.display()))?;
+    verify_chaos_report_shape(&raw)
+        .map_err(|err| format!("chaos report witness {}: {err}", path.display()))
+}
+
+/// Pure shape check on a chaos report: JSON object with an `overall_status`
+/// string. Anything else is not evidence.
+fn verify_chaos_report_shape(raw: &str) -> Result<(), String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|err| format!("not valid JSON: {err}"))?;
+    match value.get("overall_status").and_then(|v| v.as_str()) {
+        Some(status) if !status.is_empty() => Ok(()),
+        _ => Err("JSON has no `overall_status` string; not a chaos scenario report".to_owned()),
+    }
 }
 
 fn add_single_target_args(cmd: &mut Command, params: &ResolvedParams) {
@@ -279,6 +295,15 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chaos_report_shape_requires_a_json_object_with_a_verdict() {
+        assert!(verify_chaos_report_shape(r#"{"overall_status":"pass","stages":[]}"#).is_ok());
+        assert!(verify_chaos_report_shape("not json").is_err());
+        assert!(verify_chaos_report_shape(r#"{"stages":[]}"#).is_err());
+        assert!(verify_chaos_report_shape(r#"{"overall_status":""}"#).is_err());
+        assert!(verify_chaos_report_shape("[]").is_err());
+    }
 
     #[test]
     fn chaos_sigstop_reuses_daemon_fault_binary_with_sigstop_mode() {

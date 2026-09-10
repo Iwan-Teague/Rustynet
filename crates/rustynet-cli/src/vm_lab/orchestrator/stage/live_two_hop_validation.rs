@@ -165,10 +165,33 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
             second_client_params.user, second_client_params.host
         );
 
-        let report_path_str = report_path.to_str().unwrap_or("live_two_hop_report.json");
-        let log_path_str = log_path.to_str().unwrap_or("live_two_hop.log");
-        let identity_file = exit_params.identity_file.to_str().unwrap_or("");
-        let known_hosts = exit_params.known_hosts.to_str().unwrap_or("");
+        let report_path_str = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &report_path,
+            "report path",
+        ) {
+            Ok(value) => value,
+
+            Err(err) => return StageOutcome::Failed(err),
+        };
+        let log_path_str =
+            match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
+                Ok(value) => value,
+                Err(err) => return StageOutcome::Failed(err),
+            };
+        let identity_file = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &exit_params.identity_file,
+            "identity file",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
+        let known_hosts = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &exit_params.known_hosts,
+            "known hosts",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
 
         let result = std::process::Command::new("cargo")
             .args([

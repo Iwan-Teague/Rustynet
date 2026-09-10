@@ -197,7 +197,25 @@ pub enum StageSuite {
 /// `orchestrator::runner::StateMachineRunner` checks the declaration after
 /// `execute` returns `Passed` and demotes the verdict to
 /// `StageOutcome::NotProven` when the witness is absent or empty.
+/// A path the orchestrator must hand to a child process as a UTF-8 argv
+/// token. A non-UTF-8 path is a hard error here — the former
+/// `to_str().unwrap_or("<default>")` fallbacks silently pointed a report at the
+/// working directory or passed an EMPTY identity file to ssh (review NIT,
+/// 2026-09-09).
+pub(crate) fn require_utf8_path<'a>(
+    path: &'a std::path::Path,
+    what: &str,
+) -> Result<&'a str, String> {
+    path.to_str().ok_or_else(|| {
+        format!(
+            "{what} path is not valid UTF-8 and cannot be passed to a child process: {}",
+            path.display()
+        )
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+
 pub enum StageEvidence {
     /// The stage's own log (`logs/<id>.log`) must exist and be non-empty
     /// after trimming. Use only for stages that genuinely append

@@ -68,7 +68,11 @@ impl OrchestrationStage for LiveNetworkFlapValidationStage {
         let report_path_str = report_path
             .to_str()
             .unwrap_or("live_network_flap_report.json");
-        let log_path_str = log_path.to_str().unwrap_or("live_network_flap.log");
+        let log_path_str =
+            match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
+                Ok(value) => value,
+                Err(err) => return StageOutcome::Failed(err),
+            };
         // The client's actual WireGuard peer is the ENTRY when the topology has
         // one, not the final exit. Probing the exit crosses TWO hops, so a
         // failure there cannot distinguish "this client's session did not
@@ -77,7 +81,13 @@ impl OrchestrationStage for LiveNetworkFlapValidationStage {
         // the exit IS the client's peer.
         let peer_params = ssh_params_for_role(ctx, "entry").unwrap_or_else(|_| exit_params.clone());
         let peer_target = format!("{}@{}", peer_params.user, peer_params.host);
-        let identity_file = exit_params.identity_file.to_str().unwrap_or("");
+        let identity_file = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &exit_params.identity_file,
+            "identity file",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
 
         let result = std::process::Command::new("cargo")
             .args([
