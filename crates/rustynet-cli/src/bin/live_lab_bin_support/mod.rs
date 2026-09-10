@@ -1199,9 +1199,12 @@ pub fn capture_remote_stdout(
     if let Some(transport) = utm_transport_for_target(target) {
         let output = utm_exec_output(&transport, command)?;
         if !output.status.success() {
-            return Err(format!(
-                "UTM command failed against {target} with status {}",
-                status_code(output.status)
+            return Err(failed_remote_command_error(
+                "UTM",
+                target,
+                output.status,
+                &output.stdout,
+                &output.stderr,
             ));
         }
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
@@ -1214,9 +1217,12 @@ pub fn capture_remote_stdout(
         .output()
         .map_err(|err| format!("failed to run ssh against {target}: {err}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "ssh command failed against {target} with status {}",
-            status_code(output.status)
+        return Err(failed_remote_command_error(
+            "ssh",
+            target,
+            output.status,
+            &output.stdout,
+            &output.stderr,
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
