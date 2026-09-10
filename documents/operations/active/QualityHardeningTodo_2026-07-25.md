@@ -7136,7 +7136,11 @@ pins) are landed and gated. Landed on branch `ai-edit/edit-1788908162525-23870-0
    28 skipped, no NotProven (rows in both ledgers). Live re-verify of the
    cross-network / chaos / negative-control phases themselves needs their
    own plans (the five-node two-LAN topology; not the default 2-node run)
-   and is owed per phase before an evidence claim. The NegativeControl stages'
+   and is owed per phase before an evidence claim. **Chaos + NegativeControl
+   ran live 2026-09-10 on lenovo-bot** (`NodeEngineChaosLiveTriage_2026-09-10.md`):
+   4/4 negative controls and 6/9 chaos rows pass with witnesses; the 3 chaos
+   failures are lab-bin/precondition issues, fixes queued. CrossNetwork still
+   needs the two-LAN topology. The NegativeControl stages'
    witness is their inversion record (`write_control_evidence` output), never a
    lazy `None`. Each stage still needs the individual "what datum IS this
    verdict" decision — a constant-line appeasement satisfies emptiness without
