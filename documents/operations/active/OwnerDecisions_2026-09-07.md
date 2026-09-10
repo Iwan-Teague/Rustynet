@@ -23,28 +23,43 @@ path guard, and the daemon/trust-state items (1, 2-product) are implemented by
 the owner or a Claude session and then GLM-flash-reviewed. Every branch gets an
 independent review before it reaches `main`.
 
-## D6 (2026-09-10) — clock-jump policy: refuse to start, or run and reject?
+## D6 (2026-09-10, REVISED after run #4) — forward clock jump poisons the anti-rollback watermark
 
-`chaos_clock_attack` (jump-forward stage) installs a +90-day libfaketime drop-in on
-`rustynetd.service` and expects the daemon to RUN under the jumped clock and reject
-future-dated signed state while keeping its epoch. Live on lenovo-bot the daemon
-instead **refuses to start** under the jump (control process exits non-zero), which
-tripped the unit's start limit and, until `fbfcb9e3`, left the exit down for every
-later chaos stage. Both behaviours are fail-closed; they differ in availability:
+**What the lab measured** (lenovo-bot, `chaos_clock_attack` jump-forward leg, +90 days via
+libfaketime on `rustynetd.service`, exit guest journal):
 
-- (a) **Refuse to start** (current): a node whose clock is far ahead of its trust
-  state never comes up; an operator must fix the clock first. Strictest; a clock
-  fault becomes an outage.
-- (b) **Run and reject**: the daemon starts, keeps its last-good state, rejects any
-  update its clock deems future-dated, and reports the skew; the chaos stage's
-  current pass criterion (`future_state_rejected && epoch_not_regressed`) encodes
-  this.
+1. Under the faked clock the daemon starts (`daemon_started_under_fault=true`) and, within
+   seconds, runs a *pre-expiry signed-state refresh* — "signed state refresh completed
+   (reason=preexpiry)" — i.e. it mints/accepts state stamped with the future clock and
+   advances its traversal watermark to that time.
+2. Every reconcile then fails: "traversal authority requires valid signed traversal state:
+   traversal bundle is stale" (the real bundle is older than the now-future watermark);
+   after `RUSTYNET_MAX_RECONCILE_FAILURES=5` (five seconds at the 1 s reconcile interval)
+   the node is **PERMANENTLY restricted** (`restrict_permanent`, `daemon.rs:11170`).
+3. The restriction is in-memory, so the bin's teardown restart clears it — but the
+   future-dated watermark is on disk, so the fresh process fails reconcile the same way
+   and re-enters permanent restriction within five seconds, **under the real clock**
+   (journal 20:44–20:45, forty consecutive "already PERMANENTLY restricted" lines).
+   Consequences seen in the same run: epoch reads 0, no `rustynet0` interface (backend
+   not running) so `chaos_network_impairment` failed "Cannot find device", and the
+   crash-recovery loop recovered the process in 10 s but the mesh never re-converged.
 
-Manager recommendation: **(a) stays** for the product (a wildly wrong clock is
-exactly the condition under which signature validity windows cannot be trusted),
-and the chaos stage's criterion is changed to accept EITHER `daemon_started_under_fault=false`
-(with the reason logged) OR the run-and-reject pair — the stage then proves the
-node fails closed, whichever way. If you prefer (b), it is a daemon change
-(startup clock-skew tolerance), not a lab change.
+So the daemon is fail-closed (good) but a *transient* forward clock error becomes a
+*permanent* outage that survives restarts and needs an operator to reset the watermark.
+The chaos stage's own criterion (`future_state_rejected && epoch_not_regressed`) says the
+intended behaviour is the opposite: **reject** state dated in the future, keep the epoch.
+
+**Owner decision needed (trust-state; manager will implement, GLM reviews):**
+- (a) *Refuse to mint or accept a refresh whose timestamp is ahead of the last-good
+  watermark by more than the configured max-age / a skew bound* — the watermark can only
+  advance by a bounded step per refresh, so a clock jump cannot move it 90 days. The node
+  stays recoverable-restricted (not permanent) while its clock is wrong and heals when the
+  clock is corrected. Recommended.
+- (b) Keep today's behaviour and document the operator watermark-reset procedure as the
+  recovery path (an availability cost the chaos suite will keep flagging).
+
+Lab-side, independent of the decision: `chaos_clock_attack` now runs LAST in the chaos
+plan so a poisoned node cannot cascade into the other stages (`plan.rs`), and the clock
+bin records `daemon_started_under_fault`.
 
 Decision: ______
