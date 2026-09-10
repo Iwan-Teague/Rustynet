@@ -30,6 +30,7 @@ Both hosts are fully onboarded: `lenovo-bot` (two Debian guests; run
 # packages (Debian/Ubuntu)
 sudo apt-get install -y clang llvm build-essential pkg-config libssl-dev libsqlite3-dev \
   nftables wireguard-tools tcpdump git libvirt-daemon-system qemu-system-x86 virtinst \
+  libfaketime \
   cloud-image-utils genisoimage ovmf swtpm-tools sshpass
 sudo usermod -aG libvirt,kvm "$USER"          # re-login afterwards
 # pinned toolchain, NOT the distro's rustc
