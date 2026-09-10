@@ -491,7 +491,14 @@ fn run() -> Result<(), String> {
     let traversal_env = ctx.work_dir.join("rn_issue_lan_traversal.env");
     write_assignment_env(
         &traversal_env,
-        &[("NODES_SPEC", &nodes_spec), ("ALLOW_SPEC", &allow_spec)],
+        &[
+            ("NODES_SPEC", &nodes_spec),
+            ("ALLOW_SPEC", &allow_spec),
+            (
+                "TRAVERSAL_TTL_SECS",
+                live_lab_support::LAB_TRAVERSAL_TTL_SECS,
+            ),
+        ],
     )?;
     let traversal_pub_local = ctx.work_dir.join("traversal.pub");
     let exit_traversal_local = ctx.work_dir.join("traversal-exit");

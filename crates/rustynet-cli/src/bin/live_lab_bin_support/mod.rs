@@ -1485,6 +1485,11 @@ pub fn issue_assignment_bundles_from_env(
     )
 }
 
+/// TTL every live bin pins when it (re-)issues traversal bundles: the same
+/// 24 h the Setup phase distributes (`distribute_assignments::traversal_env`),
+/// so a mid-run re-issue never shortens the fleet's traversal lifetime.
+pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
+
 pub fn issue_traversal_bundles_from_env(
     identity: &Path,
     known_hosts: &Path,

@@ -401,7 +401,8 @@ fn provision(
         phase,
         EnvFile::new()
             .set("NODES_SPEC", &nodes)?
-            .set("ALLOW_SPEC", &allow),
+            .set("ALLOW_SPEC", &allow)?
+            .set("TRAVERSAL_TTL_SECS", "86400"),
     )?;
     during(
         phase,

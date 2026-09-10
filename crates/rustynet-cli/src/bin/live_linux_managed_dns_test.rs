@@ -1291,7 +1291,14 @@ fn refresh_traversal_bundles(
             let traversal_env = workspace.join("rn_issue_dns_traversal.env");
             write_env_file(
                 &traversal_env,
-                &[("NODES_SPEC", nodes_spec), ("ALLOW_SPEC", allow_spec)],
+                &[
+                    ("NODES_SPEC", nodes_spec),
+                    ("ALLOW_SPEC", allow_spec),
+                    (
+                        "TRAVERSAL_TTL_SECS",
+                        live_lab_support::LAB_TRAVERSAL_TTL_SECS,
+                    ),
+                ],
             )?;
             let remote_env_path = TRAVERSAL_ENV_REMOTE;
             ctx.scp_to(&traversal_env, &config.signer_host, remote_env_path)?;

@@ -436,6 +436,11 @@ fn run() -> Result<(), String> {
     append_env_assignment(
         &traversal_env,
         "TRAVERSAL_TTL_SECS",
+        live_lab_bin_support::LAB_TRAVERSAL_TTL_SECS,
+    )?;
+    append_env_assignment(
+        &traversal_env,
+        "TRAVERSAL_TTL_SECS",
         &config.traversal_ttl_secs.to_string(),
     )?;
 
