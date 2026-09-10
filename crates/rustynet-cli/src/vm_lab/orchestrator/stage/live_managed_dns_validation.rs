@@ -43,18 +43,10 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
-        // An exit-only topology (the blind_exit / relay / anchor role cells
-        // run exit + <role> with no client) cannot exercise managed DNS: skip
-        // with the reason, matching the two_hop / enrollment-restart /
-        // extended-soak incomplete-topology skips. Decided from the
-        // assignments alone, before any adapter resolution, so the verdict
-        // is about the topology and not about which node resolved first.
-        // Live 2026-09-10: the blind_exit cell on lenovo-bot failed here
-        // instead of skipping.
-        if ctx.assignments.iter().all(|a| a.role != NodeRole::Client) {
-            return StageOutcome::Skipped(
-                "the topology assigns no client node; managed DNS needs one".to_owned(),
-            );
+        if let Some(skip) =
+            crate::vm_lab::orchestrator::stage::exit_only_topology_skip(ctx, "managed DNS")
+        {
+            return skip;
         }
         let signer_params = match ssh_params_for_role(ctx, "exit") {
             Ok(p) => p,

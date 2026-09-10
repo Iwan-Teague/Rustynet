@@ -197,6 +197,28 @@ pub enum StageSuite {
 /// `orchestrator::runner::StateMachineRunner` checks the declaration after
 /// `execute` returns `Passed` and demotes the verdict to
 /// `StageOutcome::NotProven` when the witness is absent or empty.
+/// Role cells run `exit + <role>` with no client (blind_exit, relay, anchor,
+/// admin on a two-node lab). A live stage that needs a client must then
+/// report a skip naming the gap, not fail — decided from the assignments
+/// alone before any adapter resolves, so the verdict is about the topology.
+/// Live 2026-09-10 (lenovo-bot, katana): managed-DNS and network-flap failed
+/// "no node with role label 'client'" on every role cell.
+pub(crate) fn exit_only_topology_skip(
+    ctx: &crate::vm_lab::orchestrator::context::OrchestrationContext,
+    what: &str,
+) -> Option<crate::vm_lab::orchestrator::error::StageOutcome> {
+    if ctx
+        .assignments
+        .iter()
+        .all(|a| a.role != crate::vm_lab::orchestrator::role::NodeRole::Client)
+    {
+        return Some(crate::vm_lab::orchestrator::error::StageOutcome::Skipped(
+            format!("the topology assigns no client node; {what} needs one"),
+        ));
+    }
+    None
+}
+
 /// A path the orchestrator must hand to a child process as a UTF-8 argv
 /// token. A non-UTF-8 path is a hard error here — the former
 /// `to_str().unwrap_or("<default>")` fallbacks silently pointed a report at the
