@@ -913,6 +913,47 @@ pub fn load_macos_generic_password_system_keychain_owned(
     Err(CryptoError::OsStoreUnavailable)
 }
 
+/// Does a generic-password item for `service`/`account` exist in the macOS
+/// **System** keychain? Attribute-only `SecItemCopyMatching` scoped to
+/// `/Library/Keychains/System.keychain` — the secret is never loaded, so a
+/// custody PROBE can run as any uid without touching the passphrase. Returns
+/// `Ok(false)` when no item matches, and `Err` when the keychain cannot be
+/// opened or searched (fail closed at the caller: "unknown" is not "present").
+///
+/// This deliberately does NOT prove the daemon identity can read the secret
+/// (that is `load_macos_generic_password_system_keychain_owned`, which the
+/// daemon exercises at startup); it proves the item is where the reviewed
+/// custody contract says the passphrase lives, which is what a key-custody
+/// report is allowed to assert without handling key material.
+#[cfg(target_os = "macos")]
+pub fn macos_system_keychain_generic_password_present(
+    service: &str,
+    account: &str,
+) -> Result<bool, CryptoError> {
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+    if service.trim().is_empty() || account.trim().is_empty() {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    let keychain = SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    let keychains = [keychain];
+    match ItemSearchOptions::new()
+        .keychains(&keychains)
+        .class(ItemClass::generic_password())
+        .service(service)
+        .account(account)
+        .load_attributes(true)
+        .limit(1i64)
+        .search()
+    {
+        Ok(results) => Ok(!results.is_empty()),
+        // errSecItemNotFound is the framework's "no match" answer; every other
+        // error is a keychain problem the caller must treat as unknown.
+        Err(err) if err.code() == -25300 => Ok(false),
+        Err(_) => Err(CryptoError::OsStoreUnavailable),
+    }
+}
+
 /// `/usr/bin/security delete-generic-password` against the System keychain.
 /// Used to clear a prior item before an owned `SecItemAdd` re-store. Carries no
 /// secret in argv; service/account are validated by the caller.

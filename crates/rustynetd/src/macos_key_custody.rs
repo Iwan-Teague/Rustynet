@@ -16,6 +16,11 @@
 //! * the plaintext private key must be absent at rest.
 //! * the plaintext passphrase file must be absent at rest; passphrase custody
 //!   must use the reviewed macOS Keychain account path.
+//! * the passphrase Keychain item itself is PRESENT: the System keychain holds
+//!   a generic-password item for the reviewed service and the account the
+//!   launchd plist hands the daemon (B5, 2026-09-10 — before this the report
+//!   was keychain-blind: five file paths, and the Keychain claim above was
+//!   never probed). The probe is attribute-only; no secret is loaded.
 //!
 //! Wired through the CLI as `rustynetd macos-key-custody-check`. The
 //! orchestrator's `MacosDaemonProbe` dispatches the `KeyCustody` op here.
@@ -31,6 +36,18 @@ pub const MACOS_WG_PLAINTEXT_PRIVATE_KEY_PATH: &str = "/usr/local/var/rustynet/k
 /// Legacy plaintext passphrase — must NOT exist at rest after migration.
 pub const MACOS_WG_PLAINTEXT_PASSPHRASE_PATH: &str =
     "/usr/local/var/rustynet/keys/wireguard.passphrase";
+/// The reviewed Keychain service under which the daemon stores/reads the
+/// WireGuard key passphrase (mirrors `key_material::MACOS_PASSPHRASE_KEYCHAIN_SERVICE`
+/// and the launchd `RUSTYNET_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE` value the
+/// service-hardening check pins).
+pub const MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE: &str = "net.rustynet.wg-key-passphrase";
+/// Launchd environment key naming the Keychain account; the same key
+/// `macos_service_hardening` requires in the reviewed plist.
+pub const MACOS_WG_PASSPHRASE_KEYCHAIN_ACCOUNT_ENV: &str =
+    "RUSTYNET_WG_KEY_PASSPHRASE_KEYCHAIN_ACCOUNT";
+/// Label of the Keychain entry in the report (stable: the orchestrator's
+/// evaluator pins it).
+pub const MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL: &str = "keychain passphrase item";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -53,6 +70,12 @@ pub enum MacosKeyCustodyEntryStatus {
         reason: String,
     },
     AbsentAsExpected,
+    /// A Keychain item (not a file) was found for the reviewed service and
+    /// account. Attribute-only: the secret was never loaded.
+    KeychainPresent {
+        service: String,
+        account: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +112,7 @@ pub fn evaluate_macos_key_custody(entries: &[MacosKeyCustodyEntry]) -> Result<()
     for entry in entries {
         match (entry.expected.as_str(), &entry.status) {
             (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Ok { .. }) => {}
+            (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::KeychainPresent { .. }) => {}
             (REQUIREMENT_ABSENT, MacosKeyCustodyEntryStatus::AbsentAsExpected) => {}
             (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Missing { reason }) => {
                 reasons.push(format!("{} missing: {reason}", entry.label));
@@ -186,7 +210,114 @@ fn build_entries() -> Vec<MacosKeyCustodyEntry> {
             MACOS_WG_PLAINTEXT_PASSPHRASE_PATH,
             "plaintext key passphrase (forbidden)",
         ),
+        probe_passphrase_keychain_item(),
     ]
+}
+
+/// Where the daemon is told its Keychain account: the reviewed launchd plist
+/// first (that is what the running daemon sees), the probe's own environment
+/// second (an operator running the check by hand under the same env).
+#[cfg(target_os = "macos")]
+fn resolve_passphrase_keychain_account() -> Result<String, String> {
+    let from_plist =
+        std::fs::read_to_string(crate::macos_service_hardening::REVIEWED_LAUNCHDAEMON_PLIST)
+            .ok()
+            .and_then(|xml| {
+                crate::macos_service_hardening::parse_plist_string_dict(
+                    &xml,
+                    "EnvironmentVariables",
+                )
+                .remove(MACOS_WG_PASSPHRASE_KEYCHAIN_ACCOUNT_ENV)
+            });
+    let account = match from_plist {
+        Some(account) => account,
+        None => std::env::var(MACOS_WG_PASSPHRASE_KEYCHAIN_ACCOUNT_ENV).map_err(|_| {
+            format!(
+                "no Keychain account: {} has no {MACOS_WG_PASSPHRASE_KEYCHAIN_ACCOUNT_ENV} and the \
+                 probe environment does not set it",
+                crate::macos_service_hardening::REVIEWED_LAUNCHDAEMON_PLIST
+            )
+        })?,
+    };
+    keychain_entry_for_account(&account)
+}
+
+/// Validates the account the same way `key_material` does before it reaches
+/// the Keychain API (non-empty, trimmed, bounded, no control characters).
+fn keychain_entry_for_account(raw: &str) -> Result<String, String> {
+    let account = raw.trim();
+    if account.is_empty() || account != raw {
+        return Err("Keychain account must be non-empty with no surrounding whitespace".to_owned());
+    }
+    if account.len() > 128 {
+        return Err("Keychain account exceeds max length (128)".to_owned());
+    }
+    if account.chars().any(|c| c.is_control()) {
+        return Err("Keychain account must not contain control characters".to_owned());
+    }
+    Ok(account.to_owned())
+}
+
+/// The entry's `path` is a locator, not a filesystem path.
+fn keychain_entry_path(account: &str) -> String {
+    format!("keychain:System/{MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}/{account}")
+}
+
+#[cfg(target_os = "macos")]
+fn probe_passphrase_keychain_item() -> MacosKeyCustodyEntry {
+    let label = MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL;
+    let account = match resolve_passphrase_keychain_account() {
+        Ok(account) => account,
+        Err(reason) => {
+            return MacosKeyCustodyEntry {
+                label: label.to_owned(),
+                path: keychain_entry_path("<unresolved>"),
+                expected: "present".to_owned(),
+                status: MacosKeyCustodyEntryStatus::Missing { reason },
+            };
+        }
+    };
+    keychain_probe_entry(
+        &account,
+        rustynet_crypto::macos_system_keychain_generic_password_present(
+            MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE,
+            &account,
+        )
+        .map_err(|err| err.to_string()),
+    )
+}
+
+/// Pure mapping from a probe result to an entry, so the shape is testable
+/// off-macOS: `Ok(true)` → present, `Ok(false)` → missing, `Err` → missing
+/// naming the keychain failure (never "present" on an unreadable keychain).
+fn keychain_probe_entry(account: &str, probe: Result<bool, String>) -> MacosKeyCustodyEntry {
+    let label = MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL.to_owned();
+    let path = keychain_entry_path(account);
+    let expected = "present".to_owned();
+    let status = match probe {
+        Ok(true) => MacosKeyCustodyEntryStatus::KeychainPresent {
+            service: MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE.to_owned(),
+            account: account.to_owned(),
+        },
+        Ok(false) => MacosKeyCustodyEntryStatus::Missing {
+            reason: format!(
+                "no generic-password item for service '{MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}' \
+                 account '{account}' in the System keychain"
+            ),
+        },
+        Err(err) => MacosKeyCustodyEntryStatus::Missing {
+            reason: format!(
+                "System keychain probe for service '{MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}' \
+                 account '{account}' failed: {err}"
+            ),
+        },
+    };
+    MacosKeyCustodyEntry {
+        label,
+        path,
+        expected,
+        status,
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -230,6 +361,14 @@ fn build_entries() -> Vec<MacosKeyCustodyEntry> {
             label: "plaintext key passphrase (forbidden)".to_string(),
             path: MACOS_WG_PLAINTEXT_PASSPHRASE_PATH.to_string(),
             expected: "absent".to_string(),
+            status: MacosKeyCustodyEntryStatus::Missing {
+                reason: off_platform_reason.to_string(),
+            },
+        },
+        MacosKeyCustodyEntry {
+            label: MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL.to_string(),
+            path: keychain_entry_path("<off-platform>"),
+            expected: "present".to_string(),
             status: MacosKeyCustodyEntryStatus::Missing {
                 reason: off_platform_reason.to_string(),
             },
@@ -399,6 +538,81 @@ fn probe_forbidden_file(path: &'static str, label: &'static str) -> MacosKeyCust
 mod tests {
     use super::*;
 
+    // B5: the Keychain entry is part of the contract — a report where every
+    // FILE entry is healthy but the passphrase item is absent must not pass.
+    #[test]
+    fn keychain_probe_present_is_healthy_and_absent_or_failed_is_missing() {
+        let present = keychain_probe_entry("wg-passphrase-daemon-local", Ok(true));
+        assert_eq!(present.label, MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL);
+        assert_eq!(present.expected, "present");
+        assert_eq!(
+            present.path,
+            "keychain:System/net.rustynet.wg-key-passphrase/wg-passphrase-daemon-local"
+        );
+        assert!(matches!(
+            &present.status,
+            MacosKeyCustodyEntryStatus::KeychainPresent { service, account }
+                if service == MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE
+                    && account == "wg-passphrase-daemon-local"
+        ));
+        assert!(evaluate_macos_key_custody(std::slice::from_ref(&present)).is_ok());
+
+        let absent = keychain_probe_entry("wg-passphrase-daemon-local", Ok(false));
+        assert!(matches!(
+            &absent.status,
+            MacosKeyCustodyEntryStatus::Missing { reason } if reason.contains("no generic-password item")
+        ));
+        let reasons = evaluate_macos_key_custody(std::slice::from_ref(&absent))
+            .expect_err("an absent Keychain item is custody drift");
+        assert!(
+            reasons[0].contains("keychain passphrase item missing"),
+            "{reasons:?}"
+        );
+
+        // An unreadable keychain is "unknown", and unknown is never "present".
+        let failed = keychain_probe_entry("acct", Err("keychain locked".to_owned()));
+        assert!(matches!(
+            &failed.status,
+            MacosKeyCustodyEntryStatus::Missing { reason }
+                if reason.contains("probe") && reason.contains("keychain locked")
+        ));
+        assert!(evaluate_macos_key_custody(std::slice::from_ref(&failed)).is_err());
+    }
+
+    #[test]
+    fn keychain_present_under_an_absent_requirement_is_drift() {
+        let mut entry = keychain_probe_entry("acct", Ok(true));
+        entry.expected = "absent".to_owned();
+        let reasons = evaluate_macos_key_custody(std::slice::from_ref(&entry))
+            .expect_err("KeychainPresent only satisfies a present requirement");
+        assert!(
+            reasons[0].contains("requirement is absent but status is"),
+            "{reasons:?}"
+        );
+    }
+
+    #[test]
+    fn keychain_account_validation_matches_key_material_rules() {
+        assert_eq!(
+            keychain_entry_for_account("wg-passphrase-daemon-local").as_deref(),
+            Ok("wg-passphrase-daemon-local")
+        );
+        assert!(keychain_entry_for_account("").is_err());
+        assert!(keychain_entry_for_account(" padded").is_err());
+        assert!(keychain_entry_for_account("ctl\u{7}char").is_err());
+        assert!(keychain_entry_for_account(&"a".repeat(129)).is_err());
+    }
+
+    #[test]
+    fn keychain_entry_survives_serde_round_trip() {
+        let report = build_macos_key_custody_report(vec![keychain_probe_entry("acct", Ok(true))]);
+        assert!(report.overall_ok);
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.contains("\"status\":\"keychain_present\""), "{json}");
+        let parsed: MacosKeyCustodyReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, report);
+    }
+
     #[test]
     fn report_serde_round_trips() {
         let report = MacosKeyCustodyReport {
@@ -426,8 +640,8 @@ mod tests {
     fn collect_off_macos_marks_entries_missing() {
         let report = collect_macos_key_custody_report();
         assert!(!report.overall_ok);
-        assert_eq!(report.entries.len(), 5);
-        assert_eq!(report.drift_reasons.len(), 5);
+        assert_eq!(report.entries.len(), 6);
+        assert_eq!(report.drift_reasons.len(), 6);
         for entry in &report.entries {
             assert!(
                 matches!(
