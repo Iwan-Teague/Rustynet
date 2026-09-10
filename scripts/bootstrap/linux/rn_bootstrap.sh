@@ -182,13 +182,14 @@ install_prereqs() {
     wait_for_package_manager_idle 'dnf|rpm' 'dnf/rpm'
     run_root_timed 1800 dnf install -y \
       ca-certificates curl git gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
-      sqlite-devel clang llvm llvm-devel nftables wireguard-tools tar gzip tcpdump iputils
+      sqlite-devel clang llvm llvm-devel nftables wireguard-tools tar gzip tcpdump iputils \
+      libfaketime
   elif [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_id}" == "linuxmint" || "${os_like}" == *"debian"* ]] || command -v apt-get >/dev/null 2>&1; then
     run_apt_update_hardened
     run_apt_install_hardened \
       ca-certificates curl git build-essential pkg-config libssl-dev libsqlite3-dev \
       clang llvm nftables wireguard-tools openssl systemd-resolved libnss-resolve tar gzip \
-      tcpdump iputils-ping
+      tcpdump iputils-ping libfaketime
   else
     echo "unsupported package manager; expected apt-get or dnf" >&2
     exit 1
