@@ -22,3 +22,29 @@ edit jobs implement the lab-tooling items (2-lab, 3, 4, 5, 7, 8) under the
 path guard, and the daemon/trust-state items (1, 2-product) are implemented by
 the owner or a Claude session and then GLM-flash-reviewed. Every branch gets an
 independent review before it reaches `main`.
+
+## D6 (2026-09-10) — clock-jump policy: refuse to start, or run and reject?
+
+`chaos_clock_attack` (jump-forward stage) installs a +90-day libfaketime drop-in on
+`rustynetd.service` and expects the daemon to RUN under the jumped clock and reject
+future-dated signed state while keeping its epoch. Live on lenovo-bot the daemon
+instead **refuses to start** under the jump (control process exits non-zero), which
+tripped the unit's start limit and, until `fbfcb9e3`, left the exit down for every
+later chaos stage. Both behaviours are fail-closed; they differ in availability:
+
+- (a) **Refuse to start** (current): a node whose clock is far ahead of its trust
+  state never comes up; an operator must fix the clock first. Strictest; a clock
+  fault becomes an outage.
+- (b) **Run and reject**: the daemon starts, keeps its last-good state, rejects any
+  update its clock deems future-dated, and reports the skew; the chaos stage's
+  current pass criterion (`future_state_rejected && epoch_not_regressed`) encodes
+  this.
+
+Manager recommendation: **(a) stays** for the product (a wildly wrong clock is
+exactly the condition under which signature validity windows cannot be trusted),
+and the chaos stage's criterion is changed to accept EITHER `daemon_started_under_fault=false`
+(with the reason logged) OR the run-and-reject pair — the stage then proves the
+node fails closed, whichever way. If you prefer (b), it is a daemon change
+(startup clock-skew tolerance), not a lab change.
+
+Decision: ______
