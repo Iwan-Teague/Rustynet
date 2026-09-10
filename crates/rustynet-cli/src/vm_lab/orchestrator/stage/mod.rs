@@ -531,7 +531,6 @@ define_stage_catalog! {
     // report is Failed, so a PASS verdict always has its witness on disk.
     // Pinned by `chaos_report_witness_declared_per_stage_and_unique` +
     // `chaos_report_witness_*` tests in stage/chaos.rs.
-    ChaosClockAttack => "chaos_clock_attack" @ Chaos / T4Security / StageEvidence::File("chaos_clock_attack_report.json"),
     ChaosCrashRecovery => "chaos_crash_recovery" @ Chaos / T2Resilience / StageEvidence::File("chaos_crash_recovery_report.json"),
     ChaosDaemonFault => "chaos_daemon_fault" @ Chaos / T2Resilience / StageEvidence::File("chaos_daemon_fault_report.json"),
     ChaosDaemonSigstopSigcont => "chaos_daemon_sigstop_sigcont" @ Chaos / T2Resilience / StageEvidence::File("chaos_daemon_sigstop_sigcont_report.json"),
@@ -542,6 +541,10 @@ define_stage_catalog! {
     // impairment than to a trust-control bypass — resilience tier.
     ChaosResourceExhaustion => "chaos_resource_exhaustion" @ Chaos / T2Resilience / StageEvidence::File("chaos_resource_exhaustion_report.json"),
     ChaosSignedStateAdversarial => "chaos_signed_state_adversarial" @ Chaos / T4Security / StageEvidence::File("chaos_signed_state_adversarial_report.json"),
+    // Runs LAST in the chaos plan: its +90-day clock jump can leave the node
+    // permanently restricted (poisoned traversal watermark, D6 2026-09-10) and
+    // every chaos stage after it would inherit a dead exit.
+    ChaosClockAttack => "chaos_clock_attack" @ Chaos / T4Security / StageEvidence::File("chaos_clock_attack_report.json"),
     // T5 negative-control / adjudication suite (spec §3-T5 / §5) — the four
     // injected-fault controls, each of which PASSES iff its targeted operation
     // fails for the specific named reason (the inversion). All T5NegativeControl
