@@ -24329,25 +24329,113 @@ pub(crate) fn evaluate_macos_key_custody_report(
     // `AbsentAsExpected` for a forbidden one; both are consistent with
     // overall_ok=true. (Live run livelab-1788916793 on lenovo-bot failed both
     // nodes when this check counted AbsentAsExpected as drift.)
-    if !report.drift_reasons.is_empty()
-        || report.entries.iter().any(|entry| {
-            !matches!(
-                entry.status,
-                rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::Ok { .. }
-                    | rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::AbsentAsExpected
-            )
-        })
-    {
+    if !report.drift_reasons.is_empty() || report.entries.iter().any(|entry| {
+        !matches!(
+            entry.status,
+            rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::Ok { .. }
+                | rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::AbsentAsExpected
+                | rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::KeychainPresent { .. }
+        )
+    }) {
         return Err(
             "report set overall_ok=true but drift_reasons or a non-Ok entry disagree; output is \
              inconsistent"
                 .to_owned(),
         );
     }
+    // B5: a report that never probed the Keychain is keychain-blind — the
+    // five file entries can all be healthy while the passphrase item the
+    // daemon needs at startup is absent. Require the Keychain entry to be
+    // present AND to carry the reviewed service.
+    let keychain_ok = report.entries.iter().any(|entry| {
+        entry.label == rustynetd::macos_key_custody::MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL
+            && matches!(
+                &entry.status,
+                rustynetd::macos_key_custody::MacosKeyCustodyEntryStatus::KeychainPresent {
+                    service,
+                    ..
+                } if service == rustynetd::macos_key_custody::MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE
+            )
+    });
+    if !keychain_ok {
+        return Err(format!(
+            "macos-key-custody-check reported no healthy `{}` entry; the report is \
+             keychain-blind (B5) or the passphrase item is missing",
+            rustynetd::macos_key_custody::MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL
+        ));
+    }
     Ok(format!(
-        "macOS key custody verified on {macos_alias}: {} reviewed artifacts checked",
+        "macOS key custody verified on {macos_alias}: {} reviewed artifacts checked (incl. the \
+         Keychain passphrase item)",
         report.entries.len()
     ))
+}
+
+#[cfg(test)]
+mod macos_key_custody_evaluator_tests {
+    use super::evaluate_macos_key_custody_report;
+
+    fn file_entry(label: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "label": label, "path": path, "expected": "present",
+            "status": "ok", "mode": 0o600, "uid": 500, "gid": 500
+        })
+    }
+
+    fn healthy_file_entries() -> Vec<serde_json::Value> {
+        vec![
+            file_entry("keys dir", "/usr/local/var/rustynet/keys"),
+            file_entry(
+                "encrypted private key",
+                "/usr/local/var/rustynet/keys/wireguard.key.enc",
+            ),
+            file_entry("public key", "/usr/local/var/rustynet/keys/wireguard.pub"),
+            serde_json::json!({"label": "plaintext private key (forbidden)", "path": "/usr/local/var/rustynet/keys/wireguard.key", "expected": "absent", "status": "absent_as_expected"}),
+            serde_json::json!({"label": "plaintext key passphrase (forbidden)", "path": "/usr/local/var/rustynet/keys/wireguard.passphrase", "expected": "absent", "status": "absent_as_expected"}),
+        ]
+    }
+
+    fn report(entries: Vec<serde_json::Value>) -> String {
+        serde_json::json!({"schema_version": 1, "overall_ok": true, "entries": entries, "drift_reasons": []})
+            .to_string()
+    }
+
+    // B5 mutation: the pre-fix producer emitted exactly these five healthy
+    // file entries and the evaluator accepted them. It must not any more.
+    #[test]
+    fn keychain_blind_report_is_rejected() {
+        let err = evaluate_macos_key_custody_report("mac-1", &report(healthy_file_entries()))
+            .expect_err("five healthy file entries without the Keychain item must fail");
+        assert!(err.contains("keychain passphrase item"), "{err}");
+    }
+
+    #[test]
+    fn keychain_present_with_reviewed_service_passes() {
+        let mut entries = healthy_file_entries();
+        entries.push(serde_json::json!({
+            "label": "keychain passphrase item",
+            "path": "keychain:System/net.rustynet.wg-key-passphrase/wg-passphrase-daemon-local",
+            "expected": "present", "status": "keychain_present",
+            "service": "net.rustynet.wg-key-passphrase", "account": "wg-passphrase-daemon-local"
+        }));
+        let summary =
+            evaluate_macos_key_custody_report("mac-1", &report(entries)).expect("healthy");
+        assert!(summary.contains("6 reviewed artifacts"), "{summary}");
+    }
+
+    #[test]
+    fn keychain_present_under_a_different_service_is_rejected() {
+        let mut entries = healthy_file_entries();
+        entries.push(serde_json::json!({
+            "label": "keychain passphrase item",
+            "path": "keychain:System/other/acct",
+            "expected": "present", "status": "keychain_present",
+            "service": "other.service", "account": "acct"
+        }));
+        let err = evaluate_macos_key_custody_report("mac-1", &report(entries))
+            .expect_err("a Keychain item under the wrong service is not the reviewed custody");
+        assert!(err.contains("keychain passphrase item"), "{err}");
+    }
 }
 
 pub(crate) fn evaluate_linux_authenticode_report(
@@ -51897,12 +51985,15 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
                 {"label": "keys directory", "path": "/Library/Application Support/rustynet/keys",
                  "expected": "present", "status": "ok", "mode": 16832, "uid": 0, "gid": 0},
                 {"label": "plaintext passphrase", "path": "/Library/Application Support/rustynet/keys/wireguard.passphrase",
-                 "expected": "absent", "status": "absent_as_expected"}
+                 "expected": "absent", "status": "absent_as_expected"},
+                {"label": "keychain passphrase item", "path": "keychain:System/net.rustynet.wg-key-passphrase/wg-passphrase-daemon-local",
+                 "expected": "present", "status": "keychain_present",
+                 "service": "net.rustynet.wg-key-passphrase", "account": "wg-passphrase-daemon-local"}
             ],
             "drift_reasons": []
         }"#;
         super::evaluate_macos_key_custody_report("macos-utm-1", macos)
-            .expect("absent_as_expected is a healthy row");
+            .expect("absent_as_expected is a healthy row (with the B5 Keychain entry present)");
     }
 
     #[test]

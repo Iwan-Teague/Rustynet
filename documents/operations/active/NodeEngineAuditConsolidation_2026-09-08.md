@@ -218,7 +218,20 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    `missing_client_artifact_write_failure_fails_closed`,
    `egress_client_without_adapter_fails_closed`,
    `missing_client_note_names_exit_and_reason`). B2 done (see item 2).
-   **B5 still open.**
+   **B5 DONE (2026-09-10, manager):** `macos-key-custody-check` gains a sixth
+   entry, `keychain passphrase item`, produced by an attribute-only
+   `SecItemCopyMatching` against the System keychain
+   (`rustynet_crypto::macos_system_keychain_generic_password_present` — the
+   secret is never loaded) for the reviewed service and the account the
+   launchd plist hands the daemon (env fallback for a hand-run probe). New
+   status `KeychainPresent { service, account }` is healthy only under a
+   `present` requirement; an unreadable keychain reports `Missing` naming the
+   failure, never present. The orchestrator's `evaluate_macos_key_custody_report`
+   now REJECTS a report without a healthy Keychain entry under the reviewed
+   service (test `keychain_blind_report_is_rejected` is the B5 mutation: the
+   pre-fix five-entry report fails it). Exercised live on the Mac on both
+   failure paths; the `present` path is owed a macOS-guest
+   `key_custody_validation` run.
 
 **I3 follow-up (STAGES review, 2026-09-09):** `live_anchor.rs` carried the same
 `_ => "linux"` class in its `--platform` argv builder; now routed through
