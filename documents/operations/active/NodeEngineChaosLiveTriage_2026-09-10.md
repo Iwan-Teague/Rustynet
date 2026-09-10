@@ -20,3 +20,10 @@
 4. **`chaos_network_impairment`: run the remote script with an explicit sbin-bearing `PATH`** (the RSA-0080 pattern) — to be confirmed by fix 1's stderr on the next run.
 
 Re-run the two plans on lenovo-bot after the bin fixes land; the three rows then either pass or fail with a named cause.
+
+## Fixes landed (2026-09-10)
+
+- **Remote stderr/stdout surfaced** on every failed remote command in the lab bins (`live_lab_bin_support::failed_remote_command_error`, bounded to the last 20 lines / 2 KiB per stream, UTF-8-safe; GLM flash job `edit-1789049328878-79086-0` merged `0bd2f77b`, boundary and single-long-line defects fixed by the manager with tests). The clock bin already printed `faketime_lib_present=false` on stdout — it was the swallowed stdout that made it opaque — so fix 2 is discharged by this.
+- **Crash-recovery loop clears the start limit** (`systemctl reset-failed` before each per-iteration start and the final restart) and reports `start_limit_resets=N` in its key=value output and JSON report (required field; test `remote_script_resets_start_limit_per_kill_and_reports_the_count`).
+- **sbin-bearing PATH pinned** at the top of the clock and network-impairment remote scripts (tests `remote_script_pins_an_sbin_bearing_path_before_any_lookup`).
+- Still owed before the rerun: `libfaketime` on the lenovo guests (owner-free: `sudo apt-get install -y libfaketime` on debian@192.168.0.30/.31, or add it to the guest provisioner package list), then re-run the two plans.
