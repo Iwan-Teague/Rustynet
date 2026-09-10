@@ -465,6 +465,8 @@ fn render_remote_impairment_script(config: &Config) -> String {
 
     format!(
         r#"set -eu
+# RSA-0080: a non-login shell omits the sbin directories where tc/ip/systemctl live.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"; export PATH
 service={service}
 socket_path={socket_path}
 capture_interface={capture_interface}
@@ -761,6 +763,25 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Config, String> {
         Config::parse(args.iter().map(|value| (*value).to_owned()))
+    }
+
+    // Live 2026-09-10 (lenovo-bot): the guest's non-login PATH omits the sbin
+    // directories, so `tc`/`ip`/`systemctl` lookups can fail with an opaque
+    // status 1. The script pins an sbin-bearing PATH before any lookup.
+    #[test]
+    fn remote_script_pins_an_sbin_bearing_path_before_any_lookup() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_impairment_script(&config);
+        let path_pos = script
+            .find("PATH=\"/usr/local/sbin:/usr/sbin:/sbin:")
+            .expect("sbin PATH line present");
+        let first_lookup = script
+            .find("command -v ")
+            .expect("a command -v preflight exists");
+        assert!(
+            path_pos < first_lookup,
+            "PATH must precede the first lookup:\n{script}"
+        );
     }
 
     #[test]

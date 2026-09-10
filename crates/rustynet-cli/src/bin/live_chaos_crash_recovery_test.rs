@@ -500,7 +500,13 @@ printf 'crash_iterations=%s\n' "$iterations"
 # then SIGKILL it almost immediately so the write is interrupted in flight.
 i=0
 killed=0
+resets=0
 while [ "$i" -lt "$iterations" ]; do
+  # The unit carries StartLimitBurst=5/60s (pinned by service_hardening);
+  # a tight kill loop trips systemd's rate limiter, which would otherwise
+  # be what this stage measures instead of the daemon's own recovery. Clear
+  # it per iteration and report how often it would have engaged.
+  if systemctl reset-failed "$service" >/dev/null 2>&1; then resets="$(( resets + 1 ))"; fi
   systemctl start "$service" >/dev/null 2>&1 || true
   # Best-effort kick to drive a fresh trust-state apply; ignore failure so
   # the loop still SIGKILLs even if reload is unsupported.
@@ -511,7 +517,10 @@ while [ "$i" -lt "$iterations" ]; do
 done
 printf 'observed_kill_count=%s\n' "$killed"
 
-# Restart and wait for atomic recovery within the deadline.
+# Restart and wait for atomic recovery within the deadline (clear the
+# start-limit state left by the final kill first, same rationale as above).
+if systemctl reset-failed "$service" >/dev/null 2>&1; then resets="$(( resets + 1 ))"; fi
+printf 'start_limit_resets=%s\n' "$resets"
 systemctl start "$service" >/dev/null 2>&1 || true
 recovered=false
 end_unix="$((start_unix + deadline))"
@@ -678,6 +687,10 @@ struct CrashStageObservation {
     teardown_registered_before_fault: bool,
     persistence_boundary: String,
     observed_kill_count: u64,
+    /// How many times the loop cleared systemd's start-limit state
+    /// (`systemctl reset-failed`); reviewers read it to see how often the
+    /// unit's own rate limiter would have engaged.
+    start_limit_resets: u64,
     recovered: bool,
     measured_recovery_secs: u64,
     watermark_before: WatermarkSample,
@@ -725,6 +738,7 @@ impl CrashStageObservation {
             teardown_registered_before_fault: parse_bool("teardown_registered_before_fault")?,
             persistence_boundary: parse_str("persistence_boundary")?,
             observed_kill_count: parse_u64("observed_kill_count")?,
+            start_limit_resets: parse_u64("start_limit_resets")?,
             recovered: parse_bool("recovered")?,
             measured_recovery_secs: parse_u64("measured_recovery_secs")?,
             watermark_before: WatermarkSample::parse(&parse_str("watermark_before")?)?,
@@ -788,6 +802,7 @@ fn render_live_report(config: &Config, observation: &CrashStageObservation) -> V
                     "pass_criterion": stage.pass_criterion,
                     "recovery_deadline_secs": config.recovery_deadline_secs,
                     "measured_recovery_secs": observation.measured_recovery_secs,
+                    "start_limit_resets": observation.start_limit_resets,
                     "plaintext_leak_check": "not-applicable-persistence-boundary",
                     "persistence_boundary": observation.persistence_boundary,
                     "observed_kill_count": observation.observed_kill_count,
@@ -1148,6 +1163,7 @@ mod tests {
             "fault_signal=KILL",
             "crash_iterations=12",
             "observed_kill_count=12",
+            "start_limit_resets=13",
             "recovered=true",
             "measured_recovery_secs=7",
             "watermark_after=201",
@@ -1157,6 +1173,35 @@ mod tests {
             "mesh_status_line=node_id=node-a node_role=client state=Ready path_live_proven=true path_live_peer_count=2 bootstrap_error=none restricted_safe_mode=false",
         ]
         .join("\n")
+    }
+
+    // Live 2026-09-10 (lenovo-bot): 12 kills tripped StartLimitBurst=5/60s and
+    // the daemon never came back inside the deadline — systemd's limiter, not
+    // the daemon, decided the verdict. The script must clear it per kill and
+    // account for it in the observation.
+    #[test]
+    fn remote_script_resets_start_limit_per_kill_and_reports_the_count() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        assert!(
+            script
+                .matches("systemctl reset-failed \"$service\"")
+                .count()
+                >= 2,
+            "reset-failed must precede both the per-iteration start and the final restart:\n{script}"
+        );
+        assert!(
+            script.contains("printf 'start_limit_resets=%s\\n' \"$resets\""),
+            "{script}"
+        );
+        let observation = CrashStageObservation::parse(&passing_output()).expect("parse");
+        assert_eq!(observation.start_limit_resets, 13);
+        let missing = passing_output().replace("start_limit_resets=13\n", "");
+        assert!(
+            CrashStageObservation::parse(&missing).is_err(),
+            "the field is required"
+        );
     }
 
     #[test]

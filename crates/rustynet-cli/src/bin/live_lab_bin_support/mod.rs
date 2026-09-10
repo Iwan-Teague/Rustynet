@@ -1056,12 +1056,19 @@ fn remote_output_tail(label: &str, bytes: &[u8]) -> String {
     let mut tail = lines[start..].join("\n");
     if tail.len() > FAILED_REMOTE_OUTPUT_MAX_BYTES {
         // Keep only the last max bytes, cut forward to the next newline so a
-        // partial line never leads the tail.
-        let cut = tail.len() - FAILED_REMOTE_OUTPUT_MAX_BYTES;
-        let cut = tail[cut..]
-            .find('\n')
-            .map(|offset| cut + offset + 1)
-            .unwrap_or(tail.len());
+        // partial line never leads the tail. The byte offset may land inside
+        // a multi-byte character; walk forward to a char boundary first so
+        // the slice cannot panic on non-ASCII remote output.
+        let mut cut = tail.len() - FAILED_REMOTE_OUTPUT_MAX_BYTES;
+        while cut < tail.len() && !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        // Prefer starting at the next full line; when the capped region is
+        // one long line, keep the bounded remainder rather than nothing.
+        let cut = match tail[cut..].find('\n') {
+            Some(offset) if cut + offset + 1 < tail.len() => cut + offset + 1,
+            _ => cut,
+        };
         tail = tail[cut..].to_owned();
     }
     format!("{label}: {tail}")
@@ -1798,6 +1805,70 @@ fn is_symlink(path: &Path) -> bool {
     fs::symlink_metadata(path)
         .map(|metadata| metadata.file_type().is_symlink())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod failed_remote_command_error_tests {
+    use super::{failed_remote_command_error, remote_output_tail};
+    use std::process::ExitStatus;
+
+    fn status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(code << 8)
+    }
+
+    #[test]
+    fn error_names_status_and_both_stream_tails() {
+        let err = failed_remote_command_error(
+            "ssh",
+            "debian@10.0.0.9:22",
+            status(1),
+            b"faketime_lib_present=false\n",
+            b"sh: 3: tc: not found\n",
+        );
+        assert!(
+            err.starts_with("ssh command failed against debian@10.0.0.9:22 with status 1"),
+            "{err}"
+        );
+        assert!(
+            err.contains("remote stdout: faketime_lib_present=false"),
+            "{err}"
+        );
+        assert!(err.contains("remote stderr: sh: 3: tc: not found"), "{err}");
+    }
+
+    #[test]
+    fn tail_is_bounded_to_the_last_lines_and_bytes() {
+        let many: String = (0..200).map(|i| format!("line-{i}\n")).collect();
+        let tail = remote_output_tail("remote stdout", many.as_bytes());
+        assert!(!tail.contains("line-0\n"), "{tail}");
+        assert!(tail.contains("line-199"), "{tail}");
+        assert!(tail.lines().count() <= 21, "{tail}");
+        let huge = "x".repeat(10_000);
+        let tail = remote_output_tail("remote stderr", huge.as_bytes());
+        assert!(
+            tail.len() <= 2048 + "remote stderr: ".len(),
+            "{}",
+            tail.len()
+        );
+    }
+
+    #[test]
+    fn byte_cap_never_splits_a_multibyte_character() {
+        // 3-byte characters with no newlines: the cap offset lands mid-char.
+        let text = "\u{20ac}".repeat(1_500);
+        let tail = remote_output_tail("remote stdout", text.as_bytes());
+        assert!(tail.starts_with("remote stdout: \u{20ac}"), "{tail}");
+        assert!(tail.len() <= 2048 + 3 + "remote stdout: ".len());
+    }
+
+    #[test]
+    fn empty_streams_say_so() {
+        assert_eq!(
+            remote_output_tail("remote stderr", b"   \n"),
+            "remote stderr: (empty)"
+        );
+    }
 }
 
 #[cfg(test)]
