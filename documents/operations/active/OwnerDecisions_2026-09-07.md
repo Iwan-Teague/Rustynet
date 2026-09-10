@@ -23,43 +23,33 @@ path guard, and the daemon/trust-state items (1, 2-product) are implemented by
 the owner or a Claude session and then GLM-flash-reviewed. Every branch gets an
 independent review before it reaches `main`.
 
-## D6 (2026-09-10, REVISED after run #4) — forward clock jump poisons the anti-rollback watermark
+## D6 (2026-09-10, FINAL after run #5) — expired self-state permanently restricts a node in five seconds
 
-**What the lab measured** (lenovo-bot, `chaos_clock_attack` jump-forward leg, +90 days via
-libfaketime on `rustynetd.service`, exit guest journal):
+**The lab bug (fixed `f75514d8`, no decision needed):** the managed-DNS, LAN-toggle,
+exit-handoff, two-hop and cross-network scenario bins re-issue traversal bundles
+mid-run with only `NODES_SPEC`/`ALLOW_SPEC`, and the issuer defaulted a missing
+`TRAVERSAL_TTL_SECS` to **120 s** — silently replacing the 24-hour bundles Setup had
+distributed. Two minutes after `live_managed_dns_validation` every node in the fleet held
+an expired traversal bundle; any daemon *restart* after that (every restart-based chaos
+stage, the crash loop, the clock stage's teardown) started with "traversal bundle is
+stale", failed reconcile five times in five seconds, and was permanently restricted.
+The earlier "clock-jump poisons the watermark" reading was wrong: the watermark on disk
+was real-time; the bundle had simply expired. The issuer now refuses an env without a
+TTL and every writer pins 24 h.
 
-1. Under the faked clock the daemon starts (`daemon_started_under_fault=true`) and, within
-   seconds, runs a *pre-expiry signed-state refresh* — "signed state refresh completed
-   (reason=preexpiry)" — i.e. it mints/accepts state stamped with the future clock and
-   advances its traversal watermark to that time.
-2. Every reconcile then fails: "traversal authority requires valid signed traversal state:
-   traversal bundle is stale" (the real bundle is older than the now-future watermark);
-   after `RUSTYNET_MAX_RECONCILE_FAILURES=5` (five seconds at the 1 s reconcile interval)
-   the node is **PERMANENTLY restricted** (`restrict_permanent`, `daemon.rs:11170`).
-3. The restriction is in-memory, so the bin's teardown restart clears it — but the
-   future-dated watermark is on disk, so the fresh process fails reconcile the same way
-   and re-enters permanent restriction within five seconds, **under the real clock**
-   (journal 20:44–20:45, forty consecutive "already PERMANENTLY restricted" lines).
-   Consequences seen in the same run: epoch reads 0, no `rustynet0` interface (backend
-   not running) so `chaos_network_impairment` failed "Cannot find device", and the
-   crash-recovery loop recovered the process in 10 s but the mesh never re-converged.
+**What remains a product question:** the sequence the lab exposed is real for any
+deployment — if a node's traversal bundle expires (authority down for longer than the
+TTL, long suspend, a long crash loop) a fresh daemon start is **PERMANENTLY** restricted
+within `RUSTYNET_MAX_RECONCILE_FAILURES × reconcile interval` (5 × 1 s), and
+`complete_verified_signed_refresh` refuses to lift a permanent restriction even after
+a later refresh brings a fresh bundle (`daemon.rs:6197`). Fail-closed, but it turns a
+recoverable freshness gap into an operator-only outage.
 
-So the daemon is fail-closed (good) but a *transient* forward clock error becomes a
-*permanent* outage that survives restarts and needs an operator to reset the watermark.
-The chaos stage's own criterion (`future_state_rejected && epoch_not_regressed`) says the
-intended behaviour is the opposite: **reject** state dated in the future, keep the epoch.
-
-**Owner decision needed (trust-state; manager will implement, GLM reviews):**
-- (a) *Refuse to mint or accept a refresh whose timestamp is ahead of the last-good
-  watermark by more than the configured max-age / a skew bound* — the watermark can only
-  advance by a bounded step per refresh, so a clock jump cannot move it 90 days. The node
-  stays recoverable-restricted (not permanent) while its clock is wrong and heals when the
-  clock is corrected. Recommended.
-- (b) Keep today's behaviour and document the operator watermark-reset procedure as the
-  recovery path (an availability cost the chaos suite will keep flagging).
-
-Lab-side, independent of the decision: `chaos_clock_attack` now runs LAST in the chaos
-plan so a poisoned node cannot cascade into the other stages (`plan.rs`), and the clock
-bin records `daemon_started_under_fault`.
+- (a) Treat *staleness of otherwise-valid signed state* as RECOVERABLE (never promote to
+  permanent on `Stale`; keep permanent for signature/replay/policy failures), and let a
+  verified refresh clear a recoverable restriction — the node heals as soon as fresh
+  state arrives. Recommended; matches §3 ("fail closed when state is stale") without
+  the permanence.
+- (b) Keep today's behaviour and document the operator reset.
 
 Decision: ______
