@@ -69,8 +69,18 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
         let report_path_str = report_path
             .to_str()
             .unwrap_or("live_reboot_recovery_report.json");
-        let log_path_str = log_path.to_str().unwrap_or("live_reboot_recovery.log");
-        let identity_file = exit_params.identity_file.to_str().unwrap_or("");
+        let log_path_str =
+            match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
+                Ok(value) => value,
+                Err(err) => return StageOutcome::Failed(err),
+            };
+        let identity_file = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &exit_params.identity_file,
+            "identity file",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
 
         let result = std::process::Command::new("cargo")
             .args([

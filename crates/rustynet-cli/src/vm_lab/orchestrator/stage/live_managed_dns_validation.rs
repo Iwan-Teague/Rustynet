@@ -95,9 +95,25 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
         let report_path_str = report_path
             .to_str()
             .unwrap_or("live_managed_dns_report.json");
-        let log_path_str = log_path.to_str().unwrap_or("live_managed_dns.log");
-        let identity_file = signer_params.identity_file.to_str().unwrap_or("");
-        let known_hosts = signer_params.known_hosts.to_str().unwrap_or("");
+        let log_path_str =
+            match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
+                Ok(value) => value,
+                Err(err) => return StageOutcome::Failed(err),
+            };
+        let identity_file = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &signer_params.identity_file,
+            "identity file",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
+        let known_hosts = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &signer_params.known_hosts,
+            "known hosts",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
 
         if let Err(e) = reject_unsupported_platforms(ctx) {
             return StageOutcome::Failed(e);
