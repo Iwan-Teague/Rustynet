@@ -480,6 +480,11 @@ fn run() -> Result<(), String> {
     write_file(&traversal_env, "")?;
     append_env_assignment(&traversal_env, "NODES_SPEC", &nodes_spec)?;
     append_env_assignment(&traversal_env, "ALLOW_SPEC", &allow_spec)?;
+    append_env_assignment(
+        &traversal_env,
+        "TRAVERSAL_TTL_SECS",
+        live_lab_bin_support::LAB_TRAVERSAL_TTL_SECS,
+    )?;
 
     logger.line("[two-hop] issuing signed traversal bundles for two-hop topology")?;
     issue_traversal_bundles_from_env(

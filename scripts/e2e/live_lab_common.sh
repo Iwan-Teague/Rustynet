@@ -2019,6 +2019,11 @@ live_lab_issue_traversal_bundles_from_env() {
   local target="$1"
   local env_local="$2"
   local remote_env_path="${3:-/tmp/rn-e2e-traversal.env}"
+  # Fail closed on a missing TTL (the issuer refuses it; see ops_e2e.rs): a silent
+  # short TTL expires the fleet's traversal state mid-run.
+  if ! grep -q '^TRAVERSAL_TTL_SECS=' "$env_local"; then
+    printf 'TRAVERSAL_TTL_SECS=86400\n' >> "$env_local"
+  fi
   live_lab_scp_to "$env_local" "$target" "$remote_env_path" || return 1
   if ! live_lab_run_root "$target" "root rustynet ops e2e-issue-traversal-bundles-from-env --env-file '${remote_env_path}'"; then
     live_lab_run_root "$target" "root rm -f '${remote_env_path}'" >/dev/null 2>&1 || true

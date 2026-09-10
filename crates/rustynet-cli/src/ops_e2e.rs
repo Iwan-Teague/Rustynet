@@ -3186,6 +3186,29 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     ))
 }
 
+/// The traversal env file's TTL, REQUIRED and bounded. No default: the former
+/// silent 120 s fallback let a mid-run re-issue (`live_linux_managed_dns_test`)
+/// replace the lab's 24-hour traversal bundles with two-minute ones, so every
+/// daemon restart afterwards found a stale bundle and went permanently
+/// restricted (lenovo-bot chaos runs, 2026-09-10). The writer must say what it
+/// means.
+fn parse_required_traversal_ttl_secs(raw: Option<&String>) -> Result<u64, String> {
+    let raw = raw.ok_or_else(|| {
+        "TRAVERSAL_TTL_SECS is required in the traversal env file (no default: a silent short \
+         TTL expires the fleet's traversal state mid-run)"
+            .to_owned()
+    })?;
+    let ttl_secs = raw
+        .parse::<u64>()
+        .map_err(|err| format!("invalid TRAVERSAL_TTL_SECS in traversal env file: {err}"))?;
+    if ttl_secs == 0 || ttl_secs > 86400 {
+        return Err(format!(
+            "TRAVERSAL_TTL_SECS must be a positive integer <= 86400 (got: {ttl_secs})"
+        ));
+    }
+    Ok(ttl_secs)
+}
+
 pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
     config: E2eIssueTraversalBundlesFromEnvConfig,
 ) -> Result<String, String> {
@@ -3195,20 +3218,12 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
     let allow_spec = env_required_value(&env_values, "ALLOW_SPEC", "traversal env file")?;
     ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
     ensure_safe_spec("allow-spec", allow_spec.as_str())?;
-    let ttl_secs = env_values
-        .get("TRAVERSAL_TTL_SECS")
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|err| format!("invalid TRAVERSAL_TTL_SECS in traversal env file: {err}"))
-        })
-        .transpose()?
-        .unwrap_or(120);
-    if ttl_secs == 0 || ttl_secs > 86400 {
-        return Err(format!(
-            "TRAVERSAL_TTL_SECS must be a positive integer <= 86400 (got: {ttl_secs})"
-        ));
-    }
+    // Fail closed on a missing TTL: the former silent 120 s default let a
+    // mid-run re-issue (live_linux_managed_dns_test) replace the lab's
+    // 24-hour traversal bundles with two-minute ones, so every daemon restart
+    // afterwards found a stale bundle and went permanently restricted
+    // (lenovo-bot chaos runs, 2026-09-10). The writer must say what it means.
+    let ttl_secs = parse_required_traversal_ttl_secs(env_values.get("TRAVERSAL_TTL_SECS"))?;
 
     let nodes = parse_generic_nodes(nodes_spec.as_str())?;
     if nodes.len() < 2 {
@@ -7568,6 +7583,27 @@ pub fn execute_ops_e2e_worker_enforce_runtime(
     wait_for_daemon_socket_locally("/run/rustynet/rustynetd.sock", 20, 2)?;
 
     Ok(format!("runtime enforced for {node_id}"))
+}
+
+#[cfg(test)]
+mod traversal_issue_ttl_tests {
+    use super::parse_required_traversal_ttl_secs;
+
+    // Live 2026-09-10 (lenovo-bot): a mid-run re-issue without a TTL took the
+    // silent 120 s default and expired the fleet's traversal state two
+    // minutes later. The issuer must refuse an env file that omits the TTL.
+    #[test]
+    fn missing_traversal_ttl_is_refused_not_defaulted() {
+        let err = parse_required_traversal_ttl_secs(None).expect_err("no TTL must be an error");
+        assert!(err.contains("TRAVERSAL_TTL_SECS is required"), "{err}");
+        assert_eq!(
+            parse_required_traversal_ttl_secs(Some(&"86400".to_owned())),
+            Ok(86400)
+        );
+        assert!(parse_required_traversal_ttl_secs(Some(&"0".to_owned())).is_err());
+        assert!(parse_required_traversal_ttl_secs(Some(&"86401".to_owned())).is_err());
+        assert!(parse_required_traversal_ttl_secs(Some(&"x".to_owned())).is_err());
+    }
 }
 
 #[cfg(test)]

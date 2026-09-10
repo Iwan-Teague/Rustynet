@@ -1667,6 +1667,11 @@ pub fn run_remote_shell(
     }
 }
 
+/// TTL every live bin pins when it (re-)issues traversal bundles: the same
+/// 24 h the Setup phase distributes, so a mid-run re-issue never shortens the
+/// fleet's traversal lifetime (lenovo-bot chaos runs, 2026-09-10).
+pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
+
 #[cfg(test)]
 mod tests {
     use super::{
