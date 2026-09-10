@@ -27,3 +27,18 @@ Re-run the two plans on lenovo-bot after the bin fixes land; the three rows then
 - **Crash-recovery loop clears the start limit** (`systemctl reset-failed` before each per-iteration start and the final restart) and reports `start_limit_resets=N` in its key=value output and JSON report (required field; test `remote_script_resets_start_limit_per_kill_and_reports_the_count`).
 - **sbin-bearing PATH pinned** at the top of the clock and network-impairment remote scripts (tests `remote_script_pins_an_sbin_bearing_path_before_any_lookup`).
 - Still owed before the rerun: `libfaketime` on the lenovo guests (owner-free: `sudo apt-get install -y libfaketime` on debian@192.168.0.30/.31, or add it to the guest provisioner package list), then re-run the two plans.
+
+## Role cells on the 2-node Linux lab (2026-09-10, lenovo-bot, main `41c5cf1d`)
+
+Owner: "get as many live labs done as we can". With two guests a role cell is `exit + <role>` (preflight requires exactly one Exit; the cell has no client, so client-dependent stages report-skip).
+
+| Cell | Run | Result | Role stages |
+|---|---|---|---|
+| exit + **blind_exit** | `livelab-1789057224` | 32 / 1 / 33 | `blind_exit` pass, `blind_exit_dataplane_validation` pass — **first live proof of blind_exit on the `--node` engine** (QH-86 validator exercised: forward rules judged, no masquerade) |
+| exit + **relay** | `livelab-1789060725` | 34 / 1 / 31 | `deploy_relay_service` pass, `relay_validation` pass |
+| exit + **anchor** | `livelab-1789062468` | 32 / 1 / 33 | `anchor_validation` pass; `live_anchor` skipped by dependency (see below) |
+| exit + **admin** | in flight | | |
+
+A first blind_exit launch as `client + blind_exit` failed preflight ("lab requires exactly 1 Exit node, found 0"): blind_exit is its own role, it does not stand in for Exit. Remedy recorded.
+
+The single failure in each cell is the same lab-engine gap: `live_managed_dns_validation` failed with "no node with role label 'client'" instead of report-skipping like its siblings — fixed `18768ac6` + `825a63fb` (the topology skip is decided from assignments before any adapter resolves). Remedies recorded against all three stubs. Second gap: `live_anchor` declared `LiveMixedTopologyValidation` (the three-platform stage) as its dependency, so the skip cascade made it unreachable on every single-platform lab — fixed `449d91e1` (depends on `anchor_validation`; topology completeness stays the stage's own reported skip). Both fixes are on main behind the B5 push.
