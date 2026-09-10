@@ -42,6 +42,12 @@ impl OrchestrationStage for LiveSecretsNotInLogsValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        if let Some(skip) = crate::vm_lab::orchestrator::stage::exit_only_topology_skip(
+            ctx,
+            "secrets-not-in-logs validation",
+        ) {
+            return skip;
+        }
         let client_params = match ssh_params_for_role(ctx, "client") {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),

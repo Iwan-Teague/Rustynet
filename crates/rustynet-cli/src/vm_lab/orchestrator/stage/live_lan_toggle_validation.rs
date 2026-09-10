@@ -45,6 +45,12 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        if let Some(skip) = crate::vm_lab::orchestrator::stage::exit_only_topology_skip(
+            ctx,
+            "LAN-toggle validation",
+        ) {
+            return skip;
+        }
         let exit_params = match ssh_params_for_role(ctx, "exit") {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),

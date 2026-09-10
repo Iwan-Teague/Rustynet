@@ -39,6 +39,11 @@ impl OrchestrationStage for LiveTwoHopValidationStage {
     }
 
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
+        if let Some(skip) =
+            crate::vm_lab::orchestrator::stage::exit_only_topology_skip(ctx, "two-hop validation")
+        {
+            return skip;
+        }
         // Two-hop routing requires a distinct entry/relay hop AND a second
         // client (client -> entry -> exit, with a second client). A minimal
         // topology (e.g. exit + single client) has neither and cannot exercise
