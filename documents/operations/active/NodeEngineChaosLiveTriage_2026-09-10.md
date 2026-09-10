@@ -37,7 +37,7 @@ Owner: "get as many live labs done as we can". With two guests a role cell is `e
 | exit + **blind_exit** | `livelab-1789057224` | 32 / 1 / 33 | `blind_exit` pass, `blind_exit_dataplane_validation` pass — **first live proof of blind_exit on the `--node` engine** (QH-86 validator exercised: forward rules judged, no masquerade) |
 | exit + **relay** | `livelab-1789060725` | 34 / 1 / 31 | `deploy_relay_service` pass, `relay_validation` pass |
 | exit + **anchor** | `livelab-1789062468` | 32 / 1 / 33 | `anchor_validation` pass; `live_anchor` skipped by dependency (see below) |
-| exit + **admin** | in flight | | |
+| exit + **admin** | `livelab-1789064178-41c5cf1d6d21` | 32 / 1 / 33 | `admin_issue` pass |
 
 A first blind_exit launch as `client + blind_exit` failed preflight ("lab requires exactly 1 Exit node, found 0"): blind_exit is its own role, it does not stand in for Exit. Remedy recorded.
 
