@@ -454,6 +454,10 @@ cleanup() {{
   rm -f "$drop_in_file" >/dev/null 2>&1 || true
   rmdir "$drop_in_dir" >/dev/null 2>&1 || true
   systemctl daemon-reload >/dev/null 2>&1 || true
+  # A daemon that refused to start under the fault has tripped the unit's
+  # start limit; clear it or this restart is refused and the exit stays
+  # down for every later stage (live 2026-09-10, lenovo-bot).
+  systemctl reset-failed "$service" >/dev/null 2>&1 || true
   systemctl restart "$service" >/dev/null 2>&1 || true
 }}
 trap cleanup EXIT
@@ -489,12 +493,21 @@ install_faketime() {{
     printf 'Environment=FAKETIME_DONT_FAKE_MONOTONIC=1\n'
   }} > "$drop_in_file"
   systemctl daemon-reload
-  systemctl restart "$service"
+  systemctl reset-failed "$service" >/dev/null 2>&1 || true
+  # The restart may legitimately FAIL: a daemon that refuses to come up
+  # under the injected clock is an observation (fail-closed at start),
+  # not a script error — record it instead of aborting under `set -e`.
+  if systemctl restart "$service" >/dev/null 2>&1; then
+    printf 'daemon_started_under_fault=true\n'
+  else
+    printf 'daemon_started_under_fault=false\n'
+  fi
 }}
 remove_faketime() {{
   rm -f "$drop_in_file" >/dev/null 2>&1 || true
   rmdir "$drop_in_dir" >/dev/null 2>&1 || true
   systemctl daemon-reload
+  systemctl reset-failed "$service" >/dev/null 2>&1 || true
   systemctl restart "$service"
 }}
 wait_recovered() {{
@@ -646,6 +659,10 @@ struct ClockStageObservation {
     faketime_lib_present: bool,
     recovered: bool,
     measured_recovery_secs: Option<u64>,
+    /// Did `rustynetd` come up at all under the injected clock? `false` is
+    /// a fail-closed-at-start observation, distinct from "came up and
+    /// rejected future state" (live 2026-09-10: +90 days → refused to start).
+    daemon_started_under_fault: Option<bool>,
     future_state_rejected: Option<bool>,
     stale_state_rejected: Option<bool>,
     epoch_not_regressed: Option<bool>,
@@ -692,6 +709,7 @@ impl ClockStageObservation {
             faketime_lib_present: req_bool("faketime_lib_present")?,
             recovered: req_bool("recovered")?,
             measured_recovery_secs: opt_u64("measured_recovery_secs")?,
+            daemon_started_under_fault: opt_bool("daemon_started_under_fault")?,
             future_state_rejected: opt_bool("future_state_rejected")?,
             stale_state_rejected: opt_bool("stale_state_rejected")?,
             epoch_not_regressed: opt_bool("epoch_not_regressed")?,
@@ -768,6 +786,7 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
                     "faketime_lib_present": observation.faketime_lib_present,
                     "teardown_registered_before_fault": observation.teardown_registered_before_fault,
                     "recovered": observation.recovered,
+                    "daemon_started_under_fault": observation.daemon_started_under_fault,
                     "future_state_rejected": observation.future_state_rejected,
                     "stale_state_rejected": observation.stale_state_rejected,
                     "epoch_not_regressed": observation.epoch_not_regressed,
@@ -883,6 +902,39 @@ mod tests {
         assert!(
             path_pos < first_lookup,
             "PATH must precede the first lookup:\n{script}"
+        );
+    }
+
+    // Live 2026-09-10 (lenovo-bot): the +90-day jump made rustynetd refuse
+    // to start, the failed starts tripped StartLimitBurst, and the teardown's
+    // restart was refused — the exit stayed down for every later chaos
+    // stage. The script must reset the limit before every restart and
+    // record a non-starting daemon instead of aborting.
+    #[test]
+    fn remote_script_resets_start_limit_and_records_a_daemon_that_will_not_start() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        assert!(
+            script
+                .matches("systemctl reset-failed \"$service\"")
+                .count()
+                >= 3,
+            "{script}"
+        );
+        assert!(
+            script.contains("printf 'daemon_started_under_fault=false\\n'"),
+            "{script}"
+        );
+        let cleanup = script.find("cleanup() {").expect("cleanup fn");
+        let reset_in_cleanup = script[cleanup..]
+            .find("systemctl reset-failed")
+            .expect("reset in cleanup");
+        let restart_in_cleanup = script[cleanup..]
+            .find("systemctl restart")
+            .expect("restart in cleanup");
+        assert!(
+            reset_in_cleanup < restart_in_cleanup,
+            "reset-failed must precede the teardown restart"
         );
     }
 
