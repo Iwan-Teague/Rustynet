@@ -1,6 +1,6 @@
 # --node Chaos + Negative-Control Live Triage (2026-09-10)
 
-**Run:** lenovo-bot, 2-node Linux (`lenovo-client-1:client`, `lenovo-exit-1:exit`), main `41c5cf1d`, flags `--enable-chaos-suite --enable-negative-control`, report `artifacts/live_lab/chaos-negctl-41c5cf1d` on the host, ledger row `livelab-1789046…-41c5cf1d` (fetched into both ledgers). **48 pass / 3 fail / 28 skipped.** First-ever `--node` run of these two plans.
+**Run:** lenovo-bot, 2-node Linux (`lenovo-client-1:client`, `lenovo-exit-1:exit`), main `f6d926c0` (code-identical to `41c5cf1d`; the later commits were docs-only), flags `--enable-chaos-suite --enable-negative-control`, report `artifacts/live_lab/chaos-negctl-41c5cf1d` on the host, ledger row `livelab-1789047225-f6d926c02b2a` (fetched into both ledgers). **48 pass / 3 fail / 28 skipped.** First-ever `--node` run of these two plans.
 
 **What passed live, with QH-83 witnesses:** all four negative controls (`signed_bundle_rejection`, `planted_residue`, `wrong_node_substitution`, `daemon_kill_mid_stage` — each wrote its inversion transcript) and six of nine chaos stages (`daemon_fault`, `daemon_sigstop_sigcont`, `membership_adversarial`, `privileged_boundary`, `resource_exhaustion`, `signed_state_adversarial`). Note the plan gating: chaos stages declare `LiveMixedTopologyValidation` as a dependency, but that stage's Linux-only *skip* does not cascade (only a non-pass verdict does), so the chaos plan does run on a single-platform lab.
 
