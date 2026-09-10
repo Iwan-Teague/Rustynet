@@ -1036,6 +1036,57 @@ pub fn ssh_status(
         .map_err(|err| format!("failed to run ssh against {target}: {err}"))
 }
 
+/// Cap on how much remote output a failed-command error string may embed, so
+/// a runaway remote log cannot flood the orchestrator report.
+const FAILED_REMOTE_OUTPUT_MAX_BYTES: usize = 2048;
+/// Cap on how many trailing lines of remote output are surfaced per stream.
+const FAILED_REMOTE_OUTPUT_MAX_LINES: usize = 20;
+
+/// Format the tail of one remote output stream for a failed-command error.
+/// Keeps the LAST lines (the failing command's verdict is at the end), trims
+/// trailing whitespace, and bounds the result so the error string stays small.
+fn remote_output_tail(label: &str, bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return format!("{label}: (empty)");
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let start = lines.len().saturating_sub(FAILED_REMOTE_OUTPUT_MAX_LINES);
+    let mut tail = lines[start..].join("\n");
+    if tail.len() > FAILED_REMOTE_OUTPUT_MAX_BYTES {
+        // Keep only the last max bytes, cut forward to the next newline so a
+        // partial line never leads the tail.
+        let cut = tail.len() - FAILED_REMOTE_OUTPUT_MAX_BYTES;
+        let cut = tail[cut..]
+            .find('\n')
+            .map(|offset| cut + offset + 1)
+            .unwrap_or(tail.len());
+        tail = tail[cut..].to_owned();
+    }
+    format!("{label}: {tail}")
+}
+
+/// Build the diagnosable error for a failed remote command: the exit status
+/// plus the bounded tail of the remote stdout AND stderr, so a lab stage
+/// failure names the failing command instead of reporting an opaque status.
+/// The lab remote scripts carry no secrets and never echo the environment, so
+/// the tail is safe to surface verbatim (and must stay that way).
+fn failed_remote_command_error(
+    label: &str,
+    target: &str,
+    status: ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
+    format!(
+        "{label} command failed against {target} with status {}\n{}\n{}",
+        status_code(status),
+        remote_output_tail("remote stdout", stdout),
+        remote_output_tail("remote stderr", stderr)
+    )
+}
+
 pub fn ssh_output(
     identity: &Path,
     known_hosts: &Path,
@@ -1045,9 +1096,12 @@ pub fn ssh_output(
     if let Some(transport) = utm_transport_for_target(target) {
         let output = utm_exec_output(&transport, command)?;
         if !output.status.success() {
-            return Err(format!(
-                "UTM command failed against {target} with status {}",
-                status_code(output.status)
+            return Err(failed_remote_command_error(
+                "UTM",
+                target,
+                output.status,
+                &output.stdout,
+                &output.stderr,
             ));
         }
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
@@ -1060,9 +1114,12 @@ pub fn ssh_output(
         .output()
         .map_err(|err| format!("failed to run ssh against {target}: {err}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "ssh command failed against {target} with status {}",
-            status_code(output.status)
+        return Err(failed_remote_command_error(
+            "ssh",
+            target,
+            output.status,
+            &output.stdout,
+            &output.stderr,
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
