@@ -40,7 +40,14 @@ impl OrchestrationStage for LiveAnchorStage {
     }
 
     fn dependencies(&self) -> &[StageId] {
-        &[StageId::LiveMixedTopologyValidation]
+        // The anchor cell needs the anchor's own validation to have passed;
+        // it does NOT need the three-platform mixed-topology stage, which
+        // skips on every single-platform lab and (via the skip cascade) made
+        // live_anchor unreachable there. Live 2026-09-10 (lenovo-bot anchor
+        // cell): "dependency `live_mixed_topology_validation` did not pass".
+        // Topology completeness (entry/aux/extra) is judged by this stage's
+        // own reported skips.
+        &[StageId::AnchorValidation]
     }
 
     fn applies_to_roles(&self) -> &[NodeRole] {
@@ -253,10 +260,7 @@ mod tests {
         let stage = LiveAnchorStage;
         assert_eq!(stage.id(), StageId::LiveAnchor);
         assert_eq!(stage.name(), "live_anchor");
-        assert_eq!(
-            stage.dependencies(),
-            &[StageId::LiveMixedTopologyValidation]
-        );
+        assert_eq!(stage.dependencies(), &[StageId::AnchorValidation]);
         assert_eq!(stage.fanout(), StageFanout::Once);
     }
 
