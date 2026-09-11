@@ -560,7 +560,10 @@ if [ "$recovered" = true ]; then
   # until it reports a live-proven path with peers, bounded by the same
   # deadline, instead of sampling the instant the socket appears (live
   # 2026-09-11: recovered in 8 s, sampled unconverged, stage failed).
-  mesh_end_unix="$((start_unix + deadline))"
+  # Convergence (re-handshake + path proof) is a slower clock than socket
+  # recovery: katana (nested-virt, NAT'd guests) needed longer than the 90 s
+  # recovery deadline while lenovo converged in 12 s. Two deadlines.
+  mesh_end_unix="$((start_unix + deadline * 2))"
   while :; do
     mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
     case "$mesh_status_line" in

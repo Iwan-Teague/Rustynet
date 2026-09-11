@@ -76,6 +76,12 @@ build_bootstrap_prereqs_present() {
       missing=1
     fi
   done
+  # libfaketime is a shared object, not a command: the command loop above
+  # cannot see it, so an already-provisioned guest never gained it (katana,
+  # 2026-09-11 — chaos_clock_attack reported faketime_lib_present=false).
+  if ! ldconfig -p 2>/dev/null | grep -q libfaketime && ! ls /usr/lib/*/faketime/libfaketime.so.1 /usr/lib*/faketime/libfaketime.so.1 >/dev/null 2>&1; then
+    echo "  libfaketime  MISSING"; missing=1
+  fi
   if ! command -v gcc >/dev/null 2>&1 && ! command -v cc >/dev/null 2>&1; then
     echo "[bootstrap] missing C compiler command (gcc/cc)" >&2
     missing=1
