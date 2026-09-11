@@ -325,10 +325,17 @@ pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String>
         .iter_mut()
         .find(|record| record.stub_id == stub_id)
         .ok_or_else(|| format!("no stage triage stub with stub_id {stub_id:?}"))?;
-    if !record.is_unfilled() {
+    // A recorded attempt is never overwritten — with ONE exception that the
+    // commit-scoped decline rule requires: a template decline (`none: …`)
+    // carries no attribution, and once the tree moves it blocks the stage
+    // again; the way out is to replace it with a REAL patch. A real patch
+    // never replaces a real patch, and a decline never replaces anything.
+    let incoming_is_template = patch.trim().starts_with("none:");
+    if !record.is_unfilled() && (!is_template_decline(record) || incoming_is_template) {
         return Err(format!(
             "stage triage stub {stub_id:?} is already filled: {:?}; refusing to overwrite \
-             a recorded attempt (open a new stub by re-running the stage instead)",
+             a recorded attempt (a template `none:` decline may only be replaced by a real \
+             patch; otherwise open a new stub by re-running the stage)",
             record.patch.as_deref().unwrap_or_default()
         ));
     }
@@ -926,6 +933,34 @@ mod tests {
     /// A filled stub is always a deliberate answer — a decision not to patch is
     /// recorded as `"none: <reason>"`, never left `None` — so a second fill is
     /// an attempt to erase the only record of what a previous agent tried.
+    // A template decline may be replaced by a real patch (that is how a
+    // stale decline gets its attribution); a real patch is never replaced,
+    // and a decline never replaces a decline.
+    #[test]
+    fn fill_patch_lets_a_real_patch_replace_a_template_decline_only() {
+        let path = temp_ledger("replace_template_decline");
+        let stub = record("run-1", "chaos_clock_attack", None);
+        append_stub(path.as_path(), &stub).expect("append");
+        fill_patch(path.as_path(), &stub.stub_id, "none: overnight queue").expect("decline");
+        let err = fill_patch(path.as_path(), &stub.stub_id, "none: again")
+            .expect_err("a decline must not replace a decline");
+        assert!(err.contains("already filled"), "{err}");
+        fill_patch(
+            path.as_path(),
+            &stub.stub_id,
+            "fbfcb9e3: teardown resets the start limit",
+        )
+        .expect("a real patch replaces a template decline");
+        let err = fill_patch(path.as_path(), &stub.stub_id, "deadbeef: something else")
+            .expect_err("a real patch is never overwritten");
+        assert!(err.contains("already filled"), "{err}");
+        let ledger = load_ledger(path.as_path()).expect("load");
+        assert_eq!(
+            ledger[0].patch.as_deref(),
+            Some("fbfcb9e3: teardown resets the start limit")
+        );
+    }
+
     #[test]
     fn fill_patch_refuses_to_overwrite_an_already_recorded_attempt() {
         let path = temp_ledger("no_overwrite");
