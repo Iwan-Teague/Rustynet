@@ -486,7 +486,11 @@ pub fn parse_wg_show_endpoints(output: &str) -> Vec<String> {
         if line.is_empty() {
             continue;
         }
-        if let Some(endpoint) = line.split_whitespace().nth(1) {
+        // `wg show <iface> endpoints` prints `<pubkey>\t(none)` for a peer with
+        // no endpoint yet: that is "no datum", not an endpoint.
+        if let Some(endpoint) = line.split_whitespace().nth(1)
+            && endpoint != "(none)"
+        {
             endpoints.push(endpoint.to_owned());
         }
     }

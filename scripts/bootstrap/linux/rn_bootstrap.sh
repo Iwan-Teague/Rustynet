@@ -183,7 +183,7 @@ install_prereqs() {
     run_root_timed 1800 dnf install -y \
       ca-certificates curl git gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
       sqlite-devel clang llvm llvm-devel nftables wireguard-tools tar gzip tcpdump iputils \
-      iproute2 libfaketime
+      iproute libfaketime
   elif [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_id}" == "linuxmint" || "${os_like}" == *"debian"* ]] || command -v apt-get >/dev/null 2>&1; then
     run_apt_update_hardened
     run_apt_install_hardened \
