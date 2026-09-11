@@ -482,7 +482,10 @@ status_field() {{
     | awk -F= -v k="$1" '$1==k {{ print $2; exit }}'
 }}
 baseline_epoch="$(status_field membership_epoch)"
-case "$baseline_epoch" in ''|*[!0-9]*) baseline_epoch=0 ;; esac
+# An unsampleable baseline stays EMPTY (never 0): the daemon never emits 0,
+# and the post-recovery non-regression check must fail on an unverifiable
+# baseline rather than degrade to `recovered >= 0`.
+case "$baseline_epoch" in *[!0-9]*) baseline_epoch="" ;; esac
 baseline_future_rej="$(status_field traversal_future_dated_rejections)"
 case "$baseline_future_rej" in ''|*[!0-9]*) baseline_future_rej=0 ;; esac
 baseline_stale_rej="$(status_field traversal_stale_rejections)"
@@ -632,9 +635,10 @@ epoch_not_regressed=false
 case "$recovered_epoch" in
   ''|*[!0-9]*|none) : ;;
   *)
-    if [ "$recovered_epoch" -ge "$baseline_epoch" ]; then
-      epoch_not_regressed=true
-    fi
+    case "$baseline_epoch" in
+      ''|*[!0-9]*) : ;;   # unverifiable baseline must FAIL, never degrade to 0
+      *) [ "$recovered_epoch" -ge "$baseline_epoch" ] && epoch_not_regressed=true ;;
+    esac
     ;;
 esac
 printf 'epoch_not_regressed=%s\n' "$epoch_not_regressed"
@@ -684,9 +688,10 @@ epoch_not_regressed=false
 case "$recovered_epoch" in
   ''|*[!0-9]*|none) : ;;
   *)
-    if [ "$recovered_epoch" -ge "$baseline_epoch" ]; then
-      epoch_not_regressed=true
-    fi
+    case "$baseline_epoch" in
+      ''|*[!0-9]*) : ;;   # unverifiable baseline must FAIL, never degrade to 0
+      *) [ "$recovered_epoch" -ge "$baseline_epoch" ] && epoch_not_regressed=true ;;
+    esac
     ;;
 esac
 printf 'epoch_not_regressed=%s\n' "$epoch_not_regressed"
@@ -883,6 +888,10 @@ impl ClockStageObservation {
             && self.future_rejections_unchanged == Some(true)
             && (self.bootstrap_error_names_staleness == Some(true)
                 || self.daemon_started_under_fault == Some(false))
+            // Started form: the dataplane must be FailClosed under the fault
+            // (`path_live_proven=false` is the status-line reading of it).
+            && (self.daemon_started_under_fault == Some(false)
+                || self.path_live_proven == Some(false))
             && self.epoch_not_regressed == Some(true)
             && self.recovered_proven == Some(true)
     }
@@ -1231,6 +1240,33 @@ mod tests {
     fn jump_forward_passes_when_fail_closed_posture_and_recovered() {
         let observation = ClockStageObservation::parse(forward_pass_output()).expect("parse");
         assert!(observation.passed(ClockStage::JumpForward, 180));
+    }
+
+    // Review 2026-09-11 blocker: an unsampleable baseline used to coerce to 0,
+    // which turned the post-recovery anti-rollback gate into `>= 0`.
+    #[test]
+    fn remote_script_never_coerces_an_epoch_comparison_to_zero() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        assert!(!script.contains("post_epoch=0"), "{script}");
+        assert!(!script.contains("recovered_epoch=0"), "{script}");
+        assert!(!script.contains("baseline_epoch=0"), "{script}");
+        assert!(
+            script.contains("''|*[!0-9]*) : ;;   # unverifiable baseline must FAIL"),
+            "{script}"
+        );
+        assert!(script.contains("*[!0-9]*|none) : ;;"), "{script}");
+    }
+
+    // Started form must also prove the dataplane stayed FailClosed under
+    // the fault (path_live_proven=false); a live path under a +90d clock
+    // is the fail-open this leg exists to catch.
+    #[test]
+    fn jump_forward_fails_when_dataplane_is_live_under_fault() {
+        let output =
+            forward_pass_output().replace("path_live_proven=false", "path_live_proven=true");
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(!observation.passed_jump_forward(180));
     }
 
     #[test]
