@@ -493,7 +493,10 @@ fn blocks_launch(record: &StageTriageRecord, current_commit: &str) -> bool {
     if record.is_unfilled() {
         return true;
     }
-    is_template_decline(record) && record.run_commit != current_commit
+    is_template_decline(record)
+        // An unresolvable current commit can never prove a decline current —
+        // including against a stub that also recorded an empty commit.
+        && (current_commit.is_empty() || record.run_commit != current_commit)
 }
 
 /// Refuse to launch while a planned stage has an unfilled stub (plan §3.6/T3).
@@ -1264,6 +1267,24 @@ mod tests {
     /// Fail-closed edge: when the caller cannot resolve the launching tree's
     /// commit (empty string), a template decline can never be proven current
     /// and must block.
+    // Review DECLREV: with the current commit unresolvable, a stub that also
+    // recorded an empty commit must still block ("" == "" is not proof).
+    #[test]
+    fn template_decline_with_empty_stub_commit_blocks_when_current_is_empty() {
+        let path = temp_ledger("gate_decline_both_empty");
+        let planned = vec!["live_two_hop_validation".to_owned()];
+        let mut declined = current_record(
+            "run-1",
+            "live_two_hop_validation",
+            Some("none: overnight queue"),
+        );
+        declined.run_commit = String::new();
+        append_stub(path.as_path(), &declined).expect("append");
+        let err = enforce_launch_gate(path.as_path(), &planned, "")
+            .expect_err("an empty current commit must not satisfy a template decline");
+        assert!(err.contains(&declined.stub_id), "{err}");
+    }
+
     #[test]
     fn template_decline_blocks_when_the_current_commit_is_unresolvable() {
         let path = temp_ledger("gate_decline_unknown_commit");
