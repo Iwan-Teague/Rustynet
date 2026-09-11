@@ -140,6 +140,29 @@ fn run_chaos_bin(ctx: &OrchestrationContext, spec: &ChaosBinSpec) -> StageOutcom
     {
         return skip;
     }
+    // The chaos bins drive systemd, nft, tc and libfaketime on the guest:
+    // Linux-only by construction. A mac/win target is a platform gap to
+    // report (review F, 2026-09-11), not a failure.
+    if !matches!(spec.targets, ChaosTargets::Offline) {
+        let non_linux: Vec<String> = ctx
+            .assignments
+            .iter()
+            .filter(|a| matches!(a.role, NodeRole::Exit | NodeRole::Client))
+            .filter(|a| {
+                ctx.adapters
+                    .get(a.alias.as_str())
+                    .is_some_and(|adapter| adapter.platform() != VmGuestPlatform::Linux)
+            })
+            .map(|a| a.alias.clone())
+            .collect();
+        if !non_linux.is_empty() {
+            return StageOutcome::Skipped(format!(
+                "{} targets a non-Linux guest ({}); the chaos bins are Linux-only",
+                spec.name,
+                non_linux.join(",")
+            ));
+        }
+    }
     let report_path = ctx.report_dir.join(format!("{}_report.json", spec.name));
     let log_path = ctx.report_dir.join(format!("{}.log", spec.name));
 

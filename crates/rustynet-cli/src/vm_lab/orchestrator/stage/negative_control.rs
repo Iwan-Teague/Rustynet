@@ -219,6 +219,19 @@ impl OrchestrationStage for NegativeControlPlantedResidueStage {
     }
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let dir = control_workdir(ctx, self.name());
+        // The live controls sabotage a Linux guest (nft table, systemd kill).
+        // A topology with no Linux node cannot host them: report the platform
+        // gap (review F, 2026-09-11), never a stage failure.
+        if !ctx.assignments.iter().any(|a| {
+            ctx.adapters
+                .get(a.alias.as_str())
+                .is_some_and(|adapter| adapter.platform() == VmGuestPlatform::Linux)
+        }) {
+            return StageOutcome::Skipped(
+                "no Linux node in the topology; the live negative controls target a Linux guest"
+                    .to_owned(),
+            );
+        }
         let target = match select_linux_control_target(&ctx.assignments, &|alias| {
             ctx.adapters.get(alias).map(|adapter| adapter.platform())
         }) {
@@ -267,6 +280,19 @@ impl OrchestrationStage for NegativeControlDaemonKillMidStageStage {
     }
     fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         let dir = control_workdir(ctx, self.name());
+        // The live controls sabotage a Linux guest (nft table, systemd kill).
+        // A topology with no Linux node cannot host them: report the platform
+        // gap (review F, 2026-09-11), never a stage failure.
+        if !ctx.assignments.iter().any(|a| {
+            ctx.adapters
+                .get(a.alias.as_str())
+                .is_some_and(|adapter| adapter.platform() == VmGuestPlatform::Linux)
+        }) {
+            return StageOutcome::Skipped(
+                "no Linux node in the topology; the live negative controls target a Linux guest"
+                    .to_owned(),
+            );
+        }
         let target = match select_linux_control_target(&ctx.assignments, &|alias| {
             ctx.adapters.get(alias).map(|adapter| adapter.platform())
         }) {
