@@ -53,3 +53,5 @@ recoverable freshness gap into an operator-only outage.
 - (b) Keep today's behaviour and document the operator reset.
 
 Decision: ______
+
+*Addendum 2026-09-11:* the clock-attack leg itself does not show poisoning — under a +90-day clock the daemon refuses to start at trust preflight ("trust evidence is stale", exit 65) and boots cleanly once the clock is restored. D6 stands on the expired-traversal-bundle episode only (an expired bundle at start → permanent restriction a later verified refresh cannot lift).
