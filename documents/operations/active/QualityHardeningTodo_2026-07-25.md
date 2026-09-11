@@ -7335,3 +7335,21 @@ branch `ai-edit/edit-1788908852677-30071-0`, commits `8c4dd6f1`, `efe73099`,
 
 **Disposition: FIXED on main (F1/F2); rotation OWED; F3 + gate extension
 FIXED 2026-09-09 pending merge.**
+
+## QH-87..QH-95 — attack-coverage gaps (tough-policy audit H, 2026-09-11)
+
+Source: `state/review/r2/H.out` (GLM flash, code-cited; summary in `NodeEngineToughPolicy_2026-09-11.md`). The live suites prove posture and library-level rejection; the wire-level adversary is never attacked live. Each item is a new opt-in stage in the negative-control shape (sabotage from outside the daemon, independent observation, fail-closed criterion, QH-83 File witness, `Skipped(named precondition)` when a role is missing).
+
+| QH | Stage | Suite | Severity | Attack | Proof | Status |
+|---|---|---|---|---|---|---|
+| QH-87 | `negative_control_rogue_anchor_bundle` | NegativeControl | BLOCKER | a second "rogue anchor" serves forged-signature / epoch-regression / same-epoch-fork / quorum-inflated bundles over the real listener | every forgery rejected by NAME, zero bytes written, watermark hash unchanged; genuine bundle still applies | queued (job 2) |
+| QH-88 | `negative_control_wire_forgery` | NegativeControl | BLOCKER | forged + replayed signed updates to the exit's gossip socket and a forged assignment via IPC, from the client node | daemon-journal rejections + INDEPENDENT proof: second node's view and on-disk snapshot hash unchanged, no epoch movement, no restriction flapping | queued (job 2) |
+| QH-89 | `negative_control_enrollment_token_replay` | NegativeControl | High | enrol once via the live anchor listener, replay the token sequentially and concurrently | both replays `already_consumed`, ledger has one consumed row, mesh peer count unchanged (orchestrator's own pubkey collection) | building (job 1) |
+| QH-90 | `negative_control_killswitch_bypass` | NegativeControl | High | plant `pass out quick all` above the terminator from outside the daemon (Linux nft / macOS pf) | the live assertion FAILS naming the precedence error while planted, passes after removal; acknowledged-egress accept fires only when the daemon set the flag | building (job 1) |
+| QH-91 | `chaos_hello_flood_live` | Chaos | Should-fix | client floods the relay's pre-auth hello path: connection-count flood and maximal-length frames (AUDIT-031) | attacker-side refusals, relay status still answering within a bound, RSS delta under the byte cap (captured over SSH) | open |
+| QH-92 | `negative_control_rogue_dns_answer` | NegativeControl | Should-fix | hostile resolver answers a managed name | client rejects the forged answer (not merely refuses to forward) | open |
+| QH-93 | `negative_control_stolen_identity_join` | NegativeControl | Should-fix | a second node presents a cloned identity/key | join refused, no duplicate peer | open |
+| QH-94 | `negative_control_host_key_swap` | NegativeControl | Nit (lab trust) | host key swapped / same-IP-new-host | lab refuses | open |
+| QH-95 | `chaos_helper_socket_race` | Chaos | Nit | privileged-helper socket race | no privilege escalation | open |
+
+Cross-cutting (H, rule 2): the six self-report stages (dns_failclosed, hello-limiter, key_custody/secrets/security_audit family) need orchestrator-side corroboration (nft dump, `ss`, file modes over SSH) — folded into audit I's strengthening list.
