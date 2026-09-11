@@ -311,7 +311,11 @@ fn run_live_daemon_kill(config: &Config, logger: &mut Logger) -> Result<Value, S
 
     let cleanup_result = traffic_guard.stop();
     let output = output?;
-    let client_output = cleanup_result?;
+    let client_output = cleanup_result.map_err(|err| {
+        format!(
+            "client leak-check guard failed fail-closed; a broken or missing capture can never pass the plaintext check: {err}"
+        )
+    })?;
 
     logger.block(output.as_str())?;
     logger.block(client_output.as_str())?;
@@ -343,12 +347,82 @@ impl<'a> ClientTrafficGuard<'a> {
     }
 
     fn stop(self) -> Result<String, String> {
-        let traffic_pid_file = shell_quote(CLIENT_TRAFFIC_PID_FILE);
-        let tcpdump_pid_file = shell_quote(CLIENT_TCPDUMP_PID_FILE);
-        let capture_file = shell_quote(CLIENT_TCPDUMP_CAPTURE_FILE);
-        let error_file = shell_quote(CLIENT_TCPDUMP_ERROR_FILE);
-        let script = format!(
-            r#"set -eu
+        let script = render_client_traffic_stop_script();
+        capture_root(self.identity, self.known_hosts, self.client, &script)
+    }
+}
+
+/// Shared fail-closed capture tally for every tcpdump leak check in this bin
+/// (audit I2 finding 2, 2026-09-11). A capture that is missing, empty,
+/// unproven (no provenance marker, or tcpdump never printed its "listening on"
+/// banner into the error file), or backed by a tcpdump stderr containing
+/// anything but the known-benign startup/summary lines is an ERROR: the
+/// zero-plaintext claim would be unmeasured, and an unmeasured claim fails the
+/// stage instead of passing it. On the error path the script prints
+/// `<check_var>=error` plus the reason and exits 3 (capture_root surfaces a
+/// non-zero exit as a hard error); the observation parser additionally treats
+/// an in-band `<check_var>=error` as a stage failure naming the reason.
+fn render_capture_leak_tally_sh(
+    capture_path: &str,
+    error_path: &str,
+    lines_var: &str,
+    check_var: &str,
+    reason_var: &str,
+) -> String {
+    format!(
+        r#"{reason_var}=""
+if [ ! -f {capture_path} ]; then
+  {reason_var}=capture_missing
+elif [ ! -s {capture_path} ]; then
+  {reason_var}=capture_empty
+elif ! grep -q '^capture_provenance=' {capture_path} 2>/dev/null; then
+  {reason_var}=capture_provenance_missing
+elif ! grep -q '^listening on ' {error_path} 2>/dev/null; then
+  {reason_var}=tcpdump_did_not_start
+else
+  {lines_var}="$(grep -Evc '^(tcpdump:|listening on|capture_provenance=|$)' {capture_path} 2>/dev/null || true)"
+  case "${lines_var}" in ''|*[!0-9]*) {lines_var}=0; {reason_var}=unparseable_capture_tally ;; esac
+fi
+if [ -z "${reason_var}" ]; then
+  tcpdump_err_lines="$(grep -Evc '^(dropped privs to |listening on |[0-9]+ packets (captured|received by filter|dropped by kernel))' {error_path} 2>/dev/null || true)"
+  case "$tcpdump_err_lines" in ''|*[!0-9]*) tcpdump_err_lines=0 ;; esac
+  if [ "$tcpdump_err_lines" != "0" ]; then
+    {reason_var}=tcpdump_error_file_nonempty
+  fi
+fi
+if [ -n "${reason_var}" ]; then
+  printf '{lines_var}=0\n'
+  printf '{check_var}=error\n'
+  printf '{reason_var}=%s\n' "${reason_var}"
+  exit 3
+fi
+if [ "${lines_var}" = "0" ]; then
+  {check_var}=pass
+else
+  {check_var}=fail
+fi
+"#
+    )
+}
+
+/// Teardown for the client traffic guard: stop the pinger and tcpdump, then
+/// tally the plaintext capture fail-closed via
+/// [`render_capture_leak_tally_sh`]. A missing or empty capture exits 3 with
+/// `client_plaintext_leak_check=error` — it can never be read as a pass.
+fn render_client_traffic_stop_script() -> String {
+    let traffic_pid_file = shell_quote(CLIENT_TRAFFIC_PID_FILE);
+    let tcpdump_pid_file = shell_quote(CLIENT_TCPDUMP_PID_FILE);
+    let capture_file = shell_quote(CLIENT_TCPDUMP_CAPTURE_FILE);
+    let error_file = shell_quote(CLIENT_TCPDUMP_ERROR_FILE);
+    let leak_tally = render_capture_leak_tally_sh(
+        &capture_file,
+        &error_file,
+        "client_plaintext_lines",
+        "client_plaintext_leak_check",
+        "client_plaintext_error",
+    );
+    format!(
+        r#"set -eu
 traffic_pid_file={traffic_pid_file}
 tcpdump_pid_file={tcpdump_pid_file}
 capture_file={capture_file}
@@ -363,24 +437,12 @@ stop_pid_file() {{
 }}
 stop_pid_file "$traffic_pid_file"
 stop_pid_file "$tcpdump_pid_file"
-if [ -f "$capture_file" ]; then
-  client_plaintext_lines="$(grep -Evc '^(tcpdump:|listening on|$)' "$capture_file" 2>/dev/null || true)"
-else
-  client_plaintext_lines=0
-fi
-case "$client_plaintext_lines" in ""|*[!0-9]*) client_plaintext_lines=0 ;; esac
-if [ "$client_plaintext_lines" = "0" ]; then
-  client_plaintext_leak_check=pass
-else
-  client_plaintext_leak_check=fail
-fi
+{leak_tally}
 rm -f "$capture_file" "$error_file"
 printf 'client_plaintext_lines=%s\n' "$client_plaintext_lines"
 printf 'client_plaintext_leak_check=%s\n' "$client_plaintext_leak_check"
 "#
-        );
-        capture_root(self.identity, self.known_hosts, self.client, &script)
-    }
+    )
 }
 
 fn render_client_traffic_start_script(duration_secs: u64) -> String {
@@ -406,7 +468,11 @@ command -v timeout >/dev/null 2>&1 || {{ printf 'missing_timeout=true\n'; exit 1
 command -v ip >/dev/null 2>&1 || {{ printf 'missing_ip=true\n'; exit 1; }}
 capture_interface="$(ip route show default 0.0.0.0/0 | awk 'NR==1 {{ for (i=1; i<=NF; i++) if ($i == "dev") {{ print $(i+1); exit }} }}')"
 case "$capture_interface" in ""|*[!A-Za-z0-9_.:-]*|rustynet0) exit 1 ;; esac
-timeout {duration_secs} tcpdump -i "$capture_interface" -nn -l "icmp and dst host $probe_target" > "$capture_file" 2> "$error_file" &
+# Provenance marker: the capture is pre-seeded so a missing or empty capture
+# downstream can only mean tcpdump never ran or truncated the file (fail
+# closed); a healthy zero-packet window still yields a provable capture.
+printf 'capture_provenance=started_unix=%s\n' "$(date +%s)" > "$capture_file"
+timeout {duration_secs} tcpdump -i "$capture_interface" -nn -l "icmp and dst host $probe_target" >> "$capture_file" 2> "$error_file" &
 printf '%s\n' "$!" > "$tcpdump_pid_file"
 sleep 2
 # Unpredictable sink path: root must not write a fixed /tmp name.
@@ -429,6 +495,13 @@ fn render_remote_kill_script(config: &Config) -> String {
     let capture_interface = shell_quote(&config.capture_interface);
     let mesh_cidr = shell_quote(&config.mesh_cidr);
     let deadline = config.recovery_deadline_secs;
+    let leak_tally = render_capture_leak_tally_sh(
+        "\"$work_dir/tcpdump.txt\"",
+        "\"$work_dir/tcpdump.err\"",
+        "tcpdump_lines",
+        "plaintext_leak_check",
+        "plaintext_error",
+    );
 
     format!(
         r#"set -eu
@@ -473,7 +546,10 @@ printf 'capture_interface=%s\n' "$capture_interface"
 # The CIDR is spliced into a BPF string; charset-validate it first.
 case "$mesh_cidr" in ''|*[!A-Za-z0-9.:/]*) printf 'invalid_mesh_cidr=true\n'; exit 1 ;; esac
 filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
-timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" > "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
+# Provenance marker + append: a missing or empty capture downstream fails
+# closed (audit I2 finding 2) instead of tallying as zero plaintext.
+printf 'capture_provenance=started_unix=%s\n' "$(date +%s)" > "$work_dir/tcpdump.txt"
+timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" >> "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
 tcpdump_pid="$!"
 sleep 2
 start_unix="$(date +%s)"
@@ -492,17 +568,7 @@ measured_recovery_secs="$(( $(date +%s) - start_unix ))"
 kill "$tcpdump_pid" >/dev/null 2>&1 || true
 wait "$tcpdump_pid" >/dev/null 2>&1 || true
 tcpdump_pid=""
-if [ -f "$work_dir/tcpdump.txt" ]; then
-  tcpdump_lines="$(grep -Evc '^(tcpdump:|listening on|$)' "$work_dir/tcpdump.txt" 2>/dev/null || true)"
-else
-  tcpdump_lines=0
-fi
-case "$tcpdump_lines" in ""|*[!0-9]*) tcpdump_lines=0 ;; esac
-if [ "$tcpdump_lines" = "0" ]; then
-  plaintext_leak_check=pass
-else
-  plaintext_leak_check=fail
-fi
+{leak_tally}
 printf 'recovered=%s\n' "$recovered"
 printf 'measured_recovery_secs=%s\n' "$measured_recovery_secs"
 printf 'tcpdump_lines=%s\n' "$tcpdump_lines"
@@ -530,6 +596,13 @@ fn render_remote_sigstop_script(config: &Config) -> String {
     let capture_interface = shell_quote(&config.capture_interface);
     let mesh_cidr = shell_quote(&config.mesh_cidr);
     let deadline = config.recovery_deadline_secs;
+    let leak_tally = render_capture_leak_tally_sh(
+        "\"$work_dir/tcpdump.txt\"",
+        "\"$work_dir/tcpdump.err\"",
+        "tcpdump_lines",
+        "plaintext_leak_check",
+        "plaintext_error",
+    );
 
     format!(
         r#"set -eu
@@ -575,7 +648,10 @@ printf 'capture_interface=%s\n' "$capture_interface"
 # The CIDR is spliced into a BPF string; charset-validate it first.
 case "$mesh_cidr" in ''|*[!A-Za-z0-9.:/]*) printf 'invalid_mesh_cidr=true\n'; exit 1 ;; esac
 filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
-timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" > "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
+# Provenance marker + append: a missing or empty capture downstream fails
+# closed (audit I2 finding 2) instead of tallying as zero plaintext.
+printf 'capture_provenance=started_unix=%s\n' "$(date +%s)" > "$work_dir/tcpdump.txt"
+timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" >> "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
 tcpdump_pid="$!"
 sleep 2
 start_unix="$(date +%s)"
@@ -605,17 +681,7 @@ measured_recovery_secs="$(( $(date +%s) - start_unix ))"
 kill "$tcpdump_pid" >/dev/null 2>&1 || true
 wait "$tcpdump_pid" >/dev/null 2>&1 || true
 tcpdump_pid=""
-if [ -f "$work_dir/tcpdump.txt" ]; then
-  tcpdump_lines="$(grep -Evc '^(tcpdump:|listening on|$)' "$work_dir/tcpdump.txt" 2>/dev/null || true)"
-else
-  tcpdump_lines=0
-fi
-case "$tcpdump_lines" in ""|*[!0-9]*) tcpdump_lines=0 ;; esac
-if [ "$tcpdump_lines" = "0" ]; then
-  plaintext_leak_check=pass
-else
-  plaintext_leak_check=fail
-fi
+{leak_tally}
 printf 'recovered=%s\n' "$recovered"
 printf 'measured_recovery_secs=%s\n' "$measured_recovery_secs"
 printf 'tcpdump_lines=%s\n' "$tcpdump_lines"
@@ -655,6 +721,23 @@ impl KillStageObservation {
                     .and_then(|(found, value)| (found == key).then_some(value.trim()))
             })
         };
+        // Audit I2 finding 2 (2026-09-11): a broken capture is reported by the
+        // guest as `<check>=error` plus a named reason (the script also exits
+        // 3, which capture_root surfaces as a hard error before this parser
+        // runs). Treat an in-band error verdict as a stage failure naming the
+        // reason — never as a zero-count pass.
+        if exit_value("plaintext_leak_check") == Some("error") {
+            return Err(format!(
+                "target tcpdump leak check errored: {}",
+                exit_value("tcpdump_error").unwrap_or("reason not reported")
+            ));
+        }
+        if client_value("client_plaintext_leak_check") == Some("error") {
+            return Err(format!(
+                "client tcpdump leak check errored: {}",
+                client_value("client_plaintext_error").unwrap_or("reason not reported")
+            ));
+        }
         let parse_exit_bool = |key: &str| -> Result<bool, String> {
             match exit_value(key) {
                 Some("true") => Ok(true),
@@ -1168,5 +1251,121 @@ mod tests {
             "the ping sink must use mktemp, not a fixed /tmp name:\n{script}"
         );
         assert!(!script.contains("/tmp/rustynet-chaos-daemon-fault-client.log"));
+    }
+
+    fn client_stop_script() -> String {
+        render_client_traffic_stop_script()
+    }
+
+    // Audit I2 finding 2 (2026-09-11): the old stop script mapped a missing or
+    // empty capture to client_plaintext_lines=0 => leak_check=pass. That
+    // fail-open must be gone in every leak-tally site.
+    #[test]
+    fn leak_tallies_fail_closed_on_broken_captures() {
+        let tally_markers = [
+            "capture_missing",
+            "capture_empty",
+            "capture_provenance_missing",
+            "tcpdump_did_not_start",
+            "tcpdump_error_file_nonempty",
+            "unparseable_capture_tally",
+        ];
+        for (name, script) in [
+            ("kill", kill_script()),
+            ("sigstop", sigstop_script()),
+            ("client-stop", client_stop_script()),
+        ] {
+            for marker in tally_markers {
+                assert!(
+                    script.contains(marker),
+                    "{name}: missing {marker}:\n{script}"
+                );
+            }
+            assert!(
+                script.contains("leak_check=error"),
+                "{name}: error verdict must be emitted:\n{script}"
+            );
+            assert!(
+                script.contains("exit 3"),
+                "{name}: error must exit 3:\n{script}"
+            );
+            // The provenance marker must be excluded from the packet tally.
+            assert!(
+                script.contains("^(tcpdump:|listening on|capture_provenance=|$)"),
+                "{name}: tally must exclude the provenance marker:\n{script}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_start_script_seeds_capture_provenance_marker_before_appending_tcpdump() {
+        let script = render_client_traffic_start_script(35);
+        let marker = script
+            .find("capture_provenance=started_unix=")
+            .unwrap_or_else(|| panic!("provenance marker present:\n{script}"));
+        let launch = script
+            .find("tcpdump -i \"$capture_interface\"")
+            .unwrap_or_else(|| panic!("tcpdump launch present:\n{script}"));
+        let launch_line = script[launch..]
+            .lines()
+            .next()
+            .unwrap_or_else(|| panic!("tcpdump launch line:\n{script}"));
+        assert!(
+            launch_line.contains(">> \"$capture_file\""),
+            "tcpdump must append to the seeded capture:\n{script}"
+        );
+        assert!(
+            marker < launch,
+            "marker must be written before tcpdump:\n{script}"
+        );
+    }
+
+    #[test]
+    fn fault_scripts_seed_capture_provenance_marker_before_appending_tcpdump() {
+        for (name, script) in [("kill", kill_script()), ("sigstop", sigstop_script())] {
+            let marker = script
+                .find("capture_provenance=started_unix=")
+                .unwrap_or_else(|| panic!("{name}: provenance marker present:\n{script}"));
+            let launch = script
+                .find("tcpdump -i \"$capture_interface\"")
+                .unwrap_or_else(|| panic!("{name}: tcpdump launch present:\n{script}"));
+            let launch_line = script[launch..]
+                .lines()
+                .next()
+                .unwrap_or_else(|| panic!("{name}: tcpdump launch line:\n{script}"));
+            assert!(
+                launch_line.contains(">> \"$work_dir/tcpdump.txt\""),
+                "{name}: tcpdump must append to the seeded capture:\n{script}"
+            );
+            assert!(
+                marker < launch,
+                "{name}: marker must be written before tcpdump:\n{script}"
+            );
+        }
+    }
+
+    // The mutation the audit worried about: the old guest script turned "no
+    // capture" into leak_check=pass. The parser must now turn an in-band
+    // error verdict into a stage failure naming the reason.
+    #[test]
+    fn empty_client_capture_is_a_stage_failure_not_a_pass() {
+        let err = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=error\nclient_plaintext_error=capture_empty\n",
+        )
+        .expect_err("an empty capture must fail the stage, not pass");
+        assert!(err.contains("capture_empty"), "{err}");
+        assert!(err.contains("client tcpdump leak check"), "{err}");
+    }
+
+    #[test]
+    fn missing_target_capture_is_a_stage_failure_not_a_pass() {
+        let err = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=error\ntcpdump_error=capture_missing\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect_err("a missing capture must fail the stage, not pass");
+        assert!(err.contains("capture_missing"), "{err}");
+        assert!(err.contains("target tcpdump leak check"), "{err}");
     }
 }
