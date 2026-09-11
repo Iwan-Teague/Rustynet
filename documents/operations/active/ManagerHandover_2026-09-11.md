@@ -16,7 +16,10 @@ Read after `ManagerHandover_2026-09-08.md` (owner rules unchanged: GLM only; com
 | lenovo-bot | exit+blind_exit, exit+relay, exit+anchor, exit+admin (`f760df74`) | 34/0/32, 36/0/30, 34/0/32, 34/0/32 — **every role cell clean** |
 | lenovo-bot | chaos + negative-control (`f65e562e`) | **50 / 1 / 28**; 4/4 negative controls, 8/9 chaos; the one fail is the clock-attack criterion (D6) |
 | katana | default (`9e54d353`, `f760df74`) | 38 / 0 / 28 |
-| katana | role cells (`9e54d353`, pre-guard) | 32–34 pass, 1 fail each = `live_network_flap_validation` no-client (fixed `f760df74`, rotation via git bundle pending on its flaky link) |
+| katana | role cells (`f760df74`, after the bundle rotation) | 34/0/32, 36/0/30, 34/0/32, 34/0/32 — **clean, mirrors lenovo** |
+| katana | chaos + negative-control (`f760df74`, before the convergence poll) | 49 / 2 / 28 (same two as lenovo at that commit); a chaos-only run on `f65e562e` was queued at ~05:00 |
+
+**Ledger caveat:** `lab_rotate.sh` reverts the host's ledgers before checking out, so katana's runs BEFORE its bundle rotation (`9e54d353`/`e4d5b469`: default green, role cells with the pre-guard network-flap fail) were never fetched into the repo ledgers. Their report directories (`artifacts/live_lab/q-katana-*-20260910T*`) and report-local rows still exist on the host if they are ever needed; the `f760df74` reruns supersede them.
 
 ## 3) Root causes found and fixed overnight (lab side, on the branch)
 
