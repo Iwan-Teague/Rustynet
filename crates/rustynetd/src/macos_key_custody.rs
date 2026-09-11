@@ -256,6 +256,7 @@ fn resolve_passphrase_keychain_account() -> Result<String, String> {
     keychain_entry_for_account(&account)
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Validates the account the same way `key_material` does before it reaches
 /// the Keychain API (non-empty, trimmed, bounded, no control characters).
 fn keychain_entry_for_account(raw: &str) -> Result<String, String> {
@@ -283,6 +284,7 @@ fn keychain_entry_for_account(raw: &str) -> Result<String, String> {
     Ok(account.to_owned())
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// The entry's `path` is a locator, not a filesystem path.
 fn keychain_entry_path(account: &str) -> String {
     format!("keychain:System/{MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE}/{account}")
@@ -312,6 +314,7 @@ fn probe_passphrase_keychain_item() -> MacosKeyCustodyEntry {
     )
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 /// Pure mapping from a probe result to an entry, so the shape is testable
 /// off-macOS: `Ok(true)` → present, `Ok(false)` → missing, `Err` → missing
 /// naming the keychain failure (never "present" on an unreadable keychain).
