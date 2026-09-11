@@ -729,7 +729,7 @@ impl KillStageObservation {
         if exit_value("plaintext_leak_check") == Some("error") {
             return Err(format!(
                 "target tcpdump leak check errored: {}",
-                exit_value("tcpdump_error").unwrap_or("reason not reported")
+                exit_value("plaintext_error").unwrap_or("reason not reported")
             ));
         }
         if client_value("client_plaintext_leak_check") == Some("error") {
@@ -1361,7 +1361,7 @@ mod tests {
     #[test]
     fn missing_target_capture_is_a_stage_failure_not_a_pass() {
         let err = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=error\ntcpdump_error=capture_missing\n",
+            "teardown_registered_before_fault=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=error\nplaintext_error=capture_missing\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect_err("a missing capture must fail the stage, not pass");
