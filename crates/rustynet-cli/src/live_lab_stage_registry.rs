@@ -2243,6 +2243,21 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::NegativeControlSuite,
         ..DEFAULT_SPEC
     },
+    // QH-87 (2026-09-11): live rogue-anchor-bundle attack. Mints four
+    // forgeries (wrong pinned key, tampered state + genuine attestation,
+    // epoch regression vs the persisted watermark, stale attestation) with
+    // throwaway keys through the REAL rustynet-control mint path, serves
+    // each from a stage-run loopback listener, and drives the real
+    // `rustynet anchor pull-bundle` CLI: every forgery must be rejected
+    // BEFORE any byte reaches the output path, and the genuine control
+    // bundle must still be accepted end-to-end.
+    StageSpec {
+        name: "negative_control_rogue_anchor_bundle",
+        group: StageGroup::NegativeControl,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::NegativeControlSuite,
+        ..DEFAULT_SPEC
+    },
     // ── HP-3 disruptive relay-forwarding proof (opt-in) ─────────────────
     // Folds into the same evidence column as the bash-dialect
     // `validate_linux_relay_forwards_frame` (`linux_relay_forwards_frame`);
@@ -3213,8 +3228,9 @@ mod tests {
             // (signed-bundle rejection, planted residue, wrong-node
             // substitution, daemon-killed-mid-stage), +1 on 2026-09-11
             // (QH-89): negative_control_enrollment_token_replay, +1 on
-            // 2026-09-11 (QH-90): negative_control_killswitch_bypass.
-            ("t5_negative_control", 6),
+            // 2026-09-11 (QH-90): negative_control_killswitch_bypass, +1 on
+            // 2026-09-11 (QH-87): negative_control_rogue_anchor_bundle.
+            ("t5_negative_control", 7),
         ]
         .into_iter()
         .collect();
@@ -3236,8 +3252,8 @@ mod tests {
                 .iter()
                 .filter(|s| s.tier() == Tier::T5NegativeControl)
                 .count(),
-            6,
-            "the six T5 negative-control stages must all be tiered T5NegativeControl"
+            7,
+            "the seven T5 negative-control stages must all be tiered T5NegativeControl"
         );
     }
 
