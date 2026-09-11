@@ -193,6 +193,32 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    // Runtime accept-control (audit I2 review SHOULD-FIX 2, 2026-09-11): prove
+    // the production verifier is actually reached and ACCEPTS a fully valid
+    // update at run time, not only under `cargo test`. If a future edit reverts
+    // this bin to twin self-validation, a genuine valid update would no longer
+    // be accepted here and the live stage fails closed — every "rejection"
+    // below is meaningful only because this control passes.
+    {
+        let control = valid_signed_update("update-runtime-accept-control")?;
+        let state = synthetic_state();
+        let mut cache = MembershipReplayCache::default();
+        match apply_signed_update(&state, &control, CHAOS_NOW_UNIX, &mut cache) {
+            Ok(applied) if applied.epoch == state.epoch + 1 => {}
+            Ok(applied) => {
+                return Err(format!(
+                    "runtime accept-control applied but did not advance the epoch by one (prev={}, got={}); the production verifier is not being exercised as expected",
+                    state.epoch, applied.epoch
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "runtime accept-control rejected a fully valid update ({err}); the production membership verifier did not run so every rejection below would be vacuous"
+                ));
+            }
+        }
+    }
+
     let outcomes: Vec<CaseOutcome> = cases.iter().map(evaluate).collect();
     let all_passed = outcomes.iter().all(|outcome| outcome.passed);
     let accepted_count = outcomes.iter().filter(|outcome| !outcome.rejected).count();
