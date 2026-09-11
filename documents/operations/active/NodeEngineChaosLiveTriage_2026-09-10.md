@@ -97,3 +97,7 @@ Applied the C1/C2 second-pass findings on the chaos and live-lab bins' remote ro
 * **Nits**: `mesh_cidr` charset-validated before the BPF splice (daemon-fault ×2, impairment), the daemon-fault client guard's fixed `/tmp` log → `mktemp`, `{REMOTE_RUSTYNET_BIN}` routed through `shell_quote` in clock/crash.
 
 Each change carries a script-text or command-shape unit test in its owning bin (mirroring the existing `remote_script_pins_an_sbin_bearing_path_before_any_lookup` / `remote_script_resets_start_limit_per_kill_and_reports_the_count` pins). Gates: fmt + clippy + nextest `-E 'binary(/live_chaos|live_linux|live_lab/)'` all green (1701 tests).
+
+## First cross-network run on the `--node` engine (2026-09-11, lenovo-bot, `03033921`, `--cross-network-substrate netns`, run `q-lenovo-xnet-netns`): 38 / 0 / 28
+
+As review E predicted: `cross_network_substrate_setup` (no-overlay record), `cross_network_preflight` and `cross_network_nat_classification` **pass** with witnesses — the NAT-gate report records measured `expected`/`observed` mapping and filtering behaviour per profile — and the eight scenario stages plus `cross_network_nat_matrix` honest-skip as vxlan-only. The vxlan phase needs the two guests on distinct underlay /24s (both lenovo guests sit on 192.168.0.x) and the branch `edit-1789118886141-69129-0` (backend-neutral endpoint capture) merged first.
