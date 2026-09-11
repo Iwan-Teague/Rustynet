@@ -6681,6 +6681,10 @@ mod conclusion_barrier_tests {
         let err = crate::live_lab_stage_triage::enforce_launch_gate(
             &triage,
             &["live_two_hop_validation".to_owned()],
+            // The stub under test carries the fixture's run_commit; the gate is
+            // called "at" that commit, and the stub is UNFILLED, so commit
+            // scoping is irrelevant here and the unfilled stub still blocks.
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         )
         .expect_err("an unfilled failure for a planned stage must refuse the launch");
         assert!(
