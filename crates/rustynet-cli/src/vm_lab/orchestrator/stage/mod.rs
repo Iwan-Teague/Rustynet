@@ -137,6 +137,7 @@ pub mod mesh_status_validation;
 pub mod negative_control;
 pub mod negative_control_enrollment_replay;
 pub mod negative_control_killswitch_bypass;
+pub mod negative_control_rogue_anchor_bundle;
 pub mod preflight;
 pub mod refresh_signed_bundles;
 pub mod relay_forwards_frame_validation;
@@ -630,6 +631,9 @@ define_stage_catalog! {
     // the bypass transcript under negative_control/. Impl + adjudication in
     // `stage/negative_control_killswitch_bypass.rs`.
     NegativeControlKillswitchBypass => "negative_control_killswitch_bypass" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_killswitch_bypass/bypass_transcript.txt"),
+
+    // `stage/negative_control_rogue_anchor_bundle.rs`.
+    NegativeControlRogueAnchorBundle => "negative_control_rogue_anchor_bundle" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_rogue_anchor_bundle/rogue_bundle_transcript.txt"),
     // Always-run overlay teardown (FinalCleanupStage pattern): vxlan link
     // residue on a guest is release-blocking exactly like exit-NAT residue,
     // so this must survive skip-cascade and run just before cleanup.
