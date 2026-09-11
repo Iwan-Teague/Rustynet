@@ -556,7 +556,7 @@ if [ "$recovered" = true ]; then
   while :; do
     mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
     case "$mesh_status_line" in
-      *path_live_proven=true*path_live_peer_count=[1-9]*) break ;;
+      *path_live_proven=true*path_live_peer_count=[1-9]*bootstrap_error=none*restricted_safe_mode=false*) break ;;
     esac
     [ "$(date +%s)" -ge "$mesh_end_unix" ] && break
     sleep 2
@@ -703,9 +703,10 @@ struct CrashStageObservation {
     teardown_registered_before_fault: bool,
     persistence_boundary: String,
     observed_kill_count: u64,
-    /// Seconds from the restart until the mesh status reported a live-proven
-    /// path (or the deadline), so the report shows convergence time, not
-    /// just socket-recovery time.
+    /// Seconds from the start of the recovery window (the same origin as
+    /// `measured_recovery_secs`) until the mesh status reported a live-proven,
+    /// unrestricted path — or the deadline — so the report shows convergence
+    /// time, not just socket-recovery time.
     mesh_poll_secs: u64,
     /// How many times the loop cleared systemd's start-limit state
     /// (`systemctl reset-failed`); reviewers read it to see how often the
@@ -1235,7 +1236,9 @@ mod tests {
             &parse(&["--dry-run"]).expect("dry-run config should parse"),
         );
         assert!(
-            script.contains("*path_live_proven=true*path_live_peer_count=[1-9]*) break ;;"),
+            script.contains(
+                "*path_live_proven=true*path_live_peer_count=[1-9]*bootstrap_error=none*restricted_safe_mode=false*) break ;;"
+            ),
             "{script}"
         );
         assert!(

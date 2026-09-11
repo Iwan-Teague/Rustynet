@@ -207,11 +207,9 @@ pub(crate) fn exit_only_topology_skip(
     ctx: &crate::vm_lab::orchestrator::context::OrchestrationContext,
     what: &str,
 ) -> Option<crate::vm_lab::orchestrator::error::StageOutcome> {
-    if ctx
-        .assignments
-        .iter()
-        .all(|a| a.role != crate::vm_lab::orchestrator::role::NodeRole::Client)
-    {
+    // The client resolvers match by label (`role.as_str() == "client"`), so
+    // a `Custom("client")` assignment is a client here too (review F2).
+    if ctx.assignments.iter().all(|a| a.role.as_str() != "client") {
         return Some(crate::vm_lab::orchestrator::error::StageOutcome::Skipped(
             format!("the topology assigns no client node; {what} needs one"),
         ));
