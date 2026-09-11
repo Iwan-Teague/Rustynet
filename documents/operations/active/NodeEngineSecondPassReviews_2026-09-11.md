@@ -1,0 +1,14 @@
+# --node Engine Second-Pass Reviews (2026-09-11)
+
+Owner: "I want the --node engine to be pretty strong … get a few flash agents to review parts of it again." Six GLM-5.3-flash grounded reviews (`ai_agent`, 60–80 steps each, briefed to read the 2026-09-08/09 audits first so closed items are not re-filed), run against main `8eabdef8`–`03033921`. Raw outputs: `state/review/r2/{A,B,C1,C2,D,E,F}.out`. All findings are code-cited; dispositions below.
+
+| Area | Verdict | Findings → disposition |
+|---|---|---|
+| A runner semantics (skip cascade, evidence gate, reuse seal, panics) | no blocker; the 09-09 runner blockers hold | stale cascade doc + dead disjunct → fixed `88166aec` |
+| B topology handling across every stage | two arms missed by the 09-10 guard | chaos ExitAndClient bins → fixed `20d2cf75`; vxlan NAT-matrix client resolver → after the cross-network job merges (one-liner: `client` absence → `MissingRole`) |
+| C1/C2 remote root scripts in all lab bins | one blocker (crash cleanup restarts without `reset-failed`), trap `EXIT`-only, PATH pins missing in 3 scripts, several non-exception-safe teardowns, `/tmp` passphrases | GLM edit job `edit-1789118381882-66894-0` (brief `state/review/r2/bins_edit_brief.txt`) |
+| D ledgers, triage stubs, launch gate | gate/upserts sound; template `none:` declines abuse; silent stub-id collision; `in_progress` counted as a fail in the trend | collision loud + trend filter + dead-code allowance → fixed `7b3227c1`; commit-scoped template declines → queued job; ledger dedupe sweep → manager, one commit |
+| E cross-network static readiness | netns run meaningful as-is (2 executed rows + 11 named skips); vxlan half grades `wg show` (userspace boringtun cannot answer); missing prechecks | GLM edit job `edit-1789118886141-69129-0`; first netns run queued on lenovo-bot |
+| F macOS/Windows witness parity | no NotProven-by-construction on macOS; chaos + live negative controls had no platform gate; gossip gate seam is consistent (exhaustive delegate) | platform skips → fixed (this commit); PlatformCapabilities residue (`adapter/node_adapter.rs:556/571`, `role_validation/anchor.rs`) stays open |
+
+Method notes: 80 steps is the floor for a bin-family review (C at 60 ran out); transport "broken pipe"/EOF failures were frequent at 3–4 concurrent agents — the wrapper `state/review/r2/run_review.sh` retries; the wrapper must build its JSON in Python (an inline dict inside a shell `$(...)` gets brace-expanded).
