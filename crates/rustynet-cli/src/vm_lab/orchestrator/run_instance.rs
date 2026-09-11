@@ -21,7 +21,6 @@
 //!
 //! The id is minted ONLY after the lease is confirmed held, so a run id never
 //! exists without the exclusive right to write that report directory.
-#![allow(dead_code)] // lease acquisition is wired into native.rs in the next L0.2 increment
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};

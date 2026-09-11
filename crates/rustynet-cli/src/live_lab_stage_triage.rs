@@ -239,10 +239,22 @@ pub fn append_stub(path: &Path, record: &StageTriageRecord) -> Result<bool, Stri
     // as several attempts, which is exactly the signal this ledger exists to
     // give. The unserialized `write_all`s are the second hazard the lock closes.
     let _lock = acquire_append_lock(lock_path_for(path).as_path(), "stage triage ledger")?;
-    if load_ledger(path)?
+    if let Some(existing) = load_ledger(path)?
         .iter()
-        .any(|existing| existing.stub_id == record.stub_id)
+        .find(|existing| existing.stub_id == record.stub_id)
     {
+        // Run ids are second-resolution: two hosts on one commit can mint the
+        // same `run_id::stage`. A colliding id carrying a DIFFERENT failure is
+        // a second failure wearing the first's name — refuse it loudly rather
+        // than silently drop the evidence (review D, 2026-09-11).
+        if existing.run_commit != record.run_commit || existing.error != record.error {
+            return Err(format!(
+                "stage triage stub_id {} collision: the ledger already holds a stub for \
+                 run_commit {} with a different failure; run ids are second-resolution, \
+                 refusing to silently drop this failure (run_commit {})",
+                record.stub_id, existing.run_commit, record.run_commit
+            ));
+        }
         return Ok(false);
     }
     let mut line = serde_json::to_string(record)

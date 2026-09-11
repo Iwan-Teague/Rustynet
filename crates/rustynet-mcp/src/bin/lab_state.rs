@@ -3988,10 +3988,12 @@ fn coverage_columns_from_header(header: &[String]) -> Vec<(Option<usize>, String
 /// matrix file. Used by get_run_trend.
 fn trend_verdict(rows: &[(String, String)]) -> String {
     let is_pass = |r: &str| r.eq_ignore_ascii_case("pass") || r.eq_ignore_ascii_case("passed");
-    // Drop rows with no recorded result (in-flight / malformed).
+    // Drop rows with no recorded result: empty (malformed) and the run-start
+    // marker's `in_progress` (in-flight) — a killed run's stale marker must
+    // not count as a failure in the streak (review D, 2026-09-11).
     let runs: Vec<(&str, &str)> = rows
         .iter()
-        .filter(|(r, _)| !r.trim().is_empty())
+        .filter(|(r, _)| !r.trim().is_empty() && !r.trim().eq_ignore_ascii_case("in_progress"))
         .map(|(r, s)| (r.as_str(), s.as_str()))
         .collect();
     if runs.is_empty() {
@@ -10461,6 +10463,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
         };
         // ≥2 trailing passes → stable green.
         assert!(trend_verdict(&mk(&[("pass", ""), ("pass", "")])).starts_with("GREEN"));
+        // a stale run-start marker is in-flight, not a failure: it must not
+        // break a green streak or mint a stuck verdict.
+        assert!(
+            trend_verdict(&mk(&[("pass", ""), ("pass", ""), ("in_progress", "")]))
+                .starts_with("GREEN")
+        );
         // single latest pass after a fail → just green.
         assert!(trend_verdict(&mk(&[("fail", "anchor"), ("pass", "")])).starts_with("JUST GREEN"));
         // same failing stage repeatedly → stuck (names the stage).
