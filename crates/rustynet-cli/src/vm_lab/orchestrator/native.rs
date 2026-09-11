@@ -826,8 +826,18 @@ pub(crate) fn execute_rust_native_orchestration(
         let triage_ledger = crate::live_lab_stage_triage::default_triage_ledger_path(
             crate::live_lab_run_matrix::workspace_root_path().as_path(),
         );
-        let gate =
-            crate::live_lab_stage_triage::enforce_launch_gate(triage_ledger.as_path(), &planned)?;
+        // The commit the tree about to launch is at — the same validated
+        // derivation the run matrix and evidence bindings use, so a template
+        // decline (`none:`) in the triage ledger is honored exactly while it
+        // describes THIS tree. Unresolvable commit → empty string → never
+        // matches a recorded `run_commit`, so a decline fails closed (blocks)
+        // instead of waving through.
+        let current_commit = super::super::git_head_commit().unwrap_or_default();
+        let gate = crate::live_lab_stage_triage::enforce_launch_gate(
+            triage_ledger.as_path(),
+            &planned,
+            current_commit.as_str(),
+        )?;
         if gate.deferred_historical > 0 {
             // Printed on EVERY run, by design: this is the outstanding manual
             // work the TRIAGE_GATE_HISTORICAL_WATERMARK_UTC constant defers. If
