@@ -2127,9 +2127,9 @@ impl OrchestrationStage for CrossNetworkSubstrateSetupStage {
         // The vxlan leaf ops are Linux `ip`/`bridge`; a non-Linux guest in an
         // overlay-needing topology cannot be silently excluded (its endpoints
         // would stay unroutable), so fail closed until per-OS leaf ops exist.
-        match plan_overlay(&topology) {
+        let overlay_needed = match plan_overlay(&topology) {
             Err(err) => return StageOutcome::Failed(err),
-            Ok(None) => {}
+            Ok(None) => false,
             Ok(Some(_)) => {
                 for assignment in &ctx.assignments {
                     let platform = ctx
@@ -2146,12 +2146,36 @@ impl OrchestrationStage for CrossNetworkSubstrateSetupStage {
                         ));
                     }
                 }
+                true
             }
-        }
+        };
         let runners = match build_remote_runners(ctx, "cross_network_substrate_setup") {
             Ok(runners) => runners,
             Err(err) => return StageOutcome::Failed(err),
         };
+        // The vxlan data path rides the guest kernel's vxlan module; a guest
+        // that cannot load it would fail later mid-topology with an opaque
+        // RTNETLINK error. `modprobe -n` is the dry-run probe — it answers
+        // "could this kernel set vxlan up" (module loadable or builtin) and
+        // changes nothing — and it runs per topology participant so the
+        // failure NAMES the guests that cannot host the overlay instead of
+        // failing the first `ip link add` with a bare errno.
+        if overlay_needed {
+            for (alias, runner) in &runners {
+                if !topology.nodes.contains_key(alias) {
+                    continue;
+                }
+                if super::scenario::run_root(runner, &["modprobe", "-n", "vxlan"]).is_err() {
+                    return StageOutcome::Failed(format!(
+                        "the {} substrate needs kernel vxlan support, but guest '{}' cannot \
+                         provision it (`modprobe -n vxlan` failed): install the module \
+                         (e.g. linux-modules-extra) or use a guest whose kernel ships it",
+                        provider.id(),
+                        alias
+                    ));
+                }
+            }
+        }
         let refs = runner_refs(&runners);
         Self::provision(ctx, provider.as_ref(), &topology, &refs)
     }
