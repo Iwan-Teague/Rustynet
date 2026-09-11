@@ -39,8 +39,11 @@ struct SkipDecision {
 
 /// Drives stages in dependency order with skip-cascade.
 ///
-/// Skip-cascade rule: if a stage fails or is skipped, every stage that lists
-/// it in `dependencies()` is also skipped (recursively).
+/// Skip-cascade rule: a stage whose dependency is BLOCKING — `Failed`,
+/// `NotRun`, `NotProven`, or a cascade-`Skipped` — is itself cascade-skipped
+/// (recursively, via `mark_blocked`). An honest execute-time `Skipped`
+/// (topology/role guard), a shutdown `Skipped`, and `Reused` do NOT block
+/// dependents; `StageOutcome::is_blocking` is the authoritative set.
 pub struct StateMachineRunner {
     stages: Vec<Box<dyn OrchestrationStage>>,
     /// Stage IDs explicitly requested to skip via `--skip-stage`.
@@ -280,8 +283,9 @@ impl StateMachineRunner {
                 .map_or(StageOutcome::NotRun, |digest| StageOutcome::Reused {
                     evidence_sha256: digest.as_str().to_owned(),
                 });
-            let mark_blocked =
-                outcome.is_blocking() || matches!(outcome, StageOutcome::Skipped(..));
+            // Branch 1 yields only `NotRun` (blocking) or `Reused` (not); the
+            // former `|| Skipped` disjunct was unreachable here.
+            let mark_blocked = outcome.is_blocking();
             return Some(SkipDecision {
                 outcome,
                 mark_blocked,
