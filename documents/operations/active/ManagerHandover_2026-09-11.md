@@ -4,8 +4,8 @@ Read after `ManagerHandover_2026-09-08.md` (owner rules unchanged: GLM only; com
 
 ## 1) State of main and the lab branch
 
-- **Pushed 07:05: `main` = `f13fbf99`** (41 commits incl. B5 `de580bd9` and its GLM review fixes `f13fbf99`; review MERGE-SAFE, full gate 13,838 + secrets 22/22). lenovo-bot is on `main`; katana moves to `main` after its chaos-only run, then `git push origin :lab/pre-b5-fixes` and delete the local branch.
-- **`origin/lab/pre-b5-fixes` = main minus B5** (cherry-picks; tip `f65e562e`) — served the night; retire once katana is on `main`. Run-matrix rows written from it carry `lab/pre-b5-fixes` in the branch column (field 5), which the fetch scripts key on.
+- **Pushed 07:05: `main` = `f13fbf99`** (41 commits incl. B5 `de580bd9` and its GLM review fixes `f13fbf99`; review MERGE-SAFE, full gate 13,838 + secrets 22/22). both hosts are on `main` `1083ef6e` (katana via a git bundle over scp — its GitHub fetches fail; the bundle needs the `+refs/heads/main:refs/remotes/origin/main` refspec because its tracking ref was stale). `lab/pre-b5-fixes` is deleted on origin and locally (08:05).
+- The night-commits GLM review (`state/review/night_review.txt`) found one blocker in my own TTL change (duplicate `TRAVERSAL_TTL_SECS` in the exit-handoff env; the bin already wrote a config-driven one) plus `Custom("client")` handling in the topology guard, five leftover non-UTF-8 fallbacks, and a stricter convergence-poll pattern — all fixed and pushed in `2c21f8ee`. Run-matrix rows written from it carry `lab/pre-b5-fixes` in the branch column (field 5), which the fetch scripts key on.
 - Gate caveat learned: gating a nested worktree under `state/` with a SHARED `CARGO_TARGET_DIR` leaves that worktree's crate artifacts in the cache; the next plain-profile build on main can pick them up (the secrets gate did). Use a separate target dir per worktree, or `cargo clean -p` the affected packages.
 
 ## 2) What the night proved (all rows fetched into both ledgers)
@@ -17,7 +17,7 @@ Read after `ManagerHandover_2026-09-08.md` (owner rules unchanged: GLM only; com
 | lenovo-bot | chaos + negative-control (`f65e562e`) | **50 / 1 / 28**; 4/4 negative controls, 8/9 chaos; the one fail is the clock-attack criterion (D6) |
 | katana | default (`9e54d353`, `f760df74`) | 38 / 0 / 28 |
 | katana | role cells (`f760df74`, after the bundle rotation) | 34/0/32, 36/0/30, 34/0/32, 34/0/32 — **clean, mirrors lenovo** |
-| katana | chaos + negative-control (`f760df74`, before the convergence poll) | 49 / 2 / 28 (same two as lenovo at that commit); a chaos-only run on `f65e562e` was queued at ~05:00 |
+| katana | chaos + negative-control (`f760df74`, then chaos-only on `f65e562e`) | 49 / 2 / 28, then **50 / 1 / 28 — identical to lenovo** |
 
 **Ledger caveat:** `lab_rotate.sh` reverts the host's ledgers before checking out, so katana's runs BEFORE its bundle rotation (`9e54d353`/`e4d5b469`: default green, role cells with the pre-guard network-flap fail) were never fetched into the repo ledgers. Their report directories (`artifacts/live_lab/q-katana-*-20260910T*`) and report-local rows still exist on the host if they are ever needed; the `f760df74` reruns supersede them.
 
@@ -30,7 +30,7 @@ Read after `ManagerHandover_2026-09-08.md` (owner rules unchanged: GLM only; com
 ## 4) Owner decisions owed
 
 - **D6 (rewritten, `OwnerDecisions_2026-09-07.md`)**: an EXPIRED traversal bundle permanently restricts a freshly started daemon within 5 s and a later verified refresh cannot lift it. Recommendation (a): staleness stays recoverable; only signature/replay/policy failures promote to permanent. Product change, manager-implemented, GLM-reviewed.
-- Clock-attack jump-forward leg: its `future_state_rejected` criterion cannot fire under a forward jump (state reads stale, not future); re-derive the criterion from the daemon's contract before treating the leg as a product verdict.
+- Clock-attack jump-forward leg: a GLM research pass (`state/review/clock_criterion.txt`) confirmed the criterion is mis-specified (`membership_epoch=0` is the script coercing `none`; future-dated arms cannot fire on a forward jump; the daemon's refusal is the intended §3 fail-closed contract) and proposed the replacement checklist; GLM edit job `edit-1789108391301-99210-0` is implementing it in the bin (review + merge it, then a chaos rerun should read 51/0/28).
 - Still open from before: katana tailnet exposure (deferred), Windows ISO, PF-01, lab password rotation, requires()/provisions() decisions.
 
 ## 5) Katana
