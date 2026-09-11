@@ -4,9 +4,9 @@ Read after `ManagerHandover_2026-09-08.md` (owner rules unchanged: GLM only; com
 
 ## 1) State of main and the lab branch
 
-- **Local `main` is 35+ commits ahead of `origin/main` and UNPUSHED** because B5 (`de580bd9`, macOS Keychain probe in the key-custody report) is still waiting for its GLM security review — GLM returned 429 on every call from ~15:30 to at least 05:00 (account quota); a monitor retries from 06:35. When the review lands MERGE-SAFE: `git push origin main:main`, sync both hosts to main, `git push origin :lab/pre-b5-fixes`, `git worktree remove state/edit-worktrees/pre-b5`.
-- **`origin/lab/pre-b5-fixes` = main minus B5** (cherry-picks; tip `f65e562e`). Both hosts run it. Run-matrix rows written from it carry `lab/pre-b5-fixes` in the branch column (field 5), which the fetch scripts key on.
-- Full gate last ran green on `2d513e2c` (13,829 tests); later commits were gated per crate (`rustynet-cli` 9,073 tests at `f760df74`). Run the full §7 gate + secrets on main before the push.
+- **Pushed 07:05: `main` = `f13fbf99`** (41 commits incl. B5 `de580bd9` and its GLM review fixes `f13fbf99`; review MERGE-SAFE, full gate 13,838 + secrets 22/22). lenovo-bot is on `main`; katana moves to `main` after its chaos-only run, then `git push origin :lab/pre-b5-fixes` and delete the local branch.
+- **`origin/lab/pre-b5-fixes` = main minus B5** (cherry-picks; tip `f65e562e`) — served the night; retire once katana is on `main`. Run-matrix rows written from it carry `lab/pre-b5-fixes` in the branch column (field 5), which the fetch scripts key on.
+- Gate caveat learned: gating a nested worktree under `state/` with a SHARED `CARGO_TARGET_DIR` leaves that worktree's crate artifacts in the cache; the next plain-profile build on main can pick them up (the secrets gate did). Use a separate target dir per worktree, or `cargo clean -p` the affected packages.
 
 ## 2) What the night proved (all rows fetched into both ledgers)
 
