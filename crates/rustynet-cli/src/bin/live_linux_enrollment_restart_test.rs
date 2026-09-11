@@ -495,3 +495,21 @@ fn print_usage() {
         [--log-path <path>]"
     );
 }
+
+#[cfg(test)]
+mod tests {
+    // Review BINSREV F1: the start-limit reset must precede the start in run().
+    #[test]
+    fn start_resets_start_limit_before_start() {
+        let source = include_str!("live_linux_enrollment_restart_test.rs");
+        let impl_end = source.find("\n#[cfg(test)]").unwrap_or(source.len());
+        let body = &source[..impl_end];
+        let reset = body
+            .find("\"reset-failed\"")
+            .expect("reset-failed must be issued before the start");
+        let start = body[reset..]
+            .find("\"start\"")
+            .expect("a start follows the reset-failed");
+        assert!(start > 0, "reset-failed must precede the start");
+    }
+}
