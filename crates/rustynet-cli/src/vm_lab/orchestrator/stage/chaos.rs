@@ -257,13 +257,19 @@ fn verify_chaos_report_artifact(report_dir: &Path, stage_name: &str) -> Result<(
         .map_err(|err| format!("chaos report witness {}: {err}", path.display()))
 }
 
-/// Pure shape check on a chaos report: JSON object with an `overall_status`
-/// string. Anything else is not evidence.
+/// Pure shape check on a chaos report: JSON object whose `overall_status` is
+/// exactly `"pass"`. Any other verdict (including `"fail"` or `"skipped"`),
+/// a missing field, or a non-string value is not evidence of a pass — the
+/// stage must fail even when the bin exited 0, because the report is the
+/// witness the exit code is checked against.
 fn verify_chaos_report_shape(raw: &str) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|err| format!("not valid JSON: {err}"))?;
     match value.get("overall_status").and_then(|v| v.as_str()) {
-        Some(status) if !status.is_empty() => Ok(()),
+        Some("pass") => Ok(()),
+        Some(other) => Err(format!(
+            "chaos report overall_status is {other:?}, not \"pass\"; a failing report is not evidence"
+        )),
         _ => Err("JSON has no `overall_status` string; not a chaos scenario report".to_owned()),
     }
 }
@@ -372,12 +378,26 @@ mod tests {
     }
 
     #[test]
-    fn chaos_report_shape_requires_a_json_object_with_a_verdict() {
+    fn chaos_report_shape_requires_overall_status_pass() {
         assert!(verify_chaos_report_shape(r#"{"overall_status":"pass","stages":[]}"#).is_ok());
         assert!(verify_chaos_report_shape("not json").is_err());
         assert!(verify_chaos_report_shape(r#"{"stages":[]}"#).is_err());
         assert!(verify_chaos_report_shape(r#"{"overall_status":""}"#).is_err());
         assert!(verify_chaos_report_shape("[]").is_err());
+        // A failing report is not evidence, no matter the bin's exit code.
+        let err = verify_chaos_report_shape(r#"{"overall_status":"fail","stages":[]}"#)
+            .expect_err("overall_status \"fail\" must be rejected");
+        assert!(err.contains("\"fail\""), "{err}");
+        // Any non-pass verdict is rejected, naming the value.
+        for status in ["fail", "skipped", "PASS", "pass "] {
+            let raw = format!(r#"{{"overall_status":"{status}"}}"#);
+            let err =
+                verify_chaos_report_shape(&raw).expect_err("a non-pass verdict must be rejected");
+            assert!(err.contains(status.trim()), "{err}");
+        }
+        // Non-string values are rejected too.
+        assert!(verify_chaos_report_shape(r#"{"overall_status":1}"#).is_err());
+        assert!(verify_chaos_report_shape(r#"{"overall_status":null}"#).is_err());
     }
 
     #[test]
@@ -455,11 +475,29 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("chaos_signed_state_adversarial_report.json"),
-            b"{\"overall_status\":\"fail\"}\n",
+            b"{\"overall_status\":\"pass\"}\n",
         )
         .unwrap();
         verify_chaos_report_artifact(&dir, "chaos_signed_state_adversarial")
-            .expect("a non-empty report artifact must verify");
+            .expect("a passing report artifact must verify");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Audit I2 (2026-09-11) finding 3: a bin that writes overall_status "fail"
+    // and exits 0 must fail the stage — the report is the verdict, the exit
+    // code alone is not.
+    #[test]
+    fn chaos_report_witness_failing_report_fails_stage_on_zero_exit() {
+        let dir = chaos_witness_temp_dir("failing-report");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("chaos_signed_state_adversarial_report.json"),
+            b"{\"overall_status\":\"fail\"}\n",
+        )
+        .unwrap();
+        let err = verify_chaos_report_artifact(&dir, "chaos_signed_state_adversarial")
+            .expect_err("a failing report must fail the stage even on a zero bin exit");
+        assert!(err.contains("\"fail\""), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
