@@ -808,12 +808,24 @@ exit 0
                 teardown.err().unwrap_or_else(|| "verified".to_owned())
             ));
         }
+        // Bounded retry (30 x 1s), not a one-shot connect: the daemon binds
+        // the enrollment listener several seconds into its own init, AFTER
+        // `systemctl restart` reports the unit active (measured live on
+        // lenovo-exit-1: unit active at once, bind ~4s later). Same
+        // child-bash wrapping as the attack script's in-script loop so a
+        // failed `exec` redirection cannot kill the polling shell.
         let probe = run_remote_argv(
             &shell,
             &[
                 "bash",
                 "-c",
-                "exec 3<>/dev/tcp/127.0.0.1/\"$1\" && exec 3>&- 3<&-",
+                "tries=0; \
+                 until bash -c 'exec 3<>\"/dev/tcp/127.0.0.1/$1\"' nc-probe \"$1\" \
+                 2>/dev/null; do \
+                   tries=$((tries+1)); \
+                   if [ \"$tries\" -ge 30 ]; then exit 1; fi; \
+                   sleep 1; \
+                 done",
                 "nc-probe",
                 LISTENER_PORT,
             ],
