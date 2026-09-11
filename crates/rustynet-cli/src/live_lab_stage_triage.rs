@@ -359,17 +359,20 @@ pub fn fill_patch(path: &Path, stub_id: &str, patch: &str) -> Result<(), String>
     })
 }
 
-/// Unfilled stubs for any of `planned_stages` — what the launch gate blocks on.
+/// Every stub for any of `planned_stages` — the pool the launch gate evaluates,
+/// before unfilled-ness, commit-scoping of template declines, and the
+/// historical watermark are decided by [`blocks_launch`] inside
+/// [`enforce_launch_gate`].
 ///
-/// Scoped to the stages a run actually plans, so an unfilled stub for a stage
-/// this run does not exercise never blocks it.
-pub fn unfilled_for_planned_stages<'a>(
+/// Scoped to the stages a run actually plans, so a stub for a stage this run
+/// does not exercise never blocks it.
+fn stubs_for_planned_stages<'a>(
     records: &'a [StageTriageRecord],
     planned_stages: &[String],
 ) -> Vec<&'a StageTriageRecord> {
     records
         .iter()
-        .filter(|record| record.is_unfilled() && planned_stages.contains(&record.stage))
+        .filter(|record| planned_stages.contains(&record.stage))
         .collect()
 }
 
@@ -460,6 +463,39 @@ pub struct TriageGateReport {
     pub deferred_historical: usize,
 }
 
+/// Whether a filled stub's patch is a TEMPLATE decline — a deliberate
+/// "no fix" decision recorded as `"none: <reason>"` rather than a description
+/// of a change. Template declines are honest, but they describe nothing about
+/// the code, so they cannot be re-read as a remedy on a tree the failure's
+/// commit no longer describes (see [`enforce_launch_gate`]).
+pub fn is_template_decline(record: &StageTriageRecord) -> bool {
+    record
+        .patch
+        .as_deref()
+        .map(|patch| patch.starts_with("none:"))
+        .unwrap_or(false)
+}
+
+/// Whether this stub still blocks a launch from the tree at `current_commit`.
+///
+/// A stub blocks while unfilled, and — since review D's commit-scoped decline
+/// rule — also while it holds a TEMPLATE decline recorded against a DIFFERENT
+/// commit: `none:` waves the failure through for the commit it declined, and
+/// once HEAD moves the stage blocks again until a human records a real
+/// disposition. A genuine patch (any non-`none:` text) never re-blocks: it
+/// describes a change that is readable against any later tree.
+///
+/// `current_commit` is the commit the tree about to launch is at. Fail-closed:
+/// an unresolvable commit (empty string) never matches a recorded `run_commit`,
+/// so a template decline still blocks when the caller cannot prove which tree
+/// is launching.
+fn blocks_launch(record: &StageTriageRecord, current_commit: &str) -> bool {
+    if record.is_unfilled() {
+        return true;
+    }
+    is_template_decline(record) && record.run_commit != current_commit
+}
+
 /// Refuse to launch while a planned stage has an unfilled stub (plan §3.6/T3).
 ///
 /// The thing being prevented is *verifying without having recorded what you are
@@ -472,14 +508,30 @@ pub struct TriageGateReport {
 /// honest: fill the stub with `"none: <reason>"`, which keeps the decision
 /// visible instead of erasing it.
 ///
+/// **A template decline is scoped to the commit it declined** (review D,
+/// 2026-09-11). `none:` used as an automated bulk wave-through re-ran a failing
+/// stage across three commits with zero attribution each time. So a `none:`
+/// patch satisfies the gate only while `current_commit` equals the stub's
+/// `run_commit`; once HEAD moves, the stage blocks again until a human records
+/// a real disposition (a patch not starting with `none:`) or deliberately
+/// re-records the decline against the new commit. Genuine patches are
+/// unaffected. `current_commit` is the commit the launching tree is at — the
+/// orchestrator passes what it computes for the run row.
+///
 /// Fails closed on an unreadable or malformed ledger — [`load_ledger`]
 /// propagates that rather than reading it as "nothing outstanding".
 pub fn enforce_launch_gate(
     ledger_path: &Path,
     planned_stages: &[String],
+    current_commit: &str,
 ) -> Result<TriageGateReport, String> {
     let records = load_ledger(ledger_path)?;
-    let outstanding = unfilled_for_planned_stages(&records, planned_stages);
+    // Planned-stage scoping first; then unfilled-ness plus the commit-scoping
+    // of template declines in `blocks_launch`.
+    let outstanding: Vec<&StageTriageRecord> = stubs_for_planned_stages(&records, planned_stages)
+        .into_iter()
+        .filter(|record| blocks_launch(record, current_commit))
+        .collect();
     let (deferred, blocking): (Vec<_>, Vec<_>) = outstanding
         .into_iter()
         .partition(|record| is_deferred_historical_stub(record));
@@ -499,6 +551,16 @@ pub fn enforce_launch_gate(
             record.ts_utc,
             record.error.lines().next().unwrap_or("").trim()
         ));
+        if is_template_decline(record) {
+            detail.push_str(&format!(
+                "\n      declined \"{}\" at commit {}; the tree is now at {} — re-record the \
+                 disposition against the current commit (a real change, or the decline again, \
+                 deliberately)",
+                record.patch.as_deref().unwrap_or_default(),
+                record.run_commit,
+                current_commit
+            ));
+        }
     }
     Err(format!(
         "live-lab launch refused: {} planned stage(s) have a failure with no recorded remedy.\n\
@@ -508,6 +570,8 @@ pub fn enforce_launch_gate(
          rustynet ops live-lab-record-stage-patch --ledger {} --stub-id <stub_id> --patch <what you changed>\n\
          To decline deliberately, record the reason instead of a fix:\n  \
          ... --patch \"none: <reason>\"\n\
+         (A decline satisfies the launch gate only at the commit it declined; once HEAD moves \
+         the stage blocks again.)\n\
          There is no bypass flag by design (see enforce_launch_gate docs).",
         blocking.len(),
         ledger_path.display(),
@@ -703,6 +767,10 @@ pub fn render_prior_attempts_for_failed_stages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The commit the `record()` fixture carries in `run_commit`; launch-gate
+    /// tests call the gate "at" this commit so fixture fills behave as recorded.
+    const GATE_TEST_COMMIT: &str = "bab155abd7cc797d7f235015eca2cec48e5ef272";
 
     fn temp_ledger(name: &str) -> PathBuf {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -997,7 +1065,10 @@ mod tests {
             "live_two_hop_validation".to_owned(),
             "live_managed_dns_validation".to_owned(),
         ];
-        let blocking = unfilled_for_planned_stages(&records, &planned);
+        let blocking = stubs_for_planned_stages(&records, &planned)
+            .into_iter()
+            .filter(|record| blocks_launch(record, GATE_TEST_COMMIT))
+            .collect::<Vec<_>>();
         assert_eq!(blocking.len(), 1);
         assert_eq!(blocking[0].stage, "live_two_hop_validation");
         // live_relay_validation is unfilled but NOT planned: a stage this run
@@ -1021,14 +1092,15 @@ mod tests {
         append_stub(path.as_path(), &historical).expect("append historical");
 
         // Backlog alone must not block, but must be REPORTED so it stays visible.
-        let report = enforce_launch_gate(path.as_path(), &planned).expect("backlog must not block");
+        let report = enforce_launch_gate(path.as_path(), &planned, GATE_TEST_COMMIT)
+            .expect("backlog must not block");
         assert_eq!(report.deferred_historical, 1);
 
         let mut current = record("run-new", "live_two_hop_validation", None);
         current.ts_utc = "2026-07-29T10:00:00Z".to_owned();
         append_stub(path.as_path(), &current).expect("append current");
 
-        let err = enforce_launch_gate(path.as_path(), &planned)
+        let err = enforce_launch_gate(path.as_path(), &planned, GATE_TEST_COMMIT)
             .expect_err("a stub created after the watermark must block the launch");
         assert!(
             err.contains("run-new::live_two_hop_validation"),
@@ -1040,8 +1112,11 @@ mod tests {
         );
 
         // Filling the current stub releases the gate; the backlog stays deferred.
+        // The fill is a template decline (`none:`), valid because the gate is
+        // called at the SAME commit the failing run recorded.
         fill_patch(path.as_path(), &current.stub_id, "none: not reproducible").expect("fill");
-        let report = enforce_launch_gate(path.as_path(), &planned).expect("filled must not block");
+        let report = enforce_launch_gate(path.as_path(), &planned, GATE_TEST_COMMIT)
+            .expect("filled must not block");
         assert_eq!(report.deferred_historical, 1);
         let _ = fs::remove_file(&path);
     }
@@ -1059,7 +1134,7 @@ mod tests {
         malformed.ts_utc = "2026-07-19".to_owned();
         append_stub(path.as_path(), &malformed).expect("append");
 
-        let err = enforce_launch_gate(path.as_path(), &planned)
+        let err = enforce_launch_gate(path.as_path(), &planned, GATE_TEST_COMMIT)
             .expect_err("a non-fixed-width timestamp must not be exempted by the watermark");
         assert!(
             err.contains("run-bad::live_two_hop_validation"),
@@ -1087,7 +1162,12 @@ mod tests {
         let path = temp_ledger("gate_corrupt");
         fs::write(path.as_path(), "{not json\n").expect("seed corrupt ledger");
         assert!(
-            enforce_launch_gate(path.as_path(), &["live_two_hop_validation".to_owned()]).is_err(),
+            enforce_launch_gate(
+                path.as_path(),
+                &["live_two_hop_validation".to_owned()],
+                GATE_TEST_COMMIT
+            )
+            .is_err(),
             "a malformed ledger must fail the gate closed"
         );
         let _ = fs::remove_file(&path);
@@ -1097,9 +1177,107 @@ mod tests {
     #[test]
     fn launch_gate_passes_on_a_missing_ledger() {
         let path = temp_ledger("gate_missing");
-        let report = enforce_launch_gate(path.as_path(), &["live_two_hop_validation".to_owned()])
-            .expect("a missing ledger must not block");
+        let report = enforce_launch_gate(
+            path.as_path(),
+            &["live_two_hop_validation".to_owned()],
+            GATE_TEST_COMMIT,
+        )
+        .expect("a missing ledger must not block");
         assert_eq!(report.deferred_historical, 0);
+    }
+
+    /// Fixture stub that is CURRENT (post-watermark), so the watermark does not
+    /// defer it and the gate's commit-scoping is what is actually under test.
+    fn current_record(run_id: &str, stage: &str, patch: Option<&str>) -> StageTriageRecord {
+        let mut stub = record(run_id, stage, patch);
+        stub.ts_utc = "2026-09-11T00:00:00Z".to_owned();
+        stub
+    }
+
+    /// Review D: a `none:` template decline satisfies the gate — but only at
+    /// the commit it declined. At that same commit the launch proceeds.
+    #[test]
+    fn template_decline_on_the_same_commit_satisfies_the_gate() {
+        let path = temp_ledger("gate_decline_same_commit");
+        let planned = vec!["live_two_hop_validation".to_owned()];
+        let declined = current_record(
+            "run-1",
+            "live_two_hop_validation",
+            Some("none: not reproducible"),
+        );
+        append_stub(path.as_path(), &declined).expect("append");
+
+        let report = enforce_launch_gate(path.as_path(), &planned, GATE_TEST_COMMIT)
+            .expect("a template decline is valid at the commit it declined");
+        assert_eq!(report.deferred_historical, 0);
+        let _ = fs::remove_file(&path);
+    }
+
+    /// The other half of the rule: once HEAD moves past the stub's
+    /// `run_commit`, the template decline stops satisfying the gate and the
+    /// refusal names the stub, the commit it declined, and the current commit.
+    #[test]
+    fn template_decline_after_head_moves_blocks_and_names_both_commits() {
+        let path = temp_ledger("gate_decline_stale");
+        let planned = vec!["live_two_hop_validation".to_owned()];
+        let declined = current_record(
+            "run-1",
+            "live_two_hop_validation",
+            Some("none: overnight queue"),
+        );
+        append_stub(path.as_path(), &declined).expect("append");
+
+        let moved_on = "cccccccccccccccccccccccccccccccccccccccc";
+        assert_ne!(moved_on, GATE_TEST_COMMIT);
+        let err = enforce_launch_gate(path.as_path(), &planned, moved_on)
+            .expect_err("a template decline must re-block once HEAD moves");
+        assert!(
+            err.contains("run-1::live_two_hop_validation"),
+            "must name the stub: {err}"
+        );
+        assert!(
+            err.contains(GATE_TEST_COMMIT) && err.contains(moved_on),
+            "must name both the declined and the current commit: {err}"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
+    /// A REAL patch (any non-`none:` text) describes a change, not a
+    /// wave-through, so it keeps satisfying the gate after HEAD moves.
+    #[test]
+    fn a_real_patch_still_passes_the_gate_after_head_moves() {
+        let path = temp_ledger("gate_real_patch_moved");
+        let planned = vec!["live_two_hop_validation".to_owned()];
+        let patched = current_record(
+            "run-1",
+            "live_two_hop_validation",
+            Some("dda439a2: firewalld rich rule for the exit NAT"),
+        );
+        append_stub(path.as_path(), &patched).expect("append");
+
+        let moved_on = "cccccccccccccccccccccccccccccccccccccccc";
+        enforce_launch_gate(path.as_path(), &planned, moved_on)
+            .expect("a genuine patch is not commit-scoped");
+        let _ = fs::remove_file(&path);
+    }
+
+    /// Fail-closed edge: when the caller cannot resolve the launching tree's
+    /// commit (empty string), a template decline can never be proven current
+    /// and must block.
+    #[test]
+    fn template_decline_blocks_when_the_current_commit_is_unresolvable() {
+        let path = temp_ledger("gate_decline_unknown_commit");
+        let planned = vec!["live_two_hop_validation".to_owned()];
+        let declined = current_record(
+            "run-1",
+            "live_two_hop_validation",
+            Some("none: not reproducible"),
+        );
+        append_stub(path.as_path(), &declined).expect("append");
+
+        enforce_launch_gate(path.as_path(), &planned, "")
+            .expect_err("an unresolvable current commit must not wave a decline through");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
