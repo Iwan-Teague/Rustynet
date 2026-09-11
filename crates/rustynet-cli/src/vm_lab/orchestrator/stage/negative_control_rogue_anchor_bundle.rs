@@ -424,6 +424,17 @@ if [ ! -s "$rb_work/pin" ] || [ ! -s "$rb_work/guard" ] || [ ! -s "$rb_work/wm" 
   exit 1
 fi
 wm_for() { [ "$1" = f3 ] && { echo "$rb_work/wm_e2"; return; }; echo "$rb_work/wm"; }
+if ! command -v socat >/dev/null 2>&1; then
+  echo rb_error_no_socat=1
+  exit 1
+fi
+cat > "$rb_work/serve.sh" <<'RB_SERVE'
+#!/bin/bash
+B="$1"
+printf 'OK %s\n' "$(wc -c < "$B")"
+cat "$B"
+RB_SERVE
+chmod 700 "$rb_work/serve.sh"
 i=0
 for t in f1 f2 f3 f4 ctrl; do
   i=$((i+1))
@@ -442,8 +453,12 @@ run_pull() {
   rc=1
   while [ $attempt -lt 5 ]; do
     attempt=$((attempt+1))
-    ( printf 'OK %s\n' "$(wc -c < "$rb_work/bundle.$tag")"
-        cat "$rb_work/bundle.$tag" ) | nc -l -p "$port" -s 127.0.0.1 >/dev/null 2>&1 &
+    # socat serves one fresh response per connection (fork): the puller's
+    # half-close-after-request starves the openbsd-nc stdin forwarder (live
+    # run-qh87-lenovo1: every pull died on the puller's read timeout with the
+    # response still sitting in the nc pipe), so nc is not usable here.
+    socat -T 15 "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" \
+      "EXEC:$rb_work/serve.sh $rb_work/bundle.$tag" >/dev/null 2>&1 &
     _rb_lpid=$!
     sleep 0.5
     "__REMOTE_CLI__" anchor pull-bundle --addr "127.0.0.1:$port" --token "$TOKEN" \
@@ -453,6 +468,7 @@ run_pull() {
     rc=$?
     kill "$_rb_lpid" 2>/dev/null
     wait "$_rb_lpid" 2>/dev/null
+    pkill -f "$rb_work/serve.sh" 2>/dev/null || true
     if [ "$rc" -eq 0 ] || ! grep -qiE 'refused|connect anchor bundle-pull failed' "$rb_work/err.$tag" 2>/dev/null; then
       break
     fi
@@ -525,6 +541,11 @@ exit 0
         if field(stdout, "rb_error_stage_failed").is_some() {
             return RogueParse::NotAdjudicable {
                 reason: "guest staging failed (base64 decode or file write)".to_owned(),
+            };
+        }
+        if field(stdout, "rb_error_no_socat").is_some() {
+            return RogueParse::NotAdjudicable {
+                reason: "guest has no socat; the rogue-listener transport cannot run".to_owned(),
             };
         }
         let missing = |key: &str| RogueParse::NotAdjudicable {
@@ -1391,11 +1412,25 @@ exit 0
             let script = attack_script();
             assert!(!script.contains("__REMOTE_CLI__"));
             assert!(script.contains(REMOTE_CLI));
+            // The listener transport is socat (fork per connection); the
+            // openbsd-nc stdin forwarder starves under the puller's
+            // half-close (run-qh87-lenovo1).
+            assert!(script.contains("socat"));
+            assert!(script.contains("TCP-LISTEN"));
+            assert!(script.contains("serve.sh"));
             for port in PULL_PORTS {
                 // Ports arrive as argv; the script must not hardcode them.
                 assert!(!script.contains(&format!("{port}")));
             }
             assert!(script.contains("pull-bundle"));
+        }
+
+        #[test]
+        fn missing_socat_is_not_adjudicable() {
+            assert!(matches!(
+                parse_transcript(1, "rb_error_no_socat=1\n"),
+                RogueParse::NotAdjudicable { .. }
+            ));
         }
 
         #[test]
