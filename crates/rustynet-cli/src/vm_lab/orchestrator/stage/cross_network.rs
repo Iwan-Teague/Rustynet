@@ -398,11 +398,47 @@ fn run_nat_classification(
     // No python3 requirement any more — the netns probes are the Rust
     // `rustynet-netns-probe` binary. `nft` and `ip` do the topology work and
     // `systemd-run` runs the STUN responders as transient units, so all three
-    // are hard prerequisites.
-    let dependency_check = "sudo -n bash -lc 'nft --version >/dev/null 2>&1 && ip -V >/dev/null 2>&1 && systemd-run --version >/dev/null 2>&1'";
-    if let Some(outcome) =
-        run_ssh_checked(&host, dependency_check, &log_path, "netns dependency check")
-    {
+    // are hard prerequisites. A bare exit code says only "something is
+    // missing"; each check instead prints a `missing_<thing>=true` marker
+    // into the stage log so the operator knows exactly which package or
+    // setting to fix.
+    //
+    // Two halves, matched to the two execution contexts this stage uses:
+    // the probe build runs as the SSH user (source tree + cargo must be on
+    // the USER's PATH), while the topology itself is built by root (nft/ip/
+    // systemd-run). The veth probe is a create-then-delete around loopback —
+    // zero residue on success — and proves the guest kernel can actually
+    // build netns topology, which no `--version` check can see.
+    let user_dependency_check = concat!(
+        "m=0; ",
+        "test -d \"$HOME/Rustynet\" || { echo missing_rustynet_source_tree=true; m=1; }; ",
+        "cargo --version >/dev/null 2>&1 || { echo missing_cargo=true; m=1; }; ",
+        "exit $m",
+    );
+    if let Some(outcome) = run_ssh_checked(
+        &host,
+        user_dependency_check,
+        &log_path,
+        "netns user dependency check (source tree, cargo)",
+    ) {
+        return outcome;
+    }
+    let root_dependency_check = concat!(
+        "sudo -n bash -lc 'm=0; ",
+        "nft --version >/dev/null 2>&1 || { echo missing_nft=true; m=1; }; ",
+        "ip -V >/dev/null 2>&1 || { echo missing_ip=true; m=1; }; ",
+        "systemd-run --version >/dev/null 2>&1 || { echo missing_systemd_run=true; m=1; }; ",
+        "if ip link add rnsim-probe0 type veth peer name rnsim-probe1 >/dev/null 2>&1; then ",
+        "ip link del rnsim-probe0 >/dev/null 2>&1 || true; ",
+        "else echo missing_veth_kernel_support=true; m=1; fi; ",
+        "exit $m'",
+    );
+    if let Some(outcome) = run_ssh_checked(
+        &host,
+        root_dependency_check,
+        &log_path,
+        "netns root dependency check (nft/ip/systemd-run, veth probe)",
+    ) {
         return outcome;
     }
 

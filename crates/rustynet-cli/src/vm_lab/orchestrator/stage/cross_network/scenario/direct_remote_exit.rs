@@ -47,10 +47,10 @@ use super::provisioning::{
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
-    Checks, ScenarioInputs, ScenarioOutcome, WIREGUARD_PORT, capture_root_allow_failure,
-    client_exit_selected, exit_masquerade_present, exit_serving_route, netcheck,
-    no_plaintext_passphrase_check, path_proven_direct, route_via_rustynet, signed_state_healthy,
-    status, wait_for_daemon_socket,
+    Checks, ScenarioInputs, ScenarioOutcome, WIREGUARD_PORT, capture_peer_endpoints,
+    capture_root_allow_failure, client_exit_selected, exit_masquerade_present, exit_serving_route,
+    netcheck, no_plaintext_passphrase_check, path_proven_direct, route_via_rustynet,
+    signed_state_healthy, status, wait_for_daemon_socket,
 };
 
 /// The scenario name used in fail-closed errors and the report suite field.
@@ -206,10 +206,7 @@ fn execute(
             &["ip", "-4", "route", "get", "1.1.1.1"],
         ),
     )?;
-    let client_endpoints = during(
-        phase,
-        capture_root_allow_failure(client.runner, &["wg", "show", "rustynet0", "endpoints"]),
-    )?;
+    let client_endpoints = during(phase, capture_peer_endpoints(client.runner))?;
     let exit_nft = during(
         phase,
         capture_root_allow_failure(exit.runner, &["nft", "list", "ruleset"]),
