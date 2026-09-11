@@ -480,7 +480,7 @@ fn run() -> Result<(), String> {
         &config.ssh_identity_file,
         &work_known_hosts,
         &config.exit_a_host,
-        "mktemp /tmp/rn-exit-handoff-dns-passphrase.XXXXXX",
+        "mktemp /run/rn-exit-handoff-dns-passphrase.XXXXXX",
     )?
     .trim()
     .to_owned();
@@ -2324,6 +2324,27 @@ mod tests {
         managed_dns_state_is_valid, parse_assignment_authority_scope, route_uses_rustynet0,
     };
     use std::path::{Path, PathBuf};
+
+    // The materialized DNS signing passphrase is plaintext secret material on
+    // the guest: it must be created under /run (tmpfs, gone on reboot), never
+    // /tmp (a SIGKILL before the cleanup would leave a 0600 root-owned
+    // plaintext passphrase surviving the reboot).
+    #[test]
+    fn dns_passphrase_materializes_under_run_not_tmp() {
+        let source = include_str!("live_linux_exit_handoff_test.rs");
+        assert!(
+            source.contains("\"mktemp /run/rn-exit-handoff-dns-passphrase.XXXXXX\""),
+            "the passphrase mktemp must target /run:\n{source}"
+        );
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        for (index, line) in source[..impl_end].lines().enumerate() {
+            assert!(
+                !line.contains("/tmp/rn-exit-handoff-dns-passphrase"),
+                "line {} writes the DNS passphrase under /tmp; use /run (tmpfs)",
+                index + 1
+            );
+        }
+    }
 
     fn sample_config() -> Config {
         Config {

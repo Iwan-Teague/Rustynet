@@ -418,6 +418,7 @@ fn faketime_offset_spec(forward: bool, secs: u64) -> String {
 /// EXIT` BEFORE the fault, so the daemon is never left running under a faked
 /// clock on any abort path.
 fn render_remote_clock_script(config: &Config) -> String {
+    let remote_rustynet_bin = shell_quote(REMOTE_RUSTYNET_BIN);
     let service = shell_quote(&config.service_name);
     let socket_path = shell_quote(&config.socket_path);
     let faketime_lib = shell_quote(&config.faketime_lib);
@@ -469,7 +470,7 @@ cleanup() {{
   systemctl reset-failed "$service" >/dev/null 2>&1 || true
   systemctl restart "$service" >/dev/null 2>&1 || true
 }}
-trap cleanup EXIT
+trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
 command -v systemctl >/dev/null 2>&1 || {{ printf 'missing_systemctl=true\n'; exit 1; }}
 test -r "$faketime_lib" || {{ printf 'faketime_lib_present=false\n'; exit 1; }}
@@ -477,7 +478,7 @@ printf 'faketime_lib_present=true\n'
 systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
 test -S "$socket_path" || {{ printf 'baseline_socket_present=false\n'; exit 1; }}
 status_field() {{
-  env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null \
+  env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null \
     | tr ' ' '\n' \
     | awk -F= -v k="$1" '$1==k {{ print $2; exit }}'
 }}
@@ -592,7 +593,7 @@ printf 'post_state=%s\n' "$post_state"
 # multi-word bootstrap_error text can only be matched against the full
 # status line. An unsampleable status (refused start) leaves this false;
 # the refused-start case is accepted via daemon_started_under_fault=false.
-full_status="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null || true)"
+full_status="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null || true)"
 bootstrap_error_names_staleness=false
 case "$full_status" in *"is stale"*|*"expired"*) bootstrap_error_names_staleness=true ;; esac
 printf 'bootstrap_error_names_staleness=%s\n' "$bootstrap_error_names_staleness"
@@ -1637,8 +1638,13 @@ mod tests {
         ])
         .expect("config should parse");
         let script = render_remote_clock_script(&config);
-        // Teardown trap is registered before the fault is installed.
-        let trap_pos = script.find("trap cleanup EXIT").expect("trap present");
+        // Teardown trap is registered before the fault is installed, and it
+        // names HUP/INT/TERM explicitly: the SSH session dying (orchestrator
+        // SIGKILL) may not run an EXIT-only trap, which would leave the
+        // faketime drop-in installed.
+        let trap_pos = script
+            .find("trap cleanup EXIT HUP INT TERM")
+            .expect("trap present");
         let install_pos = script
             .find("install_faketime '+7776000s'")
             .expect("install present");

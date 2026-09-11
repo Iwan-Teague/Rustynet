@@ -333,36 +333,7 @@ impl<'a> ClientTrafficGuard<'a> {
         client: &'a str,
     ) -> Result<Self, String> {
         let duration = config.recovery_deadline_secs + 20;
-        let traffic_pid_file = shell_quote(CLIENT_TRAFFIC_PID_FILE);
-        let tcpdump_pid_file = shell_quote(CLIENT_TCPDUMP_PID_FILE);
-        let capture_file = shell_quote(CLIENT_TCPDUMP_CAPTURE_FILE);
-        let error_file = shell_quote(CLIENT_TCPDUMP_ERROR_FILE);
-        let probe_target = shell_quote(CLIENT_PROBE_TARGET);
-        let script = format!(
-            r#"set -eu
-traffic_pid_file={traffic_pid_file}
-tcpdump_pid_file={tcpdump_pid_file}
-capture_file={capture_file}
-error_file={error_file}
-probe_target={probe_target}
-rm -f "$traffic_pid_file" "$tcpdump_pid_file" "$capture_file" "$error_file"
-command -v tcpdump >/dev/null 2>&1
-command -v timeout >/dev/null 2>&1
-capture_interface="$(ip route show default 0.0.0.0/0 | awk 'NR==1 {{ for (i=1; i<=NF; i++) if ($i == "dev") {{ print $(i+1); exit }} }}')"
-case "$capture_interface" in ""|*[!A-Za-z0-9_.:-]*|rustynet0) exit 1 ;; esac
-timeout {duration} tcpdump -i "$capture_interface" -nn -l "icmp and dst host $probe_target" > "$capture_file" 2> "$error_file" &
-printf '%s\n' "$!" > "$tcpdump_pid_file"
-sleep 2
-(
-  end="$(( $(date +%s) + {duration} ))"
-  while [ "$(date +%s)" -lt "$end" ]; do
-    ping -n -c 1 -W 1 "$probe_target" >/dev/null 2>&1 || true
-    sleep 1
-  done
-) >/tmp/rustynet-chaos-daemon-fault-client.log 2>&1 &
-printf '%s\n' "$!" > "$traffic_pid_file"
-"#
-        );
+        let script = render_client_traffic_start_script(duration);
         run_root(identity, known_hosts, client, &script)?;
         Ok(Self {
             identity,
@@ -412,6 +383,46 @@ printf 'client_plaintext_leak_check=%s\n' "$client_plaintext_leak_check"
     }
 }
 
+fn render_client_traffic_start_script(duration_secs: u64) -> String {
+    let traffic_pid_file = shell_quote(CLIENT_TRAFFIC_PID_FILE);
+    let tcpdump_pid_file = shell_quote(CLIENT_TCPDUMP_PID_FILE);
+    let capture_file = shell_quote(CLIENT_TCPDUMP_CAPTURE_FILE);
+    let error_file = shell_quote(CLIENT_TCPDUMP_ERROR_FILE);
+    let probe_target = shell_quote(CLIENT_PROBE_TARGET);
+    format!(
+        r#"set -eu
+# RSA-0080: a non-login shell omits the sbin directories where ip/tcpdump live.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"; export PATH
+traffic_pid_file={traffic_pid_file}
+tcpdump_pid_file={tcpdump_pid_file}
+capture_file={capture_file}
+error_file={error_file}
+probe_target={probe_target}
+rm -f "$traffic_pid_file" "$tcpdump_pid_file" "$capture_file" "$error_file"
+# Named precheck markers: an opaque exit 1 tells the operator nothing about
+# which tool was absent on the guest (live 2026-09-10 class).
+command -v tcpdump >/dev/null 2>&1 || {{ printf 'missing_tcpdump=true\n'; exit 1; }}
+command -v timeout >/dev/null 2>&1 || {{ printf 'missing_timeout=true\n'; exit 1; }}
+command -v ip >/dev/null 2>&1 || {{ printf 'missing_ip=true\n'; exit 1; }}
+capture_interface="$(ip route show default 0.0.0.0/0 | awk 'NR==1 {{ for (i=1; i<=NF; i++) if ($i == "dev") {{ print $(i+1); exit }} }}')"
+case "$capture_interface" in ""|*[!A-Za-z0-9_.:-]*|rustynet0) exit 1 ;; esac
+timeout {duration_secs} tcpdump -i "$capture_interface" -nn -l "icmp and dst host $probe_target" > "$capture_file" 2> "$error_file" &
+printf '%s\n' "$!" > "$tcpdump_pid_file"
+sleep 2
+# Unpredictable sink path: root must not write a fixed /tmp name.
+traffic_log="$(mktemp /tmp/rustynet-chaos-daemon-fault-client-log.XXXXXX)"
+(
+  end="$(( $(date +%s) + {duration_secs} ))"
+  while [ "$(date +%s)" -lt "$end" ]; do
+    ping -n -c 1 -W 1 "$probe_target" >/dev/null 2>&1 || true
+    sleep 1
+  done
+) > "$traffic_log" 2>&1 &
+printf '%s\n' "$!" > "$traffic_pid_file"
+"#
+    )
+}
+
 fn render_remote_kill_script(config: &Config) -> String {
     let service = shell_quote(&config.service_name);
     let socket_path = shell_quote(&config.socket_path);
@@ -421,6 +432,8 @@ fn render_remote_kill_script(config: &Config) -> String {
 
     format!(
         r#"set -eu
+# RSA-0080: a non-login shell omits the sbin directories where ip/tcpdump/systemctl live.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"; export PATH
 service={service}
 socket_path={socket_path}
 capture_interface={capture_interface}
@@ -433,13 +446,17 @@ cleanup() {{
     kill "$tcpdump_pid" >/dev/null 2>&1 || true
     wait "$tcpdump_pid" >/dev/null 2>&1 || true
   fi
+  # A fault window with failed auto-restarts arms the unit's start limit;
+  # clear it or this teardown start is refused and the exit stays down.
+  systemctl reset-failed "$service" >/dev/null 2>&1 || true
   systemctl start "$service" >/dev/null 2>&1 || true
   rm -rf "$work_dir"
 }}
-trap cleanup EXIT
+trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
 command -v tcpdump >/dev/null 2>&1 || {{ printf 'missing_tcpdump=true\n'; exit 1; }}
 command -v timeout >/dev/null 2>&1 || {{ printf 'missing_timeout=true\n'; exit 1; }}
+command -v ip >/dev/null 2>&1 || {{ printf 'missing_ip=true\n'; exit 1; }}
 systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
 test -S "$socket_path" || {{ printf 'baseline_socket_present=false\n'; exit 1; }}
 if [ "$capture_interface" = "default-route" ]; then
@@ -453,6 +470,8 @@ if [ "$capture_interface" = "rustynet0" ]; then
   exit 1
 fi
 printf 'capture_interface=%s\n' "$capture_interface"
+# The CIDR is spliced into a BPF string; charset-validate it first.
+case "$mesh_cidr" in ''|*[!A-Za-z0-9.:/]*) printf 'invalid_mesh_cidr=true\n'; exit 1 ;; esac
 filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
 timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" > "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
 tcpdump_pid="$!"
@@ -494,7 +513,7 @@ printf 'plaintext_leak_check=%s\n' "$plaintext_leak_check"
 
 /// SIGSTOP/SIGCONT variant of [`render_remote_kill_script`]. The prologue is
 /// IDENTICAL (mirrors render_remote_kill_script ~395-440): same mktemp, same
-/// `trap cleanup EXIT` registered BEFORE the fault, same
+/// `trap cleanup EXIT HUP INT TERM` registered BEFORE the fault, same
 /// teardown_registered_before_fault marker, same tcpdump/timeout/active/socket
 /// preflight, same default-route capture iface that REFUSES rustynet0, and the
 /// same `timeout $((deadline+15))` tcpdump with the same BPF mesh-egress
@@ -514,6 +533,8 @@ fn render_remote_sigstop_script(config: &Config) -> String {
 
     format!(
         r#"set -eu
+# RSA-0080: a non-login shell omits the sbin directories where ip/tcpdump/systemctl live.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"; export PATH
 service={service}
 socket_path={socket_path}
 capture_interface={capture_interface}
@@ -527,13 +548,17 @@ cleanup() {{
     wait "$tcpdump_pid" >/dev/null 2>&1 || true
   fi
   systemctl kill -s CONT "$service" >/dev/null 2>&1 || true
+  # A fault window with failed auto-restarts arms the unit's start limit;
+  # clear it or this teardown start is refused and the exit stays down.
+  systemctl reset-failed "$service" >/dev/null 2>&1 || true
   systemctl start "$service" >/dev/null 2>&1 || true
   rm -rf "$work_dir"
 }}
-trap cleanup EXIT
+trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
 command -v tcpdump >/dev/null 2>&1 || {{ printf 'missing_tcpdump=true\n'; exit 1; }}
 command -v timeout >/dev/null 2>&1 || {{ printf 'missing_timeout=true\n'; exit 1; }}
+command -v ip >/dev/null 2>&1 || {{ printf 'missing_ip=true\n'; exit 1; }}
 systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
 test -S "$socket_path" || {{ printf 'baseline_socket_present=false\n'; exit 1; }}
 if [ "$capture_interface" = "default-route" ]; then
@@ -547,6 +572,8 @@ if [ "$capture_interface" = "rustynet0" ]; then
   exit 1
 fi
 printf 'capture_interface=%s\n' "$capture_interface"
+# The CIDR is spliced into a BPF string; charset-validate it first.
+case "$mesh_cidr" in ''|*[!A-Za-z0-9.:/]*) printf 'invalid_mesh_cidr=true\n'; exit 1 ;; esac
 filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
 timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" > "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
 tcpdump_pid="$!"
@@ -1007,5 +1034,139 @@ mod tests {
         assert_eq!(stages[0]["status"], "skipped");
         assert_eq!(stages[1]["status"], "skipped");
         assert_eq!(stages[3]["status"], "skipped");
+    }
+
+    fn kill_script() -> String {
+        render_remote_kill_script(&parse(&["--dry-run"]).expect("dry-run config should parse"))
+    }
+
+    fn sigstop_script() -> String {
+        render_remote_sigstop_script(
+            &parse(&["--dry-run", "--fault-mode", "sigstop-cont"])
+                .expect("sigstop dry-run config should parse"),
+        )
+    }
+
+    // Live 2026-09-10 cascade class: the teardown start must clear the unit's
+    // start limiter first, or a fault window with failed auto-restarts leaves
+    // the exit dead for every later stage.
+    #[test]
+    fn fault_scripts_reset_start_limit_before_teardown_start() {
+        for (name, script) in [("kill", kill_script()), ("sigstop", sigstop_script())] {
+            let cleanup = script
+                .find("cleanup() {")
+                .unwrap_or_else(|| panic!("{name}: cleanup fn"));
+            let body_end = script[cleanup..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("{name}: cleanup body end"));
+            let cleanup_body = &script[cleanup..cleanup + body_end];
+            let reset = cleanup_body
+                .find("systemctl reset-failed \"$service\"")
+                .unwrap_or_else(|| panic!("{name}: reset-failed inside cleanup"));
+            let start = cleanup_body
+                .find("systemctl start \"$service\"")
+                .unwrap_or_else(|| panic!("{name}: start inside cleanup"));
+            assert!(
+                reset < start,
+                "{name}: cleanup must reset-failed before the teardown start:\n{script}"
+            );
+        }
+    }
+
+    // The teardown trap must survive the SSH session dying (orchestrator
+    // SIGKILL/timeout): a POSIX shell may not run an EXIT-only trap on SIGHUP.
+    #[test]
+    fn fault_scripts_arm_teardown_against_session_death() {
+        for (name, script) in [("kill", kill_script()), ("sigstop", sigstop_script())] {
+            assert!(
+                script.contains("trap cleanup EXIT HUP INT TERM"),
+                "{name}: teardown trap must name the signals:\n{script}"
+            );
+        }
+    }
+
+    // RSA-0080: the guest's non-login PATH omits the sbin directories where
+    // ip/tcpdump/systemctl live; pin it before any lookup.
+    #[test]
+    fn fault_scripts_pin_an_sbin_bearing_path_before_any_lookup() {
+        for (name, script) in [("kill", kill_script()), ("sigstop", sigstop_script())] {
+            let path_pos = script
+                .find("PATH=\"/usr/local/sbin:/usr/sbin:/sbin:")
+                .unwrap_or_else(|| panic!("{name}: sbin PATH line present"));
+            let first_lookup = script
+                .find("command -v ")
+                .unwrap_or_else(|| panic!("{name}: a command -v preflight exists"));
+            assert!(
+                path_pos < first_lookup,
+                "{name}: PATH must precede the first lookup:\n{script}"
+            );
+        }
+    }
+
+    // A preflight that exits 1 without a named marker is the "opaque status 1"
+    // class from live 2026-09-10: the operator cannot tell which tool or
+    // lookup failed.
+    #[test]
+    fn fault_scripts_preflight_ip_with_a_named_marker() {
+        for (name, script) in [("kill", kill_script()), ("sigstop", sigstop_script())] {
+            assert!(
+                script.contains("printf 'missing_ip=true\\n'; exit 1"),
+                "{name}: ip preflight must print a named marker:\n{script}"
+            );
+        }
+    }
+
+    // The CIDR reaches a BPF string; it must be charset-validated first so no
+    // metacharacter survives into tcpdump's filter.
+    #[test]
+    fn fault_scripts_validate_mesh_cidr_before_bpf_splice() {
+        for (name, script) in [("kill", kill_script()), ("sigstop", sigstop_script())] {
+            let cidr = script.find("mesh_cidr=").expect("cidr assignment");
+            let validate = script
+                .find("case \"$mesh_cidr\" in ''|*[!A-Za-z0-9.:/]*) printf 'invalid_mesh_cidr=true\\n'")
+                .unwrap_or_else(|| panic!("{name}: mesh_cidr charset validation present"));
+            let filter = script
+                .find("filter=\"ip and src net $mesh_cidr")
+                .expect("filter build");
+            assert!(
+                validate < filter,
+                "{name}: validate before splice:\n{script}"
+            );
+            assert!(cidr < validate);
+        }
+    }
+
+    // The client guard's start script must print named markers for its
+    // tcpdump/timeout/ip preflights and must not write a fixed /tmp log name.
+    #[test]
+    fn client_start_script_prints_named_precheck_markers() {
+        let script = render_client_traffic_start_script(35);
+        assert!(
+            script.contains("printf 'missing_tcpdump=true\\n'; exit 1"),
+            "{script}"
+        );
+        assert!(
+            script.contains("printf 'missing_timeout=true\\n'; exit 1"),
+            "{script}"
+        );
+        assert!(
+            script.contains("printf 'missing_ip=true\\n'; exit 1"),
+            "{script}"
+        );
+        let path_pos = script
+            .find("PATH=\"/usr/local/sbin:/usr/sbin:/sbin:")
+            .expect("sbin PATH line present");
+        let first_lookup = script.find("command -v ").expect("preflight exists");
+        assert!(
+            path_pos < first_lookup,
+            "PATH must precede the first lookup:\n{script}"
+        );
+        assert!(
+            script.contains(
+                "traffic_log=\"$(mktemp /tmp/rustynet-chaos-daemon-fault-client-log.XXXXXX)\""
+            ),
+            "the ping sink must use mktemp, not a fixed /tmp name:\n{script}"
+        );
+        assert!(!script.contains("/tmp/rustynet-chaos-daemon-fault-client.log"));
     }
 }
