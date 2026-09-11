@@ -2934,7 +2934,7 @@ echo "LAUNCHED launch_id=launch-1-2 pid=$PID log=$LOG"
              install command was: {install_cmd}"
         );
         assert!(
-            script.contains(" ping dig; do"),
+            script.contains(" ping ip tc dig; do"),
             "dig must be in the command verification loop, or a failed install \
              is not detected until the stage that needs it"
         );
