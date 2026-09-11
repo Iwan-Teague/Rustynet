@@ -342,3 +342,14 @@ fn capture_peer_endpoints_errors_named_when_neither_source_yields_endpoints() {
     assert!(err.contains("wg show rustynet0 endpoints"), "{err}");
     assert!(err.contains("managed_peer_endpoints"), "{err}");
 }
+
+// `wg show` renders a peer without an endpoint as `(none)`; it must not be
+// mistaken for an endpoint (review XNETREV).
+#[test]
+fn parse_wg_show_endpoints_drops_none_placeholders() {
+    let out = "AAAA=\t(none)\nBBBB=\t203.0.113.7:51820\n";
+    assert_eq!(
+        super::parse_wg_show_endpoints(out),
+        vec!["203.0.113.7:51820".to_owned()]
+    );
+}

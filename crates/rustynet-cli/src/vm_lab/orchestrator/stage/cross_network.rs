@@ -409,11 +409,15 @@ fn run_nat_classification(
     // systemd-run). The veth probe is a create-then-delete around loopback —
     // zero residue on success — and proves the guest kernel can actually
     // build netns topology, which no `--version` check can see.
+    // A non-login ssh shell has no `$HOME/.cargo/bin` on PATH (the probe
+    // build below runs under `bash -lc` for the same reason), so the check
+    // must run in the same login-shell context or it reports `missing_cargo`
+    // on every correctly bootstrapped guest (review XNETREV).
     let user_dependency_check = concat!(
-        "m=0; ",
-        "test -d \"$HOME/Rustynet\" || { echo missing_rustynet_source_tree=true; m=1; }; ",
-        "cargo --version >/dev/null 2>&1 || { echo missing_cargo=true; m=1; }; ",
-        "exit $m",
+        "bash -lc 'm=0; ",
+        "test -d \"$HOME/Rustynet\" || { echo missing_rustynet_source_tree=true >&2; m=1; }; ",
+        "cargo --version >/dev/null 2>&1 || { echo missing_cargo=true >&2; m=1; }; ",
+        "exit $m'",
     );
     if let Some(outcome) = run_ssh_checked(
         &host,
