@@ -376,10 +376,11 @@ fn run_live_crash_recovery(config: &Config, logger: &mut Logger) -> Result<Value
 }
 
 /// Remote kill-on-fsync injection script. Mirrors the daemon-fault
-/// template's prologue (mktemp work_dir, `trap cleanup EXIT` registered
-/// BEFORE the fault so the daemon is never left dead on any abort path,
-/// `teardown_registered_before_fault` marker, preflight that the service
-/// is active + socket present). Divergences vs the daemon-fault path:
+/// template's prologue (mktemp work_dir, `trap cleanup EXIT HUP INT TERM`
+/// registered BEFORE the fault so the daemon is never left dead on any
+/// abort path — including the SSH session dying, where a POSIX shell may
+/// not run an EXIT-only trap; `teardown_registered_before_fault` marker,
+/// preflight that the service is active + socket present). Divergences vs the daemon-fault path:
 ///   * NO tcpdump leak capture — this boundary asserts on-disk trust-state
 ///     atomicity, not plaintext egress; the leak check is not-applicable.
 ///   * The fault is a TIGHT `kill -9` LOOP (kill -> bounded restart-wait ->
@@ -391,6 +392,7 @@ fn run_live_crash_recovery(config: &Config, logger: &mut Logger) -> Result<Value
 ///     so the Rust side can prove atomic old-or-new and no watermark
 ///     downgrade.
 fn render_remote_crash_script(config: &Config) -> String {
+    let remote_rustynet_bin = shell_quote(REMOTE_RUSTYNET_BIN);
     let service = shell_quote(&config.service_name);
     let socket_path = shell_quote(&config.socket_path);
     let bundle_path = shell_quote(&config.bundle_path);
@@ -411,6 +413,8 @@ fn render_remote_crash_script(config: &Config) -> String {
     // silently treated as valid.
     format!(
         r#"set -eu
+# RSA-0080: a non-login shell omits the sbin directories where ip/systemctl live.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"; export PATH
 service={service}
 socket_path={socket_path}
 bundle_path={bundle_path}
@@ -422,10 +426,14 @@ deadline={deadline}
 iterations={iterations}
 work_dir="$(mktemp -d /tmp/rustynet-chaos-crash-recovery.XXXXXX)"
 cleanup() {{
+  # The kill loop trips the unit's start limiter once >= StartLimitBurst
+  # kills accumulate; clear it or this teardown start is refused and the
+  # exit stays down for every later stage (live 2026-09-10, lenovo-bot).
+  systemctl reset-failed "$service" >/dev/null 2>&1 || true
   systemctl start "$service" >/dev/null 2>&1 || true
   rm -rf "$work_dir"
 }}
-trap cleanup EXIT
+trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
 command -v systemctl >/dev/null 2>&1 || {{ printf 'missing_systemctl=true\n'; exit 1; }}
 systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
@@ -554,7 +562,7 @@ if [ "$recovered" = true ]; then
   # 2026-09-11: recovered in 8 s, sampled unconverged, stage failed).
   mesh_end_unix="$((start_unix + deadline))"
   while :; do
-    mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
+    mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
     case "$mesh_status_line" in
       *path_live_proven=true*path_live_peer_count=[1-9]*bootstrap_error=none*restricted_safe_mode=false*) break ;;
     esac
@@ -1225,6 +1233,64 @@ mod tests {
         assert!(
             CrashStageObservation::parse(&missing).is_err(),
             "the field is required"
+        );
+    }
+
+    // The abort-path cleanup must clear the start limiter before its start:
+    // an abort after >= StartLimitBurst kills leaves the limiter armed, and a
+    // bare `systemctl start` is refused ("Start request repeated too
+    // quickly"), inheriting a dead daemon into every later stage.
+    #[test]
+    fn remote_script_cleanup_resets_start_limit_before_teardown_start() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        let cleanup = script.find("cleanup() {").expect("cleanup fn");
+        let body_end = script[cleanup..].find("\n}").expect("cleanup body end");
+        let cleanup_body = &script[cleanup..cleanup + body_end];
+        let reset = cleanup_body
+            .find("systemctl reset-failed \"$service\"")
+            .expect("reset-failed inside cleanup");
+        let start = cleanup_body
+            .find("systemctl start \"$service\"")
+            .expect("start inside cleanup");
+        assert!(
+            reset < start,
+            "cleanup must reset-failed before the teardown start:\n{script}"
+        );
+    }
+
+    // The teardown trap must survive the SSH session dying (orchestrator
+    // SIGKILL/timeout): a POSIX shell may not run an EXIT-only trap on
+    // SIGHUP, so the registration has to name the signals explicitly.
+    #[test]
+    fn remote_script_arms_teardown_against_session_death() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        assert!(
+            script.contains("trap cleanup EXIT HUP INT TERM"),
+            "{script}"
+        );
+    }
+
+    // RSA-0080: the guest's non-login PATH omits the sbin directories where
+    // ip/systemctl live; the script pins an sbin-bearing PATH before any
+    // lookup.
+    #[test]
+    fn remote_script_pins_an_sbin_bearing_path_before_any_lookup() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        let path_pos = script
+            .find("PATH=\"/usr/local/sbin:/usr/sbin:/sbin:")
+            .expect("sbin PATH line present");
+        let first_lookup = script
+            .find("command -v ")
+            .expect("a command -v preflight exists");
+        assert!(
+            path_pos < first_lookup,
+            "PATH must precede the first lookup:\n{script}"
         );
     }
 

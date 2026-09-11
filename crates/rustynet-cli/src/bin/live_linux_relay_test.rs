@@ -166,6 +166,43 @@ fn next_value(iter: &mut std::vec::IntoIter<String>, flag: &str) -> Result<Strin
         .ok_or_else(|| format!("missing value for {flag}"))
 }
 
+/// RAII guard around the relay stop→captures→start window (mirrors two_hop's
+/// `BundleSwapFence`): armed right after the Phase 3 stop, disarmed after the
+/// Phase 5 start. Any `?` propagated by the in-between captures drops the
+/// guard, which restarts the relay so subsequent lab stages inherit a serving
+/// node instead of a dead one. The restart failure is swallowed here on
+/// purpose — the report surfaces restart outcomes honestly, and the guard is
+/// the backstop, not the primary path (relay:289-291 pattern).
+struct RelayRestartGuard<'a> {
+    armed: bool,
+    identity: &'a Path,
+    known_hosts: &'a Path,
+    target: &'a str,
+}
+
+impl Drop for RelayRestartGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(err) = run_root(
+            self.identity,
+            self.known_hosts,
+            self.target,
+            &relay_start_command(),
+        ) {
+            eprintln!(
+                "warning: could not restart {} on {} after an aborted relay stage: {err}",
+                SYSTEMD_RELAY_UNIT, self.target
+            );
+        }
+    }
+}
+
+fn relay_start_command() -> String {
+    format!("/bin/systemctl start {}", SYSTEMD_RELAY_UNIT)
+}
+
 fn print_usage() {
     println!(
         "usage: live_linux_relay_test --ssh-identity-file <path> [options]\n\
@@ -261,6 +298,9 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
 
     // Phase 3 — stop the service via systemctl. The canonical
     // teardown verb releases listener sockets + drops sessions.
+    // From here to the Phase 5 start, every capture propagates with `?`; the
+    // guard below makes sure an abort in between still restarts the relay so
+    // subsequent lab stages inherit a serving node instead of a dead one.
     run_root(
         &config.ssh_identity_file,
         &work_known_hosts,
@@ -268,6 +308,12 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
         &format!("/bin/systemctl stop {}", SYSTEMD_RELAY_UNIT),
     )
     .map_err(|err| format!("linux relay: systemctl stop failed: {err}"))?;
+    let mut relay_restart_guard = RelayRestartGuard {
+        armed: true,
+        identity: &config.ssh_identity_file,
+        known_hosts: &work_known_hosts,
+        target: relay_target,
+    };
     std::thread::sleep(std::time::Duration::from_secs(3));
 
     // Phase 4 — after-stop captures.
@@ -284,11 +330,12 @@ fn run_linux_relay(config: &Config) -> Result<(), String> {
         &config.ssh_identity_file,
         &work_known_hosts,
         relay_target,
-        &format!("/bin/systemctl start {}", SYSTEMD_RELAY_UNIT),
+        &relay_start_command(),
     ) {
         Ok(()) => "restarted".to_owned(),
         Err(err) => format!("restart_failed: {err}"),
     };
+    relay_restart_guard.armed = false;
 
     // Phase 6 — assertions.
     let mut failures: Vec<String> = Vec::new();
@@ -1298,6 +1345,16 @@ fn utc_now_string() -> String {
 mod tests {
     use super::Config;
     use super::live_lab_bin_support::LiveLabPlatform;
+
+    // The stop→captures→start window must be guarded so a failure in between
+    // still restarts the relay: the guard's Drop command must START (never
+    // stop or restart) the canonical relay unit, and it must use the same
+    // absolute systemctl path as the happy-path start.
+    #[test]
+    fn relay_restart_guard_starts_the_canonical_relay_unit() {
+        let cmd = super::relay_start_command();
+        assert_eq!(cmd, "/bin/systemctl start rustynet-relay.service");
+    }
 
     fn base_args() -> Vec<String> {
         vec!["--ssh-identity-file".to_owned(), "/tmp/id".to_owned()]

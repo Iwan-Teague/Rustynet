@@ -85,3 +85,15 @@ The new criterion fails the leg for the right reason this time, and the exit gue
 ## Chaos plan CLEAN (2026-09-11, lenovo-bot, `03033921`, run `q-lenovo-chaos6`): **51 / 0 / 28**
 
 With the clock bin judging the fault start by unit state and polling post-recovery status until bootstrap completes, all nine chaos stages and all four negative controls pass live with witnesses. The clock leg's verdict now records the daemon's refuse-to-start under a far-future clock as the fail-closed posture it is.
+## Fixes landed (2026-09-11, second-pass review sweep, chaos + live-lab bins)
+
+Applied the C1/C2 second-pass findings on the chaos and live-lab bins' remote root scripts, ahead of the next chaos rerun (expected: no live-behaviour change on green runs; the deltas are abort-path guarantees):
+
+* **Reset-failed before every teardown start/restart** — crash-recovery's cleanup, daemon-fault's kill + sigstop cleanups, two-hop's quiesce-fence `Drop` restart, endpoint-hijack's three restarts (helper `reset_failed_then_restart_rustynetd`), enrollment-restart's start (key-custody pattern). An abort after ≥5 kills no longer inherits "Start request repeated too quickly" into later stages.
+* **`trap cleanup EXIT HUP INT TERM`** in all five chaos root scripts (clock, crash, daemon-fault ×2, impairment, resource ×2) and the anchor bin's macOS membership script — an EXIT-only trap is not guaranteed to fire when sshd HUPs the guest shell, which is how drop-ins/qdiscs/faketime survive a run.
+* **RSA-0080 sbin PATH pin** extended to crash-recovery, daemon-fault (both scripts + `command -v ip` named-marker preflight + the client guard's tcpdump/timeout/ip markers), and resource-exhaustion (both scripts).
+* **RAII fences for the unguarded multi-call windows**: network-flap's nft drop rule (`NftBlockRuleGuard`, deletes the stage's own table on drop), role-switch's blind_exit refresh-env swap (`RefreshEnvFence`, restores the baseline env on drop), relay's stop→captures→start (`RelayRestartGuard`).
+* **DNS signing passphrase materialized under `/run`** (tmpfs, gone on reboot) in lan-toggle and exit-handoff; 0600 + existing removal unchanged.
+* **Nits**: `mesh_cidr` charset-validated before the BPF splice (daemon-fault ×2, impairment), the daemon-fault client guard's fixed `/tmp` log → `mktemp`, `{REMOTE_RUSTYNET_BIN}` routed through `shell_quote` in clock/crash.
+
+Each change carries a script-text or command-shape unit test in its owning bin (mirroring the existing `remote_script_pins_an_sbin_bearing_path_before_any_lookup` / `remote_script_resets_start_limit_per_kill_and_reports_the_count` pins). Gates: fmt + clippy + nextest `-E 'binary(/live_chaos|live_linux|live_lab/)'` all green (1701 tests).

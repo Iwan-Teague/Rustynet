@@ -709,6 +709,50 @@ fn build_signed_state_refresh_context(
     }
 }
 
+/// RAII fence around the blind_exit refresh-env swap (mirrors two_hop's
+/// `BundleSwapFence`): armed after the swap install succeeds, disarmed only
+/// after the baseline env is restored in place. Every step between them
+/// propagates with `?`, so an abort anywhere in the leg would otherwise leave
+/// blind_exit intent installed on the node; the Drop restores the captured
+/// baseline env instead. The abort-path restore failure is swallowed here on
+/// purpose — the Drop is the backstop, and the stage's own error already
+/// carries the abort reason.
+struct RefreshEnvFence<'a> {
+    armed: bool,
+    identity: &'a Path,
+    known_hosts: &'a Path,
+    workspace_dir: &'a Path,
+    host: &'a str,
+    node_id: &'a str,
+    original: String,
+}
+
+impl Drop for RefreshEnvFence<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        eprintln!(
+            "warning: role-switch aborted with the blind_exit assignment-refresh env still \
+             installed on {} ({}); restoring the baseline env",
+            self.node_id, self.host
+        );
+        if let Err(err) = install_linux_refresh_env(
+            self.identity,
+            self.known_hosts,
+            self.host,
+            self.workspace_dir,
+            self.original.as_str(),
+            "baseline-restore-abort",
+        ) {
+            eprintln!(
+                "warning: could not restore the baseline assignment-refresh env on {}: {err}",
+                self.host
+            );
+        }
+    }
+}
+
 fn process_host(
     context: &mut RoleSwitchRunContext<'_>,
     spec: HostSwitchSpec<'_>,
@@ -748,7 +792,7 @@ fn process_host(
     // restored after the leg) and pre-install the matching bundle, which is
     // also valid under the still-client role (capability superset, no exit
     // consumer).
-    let mut refresh_env_backup: Option<String> = None;
+    let mut refresh_env_fence: Option<RefreshEnvFence> = None;
     if spec.temp_role == "blind_exit"
         && let Some(refresh) = context.signed_state_refresh
     {
@@ -818,7 +862,18 @@ fn process_host(
                 blind_exit_env.as_str(),
                 "blind-exit",
             )?;
-            refresh_env_backup = Some(original);
+            // Arm the fence only AFTER a successful install: if the install
+            // itself fails, the node still carries its baseline env and there
+            // is nothing to restore.
+            refresh_env_fence = Some(RefreshEnvFence {
+                armed: true,
+                identity: context.identity,
+                known_hosts: context.known_hosts,
+                workspace_dir: context.workspace_dir,
+                host: spec.host,
+                node_id: spec.node_id,
+                original,
+            });
         }
         refresh_signed_state_for_transition(
             context.logger,
@@ -912,7 +967,7 @@ fn process_host(
     // so it re-mints the baseline (exit-consuming) intent. The blind_exit
     // bundle still installed at this moment is also valid under client role,
     // so the ordering has no denied window.
-    if let Some(original) = refresh_env_backup.as_deref() {
+    if let Some(fence) = refresh_env_fence.as_mut() {
         context.logger.line(
             format!(
                 "[role-switch] restore baseline assignment-refresh env on {} ({})",
@@ -925,9 +980,12 @@ fn process_host(
             context.known_hosts,
             spec.host,
             context.workspace_dir,
-            original,
+            fence.original.as_str(),
             "baseline-restore",
         )?;
+        // Disarm only after the baseline env is back in place; on any `?`
+        // before this point the fence stays armed and its Drop restores.
+        fence.armed = false;
     }
     let mut restore_context = ClientRoleContext {
         logger: &mut *context.logger,
@@ -2043,13 +2101,36 @@ fn utc_now_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, ROUTE_PROBE_IP, TUNNEL_IFACE, WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH,
+        Config, ROUTE_PROBE_IP, RefreshEnvFence, TUNNEL_IFACE, WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH,
         build_blind_exit_refresh_env, build_signed_state_refresh_context,
         client_exit_route_converged, env_file_value, role_runtime_ready, route_uses_tunnel,
         windows_denial_command, windows_route_get_command,
     };
     use std::fs;
     use std::path::PathBuf;
+
+    // The refresh-env fence must be born armed and be disarmed only by an
+    // explicit success-path assignment: a dropped, still-armed fence restores
+    // the baseline env, so blind_exit intent can never outlive an aborted leg.
+    #[test]
+    fn refresh_env_fence_is_armed_by_default_and_disarmable() {
+        let fence = RefreshEnvFence {
+            armed: true,
+            identity: std::path::Path::new("/dev/null"),
+            known_hosts: std::path::Path::new("/dev/null"),
+            workspace_dir: std::path::Path::new("/dev/null"),
+            host: "host-a",
+            node_id: "node-a",
+            original: String::new(),
+        };
+        assert!(fence.armed, "a freshly armed fence must restore on drop");
+        // Disarmed (success-path) fences no-op on drop — the field alone
+        // decides, so the happy path can retire the guard without dropping
+        // the value it carries.
+        let mut disarmed = fence;
+        disarmed.armed = false;
+        assert!(!disarmed.armed);
+    }
 
     #[test]
     fn env_file_value_extracts_quoted_values() {
