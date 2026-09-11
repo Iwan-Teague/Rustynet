@@ -545,9 +545,25 @@ keystore_empty_after="$(keystore_empty_files)"
 # strip any embedded newlines so it round-trips on one report line. Empty
 # on failure => parse_mesh_converged returns false (fail-closed).
 mesh_status_line=""
+mesh_poll_secs=0
 if [ "$recovered" = true ]; then
-  mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
+  # Recovery (active unit + socket) precedes mesh convergence by seconds:
+  # re-handshake, signed-state apply, path proof. Poll the status line
+  # until it reports a live-proven path with peers, bounded by the same
+  # deadline, instead of sampling the instant the socket appears (live
+  # 2026-09-11: recovered in 8 s, sampled unconverged, stage failed).
+  mesh_end_unix="$((start_unix + deadline))"
+  while :; do
+    mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
+    case "$mesh_status_line" in
+      *path_live_proven=true*path_live_peer_count=[1-9]*) break ;;
+    esac
+    [ "$(date +%s)" -ge "$mesh_end_unix" ] && break
+    sleep 2
+  done
+  mesh_poll_secs="$(( $(date +%s) - start_unix ))"
 fi
+printf 'mesh_poll_secs=%s\n' "$mesh_poll_secs"
 printf 'recovered=%s\n' "$recovered"
 printf 'measured_recovery_secs=%s\n' "$measured_recovery_secs"
 printf 'watermark_after=%s\n' "$watermark_after"
@@ -687,6 +703,10 @@ struct CrashStageObservation {
     teardown_registered_before_fault: bool,
     persistence_boundary: String,
     observed_kill_count: u64,
+    /// Seconds from the restart until the mesh status reported a live-proven
+    /// path (or the deadline), so the report shows convergence time, not
+    /// just socket-recovery time.
+    mesh_poll_secs: u64,
     /// How many times the loop cleared systemd's start-limit state
     /// (`systemctl reset-failed`); reviewers read it to see how often the
     /// unit's own rate limiter would have engaged.
@@ -739,6 +759,7 @@ impl CrashStageObservation {
             persistence_boundary: parse_str("persistence_boundary")?,
             observed_kill_count: parse_u64("observed_kill_count")?,
             start_limit_resets: parse_u64("start_limit_resets")?,
+            mesh_poll_secs: parse_u64("mesh_poll_secs")?,
             recovered: parse_bool("recovered")?,
             measured_recovery_secs: parse_u64("measured_recovery_secs")?,
             watermark_before: WatermarkSample::parse(&parse_str("watermark_before")?)?,
@@ -803,6 +824,7 @@ fn render_live_report(config: &Config, observation: &CrashStageObservation) -> V
                     "recovery_deadline_secs": config.recovery_deadline_secs,
                     "measured_recovery_secs": observation.measured_recovery_secs,
                     "start_limit_resets": observation.start_limit_resets,
+                    "mesh_poll_secs": observation.mesh_poll_secs,
                     "plaintext_leak_check": "not-applicable-persistence-boundary",
                     "persistence_boundary": observation.persistence_boundary,
                     "observed_kill_count": observation.observed_kill_count,
@@ -1164,6 +1186,7 @@ mod tests {
             "crash_iterations=12",
             "observed_kill_count=12",
             "start_limit_resets=13",
+            "mesh_poll_secs=21",
             "recovered=true",
             "measured_recovery_secs=7",
             "watermark_after=201",
@@ -1202,6 +1225,25 @@ mod tests {
             CrashStageObservation::parse(&missing).is_err(),
             "the field is required"
         );
+    }
+
+    // Live 2026-09-11: socket recovery in 8 s but the mesh had not re-proven a
+    // path at that instant; the script must poll to the deadline.
+    #[test]
+    fn remote_script_polls_mesh_convergence_after_recovery() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        assert!(
+            script.contains("*path_live_proven=true*path_live_peer_count=[1-9]*) break ;;"),
+            "{script}"
+        );
+        assert!(
+            script.contains("printf 'mesh_poll_secs=%s\\n' \"$mesh_poll_secs\""),
+            "{script}"
+        );
+        let observation = CrashStageObservation::parse(&passing_output()).expect("parse");
+        assert_eq!(observation.mesh_poll_secs, 21);
     }
 
     #[test]
