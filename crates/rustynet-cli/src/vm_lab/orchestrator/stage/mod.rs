@@ -136,6 +136,7 @@ pub mod membership_init;
 pub mod mesh_status_validation;
 pub mod negative_control;
 pub mod negative_control_enrollment_replay;
+pub mod negative_control_killswitch_bypass;
 pub mod preflight;
 pub mod refresh_signed_bundles;
 pub mod relay_forwards_frame_validation;
@@ -618,6 +619,17 @@ define_stage_catalog! {
     // self-report. Witness = the attack transcript under negative_control/.
     // Impl + adjudication in `stage/negative_control_enrollment_replay.rs`.
     NegativeControlEnrollmentTokenReplay => "negative_control_enrollment_token_replay" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_enrollment_token_replay/replay_transcript.txt"),
+    // QH-90 (tough-policy audit H): live killswitch-bypass attack. Sabotage
+    // = insert a bare `accept` ABOVE the live killswitch chain's terminal
+    // drop from outside the daemon (Linux nft; macOS pf quick-pass variant
+    // when a macOS node is in the topology); detection = the SAME shared
+    // precedence evaluators the daemon's runtime assertions use, run on
+    // orchestrator-captured dumps — clean baseline accepted, planted
+    // ruleset REJECTED naming the unreachable terminal drop, accepted again
+    // after verified handle-removal. Never a daemon self-report. Witness =
+    // the bypass transcript under negative_control/. Impl + adjudication in
+    // `stage/negative_control_killswitch_bypass.rs`.
+    NegativeControlKillswitchBypass => "negative_control_killswitch_bypass" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_killswitch_bypass/bypass_transcript.txt"),
     // Always-run overlay teardown (FinalCleanupStage pattern): vxlan link
     // residue on a guest is release-blocking exactly like exit-NAT residue,
     // so this must survive skip-cascade and run just before cleanup.

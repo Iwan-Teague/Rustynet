@@ -2231,6 +2231,18 @@ pub const STAGES: &[StageSpec] = &[
         enable: EnableRule::NegativeControlSuite,
         ..DEFAULT_SPEC
     },
+    // QH-90 (2026-09-11): live killswitch-bypass attack. Plants a bare
+    // `accept` ABOVE the live killswitch chain's terminal drop from outside
+    // the daemon (macOS pf quick-pass variant when a macOS node is elected)
+    // and adjudicates with the SAME shared precedence evaluators the
+    // daemon's runtime assertions use, on orchestrator-captured dumps.
+    StageSpec {
+        name: "negative_control_killswitch_bypass",
+        group: StageGroup::NegativeControl,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::NegativeControlSuite,
+        ..DEFAULT_SPEC
+    },
     // ── HP-3 disruptive relay-forwarding proof (opt-in) ─────────────────
     // Folds into the same evidence column as the bash-dialect
     // `validate_linux_relay_forwards_frame` (`linux_relay_forwards_frame`);
@@ -3197,11 +3209,12 @@ mod tests {
             ("t2_resilience", 14),
             ("t3_cross_os", 1),
             ("t4_security", 16),
-            // A3a: the four T5 negative-control / adjudication stages
+            // A3a: the five T5 negative-control / adjudication stages
             // (signed-bundle rejection, planted residue, wrong-node
             // substitution, daemon-killed-mid-stage), +1 on 2026-09-11
-            // (QH-89): negative_control_enrollment_token_replay.
-            ("t5_negative_control", 5),
+            // (QH-89): negative_control_enrollment_token_replay, +1 on
+            // 2026-09-11 (QH-90): negative_control_killswitch_bypass.
+            ("t5_negative_control", 6),
         ]
         .into_iter()
         .collect();
@@ -3223,8 +3236,8 @@ mod tests {
                 .iter()
                 .filter(|s| s.tier() == Tier::T5NegativeControl)
                 .count(),
-            5,
-            "the five T5 negative-control stages must all be tiered T5NegativeControl"
+            6,
+            "the six T5 negative-control stages must all be tiered T5NegativeControl"
         );
     }
 
