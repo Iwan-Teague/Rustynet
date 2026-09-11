@@ -1090,7 +1090,12 @@ struct CrossNetworkTopology {
 
 impl CrossNetworkTopology {
     fn resolve(ctx: &OrchestrationContext) -> Result<Self, TopologyError> {
-        let client = ssh_params_for_role(ctx, "client").map_err(TopologyError::Message)?;
+        // A topology without a client cannot dispatch the scenario suites: that
+        // is the declared skip the role cells expect (review B, 2026-09-11),
+        // not an internal desync. Exit stays `Message`: preflight guarantees
+        // it, so its absence IS a desync.
+        let client =
+            ssh_params_for_role(ctx, "client").map_err(|_| TopologyError::MissingRole(()))?;
         let exit = ssh_params_for_role(ctx, "exit").map_err(TopologyError::Message)?;
         let relay = ssh_params_for_any_role(ctx, &["entry", "aux"])
             .map_err(|_| TopologyError::MissingRole(()))?;
