@@ -94,6 +94,7 @@ use crate::vm_lab::orchestrator::stage::negative_control::{
     NegativeControlDaemonKillMidStageStage, NegativeControlPlantedResidueStage,
     NegativeControlSignedBundleRejectionStage, NegativeControlWrongNodeSubstitutionStage,
 };
+use crate::vm_lab::orchestrator::stage::negative_control_enrollment_replay::NegativeControlEnrollmentTokenReplayStage;
 use crate::vm_lab::orchestrator::stage::preflight::PreflightStage;
 use crate::vm_lab::orchestrator::stage::refresh_signed_bundles::RefreshSignedBundlesStage;
 use crate::vm_lab::orchestrator::stage::relay_forwards_frame_validation::RelayForwardsFrameValidationStage;
@@ -596,6 +597,9 @@ impl PlanBuilder {
                     StageId::NegativeControlDaemonKillMidStage => {
                         Box::new(NegativeControlDaemonKillMidStageStage)
                     }
+                    StageId::NegativeControlEnrollmentTokenReplay => {
+                        Box::new(NegativeControlEnrollmentTokenReplayStage)
+                    }
                     // Always-run overlay teardown, ordered just before cleanup.
                     StageId::CrossNetworkSubstrateTeardown => Box::new(
                         CrossNetworkSubstrateTeardownStage::new(cross_network.clone()),
@@ -759,17 +763,17 @@ mod tests {
     }
 
     #[test]
-    fn negative_control_opt_in_appends_4_control_stages() {
+    fn negative_control_opt_in_appends_5_control_stages() {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new()
             .with_enable_negative_control(true)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        // Opt-in and out of the default plan (like chaos): default 66 + 4.
+        // Opt-in and out of the default plan (like chaos): default 67 + 5.
         assert_eq!(
             ids.len(),
-            70,
-            "negative-control-enabled plan must contain 66 stages"
+            71,
+            "negative-control-enabled plan must contain 71 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
             assert!(
@@ -797,15 +801,15 @@ mod tests {
     }
 
     #[test]
-    fn negative_control_and_chaos_stack_to_79_stages() {
+    fn negative_control_and_chaos_stack_to_80_stages() {
         let stages = PlanBuilder::new()
             .with_enable_chaos_suite(true)
             .with_enable_negative_control(true)
             .build();
         assert_eq!(
             stages.len(),
-            79,
-            "66 default (reboot-recovery included) + 9 chaos + 4 negative-control"
+            80,
+            "67 default (reboot-recovery included) + 9 chaos + 5 negative-control"
         );
     }
 
@@ -900,8 +904,8 @@ mod tests {
         let ids: Vec<StageId> = stacked.iter().map(|s| s.id()).collect();
         assert_eq!(
             stacked.len(),
-            81,
-            "66 default + 9 chaos + 4 negative-control + 1 refresh + 1 relay-forwarding"
+            82,
+            "67 default + 9 chaos + 5 negative-control + 1 refresh + 1 relay-forwarding"
         );
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }

@@ -135,6 +135,7 @@ pub mod macos_role_transition_validation;
 pub mod membership_init;
 pub mod mesh_status_validation;
 pub mod negative_control;
+pub mod negative_control_enrollment_replay;
 pub mod preflight;
 pub mod refresh_signed_bundles;
 pub mod relay_forwards_frame_validation;
@@ -609,6 +610,14 @@ define_stage_catalog! {
     NegativeControlPlantedResidue => "negative_control_planted_residue" @ NegativeControl / T5NegativeControl / StageEvidence::StageLog,
     NegativeControlWrongNodeSubstitution => "negative_control_wrong_node_substitution" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_wrong_node_substitution/wrong_node_transcript.json"),
     NegativeControlDaemonKillMidStage => "negative_control_daemon_kill_mid_stage" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_daemon_kill_mid_stage/kill_window_transcript.txt"),
+    // QH-89 (tough-policy audit H): live replay attack on the anchor's
+    // pre-auth enrollment listener. Sabotage = enable the listener via a
+    // systemd drop-in, enrol once over the wire, replay sequentially +
+    // concurrently; detection = the attacker-observed fixed refusal + the
+    // on-disk ledger singleton + snapshot immutability, never a daemon
+    // self-report. Witness = the attack transcript under negative_control/.
+    // Impl + adjudication in `stage/negative_control_enrollment_replay.rs`.
+    NegativeControlEnrollmentTokenReplay => "negative_control_enrollment_token_replay" @ NegativeControl / T5NegativeControl / StageEvidence::File("negative_control/negative_control_enrollment_token_replay/replay_transcript.txt"),
     // Always-run overlay teardown (FinalCleanupStage pattern): vxlan link
     // residue on a guest is release-blocking exactly like exit-NAT residue,
     // so this must survive skip-cascade and run just before cleanup.
