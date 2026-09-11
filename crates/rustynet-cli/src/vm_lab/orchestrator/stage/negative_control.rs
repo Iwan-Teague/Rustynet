@@ -2967,6 +2967,12 @@ mod tests {
                 NegativeControlDaemonKillMidStageStage.id(),
                 "negative_control/negative_control_daemon_kill_mid_stage/kill_window_transcript.txt",
             ),
+            (
+                // QH-89: the live enrollment-replay control declares its attack
+                // transcript (impl in stage/negative_control_enrollment_replay.rs).
+                crate::vm_lab::orchestrator::stage::StageId::NegativeControlEnrollmentTokenReplay,
+                crate::vm_lab::orchestrator::stage::negative_control_enrollment_replay::REPLAY_TRANSCRIPT_RELATIVE,
+            ),
         ];
         let mut declared: HashSet<String> = HashSet::new();
         for (id, expected_path) in expected {
@@ -2987,7 +2993,7 @@ mod tests {
             StageId::NegativeControlPlantedResidue.evidence(),
             StageEvidence::StageLog
         );
-        assert_eq!(declared.len(), 3);
+        assert_eq!(declared.len(), 4);
     }
 
     fn planted_witness_temp_dir(label: &str) -> PathBuf {
