@@ -40,3 +40,10 @@ Wi-Fi drops every few seconds (link roams across three BSSIDs of the same SSID p
 ## 6) Scripts left on the hosts
 
 `~/lab_queue.sh` (serial queue: default → blind_exit → relay → anchor → admin → chaos2; stamped report dirs; records a "none: overnight queue" remedy on failed stages so the launch gate continues), `~/lab_rotate.sh` (stop queue, wait for the orchestrator, checkout, restart), `~/lab_queue_chaos_only.sh`, `~/katana_force_rotate.sh`. Logs: `state/host-lab-runs/queue-<host>.log`. Fetch host ledgers with the `git diff -U0` pattern and revert the host copies afterwards.
+
+## 7) Daytime addendum (2026-09-11, 17:00)
+
+- **Chaos plan clean on the `--node` engine**: 51 / 0 / 28 on lenovo-bot three times (`03033921`, `7e550cf4` hardened bins). Katana still shows two host-specific failures (libfaketime was absent on its guests — installed; crash-recovery convergence needed more than 90 s — window doubled); its confirmation run at `701f67e3` is queued behind a flaky Wi-Fi handoff.
+- **First cross-network rows live**: `cross_network_preflight` and `cross_network_nat_classification` pass on the netns substrate (lenovo-bot). The vxlan phase needs the two lenovo guests on distinct underlay /24s (host networking — owner) and is otherwise ready after `f50c0dd4`.
+- **Second-pass reviews (six, GLM flash)** are recorded in `NodeEngineSecondPassReviews_2026-09-11.md`; every finding is fixed and pushed (`fd083049`…`e417145f`), including the commit-scoped template-decline rule for the launch gate (with the real-patch-replaces-decline escape; all fifteen stale declines re-attributed).
+- Gotcha of the day: a bootstrap "presence" check must test each candidate path (`[ -r ]`), never a multi-glob `ls`, or provisioned guests fail bootstrap (`701f67e3`).
