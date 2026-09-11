@@ -329,7 +329,7 @@ fn run() -> Result<(), String> {
     ))?;
     // RAII fence mirroring two_hop's BundleSwapFence: every step between the
     // rule add (here) and the Stage 5 delete propagates with `?`, so a failure
-    // — or the worker dying — must not leave the client's WG port blocked
+    // — or a panic unwind — must not leave the client's WG port blocked
     // fleet-wide. Drop removes the whole idempotent test table.
     let mut nft_guard = NftBlockRuleGuard {
         armed: true,
