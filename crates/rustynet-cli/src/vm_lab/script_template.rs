@@ -807,7 +807,7 @@ export PATH="$HOME/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 
 echo "--- rn_bootstrap prerequisite check (its list, its PATH) ---"
 missing=0
-for cmd in curl git make pkg-config clang nft wg rustup tar gzip tcpdump ping dig; do
+for cmd in curl git make pkg-config clang nft wg rustup tar gzip tcpdump ping ip tc dig; do
   if command -v "$cmd" >/dev/null 2>&1; then printf "  %-12s ok\n" "$cmd"
   else printf "  %-12s MISSING\n" "$cmd"; missing=1; fi
 done

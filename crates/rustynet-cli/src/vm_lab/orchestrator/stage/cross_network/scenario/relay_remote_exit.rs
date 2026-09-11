@@ -32,10 +32,9 @@ use super::provisioning::{
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
-    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, WIREGUARD_PORT,
-    capture_root_allow_failure, exit_serving_route, netcheck, no_plaintext_passphrase_check,
-    path_proven_relay, relay_session_live, route_via_rustynet, signed_state_healthy, status,
-    wait_for_daemon_socket,
+    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, WIREGUARD_PORT, capture_peer_endpoints,
+    exit_serving_route, netcheck, no_plaintext_passphrase_check, path_proven_relay,
+    relay_session_live, route_via_rustynet, signed_state_healthy, status, wait_for_daemon_socket,
 };
 
 /// The scenario name used in fail-closed errors and the report suite field.
@@ -188,10 +187,7 @@ fn execute(
             &["ip", "-4", "route", "get", "1.1.1.1"],
         ),
     )?;
-    let relay_endpoints = during(
-        phase,
-        capture_root_allow_failure(relay.runner, &["wg", "show", "rustynet0", "endpoints"]),
-    )?;
+    let relay_endpoints = during(phase, capture_peer_endpoints(relay.runner))?;
     let client_plaintext_ok = during(phase, no_plaintext_passphrase_check(client.runner))?;
     let relay_plaintext_ok = during(phase, no_plaintext_passphrase_check(relay.runner))?;
     let exit_plaintext_ok = during(phase, no_plaintext_passphrase_check(exit.runner))?;

@@ -58,7 +58,7 @@ use super::remote_exit_common::{
     BYPASS_CHECKS, BypassRun, run_bypass_validator, write_trust_summary,
 };
 use super::{
-    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, Verdict, capture_root_allow_failure,
+    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, Verdict, capture_peer_endpoints,
     client_exit_selected, no_plaintext_passphrase_check, route_via_rustynet, status,
     wait_for_daemon_socket,
 };
@@ -632,8 +632,7 @@ fn soak_loop(
         )
         .unwrap_or_else(|_| ROUTE_FAILED.to_owned());
         let client_endpoints =
-            capture_root_allow_failure(client.runner, &["wg", "show", "rustynet0", "endpoints"])
-                .unwrap_or_else(|_| ENDPOINT_FAILED.to_owned());
+            capture_peer_endpoints(client.runner).unwrap_or_else(|_| ENDPOINT_FAILED.to_owned());
 
         let field = |key: &str| provisioning::extract_netcheck_value(&client_status, key);
         let path_mode = field("path_mode").unwrap_or_default();
