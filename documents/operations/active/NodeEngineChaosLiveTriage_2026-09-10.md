@@ -62,3 +62,18 @@ Same three failures (`chaos_crash_recovery`, `chaos_network_impairment`, `chaos_
 default 38/0/28 (twice), blind_exit 34/0/32, relay 36/0/30, anchor 34/0/32, admin 34/0/32 — **every role cell clean** once client-dependent live stages report-skip on an exit-only topology. Chaos + negative-control: **49 / 2 / 28**: `chaos_network_impairment` now passes (the TTL fix), `chaos_crash_recovery` recovers in 8 s with atomic state but samples `mesh_converged` once at the instant of recovery (bin fix: bounded poll), and `chaos_clock_attack`'s jump-forward leg reports `daemon_started_under_fault=true`, `post_epoch=0`, `future_state_rejected=false`. That last criterion looks mis-specified for a forward jump: existing state reads as *stale* under a clock 90 days ahead, not *future-dated*, so the counter it checks can never move; the leg needs its pass criterion re-derived from the daemon's actual fail-closed contract (D6) before it can be called a product failure.
 
 Chaos rerun on `f65e562e` (convergence poll): **50 / 1 / 28** — `chaos_crash_recovery` passes (mesh converged within the deadline); only the clock-attack jump-forward leg remains, pending its criterion re-derivation (D6).
+
+## Jump-forward criterion re-derived (2026-09-11, bin rewrite)
+
+Root cause of the permanent `future_state_rejected=false`: the criterion asserted a signal the daemon cannot produce on a forward jump. A +90-day faked clock puts the on-disk signed state BEHIND the daemon's clock, so the FutureDated arms (`generated_at_unix > now + skew`, 300 s) can never fire — what fires is Stale/Expired, the snapshot load is refused, and `membership_epoch` renders `none` (the old script coerced that to 0, then failed `0 >= baseline`). The counter the old gate demanded (`traversal_future_dated_rejections`) has exactly one increment site — `TraversalBootstrapError::FutureDated` — so it cannot move on a forward jump by construction.
+
+New pass criterion, in two phases:
+
+* **Phase A (under the fault, sampled ≥20 s after restart):**
+  1. Fail-closed posture, either accepted form (D6 left open): started with `restricted_safe_mode=true` AND a bootstrap error naming staleness ("is stale" / "expired"), OR refused to start outright (`daemon_started_under_fault=false`; status then unsampleable).
+  2. No future-dated misclassification: `traversal_future_dated_rejections` AND `dns_future_dated_rejections` stay at baseline (a rise would be the daemon misclassifying stale state as future-dated — a real defect).
+  3. `state=FailClosed` under the fault (covered by 1); `path_live_proven` reported as evidence that no dataplane ran.
+  4. Stale-rejection observed is REPORT-ONLY (live f760df74 stayed flat despite the code intending otherwise; not gated).
+* **Phase B (after the drop-in is removed and the daemon recovers within 180 s):** `restricted_safe_mode=false` (the clean-load restart is the only path that lifts the restriction) and `membership_epoch` numeric AND ≥ the real-clock baseline. The epoch comparison is POST-RECOVERY: under the fault `none` is the correct refusal, not a watermark write; a genuine watermark downgrade surfaces as recovered epoch < baseline.
+
+The backward leg keeps its semantics but follows the same epoch rule: a backward clock sits BEHIND the on-disk artifacts, so future-dated rejection IS its primary assertion; stale-state rejection stays secondary; the watermark is compared post-recovery. The drift leg is unchanged. New script keys (`snapshot_refused_under_fault`, `bootstrap_error_names_staleness`, `future_rejections_unchanged`, `stale_rejection_observed`, `path_live_proven`, `recovered_proven`, `recovered_epoch`, `future_dated_rejected`) are all parsed and land in the stage's JSON report.
