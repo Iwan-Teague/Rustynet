@@ -59,9 +59,13 @@ impl OrchestrationStage for LiveKeyCustodyValidationStage {
 
         let report_path = ctx.report_dir.join(KEY_CUSTODY_REPORT_RELATIVE);
         let log_path = ctx.report_dir.join("live_key_custody.log");
-        let report_path_str = report_path
-            .to_str()
-            .unwrap_or("live_key_custody_report.json");
+        let report_path_str = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &report_path,
+            "report path",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
         let log_path_str =
             match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
                 Ok(value) => value,

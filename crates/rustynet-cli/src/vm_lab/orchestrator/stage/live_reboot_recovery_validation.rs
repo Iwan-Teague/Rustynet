@@ -72,9 +72,14 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
         let exit_target = format!("{}@{}", exit_params.user, exit_params.host);
         let client_target = format!("{}@{}", client_params.user, client_params.host);
 
-        let report_path_str = report_path
-            .to_str()
-            .unwrap_or("live_reboot_recovery_report.json");
+        let report_path_str = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &report_path,
+            "report path",
+        ) {
+            Ok(value) => value,
+
+            Err(err) => return StageOutcome::Failed(err),
+        };
         let log_path_str =
             match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
                 Ok(value) => value,

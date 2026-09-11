@@ -84,9 +84,14 @@ impl OrchestrationStage for LiveManagedDnsValidationStage {
         let signer_target = format!("{}@{}", signer_params.user, signer_params.host);
         let client_target = format!("{}@{}", client_params.user, client_params.host);
 
-        let report_path_str = report_path
-            .to_str()
-            .unwrap_or("live_managed_dns_report.json");
+        let report_path_str = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &report_path,
+            "report path",
+        ) {
+            Ok(value) => value,
+
+            Err(err) => return StageOutcome::Failed(err),
+        };
         let log_path_str =
             match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
                 Ok(value) => value,

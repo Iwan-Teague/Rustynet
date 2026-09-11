@@ -57,9 +57,13 @@ impl OrchestrationStage for LiveSecretsNotInLogsValidationStage {
 
         let report_path = ctx.report_dir.join(SECRETS_REPORT_RELATIVE);
         let log_path = ctx.report_dir.join("live_secrets_not_in_logs.log");
-        let report_path_str = report_path
-            .to_str()
-            .unwrap_or("live_secrets_not_in_logs_report.json");
+        let report_path_str = match crate::vm_lab::orchestrator::stage::require_utf8_path(
+            &report_path,
+            "report path",
+        ) {
+            Ok(value) => value,
+            Err(err) => return StageOutcome::Failed(err),
+        };
         let log_path_str =
             match crate::vm_lab::orchestrator::stage::require_utf8_path(&log_path, "log path") {
                 Ok(value) => value,
