@@ -71,9 +71,9 @@ use super::provisioning::{
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
-    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, WIREGUARD_PORT,
-    capture_root_allow_failure, path_proven_direct, route_via_rustynet,
-    rustynet_capture_allow_failure, signed_state_healthy, status, wait_for_daemon_socket,
+    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, WIREGUARD_PORT, capture_peer_endpoints,
+    path_proven_direct, route_via_rustynet, rustynet_capture_allow_failure, signed_state_healthy,
+    status, wait_for_daemon_socket,
 };
 
 /// The scenario name used in fail-closed errors and the report suite field.
@@ -370,10 +370,7 @@ fn execute(
             &["ip", "-4", "route", "get", "1.1.1.1"],
         ),
     )?;
-    let client_endpoints = during(
-        phase,
-        capture_root_allow_failure(client.runner, &["wg", "show", "rustynet0", "endpoints"]),
-    )?;
+    let client_endpoints = during(phase, capture_peer_endpoints(client.runner))?;
 
     // Five clauses. The last is what makes this a ROAM proof rather than a
     // reconnect proof: the client's endpoint table must name the exit's NEW
@@ -515,8 +512,7 @@ fn monitor_failback(
             client.runner,
             &["ip", "-4", "route", "get", "1.1.1.1"],
         )?;
-        let client_endpoints =
-            capture_root_allow_failure(client.runner, &["wg", "show", "rustynet0", "endpoints"])?;
+        let client_endpoints = capture_peer_endpoints(client.runner)?;
         let client_netcheck = rustynet_capture_allow_failure(client.runner, &["netcheck"])?;
 
         if !traversal_state_valid(&client_netcheck) {
@@ -793,9 +789,15 @@ mod tests {
         FailbackRoamingOptions::new(DEFAULT_RECOVERY_SLO_SECS, iterations).expect("positive")
     }
 
-    fn monitor(client: &MockLeafRunner, iterations: u32) -> FailbackObservation {
+    fn monitor(client: &mut MockLeafRunner, iterations: u32) -> FailbackObservation {
+        // `capture_peer_endpoints` errors on an empty capture, so the script
+        // must answer the endpoint probe with the exit's endpoint.
+        client.stdout_by_match.push((
+            "wg show rustynet0 endpoints".to_owned(),
+            "peerkey\t192.168.19.40:51820".to_owned(),
+        ));
         let lab = super::super::node_network_switch::test_support::lab("/tmp/rustynet-cn3-tests");
-        let client_node = ScenarioNode::new(client, "client-1", "192.168.18.40");
+        let client_node = ScenarioNode::new(&*client, "client-1", "192.168.18.40");
         let exit_runner = MockLeafRunner::default();
         let exit_node = ScenarioNode::new(&exit_runner, EXIT_NODE_ID, "192.168.19.40");
         monitor_failback(&client_node, &exit_node, &lab, options(iterations)).expect("monitor")
@@ -827,8 +829,8 @@ mod tests {
         // Breaking early would stop looking exactly when a flapping client
         // becomes interesting, and the leak/signed-state checks are about the
         // whole window rather than the prefix before recovery.
-        let client = recovered_client();
-        let observed = monitor(&client, 4);
+        let mut client = recovered_client();
+        let observed = monitor(&mut client, 4);
         assert_eq!(observed.transcript.lines().count(), 4);
         assert!(observed.first_direct_unix.is_some());
         assert_eq!(observed.underlay_leak_samples, 0);
@@ -854,14 +856,14 @@ mod tests {
 
     #[test]
     fn every_leaking_sample_is_counted_not_just_the_first() {
-        let client = MockLeafRunner {
+        let mut client = MockLeafRunner {
             stdout_by_match: vec![(
                 "route get 1.1.1.1".to_owned(),
                 "1.1.1.1 via 192.168.18.1 dev enp0s1".to_owned(),
             )],
             ..MockLeafRunner::default()
         };
-        let observed = monitor(&client, 3);
+        let observed = monitor(&mut client, 3);
         assert_eq!(observed.underlay_leak_samples, 3);
         assert!(observed.first_direct_unix.is_none());
     }
@@ -888,7 +890,7 @@ mod tests {
 
     #[test]
     fn reconvergence_needs_a_proven_direct_path_not_merely_the_intent() {
-        let client = MockLeafRunner {
+        let mut client = MockLeafRunner {
             stdout_by_match: vec![
                 (
                     "rustynet status".to_owned(),
@@ -907,7 +909,7 @@ mod tests {
             ],
             ..MockLeafRunner::default()
         };
-        assert!(monitor(&client, 2).first_direct_unix.is_none());
+        assert!(monitor(&mut client, 2).first_direct_unix.is_none());
     }
 
     #[test]
@@ -915,7 +917,7 @@ mod tests {
         // The shell asked for `exit_node=`, a tunnel route and a proven direct
         // path — but not `state=ExitActive`, which the direct scenario does
         // check. Preserved rather than tightened.
-        let client = MockLeafRunner {
+        let mut client = MockLeafRunner {
             stdout_by_match: vec![
                 (
                     "rustynet status".to_owned(),
@@ -932,7 +934,7 @@ mod tests {
             ],
             ..MockLeafRunner::default()
         };
-        assert!(monitor(&client, 1).first_direct_unix.is_some());
+        assert!(monitor(&mut client, 1).first_direct_unix.is_some());
     }
 
     #[test]

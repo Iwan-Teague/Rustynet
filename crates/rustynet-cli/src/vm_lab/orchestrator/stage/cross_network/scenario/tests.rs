@@ -267,3 +267,89 @@ fn a_truncated_bypass_report_cannot_produce_a_pass() {
     }
     assert!(!bypass(&[]).no_underlay_leak);
 }
+
+// ───────────────────── backend-neutral endpoint capture ─────────────────────
+
+#[test]
+fn wg_show_endpoints_parser_accepts_the_tab_and_space_spellings() {
+    // The spelling the kernel tool actually prints: `<pubkey>\t<host:port>`.
+    assert_eq!(
+        parse_wg_show_endpoints(
+            "AbCdEf0123=\t192.168.0.10:51820\n0123456789=\t192.168.0.11:51820\n"
+        ),
+        vec!["192.168.0.10:51820", "192.168.0.11:51820"]
+    );
+    // A whitespace-separated spelling stays readable.
+    assert_eq!(
+        parse_wg_show_endpoints("key1 10.0.0.1:40000\nkey2 [2001:db8::1]:51820\n"),
+        vec!["10.0.0.1:40000", "[2001:db8::1]:51820"]
+    );
+    // Empty/absent output contributes nothing — the caller fails named.
+    assert!(parse_wg_show_endpoints("").is_empty());
+    assert!(parse_wg_show_endpoints("key-without-endpoint\n\n").is_empty());
+}
+
+#[test]
+fn daemon_managed_peer_endpoints_parser_reads_the_status_field() {
+    // The daemon status line spelling: `node_id/addr:port` joined by `+`,
+    // with `node_id/none` for a peer without an endpoint.
+    let status_line = "node_id=client-1 node_role=client managed_peer_endpoints_error=none \
+managed_peer_endpoints=exit-1/192.168.0.20:51820+relay-1/192.168.0.21:40001 path_mode=direct_active";
+    assert_eq!(
+        parse_daemon_managed_peer_endpoints(status_line),
+        vec!["192.168.0.20:51820", "192.168.0.21:40001"]
+    );
+    // `none` entries and a wholly-empty field contribute nothing.
+    assert_eq!(
+        parse_daemon_managed_peer_endpoints("managed_peer_endpoints=exit-1/none+relay-1/none"),
+        Vec::<String>::new()
+    );
+    assert!(
+        parse_daemon_managed_peer_endpoints("managed_peer_endpoints=none path_mode=x").is_empty()
+    );
+    assert!(parse_daemon_managed_peer_endpoints("node_id=only").is_empty());
+    // The `_error` sibling field must never be mistaken for the data field.
+    assert!(parse_daemon_managed_peer_endpoints("managed_peer_endpoints_error=boom").is_empty());
+}
+
+#[test]
+fn capture_peer_endpoints_falls_back_to_the_daemon_when_wg_yields_none() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    // A userspace-boringtun guest: `wg show` prints nothing (or the tool is
+    // absent → non-zero exit, tolerated), but the daemon status line names
+    // the endpoints.
+    let runner = MockLeafRunner {
+        stdout_by_match: vec![(
+            "status".to_owned(),
+            "node_id=c managed_peer_endpoints=exit-1/10.0.0.9:51820".to_owned(),
+        )],
+        ..MockLeafRunner::default()
+    };
+    let endpoints = capture_peer_endpoints(&runner).expect("daemon fallback must supply endpoints");
+    assert_eq!(endpoints, "10.0.0.9:51820");
+}
+
+#[test]
+fn capture_peer_endpoints_errors_named_when_neither_source_yields_endpoints() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    // Both sources answer successfully but carry no endpoints: the helper
+    // must return a NAMED error, never an empty capture.
+    let runner = MockLeafRunner::default();
+    let err = capture_peer_endpoints(&runner).expect_err("empty capture must be a named error");
+    assert!(err.contains("peer endpoints unavailable"), "{err}");
+    assert!(err.contains("wg show rustynet0 endpoints"), "{err}");
+    assert!(err.contains("managed_peer_endpoints"), "{err}");
+}
+
+// `wg show` renders a peer without an endpoint as `(none)`; it must not be
+// mistaken for an endpoint (review XNETREV).
+#[test]
+fn parse_wg_show_endpoints_drops_none_placeholders() {
+    let out = "AAAA=\t(none)\nBBBB=\t203.0.113.7:51820\n";
+    assert_eq!(
+        super::parse_wg_show_endpoints(out),
+        vec!["203.0.113.7:51820".to_owned()]
+    );
+}

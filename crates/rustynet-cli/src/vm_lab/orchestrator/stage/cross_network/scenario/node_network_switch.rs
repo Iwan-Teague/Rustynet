@@ -51,7 +51,7 @@ use super::endpoint_switch::{self, DefaultRoute, RoamAlias, SAMPLE_INTERVAL, uni
 use super::host::ScenarioHost;
 use super::provisioning::{self, LabContext, during, netcheck_counter};
 use super::{
-    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, capture_root_allow_failure,
+    Checks, ScenarioInputs, ScenarioNode, ScenarioOutcome, capture_peer_endpoints,
     no_plaintext_passphrase_check, route_via_rustynet, rustynet_capture_allow_failure, status,
     wait_for_daemon_socket,
 };
@@ -450,10 +450,8 @@ fn observe_transition(
         )?;
         let client_netcheck = rustynet_capture_allow_failure(client.runner, &["netcheck"])?;
         let exit_netcheck = rustynet_capture_allow_failure(exit.runner, &["netcheck"])?;
-        let client_endpoints =
-            capture_root_allow_failure(client.runner, &["wg", "show", "rustynet0", "endpoints"])?;
-        let exit_endpoints =
-            capture_root_allow_failure(exit.runner, &["wg", "show", "rustynet0", "endpoints"])?;
+        let client_endpoints = capture_peer_endpoints(client.runner)?;
+        let exit_endpoints = capture_peer_endpoints(exit.runner)?;
 
         let route_ok = route_via_rustynet(&client_route);
         if !route_ok {
@@ -706,11 +704,20 @@ mod tests {
     }
 
     fn observe(
-        client: &MockLeafRunner,
-        exit: &MockLeafRunner,
+        client: &mut MockLeafRunner,
+        exit: &mut MockLeafRunner,
         options: NodeNetworkSwitchOptions,
         baseline: &Baseline<'_>,
     ) -> Result<Observation, String> {
+        // `capture_peer_endpoints` errors on an empty capture, so both ends'
+        // scripts must answer the endpoint probe with the post-switch
+        // endpoint the scenario looks for.
+        let endpoint_script = (
+            "wg show rustynet0 endpoints".to_owned(),
+            format!("peerkey\t{}", alias().wireguard_endpoint()),
+        );
+        client.stdout_by_match.push(endpoint_script.clone());
+        exit.stdout_by_match.push(endpoint_script);
         let lab = test_support::lab("/tmp/rustynet-cn3-tests");
         let client_node = ScenarioNode::new(client, "client-1", "192.168.18.40");
         let exit_node = ScenarioNode::new(exit, EXIT_NODE_ID, "192.168.19.40");
@@ -727,11 +734,11 @@ mod tests {
 
     #[test]
     fn a_converged_client_stops_sampling_on_the_first_clean_sample() {
-        let client = converged_client();
-        let exit = healthy_exit();
+        let mut client = converged_client();
+        let mut exit = healthy_exit();
         let observed = observe(
-            &client,
-            &exit,
+            &mut client,
+            &mut exit,
             NodeNetworkSwitchOptions::default(),
             &before(),
         )
@@ -754,10 +761,10 @@ mod tests {
     fn a_client_that_never_reconverges_runs_the_whole_window_and_reports_no_reconnect() {
         // Nothing scripted: no exit selected, no route through the tunnel, no
         // healthy signed state.
-        let client = MockLeafRunner::default();
-        let exit = MockLeafRunner::default();
+        let mut client = MockLeafRunner::default();
+        let mut exit = MockLeafRunner::default();
         let options = NodeNetworkSwitchOptions::new(3).expect("positive slo");
-        let observed = observe(&client, &exit, options, &before()).expect("observe");
+        let observed = observe(&mut client, &mut exit, options, &before()).expect("observe");
 
         assert!(observed.reconnect_unix.is_none());
         assert_eq!(observed.reconnect_secs(1000), None);
@@ -777,7 +784,7 @@ mod tests {
         // The client converges on the second sample, but the first one routed
         // in the clear. That window is exactly what this scenario exists to
         // inspect, so the leak must survive the later recovery.
-        let client = MockLeafRunner {
+        let mut client = MockLeafRunner {
             stdout_for: vec![(
                 // The first sample's `route get`. `apply_alias` runs three
                 // calls first — `ip addr show`, `ip addr add`, `ip route
@@ -787,10 +794,10 @@ mod tests {
             )],
             ..converged_client()
         };
-        let exit = healthy_exit();
+        let mut exit = healthy_exit();
         let observed = observe(
-            &client,
-            &exit,
+            &mut client,
+            &mut exit,
             NodeNetworkSwitchOptions::default(),
             &before(),
         )
@@ -808,11 +815,11 @@ mod tests {
         // The shell required BOTH the before and after values to be non-empty.
         // Absence is not evidence of change, and treating it as such would let
         // a daemon that reports no fingerprint at all pass this check.
-        let client = converged_client();
-        let exit = healthy_exit();
+        let mut client = converged_client();
+        let mut exit = healthy_exit();
         let observed = observe(
-            &client,
-            &exit,
+            &mut client,
+            &mut exit,
             NodeNetworkSwitchOptions::default(),
             &Baseline {
                 fingerprint: None,
@@ -825,11 +832,11 @@ mod tests {
 
     #[test]
     fn an_unchanged_reissue_counter_does_not_trigger_the_reissue_check() {
-        let client = converged_client();
-        let exit = healthy_exit();
+        let mut client = converged_client();
+        let mut exit = healthy_exit();
         let observed = observe(
-            &client,
-            &exit,
+            &mut client,
+            &mut exit,
             NodeNetworkSwitchOptions::default(),
             &Baseline {
                 fingerprint: Some("before"),

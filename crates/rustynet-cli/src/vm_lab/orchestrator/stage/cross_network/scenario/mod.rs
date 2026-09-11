@@ -426,6 +426,101 @@ pub fn netcheck(runner: &dyn NetLeafRunner) -> Result<String, String> {
     rustynet_capture(runner, &["netcheck"])
 }
 
+// ───────────────────────── peer-endpoint capture ─────────────────────────
+
+/// Backend-neutral capture of a node's WireGuard peer endpoints, one
+/// `host:port` endpoint per output line — the same spelling
+/// [`ScenarioNode::wireguard_endpoint`] produces, so a caller's
+/// `endpoints.contains(&peer.wireguard_endpoint())` works unchanged over
+/// either source.
+///
+/// Two sources, tried in order:
+///
+/// 1. `wg show rustynet0 endpoints` — the kernel-WireGuard spelling: one
+///    `<peer-public-key>\t<host:port>` line per peer.
+/// 2. The daemon's own view: `rustynet status`, whose status line carries the
+///    `managed_peer_endpoints=` field — entries are `node_id/addr:port`
+///    joined by `+` (with `node_id/none` for a peer the daemon holds no
+///    endpoint for), built by `managed_peer_endpoints_summary` and emitted in
+///    the daemon's status response format (`crates/rustynetd/src/daemon.rs`,
+///    status line `managed_peer_endpoints={} …`). That is the ONLY
+///    daemon-side field carrying peer endpoints: the `netcheck` line reports
+///    path/traversal health but no endpoint table, so it cannot substitute.
+///    A userspace-boringtun guest owns a plain TUN device `wg` cannot see,
+///    which is exactly the case source 2 exists for.
+///
+/// A named error when NEITHER source yields an endpoint. An empty capture is
+/// never returned: callers grep this text as verdict evidence, and an empty
+/// set would silently fail every check instead of saying why.
+pub fn capture_peer_endpoints(runner: &dyn NetLeafRunner) -> Result<String, String> {
+    // Source 1 tolerates a non-zero exit: a missing `wg` tool or a device the
+    // tool cannot see is precisely the case source 2 covers. A *transport*
+    // failure still fails closed (capture_root_allow_failure's contract).
+    let wg_output = capture_root_allow_failure(runner, &["wg", "show", "rustynet0", "endpoints"])?;
+    let wg_endpoints = parse_wg_show_endpoints(&wg_output);
+    if !wg_endpoints.is_empty() {
+        return Ok(wg_endpoints.join("\n"));
+    }
+    let status_line = status(runner)?;
+    let daemon_endpoints = parse_daemon_managed_peer_endpoints(&status_line);
+    if !daemon_endpoints.is_empty() {
+        return Ok(daemon_endpoints.join("\n"));
+    }
+    Err(
+        "peer endpoints unavailable: `wg show rustynet0 endpoints` yielded none AND the \
+         daemon status line carries no managed_peer_endpoints entries (no peer has an \
+         endpoint yet, or the daemon is unreachable)"
+            .to_owned(),
+    )
+}
+
+/// Parse `wg show <iface> endpoints` output — one
+/// `<peer-public-key>\t<host:port>` line per peer — into the endpoint column.
+/// Both the tab-separated spelling the tool prints and a plain
+/// whitespace-separated spelling are accepted; lines without a second field
+/// contribute nothing.
+pub fn parse_wg_show_endpoints(output: &str) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // `wg show <iface> endpoints` prints `<pubkey>\t(none)` for a peer with
+        // no endpoint yet: that is "no datum", not an endpoint.
+        if let Some(endpoint) = line.split_whitespace().nth(1)
+            && endpoint != "(none)"
+        {
+            endpoints.push(endpoint.to_owned());
+        }
+    }
+    endpoints
+}
+
+/// Parse the daemon `status` line's `managed_peer_endpoints=` field into
+/// `host:port` endpoints. Entries are `node_id/addr:port` joined by `+`;
+/// `node_id/none` records a peer the daemon holds no endpoint for and
+/// contributes nothing. An absent or empty field yields an empty vec — the
+/// caller turns that into a named error rather than an empty capture.
+pub fn parse_daemon_managed_peer_endpoints(status_line: &str) -> Vec<String> {
+    let mut endpoints = Vec::new();
+    for field in status_line.split_whitespace() {
+        let Some(value) = field.strip_prefix("managed_peer_endpoints=") else {
+            continue;
+        };
+        for entry in value.split('+') {
+            let Some((node_id, endpoint)) = entry.split_once('/') else {
+                continue;
+            };
+            if node_id.is_empty() || endpoint.is_empty() || endpoint == "none" {
+                continue;
+            }
+            endpoints.push(endpoint.to_owned());
+        }
+    }
+    endpoints
+}
+
 /// Retry `argv` as root until it succeeds, up to `attempts` times, sleeping
 /// `sleep` between tries. Mirrors `live_lab_retry_root`, including its final
 /// behaviour: the last attempt's failure is the returned error, so the caller

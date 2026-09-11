@@ -398,11 +398,51 @@ fn run_nat_classification(
     // No python3 requirement any more — the netns probes are the Rust
     // `rustynet-netns-probe` binary. `nft` and `ip` do the topology work and
     // `systemd-run` runs the STUN responders as transient units, so all three
-    // are hard prerequisites.
-    let dependency_check = "sudo -n bash -lc 'nft --version >/dev/null 2>&1 && ip -V >/dev/null 2>&1 && systemd-run --version >/dev/null 2>&1'";
-    if let Some(outcome) =
-        run_ssh_checked(&host, dependency_check, &log_path, "netns dependency check")
-    {
+    // are hard prerequisites. A bare exit code says only "something is
+    // missing"; each check instead prints a `missing_<thing>=true` marker
+    // into the stage log so the operator knows exactly which package or
+    // setting to fix.
+    //
+    // Two halves, matched to the two execution contexts this stage uses:
+    // the probe build runs as the SSH user (source tree + cargo must be on
+    // the USER's PATH), while the topology itself is built by root (nft/ip/
+    // systemd-run). The veth probe is a create-then-delete around loopback —
+    // zero residue on success — and proves the guest kernel can actually
+    // build netns topology, which no `--version` check can see.
+    // A non-login ssh shell has no `$HOME/.cargo/bin` on PATH (the probe
+    // build below runs under `bash -lc` for the same reason), so the check
+    // must run in the same login-shell context or it reports `missing_cargo`
+    // on every correctly bootstrapped guest (review XNETREV).
+    let user_dependency_check = concat!(
+        "bash -lc 'm=0; ",
+        "test -d \"$HOME/Rustynet\" || { echo missing_rustynet_source_tree=true >&2; m=1; }; ",
+        "cargo --version >/dev/null 2>&1 || { echo missing_cargo=true >&2; m=1; }; ",
+        "exit $m'",
+    );
+    if let Some(outcome) = run_ssh_checked(
+        &host,
+        user_dependency_check,
+        &log_path,
+        "netns user dependency check (source tree, cargo)",
+    ) {
+        return outcome;
+    }
+    let root_dependency_check = concat!(
+        "sudo -n bash -lc 'm=0; ",
+        "nft --version >/dev/null 2>&1 || { echo missing_nft=true; m=1; }; ",
+        "ip -V >/dev/null 2>&1 || { echo missing_ip=true; m=1; }; ",
+        "systemd-run --version >/dev/null 2>&1 || { echo missing_systemd_run=true; m=1; }; ",
+        "if ip link add rnsim-probe0 type veth peer name rnsim-probe1 >/dev/null 2>&1; then ",
+        "ip link del rnsim-probe0 >/dev/null 2>&1 || true; ",
+        "else echo missing_veth_kernel_support=true; m=1; fi; ",
+        "exit $m'",
+    );
+    if let Some(outcome) = run_ssh_checked(
+        &host,
+        root_dependency_check,
+        &log_path,
+        "netns root dependency check (nft/ip/systemd-run, veth probe)",
+    ) {
         return outcome;
     }
 
@@ -1054,7 +1094,12 @@ struct CrossNetworkTopology {
 
 impl CrossNetworkTopology {
     fn resolve(ctx: &OrchestrationContext) -> Result<Self, TopologyError> {
-        let client = ssh_params_for_role(ctx, "client").map_err(TopologyError::Message)?;
+        // A topology without a client cannot dispatch the scenario suites: that
+        // is the declared skip the role cells expect (review B, 2026-09-11),
+        // not an internal desync. Exit stays `Message`: preflight guarantees
+        // it, so its absence IS a desync.
+        let client =
+            ssh_params_for_role(ctx, "client").map_err(|_| TopologyError::MissingRole(()))?;
         let exit = ssh_params_for_role(ctx, "exit").map_err(TopologyError::Message)?;
         let relay = ssh_params_for_any_role(ctx, &["entry", "aux"])
             .map_err(|_| TopologyError::MissingRole(()))?;
