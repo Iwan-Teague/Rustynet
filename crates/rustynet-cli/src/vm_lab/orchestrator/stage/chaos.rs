@@ -131,6 +131,15 @@ chaos_stage!(
 );
 
 fn run_chaos_bin(ctx: &OrchestrationContext, spec: &ChaosBinSpec) -> StageOutcome {
+    // Role cells run `exit + <role>` with no client: a client-dependent chaos
+    // bin cannot run there, and the answer is the same declared skip the live
+    // stages report (review B, 2026-09-11), never a stage failure.
+    if matches!(spec.targets, ChaosTargets::ExitAndClient)
+        && let Some(skip) =
+            crate::vm_lab::orchestrator::stage::exit_only_topology_skip(ctx, spec.name)
+    {
+        return skip;
+    }
     let report_path = ctx.report_dir.join(format!("{}_report.json", spec.name));
     let log_path = ctx.report_dir.join(format!("{}.log", spec.name));
 
@@ -295,6 +304,49 @@ fn stderr_snippet(stderr: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Review B (2026-09-11): the three client-dependent chaos bins must
+    // report the topology gap on an exit-only cell, not fail.
+    #[test]
+    fn client_dependent_chaos_bin_skips_on_an_exit_only_topology() {
+        use crate::vm_lab::orchestrator::role::NodeRole;
+        use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+        use std::collections::HashMap;
+        let mut ctx = OrchestrationContext {
+            assignments: vec![NodeRoleAssignment {
+                alias: "exit-1".to_owned(),
+                role: NodeRole::Exit,
+            }],
+            adapters: HashMap::new(),
+            source_archive: None,
+            report_dir: std::env::temp_dir(),
+            stage_outcomes: HashMap::new(),
+            collected_pubkeys: HashMap::new(),
+            collected_gossip_identities: HashMap::new(),
+            network_id: "net".to_owned(),
+            node_ids: HashMap::new(),
+            ssh_allow_cidrs: String::new(),
+            membership_snapshot: None,
+            mesh_ips: HashMap::new(),
+            endpoints: HashMap::new(),
+            reflexive_endpoints: HashMap::new(),
+            lab_stun_servers: Vec::new(),
+            linux_backend: None,
+            orchestrator_dialect: None,
+            substrate: None,
+            substrate_record: None,
+            inventory_path: None,
+            macos_anchor_validators_elected: false,
+            macos_role_transition_elected: false,
+            macos_reboot_recovery_elected: false,
+            relay_forwarding_validation_elected: false,
+        };
+        let outcome = ChaosDaemonFaultStage.execute(&mut ctx);
+        assert!(
+            matches!(&outcome, StageOutcome::Skipped(reason) if reason.contains("no client node")),
+            "{outcome:?}"
+        );
+    }
 
     #[test]
     fn chaos_report_shape_requires_a_json_object_with_a_verdict() {
