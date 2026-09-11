@@ -515,7 +515,13 @@ install_faketime() {{
   # The restart may legitimately FAIL: a daemon that refuses to come up
   # under the injected clock is an observation (fail-closed at start),
   # not a script error — record it instead of aborting under `set -e`.
-  if systemctl restart "$service" >/dev/null 2>&1; then
+  # `systemctl restart` returning 0 only means the start job was queued;
+  # a daemon that refuses the injected clock exits a moment later (live
+  # 2026-09-11: "trust preflight failed: trust evidence is stale", exit 65).
+  # Judge the unit's state after a settle, not the restart's exit code.
+  systemctl restart "$service" >/dev/null 2>&1 || true
+  sleep 5
+  if systemctl is-active --quiet "$service" && [ -S "$socket_path" ]; then
     printf 'daemon_started_under_fault=true\n'
   else
     printf 'daemon_started_under_fault=false\n'
@@ -610,18 +616,33 @@ if [ "$post_stale_rej" -gt "$baseline_stale_rej" ] || [ "$post_dns_stale_rej" -g
   stale_rejection_observed=true
 fi
 printf 'stale_rejection_observed=%s\n' "$stale_rejection_observed"
-# Evidence that no dataplane ran under the fault (FailClosed posture).
-path_live_proven=true
-if [ "$post_state" = "FailClosed" ]; then
-  path_live_proven=false
-fi
+# Evidence that no dataplane ran under the fault (FailClosed posture). An
+# unsampleable status is UNKNOWN, never "live": the verdict then rests on
+# the refused-start form alone.
+case "$post_state" in
+  '') path_live_proven=none ;;
+  FailClosed) path_live_proven=false ;;
+  *) path_live_proven=true ;;
+esac
 printf 'path_live_proven=%s\n' "$path_live_proven"
 remove_faketime
 wait_recovered
-recovered_epoch="$(status_field membership_epoch)"
-case "$recovered_epoch" in ''|*[!0-9]*) recovered_epoch=none ;; esac
+# Socket-up precedes bootstrap-complete by seconds (live 2026-09-11: the
+# epoch read `none` when sampled at the instant the socket appeared). Poll
+# until the daemon reports a numeric epoch and an unrestricted posture, or
+# the deadline, before judging recovery.
+recovered_epoch=none
+recovered_restricted=""
+sample_end_unix="$((start_unix + deadline))"
+while :; do
+  recovered_epoch="$(status_field membership_epoch)"
+  case "$recovered_epoch" in ''|*[!0-9]*) recovered_epoch=none ;; esac
+  recovered_restricted="$(status_field restricted_safe_mode)"
+  if [ "$recovered_epoch" != none ] && [ "$recovered_restricted" = "false" ]; then break; fi
+  [ "$(date +%s)" -ge "$sample_end_unix" ] && break
+  sleep 2
+done
 printf 'recovered_epoch=%s\n' "$recovered_epoch"
-recovered_restricted="$(status_field restricted_safe_mode)"
 printf 'recovered_restricted=%s\n' "$recovered_restricted"
 if [ "$recovered_restricted" = "false" ]; then
   printf 'recovered_proven=true\n'
@@ -808,6 +829,10 @@ impl ClockStageObservation {
             match value(key) {
                 Some("true") => Ok(Some(true)),
                 Some("false") => Ok(Some(false)),
+                // The script writes `none` when the datum could not be sampled
+                // (e.g. status unanswerable under the fault): unknown, never a
+                // verdict either way.
+                Some("none") => Ok(None),
                 Some(other) => Err(format!("invalid boolean for {key}: {other}")),
                 None => Ok(None),
             }
@@ -1244,6 +1269,38 @@ mod tests {
 
     // Review 2026-09-11 blocker: an unsampleable baseline used to coerce to 0,
     // which turned the post-recovery anti-rollback gate into `>= 0`.
+    // Live 2026-09-11: `systemctl restart` returned 0 while the daemon exited
+    // a second later refusing the clock; and the post-recovery epoch was
+    // sampled before bootstrap finished. Both are observation bugs.
+    #[test]
+    fn remote_script_judges_fault_start_by_unit_state_and_polls_post_recovery() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        let install = script.find("install_faketime() {").expect("install fn");
+        let body = &script[install..install + 900];
+        assert!(body.contains("sleep 5"), "{body}");
+        assert!(
+            body.contains("systemctl is-active --quiet \"$service\" && [ -S \"$socket_path\" ]"),
+            "{body}"
+        );
+        assert!(
+            script.contains("sample_end_unix=\"$((start_unix + deadline))\""),
+            "{script}"
+        );
+        assert!(script.contains("'') path_live_proven=none ;;"), "{script}");
+    }
+
+    // An unsampleable dataplane state is unknown: with the daemon reported
+    // as started, the leg cannot claim FailClosed and must fail.
+    #[test]
+    fn jump_forward_fails_when_dataplane_state_is_unknown_but_daemon_started() {
+        let output =
+            forward_pass_output().replace("path_live_proven=false", "path_live_proven=none");
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert_eq!(observation.path_live_proven, None);
+        assert!(!observation.passed_jump_forward(180));
+    }
+
     #[test]
     fn remote_script_never_coerces_an_epoch_comparison_to_zero() {
         let config = parse(&["--dry-run"]).expect("dry-run config should parse");
