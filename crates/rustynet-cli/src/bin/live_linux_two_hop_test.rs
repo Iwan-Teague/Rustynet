@@ -1826,7 +1826,7 @@ impl Drop for BundleSwapFence {
                 &self.identity,
                 &self.known_hosts,
                 host,
-                "systemctl start rustynetd.service",
+                restart_rustynetd_command(),
             ) {
                 eprintln!(
                     "warning: could not restart rustynetd on {host} after an aborted bundle swap: {err}"
@@ -1841,6 +1841,15 @@ impl Drop for BundleSwapFence {
             }
         }
     }
+}
+
+/// Restart command for the quiesce fence's Drop path. `reset-failed` clears
+/// the unit's start limiter first: a daemon that auto-restart-failed inside
+/// the quiesce window arms it, and a bare `systemctl start` is then refused
+/// ("Start request repeated too quickly") — the live 2026-09-10 cascade
+/// class that left every later stage inheriting a dead daemon.
+fn restart_rustynetd_command() -> &'static str {
+    "systemctl reset-failed rustynetd.service >/dev/null 2>&1; systemctl start rustynetd.service"
 }
 
 fn refresh_signed_state(identity: &Path, known_hosts: &Path, target: &str) -> Result<(), String> {
@@ -2559,6 +2568,24 @@ fn route_output_names_windows_tunnel_alias(route_output: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // The quiesce fence's Drop restart must clear the unit's start limiter
+    // before starting: a bare `systemctl start` on a latched unit is refused
+    // and the exit stays down for every later stage (live 2026-09-10 class).
+    #[test]
+    fn fence_drop_restart_resets_start_limit_before_start() {
+        let cmd = super::restart_rustynetd_command();
+        let reset = cmd
+            .find("systemctl reset-failed rustynetd.service")
+            .expect("reset-failed present");
+        let start = cmd
+            .find("systemctl start rustynetd.service")
+            .expect("start present");
+        assert!(
+            reset < start,
+            "reset-failed must precede the fence's restart: {cmd}"
+        );
+    }
+
     #[test]
     fn status_field_extracts_managed_peer_endpoints() {
         let status = "node_id=client-2 managed_peer_endpoints=client-1/192.168.64.24:51820+exit-1/192.168.64.22:51820 managed_peer_endpoints_error=none";

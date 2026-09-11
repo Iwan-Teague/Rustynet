@@ -264,6 +264,11 @@ fn run() -> Result<(), String> {
 
     // ── Stage 4: restart admin daemon and wait ────────────────────────────────
     logger.line("[enrollment-restart] restarting admin daemon")?;
+    // Clear systemd's failed-start counter before starting: the SIGKILL may
+    // have been preceded by failed auto-restarts that armed the unit's start
+    // limiter, and the `systemctl start` would then be refused ("Start
+    // request repeated too quickly") — the key-custody pattern.
+    let _ = ctx.run_root_allow_failure(&admin_host, &["systemctl", "reset-failed", "rustynetd"]);
     let _ = ctx.run_root_allow_failure(&admin_host, &["systemctl", "start", "rustynetd"]);
     std::thread::sleep(std::time::Duration::from_secs(8));
 
@@ -489,4 +494,22 @@ fn print_usage() {
         [--report-path <path>] \
         [--log-path <path>]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    // Review BINSREV F1: the start-limit reset must precede the start in run().
+    #[test]
+    fn start_resets_start_limit_before_start() {
+        let source = include_str!("live_linux_enrollment_restart_test.rs");
+        let impl_end = source.find("\n#[cfg(test)]").unwrap_or(source.len());
+        let body = &source[..impl_end];
+        let reset = body
+            .find("\"reset-failed\"")
+            .expect("reset-failed must be issued before the start");
+        let start = body[reset..]
+            .find("\"start\"")
+            .expect("a start follows the reset-failed");
+        assert!(start > 0, "reset-failed must precede the start");
+    }
 }

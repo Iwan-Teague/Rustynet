@@ -227,7 +227,7 @@ fn run() -> Result<(), String> {
             "/var/lib/rustynet/rustynetd.assignment.watermark",
         ],
     );
-    ctx.run_root(&client_host, &["systemctl", "restart", "rustynetd.service"])?;
+    reset_failed_then_restart_rustynetd(&ctx, &client_host)?;
     std::thread::sleep(std::time::Duration::from_secs(3));
     ctx.wait_for_daemon_socket(&client_host, &socket_path, 20, 1)?;
 
@@ -262,7 +262,7 @@ fn run() -> Result<(), String> {
             "/var/lib/rustynet/rustynetd.assignment.watermark",
         ],
     );
-    ctx.run_root(&client_host, &["systemctl", "restart", "rustynetd.service"])?;
+    reset_failed_then_restart_rustynetd(&ctx, &client_host)?;
     rollback.backup_path = None;
     std::thread::sleep(std::time::Duration::from_secs(3));
     ctx.wait_for_daemon_socket(&client_host, &socket_path, 20, 1)?;
@@ -355,6 +355,12 @@ impl Drop for EndpointHijackRollback {
             &self.client_host,
             &["rm", "-f", backup_path, &self.watermark_path],
         );
+        // reset-failed first: the Drop path fires after an abort, where the
+        // unit may have auto-restart-failed and latched its start limiter.
+        let _ = self.ctx.run_root_allow_failure(
+            &self.client_host,
+            &["systemctl", "reset-failed", "rustynetd.service"],
+        );
         let _ = self.ctx.run_root_allow_failure(
             &self.client_host,
             &["systemctl", "restart", "rustynetd.service"],
@@ -366,6 +372,25 @@ impl Drop for EndpointHijackRollback {
             );
         }
     }
+}
+
+/// `systemctl restart rustynetd.service` preceded by `reset-failed`: a daemon
+/// that auto-restart-failed earlier arms the unit's start limiter, and a bare
+/// restart is then refused ("Start request repeated too quickly") — the live
+/// 2026-09-10 cascade class that left the node down for later stages.
+/// `reset-failed` itself is best-effort: on the happy path nothing is failed
+/// and the limiter is not armed.
+fn reset_failed_then_restart_rustynetd(ctx: &LiveLabContext, host: &str) -> Result<(), String> {
+    let _ = ctx.run_root_allow_failure(host, reset_failed_rustynetd_command());
+    ctx.run_root(host, restart_rustynetd_command())
+}
+
+fn reset_failed_rustynetd_command() -> &'static [&'static str] {
+    &["systemctl", "reset-failed", "rustynetd.service"]
+}
+
+fn restart_rustynetd_command() -> &'static [&'static str] {
+    &["systemctl", "restart", "rustynetd.service"]
 }
 
 fn required_value(args: &[String], idx: usize, flag: &str) -> Result<String, String> {
@@ -390,4 +415,31 @@ fn now_unix() -> String {
 
 fn now_utc() -> String {
     now_unix()
+}
+
+#[cfg(test)]
+mod tests {
+    // Every rustynetd restart in this bin (happy path and rollback Drop) must
+    // clear the unit's start limiter first: a daemon that auto-restart-failed
+    // arms the limiter, and a bare restart is refused ("Start request
+    // repeated too quickly") — the live 2026-09-10 cascade class.
+    #[test]
+    fn restarts_reset_start_limit_before_start() {
+        let reset = super::reset_failed_rustynetd_command();
+        let restart = super::restart_rustynetd_command();
+        // The pair must run reset-failed FIRST, then restart.
+        let pair: Vec<&&str> = reset.iter().chain(restart.iter()).collect();
+        let reset_idx = pair
+            .iter()
+            .position(|c| **c == "reset-failed")
+            .expect("reset-failed in the command pair");
+        let restart_idx = pair
+            .iter()
+            .position(|c| **c == "restart")
+            .expect("restart in the command pair");
+        assert!(
+            reset_idx < restart_idx,
+            "reset-failed must precede restart: {reset:?} then {restart:?}"
+        );
+    }
 }

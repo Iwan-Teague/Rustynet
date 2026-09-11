@@ -438,7 +438,7 @@ printf 'client_plaintext_leak_check=%s\n' "$client_plaintext_leak_check"
 
 /// Renders the remote netem-impairment script. Mirrors the proven daemon-fault
 /// kill script EXACTLY for everything safety-critical:
-///   * `trap cleanup EXIT` is armed BEFORE any impairment is applied, and the
+///   * `trap cleanup EXIT HUP INT TERM` is armed BEFORE any impairment is applied, and the
 ///     marker `teardown_registered_before_fault=true` is the first thing
 ///     printed,
 ///   * tcpdump/timeout/tc/ip preflight,
@@ -492,7 +492,7 @@ cleanup() {{
   fi
   rm -rf "$work_dir"
 }}
-trap cleanup EXIT
+trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
 command -v tcpdump >/dev/null 2>&1 || {{ printf 'missing_tcpdump=true\n'; exit 1; }}
 command -v timeout >/dev/null 2>&1 || {{ printf 'missing_timeout=true\n'; exit 1; }}
@@ -511,6 +511,8 @@ if [ "$capture_interface" = "rustynet0" ]; then
   exit 1
 fi
 printf 'capture_interface=%s\n' "$capture_interface"
+# The CIDR is spliced into a BPF string; charset-validate it first.
+case "$mesh_cidr" in ''|*[!A-Za-z0-9.:/]*) printf 'invalid_mesh_cidr=true\n'; exit 1 ;; esac
 filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
 timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" > "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
 tcpdump_pid="$!"
@@ -782,6 +784,34 @@ mod tests {
             path_pos < first_lookup,
             "PATH must precede the first lookup:\n{script}"
         );
+    }
+
+    // The teardown trap must survive the SSH session dying (orchestrator
+    // SIGKILL/timeout): a POSIX shell may not run an EXIT-only trap on
+    // SIGHUP, which would leave a netem qdisc or a shrunk MTU in place.
+    #[test]
+    fn remote_script_arms_teardown_against_session_death() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_impairment_script(&config);
+        assert!(
+            script.contains("trap cleanup EXIT HUP INT TERM"),
+            "{script}"
+        );
+    }
+
+    // The CIDR reaches a BPF string; it must be charset-validated first so no
+    // metacharacter survives into tcpdump's filter.
+    #[test]
+    fn remote_script_validates_mesh_cidr_before_bpf_splice() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_impairment_script(&config);
+        let validate = script
+            .find("case \"$mesh_cidr\" in ''|*[!A-Za-z0-9.:/]*) printf 'invalid_mesh_cidr=true\\n'")
+            .expect("mesh_cidr charset validation present");
+        let filter = script
+            .find("filter=\"ip and src net $mesh_cidr")
+            .expect("filter build");
+        assert!(validate < filter, "validate before splice:\n{script}");
     }
 
     #[test]
