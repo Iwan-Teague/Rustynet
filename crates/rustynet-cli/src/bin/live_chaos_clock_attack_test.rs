@@ -18,14 +18,23 @@
 //!
 //! Stages (TUF freeze/rollback/skew-tolerance defenses):
 //!   * `chaos_clock_jump_forward_past_max_age` — jump the daemon clock PAST a
-//!     signed bundle's max-age. The daemon must treat its live signed state as
-//!     future-dated/expired and REJECT it (freeze defense, F10); after the
-//!     faketime drop-in is removed and the daemon clock resyncs, it must
-//!     recover (re-handshake / re-prove its path) within the recovery deadline.
+//!     signed bundle's max-age (Phase A): a +90-day faked clock puts the
+//!     on-disk state BEHIND the daemon's clock, so the daemon correctly
+//!     classifies it STALE/expired — never future-dated — and fails closed:
+//!     `restricted_safe_mode=true`, `state=FailClosed`, a bootstrap error
+//!     naming staleness, or a refused start. The future-dated rejection
+//!     counters must stay at baseline (any rise would be a misclassification
+//!     defect). Phase B: after the faketime drop-in is removed and the clock
+//!     resyncs, the daemon must clear the restriction, recover within the
+//!     deadline, and hold `membership_epoch >= ` the real-clock baseline
+//!     (freeze defense, F10).
 //!   * `chaos_clock_jump_backward_past_replay_window` — jump the daemon clock
-//!     BACKWARD beyond the replay watermark window. The replay watermark
-//!     (`membership_epoch`) must NOT regress and a stale (superseded-epoch)
-//!     bundle must be rejected (rollback defense, F8).
+//!     BACKWARD beyond the replay watermark window. Under a backward jump the
+//!     daemon clock sits BEHIND the on-disk artifacts, so future-dated
+//!     rejection IS the primary assertion; a stale (superseded-epoch) bundle
+//!     must also be rejected, and the replay watermark (`membership_epoch`)
+//!     must NOT regress when measured POST-RECOVERY against the real-clock
+//!     baseline (rollback defense, F8).
 //!   * `chaos_clock_skew_slow_drift` — drift within accepted skew is tolerated
 //!     (no spurious rejection, daemon stays proven); out-of-window drift fails
 //!     closed (F16).
@@ -109,13 +118,13 @@ fn clock_attack_stages() -> Vec<ChaosStage> {
         ChaosStage {
             name: "chaos_clock_jump_forward_past_max_age",
             fault: "jump host clock beyond signed-state max age",
-            pass_criterion: "future-dated bundles are rejected and recovery occurs after clock resync",
+            pass_criterion: "Phase A: under the forward jump the daemon fails closed (restricted_safe_mode + FailClosed + stale-naming bootstrap error, or refuses to start) with no future-dated misclassification; Phase B: recovers within the deadline, restriction cleared, epoch holds post-recovery",
             recovery_deadline_secs: 180,
         },
         ChaosStage {
             name: "chaos_clock_jump_backward_past_replay_window",
             fault: "jump clock backward beyond replay watermark window",
-            pass_criterion: "replay watermark is not regressed and stale state is rejected",
+            pass_criterion: "future-dated bundles are rejected (primary), stale state is rejected, and the replay watermark holds post-recovery",
             recovery_deadline_secs: 180,
         },
         ChaosStage {
@@ -473,16 +482,25 @@ status_field() {{
     | awk -F= -v k="$1" '$1==k {{ print $2; exit }}'
 }}
 baseline_epoch="$(status_field membership_epoch)"
-case "$baseline_epoch" in ''|*[!0-9]*) baseline_epoch=0 ;; esac
+# An unsampleable baseline stays EMPTY (never 0): the daemon never emits 0,
+# and the post-recovery non-regression check must fail on an unverifiable
+# baseline rather than degrade to `recovered >= 0`.
+case "$baseline_epoch" in *[!0-9]*) baseline_epoch="" ;; esac
 baseline_future_rej="$(status_field traversal_future_dated_rejections)"
 case "$baseline_future_rej" in ''|*[!0-9]*) baseline_future_rej=0 ;; esac
 baseline_stale_rej="$(status_field traversal_stale_rejections)"
 case "$baseline_stale_rej" in ''|*[!0-9]*) baseline_stale_rej=0 ;; esac
+baseline_dns_future_rej="$(status_field dns_future_dated_rejections)"
+case "$baseline_dns_future_rej" in ''|*[!0-9]*) baseline_dns_future_rej=0 ;; esac
+baseline_dns_stale_rej="$(status_field dns_stale_rejections)"
+case "$baseline_dns_stale_rej" in ''|*[!0-9]*) baseline_dns_stale_rej=0 ;; esac
 baseline_replay_rej="$(status_field traversal_replay_rejections)"
 case "$baseline_replay_rej" in ''|*[!0-9]*) baseline_replay_rej=0 ;; esac
 printf 'baseline_epoch=%s\n' "$baseline_epoch"
 printf 'baseline_future_rej=%s\n' "$baseline_future_rej"
 printf 'baseline_stale_rej=%s\n' "$baseline_stale_rej"
+printf 'baseline_dns_future_rej=%s\n' "$baseline_dns_future_rej"
+printf 'baseline_dns_stale_rej=%s\n' "$baseline_dns_stale_rej"
 printf 'baseline_replay_rej=%s\n' "$baseline_replay_rej"
 install_faketime() {{
   mkdir -p "$drop_in_dir"
@@ -530,60 +548,131 @@ wait_recovered() {{
     // Per-stage fault body. Each emits the verdict-relevant `key=value` lines
     // the Rust evaluator parses.
     let body = match config.stage {
-        // Freeze defense: jump the daemon clock far forward. Under the faked
-        // clock, the daemon's live signed state is future-dated/expired, so the
-        // future-dated / stale rejection counters must rise above baseline and
-        // the membership epoch must NOT regress. Then remove the drop-in and
-        // assert the daemon resyncs + recovers within the deadline.
+        // Freeze defense, Phase A: jump the daemon clock far forward. A +90-day
+        // faked clock puts the on-disk signed state BEHIND the daemon's clock,
+        // so the FutureDated arms (generated_at > now + skew) can never fire;
+        // what fires is Stale/Expired and the snapshot load is REFUSED. The
+        // verdict therefore asserts the daemon's own fail-closed posture —
+        // restricted_safe_mode, state, the staleness-naming bootstrap error —
+        // plus that the future-dated counters do NOT move (a rise would be a
+        // misclassification defect), never the future-dated counter itself.
+        // Under the fault membership_epoch renders `none` (snapshot refused),
+        // so it is reported raw and the anti-rollback comparison is made
+        // POST-RECOVERY against the real-clock baseline (Phase B).
         ClockStage::JumpForward => format!(
             r#"printf 'fault_spec=%s\n' {primary_spec_q}
 install_faketime {primary_spec_q}
 # Give the daemon a reconcile cycle under the faked clock.
 sleep 20
 post_epoch="$(status_field membership_epoch)"
-case "$post_epoch" in ''|*[!0-9]*) post_epoch=0 ;; esac
-post_future_rej="$(status_field traversal_future_dated_rejections)"
-case "$post_future_rej" in ''|*[!0-9]*) post_future_rej=0 ;; esac
-post_stale_rej="$(status_field traversal_stale_rejections)"
-case "$post_stale_rej" in ''|*[!0-9]*) post_stale_rej=0 ;; esac
 printf 'post_epoch=%s\n' "$post_epoch"
+post_future_rej="$(status_field traversal_future_dated_rejections)"
+case "$post_future_rej" in ''|*[!0-9]*) post_future_rej="$baseline_future_rej" ;; esac
+post_dns_future_rej="$(status_field dns_future_dated_rejections)"
+case "$post_dns_future_rej" in ''|*[!0-9]*) post_dns_future_rej="$baseline_dns_future_rej" ;; esac
+post_stale_rej="$(status_field traversal_stale_rejections)"
+case "$post_stale_rej" in ''|*[!0-9]*) post_stale_rej="$baseline_stale_rej" ;; esac
+post_dns_stale_rej="$(status_field dns_stale_rejections)"
+case "$post_dns_stale_rej" in ''|*[!0-9]*) post_dns_stale_rej="$baseline_dns_stale_rej" ;; esac
 printf 'post_future_rej=%s\n' "$post_future_rej"
+printf 'post_dns_future_rej=%s\n' "$post_dns_future_rej"
 printf 'post_stale_rej=%s\n' "$post_stale_rej"
-if [ "$post_future_rej" -gt "$baseline_future_rej" ] || [ "$post_stale_rej" -gt "$baseline_stale_rej" ]; then
-  printf 'future_state_rejected=true\n'
-else
-  printf 'future_state_rejected=false\n'
+printf 'post_dns_stale_rej=%s\n' "$post_dns_stale_rej"
+post_restricted="$(status_field restricted_safe_mode)"
+post_state="$(status_field state)"
+printf 'post_restricted=%s\n' "$post_restricted"
+printf 'post_state=%s\n' "$post_state"
+# status_field's awk truncates each token at the first space, so the
+# multi-word bootstrap_error text can only be matched against the full
+# status line. An unsampleable status (refused start) leaves this false;
+# the refused-start case is accepted via daemon_started_under_fault=false.
+full_status="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {REMOTE_RUSTYNET_BIN} status 2>/dev/null || true)"
+bootstrap_error_names_staleness=false
+case "$full_status" in *"is stale"*|*"expired"*) bootstrap_error_names_staleness=true ;; esac
+printf 'bootstrap_error_names_staleness=%s\n' "$bootstrap_error_names_staleness"
+snapshot_refused=false
+if [ "$post_restricted" = "true" ] || ! systemctl is-active --quiet "$service"; then
+  snapshot_refused=true
 fi
-if [ "$post_epoch" -ge "$baseline_epoch" ]; then
-  printf 'epoch_not_regressed=true\n'
-else
-  printf 'epoch_not_regressed=false\n'
+printf 'snapshot_refused_under_fault=%s\n' "$snapshot_refused"
+# Unsampleable counters (refused start) cannot have moved, so they compare
+# equal to baseline: "unchanged" is vacuously true when the daemon never
+# came up, and strictly compared when it did.
+future_rejections_unchanged=false
+if [ "$post_future_rej" = "$baseline_future_rej" ] && [ "$post_dns_future_rej" = "$baseline_dns_future_rej" ]; then
+  future_rejections_unchanged=true
 fi
+printf 'future_rejections_unchanged=%s\n' "$future_rejections_unchanged"
+# REPORT-ONLY (live f760df74: the stale counters stayed flat even though the
+# code should increment them on the first status poll) — never gated.
+stale_rejection_observed=false
+if [ "$post_stale_rej" -gt "$baseline_stale_rej" ] || [ "$post_dns_stale_rej" -gt "$baseline_dns_stale_rej" ]; then
+  stale_rejection_observed=true
+fi
+printf 'stale_rejection_observed=%s\n' "$stale_rejection_observed"
+# Evidence that no dataplane ran under the fault (FailClosed posture).
+path_live_proven=true
+if [ "$post_state" = "FailClosed" ]; then
+  path_live_proven=false
+fi
+printf 'path_live_proven=%s\n' "$path_live_proven"
 remove_faketime
 wait_recovered
+recovered_epoch="$(status_field membership_epoch)"
+case "$recovered_epoch" in ''|*[!0-9]*) recovered_epoch=none ;; esac
+printf 'recovered_epoch=%s\n' "$recovered_epoch"
+recovered_restricted="$(status_field restricted_safe_mode)"
+printf 'recovered_restricted=%s\n' "$recovered_restricted"
+if [ "$recovered_restricted" = "false" ]; then
+  printf 'recovered_proven=true\n'
+else
+  printf 'recovered_proven=false\n'
+fi
+# Phase B epoch non-regression, measured POST-RECOVERY: a non-numeric
+# recovered epoch is a FAIL (never coerced to 0), and a genuine watermark
+# downgrade surfaces as recovered_epoch < baseline_epoch.
+epoch_not_regressed=false
+case "$recovered_epoch" in
+  ''|*[!0-9]*|none) : ;;
+  *)
+    case "$baseline_epoch" in
+      ''|*[!0-9]*) : ;;   # unverifiable baseline must FAIL, never degrade to 0
+      *) [ "$recovered_epoch" -ge "$baseline_epoch" ] && epoch_not_regressed=true ;;
+    esac
+    ;;
+esac
+printf 'epoch_not_regressed=%s\n' "$epoch_not_regressed"
 "#
         ),
-        // Rollback defense: jump the daemon clock far backward. The replay
-        // watermark (`membership_epoch`) must NOT regress and stale/replay
-        // rejections must rise (a superseded-epoch bundle replayed under the
-        // rolled-back clock must be rejected).
+        // Rollback defense: jump the daemon clock far backward. Unlike the
+        // forward leg, a backward jump puts the daemon clock BEHIND the
+        // on-disk signed artifacts, so the FutureDated classification fires
+        // correctly: the future-dated rejection counters are the PRIMARY
+        // assertion here. A stale (superseded-epoch) bundle must also be
+        // rejected, and the replay watermark must not regress when measured
+        // POST-RECOVERY against the real-clock baseline.
         ClockStage::JumpBackward => format!(
             r#"printf 'fault_spec=%s\n' {primary_spec_q}
 install_faketime {primary_spec_q}
 sleep 20
 post_epoch="$(status_field membership_epoch)"
-case "$post_epoch" in ''|*[!0-9]*) post_epoch=0 ;; esac
+printf 'post_epoch=%s\n' "$post_epoch"
+post_future_rej="$(status_field traversal_future_dated_rejections)"
+case "$post_future_rej" in ''|*[!0-9]*) post_future_rej=0 ;; esac
+post_dns_future_rej="$(status_field dns_future_dated_rejections)"
+case "$post_dns_future_rej" in ''|*[!0-9]*) post_dns_future_rej=0 ;; esac
 post_stale_rej="$(status_field traversal_stale_rejections)"
 case "$post_stale_rej" in ''|*[!0-9]*) post_stale_rej=0 ;; esac
 post_replay_rej="$(status_field traversal_replay_rejections)"
 case "$post_replay_rej" in ''|*[!0-9]*) post_replay_rej=0 ;; esac
-printf 'post_epoch=%s\n' "$post_epoch"
+printf 'post_future_rej=%s\n' "$post_future_rej"
+printf 'post_dns_future_rej=%s\n' "$post_dns_future_rej"
 printf 'post_stale_rej=%s\n' "$post_stale_rej"
 printf 'post_replay_rej=%s\n' "$post_replay_rej"
-if [ "$post_epoch" -ge "$baseline_epoch" ]; then
-  printf 'epoch_not_regressed=true\n'
+if [ "$post_future_rej" -gt "$baseline_future_rej" ] || [ "$post_dns_future_rej" -gt "$baseline_dns_future_rej" ]; then
+  printf 'future_dated_rejected=true\n'
 else
-  printf 'epoch_not_regressed=false\n'
+  printf 'future_dated_rejected=false\n'
 fi
 if [ "$post_stale_rej" -gt "$baseline_stale_rej" ] || [ "$post_replay_rej" -gt "$baseline_replay_rej" ]; then
   printf 'stale_state_rejected=true\n'
@@ -592,6 +681,20 @@ else
 fi
 remove_faketime
 wait_recovered
+recovered_epoch="$(status_field membership_epoch)"
+case "$recovered_epoch" in ''|*[!0-9]*) recovered_epoch=none ;; esac
+printf 'recovered_epoch=%s\n' "$recovered_epoch"
+epoch_not_regressed=false
+case "$recovered_epoch" in
+  ''|*[!0-9]*|none) : ;;
+  *)
+    case "$baseline_epoch" in
+      ''|*[!0-9]*) : ;;   # unverifiable baseline must FAIL, never degrade to 0
+      *) [ "$recovered_epoch" -ge "$baseline_epoch" ] && epoch_not_regressed=true ;;
+    esac
+    ;;
+esac
+printf 'epoch_not_regressed=%s\n' "$epoch_not_regressed"
 "#
         ),
         // Skew tolerance: within-window drift must be tolerated (no spurious
@@ -661,9 +764,32 @@ struct ClockStageObservation {
     measured_recovery_secs: Option<u64>,
     /// Did `rustynetd` come up at all under the injected clock? `false` is
     /// a fail-closed-at-start observation, distinct from "came up and
-    /// rejected future state" (live 2026-09-10: +90 days → refused to start).
+    /// rejected stale state" (live 2026-09-10: +90 days → refused to start).
     daemon_started_under_fault: Option<bool>,
-    future_state_rejected: Option<bool>,
+    /// Backward leg only: did the future-dated rejection counters rise under
+    /// the backward jump (primary assertion — a backward clock sits BEHIND the
+    /// on-disk artifacts, so FutureDated fires correctly)?
+    future_dated_rejected: Option<bool>,
+    /// Forward leg, Phase A: did the daemon fail closed under the fault —
+    /// `restricted_safe_mode=true` or the service inactive (refused start)?
+    snapshot_refused_under_fault: Option<bool>,
+    /// Forward leg, Phase A: does the daemon's bootstrap error name staleness
+    /// ("is stale" / "expired")? Accepted in place of the refused-start form.
+    bootstrap_error_names_staleness: Option<bool>,
+    /// Forward leg, Phase A: did the future-dated counters stay at baseline
+    /// (a rise would mean the daemon MISCLASSIFIED stale state as future)?
+    future_rejections_unchanged: Option<bool>,
+    /// Forward leg, Phase A, REPORT-ONLY (never gated; live f760df74 showed
+    /// the stale counters flat despite the code intending otherwise).
+    stale_rejection_observed: Option<bool>,
+    /// Forward leg, Phase A, evidence that no dataplane ran under the fault
+    /// (`state=FailClosed` ⇒ false).
+    path_live_proven: Option<bool>,
+    /// Phase B: is the post-recovery restriction cleared
+    /// (`restricted_safe_mode=false`)?
+    recovered_proven: Option<bool>,
+    /// Post-recovery `membership_epoch` (`none` while refused ⇒ `None`).
+    recovered_epoch: Option<u64>,
     stale_state_rejected: Option<bool>,
     epoch_not_regressed: Option<bool>,
     within_window_tolerated: Option<bool>,
@@ -710,7 +836,22 @@ impl ClockStageObservation {
             recovered: req_bool("recovered")?,
             measured_recovery_secs: opt_u64("measured_recovery_secs")?,
             daemon_started_under_fault: opt_bool("daemon_started_under_fault")?,
-            future_state_rejected: opt_bool("future_state_rejected")?,
+            future_dated_rejected: opt_bool("future_dated_rejected")?,
+            snapshot_refused_under_fault: opt_bool("snapshot_refused_under_fault")?,
+            bootstrap_error_names_staleness: opt_bool("bootstrap_error_names_staleness")?,
+            future_rejections_unchanged: opt_bool("future_rejections_unchanged")?,
+            stale_rejection_observed: opt_bool("stale_rejection_observed")?,
+            path_live_proven: opt_bool("path_live_proven")?,
+            recovered_proven: opt_bool("recovered_proven")?,
+            // `none` is the daemon's own rendering of a refused snapshot
+            // (membership_state absent) — parsed as absent, never coerced to 0.
+            recovered_epoch: match value("recovered_epoch") {
+                Some(raw) if raw != "none" && !raw.is_empty() => Some(
+                    raw.parse::<u64>()
+                        .map_err(|err| format!("invalid integer for recovered_epoch: {err}"))?,
+                ),
+                _ => None,
+            },
             stale_state_rejected: opt_bool("stale_state_rejected")?,
             epoch_not_regressed: opt_bool("epoch_not_regressed")?,
             within_window_tolerated: opt_bool("within_window_tolerated")?,
@@ -731,16 +872,38 @@ impl ClockStageObservation {
     }
 
     /// `chaos_clock_jump_forward_past_max_age` verdict (TUF freeze defense).
+    ///
+    /// Phase A (under the +90-day fault): the daemon must fail closed — either
+    /// it started with `restricted_safe_mode=true` AND a bootstrap error that
+    /// names staleness, or it refused to start outright — and it must NOT
+    /// misclassify the stale state as future-dated (counters stay at
+    /// baseline). Phase B (post-recovery): the restriction must be cleared and
+    /// the replay watermark must hold against the real-clock baseline.
+    /// `stale_rejection_observed` is deliberately NOT gated (report-only;
+    /// live f760df74 showed the counters flat despite the code intending
+    /// otherwise).
     fn passed_jump_forward(&self, deadline_secs: u64) -> bool {
         self.common_ok(deadline_secs)
-            && self.future_state_rejected == Some(true)
+            && self.snapshot_refused_under_fault == Some(true)
+            && self.future_rejections_unchanged == Some(true)
+            && (self.bootstrap_error_names_staleness == Some(true)
+                || self.daemon_started_under_fault == Some(false))
+            // Started form: the dataplane must be FailClosed under the fault
+            // (`path_live_proven=false` is the status-line reading of it).
+            && (self.daemon_started_under_fault == Some(false)
+                || self.path_live_proven == Some(false))
             && self.epoch_not_regressed == Some(true)
+            && self.recovered_proven == Some(true)
     }
 
     /// `chaos_clock_jump_backward_past_replay_window` verdict (rollback
-    /// defense).
+    /// defense). Future-dated rejection is the primary assertion (a backward
+    /// clock sits BEHIND the on-disk artifacts, so FutureDated fires
+    /// correctly); stale-state rejection stays as the secondary gate and the
+    /// replay watermark is compared POST-RECOVERY.
     fn passed_jump_backward(&self, deadline_secs: u64) -> bool {
         self.common_ok(deadline_secs)
+            && self.future_dated_rejected == Some(true)
             && self.epoch_not_regressed == Some(true)
             && self.stale_state_rejected == Some(true)
     }
@@ -787,7 +950,14 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
                     "teardown_registered_before_fault": observation.teardown_registered_before_fault,
                     "recovered": observation.recovered,
                     "daemon_started_under_fault": observation.daemon_started_under_fault,
-                    "future_state_rejected": observation.future_state_rejected,
+                    "future_dated_rejected": observation.future_dated_rejected,
+                    "snapshot_refused_under_fault": observation.snapshot_refused_under_fault,
+                    "bootstrap_error_names_staleness": observation.bootstrap_error_names_staleness,
+                    "future_rejections_unchanged": observation.future_rejections_unchanged,
+                    "stale_rejection_observed": observation.stale_rejection_observed,
+                    "path_live_proven": observation.path_live_proven,
+                    "recovered_proven": observation.recovered_proven,
+                    "recovered_epoch": observation.recovered_epoch,
                     "stale_state_rejected": observation.stale_state_rejected,
                     "epoch_not_regressed": observation.epoch_not_regressed,
                     "within_window_tolerated": observation.within_window_tolerated,
@@ -1042,39 +1212,156 @@ mod tests {
 
     // --- jump-forward (freeze defense) verdict ---
 
+    /// Passing Phase A + Phase B observation: under the fault the daemon
+    /// started, failed closed (`restricted_safe_mode=true`, a bootstrap error
+    /// naming staleness, `state=FailClosed`), kept the future-dated counters
+    /// at baseline, then recovered, cleared the restriction, and held the
+    /// epoch at the real-clock baseline.
     fn forward_pass_output() -> &'static str {
         "stage=chaos_clock_jump_forward_past_max_age\n\
          teardown_registered_before_fault=true\n\
          faketime_lib_present=true\n\
          baseline_epoch=4\n\
-         post_epoch=4\n\
-         future_state_rejected=true\n\
-         epoch_not_regressed=true\n\
+         post_epoch=none\n\
+         daemon_started_under_fault=true\n\
+         snapshot_refused_under_fault=true\n\
+         bootstrap_error_names_staleness=true\n\
+         future_rejections_unchanged=true\n\
+         stale_rejection_observed=false\n\
+         path_live_proven=false\n\
          measured_recovery_secs=12\n\
-         recovered=true\n"
+         recovered=true\n\
+         recovered_epoch=4\n\
+         recovered_proven=true\n\
+         epoch_not_regressed=true\n"
     }
 
     #[test]
-    fn jump_forward_passes_when_future_state_rejected_and_recovered() {
+    fn jump_forward_passes_when_fail_closed_posture_and_recovered() {
         let observation = ClockStageObservation::parse(forward_pass_output()).expect("parse");
         assert!(observation.passed(ClockStage::JumpForward, 180));
     }
 
+    // Review 2026-09-11 blocker: an unsampleable baseline used to coerce to 0,
+    // which turned the post-recovery anti-rollback gate into `>= 0`.
     #[test]
-    fn jump_forward_fails_when_future_state_accepted() {
-        // A daemon that ACCEPTS future-dated state is the FAIL we must catch.
-        let output = forward_pass_output()
-            .replace("future_state_rejected=true", "future_state_rejected=false");
+    fn remote_script_never_coerces_an_epoch_comparison_to_zero() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        assert!(!script.contains("post_epoch=0"), "{script}");
+        assert!(!script.contains("recovered_epoch=0"), "{script}");
+        assert!(!script.contains("baseline_epoch=0"), "{script}");
+        assert!(
+            script.contains("''|*[!0-9]*) : ;;   # unverifiable baseline must FAIL"),
+            "{script}"
+        );
+        assert!(script.contains("*[!0-9]*|none) : ;;"), "{script}");
+    }
+
+    // Started form must also prove the dataplane stayed FailClosed under
+    // the fault (path_live_proven=false); a live path under a +90d clock
+    // is the fail-open this leg exists to catch.
+    #[test]
+    fn jump_forward_fails_when_dataplane_is_live_under_fault() {
+        let output =
+            forward_pass_output().replace("path_live_proven=false", "path_live_proven=true");
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(!observation.passed_jump_forward(180));
+    }
+
+    #[test]
+    fn jump_forward_fails_when_restriction_not_raised_under_fault() {
+        // restricted_safe_mode stayed false under the fault (no fail-closed
+        // posture) — the exact regression the Phase A gate exists to catch.
+        let output = forward_pass_output().replace(
+            "snapshot_refused_under_fault=true",
+            "snapshot_refused_under_fault=false",
+        );
         let observation = ClockStageObservation::parse(&output).expect("parse");
         assert!(!observation.passed(ClockStage::JumpForward, 180));
     }
 
     #[test]
-    fn jump_forward_fails_when_epoch_regressed() {
+    fn jump_forward_fails_when_future_counters_misclassified() {
+        // The old gate demanded future_state_rejected=true; the NEW gate is
+        // the inverse: the future-dated counters must NOT move. A daemon that
+        // misclassifies stale state as future-dated must FAIL.
+        let output = forward_pass_output().replace(
+            "future_rejections_unchanged=true",
+            "future_rejections_unchanged=false",
+        );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(!observation.passed(ClockStage::JumpForward, 180));
+    }
+
+    #[test]
+    fn jump_forward_accepts_refused_start_without_stale_bootstrap_error() {
+        // D6 is open: a daemon that refuses to start outright satisfies the
+        // fail-closed posture via daemon_started_under_fault=false, even
+        // though no status (and so no bootstrap error) was sampleable.
+        let output = forward_pass_output()
+            .replace(
+                "daemon_started_under_fault=true",
+                "daemon_started_under_fault=false",
+            )
+            .replace(
+                "bootstrap_error_names_staleness=true",
+                "bootstrap_error_names_staleness=false",
+            );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(observation.passed(ClockStage::JumpForward, 180));
+    }
+
+    #[test]
+    fn jump_forward_fails_when_started_without_stale_naming_error() {
+        // Started but neither restricted-with-staleness-error nor refused:
+        // neither disjunct holds, so the fail-closed posture is unproven.
+        let output = forward_pass_output().replace(
+            "bootstrap_error_names_staleness=true",
+            "bootstrap_error_names_staleness=false",
+        );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(!observation.passed(ClockStage::JumpForward, 180));
+    }
+
+    #[test]
+    fn jump_forward_does_not_gate_on_stale_rejection_observed() {
+        // REPORT-ONLY: a flat stale counter (live f760df74) must not fail the
+        // leg, and an observed rise must not be required.
+        let output = forward_pass_output().replace(
+            "stale_rejection_observed=false",
+            "stale_rejection_observed=true",
+        );
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(observation.passed(ClockStage::JumpForward, 180));
+    }
+
+    #[test]
+    fn jump_forward_fails_when_epoch_regressed_post_recovery() {
+        // A genuine watermark downgrade (recovered epoch < real-clock
+        // baseline) is the rollback the leg must catch.
         let output =
             forward_pass_output().replace("epoch_not_regressed=true", "epoch_not_regressed=false");
         let observation = ClockStageObservation::parse(&output).expect("parse");
         assert!(!observation.passed(ClockStage::JumpForward, 180));
+    }
+
+    #[test]
+    fn jump_forward_fails_when_restriction_not_cleared_post_recovery() {
+        // Phase B: restricted_safe_mode must be false after recovery.
+        let output =
+            forward_pass_output().replace("recovered_proven=true", "recovered_proven=false");
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(!observation.passed(ClockStage::JumpForward, 180));
+    }
+
+    #[test]
+    fn jump_forward_parses_refused_epoch_as_absent_not_zero() {
+        // `none` (the daemon's rendering of a refused snapshot) must parse as
+        // absent — never coerced to 0, the artifact that broke the old gate.
+        let output = forward_pass_output().replace("recovered_epoch=4", "recovered_epoch=none");
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert_eq!(observation.recovered_epoch, None);
     }
 
     #[test]
@@ -1096,16 +1383,17 @@ mod tests {
     }
 
     #[test]
-    fn jump_forward_fails_when_rejection_observation_missing() {
-        // Missing the stage-specific verdict field => unverifiable => FAIL.
+    fn jump_forward_fails_when_verdict_fields_missing() {
+        // Missing the stage-specific verdict fields => unverifiable => FAIL.
         let output = "stage=chaos_clock_jump_forward_past_max_age\n\
              teardown_registered_before_fault=true\n\
              faketime_lib_present=true\n\
-             epoch_not_regressed=true\n\
              measured_recovery_secs=12\n\
              recovered=true\n";
         let observation = ClockStageObservation::parse(output).expect("parse");
-        assert_eq!(observation.future_state_rejected, None);
+        assert_eq!(observation.snapshot_refused_under_fault, None);
+        assert_eq!(observation.future_rejections_unchanged, None);
+        assert_eq!(observation.recovered_proven, None);
         assert!(!observation.passed(ClockStage::JumpForward, 180));
     }
 
@@ -1116,17 +1404,30 @@ mod tests {
          teardown_registered_before_fault=true\n\
          faketime_lib_present=true\n\
          baseline_epoch=9\n\
-         post_epoch=9\n\
-         epoch_not_regressed=true\n\
+         post_epoch=none\n\
+         future_dated_rejected=true\n\
          stale_state_rejected=true\n\
          measured_recovery_secs=20\n\
-         recovered=true\n"
+         recovered=true\n\
+         recovered_epoch=9\n\
+         epoch_not_regressed=true\n"
     }
 
     #[test]
-    fn jump_backward_passes_when_epoch_held_and_stale_rejected() {
+    fn jump_backward_passes_when_future_dated_rejected_epoch_held_and_stale_rejected() {
         let observation = ClockStageObservation::parse(backward_pass_output()).expect("parse");
         assert!(observation.passed(ClockStage::JumpBackward, 180));
+    }
+
+    #[test]
+    fn jump_backward_fails_when_future_dated_accepted() {
+        // Primary assertion: under a backward jump the FutureDated arms fire
+        // correctly, so a daemon that fails to reject future-dated state is a
+        // real defect.
+        let output = backward_pass_output()
+            .replace("future_dated_rejected=true", "future_dated_rejected=false");
+        let observation = ClockStageObservation::parse(&output).expect("parse");
+        assert!(!observation.passed(ClockStage::JumpBackward, 180));
     }
 
     #[test]
@@ -1223,6 +1524,24 @@ mod tests {
         assert_eq!(stages[0]["status"], "pass");
         assert_eq!(stages[1]["status"], "skipped");
         assert_eq!(stages[2]["status"], "skipped");
+    }
+
+    #[test]
+    fn live_report_carries_new_jump_forward_verdict_fields() {
+        // Every new key=value the remote script prints must land in the JSON
+        // report — including the report-only stale counter and the raw
+        // post-recovery epoch.
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let observation = ClockStageObservation::parse(forward_pass_output()).expect("parse");
+        let report = render_live_report(&config, &observation);
+        let stage = &report["stages"][0];
+        assert_eq!(stage["snapshot_refused_under_fault"], true);
+        assert_eq!(stage["bootstrap_error_names_staleness"], true);
+        assert_eq!(stage["future_rejections_unchanged"], true);
+        assert_eq!(stage["stale_rejection_observed"], false);
+        assert_eq!(stage["path_live_proven"], false);
+        assert_eq!(stage["recovered_proven"], true);
+        assert_eq!(stage["recovered_epoch"], 4);
     }
 
     #[test]
