@@ -112,7 +112,21 @@ pub fn evaluate_macos_key_custody(entries: &[MacosKeyCustodyEntry]) -> Result<()
     for entry in entries {
         match (entry.expected.as_str(), &entry.status) {
             (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Ok { .. }) => {}
-            (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::KeychainPresent { .. }) => {}
+            // Only the reviewed Keychain entry may carry a KeychainPresent
+            // status: a FILE entry asserting it would mask its mode/uid/gid
+            // contract (review SHOULD-FIX 2, 2026-09-11).
+            (
+                REQUIREMENT_PRESENT,
+                MacosKeyCustodyEntryStatus::KeychainPresent { service, account },
+            ) if entry.label == MACOS_WG_PASSPHRASE_KEYCHAIN_ENTRY_LABEL
+                && service == MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE
+                && entry.path == keychain_entry_path(account) => {}
+            (REQUIREMENT_PRESENT, status @ MacosKeyCustodyEntryStatus::KeychainPresent { .. }) => {
+                reasons.push(format!(
+                    "{} reports KeychainPresent but is not the reviewed Keychain entry: {status:?}",
+                    entry.label
+                ));
+            }
             (REQUIREMENT_ABSENT, MacosKeyCustodyEntryStatus::AbsentAsExpected) => {}
             (REQUIREMENT_PRESENT, MacosKeyCustodyEntryStatus::Missing { reason }) => {
                 reasons.push(format!("{} missing: {reason}", entry.label));
@@ -254,6 +268,17 @@ fn keychain_entry_for_account(raw: &str) -> Result<String, String> {
     }
     if account.chars().any(|c| c.is_control()) {
         return Err("Keychain account must not contain control characters".to_owned());
+    }
+    // Same allow-list `key_material::normalize_macos_keychain_account` applies
+    // before the daemon touches the Keychain: the probe must never report a
+    // healthy item under an account the daemon itself would refuse.
+    if !account
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        return Err(
+            "Keychain account contains invalid characters; allowed: [A-Za-z0-9._:-]".to_owned(),
+        );
     }
     Ok(account.to_owned())
 }
@@ -601,6 +626,30 @@ mod tests {
         assert!(keychain_entry_for_account(" padded").is_err());
         assert!(keychain_entry_for_account("ctl\u{7}char").is_err());
         assert!(keychain_entry_for_account(&"a".repeat(129)).is_err());
+        // Allow-list parity with key_material: spaces, slashes, non-ASCII refused.
+        assert!(keychain_entry_for_account("acct node").is_err());
+        assert!(keychain_entry_for_account("sl/ash").is_err());
+        assert!(keychain_entry_for_account("n\u{e9}").is_err());
+        assert!(keychain_entry_for_account("wg-passphrase.daemon:local_1").is_ok());
+    }
+
+    // A FILE entry that claims KeychainPresent must be drift, never healthy:
+    // it would otherwise mask its own mode/uid/gid contract.
+    #[test]
+    fn keychain_present_on_a_file_entry_is_drift() {
+        let mut entry = keychain_probe_entry("acct", Ok(true));
+        entry.label = "encrypted private key".to_owned();
+        entry.path = MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH.to_owned();
+        let reasons = evaluate_macos_key_custody(std::slice::from_ref(&entry))
+            .expect_err("a file entry may not borrow the Keychain status");
+        assert!(
+            reasons[0].contains("not the reviewed Keychain entry"),
+            "{reasons:?}"
+        );
+        // The reviewed entry with a mismatched path is drift too.
+        let mut bad_path = keychain_probe_entry("acct", Ok(true));
+        bad_path.path = "keychain:System/other/acct".to_owned();
+        assert!(evaluate_macos_key_custody(std::slice::from_ref(&bad_path)).is_err());
     }
 
     #[test]

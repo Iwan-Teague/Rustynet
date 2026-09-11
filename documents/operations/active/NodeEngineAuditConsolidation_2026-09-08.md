@@ -231,7 +231,10 @@ must exist), `launch_live_lab_on_host` arg quoting (QH-01), utmctl
    service (test `keychain_blind_report_is_rejected` is the B5 mutation: the
    pre-fix five-entry report fails it). Exercised live on the Mac on both
    failure paths; the `present` path is owed a macOS-guest
-   `key_custody_validation` run.
+   `key_custody_validation` run. GLM flash security review 2026-09-11:
+   MERGE-SAFE; both SHOULD-FIXes applied (account allow-list parity with
+   `key_material`; `KeychainPresent` accepted only on the reviewed entry with
+   its own locator path).
 
 **I3 follow-up (STAGES review, 2026-09-09):** `live_anchor.rs` carried the same
 `_ => "linux"` class in its `--platform` argv builder; now routed through
