@@ -189,14 +189,17 @@ pub(crate) mod enrollment_replay {
     /// Wait budget for the post-restart unit-active loop.
     const WAIT_TRIES: u32 = 30;
 
-    /// The throwaway enrollee pubkey, base64 (standard, padded) — the daemon
-    /// requires 32 bytes that decompress to a valid Ed25519 point, so a real
-    /// key is minted host-side instead of raw random bytes.
+    /// The throwaway enrollee pubkey, base64 URL_SAFE_NO_PAD — the exact
+    /// alphabet/padding the daemon's consume path decodes with
+    /// (daemon.rs `URL_SAFE_NO_PAD`; padded STANDARD fails its decode).
+    /// The daemon then requires 32 bytes that decompress to a valid
+    /// Ed25519 point, so a real key is minted host-side instead of raw
+    /// random bytes.
     pub(crate) fn enrollee_pubkey_b64() -> String {
         use base64::Engine as _;
         use ed25519_dalek::SigningKey;
         let signing = SigningKey::from_bytes(&ENROLLEE_KEY_SEED);
-        base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().as_bytes())
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes())
     }
 
     // ── pure topology helpers (unit-tested) ──────────────────────────────
@@ -1342,10 +1345,12 @@ exit 0
         #[test]
         fn enrollee_pubkey_decodes_to_a_valid_ed25519_point() {
             // The daemon's handler runs VerifyingKey::from_bytes and rejects
-            // invalid points; the throwaway key must be a REAL key.
+            // invalid points; the throwaway key must be a REAL key. Decode
+            // with the DAEMON's engine (URL_SAFE_NO_PAD) so the test proves
+            // the wire alphabet matches, not just that some decoder accepts.
             use base64::Engine as _;
             use ed25519_dalek::VerifyingKey;
-            let bytes = base64::engine::general_purpose::STANDARD
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .decode(enrollee_pubkey_b64())
                 .expect("b64");
             assert_eq!(bytes.len(), 32);
