@@ -2219,6 +2219,18 @@ pub const STAGES: &[StageSpec] = &[
         conditional_dispatch: true,
         ..DEFAULT_SPEC
     },
+    // QH-89 (2026-09-11): live enrollment-token replay against the anchor
+    // enrollment listener (drop-in-enabled in the lab; throwaway second
+    // consume, sequential + concurrent, adjudicated against the ledger,
+    // verify inspect, snapshot hash, and the orchestrator's own peer
+    // collection).
+    StageSpec {
+        name: "negative_control_enrollment_token_replay",
+        group: StageGroup::NegativeControl,
+        platform_rule: PlatformRule::AllPlatforms,
+        enable: EnableRule::NegativeControlSuite,
+        ..DEFAULT_SPEC
+    },
     // ── HP-3 disruptive relay-forwarding proof (opt-in) ─────────────────
     // Folds into the same evidence column as the bash-dialect
     // `validate_linux_relay_forwards_frame` (`linux_relay_forwards_frame`);
@@ -3187,8 +3199,9 @@ mod tests {
             ("t4_security", 16),
             // A3a: the four T5 negative-control / adjudication stages
             // (signed-bundle rejection, planted residue, wrong-node
-            // substitution, daemon-killed-mid-stage).
-            ("t5_negative_control", 4),
+            // substitution, daemon-killed-mid-stage), +1 on 2026-09-11
+            // (QH-89): negative_control_enrollment_token_replay.
+            ("t5_negative_control", 5),
         ]
         .into_iter()
         .collect();
@@ -3210,8 +3223,8 @@ mod tests {
                 .iter()
                 .filter(|s| s.tier() == Tier::T5NegativeControl)
                 .count(),
-            4,
-            "the four T5 negative-control stages must all be tiered T5NegativeControl"
+            5,
+            "the five T5 negative-control stages must all be tiered T5NegativeControl"
         );
     }
 
