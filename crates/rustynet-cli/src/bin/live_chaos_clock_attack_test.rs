@@ -1277,7 +1277,11 @@ mod tests {
         let config = parse(&["--dry-run"]).expect("dry-run config should parse");
         let script = render_remote_clock_script(&config);
         let install = script.find("install_faketime() {").expect("install fn");
-        let body = &script[install..install + 900];
+        let end = script[install..]
+            .find("remove_faketime() {")
+            .expect("remove fn")
+            + install;
+        let body = &script[install..end];
         assert!(body.contains("sleep 5"), "{body}");
         assert!(
             body.contains("systemctl is-active --quiet \"$service\" && [ -S \"$socket_path\" ]"),
