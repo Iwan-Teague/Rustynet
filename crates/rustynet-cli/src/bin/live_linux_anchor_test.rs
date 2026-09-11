@@ -656,7 +656,10 @@ fn set_membership_capabilities_three_step(
     let script = format!(
         r#"set -eu
 work="$(/usr/bin/mktemp -d {work_dir})"
-trap '/bin/rm -rf -- "$work"' EXIT
+# Name the signals explicitly: the SSH session dying (orchestrator
+# SIGKILL/timeout) may not run an EXIT-only trap, which would leave the
+# plaintext passphrase work dir on the guest.
+trap '/bin/rm -rf -- "$work"' EXIT HUP INT TERM
 {REMOTE_RUSTYNET_BIN} membership propose-set-capabilities \
   --node-id {node_id} \
   --capabilities {capabilities} \
@@ -2772,6 +2775,25 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The macOS 3-verb membership script's rm-trap must name the signals
+    // explicitly: the SSH session dying (orchestrator SIGKILL/timeout) may
+    // not run an EXIT-only trap, which would leave the plaintext passphrase
+    // work dir on the guest.
+    #[test]
+    fn membership_script_arms_rm_trap_against_session_death() {
+        let source = include_str!("live_linux_anchor_test.rs");
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        let script_region = &source[..impl_end];
+        assert!(
+            script_region.contains("trap '/bin/rm -rf -- \"$work\"' EXIT HUP INT TERM"),
+            "the membership script's rm trap must arm EXIT HUP INT TERM"
+        );
+        assert!(
+            !script_region.contains("' EXIT\n"),
+            "no EXIT-only trap spelling may remain in the membership script"
+        );
+    }
 
     #[test]
     fn parse_dry_run_does_not_require_identity() {

@@ -528,7 +528,7 @@ fn run() -> Result<(), String> {
     let dns_passphrase_remote = ctx
         .capture_root(
             &exit_host,
-            &["mktemp", "/tmp/rn-lan-toggle-dns-passphrase.XXXXXX"],
+            &["mktemp", "/run/rn-lan-toggle-dns-passphrase.XXXXXX"],
         )?
         .trim()
         .to_owned();
@@ -2697,5 +2697,30 @@ mod tests {
         assert!(!killswitch_drop_table_present(confusable_suffix));
         let empty_generation = "table inet rustynet_g {\n}\n";
         assert!(!killswitch_drop_table_present(empty_generation));
+    }
+
+    // The materialized DNS signing passphrase is plaintext secret material on
+    // the guest: it must be created under /run (tmpfs, gone on reboot), never
+    // /tmp (a SIGKILL before the cleanup would leave a 0600 root-owned
+    // plaintext passphrase surviving the reboot).
+    #[test]
+    fn dns_passphrase_materializes_under_run_not_tmp() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        assert!(
+            source.contains("\"mktemp\", \"/run/rn-lan-toggle-dns-passphrase.XXXXXX\""),
+            "the passphrase mktemp must target /run:\n{source}"
+        );
+        assert!(
+            !source.contains("rn-lan-toggle-dns-passphrase.XXXXXX\", \"/tmp"),
+            "no /tmp spelling of the passphrase path may remain"
+        );
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        for (index, line) in source[..impl_end].lines().enumerate() {
+            assert!(
+                !line.contains("/tmp/rn-lan-toggle-dns-passphrase"),
+                "line {} writes the DNS passphrase under /tmp; use /run (tmpfs)",
+                index + 1
+            );
+        }
     }
 }

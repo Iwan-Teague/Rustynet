@@ -388,7 +388,7 @@ fn run_live_resource_exhaustion(config: &Config, logger: &mut Logger) -> Result<
 
 /// Renders the IPC ingest-flood script. SAFETY mirror of the proven
 /// daemon-fault / network-impairment scripts:
-///   * `trap cleanup EXIT` armed BEFORE the flood; the marker
+///   * `trap cleanup EXIT HUP INT TERM` armed BEFORE the flood; the marker
 ///     `teardown_registered_before_fault=true` is the first thing printed.
 ///   * tool preflight (`socat`/`nc`/`timeout`) + baseline service-active +
 ///     baseline socket-present, all fail-closed.
@@ -416,6 +416,8 @@ fn render_ipc_flood_script(config: &Config) -> String {
 
     format!(
         r#"set -eu
+# RSA-0080: a non-login shell omits the sbin directories where ip/systemctl live.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"; export PATH
 service={service}
 socket_path={socket_path}
 work_prefix={work_prefix}
@@ -427,7 +429,7 @@ work_dir="$(mktemp -d "${{work_prefix}}.XXXXXX")"
 cleanup() {{
   rm -rf "$work_dir"
 }}
-trap cleanup EXIT
+trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
 printf 'target_ingest=ipc\n'
 printf 'ipc_command_cap_bytes=%s\n' "$ipc_cap"
@@ -540,6 +542,8 @@ fn render_gossip_flood_script(config: &Config) -> String {
 
     format!(
         r#"set -eu
+# RSA-0080: a non-login shell omits the sbin directories where ip/systemctl live.
+PATH="/usr/local/sbin:/usr/sbin:/sbin:${{PATH:-/usr/local/bin:/usr/bin:/bin}}"; export PATH
 service={service}
 socket_path={socket_path}
 work_prefix={work_prefix}
@@ -552,7 +556,7 @@ work_dir="$(mktemp -d "${{work_prefix}}.XXXXXX")"
 cleanup() {{
   rm -rf "$work_dir"
 }}
-trap cleanup EXIT
+trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
 printf 'target_ingest=gossip\n'
 printf 'gossip_datagram_cap_bytes=%s\n' "$gossip_cap"
@@ -1082,7 +1086,9 @@ mod tests {
         .expect("config should parse");
         let script = render_ipc_flood_script(&config);
         // trap before fault (mirror the proven templates).
-        let trap_idx = script.find("trap cleanup EXIT").expect("trap present");
+        let trap_idx = script
+            .find("trap cleanup EXIT HUP INT TERM")
+            .expect("trap present");
         let flood_idx = script.find("flood_sent").expect("flood present");
         assert!(
             trap_idx < flood_idx,
@@ -1106,12 +1112,72 @@ mod tests {
         assert!(script.contains("gossip_datagram_cap_bytes"));
         // never touches the underlay NIC: loopback target only.
         assert!(!script.contains("0.0.0.0"));
-        let trap_idx = script.find("trap cleanup EXIT").expect("trap present");
+        let trap_idx = script
+            .find("trap cleanup EXIT HUP INT TERM")
+            .expect("trap present");
         let flood_idx = script.find("flood_sent").expect("flood present");
         assert!(
             trap_idx < flood_idx,
             "teardown must be armed before the flood"
         );
+    }
+
+    // RSA-0080: the guest's non-login PATH omits the sbin directories; both
+    // flood scripts must pin an sbin-bearing PATH before any tool lookup.
+    #[test]
+    fn flood_scripts_pin_an_sbin_bearing_path_before_any_lookup() {
+        for (name, script) in [
+            (
+                "ipc",
+                render_ipc_flood_script(
+                    &parse(&["--dry-run", "--target-ingest", "ipc"]).expect("config should parse"),
+                ),
+            ),
+            (
+                "gossip",
+                render_gossip_flood_script(
+                    &parse(&["--dry-run", "--target-ingest", "gossip"])
+                        .expect("config should parse"),
+                ),
+            ),
+        ] {
+            let path_pos = script
+                .find("PATH=\"/usr/local/sbin:/usr/sbin:/sbin:")
+                .unwrap_or_else(|| panic!("{name}: sbin PATH line present"));
+            let first_lookup = script
+                .find("command -v ")
+                .unwrap_or_else(|| panic!("{name}: a command -v preflight exists"));
+            assert!(
+                path_pos < first_lookup,
+                "{name}: PATH must precede the first lookup:\n{script}"
+            );
+        }
+    }
+
+    // The teardown trap must survive the SSH session dying (orchestrator
+    // SIGKILL/timeout): a POSIX shell may not run an EXIT-only trap on SIGHUP.
+    #[test]
+    fn flood_scripts_arm_teardown_against_session_death() {
+        for (name, script) in [
+            (
+                "ipc",
+                render_ipc_flood_script(
+                    &parse(&["--dry-run", "--target-ingest", "ipc"]).expect("config should parse"),
+                ),
+            ),
+            (
+                "gossip",
+                render_gossip_flood_script(
+                    &parse(&["--dry-run", "--target-ingest", "gossip"])
+                        .expect("config should parse"),
+                ),
+            ),
+        ] {
+            assert!(
+                script.contains("trap cleanup EXIT HUP INT TERM"),
+                "{name}: teardown trap must name the signals:\n{script}"
+            );
+        }
     }
 
     #[test]

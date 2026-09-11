@@ -327,6 +327,15 @@ fn run() -> Result<(), String> {
     logger.line(format!(
         "[network-flap] blocking WG UDP output port {wg_port} on client"
     ))?;
+    // RAII fence mirroring two_hop's BundleSwapFence: every step between the
+    // rule add (here) and the Stage 5 delete propagates with `?`, so a failure
+    // — or the worker dying — must not leave the client's WG port blocked
+    // fleet-wide. Drop removes the whole idempotent test table.
+    let mut nft_guard = NftBlockRuleGuard {
+        armed: true,
+        ctx: &ctx,
+        client_host: &client_host,
+    };
     let flap_start = std::time::Instant::now();
     // nft table/chain may not pre-exist — create idempotently.
     let _ = ctx.run_root_allow_failure(
@@ -403,10 +412,8 @@ fn run() -> Result<(), String> {
 
     // ── Stage 5: remove block rule ────────────────────────────────────────────
     logger.line("[network-flap] removing block rule")?;
-    let _ = ctx.run_root_allow_failure(
-        &client_host,
-        &["nft", "delete", "table", "inet", "rustynet_flap_test"],
-    );
+    let _ = ctx.run_root_allow_failure(&client_host, nft_delete_flap_table_command());
+    nft_guard.armed = false;
 
     // ── Stage 6: poll for recovery ────────────────────────────────────────────
     logger.line("[network-flap] polling for WG handshake recovery")?;
@@ -700,6 +707,33 @@ fn req(args: &[String], idx: usize, flag: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing required argument value for {flag}"))
 }
 
+/// RAII guard mirroring two_hop's `BundleSwapFence`: armed before the nft
+/// block rule is installed, disarmed only after the happy-path delete. Any
+/// `?` propagation between add and delete drops the guard, which removes the
+/// whole `rustynet_flap_test` table (chain + rule) so the client's WG port
+/// cannot stay blocked past the stage. Deleting a non-existent table is a
+/// no-op, so arming before the add and double-deleting are both safe.
+struct NftBlockRuleGuard<'a> {
+    armed: bool,
+    ctx: &'a LiveLabContext,
+    client_host: &'a str,
+}
+
+fn nft_delete_flap_table_command() -> &'static [&'static str] {
+    &["nft", "delete", "table", "inet", "rustynet_flap_test"]
+}
+
+impl Drop for NftBlockRuleGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self
+            .ctx
+            .run_root_allow_failure(self.client_host, nft_delete_flap_table_command());
+    }
+}
+
 fn print_usage() {
     eprintln!(
         "usage: live_linux_network_flap_test \
@@ -715,7 +749,27 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_status_selected_exit_peer_endpoint_port, parse_wg_peer_endpoint_port};
+    use super::{
+        nft_delete_flap_table_command, parse_status_selected_exit_peer_endpoint_port,
+        parse_wg_peer_endpoint_port,
+    };
+
+    // The nft drop rule on the client's WG port must be removed by the Drop
+    // guard on any abort between add (Stage 2) and the happy-path delete
+    // (Stage 5); the guard and the happy path must target the SAME table so
+    // an aborted stage can never leave the port blocked fleet-wide.
+    #[test]
+    fn nft_guard_and_happy_path_delete_the_same_table() {
+        let cmd = nft_delete_flap_table_command();
+        assert_eq!(cmd[0], "nft");
+        assert_eq!(cmd[1], "delete");
+        assert_eq!(cmd[2], "table");
+        assert_eq!(cmd[3], "inet");
+        assert_eq!(
+            cmd[4], "rustynet_flap_test",
+            "the guard must delete the stage's own idempotent table"
+        );
+    }
 
     #[test]
     fn wg_show_empty_yields_no_port() {

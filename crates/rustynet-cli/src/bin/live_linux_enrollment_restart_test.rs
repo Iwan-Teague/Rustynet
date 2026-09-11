@@ -264,6 +264,11 @@ fn run() -> Result<(), String> {
 
     // ── Stage 4: restart admin daemon and wait ────────────────────────────────
     logger.line("[enrollment-restart] restarting admin daemon")?;
+    // Clear systemd's failed-start counter before starting: the SIGKILL may
+    // have been preceded by failed auto-restarts that armed the unit's start
+    // limiter, and the `systemctl start` would then be refused ("Start
+    // request repeated too quickly") — the key-custody pattern.
+    let _ = ctx.run_root_allow_failure(&admin_host, &["systemctl", "reset-failed", "rustynetd"]);
     let _ = ctx.run_root_allow_failure(&admin_host, &["systemctl", "start", "rustynetd"]);
     std::thread::sleep(std::time::Duration::from_secs(8));
 
