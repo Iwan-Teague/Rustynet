@@ -783,10 +783,14 @@ exit 0
             if p.rc == 0 || p.stdout.contains(PULL_SUCCESS_MARKER) {
                 return RogueBundleControlOutcome::ForgeryAccepted { tag: forgery.tag };
             }
-            if !p.stderr.contains(NO_BYTES_PREFIX) || !p.stderr.contains(forgery.class) {
+            // The pull-bundle CLI reports failures on STDOUT (run-qh87-lenovo2:
+            // every named rejection arrived via out_b64 with an empty err), so
+            // the class match reads both streams.
+            let cli_output = format!("{}\n{}", p.stdout, p.stderr);
+            if !cli_output.contains(NO_BYTES_PREFIX) || !cli_output.contains(forgery.class) {
                 return RogueBundleControlOutcome::WrongReasonRejection {
                     tag: forgery.tag,
-                    actual: p.stderr.lines().last().unwrap_or("").to_owned(),
+                    actual: cli_output.lines().last().unwrap_or("").to_owned(),
                 };
             }
             if p.guard_sha_after != obs.guard_sha_before {
@@ -806,7 +810,11 @@ exit 0
         };
         if ctrl.rc != 0 || !ctrl.stdout.contains(PULL_SUCCESS_MARKER) {
             return RogueBundleControlOutcome::ControlPullFailed {
-                detail: ctrl.stderr.lines().last().unwrap_or("").to_owned(),
+                detail: format!("{}\n{}", ctrl.stdout, ctrl.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("")
+                    .to_owned(),
             };
         }
         let ctrl_sha = match bundle_sha(obs, "ctrl") {
