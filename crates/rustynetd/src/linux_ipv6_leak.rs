@@ -751,6 +751,59 @@ mod tests {
         }
     }
 
+    /// RN-12/IPV-01/RN-29: the daemon's NEW scoped exit-node egress rule set.
+    ///
+    /// Every rule is bounded by `meta nfproto ipv4`, so none of them can match
+    /// — let alone leak — IPv6: each classifies as [`RuleDisposition::Irrelevant`]
+    /// for v6 (they are ipv4-only selectors), and the chain's terminal
+    /// `policy drop` therefore stays the verdict for global-scope IPv6. The
+    /// ruleset IS v6 containment. The DNS drops among them additionally close
+    /// the v4 underlay plaintext-DNS/DoT hole when the protected-DNS posture
+    /// is active (their drop semantics are pinned in `phase10` and
+    /// `killswitch_precedence`; the v6 classifier proves here only that they
+    /// neither escape nor defeat the v6 policy drop).
+    #[test]
+    fn nft_ruleset_scoped_egress_rules_are_v4_only_and_contain_ipv6() {
+        const SCOPED_EGRESS_KILLSWITCH: &str = r#"table inet rustynet_g1 {
+    chain killswitch {
+        type filter hook output priority 0; policy drop;
+        oifname "lo" accept
+        oifname "rustynet0" accept
+        oifname "enp0s1" meta nfproto ipv4 udp dport 53 drop
+        oifname "enp0s1" meta nfproto ipv4 tcp dport { 53, 853 } drop
+        oifname "enp0s1" meta nfproto ipv4 accept
+    }
+}"#;
+        assert!(
+            nft_ruleset_has_v6_drop(SCOPED_EGRESS_KILLSWITCH, "rustynet_g1"),
+            "the scoped (ipv4-only) egress set must leave IPv6 to the policy drop"
+        );
+
+        // Per-rule proof of WHY: every new shape is an ipv4-only selector, so
+        // the v6 classifier cannot even match it — no rule escapes.
+        let contained = ContainedInterfaces::default().with_name("rustynet0");
+        for (label, rule) in [
+            (
+                "narrow DNS udp drop",
+                "oifname \"enp0s1\" meta nfproto ipv4 udp dport 53 drop",
+            ),
+            (
+                "narrow DoT set drop",
+                "oifname \"enp0s1\" meta nfproto ipv4 tcp dport { 53, 853 } drop",
+            ),
+            (
+                "scoped ipv4 catch-all accept",
+                "oifname \"enp0s1\" meta nfproto ipv4 accept",
+            ),
+        ] {
+            assert_eq!(
+                classify_v6_egress_rule(rule, true, &contained),
+                RuleDisposition::Irrelevant,
+                "{label} is ipv4-only and must not influence the IPv6 verdict"
+            );
+        }
+    }
+
     /// The other direction, which matters just as much: a precedence check that
     /// fails closed on correct rulesets would be reverted within a week. None
     /// of these may be reported as a leak.

@@ -2330,6 +2330,11 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "established,related",
             "accept",
         ] if is_owned_failclosed_table_token(table) => Ok(()),
+        // RN-12/IPV-01/RN-29: scoped exit-node egress rules. The historical
+        // wide-open arm (`oifname <iface> accept`) is deliberately REMOVED —
+        // the helper now refuses that shape, so a regression back to the
+        // unqualified accept fails closed at the privileged boundary instead
+        // of silently reinstalling the hole.
         [
             "add",
             "rule",
@@ -2338,6 +2343,48 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "killswitch",
             "oifname",
             interface,
+            "meta",
+            "nfproto",
+            "ipv4",
+            "udp",
+            "dport",
+            "53",
+            "drop",
+        ] if is_owned_failclosed_table_token(table) && is_interface_name(interface) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "meta",
+            "nfproto",
+            "ipv4",
+            "tcp",
+            "dport",
+            "{",
+            "53,",
+            "853",
+            "}",
+            "drop",
+        ] if is_owned_failclosed_table_token(table) && is_interface_name(interface) => Ok(()),
+        // RN-12/IPV-01/RN-29: the former `dport != 53` / `dport != { 53, 853
+        // }` accept arms are gone — those rules were dead (the IPv4 catch-all
+        // below already accepted the same packets first-match) and were
+        // removed from the emitter.
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "meta",
+            "nfproto",
+            "ipv4",
             "accept",
         ] if is_owned_failclosed_table_token(table) && is_interface_name(interface) => Ok(()),
         [
@@ -4007,6 +4054,79 @@ mod tests {
             ],
         )
         .expect("per-token established/related killswitch rule should be accepted");
+    }
+
+    /// RN-12/IPV-01/RN-29: every scoped exit-node egress rule the emitter
+    /// installs must reach this allowlist as per-token nft keywords. The
+    /// brace-delimited anonymous set is spelled `{`, `53,`, `853`, `}` — one
+    /// argv element per token, the comma carried by the element. The former
+    /// `dport != …` accept rules are gone (dead behind the catch-all).
+    #[test]
+    fn validate_request_accepts_scoped_egress_killswitch_rules() {
+        let head = [
+            "add",
+            "rule",
+            "inet",
+            "rustynet_g1",
+            "killswitch",
+            "oifname",
+            "enp0s9",
+            "meta",
+            "nfproto",
+            "ipv4",
+        ];
+        let scoped_rules: Vec<Vec<&str>> = vec![
+            [head.as_slice(), &["udp", "dport", "53", "drop"]].concat(),
+            [
+                head.as_slice(),
+                &["tcp", "dport", "{", "53,", "853", "}", "drop"],
+            ]
+            .concat(),
+            [head.as_slice(), &["accept"]].concat(),
+        ];
+        for argv in &scoped_rules {
+            validate_request(PrivilegedCommandProgram::Nft, argv).unwrap_or_else(|err| {
+                panic!("scoped egress rule {argv:?} should be accepted: {err}")
+            });
+        }
+    }
+
+    /// RN-12/IPV-01/RN-29 fail-closed pin: the historical WIDE-OPEN
+    /// `oifname <underlay> accept` egress rule is no longer in this
+    /// allowlist — the helper must refuse it so a regression back to the
+    /// unqualified shape fails at the privileged boundary instead of
+    /// silently reinstalling the hole.
+    #[test]
+    fn validate_request_rejects_wide_open_egress_accept_rule() {
+        let err = validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "oifname",
+                "enp0s9",
+                "accept",
+            ],
+        )
+        .expect_err("wide-open egress accept should be refused by the allowlist");
+        assert!(err.contains("unsupported nft add rule argument schema"));
+    }
+
+    /// The pinned scoped-egress argv tokens must each satisfy the nft token
+    /// checker (braces included), so the cfg(test) token gate above
+    /// stays honest about the shapes.
+    #[cfg(not(windows))]
+    #[test]
+    fn scoped_egress_tokens_pass_is_nft_token() {
+        for token in ["{", "}", "53,", "853", "53", "nfproto", "ipv4"] {
+            assert!(
+                is_nft_token(token),
+                "token {token:?} must pass is_nft_token for the scoped egress rules"
+            );
+        }
     }
 
     #[test]

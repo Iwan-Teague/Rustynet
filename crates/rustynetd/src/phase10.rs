@@ -628,6 +628,13 @@ impl From<SystemError> for Phase10Error {
 pub trait DataplaneSystem {
     fn set_generation(&mut self, _generation: u64) {}
     fn set_relay_forwarding(&mut self, _enabled: bool) {}
+    /// RN-12/IPV-01: whether the protected-DNS posture is active for this
+    /// generation. Scoped to exit-egress rule shaping: when true, the
+    /// Linux killswitch egress rules drop plaintext DNS (udp/53, tcp/53,
+    /// DoT tcp/853) on the underlay before the scoped accepts. Default no-op
+    /// for backends whose egress shaping is handled elsewhere (macOS PF,
+    /// Windows WFP).
+    fn set_exit_egress_dns_drop(&mut self, _drop_dns: bool) {}
     /// QH-60 apply-scoped context: whether THIS generation engages
     /// full-tunnel policy routing (the `ip rule … table 51820` lookup). The
     /// management-bypass anchoring check refuses a dead carve-out only when
@@ -1172,6 +1179,11 @@ impl DataplaneSystem for DryRunSystem {
             .push(format!("set_relay_forwarding:{enabled}"));
     }
 
+    fn set_exit_egress_dns_drop(&mut self, drop_dns: bool) {
+        self.operations
+            .push(format!("set_exit_egress_dns_drop:{drop_dns}"));
+    }
+
     fn set_full_tunnel_engaged(&mut self, engaged: bool) {
         self.operations
             .push(format!("set_full_tunnel_engaged:{engaged}"));
@@ -1408,6 +1420,13 @@ pub struct LinuxCommandSystem {
     /// "not configured" and loopback DNS ownership refuses to apply.
     dns_resolver_port: u16,
     dns_protected: bool,
+    /// RN-12/IPV-01: whether the protected-DNS posture is active for the
+    /// generation being applied. When true, the exit-node egress rules drop
+    /// plaintext DNS (udp/53, tcp/53, DoT tcp/853) on the underlay BEFORE the
+    /// scoped accepts, so the drops cannot be shadowed. Set by the controller
+    /// before the NAT stage via
+    /// [`DataplaneSystem::set_exit_egress_dns_drop`].
+    exit_egress_dns_drop: bool,
     /// Set once the irreversible `blind_exit` hardened-egress posture has been
     /// applied. Like the macOS PF anchor it is one-way: rollback re-applies the
     /// hard-lock from this config instead of relaxing to an open NAT, and only a
@@ -1475,6 +1494,7 @@ impl LinuxCommandSystem {
             wg_listen_port: 0,
             dns_resolver_port: 0,
             dns_protected: false,
+            exit_egress_dns_drop: false,
             blind_exit_config: None,
             expected_management_bypass_routes: BTreeSet::new(),
             expected_peer_endpoint_bypass_routes: BTreeSet::new(),
@@ -2122,8 +2142,77 @@ impl LinuxCommandSystem {
     }
 
     /// Killswitch: allow the node's own egress while NAT forwarding is active.
-    fn killswitch_egress_allow_tokens(egress_interface: &str) -> Vec<String> {
-        vec!["oifname".into(), egress_interface.into(), "accept".into()]
+    ///
+    /// RN-12/IPV-01/RN-29: the historical rule was an unqualified
+    /// `oifname <egress> accept` — it accepted IPv4 AND IPv6, every protocol,
+    /// and shadowed the DNS-protection drops that get appended below it in the
+    /// same chain (first-match-wins). The replacement is scoped:
+    ///
+    /// - IPv4 only (`meta nfproto ipv4`): IPv6 egress falls through to the
+    ///   chain's terminal `policy drop` (IPv6 is hard-disabled system-wide).
+    /// - When the protected-DNS posture is active, plaintext DNS egress
+    ///   (udp/53, tcp/53, DoT tcp/853) on the underlay is dropped explicitly
+    ///   BEFORE the accept rules, so host DNS rides the loopback resolver
+    ///   instead of leaking to the underlay resolver.
+    /// - The final IPv4 catch-all accept accepts every remaining IPv4 packet
+    ///   out the egress underlay: all tcp/udp destination ports, ICMP/PMTU,
+    ///   and every other IPv4 protocol. It is deliberately bounded to that
+    ///   ONE interface and to IPv4 — IPv6 egress falls through to the chain's
+    ///   terminal `policy drop` (IPv6 is hard-disabled system-wide). The
+    ///   former `dport != 53` / `dport != { 53, 853 }` accepts were dead
+    ///   (the catch-all already accepted those packets first-match) and are
+    ///   gone.
+    ///
+    /// Rules are emitted in order; nft evaluates first-match-wins, so the
+    /// drops MUST come before the accepts and the catch-all MUST come last.
+    fn killswitch_egress_rule_tokens(egress_interface: &str, drop_dns: bool) -> Vec<Vec<String>> {
+        let scoped = |protocol: &str, dport: &[&str], negate: bool, verdict: &str| -> Vec<String> {
+            let mut tokens: Vec<String> = vec![
+                "oifname".into(),
+                egress_interface.into(),
+                "meta".into(),
+                "nfproto".into(),
+                "ipv4".into(),
+                protocol.into(),
+                "dport".into(),
+            ];
+            if negate {
+                tokens.push("!=".into());
+            }
+            if dport.len() == 1 {
+                tokens.push(dport[0].into());
+            } else {
+                // Rendered nft shapes an anonymous set as `{ 53, 853 }`, and
+                // the ruleset matcher matches builder tokens as substrings of
+                // that rendered line — so the set is tokenized one element per
+                // argv entry with the trailing comma carried by the element.
+                tokens.push("{".into());
+                for (index, port) in dport.iter().enumerate() {
+                    if index + 1 == dport.len() {
+                        tokens.push((*port).into());
+                    } else {
+                        tokens.push(format!("{port},"));
+                    }
+                }
+                tokens.push("}".into());
+            }
+            tokens.push(verdict.into());
+            tokens
+        };
+        let mut rules: Vec<Vec<String>> = Vec::new();
+        if drop_dns {
+            rules.push(scoped("udp", &["53"], false, "drop"));
+            rules.push(scoped("tcp", &["53", "853"], false, "drop"));
+        }
+        rules.push(vec![
+            "oifname".into(),
+            egress_interface.into(),
+            "meta".into(),
+            "nfproto".into(),
+            "ipv4".into(),
+            "accept".into(),
+        ]);
+        rules
     }
 
     /// Killswitch: allow WireGuard handshake traffic by destination OR source
@@ -2528,11 +2617,19 @@ impl LinuxCommandSystem {
             )?;
         }
         if self.nat_table.is_some() {
-            self.assert_chain_contains_strings(
-                &killswitch,
-                &Self::killswitch_egress_allow_tokens(self.egress_interface.as_str()),
-                "egress-interface killswitch allow rule missing while nat forwarding is active",
-            )?;
+            // RN-12/IPV-01/RN-29: assert every scoped egress rule (drops first
+            // when the protected-DNS posture is active, then the accepts, then
+            // the IPv4 catch-all) so none can be silently omitted.
+            for rule_tokens in Self::killswitch_egress_rule_tokens(
+                self.egress_interface.as_str(),
+                self.exit_egress_dns_drop,
+            ) {
+                self.assert_chain_contains_strings(
+                    &killswitch,
+                    &rule_tokens,
+                    "scoped egress killswitch rule missing while nat forwarding is active",
+                )?;
+            }
         }
         if self.dns_protected {
             for proto in ["udp", "tcp"] {
@@ -2555,12 +2652,16 @@ impl LinuxCommandSystem {
         // chain DEFAULT, applied only after every rule fails to match, so any
         // accept above it is evaluated first.
         //
-        // When NAT forwarding is active the daemon deliberately installs a
-        // wide-open `oifname "<underlay>" accept` here (asserted above). That is
-        // a real killswitch hole tracked as its own finding, and closing it is
-        // not this assertion's call -- so it is passed as ACKNOWLEDGED, which
-        // stops it masking anything beneath it while leaving its own disposition
-        // to the owning finding. Any other broad accept fails loudly.
+        // When NAT forwarding is active the daemon installs SCOPED egress
+        // rules here (asserted above): IPv4-only accepts that no longer admit
+        // IPv6 or shadow the DNS-protection drops, so the wide-open hole
+        // tracked as RN-12/IPV-01/RN-29 is closed. The acknowledgement mirrors
+        // the emitter's own gate exactly: the exit's egress underlay counts as
+        // an acknowledged wide-open interface ONLY while NAT forwarding is
+        // active, because that is the only context in which the daemon itself
+        // installs the IPv4 catch-all there. On a non-exit / no-NAT node
+        // nothing is acknowledged, so even the scoped shape fails loudly, and
+        // the terminal `policy drop` must stay reachable past every rule.
         let acknowledged_wide_open: Vec<&str> = if self.nat_table.is_some() {
             vec![self.egress_interface.as_str()]
         } else {
@@ -3051,6 +3152,10 @@ impl DataplaneSystem for LinuxCommandSystem {
         self.allow_tunnel_relay_forward = enabled;
     }
 
+    fn set_exit_egress_dns_drop(&mut self, drop_dns: bool) {
+        self.exit_egress_dns_drop = drop_dns;
+    }
+
     fn set_full_tunnel_engaged(&mut self, engaged: bool) {
         self.full_tunnel_engaged = engaged;
     }
@@ -3521,27 +3626,35 @@ impl DataplaneSystem for LinuxCommandSystem {
         self.nat_table = Some(nat_table);
 
         // Allow the exit node device's own outbound traffic via the egress interface.
-        // The killswitch chain has policy drop on the OUTPUT hook; without this rule
-        // the exit node device itself cannot open new connections to the internet
-        // while acting as an exit node.
+        // The killswitch chain has policy drop on the OUTPUT hook; without these
+        // rules the exit node device itself cannot open new connections to the
+        // internet while acting as an exit node. The rule set is scoped
+        // (RN-12/IPV-01/RN-29): IPv4-only, with DNS-protection drops ahead of
+        // the accepts when the protected-DNS posture is active, so a later
+        // rule can no longer shadow an earlier drop (nft is first-match-wins).
         if let Some((fw_table, egress_iface)) = egress_allow {
             let nat_name = self.nat_table.as_deref().unwrap_or("").to_owned();
-            if let Err(err) = self.run_nft_rule_argv(
-                "inet",
-                fw_table.as_str(),
-                "killswitch",
-                &Self::killswitch_egress_allow_tokens(egress_iface.as_str()),
-                &[],
+            for rule_tokens in Self::killswitch_egress_rule_tokens(
+                egress_iface.as_str(),
+                self.exit_egress_dns_drop,
             ) {
-                self.run_allow_failure(
-                    PrivilegedCommandProgram::Nft,
-                    &["delete", "table", "ip", nat_name.as_str()],
-                );
-                self.nat_table = None;
-                let _ = self.restore_ipv4_forwarding();
-                return Err(SystemError::NatApplyFailed(format!(
-                    "egress access rule failed: {err}"
-                )));
+                if let Err(err) = self.run_nft_rule_argv(
+                    "inet",
+                    fw_table.as_str(),
+                    "killswitch",
+                    &rule_tokens,
+                    &[],
+                ) {
+                    self.run_allow_failure(
+                        PrivilegedCommandProgram::Nft,
+                        &["delete", "table", "ip", nat_name.as_str()],
+                    );
+                    self.nat_table = None;
+                    let _ = self.restore_ipv4_forwarding();
+                    return Err(SystemError::NatApplyFailed(format!(
+                        "egress access rule failed: {err}"
+                    )));
+                }
             }
         }
 
@@ -7046,6 +7159,15 @@ impl DataplaneSystem for RuntimeSystem {
         }
     }
 
+    fn set_exit_egress_dns_drop(&mut self, drop_dns: bool) {
+        match self {
+            RuntimeSystem::DryRun(system) => system.set_exit_egress_dns_drop(drop_dns),
+            RuntimeSystem::Linux(system) => system.set_exit_egress_dns_drop(drop_dns),
+            RuntimeSystem::Macos(system) => system.set_exit_egress_dns_drop(drop_dns),
+            RuntimeSystem::Windows(system) => system.set_exit_egress_dns_drop(drop_dns),
+        }
+    }
+
     fn set_full_tunnel_engaged(&mut self, engaged: bool) {
         match self {
             RuntimeSystem::DryRun(system) => system.set_full_tunnel_engaged(engaged),
@@ -7846,6 +7968,12 @@ impl<B: TunnelBackend, S: DataplaneSystem> Phase10Controller<B, S> {
 
         self.system.apply_routes(&routes)?;
         applied_stages.push(StageMarker::SystemRoutesApplied);
+
+        // RN-12/IPV-01: thread the generation's DNS posture into the exit-node
+        // egress shaping BEFORE the NAT stage — the scoped egress rules must
+        // carry the plaintext-DNS drops from the moment they are emitted, or
+        // the accepts would shadow the later DNS drops (first-match-wins).
+        self.system.set_exit_egress_dns_drop(options.protected_dns);
 
         if options.exit_mode == ExitMode::FullTunnel || options.serve_exit_node {
             self.system.apply_nat_forwarding(
@@ -12274,6 +12402,64 @@ mod tests {
             "preflight must happen before owned OS mutation and NAT apply; ops={:?}",
             controller.system.operations
         );
+    }
+
+    /// The exit node's protected-DNS posture (`options.protected_dns`) must be
+    /// recorded on the system BEFORE NAT forwarding is applied — the NAT
+    /// emitter reads the recorded posture to decide whether the plaintext-DNS
+    /// drops precede the egress accepts — and the recorded value must mirror
+    /// the option exactly.
+    #[test]
+    fn exit_serving_records_protected_dns_posture_before_nat_apply() {
+        let serve = |protected_dns: bool| -> Vec<String> {
+            let policy = allow_shared_exit_policy();
+            let mut controller = Phase10Controller::new(
+                RecordingBackend::default(),
+                DryRunSystem::default(),
+                policy,
+                TrustPolicy::default(),
+            );
+            controller
+                .apply_dataplane_generation(
+                    trust_ok(),
+                    test_runtime_context(),
+                    vec![sample_peer("node-b")],
+                    vec![Route {
+                        destination_cidr: "100.100.20.0/24".to_owned(),
+                        via_node: NodeId::new("node-b").expect("node should parse"),
+                        kind: RouteKind::Mesh,
+                    }],
+                    ApplyOptions {
+                        serve_exit_node: true,
+                        protected_dns,
+                        ..ApplyOptions::default()
+                    },
+                )
+                .expect("exit-serving apply should succeed");
+            controller.system.operations
+        };
+
+        let posture = "set_exit_egress_dns_drop:";
+        for protected_dns in [true, false] {
+            let expected = format!("{posture}{protected_dns}");
+            let ops = serve(protected_dns);
+            let posture_index = ops
+                .iter()
+                .position(|op| op.starts_with(posture))
+                .unwrap_or_else(|| panic!("apply should record {expected}; ops={ops:?}"));
+            assert_eq!(
+                ops[posture_index], expected,
+                "the recorded posture must mirror options.protected_dns={protected_dns}"
+            );
+            let nat_index = ops
+                .iter()
+                .position(|op| op == "apply_nat_forwarding")
+                .expect("exit-serving apply should eventually apply NAT");
+            assert!(
+                posture_index < nat_index,
+                "{expected} must be recorded BEFORE apply_nat_forwarding; ops={ops:?}"
+            );
+        }
     }
 
     #[test]
@@ -17060,15 +17246,25 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
 
         // Matcher-side expectations (the SAME builders assert_nat_forwarding
-        // consumes) must each match some emitted argv line.
+        // consumes) must each match some emitted argv line. The egress
+        // builder now returns the SCOPED rule set (RN-12/IPV-01/RN-29);
+        // without the protected-DNS flag set, one rule is emitted.
         let egress_masquerade = LinuxCommandSystem::nat_egress_masquerade_tokens("enp0s9");
         let hairpin_masquerade = LinuxCommandSystem::nat_hairpin_masquerade_tokens("rustynet0");
-        let egress_allow = LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9");
-        for (name, tokens) in [
-            ("egress masquerade", egress_masquerade),
-            ("hairpin masquerade", hairpin_masquerade),
-            ("killswitch egress allow", egress_allow),
-        ] {
+        let egress_rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", false);
+        assert_eq!(
+            egress_rules.len(),
+            1,
+            "without the protected-DNS posture the scoped egress set is the single v4 catch-all accept"
+        );
+        let mut expectations: Vec<(String, Vec<String>)> = vec![
+            ("egress masquerade".to_owned(), egress_masquerade),
+            ("hairpin masquerade".to_owned(), hairpin_masquerade),
+        ];
+        for (index, tokens) in egress_rules.into_iter().enumerate() {
+            expectations.push((format!("scoped egress rule {index}"), tokens));
+        }
+        for (name, tokens) in expectations {
             let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
             assert!(
                 LinuxCommandSystem::chain_contains_all_tokens(&command_log, &borrowed),
@@ -17094,8 +17290,8 @@ mod tests {
     /// matcher (`assert_firewall_ruleset`) matches with — loopback,
     /// established/related, tunnel accept, both WireGuard port rules, both
     /// DNS fail-closed drops, both DNS allows, forward tun→egress, forward
-    /// hairpin, and the NAT-activated killswitch egress allow — is present
-    /// in the rendered `nft add rule` argv.
+    /// hairpin, and the NAT-activated SCOPED egress rule set (RN-12/IPV-01/
+    /// RN-29) — is present in the rendered `nft add rule` argv.
     #[cfg(target_os = "linux")]
     #[test]
     fn killswitch_and_dns_rule_tokens_agree_with_emitted_nft_argv() {
@@ -17118,6 +17314,10 @@ mod tests {
         // argv, so any non-zero port exercises the emitted rule tokens.
         .with_dns_resolver_port(53535);
         DataplaneSystem::set_relay_forwarding(&mut system, true);
+        // RN-12/IPV-01: mirror the runtime ordering — the DNS posture is
+        // threaded to the egress shaper BEFORE the NAT stage, so the scoped
+        // egress rules carry the plaintext-DNS drops from the start.
+        DataplaneSystem::set_exit_egress_dns_drop(&mut system, true);
 
         DataplaneSystem::apply_firewall_killswitch(&mut system)
             .expect("killswitch apply should succeed against the capture helper");
@@ -17159,10 +17359,15 @@ mod tests {
                 "killswitch",
                 LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
             ),
-            (
-                "killswitch",
-                LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9"),
-            ),
+        ];
+        // RN-12/IPV-01/RN-29: the egress builder now returns the SCOPED rule
+        // set (two DNS drops + one v4 catch-all accept with the posture
+        // active); every one of them must appear in the emitted killswitch
+        // argv.
+        for scoped in LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true) {
+            expectations.push(("killswitch", scoped));
+        }
+        expectations.extend([
             (
                 "killswitch",
                 LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
@@ -17185,7 +17390,7 @@ mod tests {
                 "forward",
                 LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
             ),
-        ];
+        ]);
         for (chain, tokens) in expectations {
             let chain_argv: Vec<String> = command_log
                 .iter()
@@ -17225,10 +17430,6 @@ mod tests {
             (
                 "tunnel_interface",
                 LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
-            ),
-            (
-                "egress_allow",
-                LinuxCommandSystem::killswitch_egress_allow_tokens("enp0s9"),
             ),
             (
                 "wg_dport",
@@ -17282,6 +17483,24 @@ mod tests {
                 );
             }
         }
+        // RN-12/IPV-01/RN-29: the scoped egress builder returns a rule SET —
+        // walk every rule under both postures.
+        for drop_dns in [false, true] {
+            for (index, tokens) in
+                LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", drop_dns)
+                    .into_iter()
+                    .enumerate()
+            {
+                for token in tokens {
+                    assert!(
+                        !token.chars().any(char::is_whitespace),
+                        "scoped egress builder (drop_dns={drop_dns}) rule {index} emitted a \
+                         token with internal whitespace ({token:?}); the privileged-helper \
+                         argv allowlist matches per-token nft keywords and would refuse the rule"
+                    );
+                }
+            }
+        }
     }
 
     /// Pins the established/related killswitch rule's FULL argv to the exact
@@ -17310,6 +17529,177 @@ mod tests {
                 "accept"
             ]
         );
+    }
+
+    /// RN-12/IPV-01/RN-29: pins the FULL argv of every scoped exit-node
+    /// egress rule to the exact shape the privileged-helper allowlist
+    /// accepts (mirrors `established_related_rule_argv_is_helper_allowlist_shaped`
+    /// above), so an emitter-side regression fails this test instead of every
+    /// Linux exit-node apply rolling back its NAT table at the helper.
+    #[test]
+    fn scoped_egress_rule_argvs_are_helper_allowlist_shaped() {
+        let drop_dns_rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true);
+        assert_eq!(drop_dns_rules.len(), 3);
+        let expected_rule_bodies: Vec<Vec<&str>> = vec![
+            vec![
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "53", "drop",
+            ],
+            vec![
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "tcp", "dport", "{", "53,", "853",
+                "}", "drop",
+            ],
+            vec!["oifname", "enp0s9", "meta", "nfproto", "ipv4", "accept"],
+        ];
+        for (tokens, expected_body) in drop_dns_rules.iter().zip(expected_rule_bodies.iter()) {
+            let argv = LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                tokens,
+                &[],
+            );
+            let mut expected: Vec<&str> = vec!["add", "rule", "inet", "rustynet_g1", "killswitch"];
+            expected.extend_from_slice(expected_body);
+            assert_eq!(
+                argv, expected,
+                "scoped egress argv drifted from the helper allowlist shape"
+            );
+        }
+        // Without the protected-DNS posture only the v4 catch-all accept is
+        // emitted.
+        let no_drop_rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", false);
+        assert_eq!(no_drop_rules.len(), 1);
+        assert!(
+            no_drop_rules
+                .iter()
+                .all(|tokens| tokens.last().map(String::as_str) == Some("accept"))
+        );
+    }
+
+    /// nft evaluates a chain FIRST-MATCH-WINS, so the effective verdict for a
+    /// packet is decided by rule ORDER, not by which rules exist. This
+    /// simulates first-match evaluation over the ACTUAL token set
+    /// `killswitch_egress_rule_tokens` emits, for both DNS postures, and pins
+    /// the verdict per probe. The order-mutation negative at the end proves
+    /// those verdict assertions are load-bearing: with the accepts hoisted
+    /// above the drops the DNS packets accept, so a future reordering of the
+    /// emitter cannot pass this test silently. (IPv6 needs no simulation:
+    /// every emitted rule is `meta nfproto ipv4`-qualified — asserted during
+    /// parsing — so no v6 packet matches anything here and the chain's
+    /// terminal `policy drop` decides; that containment is proven separately
+    /// in `linux_ipv6_leak`.)
+    #[test]
+    fn scoped_egress_tokens_satisfy_nft_first_match_semantics() {
+        // Parse one emitted rule into (protocol, negate, dport set, verdict).
+        // Panics unless the rule is oifname-qualified and ipv4-only.
+        let parse_rule = |tokens: &[String]| -> (Option<String>, bool, Vec<u16>, String) {
+            assert_eq!(tokens.first().map(String::as_str), Some("oifname"));
+            assert_eq!(
+                tokens.get(2..5),
+                Some(&["meta".to_owned(), "nfproto".to_owned(), "ipv4".to_owned()][..]),
+                "every scoped egress rule must be ipv4-qualified: {tokens:?}"
+            );
+            let verdict = tokens
+                .last()
+                .expect("every rule must carry a verdict")
+                .clone();
+            let mut rest = &tokens[5..tokens.len().saturating_sub(1)];
+            let protocol = match rest.first().map(String::as_str) {
+                Some("udp") | Some("tcp") => {
+                    let proto = rest[0].clone();
+                    rest = &rest[1..];
+                    Some(proto)
+                }
+                _ => None,
+            };
+            let mut negate = false;
+            if rest.first().map(String::as_str) == Some("dport") {
+                rest = &rest[1..];
+                if rest.first().map(String::as_str) == Some("!=") {
+                    negate = true;
+                    rest = &rest[1..];
+                }
+            }
+            let ports: Vec<u16> = rest
+                .iter()
+                .filter(|token| token.as_str() != "{" && token.as_str() != "}")
+                .map(|token| {
+                    token
+                        .trim_end_matches(',')
+                        .parse()
+                        .expect("dport element must be numeric")
+                })
+                .collect();
+            (protocol, negate, ports, verdict)
+        };
+        // nft first-match simulation: (protocol, port); protocol None matches
+        // any protocol (ICMP/other v4). A rule matches when its protocol
+        // selector matches and its dport set (with negation) contains the
+        // probe; the FIRST match wins; no match = fall to `policy drop`.
+        let first_match = |rules: &[Vec<String>], probe: (Option<&str>, u16)| -> Option<String> {
+            for tokens in rules {
+                let (protocol, negate, ports, verdict) = parse_rule(tokens);
+                if let Some(proto) = &protocol
+                    && Some(proto.as_str()) != probe.0
+                {
+                    continue;
+                }
+                if !ports.is_empty() && ports.contains(&probe.1) == negate {
+                    continue;
+                }
+                return Some(verdict);
+            }
+            None
+        };
+
+        let dns_drop = "drop";
+        let accept = "accept";
+        let with_posture = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true);
+        for (label, probe, expected) in [
+            ("plaintext udp/53 dns", (Some("udp"), 53), dns_drop),
+            ("plaintext tcp/53 dns", (Some("tcp"), 53), dns_drop),
+            ("dot tcp/853", (Some("tcp"), 853), dns_drop),
+            ("regular udp traffic", (Some("udp"), 443), accept),
+            ("regular tcp traffic", (Some("tcp"), 443), accept),
+            ("icmp / other v4 protocols", (None, 0), accept),
+        ] {
+            assert_eq!(
+                first_match(&with_posture, probe).as_deref(),
+                Some(expected),
+                "{label} must first-match to {expected} with the protected-DNS posture active"
+            );
+        }
+
+        let without_posture = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", false);
+        for (label, probe) in [
+            ("plaintext udp/53 dns", (Some("udp"), 53)),
+            ("dot tcp/853", (Some("tcp"), 853)),
+        ] {
+            assert_eq!(
+                first_match(&without_posture, probe).as_deref(),
+                Some(accept),
+                "{label} must first-match to accept without the protected-DNS posture"
+            );
+        }
+
+        // Order-mutation negative: hoisting the accepts above the drops flips
+        // the DNS verdicts to accept — proving the assertions above depend on
+        // the emitted order and would catch any emitter reordering.
+        let mut reordered: Vec<Vec<String>> = Vec::new();
+        reordered.push(with_posture[2].clone());
+        reordered.push(with_posture[0].clone());
+        reordered.push(with_posture[1].clone());
+        for (label, probe) in [
+            ("plaintext udp/53 dns", (Some("udp"), 53)),
+            ("dot tcp/853", (Some("tcp"), 853)),
+        ] {
+            assert_eq!(
+                first_match(&reordered, probe).as_deref(),
+                Some(accept),
+                "{label} must INCORRECTLY accept under the mutated order — \
+                 the correct-order assertions above are load-bearing"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
