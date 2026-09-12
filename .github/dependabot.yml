@@ -1,0 +1,34 @@
+# Dependabot configuration (AQ-09 / R-PROC-3).
+# Security updates (the vuln-patch path in SECURITY.md) are enabled separately
+# in repo Settings → Security; this file governs version-update PRs.
+version: 2
+updates:
+  # Rust dependencies. The Cargo workspace root ("/") covers every workspace
+  # member's dependencies via the shared Cargo.lock, so one entry suffices.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Group routine bumps into one PR to cut noise; security updates are not
+    # grouped (they arrive on their own for fast review).
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"
+
+  # GitHub Actions used by the workflows (keeps SHA-pinned actions current).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions-all:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
