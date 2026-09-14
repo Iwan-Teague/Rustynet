@@ -251,12 +251,12 @@ impl OrchestrationStage for NegativeControlPlantedResidueStage {
         // arm is `DetectedNamingPlant`, so a witness line appended here records
         // the sabotage-plant + clean-assert-detection inversion with the real
         // target alias. A witness write failure fails the control.
-        if matches!(outcome, StageOutcome::Passed) {
-            if let Err(err) = write_planted_residue_witness(&ctx.report_dir, &target) {
-                return StageOutcome::Failed(format!(
-                    "planted-residue negative control: witness write failed: {err}"
-                ));
-            }
+        if matches!(outcome, StageOutcome::Passed)
+            && let Err(err) = write_planted_residue_witness(&ctx.report_dir, &target)
+        {
+            return StageOutcome::Failed(format!(
+                "planted-residue negative control: witness write failed: {err}"
+            ));
         }
         outcome
     }
@@ -2973,6 +2973,12 @@ mod tests {
                 crate::vm_lab::orchestrator::stage::StageId::NegativeControlEnrollmentTokenReplay,
                 crate::vm_lab::orchestrator::stage::negative_control_enrollment_replay::REPLAY_TRANSCRIPT_RELATIVE,
             ),
+            (
+                // QH-88: the live wire-forgery control declares its attack
+                // transcript (impl in stage/negative_control_wire_forgery.rs).
+                crate::vm_lab::orchestrator::stage::StageId::NegativeControlWireForgery,
+                crate::vm_lab::orchestrator::stage::negative_control_wire_forgery::WIRE_FORGERY_TRANSCRIPT_RELATIVE,
+            ),
         ];
         let mut declared: HashSet<String> = HashSet::new();
         for (id, expected_path) in expected {
@@ -2993,7 +2999,7 @@ mod tests {
             StageId::NegativeControlPlantedResidue.evidence(),
             StageEvidence::StageLog
         );
-        assert_eq!(declared.len(), 4);
+        assert_eq!(declared.len(), 5);
     }
 
     fn planted_witness_temp_dir(label: &str) -> PathBuf {
