@@ -537,6 +537,11 @@ exit 0
 
     /// Parse the attack transcript. Any hard-error field or missing field is
     /// NotAdjudicable (fail closed).
+    // `RogueParse::Observed` carries the whole observation by value; the
+    // boxing it would take to satisfy the 1.97 `result_large_err` lint would
+    // touch every match arm for a parse-local ergonomic worry. Allowed here,
+    // not suppressed workspace-wide (rustc 1.97 toolchain-drift fallout).
+    #[allow(clippy::result_large_err)]
     pub(crate) fn parse_transcript(_exit_code: i32, stdout: &str) -> RogueParse {
         if field(stdout, "rb_error_stage_failed").is_some() {
             return RogueParse::NotAdjudicable {

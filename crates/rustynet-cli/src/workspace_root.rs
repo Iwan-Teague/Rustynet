@@ -236,17 +236,16 @@ pub(crate) fn init_workspace_root_in(
     }
     let resolved = cell.get_or_init(|| {
         let resolved = resolve_workspace_root(inventory, cwd);
-        if let Ok(root) = &resolved {
-            if let Ok(compiled) = compiled_in_root() {
-                if compiled != *root {
-                    eprintln!(
-                        "rustynet: workspace root resolved at runtime to `{}` \
+        if let Ok(root) = &resolved
+            && let Ok(compiled) = compiled_in_root()
+            && compiled != *root
+        {
+            eprintln!(
+                "rustynet: workspace root resolved at runtime to `{}` \
                          (compiled-in root is `{}`)",
-                        root.display(),
-                        compiled.display()
-                    );
-                }
-            }
+                root.display(),
+                compiled.display()
+            );
         }
         resolved
     });

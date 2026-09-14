@@ -200,19 +200,19 @@ fn scan_source(path: &Path, source: &str, violations: &mut Vec<Violation>) {
                     }
                     cursor += 1;
                 }
-                if let Some(unwrap_line) = saw_unwrap_line {
-                    if saw_unwrap_line_has_linux || saw_linux_elsewhere {
-                        // A Linux fallback on the unwrap line itself is
-                        // already reported by R3 in the main loop; only add
-                        // the statement-level report when the Linux literal
-                        // sits on a different line.
-                        if !saw_unwrap_line_has_linux {
-                            violations.push(Violation {
+                if let Some(unwrap_line) = saw_unwrap_line
+                    && (saw_unwrap_line_has_linux || saw_linux_elsewhere)
+                {
+                    // A Linux fallback on the unwrap line itself is
+                    // already reported by R3 in the main loop; only add
+                    // the statement-level report when the Linux literal
+                    // sits on a different line.
+                    if !saw_unwrap_line_has_linux {
+                        violations.push(Violation {
                                 path: path.to_path_buf(),
                                 line: unwrap_line,
                                 reason: "multi-line infer( statement composed with unwrap_or yielding a Linux default — resolve the unknown explicitly instead".to_owned(),
                             });
-                        }
                     }
                 }
             }

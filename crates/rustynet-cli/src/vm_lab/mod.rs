@@ -7921,26 +7921,23 @@ fn execute_ops_vm_lab_discover_local_utm_with_probes(
         // self-perpetuating. `ready`/`ready_count` (and therefore `overall_status`)
         // keep their strict meaning; only the write-eligibility set is widened.
         let ip_observed = process_present && live_ip_known && authoritative_target_present;
-        if ip_observed && inventory_match.is_some() {
-            if let Some(profile) = discovery_platform_profile.as_ref() {
-                ready_inventory_states.push(LocalUtmReadyState {
-                    alias: inventory_alias.clone().unwrap_or_else(|| utm_name.clone()),
-                    utm_name: utm_name.clone(),
-                    process_present,
-                    live_ip: live_ip.clone(),
-                    ssh_port_status: ssh_port_status.clone(),
-                    ssh_auth_status: match &ssh_auth_state {
-                        ProbeState::Ok { value } | ProbeState::Fallback { value, .. } => {
-                            value.clone()
-                        }
-                        ProbeState::Missing { reason } | ProbeState::Error { reason } => {
-                            reason.clone()
-                        }
-                    },
-                    authorized_keys_fingerprint: authorized_keys_fingerprint.clone(),
-                    platform: profile.platform,
-                });
-            }
+        if ip_observed
+            && inventory_match.is_some()
+            && let Some(profile) = discovery_platform_profile.as_ref()
+        {
+            ready_inventory_states.push(LocalUtmReadyState {
+                alias: inventory_alias.clone().unwrap_or_else(|| utm_name.clone()),
+                utm_name: utm_name.clone(),
+                process_present,
+                live_ip: live_ip.clone(),
+                ssh_port_status: ssh_port_status.clone(),
+                ssh_auth_status: match &ssh_auth_state {
+                    ProbeState::Ok { value } | ProbeState::Fallback { value, .. } => value.clone(),
+                    ProbeState::Missing { reason } | ProbeState::Error { reason } => reason.clone(),
+                },
+                authorized_keys_fingerprint: authorized_keys_fingerprint.clone(),
+                platform: profile.platform,
+            });
         }
 
         entries.push(json!({
