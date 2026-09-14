@@ -4301,12 +4301,11 @@ impl MacosCommandSystem {
         if let Ok(nested) = self.run_capture(
             PrivilegedCommandProgram::Pfctl,
             &["-a", "com.apple", "-s", "Anchors"],
-        ) {
-            if nested.success() {
-                for anchor in Self::owned_anchor_names_from_output(&nested.stdout) {
-                    if !anchors.contains(&anchor) {
-                        anchors.push(anchor);
-                    }
+        ) && nested.success()
+        {
+            for anchor in Self::owned_anchor_names_from_output(&nested.stdout) {
+                if !anchors.contains(&anchor) {
+                    anchors.push(anchor);
                 }
             }
         }
@@ -4908,13 +4907,13 @@ impl MacosCommandSystem {
             let servers = self
                 .read_networksetup_service_dns(service)
                 .map_err(SystemError::DnsApplyFailed)?;
-            if let Some(servers) = servers {
-                if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
-                    return Err(SystemError::DnsApplyFailed(format!(
-                        "refusing {} posture: service '{service}' still pins loopback DNS (stranded residue; restore the original DNS before scoping)",
-                        DnsPosture::ScopedResolverOnly.as_str()
-                    )));
-                }
+            if let Some(servers) = servers
+                && crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers)
+            {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "refusing {} posture: service '{service}' still pins loopback DNS (stranded residue; restore the original DNS before scoping)",
+                    DnsPosture::ScopedResolverOnly.as_str()
+                )));
             }
         }
         self.run(
@@ -4952,13 +4951,13 @@ impl MacosCommandSystem {
             let servers = self
                 .read_networksetup_service_dns(service)
                 .map_err(SystemError::DnsApplyFailed)?;
-            if let Some(servers) = servers {
-                if crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers) {
-                    return Err(SystemError::DnsApplyFailed(format!(
-                        "macOS DNS posture drifted ({}): service '{service}' advertises loopback DNS pins without the full-protection floor",
-                        DnsPosture::ScopedResolverOnly.as_str()
-                    )));
-                }
+            if let Some(servers) = servers
+                && crate::macos_dns_sc_protect::is_loopback_dns_server_list(&servers)
+            {
+                return Err(SystemError::DnsApplyFailed(format!(
+                    "macOS DNS posture drifted ({}): service '{service}' advertises loopback DNS pins without the full-protection floor",
+                    DnsPosture::ScopedResolverOnly.as_str()
+                )));
             }
         }
         Ok(())

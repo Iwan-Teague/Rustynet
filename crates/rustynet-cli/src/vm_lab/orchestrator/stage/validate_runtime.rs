@@ -278,13 +278,13 @@ impl OrchestrationStage for ValidateBaselineRuntimeStage {
         // daemon report embedded verbatim. Best-effort like the artifact above.
         let evidence = build_validator_evidence("validate_baseline_runtime", &records);
         let logs_dir = ctx.report_dir.join("logs");
-        if std::fs::create_dir_all(&logs_dir).is_ok() {
-            if let Ok(json) = serde_json::to_string_pretty(&evidence) {
-                let _ = std::fs::write(
-                    logs_dir.join("validate_baseline_runtime.validator-evidence.json"),
-                    json,
-                );
-            }
+        if std::fs::create_dir_all(&logs_dir).is_ok()
+            && let Ok(json) = serde_json::to_string_pretty(&evidence)
+        {
+            let _ = std::fs::write(
+                logs_dir.join("validate_baseline_runtime.validator-evidence.json"),
+                json,
+            );
         }
 
         if errors.is_empty() {

@@ -521,10 +521,10 @@ struct CrossBridgeSubnetGroup {
 /// stripped remnant still fails the later `Ipv4Addr` parse and lands in
 /// `excluded`, never in a probe argv.
 fn strip_ssh_port(host: &str) -> &str {
-    if let Some((head, tail)) = host.rsplit_once(':') {
-        if tail.parse::<u16>().is_ok() {
-            return head;
-        }
+    if let Some((head, tail)) = host.rsplit_once(':')
+        && tail.parse::<u16>().is_ok()
+    {
+        return head;
     }
     host
 }
@@ -558,7 +558,7 @@ fn classify_subnet_split(
     for g in &mut groups {
         g.aliases.sort();
     }
-    groups.sort_by(|a, b| a.subnet.cmp(&b.subnet));
+    groups.sort_by_key(|a| a.subnet);
     (groups, excluded)
 }
 
@@ -653,18 +653,18 @@ fn decide_cross_bridge(
     // fleet carrying such a target must never read as a clean single-subnet
     // pass: hard-fail under a dataplane plan, warn otherwise.
     let excluded_note = (!excluded.is_empty()).then(|| excluded.join(", "));
-    if let Some(names) = &excluded_note {
-        if plan_has_cross_bridge_dataplane_stage(planned) {
-            return CrossBridgeOutcome::Fail(format!(
-                "cross-bridge preflight: non-IPv4 ssh host(s) cannot be classified into a \
+    if let Some(names) = &excluded_note
+        && plan_has_cross_bridge_dataplane_stage(planned)
+    {
+        return CrossBridgeOutcome::Fail(format!(
+            "cross-bridge preflight: non-IPv4 ssh host(s) cannot be classified into a \
                  /24 ({names}); cross-bridge reachability is unprovable for them while \
                  cross-bridge dataplane stages (traffic_test_matrix / \
                  live_two_hop_validation / live_managed_dns_validation / \
                  relay_forwards_frame_validation) are planned (CP-1: \
                  documents/operations/active/MacosCrossNetworkTrafficBlocker_2026-09-03.md \
                  §9, scripts/vm_lab/cross_vmnet_pf_override.pf)"
-            ));
-        }
+        ));
     }
     if groups.len() <= 1 {
         if excluded.is_empty() {
@@ -832,13 +832,13 @@ impl PreflightStage {
         // write failure is the stage's failure — never a stderr note beside
         // a pass the runner would then demote to NotProven anyway.
         let log_path = ctx.report_dir.join("logs/cross_bridge_preflight.txt");
-        if let Some(parent) = log_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                return StageOutcome::Failed(format!(
-                    "cross-bridge preflight: cannot create witness log dir {}: {e}",
-                    parent.display()
-                ));
-            }
+        if let Some(parent) = log_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return StageOutcome::Failed(format!(
+                "cross-bridge preflight: cannot create witness log dir {}: {e}",
+                parent.display()
+            ));
         }
         if let Err(e) = std::fs::write(&log_path, &report) {
             return StageOutcome::Failed(format!(
@@ -1464,7 +1464,7 @@ mod tests {
                 &two_groups(),
                 &[],
                 &["a → b (192.168.65.9):22 cross-bridge unreachable (exit 1)".to_owned()],
-                &[stage.clone()],
+                std::slice::from_ref(&stage),
             );
             match outcome {
                 CrossBridgeOutcome::Fail(ref msg) => {
@@ -1535,7 +1535,7 @@ mod tests {
             StageId::LiveManagedDnsValidation,
             StageId::RelayForwardsFrameValidation,
         ] {
-            let outcome = decide_cross_bridge(&one, &excluded, &[], &[stage.clone()]);
+            let outcome = decide_cross_bridge(&one, &excluded, &[], std::slice::from_ref(&stage));
             assert!(
                 matches!(outcome, CrossBridgeOutcome::Fail(ref msg) if msg.contains("non-IPv4")),
                 "{stage:?}: expected Fail naming the non-IPv4 host, got {outcome:?}"

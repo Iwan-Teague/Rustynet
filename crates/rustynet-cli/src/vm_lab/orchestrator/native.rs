@@ -174,13 +174,13 @@ pub(crate) fn execute_rust_native_orchestration(
     // upsert's Final-over-empty-started match. Dry-run writes no row (its
     // report dir is removed afterwards). A ledger failure warns but never
     // aborts the run — the finalize path treats matrix failures the same way.
-    if !dry_run {
-        if let Err(err) = crate::live_lab_run_matrix::record_live_lab_run_matrix_run_start(
+    if !dry_run
+        && let Err(err) = crate::live_lab_run_matrix::record_live_lab_run_matrix_run_start(
             report_dir.as_path(),
             Some("vm-lab-orchestrate-live-lab"),
-        ) {
-            eprintln!("warning: live-lab run-matrix start row failed: {err}");
-        }
+        )
+    {
+        eprintln!("warning: live-lab run-matrix start row failed: {err}");
     }
 
     // The run's network profile is resolved and recorded (or, on resume,

@@ -357,12 +357,12 @@ fn distribute_bundle_kind_inner(
                 .map(|nid| (a.alias.clone(), nid.clone()))
         })
         .collect();
-    if let Some(scope) = scope_alias {
-        if aliases.is_empty() {
-            return StageOutcome::Failed(format!(
-                "scoped bundle distribution found no node_id for scope alias '{scope}'"
-            ));
-        }
+    if let Some(scope) = scope_alias
+        && aliases.is_empty()
+    {
+        return StageOutcome::Failed(format!(
+            "scoped bundle distribution found no node_id for scope alias '{scope}'"
+        ));
     }
 
     // Verify and distribute the verifier key to every in-scope node before
