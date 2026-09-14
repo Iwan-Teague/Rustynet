@@ -13,6 +13,14 @@
 //! cargo build --release -p rustynet-control --example perfprobe_membership
 //! /usr/bin/time -l target/release/examples/perfprobe_membership
 //! ```
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+// AQ-08: dev-only perfprobe (never shipped); expect is fine in a
+// measurement probe that exits on the first broken invariant.
 
 use std::hint::black_box;
 use std::time::Instant;

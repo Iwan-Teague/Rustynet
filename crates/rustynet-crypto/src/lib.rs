@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (rev-04 S2.1 / R-ENF-6): unit-test code may use unwrap/expect/panic
+// freely; production code in this crate may not (see Cargo.toml [lints]).
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::error::Error;
 use std::fmt;
@@ -1365,10 +1376,21 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, CryptoError> {
 
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for pair in bytes.chunks_exact(2) {
-        let hi = (pair[0] as char)
+        // `chunks_exact(2)` yields exactly two bytes per chunk, so
+        // `first`/`last` are always `Some` here; the `ok_or` keeps the
+        // lookup total without indexing.
+        let hi_byte = pair
+            .first()
+            .copied()
+            .ok_or(CryptoError::AttestationVerificationFailed)?;
+        let lo_byte = pair
+            .last()
+            .copied()
+            .ok_or(CryptoError::AttestationVerificationFailed)?;
+        let hi = (hi_byte as char)
             .to_digit(16)
             .ok_or(CryptoError::AttestationVerificationFailed)?;
-        let lo = (pair[1] as char)
+        let lo = (lo_byte as char)
             .to_digit(16)
             .ok_or(CryptoError::AttestationVerificationFailed)?;
         out.push(((hi << 4) | lo) as u8);
@@ -1382,6 +1404,9 @@ pub fn generate_key_custody_material() -> ([u8; 16], [u8; 24]) {
     // `try_generate_key_custody_material` so a CSPRNG failure surfaces as a
     // structured `CryptoError::RandomnessUnavailable` instead of either
     // panicking or silently degrading to a non-CSPRNG source.
+    // AQ-08: the `panic!` below is the documented legacy-fixture contract;
+    // production callers are on `try_generate_key_custody_material`.
+    #[allow(clippy::panic)]
     match try_generate_key_custody_material() {
         Ok(material) => material,
         Err(err) => panic!("kernel CSPRNG unavailable for key-custody material: {err}"),
@@ -1757,7 +1782,7 @@ fn encode_encrypted_blob(blob: &EncryptedKeyBlob) -> Vec<u8> {
 fn decode_encrypted_blob(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> {
     // v1: [version:1][salt:16][nonce:24][len:4][ct] — min 45 bytes, version != 0
     // v0: [salt:16][nonce:24][len:4][ct] — min 44 bytes, version implicitly 0
-    if bytes.len() >= 45 && bytes[0] != 0 {
+    if bytes.len() >= 45 && bytes.first() != Some(&0) {
         return decode_encrypted_blob_v1(bytes);
     }
     decode_encrypted_blob_v0(bytes)
@@ -1767,14 +1792,17 @@ fn decode_encrypted_blob_v0(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
     if bytes.len() < 44 {
         return Err(CryptoError::InvalidLength);
     }
+    // The length guard above makes every `split_at` below in-bounds.
+    let (salt_bytes, rest) = bytes.split_at(16);
+    let (nonce_bytes, rest) = rest.split_at(24);
+    let (length_bytes, ciphertext) = rest.split_at(4);
     let mut salt = [0u8; 16];
-    salt.copy_from_slice(&bytes[0..16]);
+    salt.copy_from_slice(salt_bytes);
     let mut nonce = [0u8; 24];
-    nonce.copy_from_slice(&bytes[16..40]);
-
-    let mut length_bytes = [0u8; 4];
-    length_bytes.copy_from_slice(&bytes[40..44]);
-    let ciphertext_len = u32::from_be_bytes(length_bytes) as usize;
+    nonce.copy_from_slice(nonce_bytes);
+    let mut length_arr = [0u8; 4];
+    length_arr.copy_from_slice(length_bytes);
+    let ciphertext_len = u32::from_be_bytes(length_arr) as usize;
     // CRY-12: checked add. The declared length is attacker-controlled up to
     // u32::MAX; on a 32-bit target (armv7 relay/exit nodes are a documented
     // roadmap item) `44 + ciphertext_len` overflows `usize`, which panics in a
@@ -1790,7 +1818,7 @@ fn decode_encrypted_blob_v0(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
         version: 0,
         salt,
         nonce,
-        ciphertext: bytes[44..].to_vec(),
+        ciphertext: ciphertext.to_vec(),
     })
 }
 
@@ -1798,18 +1826,22 @@ fn decode_encrypted_blob_v1(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
     if bytes.len() < 45 {
         return Err(CryptoError::InvalidLength);
     }
-    let version = bytes[0];
+    let version = bytes.first().copied().ok_or(CryptoError::InvalidLength)?;
     if version == 0 {
         return Err(CryptoError::InvalidLength);
     }
+    // The length guard above makes every `split_at` below in-bounds.
+    let (_, rest) = bytes.split_at(1);
+    let (salt_bytes, rest) = rest.split_at(16);
+    let (nonce_bytes, rest) = rest.split_at(24);
+    let (length_bytes, ciphertext) = rest.split_at(4);
     let mut salt = [0u8; 16];
-    salt.copy_from_slice(&bytes[1..17]);
+    salt.copy_from_slice(salt_bytes);
     let mut nonce = [0u8; 24];
-    nonce.copy_from_slice(&bytes[17..41]);
-
-    let mut length_bytes = [0u8; 4];
-    length_bytes.copy_from_slice(&bytes[41..45]);
-    let ciphertext_len = u32::from_be_bytes(length_bytes) as usize;
+    nonce.copy_from_slice(nonce_bytes);
+    let mut length_arr = [0u8; 4];
+    length_arr.copy_from_slice(length_bytes);
+    let ciphertext_len = u32::from_be_bytes(length_arr) as usize;
     // CRY-12: see the v0 decoder — checked add for the same reason.
     let expected_len = ciphertext_len
         .checked_add(45)
@@ -1822,7 +1854,7 @@ fn decode_encrypted_blob_v1(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
         version,
         salt,
         nonce,
-        ciphertext: bytes[45..].to_vec(),
+        ciphertext: ciphertext.to_vec(),
     })
 }
 

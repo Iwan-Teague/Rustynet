@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (rev-04 S2.1 / R-ENF-6): unit-test code may use unwrap/expect/panic
+// freely; production code in this crate may not (see Cargo.toml [lints]).
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeSet, HashMap};
 

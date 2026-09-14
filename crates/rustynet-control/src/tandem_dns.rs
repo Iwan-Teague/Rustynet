@@ -99,9 +99,15 @@ impl TandemScope {
                 if ids.len() > TANDEM_SCOPE_MAX_NODE_IDS {
                     return Err(TandemReasonCode::SignedPolicyInvalid);
                 }
-                let sorted_and_deduped = ids
-                    .windows(2)
-                    .all(|pair| !pair[0].trim().is_empty() && pair[0] < pair[1]);
+                let sorted_and_deduped = ids.windows(2).all(|pair| {
+                    // `windows(2)` always yields exactly two elements; the
+                    // unreachable arm fails closed rather than admitting a
+                    // malformed pair.
+                    let [left, right] = pair else {
+                        return false;
+                    };
+                    !left.trim().is_empty() && left < right
+                });
                 if sorted_and_deduped {
                     Ok(())
                 } else {

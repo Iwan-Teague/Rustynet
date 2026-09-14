@@ -187,25 +187,24 @@ pub const GENESIS_PREVIOUS_HASH: &str = "genesis";
 /// memory exhaustion from adversarially grown audit files.
 pub const MAX_ROLE_AUDIT_LOG_BYTES: usize = 8 * 1024 * 1024;
 
-/// Lowercase hex alphabet for the nibble-lookup encoder.
-const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
-
 fn sha256_hex(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hex_encode(hasher.finalize().as_slice())
 }
 
-/// Encode bytes as lowercase hex via a nibble lookup (no per-byte
-/// `format!` allocation). Byte-identical to the previous formatter;
-/// the hash-chain determinism tests pin it.
+/// Encode bytes as lowercase hex via `char::from_digit` (no per-byte
+/// `format!` allocation, no table indexing). Byte-identical to the
+/// previous formatter; the hash-chain determinism tests pin it.
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = Vec::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX_LOWER[(byte >> 4) as usize]);
-        out.push(HEX_LOWER[(byte & 0x0f) as usize]);
+        let hi = u32::from(byte) >> 4;
+        let lo = u32::from(byte) & 0x0f;
+        out.push(char::from_digit(hi, 16).unwrap_or('0'));
+        out.push(char::from_digit(lo, 16).unwrap_or('0'));
     }
-    String::from_utf8(out).expect("hex alphabet is valid ASCII")
+    out
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, RoleAuditError> {
@@ -318,8 +317,11 @@ pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAudit
     let mut capped = vec![0u8; MAX_ROLE_AUDIT_LOG_BYTES + 1];
     let mut filled = 0usize;
     loop {
+        let window = capped
+            .get_mut(filled..)
+            .ok_or_else(|| RoleAuditError::Io("read window out of range".to_owned()))?;
         let read = file
-            .read(&mut capped[filled..])
+            .read(window)
             .map_err(|err| RoleAuditError::Io(format!("read: {err}")))?;
         if read == 0 {
             break;
@@ -420,7 +422,17 @@ pub fn verify_role_audit_chain(entries: &[RoleAuditEntry]) -> Result<(), RoleAud
         let expected_previous = if position == 0 {
             GENESIS_PREVIOUS_HASH.to_owned()
         } else {
-            entries[position - 1].entry_hash.clone()
+            // `position` is the enumerate index of an existing entry, so
+            // the previous entry always exists; `get` keeps it total.
+            entries
+                .get(position - 1)
+                .map(|prev| prev.entry_hash.clone())
+                .ok_or_else(|| {
+                    RoleAuditError::ChainBroken(format!(
+                        "entry index={} is missing its predecessor",
+                        entry.index
+                    ))
+                })?
         };
         if entry.previous_hash != expected_previous {
             return Err(RoleAuditError::ChainBroken(format!(
