@@ -177,13 +177,11 @@ impl VerifierArchive {
     fn prune_to_retention(&mut self) {
         while self.entries.len() > self.retention {
             // BTreeMap iteration is ordered, so removing the first key
-            // drops the oldest epoch.
-            let oldest = self
-                .entries
-                .keys()
-                .next()
-                .copied()
-                .expect("retention prune only runs with non-empty archive");
+            // drops the oldest epoch. The `while` guard above guarantees
+            // at least one entry exists, so `keys().next()` yields here.
+            let Some(oldest) = self.entries.keys().next().copied() else {
+                break;
+            };
             self.entries.remove(&oldest);
         }
     }

@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (rev-04 S2.1 / R-ENF-6): unit-test code may use unwrap/expect/panic
+// freely; production code in this crate may not (see Cargo.toml [lints]).
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 pub mod admin;
 pub mod blind_relay;
@@ -1742,7 +1753,12 @@ pub fn canonical_relay_id_from_label(label: &str) -> Result<[u8; 16], String> {
         return Err("relay_id must be at most 16 ASCII bytes".to_owned());
     }
     let mut relay_id = [0u8; 16];
-    relay_id[..trimmed.len()].copy_from_slice(trimmed.as_bytes());
+    // The length guard above keeps this window in-bounds for the fixed
+    // 16-byte relay id; `get_mut` keeps the copy total instead of slicing.
+    let window = relay_id
+        .get_mut(..trimmed.len())
+        .ok_or("relay_id must be at most 16 ASCII bytes")?;
+    window.copy_from_slice(trimmed.as_bytes());
     Ok(relay_id)
 }
 
@@ -1838,6 +1854,9 @@ impl RelaySessionToken {
         // Legacy panicking entry point retained for test fixtures; production
         // code paths must call `try_sign_at` so a CSPRNG failure surfaces as
         // a structured error instead of crashing the long-running daemon.
+        // AQ-08: the `panic!` below is the documented legacy-fixture
+        // contract; production callers are on `try_sign_at`.
+        #[allow(clippy::panic)]
         match Self::try_sign_at(
             signing_key,
             node_id,
@@ -3638,6 +3657,10 @@ pub fn derive_gossip_signing_key(mut signing_secret: Vec<u8>) -> SigningKey {
 fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     let mut seed = [0u8; 32];
     let hkdf = Hkdf::<Sha256>::new(Some(SIGNING_SEED_HKDF_SALT_V1), secret);
+    // AQ-08: `expand` cannot fail for a fixed 32-byte output (well under
+    // HKDF's 255-hash-len maximum); there is no meaningful fallback, and
+    // silently substituting a zero seed would be fail-open.
+    #[allow(clippy::expect_used)]
     hkdf.expand(domain, &mut seed)
         .expect("hkdf expand length is fixed and valid");
     seed
@@ -3701,7 +3724,8 @@ fn sha256_digest(payload: &[u8]) -> [u8; 32] {
     hasher.update(payload);
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..32]);
+    // A SHA-256 digest is exactly 32 bytes, so this copy is total.
+    out.copy_from_slice(digest.as_slice());
     out
 }
 
@@ -3726,13 +3750,12 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], ()> {
     if trimmed.len() != N * 2 {
         return Err(());
     }
-    let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_hex_nibble(raw[index * 2])?;
-        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    // The length guard above makes every chunk exactly two bytes, zipped
+    // 1:1 with the output slots — no positional indexing.
+    for (dst, pair) in bytes.iter_mut().zip(trimmed.as_bytes().chunks_exact(2)) {
+        let hi = decode_hex_nibble(pair.first().copied().unwrap_or(b'0'))?;
+        let lo = decode_hex_nibble(pair.last().copied().unwrap_or(b'0'))?;
+        *dst = (hi << 4) | lo;
     }
     Ok(bytes)
 }

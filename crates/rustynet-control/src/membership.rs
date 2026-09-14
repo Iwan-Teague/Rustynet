@@ -1398,10 +1398,14 @@ pub fn render_membership_snapshot_body(
             attestation.approver_signatures.iter().collect();
         signatures.sort_by(|left, right| left.approver_id.cmp(&right.approver_id));
         for pair in signatures.windows(2) {
-            if pair[0].approver_id == pair[1].approver_id {
+            // `windows(2)` always yields exactly two elements.
+            let [left, right] = pair else {
+                continue;
+            };
+            if left.approver_id == right.approver_id {
                 return Err(MembershipError::InvalidFormat(format!(
                     "duplicate approver id {} in head attestation",
-                    pair[0].approver_id
+                    left.approver_id
                 )));
             }
         }
@@ -2049,17 +2053,15 @@ pub fn load_membership_log(
             )));
         };
         let parts = encoded.split('|').collect::<Vec<_>>();
-        if parts.len() != 4 {
-            return Err(MembershipError::InvalidFormat(
-                "log entry field count mismatch".to_owned(),
-            ));
-        }
-        let index = parts[0]
+        // Exactly four `|`-separated fields, destructured in one step so no
+        // positional indexing can panic.
+        let [index_str, previous_hash, entry_hash, encoded_update_hex] =
+            parts.try_into().map_err(|_: Vec<&str>| {
+                MembershipError::InvalidFormat("log entry field count mismatch".to_owned())
+            })?;
+        let index = index_str
             .parse::<u64>()
             .map_err(|_| MembershipError::InvalidFormat("invalid log entry index".to_owned()))?;
-        let previous_hash = parts[1].to_owned();
-        let entry_hash = parts[2].to_owned();
-        let encoded_update_hex = parts[3];
         let expected_hash =
             sha256_hex(format!("{index}|{previous_hash}|{encoded_update_hex}").as_bytes());
         if expected_hash != entry_hash {
@@ -2072,8 +2074,8 @@ pub fn load_membership_log(
         let signed_update = parse_signed_update_envelope(&encoded_update)?;
         entries.push(MembershipLogEntry {
             index,
-            previous_hash,
-            entry_hash,
+            previous_hash: previous_hash.to_owned(),
+            entry_hash: entry_hash.to_owned(),
             signed_update,
         });
     }
@@ -2159,7 +2161,12 @@ fn verify_membership_log_chain(entries: &[MembershipLogEntry]) -> Result<(), Mem
         let expected_previous = if position == 0 {
             "genesis".to_owned()
         } else {
-            entries[position - 1].entry_hash.clone()
+            // `position` is the enumerate index of an existing entry, so
+            // the previous entry always exists; `get` keeps it total.
+            entries
+                .get(position - 1)
+                .map(|prev| prev.entry_hash.clone())
+                .ok_or(MembershipError::IntegrityMismatch)?
         };
         if entry.previous_hash != expected_previous {
             return Err(MembershipError::IntegrityMismatch);
@@ -3245,20 +3252,22 @@ fn split_csv(value: &str) -> Vec<String> {
 }
 
 /// Lowercase hex alphabet for the nibble-lookup encoder.
-const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
-
 fn hex_encode(bytes: &[u8]) -> String {
-    // Two-char-per-byte lookup instead of a `format!("{:02x}")` call (which
-    // allocates a throwaway `String`) per byte. Byte-identical output — this
-    // feeds canonical signed payloads and state-root hashes, so determinism
-    // is pinned by the existing canonical/round-trip tests.
-    let mut out = Vec::with_capacity(bytes.len() * 2);
+    // Two-char-per-byte via `char::from_digit` instead of a
+    // `format!("{:02x}")` call (which allocates a throwaway `String`) per
+    // byte, and instead of indexing `HEX_LOWER` (which the workspace
+    // slicing lint forbids). Byte-identical output — this feeds canonical
+    // signed payloads and state-root hashes, so determinism is pinned by
+    // the existing canonical/round-trip tests. `from_digit` is total for
+    // radix 16 inputs 0..=15, so the `unwrap_or` arm is unreachable.
+    let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX_LOWER[(byte >> 4) as usize]);
-        out.push(HEX_LOWER[(byte & 0x0f) as usize]);
+        let hi = u32::from(byte) >> 4;
+        let lo = u32::from(byte) & 0x0f;
+        out.push(char::from_digit(hi, 16).unwrap_or('0'));
+        out.push(char::from_digit(lo, 16).unwrap_or('0'));
     }
-    // Safe: every pushed byte is an ASCII hex digit.
-    String::from_utf8(out).expect("hex alphabet is valid ASCII")
+    out
 }
 
 fn hex_decode(encoded: &str) -> Result<Vec<u8>, MembershipError> {
@@ -3269,13 +3278,11 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>, MembershipError> {
         ));
     }
     let mut out = Vec::with_capacity(trimmed.len() / 2);
-    let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < raw.len() {
-        let hi = decode_hex_nibble(raw[index])?;
-        let lo = decode_hex_nibble(raw[index + 1])?;
+    for pair in trimmed.as_bytes().chunks_exact(2) {
+        // `chunks_exact(2)` always yields exactly two bytes.
+        let hi = decode_hex_nibble(pair.first().copied().unwrap_or(b'0'))?;
+        let lo = decode_hex_nibble(pair.last().copied().unwrap_or(b'0'))?;
         out.push((hi << 4) | lo);
-        index += 2;
     }
     Ok(out)
 }

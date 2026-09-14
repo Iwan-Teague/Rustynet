@@ -7,5 +7,16 @@ authors.workspace = true
 
 [dependencies]
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "forbid"
+
+# AQ-08 (rev-04 S2.1 / R-ENF-6): panic-path denial for trust-bearing crates.
+# Explicit tables instead of `workspace = true` so the rest of the workspace
+# can adopt the clippy denials crate-by-crate; keep in sync with the
+# [workspace.lints] intent when the rollout completes.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+

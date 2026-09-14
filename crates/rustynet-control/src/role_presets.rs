@@ -367,7 +367,12 @@ pub const ROLE_PRESET_TABLE: [RolePresetComposition; 9] = [
 
 /// Look up the composition for a preset. Always succeeds — every
 /// preset variant is in the table.
+#[allow(clippy::expect_used)]
 pub fn composition_for(preset: RolePreset) -> &'static RolePresetComposition {
+    // AQ-08: this `expect` guards a build-time completeness invariant —
+    // the table covers every `RolePreset` variant (enforced by the
+    // preset-table conformance tests). There is no meaningful fallback;
+    // a missing entry is a programmer error that must be loud.
     ROLE_PRESET_TABLE
         .iter()
         .find(|entry| entry.preset == preset)

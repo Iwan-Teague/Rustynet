@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
+
 //! FIS-0019: bounded-exhaustive conformance tests binding the real
 //! `apply_signed_update` to the TLA+ model at
 //! `documents/formal/MembershipTrustState.tla`.
