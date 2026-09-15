@@ -673,8 +673,17 @@ echo "wf_log_sha=$(hash_file "$mlog")"
         }
     }
 
-    /// Pure adjudication. IPC legs: the attacker-observed reply must be
-    /// `err|…` naming the triaged class. UDP legs: each datagram was sent
+    pub(crate) const ROLE_DENIAL_MARKER: &str = "command denied";
+
+    /// Pure adjudication. IPC legs: the attacker-observed reply must be an
+    /// `err|…` REJECTION in one of the two accepted families — either the
+    /// triaged membership/gossip rejection class (signature / epoch gate) or
+    /// `command denied: current node role does not permit this operation`
+    /// (the daemon's per-role IPC authorization gate, which on a non-admin
+    /// node fires BEFORE the membership gates and is the stricter default-
+    /// deny outcome; live-run livelab-1789430002-b0aba24a2721 showed the
+    /// exit-role daemon denies the command outright). Success replies or
+    /// non-rejection noise fail the leg. UDP legs: each datagram was sent
     /// (exit 0) AND the daemon's journal shows `gossip_recv_error` at least
     /// once in THAT datagram's own disjoint window. Immobile-state legs:
     /// snapshot/watermark/log hashes byte-identical on BOTH nodes; the
@@ -707,26 +716,31 @@ echo "wf_log_sha=$(hash_file "$mlog")"
                 post_aux.udp_superseded_sent, post_target.udp_superseded_hits
             ),
         );
-        let ipc_ok = |reply: &str, class: &str| reply.starts_with("err|") && reply.contains(class);
+        let ipc_ok = |reply: &str, class: &str| {
+            reply.starts_with("err|")
+                && (reply.contains(class) || reply.contains(ROLE_DENIAL_MARKER))
+        };
         v(
             "WF-C_ipc_forged_rejected",
             ipc_ok(&post_target.ipc_forged, forged_class),
             format!(
-                "reply={} expected_class={forged_class}",
-                post_target.ipc_forged
+                "reply={} expected_class={forged_class} (or role-gate {})",
+                post_target.ipc_forged, ROLE_DENIAL_MARKER
             ),
         );
         v(
             "WF-D_ipc_superseded_rejected",
             ipc_ok(&post_target.ipc_superseded, superseded_class),
             format!(
-                "reply={} expected_class={superseded_class}",
-                post_target.ipc_superseded
+                "reply={} expected_class={superseded_class} (or role-gate {})",
+                post_target.ipc_superseded, ROLE_DENIAL_MARKER
             ),
         );
         v(
             "WF-E_ipc_gossip_forged_rejected",
-            post_target.ipc_gossip.starts_with("err|gossip rejected:"),
+            post_target.ipc_gossip.starts_with("err|")
+                && (post_target.ipc_gossip.starts_with("err|gossip rejected:")
+                    || post_target.ipc_gossip.contains(ROLE_DENIAL_MARKER)),
             format!("reply={}", post_target.ipc_gossip),
         );
         v(
@@ -1292,6 +1306,67 @@ wf_udp_forged_sent=0\nwf_udp_superseded_sent=0\nwf_mid_ts=5\n"
             let outcome = adjudicate_all_pass();
             assert!(outcome.pass, "fixture verdicts: {outcome:?}");
             assert_eq!(outcome.verdicts.len(), 8);
+        }
+
+        #[test]
+        fn adjudicate_accepts_role_gate_denial_as_rejection() {
+            // Live evidence (livelab-1789430002-b0aba24a2721): a non-admin
+            // daemon's role gate denies the IPC command outright, BEFORE the
+            // membership gates. That is a valid rejection family.
+            let (probe, mut target_post, aux_pre, aux_post) = all_pass_artifacts();
+            target_post.ipc_forged =
+                "err|command denied: current node role does not permit this operation".to_owned();
+            target_post.ipc_superseded =
+                "err|command denied: current node role does not permit this operation".to_owned();
+            target_post.ipc_gossip =
+                "err|command denied: current node role does not permit this operation".to_owned();
+            let outcome = adjudicate(
+                "signer is not authorized",
+                "epoch chain mismatch",
+                &probe,
+                &target_post,
+                &aux_pre,
+                &aux_post,
+            );
+            assert!(outcome.pass, "role-denial fixture verdicts: {outcome:?}");
+        }
+
+        #[test]
+        fn adjudicate_rejects_unrelated_error_reply() {
+            // A rejection is required: an unrelated err| text that is neither
+            // the triaged class nor a role denial must fail EVERY IPC leg.
+            for (tag, reply) in [
+                ("WF-C_ipc_forged_rejected", "err|internal error: disk full"),
+                (
+                    "WF-D_ipc_superseded_rejected",
+                    "err|internal error: disk full",
+                ),
+                ("WF-E_ipc_gossip_forged_rejected", "err|confused noise"),
+            ] {
+                let (probe, mut target_post, aux_pre, aux_post) = all_pass_artifacts();
+                if tag == "WF-C_ipc_forged_rejected" {
+                    target_post.ipc_forged = reply.to_owned();
+                } else if tag == "WF-D_ipc_superseded_rejected" {
+                    target_post.ipc_superseded = reply.to_owned();
+                } else {
+                    target_post.ipc_gossip = reply.to_owned();
+                }
+                let outcome = adjudicate(
+                    "signer is not authorized",
+                    "epoch chain mismatch",
+                    &probe,
+                    &target_post,
+                    &aux_pre,
+                    &aux_post,
+                );
+                assert!(!outcome.pass, "{tag} must fail on unrelated err reply");
+                let leg = outcome
+                    .verdicts
+                    .iter()
+                    .find(|(leg_tag, _, _)| *leg_tag == tag)
+                    .unwrap();
+                assert!(!leg.1, "{tag} verdict must itself be false");
+            }
         }
 
         #[test]
