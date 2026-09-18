@@ -32,9 +32,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use ed25519_dalek::VerifyingKey;
+use rand::TryRngCore;
 use rustynet_control::{MAX_RELAY_SESSION_TOKEN_TTL_SECS, RELAY_TOKEN_SCOPE, RelaySessionToken};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::blind_relay_listener::{AddressArtifactError, AddressValidationKeyRing};
 use crate::rate_limit::RateLimiter;
 use crate::session::{RelaySession, SessionId};
 
@@ -109,6 +112,10 @@ const _: () = assert!(
 /// Maximum `handle_hello` calls accepted per node within a one-second window
 /// before the hello itself is rejected (separate from packet rate limiting).
 const MAX_HELLOS_PER_NODE_PER_SEC: u32 = 5;
+/// Domain-separation prefix for the v1 hello address-validation MAC. Distinct
+/// from the blind-relay listener's domain so an artifact minted by one admission
+/// path is never acceptable to the other.
+const RELAY_ADDR_VALIDATION_DOMAIN: &[u8] = b"rustynet-relay-hello-addr-validation-v1";
 /// Default global active session cap. Production daemons may lower or raise this
 /// during startup, but the transport must always retain a total cap.
 const DEFAULT_MAX_TOTAL_SESSIONS: usize = 4096;
@@ -142,6 +149,15 @@ pub enum RejectReason {
     /// the forwarding map; a predictable id would let one peer hijack
     /// another's relay session.
     SessionIdRandomnessUnavailable,
+    /// Address validation is required by policy but the hello presented no
+    /// artifact. The peer must answer a relay challenge before any signature
+    /// work is spent on it: this rejection is emitted BEFORE the ed25519
+    /// verification step so an unauthenticated flood of artifact-free hellos
+    /// cannot force per-hello signature cost (relay pre-auth DoS finding).
+    AddressValidationRequired,
+    /// The presented address-validation artifact failed verification (wrong
+    /// source address, wrong nonce, expired, foreign relay, or bad MAC).
+    AddressValidationInvalid,
 }
 
 /// Session establishment request from a node to the relay.
@@ -154,6 +170,10 @@ pub struct RelayHello {
     pub node_id: String,
     pub peer_node_id: String,
     pub session_token: RelaySessionToken,
+    /// Optional address-validation artifact proving the sender answered a
+    /// relay challenge from THIS source address. `None` is acceptable only
+    /// while `require_addr_validation` is off (staged rollout default).
+    pub addr_validation_artifact: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +219,32 @@ pub struct RelayTransport {
     clock_skew_tolerance_secs: u64,
     max_sessions_per_node: usize,
     max_total_sessions: usize,
+    /// Key ring for the hello address-validation artifact MAC (domain-
+    /// separated from the blind-relay listener's artifacts). The per-transport
+    /// key is drawn from the kernel CSPRNG at construction; a failure to draw
+    /// it is fatal (fail closed) rather than degrading to a weaker source.
+    addr_validation_keys: AddressValidationKeyRing,
+    /// When true, hellos without a valid address-validation artifact are shed
+    /// BEFORE any signature work (pre-auth DoS gate). Default OFF; the daemon
+    /// opt-in flag is `--require-addr-validation` (staged rollout).
+    require_addr_validation: bool,
+}
+
+/// Fold the relay id into a stable 64-bit privacy-epoch input for the artifact
+/// MAC so an artifact minted by one relay can never verify against another
+/// (cross-relay artifact replay) even with identical key material.
+fn relay_epoch_input(relay_id: [u8; 16]) -> u64 {
+    let [a, b, c, d, e, f, g, h, ..] = relay_id;
+    u64::from_be_bytes([a, b, c, d, e, f, g, h])
+}
+
+/// Widen the token's 16-byte nonce into the 32-byte client-nonce input the
+/// artifact MAC expects. Both issuance and verification derive it the same
+/// way from `session_token.nonce`, so the artifact stays bound to the exact
+/// token it will authenticate (the token nonce itself is authenticated by the
+/// ed25519 signature in Check 2, after the cheap gate has passed).
+fn artifact_nonce_input(token_nonce: &[u8; 16]) -> [u8; 32] {
+    Sha256::digest(token_nonce).into()
 }
 
 impl RelayTransport {
@@ -207,7 +253,18 @@ impl RelayTransport {
         control_verifier_key: VerifyingKey,
         max_sessions_per_node: usize,
         clock_skew_tolerance_secs: u64,
-    ) -> Self {
+    ) -> Result<Self, String> {
+        // Fail closed on CSPRNG failure: the address-validation key is the
+        // thing that makes the pre-auth shed cheap. Minting it from a weaker
+        // source (or shipping a zero key, which `AddressValidationKeyRing::new`
+        // also refuses) would let an attacker forge artifacts and bypass the
+        // gate entirely.
+        let mut validation_key = [0u8; 32];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut validation_key)
+            .map_err(|e| format!("kernel CSPRNG unavailable; refusing to open relay transport: {e}"))?;
+        let addr_validation_keys = AddressValidationKeyRing::new(0, validation_key)
+            .map_err(|e| format!("relay transport address-validation key rejected: {e}"))?;
         // Clamp skew so the replay-store retention window always strictly
         // dominates the maximum acceptable token validity. Without this, an
         // operator that supplies an unreasonably large skew (>120 s) could
@@ -224,7 +281,7 @@ impl RelayTransport {
                 "warn relay_transport: clock_skew_tolerance_secs clamped to {MAX_CLOCK_SKEW_TOLERANCE_SECS} (operator-supplied value exceeded the safe ceiling; replay window would otherwise reopen)"
             );
         }
-        Self {
+        Ok(Self {
             relay_id,
             sessions: HashMap::new(),
             node_pair_index: HashMap::new(),
@@ -235,7 +292,9 @@ impl RelayTransport {
             clock_skew_tolerance_secs,
             max_sessions_per_node,
             max_total_sessions: DEFAULT_MAX_TOTAL_SESSIONS,
-        }
+            addr_validation_keys,
+            require_addr_validation: false,
+        })
     }
 
     pub fn new_with_replay_store_path(
@@ -250,11 +309,42 @@ impl RelayTransport {
             control_verifier_key,
             max_sessions_per_node,
             clock_skew_tolerance_secs,
-        );
+        )?;
         let mut nonce_store = NonceStore::load(replay_store_path.into())?;
         nonce_store.prune(Duration::from_secs(NONCE_RETENTION_SECS))?;
         transport.nonce_store = nonce_store;
         Ok(transport)
+    }
+
+    /// Enable or disable the pre-auth address-validation gate (Check 1.5).
+    /// A startup-config mode selection only: there is no per-hello fallback,
+    /// so a hello is admitted or shed entirely by this flag at validation
+    /// time (G1 of the staged rollout; the default-off flip is deferred).
+    pub fn set_require_addr_validation(&mut self, require: bool) {
+        self.require_addr_validation = require;
+    }
+
+    /// Whether the pre-auth address-validation gate is currently enforced.
+    pub fn require_addr_validation(&self) -> bool {
+        self.require_addr_validation
+    }
+
+    /// Mint the 32-byte address-validation artifact a client presents back in
+    /// its hello. Bound to the observed source address, the hello token's own
+    /// nonce, this relay's identity epoch, and a short TTL.
+    pub fn issue_hello_validation_artifact(
+        &self,
+        observed: &SocketAddr,
+        token_nonce: &[u8; 16],
+        now_unix: u64,
+    ) -> Result<[u8; 32], AddressArtifactError> {
+        self.addr_validation_keys.issue_artifact_for_domain(
+            RELAY_ADDR_VALIDATION_DOMAIN,
+            observed,
+            &artifact_nonce_input(token_nonce),
+            relay_epoch_input(self.relay_id),
+            now_unix,
+        )
     }
 
     pub fn set_max_total_sessions(&mut self, max_total_sessions: usize) -> Result<(), String> {
@@ -304,7 +394,7 @@ impl RelayTransport {
         hello: &RelayHello,
         _observed_addr: SocketAddr,
     ) -> Result<(), RejectReason> {
-        self.validate_hello(hello, true)
+        self.validate_hello(hello, true, _observed_addr)
     }
 
     /// Process a session establishment request with a daemon-owned allocated port.
@@ -312,6 +402,10 @@ impl RelayTransport {
     /// All security checks are performed in a deliberate order:
     ///
     /// 1. Hello rate limit (cheap, no crypto — shed load before signature work)
+    /// 1.5. Address-validation artifact (when `require_addr_validation` is
+    ///     on): prove the sender answered a challenge from THIS source address
+    ///     BEFORE any signature work, so an unauthenticated flood of
+    ///     artifact-free hellos cannot force per-hello ed25519 cost
     /// 2. Signature verification (ed25519, inherently constant-time)
     /// 3. TTL bound check (max 120 s)
     /// 4. Token freshness / expiry
@@ -329,7 +423,7 @@ impl RelayTransport {
         observed_addr: SocketAddr,
         allocated_port: u16,
     ) -> RelayHelloResponse {
-        if let Err(reason) = self.validate_hello(&hello, false) {
+        if let Err(reason) = self.validate_hello(&hello, false, observed_addr) {
             return RelayHelloResponse::Rejected(reason);
         }
         if allocated_port == 0 {
@@ -383,10 +477,44 @@ impl RelayTransport {
         &mut self,
         hello: &RelayHello,
         record_hello_rate: bool,
+        observed_addr: SocketAddr,
     ) -> Result<(), RejectReason> {
         // Check 1: Hello rate limit — shed before any crypto work
         if record_hello_rate && !self.hello_limiter.check(&hello.node_id) {
             return Err(RejectReason::RateLimitExceeded);
+        }
+
+        // Check 1.5: Address-validation artifact (pre-auth DoS gate).
+        //
+        // Only when the gate is enabled (staged rollout, default off). When on,
+        // this runs BEFORE Check 2's ed25519 verification so that an
+        // unauthenticated sender cannot force signature work at all: the cheap
+        // HMAC artifact check is the price of admission. The artifact binds
+        // the source address observed on the wire, the token's own nonce, and
+        // this relay's identity — so it is useless replayed from another
+        // address, against another relay, or under a different token.
+        if self.require_addr_validation {
+            let Some(now_unix) = now_unix_checked() else {
+                eprintln!("Relay hello rejected: host clock unusable, cannot evaluate address-validation artifact");
+                return Err(RejectReason::ClockUnavailable);
+            };
+            let Some(artifact) = hello.addr_validation_artifact else {
+                // No artifact presented: shed BEFORE any signature work. The
+                // daemon answers this class with a budgeted challenge reply.
+                return Err(RejectReason::AddressValidationRequired);
+            };
+            if let Err(err) = self.addr_validation_keys.verify_artifact_for_domain(
+                RELAY_ADDR_VALIDATION_DOMAIN,
+                &observed_addr,
+                &artifact_nonce_input(&hello.session_token.nonce),
+                relay_epoch_input(self.relay_id),
+                &artifact,
+                now_unix,
+                self.clock_skew_tolerance_secs,
+            ) {
+                eprintln!("Relay hello rejected: address-validation artifact invalid: {err}");
+                return Err(RejectReason::AddressValidationInvalid);
+            }
         }
 
         // Check 2: Verify token signature (ed25519, constant-time internally)
@@ -1325,6 +1453,7 @@ mod tests {
 
     fn make_transport(signing_key: &SigningKey) -> RelayTransport {
         RelayTransport::new(TEST_RELAY_ID, signing_key.verifying_key(), 8, 90)
+            .expect("relay transport init")
     }
 
     fn temp_replay_store_path(test_name: &str) -> PathBuf {
@@ -1359,6 +1488,7 @@ mod tests {
             node_id: node_id.to_owned(),
             peer_node_id: peer_node_id.to_owned(),
             session_token: make_valid_token(signing_key, node_id, peer_node_id, 60),
+            addr_validation_artifact: None,
         }
     }
 
@@ -1419,6 +1549,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1472,6 +1603,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1489,6 +1621,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: make_valid_token(&sk, "node-a", "node-b", 200), // > 120 s
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1509,6 +1642,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token.clone(),
+            addr_validation_artifact: None,
         };
         assert!(matches!(
             transport.handle_hello(hello1),
@@ -1519,6 +1653,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
         assert_eq!(
             transport.handle_hello(hello2),
@@ -1559,6 +1694,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token.clone(),
+            addr_validation_artifact: None,
         };
 
         {
@@ -1592,6 +1728,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
         assert_eq!(
             restarted.handle_hello_from_tuple_with_allocated_port(
@@ -1675,6 +1812,7 @@ mod tests {
             node_id: "attacker".to_owned(), // wrong
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1697,6 +1835,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1734,6 +1873,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1754,6 +1894,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-c".to_owned(), // different from token
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         assert_eq!(
@@ -1767,7 +1908,8 @@ mod tests {
     #[test]
     fn test_capacity_limit_enforced() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90)
+            .expect("relay transport init");
 
         for i in 0..2 {
             let hello = make_hello(&sk, "node-a", &format!("node-b-{i}"));
@@ -1788,7 +1930,8 @@ mod tests {
     #[test]
     fn test_global_capacity_limit_enforced_across_nodes() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
         transport
             .set_max_total_sessions(2)
             .expect("global session cap should configure");
@@ -1813,7 +1956,8 @@ mod tests {
     #[test]
     fn test_global_capacity_allows_existing_pair_replacement() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
         transport
             .set_max_total_sessions(1)
             .expect("global session cap should configure");
@@ -1844,7 +1988,8 @@ mod tests {
     fn test_hello_rate_limit_blocks_flood() {
         let (sk, _) = make_test_keypair();
         // Very tight hello limit so we can test without sleeping
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
         transport.hello_limiter.max_per_sec = 2;
 
         // First two should pass
@@ -1870,7 +2015,8 @@ mod tests {
     #[test]
     fn test_hello_rate_limit_resets_after_window() {
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
         transport.hello_limiter.max_per_sec = 1;
 
         // Exhaust the window
@@ -2138,7 +2284,8 @@ mod tests {
         // the old session is still alive), locking every refresh out until
         // sessions fully expire.
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90)
+            .expect("relay transport init");
 
         let sid_first = accept_hello_from(
             &mut transport,
@@ -2173,7 +2320,8 @@ mod tests {
         // is occupied by a DIFFERENT pair, a hello for a new pair is genuine
         // growth and must still be refused at the per-node cap.
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 1, 90)
+            .expect("relay transport init");
 
         accept_hello_from(
             &mut transport,
@@ -2541,6 +2689,7 @@ mod tests {
                 node_id: wrong_id.to_owned(),
                 peer_node_id: "node-b".to_owned(),
                 session_token: token.clone(),
+                addr_validation_artifact: None,
             };
 
             // All mismatches must produce InvalidToken (not a position-revealing error)
@@ -2572,6 +2721,7 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 peer_node_id: wrong_peer.to_owned(),
                 session_token: token.clone(),
+                addr_validation_artifact: None,
             };
 
             // All mismatches must produce PeerMismatch (consistent rejection)
@@ -2611,6 +2761,7 @@ mod tests {
                 node_id: "node-a".to_owned(),
                 peer_node_id: "node-b".to_owned(),
                 session_token: token,
+                addr_validation_artifact: None,
             };
 
             // All mismatches must produce InvalidToken
@@ -2677,7 +2828,8 @@ mod tests {
     fn adversarial_forged_signature_rejected_without_timing_leak() {
         // Attacker forges a token with wrong signature bytes
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
 
         let mut hello = make_hello(&sk, "attacker", "victim");
         // Corrupt the signature
@@ -2697,14 +2849,16 @@ mod tests {
     fn adversarial_past_expired_token_rejected() {
         // Attacker tries to use a token that has expired beyond clock skew tolerance
         let (sk, _) = make_test_keypair();
-        let _transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let _transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
         let _token = RelaySessionToken::sign(&sk, "node-a", "node-b", TEST_RELAY_ID, 1);
         // The explicit expired-token path is already covered by test_expired_token_rejected.
         // This test keeps the adversarial boundary case focused on a strict clock-skew policy.
 
         // Instead, verify that a very short TTL with no skew tolerance is rejected
         // This tests the boundary condition
-        let mut transport_strict = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 0);
+        let mut transport_strict = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 0)
+            .expect("relay transport init");
 
         // With 1 second TTL and immediate check, should still pass (just barely)
         let hello = make_hello(&sk, "node-a", "node-b");
@@ -2721,7 +2875,8 @@ mod tests {
     fn adversarial_session_exhaustion_attack_blocked() {
         // Attacker tries to exhaust session capacity for a node
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 2, 90)
+            .expect("relay transport init");
 
         // Fill up the session quota
         for i in 0..2 {
@@ -2742,7 +2897,8 @@ mod tests {
 
         // Verify other nodes are not affected
         let (sk2, _) = make_test_keypair();
-        let mut transport2 = RelayTransport::new(TEST_RELAY_ID, sk2.verifying_key(), 2, 90);
+        let mut transport2 = RelayTransport::new(TEST_RELAY_ID, sk2.verifying_key(), 2, 90)
+            .expect("relay transport init");
         let hello = make_hello(&sk2, "honest-node", "peer-1");
         assert!(
             matches!(
@@ -2757,7 +2913,8 @@ mod tests {
     fn adversarial_hello_flood_rate_limited() {
         // Attacker floods hello messages to exhaust CPU
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 100, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 100, 90)
+            .expect("relay transport init");
 
         // Send hellos up to the rate limit
         let mut accepted = 0;
@@ -2787,7 +2944,8 @@ mod tests {
         // Attacker tries to use a token issued for a different relay
         let (sk, _) = make_test_keypair();
         let other_relay_id: [u8; 16] = [0xDE; 16];
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
 
         // Token signed for wrong relay
         let token = RelaySessionToken::sign(&sk, "node-a", "node-b", other_relay_id, 60);
@@ -2795,6 +2953,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let result = transport.handle_hello(hello);
@@ -2809,7 +2968,8 @@ mod tests {
     fn adversarial_node_impersonation_rejected() {
         // Attacker tries to claim a different node_id in hello vs token
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
 
         // Token for "real-node" but hello claims "attacker"
         let token = RelaySessionToken::sign(&sk, "real-node", "peer-b", TEST_RELAY_ID, 60);
@@ -2817,6 +2977,7 @@ mod tests {
             node_id: "attacker".to_owned(), // Mismatch!
             peer_node_id: "peer-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let result = transport.handle_hello(hello);
@@ -2831,7 +2992,8 @@ mod tests {
     fn adversarial_peer_redirection_rejected() {
         // Attacker tries to redirect traffic to different peer
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
 
         // Token for node-a→peer-b but hello claims node-a→attacker-peer
         let token = RelaySessionToken::sign(&sk, "node-a", "peer-b", TEST_RELAY_ID, 60);
@@ -2839,6 +3001,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "attacker-peer".to_owned(), // Mismatch!
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let result = transport.handle_hello(hello);
@@ -2853,7 +3016,8 @@ mod tests {
     fn adversarial_nonce_reuse_rejected_even_with_valid_signature() {
         // Attacker captures valid token and replays it
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
 
         let hello = make_hello(&sk, "node-a", "node-b");
         let cloned_hello = hello.clone();
@@ -2939,13 +3103,15 @@ mod tests {
         // expires_at + MAX_CLOCK_SKEW_TOLERANCE_SECS, which never exceeds
         // NONCE_RETENTION_SECS.
         let (sk, _) = make_test_keypair();
-        let transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 600);
+        let transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 600)
+            .expect("relay transport init");
         assert_eq!(
             transport.clock_skew_tolerance_secs, MAX_CLOCK_SKEW_TOLERANCE_SECS,
             "clock skew larger than MAX_CLOCK_SKEW_TOLERANCE_SECS must be clamped"
         );
 
-        let inside = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 30);
+        let inside = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 30)
+            .expect("relay transport init");
         assert_eq!(
             inside.clock_skew_tolerance_secs, 30,
             "clock skew within bounds must be preserved verbatim"
@@ -2956,7 +3122,8 @@ mod tests {
             sk.verifying_key(),
             8,
             MAX_CLOCK_SKEW_TOLERANCE_SECS,
-        );
+        )
+        .expect("relay transport init");
         assert_eq!(
             exact.clock_skew_tolerance_secs, MAX_CLOCK_SKEW_TOLERANCE_SECS,
             "boundary value must be preserved (not over-clamped)"
@@ -3290,7 +3457,8 @@ mod tests {
         // budget is halved and an honest peer can rate-limit itself with two
         // legitimate sequential calls in the daemon's pre-check + commit flow.
         let (sk, _) = make_test_keypair();
-        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90);
+        let mut transport = RelayTransport::new(TEST_RELAY_ID, sk.verifying_key(), 8, 90)
+            .expect("relay transport init");
         transport.hello_limiter.max_per_sec = 1;
         let from = observed_addr([198, 51, 100, 93], 40_930);
 
@@ -3921,6 +4089,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         match transport.handle_hello(hello) {
@@ -3951,6 +4120,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         match transport.handle_hello(hello) {
@@ -3985,8 +4155,9 @@ mod tests {
             RelayHello {
                 node_id: "node-a".to_owned(),
                 peer_node_id: "node-b".to_owned(),
-                session_token: token,
-            }
+            session_token: token,
+            addr_validation_artifact: None,
+        }
         };
 
         // Exactly at the tolerance: still acceptable.
@@ -4018,6 +4189,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-a".to_owned(),
             session_token: make_valid_token(&sk, "node-a", "node-a", 60),
+            addr_validation_artifact: None,
         };
 
         match transport.handle_hello(hello) {

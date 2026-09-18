@@ -68,9 +68,9 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use rustynet_control::blind_relay::{
-    BLIND_RELAY_TOKEN_SCOPE_V2, BlindRelayLegSlot, BlindRelayTokenKindV2,
-    MAX_BLIND_RELAY_HELLO_WIRE_BYTES, MAX_BLIND_RELAY_LEG_TOKEN_TTL_SECS,
-    parse_blind_relay_hello_v2_wire_bytes,
+    parse_blind_relay_hello_v2_wire_bytes, BlindRelayLegSlot, BlindRelayTokenKindV2,
+    BLIND_RELAY_TOKEN_SCOPE_V2, MAX_BLIND_RELAY_HELLO_WIRE_BYTES,
+    MAX_BLIND_RELAY_LEG_TOKEN_TTL_SECS,
 };
 
 // ── Bounds and constants ─────────────────────────────────────────────────────
@@ -432,6 +432,7 @@ impl AddressValidationKeyRing {
     }
 
     fn artifact_tag(
+        domain: &[u8],
         key: &[u8; 32],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
@@ -441,7 +442,7 @@ impl AddressValidationKeyRing {
     ) -> Result<[u8; BLIND_ADDR_VALIDATION_TAG_LEN], AddressArtifactError> {
         let mut mac = Hmac::<Sha256>::new_from_slice(key)
             .map_err(|_| AddressArtifactError::InvalidArtifact)?;
-        mac.update(BLIND_ADDR_VALIDATION_DOMAIN);
+        mac.update(domain);
         mac.update(&key_epoch.to_be_bytes());
         mac.update(&expires_at_unix.to_be_bytes());
         mac.update(addr_octets(observed).as_slice());
@@ -463,6 +464,28 @@ impl AddressValidationKeyRing {
         privacy_epoch: u64,
         now_unix: u64,
     ) -> Result<[u8; 32], AddressArtifactError> {
+        self.issue_artifact_for_domain(
+            BLIND_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            now_unix,
+        )
+    }
+
+    /// Domain-parameterized issuance: identical to [`Self::issue_artifact`] but
+    /// keyed under a caller-supplied MAC domain prefix. The v1 hello path uses
+    /// its own domain (`rustynet-relay-hello-addr-validation-v1`) so an artifact
+    /// minted for the blind-relay path can never be replayed as a v1 hello
+    /// artifact, and vice versa.
+    pub fn issue_artifact_for_domain(
+        &self,
+        domain: &[u8],
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        privacy_epoch: u64,
+        now_unix: u64,
+    ) -> Result<[u8; 32], AddressArtifactError> {
         // Constant-time: client_nonce is random material even for the degenerate
         // all-zero check, and the workspace secret-equality audit requires it.
         if client_nonce.ct_eq(&[0u8; 32]).unwrap_u8() == 1 {
@@ -476,6 +499,7 @@ impl AddressValidationKeyRing {
             .key_for(key_epoch)
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let tag = Self::artifact_tag(
+            domain,
             key,
             observed,
             client_nonce,
@@ -496,6 +520,31 @@ impl AddressValidationKeyRing {
     /// extend any session's life.
     pub fn verify_artifact(
         &self,
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        privacy_epoch: u64,
+        artifact: &[u8; 32],
+        now_unix: u64,
+        clock_skew_tolerance_secs: u64,
+    ) -> Result<(), AddressArtifactError> {
+        self.verify_artifact_for_domain(
+            BLIND_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            artifact,
+            now_unix,
+            clock_skew_tolerance_secs,
+        )
+    }
+
+    /// Domain-parameterized verification: the mirror of
+    /// [`Self::issue_artifact_for_domain`]. Uses constant-time tag comparison.
+    /// Expired means expired PAST the skew window; artifacts never extend any
+    /// session's life.
+    pub fn verify_artifact_for_domain(
+        &self,
+        domain: &[u8],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
         privacy_epoch: u64,
@@ -525,6 +574,7 @@ impl AddressValidationKeyRing {
             .key_for(key_epoch)
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let expected = Self::artifact_tag(
+            domain,
             key,
             observed,
             client_nonce,
@@ -1836,11 +1886,9 @@ mod tests {
             observer.stages.last(),
             Some(&BlindAdmissionStage::IssuerVerification)
         );
-        assert!(
-            !observer
-                .stages
-                .contains(&BlindAdmissionStage::FieldValidation)
-        );
+        assert!(!observer
+            .stages
+            .contains(&BlindAdmissionStage::FieldValidation));
     }
 
     #[test]
