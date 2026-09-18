@@ -2308,6 +2308,49 @@ impl AiAgentServer {
         running.len()
     }
 
+    /// Sweep the repo root for orphaned per-job CARGO_TARGET_DIR dirs
+    /// (`target-deepseek-<jobid>`, minted only by the allow_concurrent
+    /// ai_lab_run worker) and remove_dir_all every one whose embedded job id
+    /// has NO running record — record missing or terminal (done/crashed). A
+    /// dir whose record still says `state=running` is NEVER swept: the
+    /// detached orchestrator may be alive and compiling into it (reload
+    /// survival), and reconcile reclassifies dead ones first — so callers run
+    /// this AFTER `call_reconcile_jobs` or at process start. Best-effort.
+    fn sweep_orphan_target_dirs(&self) -> Vec<String> {
+        let mut swept = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.repo_root) else {
+            return swept;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(job_id) = name.strip_prefix("target-deepseek-") else {
+                continue;
+            };
+            if !job_id.starts_with("labrun-") {
+                continue;
+            }
+            let in_memory_running = self
+                .jobs
+                .lock()
+                .map(|m| {
+                    m.get(job_id)
+                        .is_some_and(|j| matches!(j, TriageJob::Running { .. }))
+                })
+                .unwrap_or(true); // lock poisoned → assume running, skip
+            let record_running = self
+                .read_job_record(job_id)
+                .is_some_and(|r| r.get("state").and_then(|s| s.as_str()) == Some("running"));
+            if in_memory_running || record_running {
+                continue;
+            }
+            if std::fs::remove_dir_all(entry.path()).is_ok() {
+                swept.push(job_id.to_string());
+            }
+        }
+        swept
+    }
+
     /// Reconcile a SINGLE persisted labrun record, mutating it on disk if its
     /// `state=running` no longer reflects reality. Returns `Some(change)` when the
     /// record was reclassified (done / crashed), `None` when it was left running
@@ -4003,8 +4046,11 @@ impl AiAgentServer {
     /// `state=running` labrun records so a crashed/killed run can no longer block
     /// the singleton gate forever. With `job_id` it reconciles that one record;
     /// otherwise it scans EVERY record under DEEPSEEK_JOBS_SUBDIR. Read-only with
-    /// respect to the lab/guests/repo — it only rewrites this server's own job
-    /// records (atomic tmp+rename, as every job-record write does).
+    /// respect to the lab/guests/repo — beyond rewriting this server's own job
+    /// records (atomic tmp+rename, as every job-record write does), the
+    /// scan-all path ALSO sweeps orphaned `target-deepseek-*` build dirs at the
+    /// repo root (see [`Self::sweep_orphan_target_dirs`]) — never one whose record
+    /// still says running.
     fn call_reconcile_jobs(&self, args: &Value) -> ToolCallResult {
         let single = get_str(args, "job_id")
             .map(str::trim)
@@ -4074,6 +4120,19 @@ impl AiAgentServer {
                     c.job_id, c.kind, c.old_state, c.new_state, c.reason
                 ));
             }
+        }
+        // AFTER reclassification: records the loop above flipped
+        // running→done/crashed release their orphaned per-job build dirs to
+        // this sweep in the same call (a still-running record protects its
+        // dir).
+        let swept = self.sweep_orphan_target_dirs();
+        if !swept.is_empty() {
+            out.push_str(&format!(
+                "\nSwept {} orphaned per-job build dir(s) `target-deepseek-*` at the repo root: \
+                 {}\n",
+                swept.len(),
+                swept.join(", ")
+            ));
         }
         ToolCallResult {
             content: text_content(out),
@@ -4561,6 +4620,18 @@ impl AiAgentServer {
             } else {
                 Vec::new()
             };
+            // Best-effort removal of the per-job CARGO_TARGET_DIR on every
+            // terminal path of this worker: once the orchestrator has exited,
+            // its build cache is dead weight, and without this a finished (or
+            // reload-orphaned) run leaks a multi-GB `target-deepseek-<jobid>`
+            // dir at the repo root forever. The startup/reconcile sweep only
+            // catches what outlives this worker.
+            let target_dir_path = worker.repo_root.join(&target_dir);
+            let cleanup_target_dir = || {
+                if allow_concurrent {
+                    let _ = std::fs::remove_dir_all(&target_dir_path);
+                }
+            };
             let mut cargo_args: Vec<String> = [
                 "run",
                 "--quiet",
@@ -4676,6 +4747,7 @@ impl AiAgentServer {
                                 log_path.display()
                             ),
                         );
+                        cleanup_target_dir();
                         return;
                     }
                 }
@@ -4732,6 +4804,7 @@ impl AiAgentServer {
                 )
             };
             worker.finish_job(&jid, body);
+            cleanup_target_dir();
         });
 
         ToolCallResult {
@@ -8647,6 +8720,18 @@ impl McpServer for AiAgentServer {
 
 fn main() {
     let server = AiAgentServer::new();
+    // Startup sweep: per-job CARGO_TARGET_DIR dirs minted by concurrent
+    // ai_lab_run workers whose server died before the worker could clean up
+    // are multi-GB orphans. A record still state=running protects its dir
+    // (reload-survival — the detached orchestrator may still be compiling).
+    let swept = server.sweep_orphan_target_dirs();
+    if !swept.is_empty() {
+        eprintln!(
+            "rustynet-mcp-ai-agent: swept {} orphaned target-deepseek-* dir(s): {}",
+            swept.len(),
+            swept.join(", ")
+        );
+    }
     run_server(server);
 }
 
