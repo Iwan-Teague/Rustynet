@@ -2216,8 +2216,18 @@ pub struct ControlPlanePersistence {
 }
 
 impl ControlPlanePersistence {
-    pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self, persistence::PersistenceError> {
-        let store = persistence::SqliteStore::open(path)?;
+    /// Open the control database at `path` under the SQLCipher key. The
+    /// key is unwrapped from OS-secure custody by the caller (see
+    /// `SqlcipherKey::from_keystore`); an existing plaintext control.db is
+    /// migrated to SQLCipher exactly once before the keyed open. There is
+    /// no unkeyed disk path: a missing/invalid key fails closed.
+    pub fn open_sqlite(
+        path: impl AsRef<Path>,
+        key: &persistence::SqlcipherKey,
+    ) -> Result<Self, persistence::PersistenceError> {
+        let path = path.as_ref();
+        persistence::migrate_plaintext_control_db(path, key)?;
+        let store = persistence::SqliteStore::open_keyed(path, key)?;
         store.apply_migrations()?;
         Ok(Self {
             store: Mutex::new(store),
