@@ -185,6 +185,12 @@ mod daemon {
         pub blind_issuer_key_id: String,
         /// Public profile ids the blind listener admits (must be non-empty).
         pub blind_profiles: Vec<String>,
+        /// Operator switch for the v1 hello pre-auth address-validation gate
+        /// (relay pre-auth DoS finding): when on, hellos without a valid
+        /// challenge artifact are shed BEFORE any ed25519 signature work.
+        /// Off by default (staged rollout G1); the default flip is deferred
+        /// until clients implement challenge retry.
+        pub require_addr_validation: bool,
     }
 
     impl Default for RelayConfig {
@@ -207,6 +213,7 @@ mod daemon {
                 blind_replay_store_path: String::new(),
                 blind_issuer_key_id: String::new(),
                 blind_profiles: Vec::new(),
+                require_addr_validation: false,
             }
         }
     }
@@ -322,6 +329,18 @@ mod daemon {
     /// `AddressValidationKeyRing` — no new cryptographic construction is
     /// defined here.
     const BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE: u8 = 0x05;
+    /// Relay control-plane framing byte for the v1 hello address-validation
+    /// challenge datagram: `[0x06] ++ client_nonce[32]` from the relay, and
+    /// the relay's reply is `[0x06] ++ artifact[32]`. Framing only: the
+    /// payload is the opaque 32-byte artifact minted by the reviewed
+    /// `AddressValidationKeyRing` under the transport's own MAC domain — no
+    /// new cryptographic construction is defined here.
+    const RELAY_CHALLENGE_MSG_TYPE: u8 = 0x06;
+    /// Trailing hello field framing: a v1 hello MAY carry exactly
+    /// `[0x07] ++ artifact[32]` after the session token. Any other trailing
+    /// byte sequence fails the parse closed (previously trailing bytes were
+    /// silently ignored).
+    const RELAY_HELLO_ARTIFACT_FIELD_TYPE: u8 = 0x07;
     /// Pinned ASCII prefix of a blind-relay v2 hello datagram. The canonical
     /// line order (`version=2` then `token_kind=blind_relay_leg`) is fixed by
     /// the rustynet-control v2 parser, so this cheap byte-prefix match is
@@ -407,6 +426,11 @@ mod daemon {
         /// answer, so an operator can see the throttle working rather than
         /// having to infer it from missing lines.
         notices_suppressed_total: AtomicU64,
+        /// Address-validation challenge replies actually emitted (budgeted).
+        /// Nonzero traffic here under `--require-addr-validation` means peers
+        /// are still arriving without artifacts — useful for sizing the G1
+        /// rollout before flipping the gate on by default.
+        challenges_issued_total: AtomicU64,
     }
 
     /// Records one successfully forwarded frame. `len` is the byte count
@@ -1604,11 +1628,29 @@ mod daemon {
         }
         let token_data = &data[pos..pos + token_len];
         let session_token = parse_relay_token(token_data)?;
+        pos += token_len;
+
+        // Optional trailing address-validation artifact (relay pre-auth DoS
+        // finding): exactly `[0x07] ++ artifact[32]` or nothing at all. Any
+        // other trailing byte sequence fails the parse CLOSED — the previous
+        // behaviour silently ignored unknown trailing bytes, which would have
+        // let a sender that "thinks" it attached an artifact be silently
+        // admitted (or shed) as if it had not.
+        let addr_validation_artifact = match data.len() - pos {
+            0 => None,
+            33 if data[pos] == RELAY_HELLO_ARTIFACT_FIELD_TYPE => Some(
+                data[pos + 1..]
+                    .try_into()
+                    .map_err(|_| "malformed address-validation artifact".to_owned())?,
+            ),
+            _ => return Err("malformed trailing hello field".to_owned()),
+        };
 
         Ok(rustynet_relay::transport::RelayHello {
             node_id,
             peer_node_id,
             session_token,
+            addr_validation_artifact,
         })
     }
 
