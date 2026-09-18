@@ -2150,6 +2150,102 @@ pub(crate) fn render_windows_stop_and_wait_services_script(
     )
 }
 
+/// Rogue-anchor-bundle negative control: the guest-side attack script that
+/// drives real anchor bundle-pull attempts against a fake bundle server.
+/// `__REMOTE_CLI__` is the on-guest puller binary path — a `Literal` so the
+/// renderer shell-quotes it (the caller never wraps it in quotes).
+const ROGUE_ANCHOR_ATTACK_SCRIPT: ScriptTemplate = ScriptTemplate(r#"
+rb_work=/tmp/rustynet-nc-qh87.$$
+mkdir -p "$rb_work" && chmod 700 "$rb_work" || { echo rb_error_stage_failed=1; exit 1; }
+trap 'rm -rf "$rb_work"' EXIT
+TOKEN="$1"; PIN_B64="$2"; GUARD_B64="$3"; WM_B64="$4"; WM_E2_B64="$5"
+shift 5
+printf '%s' "$PIN_B64" | base64 -d > "$rb_work/pin" 2>/dev/null
+printf '%s' "$GUARD_B64" | base64 -d > "$rb_work/guard" 2>/dev/null
+printf '%s' "$WM_B64" | base64 -d > "$rb_work/wm" 2>/dev/null
+printf '%s' "$WM_E2_B64" | base64 -d > "$rb_work/wm_e2" 2>/dev/null
+if [ ! -s "$rb_work/pin" ] || [ ! -s "$rb_work/guard" ] || [ ! -s "$rb_work/wm" ] || [ ! -s "$rb_work/wm_e2" ]; then
+  echo rb_error_stage_failed=1
+  exit 1
+fi
+wm_for() { [ "$1" = f3 ] && { echo "$rb_work/wm_e2"; return; }; echo "$rb_work/wm"; }
+if ! command -v socat >/dev/null 2>&1; then
+  echo rb_error_no_socat=1
+  exit 1
+fi
+cat > "$rb_work/serve.sh" <<'RB_SERVE'
+#!/bin/bash
+B="$1"
+printf 'OK %s\n' "$(wc -c < "$B")"
+cat "$B"
+RB_SERVE
+chmod 700 "$rb_work/serve.sh"
+i=0
+for t in f1 f2 f3 f4 ctrl; do
+  i=$((i+1))
+  eval "port=\${$((2*i-1))}"
+  eval "b64=\${$((2*i))}"
+  printf '%s' "$b64" | base64 -d > "$rb_work/bundle.$t" 2>/dev/null
+  if [ ! -s "$rb_work/bundle.$t" ]; then echo rb_error_stage_failed=1; exit 1; fi
+  echo "rb_bundle_sha_$t=$(sha256sum "$rb_work/bundle.$t" | cut -d' ' -f1)"
+  echo "rb_bundle_bytes_$t=$(wc -c < "$rb_work/bundle.$t")"
+done
+run_pull() {
+  tag="$1"
+  port="$2"
+  wmpath=$(wm_for "$tag")
+  attempt=0
+  rc=1
+  while [ $attempt -lt 5 ]; do
+    attempt=$((attempt+1))
+    # socat serves one fresh response per connection (fork): the puller's
+    # half-close-after-request starves the openbsd-nc stdin forwarder (live
+    # run-qh87-lenovo1: every pull died on the puller's read timeout with the
+    # response still sitting in the nc pipe), so nc is not usable here.
+    socat -T 15 "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" \
+      "EXEC:$rb_work/serve.sh $rb_work/bundle.$tag" >/dev/null 2>&1 &
+    _rb_lpid=$!
+    sleep 0.5
+    __REMOTE_CLI__ anchor pull-bundle --addr "127.0.0.1:$port" --token "$TOKEN" \
+      --output "$rb_work/guard" --owner-key-pub "$rb_work/pin" \
+      --watermark-path "$wmpath" \
+      >"$rb_work/out.$tag" 2>"$rb_work/err.$tag"
+    rc=$?
+    kill "$_rb_lpid" 2>/dev/null
+    wait "$_rb_lpid" 2>/dev/null
+    pkill -f "$rb_work/serve.sh" 2>/dev/null || true
+    if [ "$rc" -eq 0 ] || ! grep -qiE 'refused|connect anchor bundle-pull failed' "$rb_work/err.$tag" 2>/dev/null; then
+      break
+    fi
+  done
+  echo "rb_${tag}_rc=$rc"
+  echo "rb_${tag}_out_b64=$(base64 -w0 < "$rb_work/out.$tag" 2>/dev/null)"
+  echo "rb_${tag}_err_b64=$(base64 -w0 < "$rb_work/err.$tag" 2>/dev/null)"
+  echo "rb_${tag}_guard_sha_after=$(sha256sum "$rb_work/guard" | cut -d' ' -f1)"
+  echo "rb_${tag}_wm_sha_after=$(sha256sum "$wmpath" | cut -d' ' -f1)"
+}
+echo "rb_guard_sha_before=$(sha256sum "$rb_work/guard" | cut -d' ' -f1)"
+echo "rb_wm_sha_before=$(sha256sum "$rb_work/wm" | cut -d' ' -f1)"
+echo "rb_wm2_sha_before=$(sha256sum "$rb_work/wm_e2" | cut -d' ' -f1)"
+echo "rb_guest_unix=$(date +%s)"
+run_pull f1 "$1" ; shift 2
+run_pull f2 "$1" ; shift 2
+run_pull f3 "$1" ; shift 2
+run_pull f4 "$1" ; shift 2
+run_pull ctrl "$1" ; shift 2
+echo "rb_done=1"
+exit 0
+"#);
+
+pub(crate) fn render_rogue_anchor_attack_script(
+    remote_cli: &str,
+) -> Result<RenderedScript, String> {
+    render_script_template(
+        ROGUE_ANCHOR_ATTACK_SCRIPT,
+        &[("__REMOTE_CLI__", Binding::Literal(remote_cli))],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
