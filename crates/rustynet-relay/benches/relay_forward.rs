@@ -8,7 +8,7 @@
 use std::hint::black_box;
 use std::net::SocketAddr;
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ed25519_dalek::SigningKey;
 use rustynet_control::RelaySessionToken;
 use rustynet_relay::transport::{RelayHello, RelayHelloResponse, RelayTransport};
