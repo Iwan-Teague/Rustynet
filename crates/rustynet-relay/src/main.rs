@@ -4949,7 +4949,8 @@ mod daemon {
                 signing_key.verifying_key(),
                 8,
                 90,
-            )));
+            )
+            .expect("relay transport init failed")));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -5010,7 +5011,8 @@ mod daemon {
                 signing_key.verifying_key(),
                 8,
                 90,
-            )));
+            )
+            .expect("relay transport init failed")));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -5078,6 +5080,7 @@ mod daemon {
                     relay_id,
                     90,
                 ),
+                addr_validation_artifact: None,
             }
         }
 
@@ -5102,7 +5105,8 @@ mod daemon {
                 signing_key.verifying_key(),
                 8,
                 90,
-            )));
+            )
+            .expect("relay transport init failed")));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -5154,7 +5158,8 @@ mod daemon {
                 signing_key.verifying_key(),
                 8,
                 90,
-            )));
+            )
+            .expect("relay transport init failed")));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -5228,8 +5233,13 @@ mod daemon {
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
-            let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+            let mut transport_inner = RelayTransport::new(
+                relay_id,
+                signing_key.verifying_key(),
+                8,
+                90,
+            )
+            .expect("relay transport init failed");
             let from_addr: std::net::SocketAddr = "127.0.0.1:41000".parse().unwrap();
             let hello = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner
@@ -5299,8 +5309,13 @@ mod daemon {
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
-            let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+            let mut transport_inner = RelayTransport::new(
+                relay_id,
+                signing_key.verifying_key(),
+                8,
+                90,
+            )
+            .expect("relay transport init failed");
 
             let hello_a = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner
