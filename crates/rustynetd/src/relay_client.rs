@@ -544,6 +544,7 @@ impl RelayClient {
         let hello = RelayHello {
             node_id: self.node_id.as_str().to_owned(),
             peer_node_id: peer_node_id.as_str().to_owned(),
+            addr_validation_artifact: None,
             session_token: token,
         };
 
@@ -1116,6 +1117,7 @@ mod tests {
         let hello = RelayHello {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
+            addr_validation_artifact: None,
             session_token: token,
         };
 
