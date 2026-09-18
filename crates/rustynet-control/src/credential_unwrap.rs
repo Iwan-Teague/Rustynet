@@ -594,6 +594,26 @@ fn run_helper_and_capture(
     Ok(Zeroizing::new(stdout))
 }
 
+// ─── Default-credential helpers for the control database key ──────────
+
+/// Canonical descriptor for the control-database (control.db) SQLCipher
+/// key. The item is DEDICATED to the control database: the WG-key
+/// passphrase and the membership signing-key passphrase are never reused
+/// for it. The plaintext must be exactly 32 bytes (the raw SQLCipher key);
+/// `SqlcipherKey::from_keystore` enforces that length fail-closed.
+///
+/// Maps to:
+/// - macOS:   System keychain item (service=control_db_key,
+///   account=rustynet-control-db-key)
+/// - Linux:   /etc/rustynet/credentials/control_db_key.cred
+/// - Windows: C:\ProgramData\RustyNet\secrets\control_db_key.dpapi
+pub fn control_db_key_descriptor() -> CredentialDescriptor {
+    CredentialDescriptor {
+        account: "rustynet-control-db-key".to_owned(),
+        service: "control_db_key".to_owned(),
+    }
+}
+
 // ─── Default-credential helpers for the membership owner signing key ──
 
 /// Canonical descriptor for the membership-owner signing-key passphrase.
