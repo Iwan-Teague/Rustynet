@@ -12,7 +12,13 @@ rustynet-crypto = { path = "../rustynet-crypto" }
 subtle = "2"
 sha2 = "0.10"
 hkdf = "0.12"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# SQLCipher continuous page encryption (AES-256 + per-page HMAC) for the
+# control database at rest. NOT `bundled-sqlcipher-vendored-openssl`: that
+# pulls `openssl`/`openssl-sys`, which the supply-chain bans reject. Plain
+# `bundled-sqlcipher` links system libcrypto (Linux/Windows) / CommonCrypto
+# (Apple). This crate is the workspace's only rusqlite consumer, so the
+# feature switch cannot collide via feature unification.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 ed25519-dalek = "2"
 hmac = "0.12"
 rand.workspace = true
