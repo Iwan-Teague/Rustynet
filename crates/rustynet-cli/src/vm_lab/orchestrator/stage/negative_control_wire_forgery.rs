@@ -103,8 +103,7 @@ impl OrchestrationStage for NegativeControlWireForgeryStage {
         let aux_adapter = aux.and_then(|alias| ctx.adapters.get(alias));
         if aux.is_some() && aux_adapter.is_none() {
             return StageOutcome::Failed(format!(
-                "wire-forgery negative control: aux node '{:?}' has no adapter (fail closed)",
-                aux
+                "wire-forgery negative control: aux node '{aux:?}' has no adapter (fail closed)"
             ));
         }
         wire_forgery::run_wire_forgery_control(
