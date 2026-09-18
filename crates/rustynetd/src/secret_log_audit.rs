@@ -1201,6 +1201,11 @@ const FORBIDDEN_SECRET_EQUALITY_TOKENS: &[&str] = &[
 /// (`x == other_secret`) and therefore cannot accidentally suppress a real hit.
 const REVIEWED_SECRET_EQUALITY_EXCEPTIONS: &[(&str, &str, &str)] = &[
     (
+        "crates/rustynet-control/src/persistence.rs",
+        "as_str(&hmac).as_deref() == Some(SQLCIPHER_HMAC_ALGORITHM)",
+        "SQLCipher at-rest param-pin verification (atrest-v3): compares the public cipher_hmac_algorithm PRAGMA value against the pinned SQLCIPHER_HMAC_ALGORITHM constant — a config-integrity check, not secret material. `mac` is only a substring of the `hmac` PRAGMA-value binding; the actual key/HMAC material never appears here.",
+    ),
+    (
         "crates/rustynet-control/src/lib.rs",
         "nonce == 0",
         "nonce counter zero-check on relay fleet bundle/request u64 input (compare to the literal 0, never a secret-vs-secret compare)",
