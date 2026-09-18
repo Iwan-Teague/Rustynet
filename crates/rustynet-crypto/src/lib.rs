@@ -26,7 +26,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
-    WindowsDpapiScope, dpapi_protect, dpapi_unprotect, inspect_file_sddl,
+    dpapi_protect, dpapi_unprotect, inspect_file_sddl, WindowsDpapiScope,
 };
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
@@ -322,7 +322,7 @@ pub struct EncryptedKeyBlob {
 
 pub trait OsSecureStore {
     fn store_key(&self, key_id: &str, key_material: &[u8]) -> Result<(), CryptoError>;
-    fn load_key(&self, key_id: &str) -> Result<Vec<u8>, CryptoError>;
+    fn load_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,7 +339,7 @@ impl OsSecureStore for NoOsSecureStore {
         Err(CryptoError::OsStoreUnavailable)
     }
 
-    fn load_key(&self, _key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    fn load_key(&self, _key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         Err(CryptoError::OsStoreUnavailable)
     }
 }
@@ -368,7 +368,7 @@ impl OsSecureStore for PlatformOsSecureStore {
         }
     }
 
-    fn load_key(&self, key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    fn load_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         #[cfg(target_os = "macos")]
         {
             load_from_macos_keychain(key_id)
@@ -467,7 +467,7 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
         }
     }
 
-    pub fn load_private_key(&self, key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    pub fn load_private_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         match self.os_store.load_key(key_id) {
             Ok(key) => Ok(key),
             Err(CryptoError::OsStoreUnavailable) => {
@@ -523,7 +523,7 @@ fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), Cryp
 }
 
 #[cfg(target_os = "macos")]
-fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+fn load_from_macos_keychain(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if !is_valid_key_identifier(key_id) {
         return Err(CryptoError::InvalidLength);
     }
@@ -539,11 +539,11 @@ fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
         .and_then(Result::ok);
         if let Some(decoded) = maybe_hex_decoded {
             value.zeroize();
-            return Ok(decoded);
+            return Ok(Zeroizing::new(decoded));
         }
     }
 
-    Ok(value)
+    Ok(Zeroizing::new(value))
 }
 
 /// Absolute path to the macOS System keychain.
@@ -1012,7 +1012,7 @@ fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<()
 }
 
 #[cfg(target_os = "linux")]
-fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+fn load_from_linux_secret_service(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let output = Command::new("secret-tool")
         .arg("lookup")
         .arg("rustynet-key-id")
@@ -1029,7 +1029,7 @@ fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> 
         hex_decode(trimmed)
     };
     value.zeroize();
-    decoded
+    Ok(Zeroizing::new(decoded))
 }
 
 #[cfg(target_os = "windows")]
@@ -1063,7 +1063,7 @@ fn store_in_windows_dpapi(key_id: &str, key_material: &[u8]) -> Result<(), Crypt
 }
 
 #[cfg(target_os = "windows")]
-fn load_from_windows_dpapi(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+fn load_from_windows_dpapi(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let root = windows_dpapi_root()?;
     validate_windows_dpapi_root(root.as_path())?;
     let path = windows_dpapi_file_path(root.as_path(), key_id)?;
@@ -1077,7 +1077,7 @@ fn load_from_windows_dpapi(key_id: &str) -> Result<Vec<u8>, CryptoError> {
     let mut protected = std::fs::read(path.as_path()).map_err(|_| CryptoError::Io)?;
     let result = dpapi_unprotect(&protected).map_err(|_| CryptoError::DecryptionFailed);
     protected.zeroize();
-    result
+    result.map(Zeroizing::new)
 }
 
 #[cfg(target_os = "windows")]
@@ -1497,7 +1497,7 @@ pub fn encrypt_private_key_envelope(
 pub fn decrypt_private_key_envelope(
     blob: &EncryptedKeyBlob,
     passphrase: &str,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), &blob.salt, &mut key)
@@ -1544,7 +1544,7 @@ pub fn decrypt_private_key_envelope(
 
     key.zeroize();
 
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
 /// Raw-key XChaCha20-Poly1305 sealed blob for at-rest service data
@@ -1749,7 +1749,7 @@ pub fn read_encrypted_key_file(
     file: &Path,
     passphrase: &str,
     policy: KeyCustodyPermissionPolicy,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     validate_key_custody_permissions(directory, file, policy)?;
     let encoded_len = std::fs::metadata(file).map_err(|_| CryptoError::Io)?.len();
     if encoded_len > MAX_ENCRYPTED_KEY_FILE_BYTES {
@@ -2011,8 +2011,8 @@ pub fn validate_key_custody_permissions(
 #[cfg(all(test, unix))]
 mod unix_custody_tests {
     use super::{
-        CryptoError, KeyCustodyPermissionPolicy, UnixCustodyMetadata,
-        evaluate_unix_custody_metadata,
+        evaluate_unix_custody_metadata, CryptoError, KeyCustodyPermissionPolicy,
+        UnixCustodyMetadata,
     };
 
     const ME: u32 = 501;
@@ -2446,13 +2446,12 @@ mod tests {
     }
 
     use super::{
-        AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
-        Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
-        NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
         create_provider_attestation, decode_encrypted_blob_v0, decode_encrypted_blob_v1,
         decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
         try_generate_key_custody_material, validate_signing_provider_policy,
-        verify_provider_attestation,
+        verify_provider_attestation, AlgorithmPolicy, CompatibilityException, CryptoAlgorithm,
+        CryptoError, Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy,
+        NoOsSecureStore, NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
     };
     use ed25519_dalek::SigningKey;
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
@@ -2461,8 +2460,8 @@ mod tests {
     // them as unused.
     #[cfg(unix)]
     use super::{
-        OsStoreFallbackPolicy, read_encrypted_key_file, validate_key_custody_permissions,
-        write_encrypted_key_file,
+        read_encrypted_key_file, validate_key_custody_permissions, write_encrypted_key_file,
+        OsStoreFallbackPolicy,
     };
 
     #[test]
@@ -2951,7 +2950,7 @@ mod tests {
 
         let plaintext = decrypt_private_key_envelope(&blob, "phase2-passphrase")
             .expect("decryption should succeed");
-        assert_eq!(plaintext, b"private-material");
+        assert_eq!(plaintext.as_slice(), b"private-material");
     }
 
     #[test]
@@ -2987,7 +2986,9 @@ mod tests {
         );
         let decoded = super::decode_encrypted_blob(&encoded).expect("v1 blob should decode");
         assert_eq!(
-            decrypt_private_key_envelope(&decoded, "pw").expect("v1 round-trip should decrypt"),
+            decrypt_private_key_envelope(&decoded, "pw")
+                .expect("v1 round-trip should decrypt")
+                .as_slice(),
             b"private-material"
         );
 
@@ -3116,7 +3117,7 @@ mod tests {
         )
         .expect("read should succeed");
 
-        assert_eq!(plaintext, b"very-secret-private-key");
+        assert_eq!(plaintext.as_slice(), b"very-secret-private-key");
 
         let wrong = read_encrypted_key_file(
             &directory,
@@ -3192,7 +3193,7 @@ mod tests {
         let loaded = manager
             .load_private_key("node_identity")
             .expect("fallback read should succeed");
-        assert_eq!(loaded, b"node-private-key");
+        assert_eq!(loaded.as_slice(), b"node-private-key");
 
         let key_file = fallback_directory.join("node_identity.enc");
         let _ = std::fs::remove_file(key_file);
