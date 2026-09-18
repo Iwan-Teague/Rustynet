@@ -97,6 +97,45 @@ const ALLOWLIST: &[AllowedMarker] = &[
                      no enforcement weakened, and its false pre-commit-hook-wiring claim was caught and \
                      completed in 33d46fe1; docs + CI-tooling only, no product code",
     },
+    AllowedMarker {
+        sha: "1582e0f3aeac14565dc0f60e2e516325a6ffb0d1",
+        date: "2026-09-09",
+        rationale: "skip-semantics review F1: vacuous-pass guards → Skipped/Failed never Passed \
+                     (10 validation stages + mod.rs tripwire); merged via fa0ab6b8, disposition \
+                     in NodeEngineSkipSemanticsReview_2026-09-09",
+    },
+    AllowedMarker {
+        sha: "338b2c4522d8188e43fa9c88fd9462de489f5693",
+        date: "2026-09-09",
+        rationale: "first half of role_validation require_daemon_success; completed by 22b47eee + \
+                     4464f3a1 (12 wrappers wired, tests); cited in \
+                     NodeEngineValidatorFalseGreenReview_2026-09-09 §gate-evidence",
+    },
+    AllowedMarker {
+        sha: "30f943935dc9bcbb2c31762db3d593210f7412ce",
+        date: "2026-09-09",
+        rationale: "QH-83 F1 pre-execute stale-witness clear + F4 trait doc; reviewed \
+                     MERGE-WITH-FIXES in NodeEngineRunnerEdgeAudit_2026-09-09 §6/§review-disposition",
+    },
+    AllowedMarker {
+        sha: "3d385f323a9228188aab612c8520095594b41fac",
+        date: "2026-09-09",
+        rationale: "provenance F3 fail-closed empty-scope guards (collect_pubkeys/enforce_runtime/\
+                     validate_runtime); branch continued via 113c9726, merged via 39a34300",
+    },
+    AllowedMarker {
+        sha: "44795c5e72a14b1cc8f6e0943ba7aac1da2f37a6",
+        date: "2026-09-09",
+        rationale: "QH-83 witness enforcement on stage pass paths (+613/−43: collect_pubkeys, \
+                     substrate, install, admin_issue, enforce_runtime, verify_ssh, cleanup, \
+                     stage/mod); continued by f54c4797/48b2205e/7a85f24c",
+    },
+    AllowedMarker {
+        sha: "5910c32fcc98e19af54bb547d25f85bf6fe6c643",
+        date: "2026-09-10",
+        rationale: "bounded remote-output tails in SSH/UTM failure errors (live_lab_bin_support); \
+                     merged branch ai-edit/edit-1789049328878-79086-0, evolved by d43f293e/43933e66",
+    },
 ];
 
 /// A commit as parsed out of `git log`.
