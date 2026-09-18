@@ -89,7 +89,11 @@ produced work that had to be redone.
 5. **Give it permission to stop.** "If this is larger than the brief assumes, commit what is
    complete and write the remainder into the ledger. Do not half-land." Agents that lack this
    produce half-migrations.
-6. **House rules block**: pinned toolchain and a dedicated `CARGO_TARGET_DIR`, gates that must exit
+6. **House rules block**: pinned toolchain and the ONE shared reused `CARGO_TARGET_DIR` at the
+   repo root (e.g. `target-pinned`) — never mint a fresh per-task `target-*` dir; if build-lock
+   contention genuinely forces a dedicated dir, it MUST be removed (`rm -rf`) when the task ends,
+   and the ai_agent startup/reconcile sweep removes orphaned `target-deepseek-*` dirs whose job is
+   no longer running. Gates that must exit
    0, no `unwrap`/`expect` in non-test code, touch only the named files, **never** a
    `Co-Authored-By` trailer (owner rule, has recurred).
 
