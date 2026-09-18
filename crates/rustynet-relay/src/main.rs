@@ -63,7 +63,9 @@ mod daemon {
         BlindRelayListener, BlindRelayListenerConfig, BlindRelayListenerLimits,
     };
     use rustynet_relay::session::SessionId;
-    use rustynet_relay::transport::{RelayForwardError, RelayHelloResponse, RelayTransport};
+    use rustynet_relay::transport::{
+        RejectReason, RelayForwardError, RelayHelloResponse, RelayTransport,
+    };
 
     /// Maximum accepted byte length of `node_id` / `peer_node_id` in a relay
     /// hello, enforced at parse time before either value is copied or used as a
@@ -185,6 +187,12 @@ mod daemon {
         pub blind_issuer_key_id: String,
         /// Public profile ids the blind listener admits (must be non-empty).
         pub blind_profiles: Vec<String>,
+        /// Operator switch for the v1 hello pre-auth address-validation gate
+        /// (relay pre-auth DoS finding): when on, hellos without a valid
+        /// challenge artifact are shed BEFORE any ed25519 signature work.
+        /// Off by default (staged rollout G1); the default flip is deferred
+        /// until clients implement challenge retry.
+        pub require_addr_validation: bool,
     }
 
     impl Default for RelayConfig {
@@ -207,6 +215,7 @@ mod daemon {
                 blind_replay_store_path: String::new(),
                 blind_issuer_key_id: String::new(),
                 blind_profiles: Vec::new(),
+                require_addr_validation: false,
             }
         }
     }
@@ -322,6 +331,20 @@ mod daemon {
     /// `AddressValidationKeyRing` — no new cryptographic construction is
     /// defined here.
     const BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE: u8 = 0x05;
+    /// Relay control-plane framing byte for the v1 hello address-validation
+    /// exchange (only answered while `require_addr_validation` is on). The
+    /// client's solicitation is `[0x06] ++ client_nonce[32]` — its own
+    /// `artifact_nonce_input` widening of the hello token nonce — and the
+    /// relay's reply is `[0x06] ++ artifact[32]`. Framing only: the
+    /// payload is the opaque 32-byte artifact minted by the reviewed
+    /// `AddressValidationKeyRing` under the transport's own MAC domain — no
+    /// new cryptographic construction is defined here.
+    const RELAY_CHALLENGE_MSG_TYPE: u8 = 0x06;
+    /// Trailing hello field framing: a v1 hello MAY carry exactly
+    /// `[0x07] ++ artifact[32]` after the session token. Any other trailing
+    /// byte sequence fails the parse closed (previously trailing bytes were
+    /// silently ignored).
+    const RELAY_HELLO_ARTIFACT_FIELD_TYPE: u8 = 0x07;
     /// Pinned ASCII prefix of a blind-relay v2 hello datagram. The canonical
     /// line order (`version=2` then `token_kind=blind_relay_leg`) is fixed by
     /// the rustynet-control v2 parser, so this cheap byte-prefix match is
@@ -407,6 +430,11 @@ mod daemon {
         /// answer, so an operator can see the throttle working rather than
         /// having to infer it from missing lines.
         notices_suppressed_total: AtomicU64,
+        /// Address-validation challenge replies actually emitted (budgeted).
+        /// Nonzero traffic here under `--require-addr-validation` means peers
+        /// are still arriving without artifacts — useful for sizing the G1
+        /// rollout before flipping the gate on by default.
+        challenges_issued_total: AtomicU64,
     }
 
     /// Records one successfully forwarded frame. `len` is the byte count
@@ -545,6 +573,17 @@ mod daemon {
         datagram
     }
 
+    /// Frames a v1 hello address-validation challenge reply as a relay
+    /// control datagram: `[0x06] ++ artifact[32]`. Pure framing over the
+    /// opaque artifact the transport minted; the client presents it back in
+    /// the hello's `RELAY_HELLO_ARTIFACT_FIELD_TYPE` trailing field.
+    fn serialize_relay_addr_validation_challenge(artifact: &[u8; 32]) -> [u8; 33] {
+        let mut datagram = [0u8; 33];
+        datagram[0] = RELAY_CHALLENGE_MSG_TYPE;
+        datagram[1..].copy_from_slice(artifact);
+        datagram
+    }
+
     /// Checked wall-clock read for artifact issuance (`now_unix`). A clock
     /// reading before the epoch is a failure, never a zero.
     fn checked_unix_now() -> Option<u64> {
@@ -660,6 +699,13 @@ mod daemon {
             )
             .map_err(|e| format!("failed to initialize relay replay store: {e}"))?;
             transport.set_max_total_sessions(config.max_total_sessions)?;
+            // Pre-auth address-validation gate (relay pre-auth DoS finding):
+            // the operator switch moves from the parsed config into the
+            // transport's hello validator here. Without this wiring the flag
+            // would be declared but never enforced; `require_addr_validation()`
+            // below also gates the 0x06 challenge path, so the challenge
+            // exchange exists only while the gate is actually on.
+            transport.set_require_addr_validation(config.require_addr_validation);
 
             // O1 open-from-runtime: resolve the blind-relay v2 listener from
             // real signed state + the operator switch. `try_open` still
@@ -888,6 +934,9 @@ mod daemon {
                     }
                     self.handle_hello(data, from_addr).await
                 }
+                RELAY_CHALLENGE_MSG_TYPE => {
+                    self.handle_addr_validation_challenge(data, from_addr).await
+                }
                 _ => Err(format!("unknown message type: {:#04x}", data[0])),
             }
         }
@@ -981,6 +1030,94 @@ mod daemon {
             Ok(())
         }
 
+        /// Sends a minted v1 challenge artifact as the
+        /// `[0x06] ++ artifact[32]` reply and counts the emission.
+        /// `Ok(true)`: reply sent. `Ok(false)`: never happens today (kept for
+        /// symmetry with the minting call sites). `Err`: the reply could not
+        /// be sent.
+        async fn send_challenge_reply(
+            &self,
+            artifact: [u8; 32],
+            from_addr: SocketAddr,
+        ) -> Result<bool, String> {
+            let reply = serialize_relay_addr_validation_challenge(&artifact);
+            self.control_socket
+                .send_to(&reply, from_addr)
+                .await
+                .map_err(|e| format!("failed to send address-validation challenge: {e}"))?;
+            self.pre_auth_stats
+                .challenges_issued_total
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(true)
+        }
+
+        /// Handles an explicit `[0x06] ++ client_nonce[32]` address-validation
+        /// challenge solicitation by replying the challenge artifact frame
+        /// `[0x06] ++ artifact[32]` (see `RELAY_CHALLENGE_MSG_TYPE`).
+        ///
+        /// `client_nonce` is the client's own `artifact_nonce_input`
+        /// widening of its hello token nonce; the minted artifact verifies
+        /// only against a retry hello carrying the token whose nonce hashes
+        /// to it, so a farmed artifact authenticates nothing by itself.
+        ///
+        /// Fail-closed behavior: gate off (`require_addr_validation` false)
+        /// is answered exactly as the unknown-message-type path would — the
+        /// exchange exists only while the gate is enforced, leaving the
+        /// staged-rollout pre-auth surface unchanged; a wrong-length
+        /// solicitation is counted malformed and dropped silently; limiter
+        /// refusal gets the same budgeted rate-limit refusal a hello would
+        /// (shared budget with `handle_hello`); a clock or issuance failure
+        /// drops silently with no reply.
+        async fn handle_addr_validation_challenge(
+            &self,
+            data: &[u8],
+            from_addr: SocketAddr,
+        ) -> Result<(), String> {
+            let gate_on = lock_transport(&self.transport).require_addr_validation();
+            if !gate_on {
+                return Err(format!("unknown message type: {:#04x}", data[0]));
+            }
+            let Some(client_nonce) = data
+                .get(1..33)
+                .and_then(|slice| <[u8; 32]>::try_from(slice).ok())
+            else {
+                self.pre_auth_stats
+                    .malformed_packets_total
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            };
+            if !self
+                .pre_auth_hello_limiter
+                .write()
+                .await
+                .check(from_addr.ip())
+            {
+                emit_pre_auth_rate_limit_reject_notice(
+                    &self.control_socket,
+                    &self.pre_auth_notice_budget,
+                    &self.pre_auth_stats,
+                    from_addr,
+                    Instant::now(),
+                )
+                .await?;
+                return Ok(());
+            }
+            let Some(now_unix) = checked_unix_now() else {
+                // Clock unusable: no artifact can be minted, drop silently.
+                return Ok(());
+            };
+            let artifact = {
+                let transport = lock_transport(&self.transport);
+                match transport.issue_challenge_artifact(&from_addr, &client_nonce, now_unix) {
+                    Ok(artifact) => artifact,
+                    // Keyring failure: fail closed with no reply.
+                    Err(_) => return Ok(()),
+                }
+            };
+            self.send_challenge_reply(artifact, from_addr).await?;
+            Ok(())
+        }
+
         /// Handles a `RelayHello` message.
         async fn handle_hello(&self, data: &[u8], from_addr: SocketAddr) -> Result<(), String> {
             let hello = parse_relay_hello(data)?;
@@ -989,6 +1126,33 @@ mod daemon {
                 let mut transport = lock_transport(&self.transport);
                 transport.validate_hello_from_tuple(&hello, from_addr)
             } {
+                if reason == RejectReason::AddressValidationRequired {
+                    // The gate fired: this hello carried no artifact. Answer
+                    // with the challenge artifact bound to THIS source
+                    // address and the hello's own token nonce; the client
+                    // retries the hello with it in the
+                    // `RELAY_HELLO_ARTIFACT_FIELD_TYPE` trailing field.
+                    // Issuance is bounded by the pre-auth hello limiter that
+                    // already admitted this hello, and the reply is a fixed
+                    // 33-byte datagram. Minting or clock failure falls
+                    // through to the generic reject (fail closed); a send
+                    // failure propagates exactly like a failed reject send.
+                    if let Some(now_unix) = checked_unix_now() {
+                        let artifact = {
+                            let transport = lock_transport(&self.transport);
+                            transport.issue_hello_validation_artifact(
+                                &from_addr,
+                                &hello.session_token.nonce,
+                                now_unix,
+                            )
+                        };
+                        if let Ok(artifact) = artifact
+                            && self.send_challenge_reply(artifact, from_addr).await?
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
                 let reject_bytes = serialize_relay_reject();
                 self.control_socket
                     .send_to(&reject_bytes, from_addr)
@@ -1604,11 +1768,29 @@ mod daemon {
         }
         let token_data = &data[pos..pos + token_len];
         let session_token = parse_relay_token(token_data)?;
+        pos += token_len;
+
+        // Optional trailing address-validation artifact (relay pre-auth DoS
+        // finding): exactly `[0x07] ++ artifact[32]` or nothing at all. Any
+        // other trailing byte sequence fails the parse CLOSED — the previous
+        // behaviour silently ignored unknown trailing bytes, which would have
+        // let a sender that "thinks" it attached an artifact be silently
+        // admitted (or shed) as if it had not.
+        let addr_validation_artifact = match data.len() - pos {
+            0 => None,
+            33 if data[pos] == RELAY_HELLO_ARTIFACT_FIELD_TYPE => Some(
+                data[pos + 1..]
+                    .try_into()
+                    .map_err(|_| "malformed address-validation artifact".to_owned())?,
+            ),
+            _ => return Err("malformed trailing hello field".to_owned()),
+        };
 
         Ok(rustynet_relay::transport::RelayHello {
             node_id,
             peer_node_id,
             session_token,
+            addr_validation_artifact,
         })
     }
 
@@ -1839,6 +2021,7 @@ mod daemon {
         pre_auth_hellos_refused_total: u64,
         pre_auth_malformed_packets_total: u64,
         pre_auth_notices_suppressed_total: u64,
+        pre_auth_challenges_issued_total: u64,
     }
 
     async fn bind_health_listener(bind_addr: SocketAddr) -> Result<TcpListener, String> {
@@ -1907,6 +2090,9 @@ mod daemon {
                     pre_auth_notices_suppressed_total: pre_auth_stats
                         .notices_suppressed_total
                         .load(Ordering::Relaxed),
+                    pre_auth_challenges_issued_total: pre_auth_stats
+                        .challenges_issued_total
+                        .load(Ordering::Relaxed),
                 };
                 let (status, content_type, body) = match path {
                     "/healthz" => ("200 OK", "application/json", render_health_json(snapshot)),
@@ -1940,7 +2126,7 @@ mod daemon {
 
     fn render_health_json(snapshot: HealthSnapshot) -> String {
         format!(
-            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{},\"frames_forwarded_total\":{},\"bytes_forwarded_total\":{},\"pre_auth_hellos_refused_total\":{},\"pre_auth_malformed_packets_total\":{},\"pre_auth_notices_suppressed_total\":{}}}\n",
+            "{{\"status\":\"ok\",\"active_sessions\":{},\"allocated_ports\":{},\"max_sessions_per_node\":{},\"max_total_sessions\":{},\"frames_forwarded_total\":{},\"bytes_forwarded_total\":{},\"pre_auth_hellos_refused_total\":{},\"pre_auth_malformed_packets_total\":{},\"pre_auth_notices_suppressed_total\":{},\"pre_auth_challenges_issued_total\":{}}}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
@@ -1949,13 +2135,14 @@ mod daemon {
             snapshot.bytes_forwarded_total,
             snapshot.pre_auth_hellos_refused_total,
             snapshot.pre_auth_malformed_packets_total,
-            snapshot.pre_auth_notices_suppressed_total
+            snapshot.pre_auth_notices_suppressed_total,
+            snapshot.pre_auth_challenges_issued_total
         )
     }
 
     fn render_metrics(snapshot: HealthSnapshot) -> String {
         format!(
-            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total {}\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total {}\n# TYPE rustynet_relay_pre_auth_hellos_refused_total counter\nrustynet_relay_pre_auth_hellos_refused_total {}\n# TYPE rustynet_relay_pre_auth_malformed_packets_total counter\nrustynet_relay_pre_auth_malformed_packets_total {}\n# TYPE rustynet_relay_pre_auth_notices_suppressed_total counter\nrustynet_relay_pre_auth_notices_suppressed_total {}\n",
+            "# TYPE rustynet_relay_active_sessions gauge\nrustynet_relay_active_sessions {}\n# TYPE rustynet_relay_allocated_ports gauge\nrustynet_relay_allocated_ports {}\n# TYPE rustynet_relay_max_sessions_per_node gauge\nrustynet_relay_max_sessions_per_node {}\n# TYPE rustynet_relay_max_total_sessions gauge\nrustynet_relay_max_total_sessions {}\n# TYPE rustynet_relay_frames_forwarded_total counter\nrustynet_relay_frames_forwarded_total {}\n# TYPE rustynet_relay_bytes_forwarded_total counter\nrustynet_relay_bytes_forwarded_total {}\n# TYPE rustynet_relay_pre_auth_hellos_refused_total counter\nrustynet_relay_pre_auth_hellos_refused_total {}\n# TYPE rustynet_relay_pre_auth_malformed_packets_total counter\nrustynet_relay_pre_auth_malformed_packets_total {}\n# TYPE rustynet_relay_pre_auth_notices_suppressed_total counter\nrustynet_relay_pre_auth_notices_suppressed_total {}\n# TYPE rustynet_relay_pre_auth_challenges_issued_total counter\nrustynet_relay_pre_auth_challenges_issued_total {}\n",
             snapshot.active_sessions,
             snapshot.allocated_ports,
             snapshot.max_sessions_per_node,
@@ -1964,7 +2151,8 @@ mod daemon {
             snapshot.bytes_forwarded_total,
             snapshot.pre_auth_hellos_refused_total,
             snapshot.pre_auth_malformed_packets_total,
-            snapshot.pre_auth_notices_suppressed_total
+            snapshot.pre_auth_notices_suppressed_total,
+            snapshot.pre_auth_challenges_issued_total
         )
     }
 
@@ -3423,12 +3611,14 @@ mod daemon {
             BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE, ForwardStats, HealthSnapshot,
             MAX_PRE_AUTH_HELLO_SOURCE_IPS, MAX_RELAY_NODE_ID_BYTES, PRE_AUTH_HELLO_WINDOW,
             PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget, PreAuthStats,
+            RELAY_CHALLENGE_MSG_TYPE, RELAY_HELLO_ACK_MSG_TYPE, RELAY_HELLO_ARTIFACT_FIELD_TYPE,
             RELAY_HELLO_MSG_TYPE, RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON,
             RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon, RelayForwardError, RelayHelloResponse,
             RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
             WindowsRelayServiceOptions, bind_health_listener, build_blind_listener_config,
-            build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
-            http_request_path, is_blind_relay_hello_v2_frame, load_control_verifier_key,
+            build_windows_relay_service_hardening_report, checked_unix_now,
+            evaluate_windows_relay_service_hardening, http_request_path,
+            is_blind_relay_hello_v2_frame, load_control_verifier_key, lock_transport,
             parse_relay_hello, parse_relay_id_arg, parse_windows_image_path_argv, record_forward,
             render_health_json, render_metrics, run_hello_limiter_audit_command,
             select_relay_host_entry, serialize_blind_relay_addr_validation_response,
@@ -4823,6 +5013,7 @@ mod daemon {
                 pre_auth_hellos_refused_total: 91,
                 pre_auth_malformed_packets_total: 7,
                 pre_auth_notices_suppressed_total: 88,
+                pre_auth_challenges_issued_total: 13,
             };
 
             let health = render_health_json(snapshot);
@@ -4834,6 +5025,7 @@ mod daemon {
             assert!(health.contains("\"pre_auth_hellos_refused_total\":91"));
             assert!(health.contains("\"pre_auth_malformed_packets_total\":7"));
             assert!(health.contains("\"pre_auth_notices_suppressed_total\":88"));
+            assert!(health.contains("\"pre_auth_challenges_issued_total\":13"));
             assert!(!health.contains("verifier"));
             assert!(!health.contains("replay"));
             assert!(!health.contains("token"));
@@ -4848,6 +5040,7 @@ mod daemon {
             assert!(metrics.contains("rustynet_relay_pre_auth_hellos_refused_total 91"));
             assert!(metrics.contains("rustynet_relay_pre_auth_malformed_packets_total 7"));
             assert!(metrics.contains("rustynet_relay_pre_auth_notices_suppressed_total 88"));
+            assert!(metrics.contains("rustynet_relay_pre_auth_challenges_issued_total 13"));
             assert!(!metrics.contains("verifier"));
             assert!(!metrics.contains("replay"));
             assert!(!metrics.contains("token"));
@@ -4902,12 +5095,10 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init failed"),
+            ));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -4963,12 +5154,10 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init failed"),
+            ));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -5036,6 +5225,7 @@ mod daemon {
                     relay_id,
                     90,
                 ),
+                addr_validation_artifact: None,
             }
         }
 
@@ -5055,12 +5245,10 @@ mod daemon {
             let socket = Arc::new(socket);
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init failed"),
+            ));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -5107,12 +5295,10 @@ mod daemon {
             let port = socket.local_addr().expect("local addr").port();
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init failed"),
+            ));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -5187,7 +5373,8 @@ mod daemon {
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
             let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init failed");
             let from_addr: std::net::SocketAddr = "127.0.0.1:41000".parse().unwrap();
             let hello = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner
@@ -5258,7 +5445,8 @@ mod daemon {
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
             let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init failed");
 
             let hello_a = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner
@@ -6215,6 +6403,13 @@ mod daemon {
         }
 
         async fn build_test_daemon(dir: &Path) -> RelayDaemon {
+            build_test_daemon_with_gate(dir, false).await
+        }
+
+        async fn build_test_daemon_with_gate(
+            dir: &Path,
+            require_addr_validation: bool,
+        ) -> RelayDaemon {
             let key_path = dir.join("control.pub");
             write_verifier_key(&key_path);
             let mut built = None;
@@ -6237,6 +6432,7 @@ mod daemon {
                     port_range_start: 1024,
                     port_range_end: 5119,
                     health_bind_addr: None,
+                    require_addr_validation,
                     ..RelayConfig::default()
                 };
                 if let Ok(daemon) = RelayDaemon::new(config).await {
@@ -6286,6 +6482,186 @@ mod daemon {
                 .expect_err("dormant relay must not admit v2 frames");
             assert_eq!(err, format!("unknown message type: {:#04x}", frame[0]));
             assert_eq!(err, "unknown message type: 0x76");
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[tokio::test]
+        async fn challenge_solicitation_stays_unknown_type_while_the_gate_is_off() {
+            // The 0x06 exchange exists only while `require_addr_validation`
+            // is enforced. With the staged-rollout gate off the pre-auth
+            // surface must stay byte-for-byte the legacy one: no artifact
+            // minting, no counter movement, the legacy unknown-type answer.
+            let dir = restricted_temp_dir("preauth-challenge-gate-off");
+            let daemon = build_test_daemon(&dir).await;
+            let peer: SocketAddr = "127.0.0.1:54331".parse().expect("peer addr");
+            let mut frame = vec![RELAY_CHALLENGE_MSG_TYPE];
+            frame.extend_from_slice(&[9u8; 32]);
+            let err = daemon
+                .handle_control_packet(&frame, peer)
+                .await
+                .expect_err("gate-off solicitation must stay unknown-type");
+            assert_eq!(err, "unknown message type: 0x06");
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .challenges_issued_total
+                    .load(Ordering::Relaxed),
+                0
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[tokio::test]
+        async fn gated_challenge_solicitation_replies_with_a_bound_artifact() {
+            // Full loop through the real control packet path: a gated relay
+            // answers exactly one 33-byte challenge frame, the counter moves
+            // by one, and the artifact verifies ONLY for the same source
+            // address and nonce (fail closed on every other input).
+            let dir = restricted_temp_dir("preauth-challenge-solicitation");
+            let daemon = build_test_daemon_with_gate(&dir, true).await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let client_nonce = [9u8; 32];
+            let mut frame = vec![RELAY_CHALLENGE_MSG_TYPE];
+            frame.extend_from_slice(&client_nonce);
+            daemon
+                .handle_control_packet(&frame, peer)
+                .await
+                .expect("gated solicitation must be answered");
+            let mut reply = [0u8; 64];
+            let read = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut reply))
+                .await
+                .expect("reply should arrive")
+                .expect("recv should succeed");
+            assert_eq!(read, 33);
+            assert_eq!(reply[0], RELAY_CHALLENGE_MSG_TYPE);
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .challenges_issued_total
+                    .load(Ordering::Relaxed),
+                1
+            );
+            let artifact: [u8; 32] = reply[1..33].try_into().expect("artifact slice");
+            let transport = lock_transport(&daemon.transport);
+            let now = checked_unix_now().expect("clock");
+            transport
+                .verify_challenge_artifact(&peer, &client_nonce, &artifact, now)
+                .expect("faithful artifact must verify");
+            let foreign: SocketAddr = "127.0.0.1:1".parse().expect("foreign addr");
+            assert!(
+                transport
+                    .verify_challenge_artifact(&foreign, &client_nonce, &artifact, now)
+                    .is_err(),
+                "artifact bound to one source address must fail for another"
+            );
+            assert!(
+                transport
+                    .verify_challenge_artifact(&peer, &[8u8; 32], &artifact, now)
+                    .is_err(),
+                "artifact bound to one nonce must fail for another"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[tokio::test]
+        async fn malformed_challenge_solicitation_is_counted_and_dropped_silently() {
+            let dir = restricted_temp_dir("preauth-challenge-malformed");
+            let daemon = build_test_daemon_with_gate(&dir, true).await;
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let short = [RELAY_CHALLENGE_MSG_TYPE, 1, 2, 3];
+            daemon
+                .handle_control_packet(&short, peer)
+                .await
+                .expect("malformed solicitation is swallowed, not an error");
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .malformed_packets_total
+                    .load(Ordering::Relaxed),
+                1
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .challenges_issued_total
+                    .load(Ordering::Relaxed),
+                0
+            );
+            let mut reply = [0u8; 64];
+            let got =
+                tokio::time::timeout(Duration::from_millis(300), client.recv(&mut reply)).await;
+            assert!(got.is_err(), "no reply may follow a malformed solicitation");
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        #[tokio::test]
+        async fn gated_hello_without_artifact_gets_a_challenge_then_admits_the_retry() {
+            // The staged-rollout exchange, end to end: (1) a hello without an
+            // artifact is shed BEFORE signature work and answered with the
+            // challenge artifact frame — NOT the generic reject; (2) the
+            // client retries the same hello with the artifact in the 0x07
+            // trailing field from the SAME source address and the gate
+            // passes through to the hello ACK.
+            let dir = restricted_temp_dir("preauth-hello-challenge");
+            let daemon = build_test_daemon_with_gate(&dir, true).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let token = RelaySessionToken::sign(&signing_key, "a", "b", relay_id, 90);
+
+            let mut token_bytes = vec![1u8];
+            token_bytes.extend_from_slice(&(token.node_id.len() as u16).to_be_bytes());
+            token_bytes.extend_from_slice(token.node_id.as_bytes());
+            token_bytes.extend_from_slice(&(token.peer_node_id.len() as u16).to_be_bytes());
+            token_bytes.extend_from_slice(token.peer_node_id.as_bytes());
+            token_bytes.extend_from_slice(&token.relay_id);
+            token_bytes.extend_from_slice(&(RELAY_TOKEN_SCOPE.len() as u16).to_be_bytes());
+            token_bytes.extend_from_slice(RELAY_TOKEN_SCOPE.as_bytes());
+            token_bytes.extend_from_slice(&token.issued_at_unix.to_be_bytes());
+            token_bytes.extend_from_slice(&token.expires_at_unix.to_be_bytes());
+            token_bytes.extend_from_slice(&token.nonce);
+            token_bytes.extend_from_slice(&token.signature);
+            let hello_wire = hello_with_token_bytes(&token_bytes);
+
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            daemon
+                .handle_control_packet(&hello_wire, peer)
+                .await
+                .expect("shed hello must be answered with a challenge");
+            let mut reply = [0u8; 64];
+            let read = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut reply))
+                .await
+                .expect("challenge should arrive")
+                .expect("recv should succeed");
+            assert_eq!(
+                read, 33,
+                "the shed hello must get a challenge artifact frame, not the 9-byte reject"
+            );
+            assert_eq!(reply[0], RELAY_CHALLENGE_MSG_TYPE);
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .challenges_issued_total
+                    .load(Ordering::Relaxed),
+                1
+            );
+
+            let artifact: [u8; 32] = reply[1..33].try_into().expect("artifact slice");
+            let mut retry = hello_wire.clone();
+            retry.push(RELAY_HELLO_ARTIFACT_FIELD_TYPE);
+            retry.extend_from_slice(&artifact);
+            daemon
+                .handle_control_packet(&retry, peer)
+                .await
+                .expect("retry hello must be processed");
+            let read = tokio::time::timeout(Duration::from_secs(2), client.recv(&mut reply))
+                .await
+                .expect("ack should arrive")
+                .expect("recv should succeed");
+            assert_eq!(read, 1 + 16 + 2, "ack frame: type ++ session_id ++ port");
+            assert_eq!(reply[0], RELAY_HELLO_ACK_MSG_TYPE);
             fs::remove_dir_all(dir).expect("test dir should be removed");
         }
 

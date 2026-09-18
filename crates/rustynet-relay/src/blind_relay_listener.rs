@@ -361,6 +361,17 @@ impl fmt::Display for AddressArtifactError {
     }
 }
 
+/// Borrowed inputs to [`AddressValidationKeyRing::verify_artifact_for_domain`],
+/// grouped so the verifier's parameter list stays within the lint budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ArtifactVerifyInput<'a> {
+    pub domain: &'a [u8],
+    pub observed: &'a SocketAddr,
+    pub client_nonce: &'a [u8; 32],
+    pub privacy_epoch: u64,
+    pub artifact: &'a [u8; 32],
+}
+
 /// Rotating HMAC key material for the address-validation artifacts.
 ///
 /// Keys are held zeroized-on-drop. Rotation is strictly forward (a new epoch
@@ -432,6 +443,7 @@ impl AddressValidationKeyRing {
     }
 
     fn artifact_tag(
+        domain: &[u8],
         key: &[u8; 32],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
@@ -441,7 +453,7 @@ impl AddressValidationKeyRing {
     ) -> Result<[u8; BLIND_ADDR_VALIDATION_TAG_LEN], AddressArtifactError> {
         let mut mac = Hmac::<Sha256>::new_from_slice(key)
             .map_err(|_| AddressArtifactError::InvalidArtifact)?;
-        mac.update(BLIND_ADDR_VALIDATION_DOMAIN);
+        mac.update(domain);
         mac.update(&key_epoch.to_be_bytes());
         mac.update(&expires_at_unix.to_be_bytes());
         mac.update(addr_octets(observed).as_slice());
@@ -463,6 +475,28 @@ impl AddressValidationKeyRing {
         privacy_epoch: u64,
         now_unix: u64,
     ) -> Result<[u8; 32], AddressArtifactError> {
+        self.issue_artifact_for_domain(
+            BLIND_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            now_unix,
+        )
+    }
+
+    /// Domain-parameterized issuance: identical to [`Self::issue_artifact`] but
+    /// keyed under a caller-supplied MAC domain prefix. The v1 hello path uses
+    /// its own domain (`rustynet-relay-hello-addr-validation-v1`) so an artifact
+    /// minted for the blind-relay path can never be replayed as a v1 hello
+    /// artifact, and vice versa.
+    pub fn issue_artifact_for_domain(
+        &self,
+        domain: &[u8],
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        privacy_epoch: u64,
+        now_unix: u64,
+    ) -> Result<[u8; 32], AddressArtifactError> {
         // Constant-time: client_nonce is random material even for the degenerate
         // all-zero check, and the workspace secret-equality audit requires it.
         if client_nonce.ct_eq(&[0u8; 32]).unwrap_u8() == 1 {
@@ -476,6 +510,7 @@ impl AddressValidationKeyRing {
             .key_for(key_epoch)
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let tag = Self::artifact_tag(
+            domain,
             key,
             observed,
             client_nonce,
@@ -503,6 +538,36 @@ impl AddressValidationKeyRing {
         now_unix: u64,
         clock_skew_tolerance_secs: u64,
     ) -> Result<(), AddressArtifactError> {
+        self.verify_artifact_for_domain(
+            ArtifactVerifyInput {
+                domain: BLIND_ADDR_VALIDATION_DOMAIN,
+                observed,
+                client_nonce,
+                privacy_epoch,
+                artifact,
+            },
+            now_unix,
+            clock_skew_tolerance_secs,
+        )
+    }
+
+    /// Domain-parameterized verification: the mirror of
+    /// [`Self::issue_artifact_for_domain`]. Uses constant-time tag comparison.
+    /// Expired means expired PAST the skew window; artifacts never extend any
+    /// session's life.
+    pub fn verify_artifact_for_domain(
+        &self,
+        input: ArtifactVerifyInput<'_>,
+        now_unix: u64,
+        clock_skew_tolerance_secs: u64,
+    ) -> Result<(), AddressArtifactError> {
+        let ArtifactVerifyInput {
+            domain,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            artifact,
+        } = input;
         // Constant-time: client_nonce is random material even for the degenerate
         // all-zero check, and the workspace secret-equality audit requires it.
         if client_nonce.ct_eq(&[0u8; 32]).unwrap_u8() == 1 {
@@ -525,6 +590,7 @@ impl AddressValidationKeyRing {
             .key_for(key_epoch)
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let expected = Self::artifact_tag(
+            domain,
             key,
             observed,
             client_nonce,

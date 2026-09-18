@@ -20,6 +20,7 @@ fn make_hello(signing_key: &SigningKey, node_id: &str, peer_node_id: &str) -> Re
         node_id: node_id.to_owned(),
         peer_node_id: peer_node_id.to_owned(),
         session_token: RelaySessionToken::sign(signing_key, node_id, peer_node_id, RELAY_ID, 90),
+        addr_validation_artifact: None,
     }
 }
 
@@ -49,7 +50,8 @@ fn paired_transport() -> (
     Vec<u8>,
 ) {
     let signing_key = SigningKey::from_bytes(&[1u8; 32]);
-    let mut transport = RelayTransport::new(RELAY_ID, signing_key.verifying_key(), 8, 90);
+    let mut transport = RelayTransport::new(RELAY_ID, signing_key.verifying_key(), 8, 90)
+        .expect("relay transport init");
     // Lift the per-node rate limits far above bench iteration speed so the
     // bench measures the forward path, not token-bucket drops. (Must happen
     // before the first forward: buckets capture limits at first use.)
