@@ -39945,11 +39945,13 @@ fn kept_after() {}\n\
         // slack absorbs files losing their scan coverage silently. Measured
         // 2026-09-09: 88 stage sources; 89 after the QH-83 F1b
         // bundle_evidence.rs witness module joined the tree. Re-measured
-        // 2026-09-21 (AQ-85, wave-13 F1): 91 stage sources. Bump this
+        // 2026-09-21 (AQ-85, wave-13 F1): 91 stage sources; 93 after the
+        // rogue-anchor-bundle (QH-87) and wire-forgery (QH-88) negative
+        // controls joined in the OI-44 migration (2026-09-25). Bump this
         // number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 91,
-            "expected exactly 91 stage sources under the scan root; found \
+            files_scanned, 93,
+            "expected exactly 93 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );
