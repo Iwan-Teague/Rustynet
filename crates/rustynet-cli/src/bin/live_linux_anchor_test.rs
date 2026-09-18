@@ -3530,7 +3530,7 @@ mod tests {
             .write_file(cfg.anchor_token_path.as_str(), token, 0o600)
             .unwrap();
         let leaky =
-            "Jul 01 anchor_bundle_pull: peer=relay-1 token=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
+            "Jul 01 anchor_bundle_pull: peer=relay-1 leaked_token=ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
         shell.program_run_response(
             &[
                 "journalctl",
