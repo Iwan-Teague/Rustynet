@@ -68,9 +68,9 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use rustynet_control::blind_relay::{
-    parse_blind_relay_hello_v2_wire_bytes, BlindRelayLegSlot, BlindRelayTokenKindV2,
-    BLIND_RELAY_TOKEN_SCOPE_V2, MAX_BLIND_RELAY_HELLO_WIRE_BYTES,
-    MAX_BLIND_RELAY_LEG_TOKEN_TTL_SECS,
+    BLIND_RELAY_TOKEN_SCOPE_V2, BlindRelayLegSlot, BlindRelayTokenKindV2,
+    MAX_BLIND_RELAY_HELLO_WIRE_BYTES, MAX_BLIND_RELAY_LEG_TOKEN_TTL_SECS,
+    parse_blind_relay_hello_v2_wire_bytes,
 };
 
 // ── Bounds and constants ─────────────────────────────────────────────────────
@@ -361,6 +361,17 @@ impl fmt::Display for AddressArtifactError {
     }
 }
 
+/// Borrowed inputs to [`AddressValidationKeyRing::verify_artifact_for_domain`],
+/// grouped so the verifier's parameter list stays within the lint budget.
+#[derive(Debug, Clone, Copy)]
+pub struct ArtifactVerifyInput<'a> {
+    pub domain: &'a [u8],
+    pub observed: &'a SocketAddr,
+    pub client_nonce: &'a [u8; 32],
+    pub privacy_epoch: u64,
+    pub artifact: &'a [u8; 32],
+}
+
 /// Rotating HMAC key material for the address-validation artifacts.
 ///
 /// Keys are held zeroized-on-drop. Rotation is strictly forward (a new epoch
@@ -528,11 +539,13 @@ impl AddressValidationKeyRing {
         clock_skew_tolerance_secs: u64,
     ) -> Result<(), AddressArtifactError> {
         self.verify_artifact_for_domain(
-            BLIND_ADDR_VALIDATION_DOMAIN,
-            observed,
-            client_nonce,
-            privacy_epoch,
-            artifact,
+            ArtifactVerifyInput {
+                domain: BLIND_ADDR_VALIDATION_DOMAIN,
+                observed,
+                client_nonce,
+                privacy_epoch,
+                artifact,
+            },
             now_unix,
             clock_skew_tolerance_secs,
         )
@@ -544,14 +557,17 @@ impl AddressValidationKeyRing {
     /// session's life.
     pub fn verify_artifact_for_domain(
         &self,
-        domain: &[u8],
-        observed: &SocketAddr,
-        client_nonce: &[u8; 32],
-        privacy_epoch: u64,
-        artifact: &[u8; 32],
+        input: ArtifactVerifyInput<'_>,
         now_unix: u64,
         clock_skew_tolerance_secs: u64,
     ) -> Result<(), AddressArtifactError> {
+        let ArtifactVerifyInput {
+            domain,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            artifact,
+        } = input;
         // Constant-time: client_nonce is random material even for the degenerate
         // all-zero check, and the workspace secret-equality audit requires it.
         if client_nonce.ct_eq(&[0u8; 32]).unwrap_u8() == 1 {
@@ -1886,9 +1902,11 @@ mod tests {
             observer.stages.last(),
             Some(&BlindAdmissionStage::IssuerVerification)
         );
-        assert!(!observer
-            .stages
-            .contains(&BlindAdmissionStage::FieldValidation));
+        assert!(
+            !observer
+                .stages
+                .contains(&BlindAdmissionStage::FieldValidation)
+        );
     }
 
     #[test]

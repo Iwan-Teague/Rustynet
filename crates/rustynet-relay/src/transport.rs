@@ -37,7 +37,9 @@ use rustynet_control::{MAX_RELAY_SESSION_TOKEN_TTL_SECS, RELAY_TOKEN_SCOPE, Rela
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::blind_relay_listener::{AddressArtifactError, AddressValidationKeyRing};
+use crate::blind_relay_listener::{
+    AddressArtifactError, AddressValidationKeyRing, ArtifactVerifyInput,
+};
 use crate::rate_limit::RateLimiter;
 use crate::session::{RelaySession, SessionId};
 
@@ -262,7 +264,9 @@ impl RelayTransport {
         let mut validation_key = [0u8; 32];
         rand::rngs::OsRng
             .try_fill_bytes(&mut validation_key)
-            .map_err(|e| format!("kernel CSPRNG unavailable; refusing to open relay transport: {e}"))?;
+            .map_err(|e| {
+                format!("kernel CSPRNG unavailable; refusing to open relay transport: {e}")
+            })?;
         let addr_validation_keys = AddressValidationKeyRing::new(0, validation_key)
             .map_err(|e| format!("relay transport address-validation key rejected: {e}"))?;
         // Clamp skew so the replay-store retention window always strictly
@@ -347,6 +351,56 @@ impl RelayTransport {
         )
     }
 
+    /// Mint the 32-byte address-validation artifact answering an explicit
+    /// `[0x06] ++ client_nonce[32]` challenge solicitation, where
+    /// `client_nonce` is the client's own `artifact_nonce_input(token_nonce)`
+    /// (the widening is client-computable, so the 16-byte token nonce never
+    /// has to travel). Verifies against the same 32-byte input, so the
+    /// artifact only authenticates a hello carrying the token whose nonce
+    /// hashes to it. Bound to the observed source address, this relay's
+    /// identity epoch, and a short TTL, exactly like
+    /// [`Self::issue_hello_validation_artifact`].
+    pub fn issue_challenge_artifact(
+        &self,
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        now_unix: u64,
+    ) -> Result<[u8; 32], AddressArtifactError> {
+        self.addr_validation_keys.issue_artifact_for_domain(
+            RELAY_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            relay_epoch_input(self.relay_id),
+            now_unix,
+        )
+    }
+
+    /// Verify a challenge artifact against the same inputs
+    /// [`Self::issue_challenge_artifact`] bound it to. The mirror of
+    /// issuance so callers (and tests) never rebuild the transport-private
+    /// MAC domain by hand; the hello path verifies through
+    /// `validate_hello`, which derives the nonce input from the presented
+    /// token itself.
+    pub fn verify_challenge_artifact(
+        &self,
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        artifact: &[u8; 32],
+        now_unix: u64,
+    ) -> Result<(), AddressArtifactError> {
+        self.addr_validation_keys.verify_artifact_for_domain(
+            ArtifactVerifyInput {
+                domain: RELAY_ADDR_VALIDATION_DOMAIN,
+                observed,
+                client_nonce,
+                privacy_epoch: relay_epoch_input(self.relay_id),
+                artifact,
+            },
+            now_unix,
+            self.clock_skew_tolerance_secs,
+        )
+    }
+
     pub fn set_max_total_sessions(&mut self, max_total_sessions: usize) -> Result<(), String> {
         if max_total_sessions == 0 {
             return Err("max total relay sessions must be greater than 0".to_owned());
@@ -402,21 +456,21 @@ impl RelayTransport {
     /// All security checks are performed in a deliberate order:
     ///
     /// 1. Hello rate limit (cheap, no crypto — shed load before signature work)
-    /// 1.5. Address-validation artifact (when `require_addr_validation` is
-    ///     on): prove the sender answered a challenge from THIS source address
-    ///     BEFORE any signature work, so an unauthenticated flood of
-    ///     artifact-free hellos cannot force per-hello ed25519 cost
-    /// 2. Signature verification (ed25519, inherently constant-time)
-    /// 3. TTL bound check (max 120 s)
-    /// 4. Token freshness / expiry
-    /// 5. Replay nonce check
-    /// 6. `node_id` binding (`ct_eq`: `hello.node_id` == `token.node_id`)
-    /// 7. `peer_node_id` binding (`ct_eq`: `hello.peer_node_id` == `token.peer_node_id`)
-    /// 8. `relay_id` binding (`ct_eq`: `token.relay_id` == `self.relay_id`)
-    /// 9. Scope enforcement (token.scope == "`forward_ciphertext_only`")
-    /// 10. Global session capacity
-    /// 11. Per-node session capacity
-    /// 12. Daemon-supplied allocated port validation
+    /// 2. Address-validation artifact (when `require_addr_validation` is
+    ///    on): prove the sender answered a challenge from THIS source address
+    ///    BEFORE any signature work, so an unauthenticated flood of
+    ///    artifact-free hellos cannot force per-hello ed25519 cost
+    /// 3. Signature verification (ed25519, inherently constant-time)
+    /// 4. TTL bound check (max 120 s)
+    /// 5. Token freshness / expiry
+    /// 6. Replay nonce check
+    /// 7. `node_id` binding (`ct_eq`: `hello.node_id` == `token.node_id`)
+    /// 8. `peer_node_id` binding (`ct_eq`: `hello.peer_node_id` == `token.peer_node_id`)
+    /// 9. `relay_id` binding (`ct_eq`: `token.relay_id` == `self.relay_id`)
+    /// 10. Scope enforcement (token.scope == "`forward_ciphertext_only`")
+    /// 11. Global session capacity
+    /// 12. Per-node session capacity
+    /// 13. Daemon-supplied allocated port validation
     pub fn handle_hello_from_tuple_with_allocated_port(
         &mut self,
         hello: RelayHello,
@@ -495,7 +549,9 @@ impl RelayTransport {
         // address, against another relay, or under a different token.
         if self.require_addr_validation {
             let Some(now_unix) = now_unix_checked() else {
-                eprintln!("Relay hello rejected: host clock unusable, cannot evaluate address-validation artifact");
+                eprintln!(
+                    "Relay hello rejected: host clock unusable, cannot evaluate address-validation artifact"
+                );
                 return Err(RejectReason::ClockUnavailable);
             };
             let Some(artifact) = hello.addr_validation_artifact else {
@@ -504,11 +560,13 @@ impl RelayTransport {
                 return Err(RejectReason::AddressValidationRequired);
             };
             if let Err(err) = self.addr_validation_keys.verify_artifact_for_domain(
-                RELAY_ADDR_VALIDATION_DOMAIN,
-                &observed_addr,
-                &artifact_nonce_input(&hello.session_token.nonce),
-                relay_epoch_input(self.relay_id),
-                &artifact,
+                ArtifactVerifyInput {
+                    domain: RELAY_ADDR_VALIDATION_DOMAIN,
+                    observed: &observed_addr,
+                    client_nonce: &artifact_nonce_input(&hello.session_token.nonce),
+                    privacy_epoch: relay_epoch_input(self.relay_id),
+                    artifact: &artifact,
+                },
                 now_unix,
                 self.clock_skew_tolerance_secs,
             ) {
@@ -4155,9 +4213,9 @@ mod tests {
             RelayHello {
                 node_id: "node-a".to_owned(),
                 peer_node_id: "node-b".to_owned(),
-            session_token: token,
-            addr_validation_artifact: None,
-        }
+                session_token: token,
+                addr_validation_artifact: None,
+            }
         };
 
         // Exactly at the tolerance: still acceptable.
