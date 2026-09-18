@@ -5104,7 +5104,7 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             }
             let signing_secret =
                 decrypt_private_key(secret_path, passphrase_path).map_err(DaemonError::Io)?;
-            let signing_key = derive_endpoint_hint_signing_key(signing_secret);
+            let signing_key = derive_endpoint_hint_signing_key(signing_secret.to_vec());
             let relay_client = RelayClient::new(
                 NodeId::new(config.node_id.clone())
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
@@ -5155,7 +5155,7 @@ fn build_gossip_node(
     let signing_secret = decrypt_private_key(secret_path, passphrase_path)
         .map_err(|err| DaemonError::Io(format!("gossip signing secret load failed: {err}")))?;
     // One-way derivation; `derive_gossip_signing_key` zeroizes the secret.
-    let signing_key = derive_gossip_signing_key(signing_secret);
+    let signing_key = derive_gossip_signing_key(signing_secret.to_vec());
     let node = crate::gossip_runtime::GossipNode::new(
         signing_key,
         config.gossip_watermark_path.clone(),
