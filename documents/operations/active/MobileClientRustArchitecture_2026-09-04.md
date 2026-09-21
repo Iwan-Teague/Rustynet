@@ -315,7 +315,7 @@ Component-by-component disposition (LOC from the audit; "core" = shared library 
 | Component | Disposition | Notes |
 | --- | --- | --- |
 | boringtun noise core (~2,700 LOC compiled) | **Rust** | unchanged, vendored |
-| userspace engine + runtime + fair_drain (~7,500 LOC) | **Rust** | generalize fd acquisition (Android arm) |
+| userspace engine + runtime (~7,000 LOC; fair_drain deleted 2026-09-21, AQ-71) | **Rust** | generalize fd acquisition (Android arm) |
 | rustynet-tun (547 LOC) | **Rust** | + ~20-40 LOC Android/iOS arms |
 | backend-api (442 LOC) | **Rust** | unchanged |
 | rustynet-control (32,319 LOC) | **Rust** | unchanged |
@@ -348,7 +348,7 @@ Component-by-component disposition (LOC from the audit; "core" = shared library 
 
 1. **App Store / Play VPN policy.** Apple requires the NetworkExtension entitlement (request it from Apple; provisioning time is a schedule risk, not a code risk) and review of VPN apps under App Review guideline 5.6-ish VPN disclosures (privacy policy, data collection disclosure). Play requires the VPN permission declaration form and a privacy policy; background VPN policy favors foreground-service usage. Neither store prohibits userspace WG or Rust-compiled extensions; Mozilla VPN and Tailscale are operating precedents for exactly this architecture (Rust core + boringtun-lineage + UniFFI). Risk is procedural, not architectural.
 2. **iOS packet model uncertainty** (`NEPacketTunnelFlow` arrays vs raw fd): affects the engine's read loop plumbing (§3.2). Bounded: the device seam absorbs either model. **Prototype P1 resolves it.**
-3. **boringtun mobile performance.** Desktop numbers do not transfer directly (older ARM cores, thermal ceilings, NE memory limits). Mitigation: the engine already does batched fair draining (`fair_drain.rs`); benchmark early on target hardware (P2). No reason to expect inadequacy — commercial VPNs ship this exact lineage on phones — but *measure, don't assume*.
+3. **boringtun mobile performance.** Desktop numbers do not transfer directly (older ARM cores, thermal ceilings, NE memory limits). Mitigation: the engine already does batched fair draining (`fair_drain.rs`); benchmark early on target hardware (P2). No reason to expect inadequacy — commercial VPNs ship this exact lineage on phones — but *measure, don't assume*. *(2026-09-21 correction: the batched fair-drain scheduler was never wired and was deleted under AQ-71; this mitigation is currently not available — see FIS-0012 tracker row.)*
 4. **Background execution limits.** iOS extensions are kill-prone; Android foreground services are persistent-notification-bound. Design consequence adopted throughout: cold-start correctness (fail-closed verification on every start — already the house rule), jittered reconnect (`resilience.rs` policy), no warm-state assumptions.
 5. **Extension memory ceilings** (iOS NE budget ~50 MB class): the full domain stack is small, but audit `rustynet-control` + engine allocations under load; the `rustynet-alloc-meter` vendored crate exists for exactly this kind of accounting.
 6. **Key-store policy drift:** OS store APIs change (accessibility classes, StrongBox availability); the `OsSecureStore` seam isolates it.
