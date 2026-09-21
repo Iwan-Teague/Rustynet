@@ -312,6 +312,11 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "daemon" => {
                 let config = parse_daemon_config(rest)?;
                 init_daemon_logging(daemon_log_file_path(&config).as_deref());
+                // AQ-40 (B8 / R-SEC-15): disable core dumps + debugger-friendly
+                // dumpable state BEFORE any key material is loaded. Fatal on
+                // failure (fail-closed); RUSTYNET_ALLOW_CORE_DUMPS=1 is the
+                // reviewed lab-debugging opt-out.
+                rustynetd::core_hardening::apply_startup_hardening()?;
                 run_daemon(config).map_err(|err| {
                     log::error!("rustynetd startup: daemon exited fatally: {err}");
                     err.to_string()
@@ -535,6 +540,9 @@ fn init_daemon_logging(log_file: Option<&Path>) {
 fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
     let config = parse_daemon_config(args)?;
     init_daemon_logging(daemon_log_file_path(&config).as_deref());
+    // AQ-40 (B8 / R-SEC-15): same Linux core-dump hardening as the standard
+    // daemon arm; the Windows SCM host must carry the identical posture.
+    rustynetd::core_hardening::apply_startup_hardening()?;
     run_daemon(config).map_err(|err| {
         // A fatal startup error is otherwise returned only to the SCM (and lost
         // — the Windows service discards stderr), leaving the durable log
