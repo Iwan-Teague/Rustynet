@@ -865,29 +865,6 @@ impl UserspaceEngine {
         Ok(index)
     }
 
-    /// FIS-0012 metadata seam: classify an inbound datagram's source into
-    /// a fair-drain flow key BEFORE any processing. Linear endpoint match —
-    /// the same predicate inbound processing uses.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn flow_key_for_remote(
-        &self,
-        remote_addr: SocketAddr,
-    ) -> crate::userspace_shared::fair_drain::FlowKey {
-        match self.find_node_id_by_endpoint(remote_addr) {
-            Some(node_id) => crate::userspace_shared::fair_drain::FlowKey::Peer(node_id),
-            None => crate::userspace_shared::fair_drain::FlowKey::Unclassified,
-        }
-    }
-
-    /// FIS-0012 metadata seam: destination peer of an outbound plaintext
-    /// packet, without processing it (wraps `Tunn::dst_address` +
-    /// `select_peer_for_destination`).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn resolve_destination_peer(&self, packet: &[u8]) -> Option<NodeId> {
-        let dst_addr = Tunn::dst_address(packet)?;
-        self.select_peer_for_destination(dst_addr)
-    }
-
     /// Duplicate-endpoint tie-break: `.first()` on the per-endpoint
     /// `BTreeSet<NodeId>` is the LOWEST NodeId currently pinned to
     /// `remote_addr`, matching what the former linear scan over the
@@ -910,6 +887,7 @@ impl UserspaceEngine {
     // module gated behind `cfg(any(test, feature = "test-harness"))` — can
     // probe this lookup directly for the P4 microbenchmark below; no wider
     // exposure than that (still unreachable outside this crate).
+    #[cfg_attr(not(any(test, feature = "test-harness")), allow(dead_code))] // only bench_support/tests probe it (AQ-71 removed the last lib caller)
     pub(crate) fn find_node_id_by_endpoint(&self, remote_addr: SocketAddr) -> Option<NodeId> {
         Self::endpoint_index_lookup(&self.endpoint_index, remote_addr).cloned()
     }
@@ -1988,54 +1966,6 @@ mod tests {
         assert!(engine.has_endpoint(endpoint_2));
         assert_eq!(engine.find_node_id_by_endpoint(endpoint_2), Some(peer));
     }
-
-    #[test]
-    fn fis0012_metadata_seams_classify_without_processing() {
-        use crate::userspace_shared::fair_drain::FlowKey;
-        use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("wg.key");
-        std::fs::write(&path, BASE64_STANDARD.encode([9u8; 32])).expect("write key");
-        let mut engine = UserspaceEngine::from_private_key_file(&path).expect("engine");
-        let node_id = NodeId::new("peer-a").expect("node id");
-        engine
-            .configure_peer(&PeerConfig {
-                node_id: node_id.clone(),
-                endpoint: SocketEndpoint {
-                    addr: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9)),
-                    port: 51820,
-                },
-                public_key: [0x11; 32],
-                allowed_ips: vec!["100.64.7.0/24".to_owned()],
-                persistent_keepalive_secs: None,
-            })
-            .expect("peer configures");
-
-        // Inbound classification by source endpoint.
-        assert_eq!(
-            engine.flow_key_for_remote("203.0.113.9:51820".parse().expect("addr")),
-            FlowKey::Peer(node_id.clone())
-        );
-        assert_eq!(
-            engine.flow_key_for_remote("198.51.100.1:9999".parse().expect("addr")),
-            FlowKey::Unclassified
-        );
-
-        // Outbound destination resolution: minimal IPv4 header, dst at
-        // bytes 16..20.
-        let mut packet = vec![0u8; 20];
-        packet[0] = 0x45;
-        packet[16..20].copy_from_slice(&[100, 64, 7, 42]);
-        assert_eq!(engine.resolve_destination_peer(&packet), Some(node_id));
-
-        packet[16..20].copy_from_slice(&[10, 0, 0, 1]);
-        assert_eq!(engine.resolve_destination_peer(&packet), None);
-
-        // Garbage never resolves (and never panics).
-        assert_eq!(engine.resolve_destination_peer(&[0u8; 3]), None);
-    }
-
     // Property test: after every mutation in a randomized (but
     // deterministically seeded) configure/move/remove sequence, the
     // `endpoint_index` reverse map must answer EXACTLY what a fresh linear
