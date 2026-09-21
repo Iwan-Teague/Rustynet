@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod dataplane_candidates;
 pub mod enrollment_consume;
 pub mod enrollment_replay_audit;
+pub mod enrollment_secret_custody;
 pub mod enrollment_token;
 pub mod exit_codes;
 pub mod fetcher;

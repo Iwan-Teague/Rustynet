@@ -2000,10 +2000,17 @@ fn bind_anchor_enrollment_listener(
             "anchor enrollment listener requires an enrollment ledger path".to_owned(),
         ));
     }
-    // Fail fast on an unloadable secret (missing, symlinked, wrong size,
-    // group/world-readable). The Zeroizing buffer is dropped immediately;
-    // nothing secret is retained here.
-    crate::enrollment_token::load_secret(secret_path).map_err(|err| {
+    // Fail fast on an unresolvable secret (not in the OS keystore, plaintext
+    // without the explicit lab opt-in, symlinked, wrong size,
+    // group/world-readable). AQ-68: plaintext-at-rest is refused unless
+    // `allow_plaintext_enrollment_secret` was set. The Zeroizing buffer is
+    // dropped immediately; nothing secret is retained here.
+    crate::enrollment_secret_custody::resolve_enrollment_secret(
+        &rustynet_crypto::PlatformOsSecureStore,
+        secret_path,
+        config.allow_plaintext_enrollment_secret,
+    )
+    .map_err(|err| {
         DaemonError::InvalidConfig(format!("anchor enrollment secret unavailable: {err}"))
     })?;
     require_local_signed_capability(
@@ -2550,6 +2557,13 @@ pub struct DaemonConfig {
     /// without it will reject `enrollment consume` with a typed
     /// "not configured" error).
     pub enrollment_secret_path: Option<PathBuf>,
+    /// AQ-68: lab-only escape hatch. When false (the default), the daemon
+    /// REFUSES to resolve the enrollment secret from a plaintext file at
+    /// rest and requires it to live in the OS keystore (see
+    /// [`crate::enrollment_secret_custody`]). Only an explicit opt-in —
+    /// env `RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1` or this field —
+    /// accepts plaintext custody.
+    pub allow_plaintext_enrollment_secret: bool,
     /// D2.7: per-host spool for the consumed-token ledger. Required
     /// when `enrollment_secret_path` is set so single-use semantics
     /// survive daemon restarts.
@@ -2664,6 +2678,8 @@ impl Default for DaemonConfig {
             )
             .map(PathBuf::from),
             enrollment_secret_path: std::env::var_os(ENROLLMENT_SECRET_PATH_ENV).map(PathBuf::from),
+            allow_plaintext_enrollment_secret:
+                crate::enrollment_secret_custody::allow_plaintext_enrollment_secret_from_env(),
             enrollment_ledger_path: std::env::var_os(ENROLLMENT_LEDGER_PATH_ENV).map(PathBuf::from),
             auto_tunnel_enforce: true,
             auto_tunnel_bundle_path: Some(PathBuf::from(DEFAULT_AUTO_TUNNEL_BUNDLE_PATH)),
@@ -4974,6 +4990,8 @@ struct DaemonRuntime {
     /// `None` disables the `enrollment consume` verb entirely.
     enrollment_secret_path: Option<PathBuf>,
     enrollment_ledger_path: Option<PathBuf>,
+    /// AQ-68: mirrors `DaemonConfig::allow_plaintext_enrollment_secret`.
+    allow_plaintext_enrollment_secret: bool,
     /// Persistent local rotation ledger: monotonic rotation epoch,
     /// archived verifier keys, per-epoch replay watermark, and the
     /// rotation audit ring. Loaded from `ledger_path_for(wg_private_key_path)`
@@ -5437,6 +5455,7 @@ impl DaemonRuntime {
             gossip_recv_errors: 0,
             enrollment_secret_path: config.enrollment_secret_path.clone(),
             enrollment_ledger_path: config.enrollment_ledger_path.clone(),
+            allow_plaintext_enrollment_secret: config.allow_plaintext_enrollment_secret,
             rotation_ledger: load_rotation_ledger(config.wg_private_key_path.as_deref())
                 .map_err(|err| DaemonError::InvalidConfig(format!("rotation ledger: {err}")))?,
             rotation_handshake_tracker: InFlightHandshakeTracker::new(),
@@ -9906,8 +9925,12 @@ impl DaemonRuntime {
         let push_addr: SocketAddr = push_addr_str
             .parse()
             .map_err(|err| format!("enrollee push address parse failed: {err}"))?;
-        let secret = crate::enrollment_token::load_secret(secret_path)
-            .map_err(|err| format!("enrollment secret load failed: {err}"))?;
+        let secret = crate::enrollment_secret_custody::resolve_enrollment_secret(
+            &rustynet_crypto::PlatformOsSecureStore,
+            secret_path,
+            self.allow_plaintext_enrollment_secret,
+        )
+        .map_err(|err| format!("enrollment secret load failed: {err}"))?;
         // RSA-0023: hold an exclusive advisory lock over the ENTIRE
         // load → check-consumed → register → write sequence so two concurrent
         // redemptions of the same single-use token cannot both observe "not
@@ -24141,6 +24164,12 @@ mod tests {
             membership_watermark_path: dir.join("membership.watermark"),
             enrollment_secret_path: Some(secret_path),
             enrollment_ledger_path: Some(dir.join("enrollment.ledger")),
+            // AQ-68: the fixture provisions the secret as a plaintext file
+            // (the historical custody model); the listener now refuses
+            // plaintext at rest by default, so the fixture carries the
+            // explicit lab opt-in. Keystore-custody refusal is covered by
+            // bind_anchor_enrollment_listener_refuses_plaintext_secret_without_opt_in.
+            allow_plaintext_enrollment_secret: true,
             anchor_enrollment_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
             anchor_enrollment_allow_lan: false,
             backend_mode: DaemonBackendMode::InMemory,
@@ -24315,6 +24344,61 @@ mod tests {
         assert!(
             format!("{err}").contains("secret path"),
             "refusal must name the missing provisioning: {err}"
+        );
+    }
+
+    /// AQ-68 fail-closed: with the plaintext file present and NO opt-in,
+    /// the listener refuses to open and leaves the plaintext file
+    /// untouched. This is the boot-time refusal for plaintext-at-rest
+    /// custody of the minting secret.
+    #[test]
+    fn bind_anchor_enrollment_listener_refuses_plaintext_secret_without_opt_in() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-no-plaintext-optin");
+        let (mut config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        config.allow_plaintext_enrollment_secret = false;
+        let secret_path = config
+            .enrollment_secret_path
+            .clone()
+            .expect("fixture provisions a secret path");
+        // `expect_err` would require `Ok` to be `Debug`; destructure instead.
+        let err = match bind_anchor_enrollment_listener(&config) {
+            Ok(_) => panic!("plaintext secret at rest must refuse the bind without opt-in"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err}").contains("refusing plaintext enrollment secret"),
+            "refusal must name the plaintext-custody gate: {err}"
+        );
+        assert!(
+            secret_path.exists(),
+            "refusal must not shred the plaintext file"
+        );
+    }
+
+    /// AQ-68 positive control: the same fixture with the explicit opt-in
+    /// gets past the custody gate (the bind then proceeds exactly as
+    /// before AQ-68 — same discriminator pattern as the capability pair).
+    #[test]
+    fn bind_anchor_enrollment_listener_accepts_plaintext_secret_with_explicit_opt_in() {
+        let dir = secure_test_dir("rustynetd-enroll-bind-plaintext-optin");
+        let (config, _runtime) =
+            enrollment_listener_fixture(&dir, anchor_caps_with_enrollment_endpoint());
+        assert!(
+            config.allow_plaintext_enrollment_secret,
+            "fixture carries the explicit plaintext opt-in"
+        );
+        let listener = bind_anchor_enrollment_listener(&config)
+            .expect("explicit opt-in must let the bind proceed")
+            .expect("a configured addr + capability ⇒ a listener");
+        assert!(
+            listener
+                .listener
+                .local_addr()
+                .expect("bound addr")
+                .ip()
+                .is_loopback(),
+            "opt-in bind must stay loopback"
         );
     }
 
