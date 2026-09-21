@@ -39944,11 +39944,12 @@ fn kept_after() {}\n\
         // Exact pin, not a floor (the bin-launcher precedent): a floor with
         // slack absorbs files losing their scan coverage silently. Measured
         // 2026-09-09: 88 stage sources; 89 after the QH-83 F1b
-        // bundle_evidence.rs witness module joined the tree. Bump this
+        // bundle_evidence.rs witness module joined the tree. Re-measured
+        // 2026-09-21 (AQ-85, wave-13 F1): 91 stage sources. Bump this
         // number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 89,
-            "expected exactly 89 stage sources under the scan root; found \
+            files_scanned, 91,
+            "expected exactly 91 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );
