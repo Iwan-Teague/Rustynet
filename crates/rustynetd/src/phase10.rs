@@ -2113,7 +2113,8 @@ impl LinuxCommandSystem {
         vec!["oifname".into(), "lo".into(), "accept".into()]
     }
 
-    /// Killswitch + forward: allow established/related traffic.
+    /// Killswitch + forward: allow established/related traffic, scoped so it
+    /// cannot shadow the DNS protections (AQ-70/F2).
     ///
     /// These tokens feed TWO consumers that must agree (QH-29): the
     /// `nft add rule` argv sent through the privileged helper, and the
@@ -2127,18 +2128,83 @@ impl LinuxCommandSystem {
     /// Linux reconcile apply live (2026-08-29 run: permanent restriction,
     /// no `rustynet0`, managed-DNS oneshot timeout, NotRunning shutdown
     /// residue on both Debian nodes).
-    fn established_related_accept_tokens() -> Vec<String> {
-        vec![
-            "ct".into(),
-            "state".into(),
-            "established,related".into(),
-            "accept".into(),
-        ]
+    ///
+    /// AQ-70/F2: the historical single unqualified
+    /// `ct state established,related accept` sat EARLIER in both chains than
+    /// the DNS/DoT/DoQ drops and the egress scoping, and nft evaluates
+    /// first-match-wins — so an already-established flow to udp/53, tcp/53,
+    /// tcp/853 or udp/853 was accepted before any drop could match, and the
+    /// unqualified form also admitted IPv6 in a chain whose posture is
+    /// IPv4-only (IPv6 is hard-disabled system-wide; see the egress rule
+    /// documentation below). The replacement is THREE rules, all scoped to
+    /// `meta nfproto ipv4`:
+    ///
+    /// - tcp and udp `dport != { 53, 853 }`: established/related traffic is
+    ///   accepted for every port EXCEPT plaintext DNS (53), DoT (853/tcp) and
+    ///   DoQ (853/udp), which must fall through to the later drops or, once
+    ///   expired, the `policy drop`;
+    /// - `meta l4proto != { tcp, udp }`: preserves established/related
+    ///   non-tcp/udp IPv4 traffic (ICMP/PMTU replies and friends) that the
+    ///   port-scoped rules above no longer match.
+    ///
+    /// The `!= { ... }` negated anonymous sets are tokenized one element per
+    /// argv entry with the trailing comma carried by the element, exactly
+    /// like the egress drop sets, and the rendered spacing is pinned by the
+    /// helper allowlist arms + tests on both sides (emitter and helper).
+    fn established_related_accept_tokens() -> Vec<Vec<String>> {
+        let head: [&str; 6] = [
+            "ct",
+            "state",
+            "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+        ];
+        let head = head.map(String::from).to_vec();
+        let negated_port_set = |protocol: &str| -> Vec<String> {
+            let mut tokens = head.clone();
+            tokens.push(protocol.into());
+            tokens.push("dport".into());
+            tokens.push("!=".into());
+            tokens.push("{".into());
+            tokens.push("53,".into());
+            tokens.push("853".into());
+            tokens.push("}".into());
+            tokens.push("accept".into());
+            tokens
+        };
+        let mut rules = vec![negated_port_set("tcp"), negated_port_set("udp")];
+        let mut non_tcp_udp = head;
+        non_tcp_udp.push("meta".into());
+        non_tcp_udp.push("l4proto".into());
+        non_tcp_udp.push("!=".into());
+        non_tcp_udp.push("{".into());
+        non_tcp_udp.push("tcp,".into());
+        non_tcp_udp.push("udp".into());
+        non_tcp_udp.push("}".into());
+        non_tcp_udp.push("accept".into());
+        rules.push(non_tcp_udp);
+        rules
     }
 
     /// Killswitch: allow anything leaving via the tunnel interface.
+    ///
+    /// AQ-70/F3: scoped to IPv4 like every other killswitch allow. The
+    /// historical unqualified `oifname <tunnel> accept` shape lost its
+    /// privileged-helper arm when the RN-12/IPV-01/RN-29 egress scoping
+    /// removed the wide-open form, so the unscoped shape is refused at the
+    /// privileged boundary; the `meta nfproto ipv4` scope is what makes this
+    /// rule installable again (it shares the helper arm with the scoped
+    /// egress catch-all) while keeping IPv6 on the `policy drop` path.
     fn tunnel_interface_accept_tokens(tunnel_interface: &str) -> Vec<String> {
-        vec!["oifname".into(), tunnel_interface.into(), "accept".into()]
+        vec![
+            "oifname".into(),
+            tunnel_interface.into(),
+            "meta".into(),
+            "nfproto".into(),
+            "ipv4".into(),
+            "accept".into(),
+        ]
     }
 
     /// Killswitch: allow the node's own egress while NAT forwarding is active.
@@ -2201,7 +2267,9 @@ impl LinuxCommandSystem {
         };
         let mut rules: Vec<Vec<String>> = Vec::new();
         if drop_dns {
-            rules.push(scoped("udp", &["53"], false, "drop"));
+            // AQ-70/F1: the udp drop covers DoQ (udp/853) alongside plaintext
+            // DNS (udp/53), matching the tcp drop's DoT (tcp/853) scope.
+            rules.push(scoped("udp", &["53", "853"], false, "drop"));
             rules.push(scoped("tcp", &["53", "853"], false, "drop"));
         }
         rules.push(vec![
@@ -2226,6 +2294,11 @@ impl LinuxCommandSystem {
         vec![
             "oifname".into(),
             egress_interface.into(),
+            // AQ-70/F3: IPv4-only like the rest of the killswitch allows; the
+            // WireGuard underlay endpoints are IPv4 (IPv6 hard-disabled).
+            "meta".into(),
+            "nfproto".into(),
+            "ipv4".into(),
             "udp".into(),
             port_match.into(),
             wg_listen_port.to_string(),
@@ -2566,11 +2639,15 @@ impl LinuxCommandSystem {
             &Self::loopback_accept_tokens(),
             "loopback killswitch allow rule missing",
         )?;
-        self.assert_chain_contains_strings(
-            &killswitch,
-            &Self::established_related_accept_tokens(),
-            "established/related killswitch allow rule missing",
-        )?;
+        // AQ-70/F2: one scoped established/related rule per iteration; each
+        // is asserted/installed individually so none can be silently omitted.
+        for rule_tokens in Self::established_related_accept_tokens() {
+            self.assert_chain_contains_strings(
+                &killswitch,
+                &rule_tokens,
+                "established/related killswitch allow rule missing",
+            )?;
+        }
         self.assert_chain_contains_strings(
             &killswitch,
             &Self::tunnel_interface_accept_tokens(self.interface_name.as_str()),
@@ -2596,11 +2673,13 @@ impl LinuxCommandSystem {
                 "wireguard source port killswitch allow rule missing",
             )?;
         }
-        self.assert_chain_contains_strings(
-            &forward,
-            &Self::established_related_accept_tokens(),
-            "forward established/related allow rule missing",
-        )?;
+        for rule_tokens in Self::established_related_accept_tokens() {
+            self.assert_chain_contains_strings(
+                &forward,
+                &rule_tokens,
+                "forward established/related allow rule missing",
+            )?;
+        }
         self.assert_chain_contains_strings(
             &forward,
             &Self::forward_tunnel_to_egress_tokens(
@@ -3306,14 +3385,13 @@ impl DataplaneSystem for LinuxCommandSystem {
         // QH-29: every rule body below comes from the shared token builders
         // that assert_firewall_ruleset matches against — the generator and
         // the fail-closed matcher cannot drift apart silently.
-        self.run_nft_rule_argv(
-            "inet",
-            table.as_str(),
-            "killswitch",
-            &Self::established_related_accept_tokens(),
-            &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        // AQ-70/F2: install every scoped established/related rule in order;
+        // nft first-match-wins, and all three must precede nothing that would
+        // shadow them (they ARE the shadowing fix).
+        for rule_tokens in Self::established_related_accept_tokens() {
+            self.run_nft_rule_argv("inet", table.as_str(), "killswitch", &rule_tokens, &[])
+                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        }
         self.run_nft_rule_argv(
             "inet",
             table.as_str(),
@@ -3322,14 +3400,10 @@ impl DataplaneSystem for LinuxCommandSystem {
             &[],
         )
         .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
-        self.run_nft_rule_argv(
-            "inet",
-            table.as_str(),
-            "forward",
-            &Self::established_related_accept_tokens(),
-            &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        for rule_tokens in Self::established_related_accept_tokens() {
+            self.run_nft_rule_argv("inet", table.as_str(), "forward", &rule_tokens, &[])
+                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        }
         self.run_nft_rule_argv(
             "inet",
             table.as_str(),
@@ -17341,25 +17415,28 @@ mod tests {
 
         // Matcher-side expectations (the SAME builders assert_firewall_ruleset
         // consumes), paired with the chain the matcher searches for them in.
-        let expectations: Vec<(&str, Vec<String>)> = vec![
-            ("killswitch", LinuxCommandSystem::loopback_accept_tokens()),
-            (
-                "killswitch",
-                LinuxCommandSystem::established_related_accept_tokens(),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::wg_listen_port_allow_tokens("dport", "enp0s9", 51820),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
-            ),
-        ];
+        let expectations: Vec<(&str, Vec<String>)> =
+            vec![("killswitch", LinuxCommandSystem::loopback_accept_tokens())]
+                .into_iter()
+                .chain(
+                    LinuxCommandSystem::established_related_accept_tokens()
+                        .into_iter()
+                        .map(|rule| ("killswitch", rule)),
+                )
+                .chain(vec![
+                    (
+                        "killswitch",
+                        LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
+                    ),
+                    (
+                        "killswitch",
+                        LinuxCommandSystem::wg_listen_port_allow_tokens("dport", "enp0s9", 51820),
+                    ),
+                    (
+                        "killswitch",
+                        LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
+                    ),
+                ]);
         // RN-12/IPV-01/RN-29: the egress builder now returns the SCOPED rule
         // set (two DNS drops + one v4 catch-all accept with the posture
         // active); every one of them must appear in the emitted killswitch
@@ -17367,30 +17444,34 @@ mod tests {
         for scoped in LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true) {
             expectations.push(("killswitch", scoped));
         }
-        expectations.extend([
-            (
-                "killswitch",
-                LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
-            ),
-            (
-                "killswitch",
-                LinuxCommandSystem::dns_off_tunnel_drop_tokens("tcp", "rustynet0"),
-            ),
-            ("killswitch", LinuxCommandSystem::dns_accept_tokens("udp")),
-            ("killswitch", LinuxCommandSystem::dns_accept_tokens("tcp")),
-            (
-                "forward",
-                LinuxCommandSystem::established_related_accept_tokens(),
-            ),
-            (
-                "forward",
-                LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
-            ),
-            (
-                "forward",
-                LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
-            ),
-        ]);
+        expectations
+            .extend([
+                (
+                    "killswitch",
+                    LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
+                ),
+                (
+                    "killswitch",
+                    LinuxCommandSystem::dns_off_tunnel_drop_tokens("tcp", "rustynet0"),
+                ),
+                ("killswitch", LinuxCommandSystem::dns_accept_tokens("udp")),
+                ("killswitch", LinuxCommandSystem::dns_accept_tokens("tcp")),
+            ])
+            .chain(
+                LinuxCommandSystem::established_related_accept_tokens()
+                    .into_iter()
+                    .map(|rule| ("forward", rule)),
+            )
+            .chain(vec![
+                (
+                    "forward",
+                    LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
+                ),
+                (
+                    "forward",
+                    LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
+                ),
+            ]);
         for (chain, tokens) in expectations {
             let chain_argv: Vec<String> = command_log
                 .iter()
@@ -17423,10 +17504,6 @@ mod tests {
     fn nft_rule_builder_tokens_never_carry_internal_whitespace() {
         let builder_sets: Vec<(&str, Vec<String>)> = vec![
             ("loopback", LinuxCommandSystem::loopback_accept_tokens()),
-            (
-                "established_related",
-                LinuxCommandSystem::established_related_accept_tokens(),
-            ),
             (
                 "tunnel_interface",
                 LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
@@ -17501,34 +17578,162 @@ mod tests {
                 }
             }
         }
+        // AQ-70/F2: the established/related builder also returns a rule SET.
+        for (index, tokens) in LinuxCommandSystem::established_related_accept_tokens()
+            .into_iter()
+            .enumerate()
+        {
+            for token in tokens {
+                assert!(
+                    !token.chars().any(char::is_whitespace),
+                    "established/related builder rule {index} emitted a token with internal \
+                     whitespace ({token:?}); the privileged-helper argv allowlist matches \
+                     per-token nft keywords and would refuse the rule"
+                );
+            }
+        }
     }
 
-    /// Pins the established/related killswitch rule's FULL argv to the exact
+    /// AQ-70/F1: with the protected-DNS posture active the underlay udp drop
+    /// must cover DoQ (udp/853) exactly like DoT (tcp/853), else established
+    /// or catch-all ordering lets udp/853 egress leak.
+    #[test]
+    fn aq70_doq_udp_853_is_dropped_when_dns_protected() {
+        let rules = LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true);
+        let udp_drop = rules
+            .iter()
+            .find(|rule| rule.iter().any(|t| t == "udp") && rule.contains(&"drop".to_string()))
+            .expect("protected-DNS egress rules must contain a udp drop");
+        assert!(
+            udp_drop.contains(&"853".to_string()),
+            "udp drop must cover DoQ 853, got {udp_drop:?}"
+        );
+    }
+
+    /// AQ-70/F2: the established/related accepts must be family- and port-
+    /// scoped so they cannot shadow the DNS protections by first-match.
+    #[test]
+    fn aq70_established_related_accept_is_family_scoped_not_dns_shadowing() {
+        let rules = LinuxCommandSystem::established_related_accept_tokens();
+        assert!(
+            rules.len() >= 3,
+            "expected scoped established/related rules, got {rules:?}"
+        );
+        for rule_tokens in &rules {
+            let rendered = rule_tokens.join(" ");
+            assert!(
+                rendered.contains("nfproto ipv4"),
+                "established accept must be scoped to IPv4, got: {rendered}"
+            );
+        }
+        let port_scoped: Vec<String> = rules
+            .iter()
+            .filter(|rule| rule.iter().any(|token| token == "dport"))
+            .map(|rule| rule.join(" "))
+            .collect();
+        assert_eq!(
+            port_scoped.len(),
+            2,
+            "tcp+udp dport-scoped established rules required, got {port_scoped:?}"
+        );
+        for rendered in &port_scoped {
+            assert!(
+                rendered.contains("!= { 53, 853 }"),
+                "established accept must exclude DNS/DoT/DoQ ports, got: {rendered}"
+            );
+        }
+    }
+
+    /// AQ-70/F3: the tunnel-interface accept must be scoped to IPv4 (the
+    /// unqualified form was left dead by the RN-12 allowlist removal and must
+    /// never come back).
+    #[test]
+    fn aq70_tunnel_interface_accept_is_nfproto_scoped() {
+        let rendered = LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0").join(" ");
+        assert!(
+            rendered.contains("nfproto ipv4"),
+            "tunnel accept must be scoped to IPv4, got: {rendered}"
+        );
+    }
+
+    /// Pins the established/related killswitch rules' FULL argv to the exact
     /// shape the privileged-helper allowlist accepts, so an emitter-side
     /// regression fails this test instead of every Linux reconcile apply.
+    /// AQ-70/F2: the builder emits THREE scoped rules; each pinned argv is
+    /// the scoped shape whose allowlist arms live in `privileged_helper.rs`.
     #[test]
     fn established_related_rule_argv_is_helper_allowlist_shaped() {
-        let argv = LinuxCommandSystem::nft_add_rule_argv(
-            "inet",
-            "rustynet_g1",
-            "killswitch",
-            &LinuxCommandSystem::established_related_accept_tokens(),
-            &[],
-        );
-        assert_eq!(
-            argv,
+        let expected_bodies: [Vec<&str>; 3] = [
             vec![
-                "add",
-                "rule",
-                "inet",
-                "rustynet_g1",
-                "killswitch",
                 "ct",
                 "state",
                 "established,related",
-                "accept"
-            ]
+                "meta",
+                "nfproto",
+                "ipv4",
+                "tcp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            vec![
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "udp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            vec![
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "meta",
+                "l4proto",
+                "!=",
+                "{",
+                "tcp,",
+                "udp",
+                "}",
+                "accept",
+            ],
+        ];
+        let rules = LinuxCommandSystem::established_related_accept_tokens();
+        assert_eq!(
+            rules.len(),
+            3,
+            "established/related builder must emit exactly three scoped rules"
         );
+        for (rule_tokens, expected_body) in rules.iter().zip(expected_bodies.iter()) {
+            let expected: Vec<String> = vec!["add", "rule", "inet", "rustynet_g1", "killswitch"]
+                .into_iter()
+                .map(String::from)
+                .chain(expected_body.iter().copied().map(String::from))
+                .collect();
+            let argv = LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                rule_tokens,
+                &[],
+            );
+            assert_eq!(argv, expected, "established/related argv drifted");
+        }
     }
 
     /// RN-12/IPV-01/RN-29: pins the FULL argv of every scoped exit-node
@@ -17542,7 +17747,8 @@ mod tests {
         assert_eq!(drop_dns_rules.len(), 3);
         let expected_rule_bodies: Vec<Vec<&str>> = vec![
             vec![
-                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "53", "drop",
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "{", "53,", "853",
+                "}", "drop",
             ],
             vec![
                 "oifname", "enp0s9", "meta", "nfproto", "ipv4", "tcp", "dport", "{", "53,", "853",
@@ -17659,6 +17865,7 @@ mod tests {
             ("plaintext udp/53 dns", (Some("udp"), 53), dns_drop),
             ("plaintext tcp/53 dns", (Some("tcp"), 53), dns_drop),
             ("dot tcp/853", (Some("tcp"), 853), dns_drop),
+            ("doq udp/853", (Some("udp"), 853), dns_drop),
             ("regular udp traffic", (Some("udp"), 443), accept),
             ("regular tcp traffic", (Some("tcp"), 443), accept),
             ("icmp / other v4 protocols", (None, 0), accept),
@@ -17692,6 +17899,7 @@ mod tests {
         for (label, probe) in [
             ("plaintext udp/53 dns", (Some("udp"), 53)),
             ("dot tcp/853", (Some("tcp"), 853)),
+            ("doq udp/853", (Some("udp"), 853)),
         ] {
             assert_eq!(
                 first_match(&reordered, probe).as_deref(),
@@ -17799,18 +18007,26 @@ mod tests {
         let mut rules = "table inet rustynet_g1 {\n  chain killswitch {\n    type filter hook output priority 0; policy drop;\n    oifname \"lo\" accept\n".to_string();
         if wg_listen_port != 0 {
             rules.push_str(
-                format!("    oifname \"{egress_interface}\" udp dport {wg_listen_port} accept\n")
-                    .as_str(),
+                format!(
+                    "    oifname \"{egress_interface}\" meta nfproto ipv4 udp dport {wg_listen_port} accept\n"
+                )
+                .as_str(),
             );
         }
+        // AQ-70/F2: the established/related accepts are the three scoped
+        // rules the builder emits (tcp/udp dport != { 53, 853 }, then the
+        // non-tcp/udp l4proto rule). AQ-70/F3: tunnel and egress accepts are
+        // `meta nfproto ipv4`-qualified.
         rules.push_str(
-            format!(
-                "    ct state established,related accept\n    oifname \"{interface_name}\" accept\n"
-            )
-            .as_str(),
+            "    ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n",
+        );
+        rules.push_str(
+            format!("    oifname \"{interface_name}\" meta nfproto ipv4 accept\n").as_str(),
         );
         if include_egress_allow {
-            rules.push_str(format!("    oifname \"{egress_interface}\" accept\n").as_str());
+            rules.push_str(
+                format!("    oifname \"{egress_interface}\" meta nfproto ipv4 accept\n").as_str(),
+            );
         }
         if dns_protected {
             rules.push_str(
@@ -17821,7 +18037,7 @@ mod tests {
             );
         }
         rules.push_str(
-            "  }\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related accept\n",
+            "  }\n  chain forward {\n    type filter hook forward priority 0; policy drop;\n    ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n    ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n",
         );
         rules.push_str(
             format!("    iifname \"{interface_name}\" oifname \"{egress_interface}\" accept\n")

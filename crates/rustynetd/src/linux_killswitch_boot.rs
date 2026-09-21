@@ -87,8 +87,14 @@ pub const REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS: &[&str] = &[
     "oifname \"lo\" accept",
     // Established/related must always pass — without it, return
     // traffic for handshakes is dropped and the killswitch becomes
-    // a black hole even for legitimate traffic.
-    "ct state established,related accept",
+    // a black hole even for legitimate traffic. AQ-70/F2: the pass
+    // is THREE family- and port-scoped rules, so an established
+    // plaintext-DNS (53), DoT (tcp/853) or DoQ (udp/853) flow can
+    // never ride the established accept past the DNS drops, and
+    // established IPv6 cannot ride it in an IPv4-only posture.
+    "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+    "ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+    "ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
 ];
 
 /// nftables table name for the boot-time pre-protective killswitch
@@ -208,8 +214,9 @@ impl BootTraversalEndpoint {
 ///
 /// The table installs:
 /// - loopback accept
-/// - `ct state established,related accept` (allows SSH reply traffic
-///   during normal daemon operation)
+/// - three scoped `ct state established,related ... accept` rules
+///   (AQ-70/F2: SSH reply traffic still passes; established DNS/DoT/DoQ
+///   and IPv4-only scoping can no longer shadow the DNS drops)
 /// - outbound accept for the WireGuard interface (passthrough for
 ///   tunnel traffic when the daemon later brings the interface up)
 /// - outbound UDP accept on `wg_listen_port` when `Some(port)` is
@@ -330,6 +337,10 @@ fn install_linux_boot_killswitch_inner(
         "lo",
         "accept",
     ])?;
+    // AQ-70/F2: established/related passes through THREE scoped rules so an
+    // established DNS/DoT/DoQ flow is never accepted ahead of the DNS drops
+    // and established IPv6 stays on the policy-drop path. Mirrors the runtime
+    // generator's `established_related_accept_tokens` in `phase10.rs`.
     nft(&[
         "add",
         "rule",
@@ -339,6 +350,58 @@ fn install_linux_boot_killswitch_inner(
         "ct",
         "state",
         "established,related",
+        "meta",
+        "nfproto",
+        "ipv4",
+        "tcp",
+        "dport",
+        "!=",
+        "{",
+        "53,",
+        "853",
+        "}",
+        "accept",
+    ])?;
+    nft(&[
+        "add",
+        "rule",
+        "inet",
+        BOOT_KILLSWITCH_TABLE,
+        "killswitch",
+        "ct",
+        "state",
+        "established,related",
+        "meta",
+        "nfproto",
+        "ipv4",
+        "udp",
+        "dport",
+        "!=",
+        "{",
+        "53,",
+        "853",
+        "}",
+        "accept",
+    ])?;
+    nft(&[
+        "add",
+        "rule",
+        "inet",
+        BOOT_KILLSWITCH_TABLE,
+        "killswitch",
+        "ct",
+        "state",
+        "established,related",
+        "meta",
+        "nfproto",
+        "ipv4",
+        "meta",
+        "l4proto",
+        "!=",
+        "{",
+        "tcp,",
+        "udp",
+        "}",
         "accept",
     ])?;
     // Allow outbound through the WireGuard interface.  The iface may not
@@ -973,12 +1036,14 @@ table inet rustynet {
         chain killswitch {
                 type filter hook output priority 0; policy drop;
                 oifname "lo" accept
-                ct state established,related accept
+                ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept
                 oifname "rustynet0" accept
         }
         chain forward {
                 type filter hook forward priority 0; policy drop;
-                ct state established,related accept
+                ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept
                 iifname "rustynet0" oifname "eth0" accept
         }
 }
@@ -998,10 +1063,10 @@ table inet rustynet {
             "loopback fragment must match: {frags:?}"
         );
         assert!(
-            frags
-                .iter()
-                .any(|f| f.contains("ct state established,related accept")),
-            "est/rel fragment must match: {frags:?}"
+            frags.iter().any(|f| f.contains(
+                "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept"
+            )),
+            "scoped est/rel fragment must match: {frags:?}"
         );
     }
 
@@ -1031,7 +1096,9 @@ table inet rustynet {
                 type filter hook output priority 0; policy drop;
         }
         chain forward {
-                ct state established,related accept
+                ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept
         }
 }
 "#;
@@ -1054,7 +1121,9 @@ table ip nat { chain postrouting {} }
 table inet rustynet {
         chain killswitch {
                 oifname "lo" accept
-                ct state established,related accept
+                ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept
         }
         chain forward {}
 }
@@ -1062,7 +1131,7 @@ table inet rustynet {
         let (present, chains, frags) = parse_nft_ruleset_for_killswitch(body);
         assert!(present);
         assert_eq!(chains.len(), 2);
-        assert_eq!(frags.len(), 2);
+        assert_eq!(frags.len(), 4);
     }
 
     #[test]
@@ -1088,7 +1157,9 @@ table inet rustynet_g5 {
         chain killswitch {
                 type filter hook output priority 0; policy drop;
                 oifname "lo" accept
-                ct state established,related accept
+                ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept
+                ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept
         }
         chain forward {
                 type filter hook forward priority 0; policy drop;
@@ -1102,7 +1173,7 @@ table inet rustynet_g5 {
         );
         assert!(chains.iter().any(|c| c == "killswitch"));
         assert!(chains.iter().any(|c| c == "forward"));
-        assert_eq!(frags.len(), 2, "both reviewed fragments must match");
+        assert_eq!(frags.len(), 4, "all reviewed fragments must match");
     }
 
     #[test]
@@ -1161,13 +1232,18 @@ table inet rustynetfoo {
     }
 
     #[test]
-    fn reviewed_required_fragments_pinned_at_two() {
-        assert_eq!(REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS.len(), 2);
+    fn reviewed_required_fragments_pinned_at_four() {
+        assert_eq!(REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS.len(), 4);
         assert!(REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS.contains(&"oifname \"lo\" accept"));
-        assert!(
-            REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS
-                .contains(&"ct state established,related accept")
-        );
+        assert!(REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS.contains(
+            &"ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept"
+        ));
+        assert!(REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS.contains(
+            &"ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept"
+        ));
+        assert!(REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS.contains(
+            &"ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept"
+        ));
     }
 
     #[test]
