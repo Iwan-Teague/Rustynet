@@ -89,9 +89,8 @@ pub(crate) fn load_encrypted_secret_material(
         .parent()
         .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
     let permission_policy = encrypted_secret_permission_policy(path);
-    let secret = read_encrypted_key_file(parent, path, passphrase.as_str(), permission_policy)
-        .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))?;
-    Ok(Zeroizing::new(secret))
+    read_encrypted_key_file(parent, path, passphrase.as_str(), permission_policy)
+        .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))
 }
 
 pub(crate) fn load_assignment_signing_secret(

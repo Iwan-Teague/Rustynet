@@ -380,7 +380,7 @@ fn load_encrypted_secret_material(
         encrypted_secret_permission_policy(path),
     )
     .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))?;
-    Ok(Zeroizing::new(secret))
+    Ok(secret)
 }
 
 fn encrypted_secret_permission_policy(_path: &Path) -> KeyCustodyPermissionPolicy {

@@ -577,7 +577,7 @@ fn normalize_macos_keychain_account(raw: &str) -> Result<String, String> {
 pub fn decrypt_private_key(
     encrypted_key_path: &Path,
     passphrase_path: &Path,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let passphrase = read_passphrase_file(passphrase_path)?;
     // Fail closed on Windows if process startup cannot prove LocalMachine DPAPI
     // protect/unprotect works. The check is cached so repeated key loads do not
@@ -585,7 +585,7 @@ pub fn decrypt_private_key(
     verify_dpapi_startup_self_test()?;
     let manager = key_custody_manager(encrypted_key_path, passphrase)?;
     let key_id = key_custody_key_id(encrypted_key_path);
-    let mut key = manager
+    let key = manager
         .load_private_key(&key_id)
         .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
     if key.is_empty() {
@@ -593,7 +593,7 @@ pub fn decrypt_private_key(
     }
     // Shared with `decrypt_private_key_with_passphrase` so the two cannot
     // drift: a divergence here changes the derived gossip identity silently.
-    key = append_key_terminator(key);
+    let key = append_key_terminator(key);
     Ok(key)
 }
 
@@ -624,7 +624,7 @@ pub fn decrypt_private_key_with_passphrase(
     encrypted_key_path: &Path,
     passphrase_path: &Path,
     explicit_passphrase_path: Option<&Path>,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let passphrase = match explicit_passphrase_path {
         Some(path) => read_passphrase_file_explicit(path)?,
         None => read_passphrase_file(passphrase_path)?,
@@ -634,13 +634,13 @@ pub fn decrypt_private_key_with_passphrase(
     verify_dpapi_startup_self_test()?;
     let manager = key_custody_manager(encrypted_key_path, passphrase)?;
     let key_id = key_custody_key_id(encrypted_key_path);
-    let mut key = manager
+    let key = manager
         .load_private_key(&key_id)
         .map_err(|err| format!("decrypt encrypted key failed: {err}"))?;
     if key.is_empty() {
         return Err("decrypted key is empty".to_owned());
     }
-    key = append_key_terminator(key);
+    let key = append_key_terminator(key);
     Ok(key)
 }
 
@@ -653,7 +653,7 @@ pub fn decrypt_private_key_with_passphrase(
 /// random secrets do not end in `0x0a`, so a deriver fed the un-terminated
 /// bytes produces a different key with probability 255/256 — and the failure is
 /// silent, because both sides still produce a syntactically valid key.
-fn append_key_terminator(mut key: Vec<u8>) -> Vec<u8> {
+fn append_key_terminator(mut key: Zeroizing<Vec<u8>>) -> Zeroizing<Vec<u8>> {
     if !key.ends_with(b"\n") {
         key.push(b'\n');
     }
@@ -681,12 +681,15 @@ pub fn export_gossip_verifying_key_hex(
     passphrase_path: &Path,
     explicit_passphrase_path: Option<&Path>,
 ) -> Result<String, String> {
-    let secret = decrypt_private_key_with_passphrase(
+    let mut secret = decrypt_private_key_with_passphrase(
         encrypted_secret_path,
         passphrase_path,
         explicit_passphrase_path,
     )?;
-    Ok(gossip_verifying_key_hex_from_secret(secret))
+    // zeroize 1.8 removed `Zeroizing::into_inner`; `mem::take` moves the
+    // buffer to the deriver, which zeroizes it after use.
+    let secret_bytes = std::mem::take(&mut *secret);
+    Ok(gossip_verifying_key_hex_from_secret(secret_bytes))
 }
 
 /// Derive the published gossip verifying key from already-decrypted secret
@@ -1631,8 +1634,9 @@ mod tests {
             "fixture must not already end in a newline or the pin is vacuous"
         );
 
+        let mut terminated = super::append_key_terminator(Zeroizing::new(raw.clone()));
         let exported =
-            super::gossip_verifying_key_hex_from_secret(super::append_key_terminator(raw.clone()));
+            super::gossip_verifying_key_hex_from_secret(std::mem::take(&mut *terminated));
 
         let expected_key =
             rustynet_control::derive_gossip_signing_key([raw.as_slice(), b"\n"].concat());
@@ -1665,10 +1669,13 @@ mod tests {
     /// The terminator rule itself: append when absent, never double up.
     #[test]
     fn key_terminator_is_appended_only_when_absent() {
-        assert_eq!(super::append_key_terminator(b"abc".to_vec()), b"abc\n");
         assert_eq!(
-            super::append_key_terminator(b"abc\n".to_vec()),
-            b"abc\n",
+            super::append_key_terminator(Zeroizing::new(b"abc".to_vec())).as_slice(),
+            b"abc\n".as_slice()
+        );
+        assert_eq!(
+            super::append_key_terminator(Zeroizing::new(b"abc\n".to_vec())).as_slice(),
+            b"abc\n".as_slice(),
             "an already-terminated secret must not gain a second newline"
         );
     }
@@ -1695,6 +1702,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     use super::{MACOS_PASSPHRASE_KEYCHAIN_SERVICE, normalize_macos_keychain_account};
     use super::{remove_file_if_present, validate_binary_path};
+    use zeroize::Zeroizing;
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
         let stamp = std::time::SystemTime::now()
