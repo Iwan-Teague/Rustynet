@@ -27895,6 +27895,11 @@ mod tests {
         }
     }
 
+    // The verbs below live in `parse_ops_command` arms that are
+    // `#[cfg(feature = "vm-lab")]`-gated (RNQ-17 default-off), so the tripwire
+    // itself must be gated the same way or it fails on verbs that legitimately
+    // do not exist in a default build (wave-13 Fable review F1, AQ-85).
+    #[cfg(feature = "vm-lab")]
     #[test]
     fn every_ops_verb_the_harness_invokes_parses() {
         // MAC-D6 audit: each `ops <verb>` the live-lab harnesses shell out to
