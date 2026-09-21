@@ -311,7 +311,7 @@ pub struct EncryptedKeyBlob {
 
 pub trait OsSecureStore {
     fn store_key(&self, key_id: &str, key_material: &[u8]) -> Result<(), CryptoError>;
-    fn load_key(&self, key_id: &str) -> Result<Vec<u8>, CryptoError>;
+    fn load_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,7 +328,7 @@ impl OsSecureStore for NoOsSecureStore {
         Err(CryptoError::OsStoreUnavailable)
     }
 
-    fn load_key(&self, _key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    fn load_key(&self, _key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         Err(CryptoError::OsStoreUnavailable)
     }
 }
@@ -357,7 +357,7 @@ impl OsSecureStore for PlatformOsSecureStore {
         }
     }
 
-    fn load_key(&self, key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    fn load_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         #[cfg(target_os = "macos")]
         {
             load_from_macos_keychain(key_id)
@@ -456,7 +456,7 @@ impl<S: OsSecureStore> KeyCustodyManager<S> {
         }
     }
 
-    pub fn load_private_key(&self, key_id: &str) -> Result<Vec<u8>, CryptoError> {
+    pub fn load_private_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
         match self.os_store.load_key(key_id) {
             Ok(key) => Ok(key),
             Err(CryptoError::OsStoreUnavailable) => {
@@ -512,7 +512,7 @@ fn store_in_macos_keychain(key_id: &str, key_material: &[u8]) -> Result<(), Cryp
 }
 
 #[cfg(target_os = "macos")]
-fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+fn load_from_macos_keychain(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if !is_valid_key_identifier(key_id) {
         return Err(CryptoError::InvalidLength);
     }
@@ -528,11 +528,11 @@ fn load_from_macos_keychain(key_id: &str) -> Result<Vec<u8>, CryptoError> {
         .and_then(Result::ok);
         if let Some(decoded) = maybe_hex_decoded {
             value.zeroize();
-            return Ok(decoded);
+            return Ok(Zeroizing::new(decoded));
         }
     }
 
-    Ok(value)
+    Ok(Zeroizing::new(value))
 }
 
 /// Absolute path to the macOS System keychain.
@@ -1001,7 +1001,7 @@ fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<()
 }
 
 #[cfg(target_os = "linux")]
-fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+fn load_from_linux_secret_service(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let output = Command::new("secret-tool")
         .arg("lookup")
         .arg("rustynet-key-id")
@@ -1018,7 +1018,7 @@ fn load_from_linux_secret_service(key_id: &str) -> Result<Vec<u8>, CryptoError> 
         hex_decode(trimmed)
     };
     value.zeroize();
-    decoded
+    decoded.map(Zeroizing::new)
 }
 
 #[cfg(target_os = "windows")]
@@ -1052,7 +1052,7 @@ fn store_in_windows_dpapi(key_id: &str, key_material: &[u8]) -> Result<(), Crypt
 }
 
 #[cfg(target_os = "windows")]
-fn load_from_windows_dpapi(key_id: &str) -> Result<Vec<u8>, CryptoError> {
+fn load_from_windows_dpapi(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let root = windows_dpapi_root()?;
     validate_windows_dpapi_root(root.as_path())?;
     let path = windows_dpapi_file_path(root.as_path(), key_id)?;
@@ -1064,7 +1064,9 @@ fn load_from_windows_dpapi(key_id: &str) -> Result<Vec<u8>, CryptoError> {
         return Err(CryptoError::Io);
     }
     let mut protected = std::fs::read(path.as_path()).map_err(|_| CryptoError::Io)?;
-    let result = dpapi_unprotect(&protected).map_err(|_| CryptoError::DecryptionFailed);
+    let result = dpapi_unprotect(&protected)
+        .map_err(|_| CryptoError::DecryptionFailed)
+        .map(Zeroizing::new);
     protected.zeroize();
     result
 }
@@ -1413,6 +1415,22 @@ pub fn try_generate_key_custody_material() -> Result<([u8; 16], [u8; 24]), Crypt
     Ok((salt, nonce))
 }
 
+/// AAD construction for the key envelope: the constant magic `b"RNET"` plus
+/// the envelope version byte. Shared by the encrypt path and the v1 decrypt
+/// arm so the two sides of the AEAD context binding cannot drift.
+const KEY_ENVELOPE_AAD_MAGIC: &[u8; 4] = b"RNET";
+const KEY_ENVELOPE_VERSION_V1: u8 = 1;
+
+fn key_envelope_aad(version: u8) -> [u8; 5] {
+    [
+        KEY_ENVELOPE_AAD_MAGIC[0],
+        KEY_ENVELOPE_AAD_MAGIC[1],
+        KEY_ENVELOPE_AAD_MAGIC[2],
+        KEY_ENVELOPE_AAD_MAGIC[3],
+        version,
+    ]
+}
+
 /// Encrypt `plaintext` under `passphrase` with Argon2id + XChaCha20-Poly1305.
 ///
 /// Generates a v1 envelope with AAD binding: the AAD is the constant
@@ -1426,15 +1444,7 @@ pub fn encrypt_private_key_envelope(
     salt: [u8; 16],
     nonce: [u8; 24],
 ) -> Result<EncryptedKeyBlob, CryptoError> {
-    const KEY_ENVELOPE_AAD_MAGIC: &[u8; 4] = b"RNET";
-    const KEY_ENVELOPE_VERSION: u8 = 1;
-    let aad = [
-        KEY_ENVELOPE_AAD_MAGIC[0],
-        KEY_ENVELOPE_AAD_MAGIC[1],
-        KEY_ENVELOPE_AAD_MAGIC[2],
-        KEY_ENVELOPE_AAD_MAGIC[3],
-        KEY_ENVELOPE_VERSION,
-    ];
+    let aad = key_envelope_aad(KEY_ENVELOPE_VERSION_V1);
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
@@ -1458,7 +1468,7 @@ pub fn encrypt_private_key_envelope(
     key.zeroize();
 
     Ok(EncryptedKeyBlob {
-        version: KEY_ENVELOPE_VERSION,
+        version: KEY_ENVELOPE_VERSION_V1,
         salt,
         nonce,
         ciphertext,
@@ -1469,10 +1479,15 @@ pub fn encrypt_private_key_envelope(
 /// v1 (AAD-bound) blobs. v0 decryption uses empty AAD; v1 uses the
 /// constant magic `b"RNET"` + version byte. A v0 blob re-encrypted
 /// becomes a v1 blob on the next write cycle.
+///
+/// The permanent v0 empty-AAD decrypt branch is an OPEN owner decision
+/// (AQ-67 F2): retiring it fail-closed requires a fleet audit confirming
+/// no v0 blobs remain plus a re-encrypt-on-read migration window. This
+/// implementation keeps the pre-decision behaviour unchanged.
 pub fn decrypt_private_key_envelope(
     blob: &EncryptedKeyBlob,
     passphrase: &str,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     let mut key = [0u8; 32];
     Argon2::default()
         .hash_password_into(passphrase.as_bytes(), &blob.salt, &mut key)
@@ -1484,18 +1499,14 @@ pub fn decrypt_private_key_envelope(
             XNonce::from_slice(&blob.nonce),
             chacha20poly1305::aead::Payload {
                 msg: blob.ciphertext.as_ref(),
+                // AQ-67 F2 (owner decision pending): the legacy v0 envelope
+                // predates AAD binding, so its ciphertext carries none. Kept
+                // byte-for-byte identical to the pre-decision behaviour.
                 aad: b"",
             },
         ),
         1 => {
-            const KEY_ENVELOPE_AAD_MAGIC: &[u8; 4] = b"RNET";
-            let aad = [
-                KEY_ENVELOPE_AAD_MAGIC[0],
-                KEY_ENVELOPE_AAD_MAGIC[1],
-                KEY_ENVELOPE_AAD_MAGIC[2],
-                KEY_ENVELOPE_AAD_MAGIC[3],
-                blob.version,
-            ];
+            let aad = key_envelope_aad(blob.version);
             cipher.decrypt(
                 XNonce::from_slice(&blob.nonce),
                 chacha20poly1305::aead::Payload {
@@ -1519,7 +1530,7 @@ pub fn decrypt_private_key_envelope(
 
     key.zeroize();
 
-    Ok(plaintext)
+    Ok(Zeroizing::new(plaintext))
 }
 
 /// Raw-key XChaCha20-Poly1305 sealed blob for at-rest service data
@@ -1724,7 +1735,7 @@ pub fn read_encrypted_key_file(
     file: &Path,
     passphrase: &str,
     policy: KeyCustodyPermissionPolicy,
-) -> Result<Vec<u8>, CryptoError> {
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     validate_key_custody_permissions(directory, file, policy)?;
     let encoded_len = std::fs::metadata(file).map_err(|_| CryptoError::Io)?.len();
     if encoded_len > MAX_ENCRYPTED_KEY_FILE_BYTES {
@@ -2919,7 +2930,7 @@ mod tests {
 
         let plaintext = decrypt_private_key_envelope(&blob, "phase2-passphrase")
             .expect("decryption should succeed");
-        assert_eq!(plaintext, b"private-material");
+        assert_eq!(plaintext.as_slice(), b"private-material".as_slice());
     }
 
     #[test]
@@ -2955,8 +2966,10 @@ mod tests {
         );
         let decoded = super::decode_encrypted_blob(&encoded).expect("v1 blob should decode");
         assert_eq!(
-            decrypt_private_key_envelope(&decoded, "pw").expect("v1 round-trip should decrypt"),
-            b"private-material"
+            decrypt_private_key_envelope(&decoded, "pw")
+                .expect("v1 round-trip should decrypt")
+                .as_slice(),
+            b"private-material".as_slice()
         );
 
         // (3) Tamper the version byte to an unknown version: the blob still
@@ -2983,6 +2996,63 @@ mod tests {
             decrypt_private_key_envelope(&as_v0, "pw").err(),
             Some(CryptoError::DecryptionFailed),
             "v1 ciphertext must not decrypt under the v0 empty-AAD path"
+        );
+    }
+
+    #[test]
+    fn legacy_v0_envelope_still_decrypts_and_reencrypts_as_v1() {
+        // AQ-67 F2 behaviour pin, PRE-cutover: a genuine v0 envelope (empty
+        // AAD, as written by legacy writers) still decrypts while the v0
+        // empty-AAD decrypt branch is retained (owner cutover decision
+        // pending). The positive test also pins the documented migration
+        // semantics: any re-encryption emits a v1 AAD-bound envelope, so the
+        // next write cycle upgrades a v0 secret in place.
+        use super::{Argon2, XChaCha20Poly1305, XNonce};
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use zeroize::Zeroize;
+
+        let (salt, nonce) = generate_key_custody_material();
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(b"v0-passphrase", &salt, &mut key)
+            .expect("kdf should succeed");
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: b"v0-secret",
+                    aad: b"",
+                },
+            )
+            .expect("legacy v0 seal should succeed");
+        key.zeroize();
+        let legacy_blob = super::EncryptedKeyBlob {
+            version: 0,
+            salt,
+            nonce,
+            ciphertext,
+        };
+
+        let plaintext = decrypt_private_key_envelope(&legacy_blob, "v0-passphrase")
+            .expect("legacy v0 envelope must still decrypt pre-cutover");
+        assert_eq!(plaintext.as_slice(), b"v0-secret".as_slice());
+
+        // The v0 path still authenticates the passphrase (AEAD tag), it only
+        // lacks context binding — a wrong passphrase must fail closed.
+        assert_eq!(
+            decrypt_private_key_envelope(&legacy_blob, "wrong-passphrase").err(),
+            Some(CryptoError::DecryptionFailed),
+            "v0 decryption must still verify the passphrase tag"
+        );
+
+        // Re-encrypting the recovered secret today always emits v1 (AAD-bound).
+        let (salt, nonce) = generate_key_custody_material();
+        let upgraded = encrypt_private_key_envelope(&plaintext, "v0-passphrase", salt, nonce)
+            .expect("re-encryption should succeed");
+        assert_eq!(
+            upgraded.version, 1,
+            "new writes must always be v1 AAD-bound envelopes"
         );
     }
 
@@ -3084,7 +3154,7 @@ mod tests {
         )
         .expect("read should succeed");
 
-        assert_eq!(plaintext, b"very-secret-private-key");
+        assert_eq!(plaintext.as_slice(), b"very-secret-private-key".as_slice());
 
         let wrong = read_encrypted_key_file(
             &directory,
@@ -3160,7 +3230,45 @@ mod tests {
         let loaded = manager
             .load_private_key("node_identity")
             .expect("fallback read should succeed");
-        assert_eq!(loaded, b"node-private-key");
+        assert_eq!(loaded.as_slice(), b"node-private-key".as_slice());
+
+        let key_file = fallback_directory.join("node_identity.enc");
+        let _ = std::fs::remove_file(key_file);
+        let _ = std::fs::remove_dir(fallback_directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_private_key_returns_zeroizing_key_bytes() {
+        // AQ-67 F1: decrypted key bytes must leave this crate as
+        // zeroize-on-drop memory, not a bare `Vec<u8>`. The type annotation is
+        // the enforcement point: reverting the return type to
+        // `Result<Vec<u8>, _>` fails compilation, not merely review.
+        use zeroize::Zeroizing;
+
+        let unique = format!(
+            "rustynet-crypto-zeroizing-load-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let fallback_directory = std::env::temp_dir().join(unique);
+        let manager = KeyCustodyManager::new(
+            NoOsSecureStore,
+            fallback_directory.clone(),
+            "phase2-passphrase".to_owned(),
+            KeyCustodyPermissionPolicy::default(),
+        );
+
+        manager
+            .store_private_key("node_identity", b"node-private-key")
+            .expect("fallback storage should succeed");
+
+        let loaded: Zeroizing<Vec<u8>> = manager
+            .load_private_key("node_identity")
+            .expect("fallback read should succeed");
+        assert_eq!(loaded.as_slice(), b"node-private-key".as_slice());
 
         let key_file = fallback_directory.join("node_identity.enc");
         let _ = std::fs::remove_file(key_file);

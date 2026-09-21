@@ -5102,9 +5102,12 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
                     "local relay session token issuer is disabled; set {RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV}=true only for reviewed lab/control-plane-collocated deployments"
                 )));
             }
-            let signing_secret =
+            let mut signing_secret =
                 decrypt_private_key(secret_path, passphrase_path).map_err(DaemonError::Io)?;
-            let signing_key = derive_endpoint_hint_signing_key(signing_secret);
+            // zeroize 1.8 removed `Zeroizing::into_inner`; `mem::take` moves the
+            // buffer to the deriver, which zeroizes it after use.
+            let signing_key =
+                derive_endpoint_hint_signing_key(std::mem::take(&mut *signing_secret));
             let relay_client = RelayClient::new(
                 NodeId::new(config.node_id.clone())
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
@@ -5152,10 +5155,12 @@ fn build_gossip_node(
         }
         (Some(secret_path), Some(passphrase_path)) => (secret_path, passphrase_path),
     };
-    let signing_secret = decrypt_private_key(secret_path, passphrase_path)
+    let mut signing_secret = decrypt_private_key(secret_path, passphrase_path)
         .map_err(|err| DaemonError::Io(format!("gossip signing secret load failed: {err}")))?;
     // One-way derivation; `derive_gossip_signing_key` zeroizes the secret.
-    let signing_key = derive_gossip_signing_key(signing_secret);
+    // zeroize 1.8 removed `Zeroizing::into_inner`; `mem::take` moves the
+    // buffer out to the deriver, which zeroizes it after use.
+    let signing_key = derive_gossip_signing_key(std::mem::take(&mut *signing_secret));
     let node = crate::gossip_runtime::GossipNode::new(
         signing_key,
         config.gossip_watermark_path.clone(),
