@@ -6890,7 +6890,7 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                     .collect::<Vec<_>>(),
             };
 
-            let core = ControlPlaneCore::new(signing_secret, policy);
+            let core = ControlPlaneCore::new((*signing_secret).clone(), policy);
             for node in nodes {
                 core.nodes
                     .upsert(NodeMetadata {
@@ -6997,7 +6997,7 @@ fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String
             .collect::<Vec<_>>(),
     };
 
-    let core = ControlPlaneCore::new(signing_secret, policy);
+    let core = ControlPlaneCore::new((*signing_secret).clone(), policy);
     for node in nodes {
         core.nodes
             .upsert(NodeMetadata {
@@ -7088,7 +7088,7 @@ fn execute_traversal_issue(command: TraversalIssueCommand) -> Result<String, Str
             .collect::<Vec<_>>(),
     };
 
-    let core = ControlPlaneCore::new(signing_secret, policy);
+    let core = ControlPlaneCore::new((*signing_secret).clone(), policy);
     for node in nodes {
         core.nodes
             .upsert(NodeMetadata {

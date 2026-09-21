@@ -100,7 +100,12 @@ fn run() -> Result<(), i32> {
     // prints "rustc 1.88.0 (<hash> <date>)"; the trailing space keeps the match
     // exact (so 1.88.0 cannot prefix-match a longer version).
     let expected_rustc = format!("rustc {security_toolchain} ");
-    if !version_starts_with("rustc", &["--version"], &expected_rustc, cargo_bin.as_deref()) {
+    if !version_starts_with(
+        "rustc",
+        &["--version"],
+        &expected_rustc,
+        cargo_bin.as_deref(),
+    ) {
         eprintln!(
             "error [{}]: active rustc is not the pinned toolchain {security_toolchain}; \
              rust-toolchain.toml and DEFAULT_SECURITY_TOOLCHAIN must agree",
