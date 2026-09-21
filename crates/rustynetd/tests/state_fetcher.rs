@@ -87,6 +87,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         anchor_bundle_pull_allow_lan: false,
         anchor_enrollment_addr: None,
         anchor_enrollment_allow_lan: false,
+        allow_plaintext_enrollment_secret: false,
     }
 }
 
