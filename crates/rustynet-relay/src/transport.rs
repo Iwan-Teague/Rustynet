@@ -47,6 +47,20 @@ const IDLE_SESSION_TIMEOUT_SECS: u64 = 30;
 /// Maximum forwarded-payload size.  Packets larger than this are dropped
 /// silently rather than returned as an error (to avoid amplification).
 const MAX_PACKET_SIZE_BYTES: usize = 65_536;
+/// Wire-format message-type byte for a relay hello, matching
+/// `relay_client.rs` (moved here with `parse_relay_hello` so the library
+/// parser and the daemon dispatch share one constant).
+pub const RELAY_HELLO_MSG_TYPE: u8 = 0x01;
+/// Maximum accepted byte length of `node_id` / `peer_node_id` in a relay
+/// hello, enforced at parse time before either value is copied or used as a
+/// pre-auth map key (RLY-05).
+///
+/// Node ids in this deployment are hostname-style slugs (`exit-1`,
+/// `client-1`, `relay-1`), so 128 bytes is far above any legitimate value
+/// while cutting the pre-authentication memory a hostile sender can park from
+/// ~65 KB per entry to ~128 B — a ~500x reduction against
+/// `MAX_HELLO_LIMITER_ENTRIES` retained keys.
+pub const MAX_RELAY_NODE_ID_BYTES: usize = 128;
 /// How long we retain nonces in the replay-prevention store: must cover the
 /// entire window in which a token can still be accepted, so a nonce cannot be
 /// recycled while its token remains valid.
@@ -169,6 +183,237 @@ pub struct RelayHello {
     pub node_id: String,
     pub peer_node_id: String,
     pub session_token: RelaySessionToken,
+}
+
+/// Parses a `RelayHello` from wire format.
+///
+/// This is the attacker-reachable pre-auth parser for the relay's UDP hello
+/// path (run before any signature verification), which is why every field it
+/// copies is length-bounded (RLY-05 / AUDIT-031). It is `pub` in the library
+/// so the fuzz target `fuzz/fuzz_targets/relay_hello_parse.rs` can exercise
+/// it directly; the daemon dispatches through this same function.
+pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
+    if data.is_empty() || data[0] != RELAY_HELLO_MSG_TYPE {
+        return Err("not a hello message".to_owned());
+    }
+
+    let mut pos = 1;
+
+    // Node ID
+    if pos + 2 > data.len() {
+        return Err("truncated node_id length".to_owned());
+    }
+    let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Bound the identifier BEFORE it is copied (RLY-05 / AUDIT-031).
+    //
+    // `validate_hello`'s first check keys the pre-auth `HelloLimiter` on this
+    // value — `counts.entry(node_id.to_owned())` — which happens BEFORE the
+    // signature is verified. `MAX_HELLO_LIMITER_ENTRIES` bounds how many
+    // entries that map holds, but nothing bounded how large each key was, and
+    // the only ceiling here was the 64 KiB datagram. 16384 entries x ~65 KB
+    // measured at ~1015 MiB of unverified attacker-chosen bytes resident
+    // pre-authentication.
+    //
+    // AUDIT-031 ("cap the relay pre-auth map") is on the before-release list;
+    // RSA-0037 capped the entry COUNT, and this caps the byte size, which was
+    // the remaining half.
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + node_id_len > data.len() {
+        return Err("truncated node_id".to_owned());
+    }
+    let node_id =
+        String::from_utf8(data[pos..pos + node_id_len].to_vec()).map_err(|e| e.to_string())?;
+    pos += node_id_len;
+
+    // Peer node ID
+    if pos + 2 > data.len() {
+        return Err("truncated peer_node_id length".to_owned());
+    }
+    let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Same bound as `node_id` above: `peer_node_id` is likewise copied out of
+    // an unauthenticated datagram, and both are compared against the signed
+    // token later, so neither can legitimately exceed the protocol cap.
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated peer_node_id".to_owned());
+    }
+    let peer_node_id =
+        String::from_utf8(data[pos..pos + peer_node_id_len].to_vec()).map_err(|e| e.to_string())?;
+    pos += peer_node_id_len;
+
+    // Token
+    if pos + 2 > data.len() {
+        return Err("truncated token length".to_owned());
+    }
+    let token_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    if pos + token_len > data.len() {
+        return Err("truncated token".to_owned());
+    }
+    let token_data = &data[pos..pos + token_len];
+    let session_token = parse_relay_token(token_data)?;
+
+    Ok(RelayHello {
+        node_id,
+        peer_node_id,
+        session_token,
+    })
+}
+
+/// Parses a `RelaySessionToken` from wire format.
+///
+/// Like `parse_relay_hello`, this runs on an unauthenticated datagram before
+/// signature verification, so every embedded field is length-bounded before
+/// it is copied (same pre-auth memory bound as the hello fields).
+pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
+    let mut pos = 0;
+
+    // Version
+    if pos >= data.len() {
+        return Err("missing version".to_owned());
+    }
+    let version = data[pos];
+    if version != 1 {
+        return Err(format!("unsupported token version: {version}"));
+    }
+    pos += 1;
+
+    // Node ID
+    if pos + 2 > data.len() {
+        return Err("truncated token node_id length".to_owned());
+    }
+    let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Bound the token-embedded identifier BEFORE it is copied. This is the
+    // same pre-auth memory bound RLY-05 applied to the outer hello fields,
+    // which `parse_relay_token` missed: this function runs on an
+    // unauthenticated datagram BEFORE signature verification, and without a
+    // bound each of `node_id` / `peer_node_id` / `scope` could be declared
+    // up to 64 KiB inside one ~64 KiB hello, forcing ~3x that in heap
+    // `String`s per datagram. No legitimate token can hit these caps: any
+    // session that would pass validation has token ids equal (constant-time
+    // compared) to hello fields already capped at
+    // `MAX_RELAY_NODE_ID_BYTES`, and scope equal to `RELAY_TOKEN_SCOPE`, so
+    // a longer value could never authenticate.
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + node_id_len > data.len() {
+        return Err("truncated token node_id".to_owned());
+    }
+    let node_id = String::from_utf8(data[pos..pos + node_id_len].to_vec())
+        .map_err(|e| format!("invalid token node_id: {e}"))?;
+    pos += node_id_len;
+
+    // Peer node ID
+    if pos + 2 > data.len() {
+        return Err("truncated token peer_node_id length".to_owned());
+    }
+    let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Same bound as the token's node_id above.
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated token peer_node_id".to_owned());
+    }
+    let peer_node_id = String::from_utf8(data[pos..pos + peer_node_id_len].to_vec())
+        .map_err(|e| format!("invalid token peer_node_id: {e}"))?;
+    pos += peer_node_id_len;
+
+    // Relay ID (16 bytes)
+    if pos + 16 > data.len() {
+        return Err("truncated relay_id".to_owned());
+    }
+    let relay_id: [u8; 16] = data[pos..pos + 16]
+        .try_into()
+        .map_err(|_| "invalid relay_id")?;
+    pos += 16;
+
+    // Scope
+    if pos + 2 > data.len() {
+        return Err("truncated scope length".to_owned());
+    }
+    let scope_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Scope is compared for exact equality against `RELAY_TOKEN_SCOPE`
+    // during validation, so anything longer can never authenticate — cap
+    // the copy at that length (same pre-auth memory bound as above).
+    if scope_len > RELAY_TOKEN_SCOPE.len() {
+        return Err(format!(
+            "token scope length {scope_len} exceeds maximum {}",
+            RELAY_TOKEN_SCOPE.len()
+        ));
+    }
+
+    if pos + scope_len > data.len() {
+        return Err("truncated scope".to_owned());
+    }
+    let scope = String::from_utf8(data[pos..pos + scope_len].to_vec())
+        .map_err(|e| format!("invalid scope: {e}"))?;
+    pos += scope_len;
+
+    // Timestamps
+    if pos + 16 > data.len() {
+        return Err("truncated timestamps".to_owned());
+    }
+    let issued_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+    let expires_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    // Nonce (16 bytes)
+    if pos + 16 > data.len() {
+        return Err("truncated nonce".to_owned());
+    }
+    let nonce: [u8; 16] = data[pos..pos + 16]
+        .try_into()
+        .map_err(|_| "invalid nonce")?;
+    pos += 16;
+
+    // Signature (64 bytes)
+    if pos + 64 > data.len() {
+        return Err("truncated signature".to_owned());
+    }
+    let signature: [u8; 64] = data[pos..pos + 64]
+        .try_into()
+        .map_err(|_| "invalid signature")?;
+
+    Ok(RelaySessionToken {
+        node_id,
+        peer_node_id,
+        relay_id,
+        scope,
+        issued_at_unix,
+        expires_at_unix,
+        nonce,
+        signature,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

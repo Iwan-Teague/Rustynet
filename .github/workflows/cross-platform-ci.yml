@@ -209,6 +209,34 @@ jobs:
           cargo audit --deny warnings
           cargo deny check bans licenses sources advisories
 
+  supply_chain:
+    name: cargo-vet supply-chain audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Bootstrap CI tools
+        run: |
+          ./scripts/ci/bootstrap_ci_tools.sh
+      - name: cargo vet (AQ-30)
+        # supply-chain/config.toml + audits.toml + imports.lock gate every
+        # dependency addition: a crate with no peer audit (mozilla / google /
+        # bytecodealliance via imports.lock) and no local exemption fails the
+        # build here. --locked = fully offline, uses the committed
+        # imports.lock; a dependency bump that outruns an audit fails CI
+        # until audited (cargo vet certify/inspect) or explicitly exempted.
+        #
+        # Exemption policy: any new exemption for a crypto- or parsing-adjacent
+        # crate requires a documented human/AI code review of the crate source
+        # (cargo vet inspect <crate>) recorded in the exempting commit —
+        # adversarial-review-04 fix item 9.
+        #
+        # cargo-vet version pinned like cargo-audit/cargo-deny above (AQ-18
+        # style); bump it together with [cargo-vet].version in
+        # supply-chain/config.toml.
+        run: |
+          cargo install --locked cargo-vet --version 0.10.2
+          cargo vet check --locked
+
   linux_e2e:
     name: Linux real WireGuard E2E
     runs-on: ubuntu-latest
