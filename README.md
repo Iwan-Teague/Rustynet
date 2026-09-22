@@ -66,8 +66,8 @@ An operator could be compelled to produce:
  **The complete stderr write-site inventory of this binary, as of commit
  e9e9e2b03e42607355bc71cf7b9ba971b02a7a63.** Every site in production code, enumerated —
  identifier-bearing: `transport.rs:781, 821`, `main.rs:750, 939, 994,
- 1057, 1072, 1492, 1523`; store/operational (the second carries the
- replay-store path is the **third**, `transport.rs:1395`): `transport.rs:606, 1079, 1395`; identifier-free
+ 1057, 1072, 1492, 1523`; store/operational (the third carries the
+ replay-store path, `transport.rs:1395`): `transport.rs:606, 1079, 1395`; identifier-free
  per-event lines (rejection reasons and lifecycle — still a per-flow
  frequency signal, see side channels below): `transport.rs:484, 600, 616,
  674, 681, 690, 698, 726, 740, 746, 757, 768, 775, 793`,
@@ -80,7 +80,7 @@ An operator could be compelled to produce:
  itself warns that earlier `#[cfg(test)]` attributes sit on production
  helpers, `transport.rs:3512-3513`) — plus 20 in `main.rs` (18 logging
  sites above plus usage and gate) and 1 in
- `blind_relay_listener.rs`: **40 sites, complete for commit e9e9e2b03e42607355bc71cf7b9ba971b02a7a63.** One-shot subcommands print JSON reports to
+ `blind_relay_listener.rs`: **40 sites, complete for commit e9e9e2b03e42607355bc71cf7b9ba971b02a7a63.** "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
  stdout, not stderr: `hello-limiter-audit` (`main.rs:2914-2927`) and
  `windows-service-hardening-check` (`main.rs:2931-2940`). New logging
  code added after the audited commit is a gap until the inventory is
