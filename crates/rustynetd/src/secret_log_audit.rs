@@ -15,12 +15,22 @@
 //!    catches the common-shape leak: a developer adds `eprintln!("…
 //!    {passphrase}")` while debugging and forgets to remove it.
 //!
-//! 2. **Forbidden Debug-derive on secret-bearing types** — the
-//!    canonical secret-bearing structs in `key_material` must NOT
-//!    carry `#[derive(Debug)]` or implement `Debug`, since any future
-//!    `{:?}` print would surface the inner bytes. Audited by checking
-//!    that those types' source spans contain no `Debug` derive and
-//!    no manual `impl Debug for <Type>`.
+//! 2. **Forbidden Debug/Display exposure on secret-bearing types** —
+//!    the canonical secret-bearing types must NOT expose their bytes via
+//!    `#[derive(Debug)]`/`derive(Display)` or an UNREVIEWED manual impl,
+//!    since any future `{:?}`/`{}` print would surface the inner bytes.
+//!    A hand-written impl that REDACTS every secret field is allowed, but
+//!    only with an entry in `REVIEWED_REDACTING_DEBUG_IMPLS` /
+//!    `REVIEWED_REDACTING_DISPLAY_IMPLS` (name + path + justification +
+//!    a named liveness-witness test pinning the impl's redacted output —
+//!    AQ-126); derive-shaped hits are never reviewable. A vocabulary
+//!    coverage backstop additionally requires every secret-vocabulary
+//!    `struct`/`enum` declaration under the audited roots to be
+//!    explicitly classified (AQ-115/F3). That backstop is
+//!    vocabulary-derived: it proves classified coverage of the DECLARED
+//!    vocabulary, not that no secret-bearing type exists outside it — the
+//!    known blind spots are documented on `SECRET_VOCABULARY_NAME_TOKENS`
+//!    (AQ-126).
 //!
 //! The audit is conservative: it allowlists doc-comments, test files,
 //! and the audit module itself so the patterns can be discussed in
@@ -246,33 +256,517 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
     hits
 }
 
-/// Reviewed secret-bearing type names whose ANY `Debug` impl/derive is
-/// forbidden across the workspace (the "no-Debug-at-all" policy: types whose
-/// inner bytes ARE the secret and for which no safe redaction is applied).
+/// Canonical secret-bearing type names whose ANY `Debug` exposure is
+/// forbidden across the audited roots, EXCEPT a hand-written impl that is
+/// explicitly reviewed as redacting (see `REVIEWED_REDACTING_DEBUG_IMPLS`).
 ///
-/// RSA-0026: this list was previously populated with FOUR phantom names
-/// (`PassphraseMaterial`, `WrappedKeyMaterial`, `RuntimePrivateKey`,
-/// `SigningKeyMaterial`) — none of which are defined anywhere in the workspace
-/// — so the gate guarded zero real types while *appearing* to guard four
-/// (false assurance in a Critical §3.4 control). The real secret-bearing types
-/// do NOT belong here because they use a SAFE redaction strategy the substring
-/// matcher cannot distinguish from a dangerous impl, and so are pinned by
-/// dedicated tests instead. `SecretKey` (rustynet-crypto) has a redacting
-/// `Debug` pinned by `secret_key_debug_redacts`; `EnrollmentToken` /
-/// `MappingLease` have redacting `Debug` pinned by
-/// `enrollment_token_debug_output_redacts_tag_and_token_id` /
-/// `mapping_lease_debug_output_redacts_pcp_nonce`; passphrase material is held
-/// as `Zeroizing<String>` / `Zeroizing<Vec<u8>>` locals (no named struct to
-/// forbid) and is covered by the `FORBIDDEN_PLACEHOLDER_TOKENS` log-macro scan.
+/// AQ-115/F3 policy (supersedes the "no-Debug-at-all + dedicated-tests-only"
+/// posture that followed RSA-0026): the lists are POPULATED with every type in
+/// the audited crates whose NAME carries one of the declared vocabulary tokens
+/// below — which is NOT the same as every secret-bearing type, and the
+/// difference is not hypothetical: `BlindCircuitKey` and `EncryptedKeyBlob`
+/// both derive `Debug` over secret-adjacent bytes today and are invisible here
+/// because `key` and `blob` are not declared tokens (see the vocabulary note).
+/// Claiming otherwise would be the exact over-claim this module exists to stop.
+/// A `derive(Debug)`-shaped hit is
+/// NEVER reviewable, and a manual impl is only suppressible by a reviewed
+/// `(name, path, justification)` entry whose impl provably redacts every
+/// secret field. Three tests keep the gate honest:
+/// - `forbidden_secret_type_lists_contain_only_real_types` — fails closed on
+///   phantom names (the RSA-0026 failure mode: four invented names guarded
+///   nothing while appearing to guard something);
+/// - `production_forbidden_lists_flag_planted_exposures` — proves every entry
+///   is LIVE against planted derives/impls (anti-empty, anti-rot);
+/// - `every_secret_vocabulary_type_is_classified` — a coverage backstop
+///   requiring every secret-vocabulary `struct`/`enum` declaration under the
+///   audited roots to be explicitly classified. AQ-126: this scopes the
+///   backstop to the DECLARED vocabulary — see
+///   `SECRET_VOCABULARY_NAME_TOKENS` for what that vocabulary deliberately
+///   does not cover.
 ///
-/// The `forbidden_secret_type_lists_contain_only_real_types` meta-test below
-/// now fails closed if a phantom name is ever re-added. Add a real type here
-/// only when it carries secret bytes with NO Debug (not a redacting one).
-const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[];
+/// Each entry below cites its definition site; adding a type here requires
+/// the same evidence. Passphrase material remains held as
+/// `Zeroizing<String>` / `Zeroizing<Vec<u8>>` locals (no named struct to
+/// forbid) and is covered by the `FORBIDDEN_PLACEHOLDER_TOKENS` log-macro
+/// scan.
+const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
+    // rustynet-crypto
+    "SecretKey", // crates/rustynet-crypto/src/lib.rs:43 — [u8;32] private key, zeroizing Drop :61
+    "Ed25519SigningProvider", // crates/rustynet-crypto/src/lib.rs:1191 — holds SigningKey seed :1195
+    // rustynetd
+    "EnrollmentToken", // crates/rustynetd/src/enrollment_token.rs:104 — bearer token_id+tag, zeroizing Drop :123
+    "ConsumedTokenLedger", // crates/rustynetd/src/enrollment_token.rs:363 — keys are consumed token ids (bearer halves)
+    "LocalRelaySessionTokenIssuer", // crates/rustynetd/src/relay_client.rs:113 — holds Arc<SigningKey> :114; NO Debug today, listed to guard forward (no reviewed impl)
+    // rustynet-control
+    "TokenClaims",             // crates/rustynet-control/src/lib.rs:108 — subject+nonce
+    "SignedTokenClaims",       // crates/rustynet-control/src/lib.rs:146 — signature bytes
+    "ThrowawayCredential", // crates/rustynet-control/src/lib.rs:592 — credential id+storage policy
+    "RelaySessionToken", // crates/rustynet-control/src/lib.rs:1756 — nonce+signature bytes, ct_eq only
+    "BlindRelayLegTokenV2", // crates/rustynet-control/src/blind_relay.rs:341 — handles+nonce+signature
+    "BlindRelayPopTranscript", // crates/rustynet-control/src/blind_relay.rs:859 — token digest+challenge+handles
+    "BlindRelayHelloV2", // crates/rustynet-control/src/blind_relay.rs:1009 — hello nonce+signature
+    // rustynet-relay
+    "AddressValidationKeyRing", // crates/rustynet-relay/src/blind_relay_listener.rs:374 — HMAC keys (Zeroizing<[u8;32]>)
+];
 
-/// Reviewed secret-bearing type names whose `Display`/`ToString` exposure is
-/// forbidden. Same policy + phantom-removal as `FORBIDDEN_DEBUG_SECRET_TYPES`.
-const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[];
+/// Canonical secret-bearing type names whose `Display`/`ToString` exposure is
+/// forbidden. Same list as `FORBIDDEN_DEBUG_SECRET_TYPES`: NONE of these
+/// types implements `Display`/`ToString` today, so
+/// `REVIEWED_REDACTING_DISPLAY_IMPLS` is empty — the list enforces "never add
+/// one unreviewed".
+const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[
+    // rustynet-crypto
+    "SecretKey",              // crates/rustynet-crypto/src/lib.rs:43
+    "Ed25519SigningProvider", // crates/rustynet-crypto/src/lib.rs:1191
+    // rustynetd
+    "EnrollmentToken",              // crates/rustynetd/src/enrollment_token.rs:104
+    "ConsumedTokenLedger",          // crates/rustynetd/src/enrollment_token.rs:363
+    "LocalRelaySessionTokenIssuer", // crates/rustynetd/src/relay_client.rs:113
+    // rustynet-control
+    "TokenClaims",             // crates/rustynet-control/src/lib.rs:108
+    "SignedTokenClaims",       // crates/rustynet-control/src/lib.rs:146
+    "ThrowawayCredential",     // crates/rustynet-control/src/lib.rs:592
+    "RelaySessionToken",       // crates/rustynet-control/src/lib.rs:1756
+    "BlindRelayLegTokenV2",    // crates/rustynet-control/src/blind_relay.rs:341
+    "BlindRelayPopTranscript", // crates/rustynet-control/src/blind_relay.rs:859
+    "BlindRelayHelloV2",       // crates/rustynet-control/src/blind_relay.rs:1009
+    // rustynet-relay
+    "AddressValidationKeyRing", // crates/rustynet-relay/src/blind_relay_listener.rs:374
+];
+
+/// Reviewed `(type_name, path_suffix, justification, witness_test)` entries
+/// for manual, REDACTING `Debug` impls on the forbidden secret-bearing
+/// types. A scanner hit whose reason is a `derive(...)` shape is NEVER
+/// suppressible (derives cannot redact); a manual-impl hit is suppressed
+/// only when the name and swept-file path suffix both match an entry here.
+/// Every justification must state what the impl prints and cite the
+/// decl/impl sites. AQ-126: the fourth field names the test that pins the
+/// impl's redacted OUTPUT (it constructs a real instance and asserts the
+/// secret bytes are absent);
+/// `every_reviewed_redacting_impl_entry_has_a_live_witness_test` fails
+/// while that witness is missing from the same file, so the suppression
+/// never outlives its evidence. Stated residual: this text gate cannot
+/// read the witness body — gutting a witness's assertions while keeping
+/// its name is caught by the owning crate's suite and review, not here.
+const REVIEWED_REDACTING_DEBUG_IMPLS: &[(&str, &str, &str, &str)] = &[
+    (
+        "SecretKey",
+        "crates/rustynet-crypto/src/lib.rs",
+        "Debug prints only 'SecretKey(REDACTED [32 bytes])'; the [u8;32] key bytes are never emitted and the type is zeroizing-on-drop (decl lib.rs:43, impl lib.rs:55, Drop lib.rs:61)",
+        "secret_key_debug_redacts",
+    ),
+    (
+        "Ed25519SigningProvider",
+        "crates/rustynet-crypto/src/lib.rs",
+        "Debug redacts the SigningKey seed and prints only the public verifying_key hex (decl lib.rs:1191, impl lib.rs:1198)",
+        "ed25519_signing_provider_debug_redacts_seed",
+    ),
+    (
+        "EnrollmentToken",
+        "crates/rustynetd/src/enrollment_token.rs",
+        "Debug redacts token_id+tag (zeroized bearer halves) and prints only a token_id prefix/tag length/expiry (decl :104, impl :112, Drop :123)",
+        "enrollment_token_debug_output_redacts_tag_and_token_id",
+    ),
+    (
+        "ConsumedTokenLedger",
+        "crates/rustynetd/src/enrollment_token.rs",
+        "Debug (AQ-115/F3) prints only consumed_count; ledger keys are consumed token ids — bearer halves (decl :363, impl right after the struct)",
+        "consumed_token_ledger_debug_output_redacts_consumed_token_ids",
+    ),
+    (
+        "TokenClaims",
+        "crates/rustynet-control/src/lib.rs",
+        "Debug redacts subject+nonce (decl :108, impl :134)",
+        "token_claims_debug_redacts_sensitive_fields",
+    ),
+    (
+        "SignedTokenClaims",
+        "crates/rustynet-control/src/lib.rs",
+        "Debug redacts signature_hex (decl :146, impl :164)",
+        "signed_token_claims_debug_redacts_signature_hex",
+    ),
+    (
+        "ThrowawayCredential",
+        "crates/rustynet-control/src/lib.rs",
+        "Debug redacts id+storage_policy (decl :592, impl :605)",
+        "throwaway_credential_debug_redacts_sensitive_fields",
+    ),
+    (
+        "RelaySessionToken",
+        "crates/rustynet-control/src/lib.rs",
+        "Debug redacts relay_id+nonce+signature byte fields; equality is ct_eq only (decl :1756, impl :1777)",
+        "relay_session_token_debug_redacts_sensitive_fields",
+    ),
+    (
+        "BlindRelayLegTokenV2",
+        "crates/rustynet-control/src/blind_relay.rs",
+        "Debug redacts circuit_handle+leg_handle+nonce+signature (decl :341, impl :369)",
+        "blind_relay_leg_token_v2_debug_redacts_secret_fields",
+    ),
+    (
+        "BlindRelayPopTranscript",
+        "crates/rustynet-control/src/blind_relay.rs",
+        "Debug redacts token_digest+relay_challenge+handles+nonces (decl :859, impl :873)",
+        "blind_relay_pop_transcript_debug_redacts_secret_fields",
+    ),
+    (
+        "BlindRelayHelloV2",
+        "crates/rustynet-control/src/blind_relay.rs",
+        "Debug redacts all four secret byte fields (decl :1009, impl :1016)",
+        "blind_relay_hello_v2_debug_redacts_secret_fields",
+    ),
+    (
+        "AddressValidationKeyRing",
+        "crates/rustynet-relay/src/blind_relay_listener.rs",
+        "Debug prints only epoch+key count; the HMAC keys are Zeroizing<[u8;32]> (decl :374, impl :379)",
+        "address_validation_key_ring_debug_redacts_hmac_keys",
+    ),
+];
+
+/// Reviewed redacting `Display`/`ToString` impls on the forbidden types.
+/// EMPTY today: none of the forbidden types implements `Display`/`ToString`.
+/// Add an entry only for a reviewed impl that provably redacts every secret
+/// field, with the decl/impl sites cited and a live witness test named in
+/// the fourth field (same contract as `REVIEWED_REDACTING_DEBUG_IMPLS`).
+const REVIEWED_REDACTING_DISPLAY_IMPLS: &[(&str, &str, &str, &str)] = &[];
+
+/// Reviewed `(type_name, path_suffix, justification)` entries for
+/// secret-VOCABULARY-named types (`SECRET_VOCABULARY_NAME_TOKENS` matches
+/// their names) that are NOT secret-bearing: name-only matches, counters,
+/// paths, diagnostics, kind enums, error enums, and test doubles. Backed by
+/// `every_secret_vocabulary_type_is_classified`, which fails when any
+/// vocabulary declaration under the audited roots is absent from ALL of:
+/// the forbidden lists, the reviewed-redacting registries, or this table.
+const REVIEWED_SECRET_VOCABULARY_TYPE_EXEMPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "SigningPassphraseHostProfile",
+        "crates/rustynet-cli/src/main.rs",
+        "host-profile enum; name-only vocabulary match, carries no secret bytes",
+    ),
+    (
+        "SigningPassphraseOpsConfig",
+        "crates/rustynet-cli/src/main.rs",
+        "ops config holding passphrase PATHS, never passphrase bytes",
+    ),
+    (
+        "RelaySelfSignedCodeSigning",
+        "crates/rustynet-cli/src/ops_e2e.rs",
+        "e2e code-signing feature type; name-only match",
+    ),
+    (
+        "WriteLiveLinuxSecretsNotInLogsReportConfig",
+        "crates/rustynet-cli/src/ops_live_lab_orchestrator.rs",
+        "report COUNTERS config for the secrets-not-in-logs gate",
+    ),
+    (
+        "CheckSecretsHygieneConfig",
+        "crates/rustynet-cli/src/ops_phase1.rs",
+        "hygiene-gate config over PathBufs",
+    ),
+    (
+        "SecretPattern",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/secrets_not_in_logs_eval.rs",
+        "regex/eval scanner value type of the secrets gate itself",
+    ),
+    (
+        "SecretHit",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/secrets_not_in_logs_eval.rs",
+        "scanner hit record (path+line), not secret bytes",
+    ),
+    (
+        "SecretsNotInLogsCheckEntry",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/secrets_not_in_logs_eval.rs",
+        "gate checklist entry descriptor",
+    ),
+    (
+        "SecretsNotInLogsReport",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/role_validation/secrets_not_in_logs_eval.rs",
+        "gate report aggregate",
+    ),
+    (
+        "LiveSecretsNotInLogsValidationStage",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/stage/live_secrets_not_in_logs_validation.rs",
+        "unit-struct stage marker",
+    ),
+    (
+        "NegativeControlEnrollmentTokenReplayStage",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/stage/negative_control_enrollment_replay.rs",
+        "unit-struct stage marker",
+    ),
+    (
+        "BlindRelayTokenKindV2",
+        "crates/rustynet-control/src/blind_relay.rs",
+        "kind/variant enum; name-only match, no bearer bytes",
+    ),
+    (
+        "CredentialDescriptor",
+        "crates/rustynet-control/src/credential_unwrap.rs",
+        "account/service NAME descriptor",
+    ),
+    (
+        "ThrowawayCredentialState",
+        "crates/rustynet-control/src/lib.rs",
+        "state-machine labels over redacting ThrowawayCredential",
+    ),
+    (
+        "CredentialKind",
+        "crates/rustynet-control/src/lib.rs",
+        "kind enum",
+    ),
+    (
+        "CredentialError",
+        "crates/rustynet-control/src/lib.rs",
+        "error enum carrying status text, not secret bytes",
+    ),
+    (
+        "CredentialAuditEvent",
+        "crates/rustynet-control/src/lib.rs",
+        "append-only audit-trail record; id is an opaque reference",
+    ),
+    (
+        "CredentialRevocationEvent",
+        "crates/rustynet-control/src/lib.rs",
+        "revocation audit record",
+    ),
+    (
+        "ThrowawayCredentialStore",
+        "crates/rustynet-control/src/lib.rs",
+        "Debug is transitive over the redacting per-credential entries",
+    ),
+    (
+        "ReusableCredentialPolicy",
+        "crates/rustynet-control/src/lib.rs",
+        "policy flags",
+    ),
+    (
+        "ReusableCredentialRequest",
+        "crates/rustynet-control/src/lib.rs",
+        "request descriptor",
+    ),
+    (
+        "RelaySessionTokenRequest",
+        "crates/rustynet-control/src/lib.rs",
+        "request descriptor; tokens themselves are the listed RelaySessionToken",
+    ),
+    (
+        "RelayTokenMintError",
+        "crates/rustynet-control/src/lib.rs",
+        "error enum carrying OS error text",
+    ),
+    (
+        "CredentialRow",
+        "crates/rustynet-control/src/persistence.rs",
+        "DB projection row",
+    ),
+    (
+        "NodeKeyPair",
+        "crates/rustynet-crypto/src/lib.rs",
+        "private half is the LISTED SecretKey, so Debug redacts transitively (decl lib.rs:71)",
+    ),
+    (
+        "SigningProviderKind",
+        "crates/rustynet-crypto/src/lib.rs",
+        "kind enum",
+    ),
+    (
+        "SigningProviderPolicy",
+        "crates/rustynet-crypto/src/lib.rs",
+        "policy descriptor",
+    ),
+    (
+        "TokenBucket",
+        "crates/rustynet-relay/src/rate_limit.rs",
+        "rate limiter; 'token' is the rate-limit token bucket, false-positive vocabulary match",
+    ),
+    (
+        "EnrollmentSecretLocation",
+        "crates/rustynetd/src/enrollment_secret_custody.rs",
+        "doc-declared diagnostic enum of custody LOCATIONS",
+    ),
+    (
+        "EnrollmentTokenError",
+        "crates/rustynetd/src/enrollment_token.rs",
+        "error enum carrying status text",
+    ),
+    (
+        "TokenInspection",
+        "crates/rustynetd/src/enrollment_token.rs",
+        "doc-declared never-carries-secrets inspection summary",
+    ),
+    (
+        "CredentialPathOverride",
+        "crates/rustynetd/src/key_material.rs",
+        "test-module RAII guard over PathBuf",
+    ),
+    (
+        "PreissuedRelaySessionTokenIssuer",
+        "crates/rustynetd/src/relay_client.rs",
+        "holds spool dir + PUBLIC VerifyingKey only",
+    ),
+    (
+        "FailingRelaySessionTokenIssuer",
+        "crates/rustynetd/src/relay_client.rs",
+        "test double that always errors",
+    ),
+    (
+        "StaticRelaySessionTokenIssuer",
+        "crates/rustynetd/src/relay_client.rs",
+        "test double; Debug transitive over redacting token",
+    ),
+    (
+        "ControlPlaneNonceMintError",
+        "crates/rustynet-control/src/lib.rs",
+        "error struct for control-plane nonce minting failures (decl lib.rs:3683); carries only the OS source text, no nonce bytes (AQ-126 nonce-vocabulary widening)",
+    ),
+    (
+        "NonceStore",
+        "crates/rustynet-relay/src/transport.rs",
+        "replay-window store of SEEN wire nonces (decl transport.rs:1150); derives Default only, carries no Debug/Display impl, tracks nonces already observed (AQ-126 nonce-vocabulary widening)",
+    ),
+];
+
+/// Returns true iff a scanner hit on `name` with reason `why` in file
+/// `file_path_label` is a REVIEWED redacting impl. Derive-shaped reasons
+/// (starting with `derive(`) are NEVER reviewable — a derive cannot redact.
+/// Manual-impl hits are suppressed only when the type name AND the swept
+/// file's path suffix both match a reviewed entry. Path matching normalizes
+/// backslashes (Windows separators) exactly like the equality allowlist.
+fn hit_is_reviewed_redacting_impl(
+    name: &str,
+    why: &str,
+    file_path_label: &str,
+    reviewed: &[(&str, &str, &str, &str)],
+) -> bool {
+    if why.starts_with("derive(") {
+        return false;
+    }
+    let normalized_label = file_path_label.replace('\\', "/");
+    reviewed.iter().any(|(entry_name, path, _why, _witness)| {
+        *entry_name == name && normalized_label.ends_with(path)
+    })
+}
+
+/// True iff the secret-vocabulary declaration `name` in `file_path_label` is
+/// explicitly classified in one of the registries above. Used by the
+/// coverage-backstop meta-test so a new secret-VOCABULARY type cannot ship
+/// unclassified (AQ-126: vocabulary-scoped, not a completeness claim).
+fn vocabulary_type_is_classified(name: &str, file_path_label: &str) -> bool {
+    if FORBIDDEN_DEBUG_SECRET_TYPES.contains(&name)
+        || FORBIDDEN_DISPLAY_SECRET_TYPES.contains(&name)
+    {
+        return true;
+    }
+    let normalized_label = file_path_label.replace('\\', "/");
+    // Two registry shapes, so two closures. The impl registries carry a witness-test
+    // name (4-tuple); the vocabulary exemptions do not (3-tuple, declared at the const
+    // above). Passing the 3-tuple through a 4-tuple closure was E0308 and never compiled.
+    let in_impl_registry = |registry: &[(&str, &str, &str, &str)]| {
+        registry.iter().any(|(entry_name, path, _why, _witness)| {
+            *entry_name == name && normalized_label.ends_with(path)
+        })
+    };
+    let in_exemptions = |registry: &[(&str, &str, &str)]| {
+        registry
+            .iter()
+            .any(|(entry_name, path, _why)| *entry_name == name && normalized_label.ends_with(path))
+    };
+    in_impl_registry(REVIEWED_REDACTING_DEBUG_IMPLS)
+        || in_impl_registry(REVIEWED_REDACTING_DISPLAY_IMPLS)
+        || in_exemptions(REVIEWED_SECRET_VOCABULARY_TYPE_EXEMPTIONS)
+}
+
+/// Identifier substrings (case-insensitive) that mark a type name as
+/// secret-VOCABULARY for the coverage backstop below.
+///
+/// AQ-126 scope note: this list is a reviewed heuristic, NOT a claim that
+/// every secret-bearing type name matches it. Deliberately excluded: bare
+/// `"key"` (the 2026-09-22 enumeration adds 30 declarations to classify —
+/// mostly public-key and custody-report naming: `PublicKey`,
+/// `ExportKeysCommand`, the `*KeyCustody*` family — while the two REAL
+/// exposures a bare `"key"` would surface are named below), and bearer-style
+/// names carrying no vocabulary token at all. Known live escapes, left for a
+/// follow-up AQ rather than misclassified as name-only here:
+/// - `BlindCircuitKey` (crates/rustynet-relay/src/blind_relay_listener.rs)
+///   derives `Debug` over a 32-byte `circuit_handle`;
+/// - `EncryptedKeyBlob` (crates/rustynet-crypto/src/lib.rs) derives `Debug`
+///   over `nonce: [u8; 24]` plus ciphertext.
+///
+/// `seed` and `nonce` were ADDED by AQ-126 (reviewer finding: seed- and
+/// nonce-bearing names escaped the original eight tokens).
+const SECRET_VOCABULARY_NAME_TOKENS: &[&str] = &[
+    "secret",
+    "private",
+    "passphrase",
+    "signing",
+    "token",
+    "credential",
+    "keyring",
+    "keypair",
+    "seed",
+    "nonce",
+];
+
+/// Pure scan helper for the AQ-115/F3 coverage backstop: returns every
+/// `struct`/`enum` DECLARATION in `body` whose type name carries the secret
+/// vocabulary, as `(line_no, type_name)`. Grammar (kept identical to the
+/// 2026-09-22 fleet sweep that enumerated the classification registries):
+/// a trimmed, non-comment line matching
+/// `^(pub (…)? )?(struct|enum) [A-Za-z0-9_]+` where the optional
+/// `pub(…)` qualifier contains only lowercase ASCII letters/spaces, and
+/// exactly one space separates each element. Comment-only lines are
+/// skipped.
+pub(crate) fn scan_source_for_secret_vocabulary_type_declarations(
+    body: &str,
+) -> Vec<(usize, String)> {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    for (idx, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with("/*") {
+            continue;
+        }
+        let mut rest = trimmed;
+        if let Some(after_pub) = rest.strip_prefix("pub") {
+            let after_qualifier = if let Some(after_paren) = after_pub.strip_prefix('(') {
+                let Some(close) = after_paren.find(')') else {
+                    continue;
+                };
+                let inner = &after_paren[..close];
+                if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_lowercase() || c == ' ') {
+                    continue;
+                }
+                &after_paren[close + 1..]
+            } else {
+                after_pub
+            };
+            let Some(after_space) = after_qualifier.strip_prefix(' ') else {
+                continue;
+            };
+            rest = after_space;
+        }
+        let after_keyword = if let Some(r) = rest.strip_prefix("struct ") {
+            r
+        } else if let Some(r) = rest.strip_prefix("enum ") {
+            r
+        } else {
+            continue;
+        };
+        let name: String = after_keyword
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.is_empty() {
+            continue;
+        }
+        let lowercase_name = name.to_ascii_lowercase();
+        if SECRET_VOCABULARY_NAME_TOKENS
+            .iter()
+            .any(|token| lowercase_name.contains(token))
+        {
+            hits.push((idx + 1, name));
+        }
+    }
+    hits
+}
 
 /// Sample type names used ONLY by the scanner-logic self-tests below, which
 /// feed synthetic source bodies. Kept separate from the production
@@ -574,6 +1068,14 @@ fn no_debug_derives_on_canonical_secret_types() {
             for (line_no, name, why) in
                 scan_source_for_debug_on_secret_types(&body, FORBIDDEN_DEBUG_SECRET_TYPES)
             {
+                if hit_is_reviewed_redacting_impl(
+                    &name,
+                    &why,
+                    &rel.display().to_string(),
+                    REVIEWED_REDACTING_DEBUG_IMPLS,
+                ) {
+                    continue;
+                }
                 offenders.push(format!("{}:{}: {why}: {name}", rel.display(), line_no));
             }
         }
@@ -1062,6 +1564,14 @@ fn no_display_impls_on_canonical_secret_types() {
             for (line_no, name, why) in
                 scan_source_for_display_on_secret_types(&body, FORBIDDEN_DISPLAY_SECRET_TYPES)
             {
+                if hit_is_reviewed_redacting_impl(
+                    &name,
+                    &why,
+                    &rel.display().to_string(),
+                    REVIEWED_REDACTING_DISPLAY_IMPLS,
+                ) {
+                    continue;
+                }
                 offenders.push(format!("{}:{}: {why}: {name}", rel.display(), line_no));
             }
         }
@@ -2462,5 +2972,231 @@ fn panic_scanner_silent_on_safe_format_token() {
     assert!(
         hits.is_empty(),
         "`panic!()` with non-forbidden token must not fire: {hits:?}"
+    );
+}
+
+// ---- AQ-115/F3: populated-lists liveness + vocabulary coverage backstop ---
+
+#[test]
+// clippy's `const_is_empty` correctly notes that the two emptiness asserts below are
+// const-evaluable and true TODAY. That is the point of them, not a defect: they exist to
+// fail on the day someone empties a list, which is exactly how this gate came to guard
+// nothing before AQ-115. Rewriting them to satisfy the lint would delete the guard, so the
+// lint is allowed here with the reason instead — the gate runs under `-D warnings`.
+#[allow(clippy::const_is_empty)]
+fn production_forbidden_lists_flag_planted_exposures() {
+    // Anti-false-assurance complement to the phantom-name meta-test: every
+    // production list entry must actually FIRE against a planted derive and
+    // a planted manual impl of that exact type. An empty or stale list would
+    // read green here (that is exactly how this gate guarded nothing).
+    assert!(
+        !FORBIDDEN_DEBUG_SECRET_TYPES.is_empty(),
+        "FORBIDDEN_DEBUG_SECRET_TYPES must not be empty (AQ-115/F3: the gate must guard real types)"
+    );
+    assert!(
+        !FORBIDDEN_DISPLAY_SECRET_TYPES.is_empty(),
+        "FORBIDDEN_DISPLAY_SECRET_TYPES must not be empty (AQ-115/F3: the gate must guard real types)"
+    );
+    for name in FORBIDDEN_DEBUG_SECRET_TYPES {
+        let derive_body = format!("#[derive(Debug)]\npub struct {name} {{ bytes: Vec<u8> }}\n");
+        let derive_hits =
+            scan_source_for_debug_on_secret_types(&derive_body, FORBIDDEN_DEBUG_SECRET_TYPES);
+        assert!(
+            derive_hits
+                .iter()
+                .any(|(_, n, why)| n == name && why.starts_with("derive(")),
+            "planted derive(Debug) on {name} must fire with a derive-shaped reason: {derive_hits:?}"
+        );
+        let impl_body = format!(
+            "impl std::fmt::Debug for {name} {{\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {{\n        write!(f, \"{name}\")\n    }}\n}}\n"
+        );
+        let impl_hits =
+            scan_source_for_debug_on_secret_types(&impl_body, FORBIDDEN_DEBUG_SECRET_TYPES);
+        assert!(
+            impl_hits.iter().any(|(_, n, _)| n == name),
+            "planted manual impl Debug for {name} must fire: {impl_hits:?}"
+        );
+    }
+    for name in FORBIDDEN_DISPLAY_SECRET_TYPES {
+        let derive_body = format!("#[derive(Display)]\npub struct {name} {{ bytes: Vec<u8> }}\n");
+        let derive_hits =
+            scan_source_for_display_on_secret_types(&derive_body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+        assert!(
+            derive_hits.iter().any(|(_, n, _)| n == name),
+            "planted derive(Display) on {name} must fire: {derive_hits:?}"
+        );
+        let impl_body = format!(
+            "impl std::fmt::Display for {name} {{\n    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {{\n        write!(f, \"{name}\")\n    }}\n}}\n"
+        );
+        let impl_hits =
+            scan_source_for_display_on_secret_types(&impl_body, FORBIDDEN_DISPLAY_SECRET_TYPES);
+        assert!(
+            impl_hits.iter().any(|(_, n, _)| n == name),
+            "planted manual impl Display for {name} must fire: {impl_hits:?}"
+        );
+    }
+}
+
+#[test]
+fn every_secret_vocabulary_type_is_classified() {
+    // AQ-115/F3 coverage backstop: every secret-vocabulary struct/enum
+    // declaration under the audited roots must be explicitly classified in
+    // one of the registries above. AQ-126 scope: this enforces
+    // classification of the DECLARED vocabulary
+    // (`SECRET_VOCABULARY_NAME_TOKENS`); it is not proof that no
+    // secret-bearing type exists outside that vocabulary.
+    let root = workspace_root();
+    let allowlist = audited_path_allowlist();
+    let mut unclassified: Vec<String> = Vec::new();
+    let mut vocabulary_hits = 0usize;
+    for src_root in audited_source_roots(&root) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        for file in files {
+            let rel = workspace_relative(&file, &root);
+            if allowlist.contains(&rel) {
+                continue;
+            }
+            let Ok(body) = fs::read_to_string(&file) else {
+                continue;
+            };
+            let label = rel.display().to_string();
+            for (line_no, name) in scan_source_for_secret_vocabulary_type_declarations(&body) {
+                vocabulary_hits += 1;
+                if vocabulary_type_is_classified(&name, &label) {
+                    continue;
+                }
+                unclassified.push(format!("{label}:{line_no}: {name}"));
+            }
+        }
+    }
+    assert!(
+        vocabulary_hits > 0,
+        "vocabulary backstop found zero secret-vocabulary declarations — the scanner is blind; do not let this gate rot into a no-op"
+    );
+    if !unclassified.is_empty() {
+        panic!(
+            "secret-vocabulary coverage backstop found {} unclassified struct/enum declaration(s). \
+             Classify each in secret_log_audit.rs: list it in FORBIDDEN_DEBUG/DISPLAY_SECRET_TYPES \
+             (secret-bearing), REVIEWED_REDACTING_DEBUG/DISPLAY_IMPLS (reviewed redacting impl), or \
+             REVIEWED_SECRET_VOCABULARY_TYPE_EXEMPTIONS (name-only / non-secret) with a justification:\n  {}",
+            unclassified.len(),
+            unclassified.join("\n  ")
+        );
+    }
+}
+
+/// AQ-126 design-fix 2: pure check that `witness_test_name` exists as a
+/// `fn` in `file_body`. The reviewed-redacting-impl suppression is only as
+/// good as the evidence behind it, so every registry entry must name the
+/// test that pins its impl's redacted OUTPUT and that test must still be
+/// present in the impl's file. Split out as a pure fn so the negative
+/// controls below can prove the checker refuses, not merely accepts.
+fn witness_test_present_in_source(file_body: &str, witness_test_name: &str) -> bool {
+    file_body.contains(&format!("fn {witness_test_name}("))
+}
+
+#[test]
+fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
+    // AQ-126: a suppression that outlives its evidence is a silent
+    // allowance. Deleting or renaming a witness test must turn this gate
+    // red. Stated residual: this text gate reads NAMES, not bodies — a
+    // witness whose assertions are gutted while its name survives is the
+    // owning crate's own red test and review's job, not this check's.
+    let root = workspace_root();
+    let mut failures: Vec<String> = Vec::new();
+    for (registry_name, registry) in [
+        (
+            "REVIEWED_REDACTING_DEBUG_IMPLS",
+            REVIEWED_REDACTING_DEBUG_IMPLS,
+        ),
+        (
+            "REVIEWED_REDACTING_DISPLAY_IMPLS",
+            REVIEWED_REDACTING_DISPLAY_IMPLS,
+        ),
+    ] {
+        assert!(
+            !registry.is_empty() || registry_name == "REVIEWED_REDACTING_DISPLAY_IMPLS",
+            "{registry_name} must not be silently emptied"
+        );
+        // `*registry` is an unsized `[T]` and is not IntoIterator — this was E0277.
+        for (name, path, _why, witness) in registry.iter() {
+            let file = root.join(path);
+            let Ok(body) = fs::read_to_string(&file) else {
+                failures.push(format!("{registry_name}: {name}: cannot read {path:?}"));
+                continue;
+            };
+            if !witness_test_present_in_source(&body, witness) {
+                failures.push(format!(
+                    "{registry_name}: {name}: witness test `{witness}` not found in {path:?} — \
+                     the redacting-impl suppression has no live evidence; restore the test or \
+                     re-review the impl"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "reviewed redacting-impl entries without a live witness test:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+#[test]
+fn witness_presence_checker_refuses_absent_test() {
+    // Negative control: the checker must REFUSE a body without the witness
+    // and accept one with it, or the enforcement above is a no-op that
+    // always reads green (the exact fail-open shape this wave rejects).
+    let body_with =
+        "mod tests {\n    #[test]\n    fn some_witness() {\n        assert!(true);\n    }\n}\n";
+    let body_without = "mod tests {\n    #[test]\n    fn unrelated_other_test() {}\n}\n";
+    assert!(witness_test_present_in_source(body_with, "some_witness"));
+    assert!(!witness_test_present_in_source(
+        body_with,
+        "gutted_witness_name"
+    ));
+    assert!(!witness_test_present_in_source(
+        body_without,
+        "some_witness"
+    ));
+}
+
+#[test]
+fn vocabulary_scanner_flags_pub_crate_private_key_struct() {
+    let body = "pub(crate) struct FooPrivateKey {\n    bytes: Vec<u8>,\n}\n";
+    let hits = scan_source_for_secret_vocabulary_type_declarations(body);
+    assert!(
+        hits.iter().any(|(_, n)| n == "FooPrivateKey"),
+        "pub(crate) secret-vocabulary declaration must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn vocabulary_scanner_flags_enum_with_token_name() {
+    let body = "pub enum BarToken {\n    Legacy,\n}\n";
+    let hits = scan_source_for_secret_vocabulary_type_declarations(body);
+    assert!(
+        hits.iter().any(|(_, n)| n == "BarToken"),
+        "token-named enum declaration must surface: {hits:?}"
+    );
+}
+
+#[test]
+fn vocabulary_scanner_silent_on_non_vocabulary_type() {
+    let body = "pub struct AddressBook {\n    entries: Vec<String>,\n}\n";
+    let hits = scan_source_for_secret_vocabulary_type_declarations(body);
+    assert!(
+        hits.is_empty(),
+        "non-vocabulary declaration must not surface: {hits:?}"
+    );
+}
+
+#[test]
+fn vocabulary_scanner_silent_on_comment_only_mention() {
+    let body = "// struct SecretThing would be flagged if it were code\n";
+    let hits = scan_source_for_secret_vocabulary_type_declarations(body);
+    assert!(
+        hits.is_empty(),
+        "comment-only mention must not surface: {hits:?}"
     );
 }

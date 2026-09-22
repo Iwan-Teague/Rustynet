@@ -359,9 +359,23 @@ pub fn decode_token(encoded: &str) -> Result<EnrollmentToken, EnrollmentTokenErr
 /// expiry so expired entries can be pruned instead of growing forever.
 /// Persisted via the daemon's watermark spool pattern so single-use
 /// survives restart.
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct ConsumedTokenLedger {
     inner: HashMap<[u8; TOKEN_ID_LEN], u64>,
+}
+
+// AQ-115/F3: the ledger keys are consumed EnrollmentToken token ids —
+// bearer halves of an enrollment secret — so the blanket `Debug` derive is
+// replaced by a redacting impl that exposes only the entry count. The type
+// is pinned on FORBIDDEN_DEBUG_SECRET_TYPES in secret_log_audit, so a
+// future re-derive fails the X3 no-secret-leakage gate. There are no
+// `{:?}` call sites for this type in the workspace.
+impl std::fmt::Debug for ConsumedTokenLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConsumedTokenLedger")
+            .field("consumed_count", &self.inner.len())
+            .finish()
+    }
 }
 
 /// Expiry recorded for entries migrated from ledger format v1, which
@@ -1327,6 +1341,26 @@ mod tests {
         let err = verify_and_consume_token_with_now(&encoded, &secret, &mut ledger, 1_700_000_600)
             .expect_err("expiry exactly now must be rejected");
         assert!(matches!(err, EnrollmentTokenError::Expired { .. }));
+    }
+
+    #[test]
+    fn consumed_token_ledger_debug_output_redacts_consumed_token_ids() {
+        // AQ-126: liveness witness for the `ConsumedTokenLedger` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS. The ledger is
+        // populated with a fixed marker token id; the redacting Debug must
+        // keep the count field live and never print the consumed ids
+        // (bearer halves) in decimal or hex.
+        let mut ledger = ConsumedTokenLedger::default();
+        ledger.record_consumed([0xABu8; TOKEN_ID_LEN], 1_700_000_000);
+        let rendered = format!("{ledger:?}");
+        assert!(
+            rendered.contains("consumed_count: 1"),
+            "Debug must keep the consumed_count field live: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "ConsumedTokenLedger Debug must not surface consumed token ids: {rendered}"
+        );
     }
 
     #[test]
