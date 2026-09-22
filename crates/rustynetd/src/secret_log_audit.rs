@@ -182,7 +182,30 @@ pub(crate) fn scan_source_for_forbidden_placeholders(body: &str) -> Vec<(usize, 
     hits
 }
 
-/// Pure scan helper: takes a source body and returns true iff a
+/// Mirrors the visibility grammar of
+/// `scan_source_for_secret_vocabulary_type_declarations`: an optional `pub`
+/// qualifier — plain, or `pub(<path>)` where `<path>` is non-empty and made
+/// of lowercase ASCII letters or spaces — followed by `struct `/`enum ` and
+/// the type name. Returns the text after the keyword, or `None` when the
+/// line is not a type declaration in that grammar.
+fn strip_type_decl_prefix(trimmed: &str) -> Option<&str> {
+    let after_pub = trimmed.strip_prefix("pub").unwrap_or(trimmed);
+    let after_visibility = if let Some(rest) = after_pub.strip_prefix('(') {
+        let close = rest.find(')')?;
+        let inner = &rest[..close];
+        if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_lowercase() || c == ' ') {
+            return None;
+        }
+        &rest[close + 1..]
+    } else {
+        after_pub
+    };
+    let after_visibility = after_visibility.strip_prefix(' ')?;
+    after_visibility
+        .strip_prefix("struct ")
+        .or_else(|| after_visibility.strip_prefix("enum "))
+}
+
 /// `#[derive(... Debug ...)]` or `impl Debug for …` appears for a
 /// type whose name matches one of the canonical secret-bearing
 /// types. Exposed for unit testing.
@@ -199,20 +222,12 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
         }
         // Pattern 1: derive Debug on a secret type. Look for a struct
         // declaration after a derive line that includes Debug.
-        if trimmed.starts_with("#[derive(") && trimmed.contains("Debug") {
+        // AQ-135: any attribute line that derives Debug counts — not just a bare
+        // `#[derive(...)]`, so `#[cfg_attr(..., derive(Debug))]` is caught too.
+        if trimmed.starts_with("#[") && trimmed.contains("derive(") && trimmed.contains("Debug") {
             // Search forward for the next `struct`/`enum` name.
             for next in lines.iter().skip(idx + 1).take(4) {
-                let nt = next.trim_start();
-                let after_kw = if let Some(rest) = nt.strip_prefix("pub struct ") {
-                    Some(rest)
-                } else if let Some(rest) = nt.strip_prefix("struct ") {
-                    Some(rest)
-                } else if let Some(rest) = nt.strip_prefix("pub enum ") {
-                    Some(rest)
-                } else {
-                    nt.strip_prefix("enum ")
-                };
-                if let Some(rest) = after_kw {
+                if let Some(rest) = strip_type_decl_prefix(next.trim_start()) {
                     // Extract just the type name (token up to space,
                     // `<`, `{`, `(`).
                     let name: String = rest
@@ -944,19 +959,11 @@ pub(crate) fn scan_source_for_display_on_secret_types(
         // Pattern 1: derive Display on a secret type. Display is not
         // a stdlib derive, but third-party derive macros exist
         // (`derive_more::Display`) — flag the shape anyway.
-        if trimmed.starts_with("#[derive(") && trimmed.contains("Display") {
+        // AQ-135: any attribute line that derives Display counts — not just a bare
+        // `#[derive(...)]`, so `#[cfg_attr(..., derive(Display))]` is caught too.
+        if trimmed.starts_with("#[") && trimmed.contains("derive(") && trimmed.contains("Display") {
             for next in body.lines().skip(idx + 1).take(4) {
-                let nt = next.trim_start();
-                let after_kw = if let Some(rest) = nt.strip_prefix("pub struct ") {
-                    Some(rest)
-                } else if let Some(rest) = nt.strip_prefix("struct ") {
-                    Some(rest)
-                } else if let Some(rest) = nt.strip_prefix("pub enum ") {
-                    Some(rest)
-                } else {
-                    nt.strip_prefix("enum ")
-                };
-                if let Some(rest) = after_kw {
+                if let Some(rest) = strip_type_decl_prefix(next.trim_start()) {
                     let name: String = rest
                         .chars()
                         .take_while(|c| c.is_alphanumeric() || *c == '_')
@@ -1349,6 +1356,71 @@ impl std::fmt::Display for SigningKeyMaterialError {
     assert!(
         hits.is_empty(),
         "audit must not false-match `Display for SigningKeyMaterialError` against the `SigningKeyMaterial` allowlist entry: {hits:?}"
+    );
+}
+
+#[test]
+fn debug_scanner_flags_derive_debug_on_pub_crate_secret_type() {
+    // AQ-135 escape 1: `pub(<path>)` declarations must be caught exactly
+    // like plain `pub` declarations. The old scanner only knew
+    // `pub struct `/`struct `/`pub enum `/`enum `, so this planted
+    // `pub(crate)` secret type used to pass clean.
+    let source =
+        "\n#[derive(Debug)]\npub(crate) struct PassphraseMaterial {\n    bytes: Vec<u8>,\n}\n";
+    let hits = scan_source_for_debug_on_secret_types(source, SAMPLE_FORBIDDEN_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, name, reason)| {
+            name == "PassphraseMaterial" && reason.starts_with("derive(")
+        }),
+        "expected derive(Debug) hit for pub(crate) secret type, got {hits:?}"
+    );
+}
+
+#[test]
+fn debug_scanner_flags_derive_debug_on_pub_super_secret_type() {
+    let source =
+        "\n#[derive(Debug)]\npub(super) struct SigningKeyMaterial {\n    inner: Vec<u8>,\n}\n";
+    let hits = scan_source_for_debug_on_secret_types(source, SAMPLE_FORBIDDEN_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, name, _)| name == "SigningKeyMaterial"),
+        "expected derive(Debug) hit for pub(super) secret type, got {hits:?}"
+    );
+}
+
+#[test]
+fn debug_scanner_flags_cfg_attr_derive_debug_on_secret_type() {
+    // AQ-135 decide-and-report fix: a derive hidden behind `cfg_attr`
+    // used to evade the `#[derive(` prefix check entirely.
+    let source = "\n#[cfg_attr(test, derive(Debug))]\npub struct PassphraseMaterial {\n    bytes: Vec<u8>,\n}\n";
+    let hits = scan_source_for_debug_on_secret_types(source, SAMPLE_FORBIDDEN_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, name, reason)| {
+            name == "PassphraseMaterial" && reason.starts_with("derive(")
+        }),
+        "expected cfg_attr derive(Debug) hit, got {hits:?}"
+    );
+}
+
+#[test]
+fn display_scanner_flags_derive_display_on_pub_crate_secret_type() {
+    let source =
+        "\n#[derive(Display)]\npub(crate) struct PassphraseMaterial {\n    bytes: Vec<u8>,\n}\n";
+    let hits = scan_source_for_display_on_secret_types(source, SAMPLE_FORBIDDEN_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, name, reason)| {
+            name == "PassphraseMaterial" && reason.starts_with("derive(")
+        }),
+        "expected derive(Display) hit for pub(crate) secret type, got {hits:?}"
+    );
+}
+
+#[test]
+fn display_scanner_flags_cfg_attr_derive_display_on_secret_type() {
+    let source = "\n#[cfg_attr(test, derive(Display))]\npub struct SigningKeyMaterial {\n    inner: Vec<u8>,\n}\n";
+    let hits = scan_source_for_display_on_secret_types(source, SAMPLE_FORBIDDEN_SECRET_TYPES);
+    assert!(
+        hits.iter().any(|(_, name, _)| name == "SigningKeyMaterial"),
+        "expected cfg_attr derive(Display) hit, got {hits:?}"
     );
 }
 
@@ -3086,14 +3158,70 @@ fn every_secret_vocabulary_type_is_classified() {
     }
 }
 
-/// AQ-126 design-fix 2: pure check that `witness_test_name` exists as a
-/// `fn` in `file_body`. The reviewed-redacting-impl suppression is only as
-/// good as the evidence behind it, so every registry entry must name the
-/// test that pins its impl's redacted OUTPUT and that test must still be
-/// present in the impl's file. Split out as a pure fn so the negative
-/// controls below can prove the checker refuses, not merely accepts.
-fn witness_test_present_in_source(file_body: &str, witness_test_name: &str) -> bool {
-    file_body.contains(&format!("fn {witness_test_name}("))
+/// AQ-135 fix (escape 2): pure check that `witness_test_name` names a LIVE
+/// `#[test]` fn in `file_body`: the `fn <name>(` definition must sit on a
+/// non-commented code line and the contiguous attribute run directly above
+/// it must carry `#[test]` and no `#[ignore]`. Commented-out, `#[ignore]`d,
+/// or non-test definitions are refused, so reviewed-redacting-impl
+/// suppression only counts when there is live evidence that actually runs.
+/// Split out pure so negative controls below can prove the checker refuses,
+/// not merely accepts.
+fn live_witness_test_in_source(file_body: &str, witness_test_name: &str) -> bool {
+    let needle = format!("fn {witness_test_name}(");
+    let lines: Vec<&str> = file_body.lines().collect();
+    let mut in_block_comment = false;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if in_block_comment {
+            if trimmed.contains("*/") {
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some(after_open) = trimmed.strip_prefix("/*") {
+            if !after_open.contains("*/") {
+                in_block_comment = true;
+            }
+            continue;
+        }
+        let blanked = strip_string_literal_contents(line);
+        let Some(pos) = blanked.find(needle.as_str()) else {
+            continue;
+        };
+        if pos > 0
+            && blanked[..pos]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        // Definition found on a live code line; require the contiguous
+        // attribute run directly above it to carry #[test] and no #[ignore].
+        let mut saw_test = false;
+        let mut ignored = false;
+        let mut run = idx;
+        while run > 0 {
+            run -= 1;
+            let attr = lines[run].trim();
+            if !attr.starts_with("#[") {
+                break;
+            }
+            if attr.starts_with("#[test") {
+                saw_test = true;
+            }
+            if attr.starts_with("#[ignore") {
+                ignored = true;
+            }
+        }
+        if saw_test && !ignored {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]
@@ -3126,9 +3254,9 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
                 failures.push(format!("{registry_name}: {name}: cannot read {path:?}"));
                 continue;
             };
-            if !witness_test_present_in_source(&body, witness) {
+            if !live_witness_test_in_source(&body, witness) {
                 failures.push(format!(
-                    "{registry_name}: {name}: witness test `{witness}` not found in {path:?} — \
+                    "{registry_name}: {name}: no live #[test] fn `{witness}` found in {path:?} — \
                      the redacting-impl suppression has no live evidence; restore the test or \
                      re-review the impl"
                 ));
@@ -3143,20 +3271,32 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
 }
 
 #[test]
-fn witness_presence_checker_refuses_absent_test() {
-    // Negative control: the checker must REFUSE a body without the witness
-    // and accept one with it, or the enforcement above is a no-op that
-    // always reads green (the exact fail-open shape this wave rejects).
-    let body_with =
-        "mod tests {\n    #[test]\n    fn some_witness() {\n        assert!(true);\n    }\n}\n";
-    let body_without = "mod tests {\n    #[test]\n    fn unrelated_other_test() {}\n}\n";
-    assert!(witness_test_present_in_source(body_with, "some_witness"));
-    assert!(!witness_test_present_in_source(
-        body_with,
-        "gutted_witness_name"
+fn witness_liveness_checker_refuses_dead_witnesses() {
+    // Negative controls: the checker must REFUSE a witness that is
+    // commented out, block-commented, missing #[test], or #[ignore]d —
+    // and accept the live shape. Raw text presence is not evidence.
+    let live = "\n#[test]\nfn some_witness() {}\n";
+    assert!(live_witness_test_in_source(live, "some_witness"));
+
+    // The demonstrated escape: witness commented out entirely.
+    let commented_out = "\n// #[test]\n// fn some_witness() {}\n";
+    assert!(!live_witness_test_in_source(commented_out, "some_witness"));
+
+    let block_commented = "\n/*\n#[test]\nfn some_witness() {}\n*/\n";
+    assert!(!live_witness_test_in_source(
+        block_commented,
+        "some_witness"
     ));
-    assert!(!witness_test_present_in_source(
-        body_without,
+
+    let plain_fn = "\nfn some_witness() {}\n";
+    assert!(!live_witness_test_in_source(plain_fn, "some_witness"));
+
+    // An #[ignore]d test does not prove the gate runs.
+    let ignored_test = "\n#[test]\n#[ignore]\nfn some_witness() {}\n";
+    assert!(!live_witness_test_in_source(ignored_test, "some_witness"));
+
+    assert!(!live_witness_test_in_source(
+        "\nfn unrelated_other_test() {}\n",
         "some_witness"
     ));
 }
