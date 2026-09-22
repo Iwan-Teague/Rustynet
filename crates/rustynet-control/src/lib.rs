@@ -7674,6 +7674,30 @@ mod tests {
     }
 
     #[test]
+    fn signed_token_claims_debug_redacts_signature_hex() {
+        // AQ-126: liveness witness for the `SignedTokenClaims` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS. Constructs a
+        // real claims set with marker subject/nonce/signature values and
+        // pins that the rendered Debug contains none of them.
+        let claims = super::SignedTokenClaims {
+            claims: super::TokenClaims {
+                subject: "witness-secret-subject".to_owned(),
+                issued_at_unix: 0,
+                expires_at_unix: 0,
+                nonce: "witness-secret-nonce".to_owned(),
+            },
+            signature_hex: "deadbeefcafe".to_owned(),
+        };
+        let rendered = format!("{claims:?}");
+        assert!(
+            !rendered.contains("witness-secret-subject")
+                && !rendered.contains("witness-secret-nonce")
+                && !rendered.contains("deadbeefcafe"),
+            "SignedTokenClaims Debug must not surface subject/nonce/signature: {rendered}"
+        );
+    }
+
+    #[test]
     fn token_claims_debug_redacts_sensitive_fields() {
         let claims = TokenClaims {
             subject: "alice@example.local".to_owned(),

@@ -1626,6 +1626,82 @@ mod tests {
     use super::*;
     use ed25519_dalek::Signer;
 
+    /// AQ-126: fixed-marker fixture for the Debug-redaction witnesses below.
+    /// Never a production value; every secret byte slot is 0xAB so a leaked
+    /// field is detectable as `171` / `ab` in the rendered form.
+    fn witness_leg_token_v2() -> BlindRelayLegTokenV2 {
+        BlindRelayLegTokenV2 {
+            token_kind: BlindRelayTokenKindV2::BlindRelayLeg,
+            audience_relay_id: [0xAB; 16],
+            scope: "v2".to_owned(),
+            privacy_epoch: 1,
+            circuit_handle: [0xAB; 32],
+            leg_handle: [0xAB; 32],
+            leg_slot: BlindRelayLegSlot::Slot0,
+            presenter_public_key: [0xAB; 32],
+            issued_at_unix: 0,
+            expires_at_unix: 0,
+            nonce: [0xAB; 16],
+            profile_id: "default".to_owned(),
+            issuer_key_id: "witness-key-id".to_owned(),
+            signature: [0xAB; 64],
+        }
+    }
+
+    #[test]
+    fn blind_relay_leg_token_v2_debug_redacts_secret_fields() {
+        // AQ-126: liveness witness for the `BlindRelayLegTokenV2` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS.
+        let rendered = format!("{:?}", witness_leg_token_v2());
+        assert!(
+            rendered.contains("BlindRelayLegTokenV2"),
+            "expected the type name in the rendered form: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "BlindRelayLegTokenV2 Debug must not surface handle/nonce/signature bytes: {rendered}"
+        );
+    }
+
+    #[test]
+    fn blind_relay_pop_transcript_debug_redacts_secret_fields() {
+        // AQ-126: liveness witness for the `BlindRelayPopTranscript` entry
+        // in secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS.
+        let transcript = BlindRelayPopTranscript {
+            token_digest_hex: "deadbeefcafe".to_owned(),
+            relay_challenge: [0xAB; 32],
+            circuit_handle: [0xAB; 32],
+            leg_handle: [0xAB; 32],
+            leg_slot: BlindRelayLegSlot::Slot1,
+            privacy_epoch: 1,
+            client_nonce: [0xAB; 32],
+        };
+        let rendered = format!("{transcript:?}");
+        assert!(
+            !rendered.contains("deadbeefcafe")
+                && !rendered.contains("171")
+                && !rendered.to_lowercase().contains("ab"),
+            "BlindRelayPopTranscript Debug must not surface digest/challenge/handles/nonces: {rendered}"
+        );
+    }
+
+    #[test]
+    fn blind_relay_hello_v2_debug_redacts_secret_fields() {
+        // AQ-126: liveness witness for the `BlindRelayHelloV2` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS.
+        let hello = BlindRelayHelloV2 {
+            token: witness_leg_token_v2(),
+            client_nonce: [0xAB; 32],
+            relay_challenge: [0xAB; 32],
+            pop_signature: [0xAB; 64],
+        };
+        let rendered = format!("{hello:?}");
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "BlindRelayHelloV2 Debug must not surface token/nonce/challenge/signature bytes: {rendered}"
+        );
+    }
+
     /// Fixed test seed for the signed-preimage fixtures (vector 2). Never a
     /// production key: the seed is a constant in test code only.
     const TEST_SEED: [u8; 32] = *b"rustynet-blind-relay-test-seed01";
