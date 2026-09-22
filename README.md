@@ -63,8 +63,8 @@ An operator could be compelled to produce:
  (`transport.rs:1395-1398`). What happens to stderr — journald, launchd,
  the Windows service log — is decided by whoever runs the process, and
  those lines live as long as that log does.
- **The complete stderr write-site inventory of this binary, as of the
- audited commit.** Every site in production code, enumerated —
+ **The complete stderr write-site inventory of this binary, as of commit
+ e9e9e2b03e42607355bc71cf7b9ba971b02a7a63.** Every site in production code, enumerated —
  identifier-bearing: `transport.rs:781, 821`, `main.rs:750, 939, 994,
  1057, 1072, 1492, 1523`; store/operational (the second carries the
  replay-store path is the **third**, `transport.rs:1395`): `transport.rs:606, 1079, 1395`; identifier-free
@@ -80,11 +80,13 @@ An operator could be compelled to produce:
  itself warns that earlier `#[cfg(test)]` attributes sit on production
  helpers, `transport.rs:3512-3513`) — plus 20 in `main.rs` (18 logging
  sites above plus usage and gate) and 1 in
- `blind_relay_listener.rs`: **40 sites, complete for this commit.** One-shot subcommands print JSON reports to
+ `blind_relay_listener.rs`: **40 sites, complete for commit e9e9e2b03e42607355bc71cf7b9ba971b02a7a63.** One-shot subcommands print JSON reports to
  stdout, not stderr: `hello-limiter-audit` (`main.rs:2914-2927`) and
  `windows-service-hardening-check` (`main.rs:2931-2940`). New logging
  code added after the audited commit is a gap until the inventory is
- re-run; do not extend this list by hand.
+ re-run; do not extend this list by hand. Re-count with
+ `tooling/check_stderr_inventory.sh` (witness:
+ `tooling/test_check_stderr_inventory.sh`).
 - **The blind replay store (blind v2 listener only).** A mode-0600 file of
  `<64-hex digest> <timestamp>` lines kept solely to reject replays
  (`crates/rustynet-relay/src/blind_relay_listener.rs:623-637`). It is
