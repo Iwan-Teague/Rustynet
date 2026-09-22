@@ -1383,6 +1383,26 @@ mod tests {
     use ed25519_dalek::{Signer, SigningKey};
     use rustynet_control::blind_relay::{BlindRelayHelloV2, BlindRelayLegTokenV2};
 
+    #[test]
+    fn address_validation_key_ring_debug_redacts_hmac_keys() {
+        // AQ-126: liveness witness for the `AddressValidationKeyRing` entry
+        // in secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS. The ring is
+        // built with a fixed non-zero HMAC key; the rendered Debug must
+        // never contain the key bytes (nor their decimal 171 / hex ab
+        // spellings).
+        let ring = AddressValidationKeyRing::new(7, [0xABu8; 32])
+            .expect("non-zero HMAC key must construct");
+        let rendered = format!("{ring:?}");
+        assert!(
+            rendered.contains("AddressValidationKeyRing"),
+            "expected the type name in the rendered form: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "AddressValidationKeyRing Debug must not surface HMAC key bytes: {rendered}"
+        );
+    }
+
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 

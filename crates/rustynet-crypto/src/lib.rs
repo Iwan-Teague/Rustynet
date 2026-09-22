@@ -4610,6 +4610,30 @@ mod tests {
     }
 
     #[test]
+    fn ed25519_signing_provider_debug_redacts_seed() {
+        // AQ-126: liveness witness for the `Ed25519SigningProvider` entry in
+        // secret_log_audit::REVIEWED_REDACTING_DEBUG_IMPLS. Pins the Debug
+        // impl's redacted OUTPUT: a real provider is constructed from a
+        // fixed non-zero seed and the rendered form must never contain the
+        // seed bytes (nor their decimal 171 / hex ab spellings).
+        let provider = super::Ed25519SigningProvider::try_from_seed(
+            super::SigningProviderKind::LocalEncryptedFile,
+            "witness-key-id",
+            [0xABu8; 32],
+        )
+        .expect("non-zero seed must construct");
+        let rendered = format!("{provider:?}");
+        assert!(
+            rendered.contains("Ed25519SigningProvider") && rendered.contains("witness-key-id"),
+            "Debug must keep the non-secret identity fields visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("171") && !rendered.to_lowercase().contains("ab"),
+            "Ed25519SigningProvider Debug must not surface the signing seed: {rendered}"
+        );
+    }
+
+    #[test]
     fn secret_key_debug_redacts() {
         // RSA-0026: SecretKey is the canonical secret type; its Debug must
         // redact the inner bytes so a `{:?}` / structured-log call cannot leak
