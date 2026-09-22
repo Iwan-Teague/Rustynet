@@ -13,7 +13,7 @@ jobs:
     name: macOS build+security
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Bootstrap CI tools
         run: |
           RUSTYNET_CI_BOOTSTRAP_SYSTEM=0 ./scripts/ci/bootstrap_ci_tools.sh
@@ -125,7 +125,7 @@ jobs:
           # code shells out to it for the evidence commit marker.
           git config --global --add safe.directory '*'
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           # Full history: the delegated-edit marker gate scans a git log
           # window, which needs real history, not a shallow clone.
@@ -213,7 +213,7 @@ jobs:
     name: cargo-vet supply-chain audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
@@ -241,7 +241,7 @@ jobs:
     name: Linux real WireGuard E2E
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Bootstrap CI tools
         run: |
           ./scripts/ci/bootstrap_ci_tools.sh
@@ -274,7 +274,7 @@ jobs:
         # the cargo invocations match the macOS / Debian jobs above.
         shell: bash
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Pin toolchain + install cargo-audit / cargo-deny / cargo-nextest
         run: |
           # The bash bootstrap wrapper invokes `cargo run -p
