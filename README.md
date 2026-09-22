@@ -10,6 +10,163 @@
 > `boringtun`, BSD-3-Clause) and crates.io dependencies keep their own licenses.
 > Copyright © 2026 Iwan Teague.
 
+## What a subpoena yields (relay data minimisation)
+
+Rule (charter security bar E8), quoted as written: "Relays/anchors/**rendezvous**:
+no per-flow logs; bounded counters only; retention stated in README"
+(`charter/security-bar/T2-security-bar.md:82`).
+Status: **not yet fully met**; this section states what an operator of the
+`rustynet-relay` binary could be compelled to produce today (audited
+2026-09-22, action-queue AQ-112).
+
+**Scope, stated plainly.** This section covers the `rustynet-relay` binary
+only: the default relay listener and the opt-in blind v2 listener. E8 also
+names **anchors** and **rendezvous**. The anchor role is implemented outside
+this binary and is *not assessed* by this section — E8's anchor half remains open, and
+nothing below may be read as clearing it.
+
+An operator could be compelled to produce:
+
+- **The durable replay store — the default path, not an exception.** The
+ binary refuses to start without `--replay-store <absolute path>`
+ (`crates/rustynet-relay/src/main.rs:218-219`), and the default transport
+ keeps a **durable, on-disk** nonce store there
+ (`crates/rustynet-relay/src/transport.rs:1150-1153`; loaded — and the file
+ created — at startup, `transport.rs:1156-1160`; wired on the default path,
+ `main.rs:650-655`). Format: one line per retained hello nonce,
+ `<32-hex nonce> <inserted-at-unix>`, mode 0600, replaced atomically on each
+ persist (`transport.rs:1423-1459` — format at :1435-1438, mode 0600 at :1445/:1456, atomic rename at :1459). Entries are the session token's random
+ 16-byte nonces — keyless; a line names no node — retained 359 seconds
+ (`transport.rs:83`: 120 s TTL + 2 × 119 s skew + 1; TTL constant
+ `crates/rustynet-control/src/lib.rs:1726`). Its evidentiary content is
+ "some token handshake arrived at time T" and whether a given nonce
+ recurred. The store is load-bearing across restarts by design: a test
+ restarts the transport against the same file and asserts a replayed nonce
+ is still rejected (`transport.rs:1911`,
+ `test_durable_replay_store_rejects_nonce_after_restart`).
+- **stderr log lines that carry identifiers or source addresses.** The relay
+ writes per-flow lines to stderr unconditionally: `session established:
+ <first 4 bytes of the session id> -> port N from <ip:port>`
+ (`crates/rustynet-relay/src/main.rs:1057`), `session rejected from
+ <ip:port>: <reason>` (`main.rs:994`, `main.rs:1072`), and blind-listener
+ admission outcomes with the source address (`main.rs:939`). The startup
+ line names the bind address and the first 4 bytes of the relay id
+ (`main.rs:750`), the pre-auth notice lines are rate-limited per source but
+ still name the address (`main.rs:1492`, `main.rs:1523`). Two rejection
+ paths carry token identifiers too: a wrong-scope token logs the token's
+ scope string (`transport.rs:781-783`; the scope is part of the signed
+ token payload, `crates/rustynet-control/src/lib.rs:1760`, expected value
+ `forward_ciphertext_only`, `lib.rs:1723`), and a per-node capacity
+ rejection logs the hello's node id (`transport.rs:821-823`) — reached only
+ after signature and binding checks, so it names a token-valid member node.
+ One operational warning prints the configured replay-store path
+ (`transport.rs:1395-1398`). What happens to stderr — journald, launchd,
+ the Windows service log — is decided by whoever runs the process, and
+ those lines live as long as that log does.
+ **The complete stderr write-site inventory of this binary, as of the
+ audited commit.** Every site in production code, enumerated —
+ identifier-bearing: `transport.rs:781, 821`, `main.rs:750, 939, 994,
+ 1057, 1072, 1492, 1523`; store/operational (the second carries the
+ replay-store path is the **third**, `transport.rs:1395`): `transport.rs:606, 1079, 1395`; identifier-free
+ per-event lines (rejection reasons and lifecycle — still a per-flow
+ frequency signal, see side channels below): `transport.rs:484, 600, 616,
+ 674, 681, 690, 698, 726, 740, 746, 757, 768, 775, 793`,
+ `main.rs:671, 675, 681, 799, 825, 830, 835, 1654, 1703, 3126, 6206`,
+ plus `crates/rustynet-relay/src/blind_relay_listener.rs:1083`;
+ CLI/build output, not daemon logging: the `--help` usage text
+ (`main.rs:2858`) and the no-daemon-feature gate message (`main.rs:6213`).
+ Counted: 19 sites in `transport.rs` — every `eprintln!` in that file,
+ whose test module starts at `:1671`, so all 19 are production (the file
+ itself warns that earlier `#[cfg(test)]` attributes sit on production
+ helpers, `transport.rs:3512-3513`) — plus 20 in `main.rs` (18 logging
+ sites above plus usage and gate) and 1 in
+ `blind_relay_listener.rs`: **40 sites, complete for this commit.** One-shot subcommands print JSON reports to
+ stdout, not stderr: `hello-limiter-audit` (`main.rs:2914-2927`) and
+ `windows-service-hardening-check` (`main.rs:2931-2940`). New logging
+ code added after the audited commit is a gap until the inventory is
+ re-run; do not extend this list by hand.
+- **The blind replay store (blind v2 listener only).** A mode-0600 file of
+ `<64-hex digest> <timestamp>` lines kept solely to reject replays
+ (`crates/rustynet-relay/src/blind_relay_listener.rs:623-637`). It is
+ keyless — a digest names no node — entries expire after 359 seconds
+ (`blind_relay_listener.rs:92-94`), the file is hard-capped at 4 MiB /
+ ~48.8k lines (`:104-111`), and a full store refuses admission rather than
+ evict. It can show "some handshake arrived at time T" and nothing about
+ who. Its doc comment says it mirrors the v1 store's discipline — that is
+ the durability discipline the default path's store (first bullet) already
+ has, not a difference from it.
+- **Timing and volume side channels — these survive perfect content
+ minimisation.** Beyond the replay stores' insertion stamps (bullets one
+ and three) and the establishment / last-packet times each live session
+ holds in RAM (below), the timestamped per-flow stderr lines are
+ themselves a per-session timing record once a service manager journals
+ them. The health/metrics endpoint exposes aggregate counters only
+ (`main.rs:1717-1731` JSON, `main.rs:1733-1745` Prometheus text), yet
+ `rustynet_relay_active_sessions` is a **gauge** (`main.rs:1736`): on a
+ quiet relay, a scraped time series of that gauge reconstructs each
+ session's start and stop to the scrape interval, and the slope of
+ `rustynet_relay_bytes_forwarded_total` gives volume per interval. That
+ scrape history lives in the operator's monitoring stack — outside this
+ program, and outside anything this program could delete or shrink.
+- **Whatever is in RAM at seizure.** Every live session holds both node ids,
+ the hello source address, the bound peer address, and establishment /
+ last-packet times — the relay's memory links who-talked-to-whom to IP
+ addresses for the life of the session
+ (`crates/rustynet-relay/src/session.rs:63-84`). The rate and hello limiters
+ keep bounded, short-windowed tables of recent node ids
+ (`crates/rustynet-relay/src/rate_limit.rs:13`) and of **full source IP
+ addresses** — not truncated prefixes — in two separate tables: the pre-auth
+ hello limiter (`main.rs:1252`, `counts: HashMap<IpAddr, …>`, capped at 4096
+ addresses, `main.rs:329`) and the pre-auth notice budget
+ (`main.rs:1425-1433`), which keys the same way. Only the blind v2 listener
+ truncates to a prefix. The
+ blind v2 listener adds three bounded in-memory retainers of its own: the
+ waiting-circuit table, whose per-leg records hold the leg's **bound peer
+ socket address** plus a presenter-key digest and expiry
+ (`blind_relay_listener.rs:838-843`, held in the `circuits` map
+ `:1029`, capped at 256 waiting legs total, 16 per source prefix, 64 per
+ profile — `:115, :131, :134`), and the pre-auth source-prefix limiter,
+ a map of source /24 (v4) or /48 (v6) prefixes to hit counts and a
+ last-window instant, capped at 16,384 entries
+ (`blind_relay_listener.rs:280-305`, cap `:143`), and the paired-circuit
+ quarantine map, which holds a per-circuit expiry record and no addresses
+ (`blind_relay_listener.rs:1030`, struct `:887-894`, capped at 256 entries
+ `:128`). The application writes
+ none of this to any file and it dies with the process —
+ **but that is the whole of the claim, and it is weaker than it sounds:**
+ the relay disables no core dumps, locks no memory, and does not address
+ swap or hibernation, so a swap partition, a hibernation image, or a
+ post-crash core file can hold these tables without the program ever
+ choosing to write them. "Not written by the application" is the strongest
+ sentence the code supports here; the OS's memory-to-disk paths are the
+ host's, not this program's, and they are unaddressed.
+- **The self-audit subcommand surface.** `rustynet-relay hello-limiter-audit`
+ (implemented in the 189-line `crates/rustynet-relay/src/hello_limiter_audit.rs`,
+ wired at `main.rs:1781-1805` and `main.rs:2914-2927`) drives the real
+ hello limiter in-process through a DOS-1 flood case and a baseline case and
+ prints a schema-versioned JSON report to stdout
+ (`hello_limiter_audit.rs:35-59, 61-136`). It retains nothing between runs;
+ compulsion reaches only whatever stdout capture the operator's own session
+ or CI log kept.
+
+An operator genuinely cannot produce, because it is never retained:
+
+- payload content — the relay forwards opaque ciphertext frames and buffers
+ nothing beyond a single datagram;
+- session, pairing, or limiter state across restarts (all memory-only; the
+ one deliberate on-disk exception is the keyless replay store, first bullet);
+- identities, addresses, or pairings for ended sessions (token TTL ≤ 120 s
+ plus the cleanup cadence);
+- per-session or per-node statistics — the health/metrics endpoint exposes
+ aggregate bounded counters only (`main.rs:1721`, `main.rs:1736`), though see
+ the gauge caveat above: aggregate is not the same as uninstructive over time.
+
+What would have to change for the answer to be "nothing useful": the per-flow
+stderr lines would have to become counters (no addresses, no session-id
+fragments, no node ids, no scope strings). That change is tracked in the
+action queue; until it lands, treat a relay's service-manager log as
+sensitive material and rotate or shred it accordingly.
+
 ## Current Focus
 
 - finish an honest production transport-owning backend for traversal and relay on the real peer-traffic path
