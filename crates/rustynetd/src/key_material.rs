@@ -1090,7 +1090,14 @@ pub fn tighten_public_key_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
+/// Generates a fresh WireGuard keypair via `wg genkey` / `wg pubkey`.
+///
+/// AQ-115/F2: the private half is returned as `Zeroizing<Vec<u8>>` so the
+/// plaintext key bytes are wiped from memory on drop on EVERY path —
+/// including the success path where a caller simply lets the buffer fall
+/// out of scope after persisting it. `&private_key` deref-coerces to
+/// `&[u8]`, so existing `&[u8]` key-material helpers need no change.
+pub fn generate_wireguard_keypair() -> Result<(Zeroizing<Vec<u8>>, String), String> {
     let wg_binary = resolve_wireguard_binary_path()?;
     let private = Command::new(&wg_binary)
         .arg("genkey")
@@ -1099,7 +1106,7 @@ pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
     if !private.status.success() {
         return Err(format!("wg genkey failed: {}", private.status));
     }
-    let mut private_key = private.stdout;
+    let mut private_key = Zeroizing::new(private.stdout);
     if private_key.is_empty() {
         return Err("wg genkey produced empty key".to_owned());
     }
@@ -1110,11 +1117,34 @@ pub fn generate_wireguard_keypair() -> Result<(Vec<u8>, String), String> {
     let public_key = match derive_public_key_from_private_key(&private_key) {
         Ok(value) => value,
         Err(err) => {
+            // Belt-and-suspenders: `Zeroizing` already wipes on drop; the
+            // explicit fill keeps the wipe visible at this error path.
             private_key.fill(0);
             return Err(err);
         }
     };
     Ok((private_key, public_key))
+}
+
+#[cfg(test)]
+mod generate_wireguard_keypair_contract_tests {
+    use super::{Zeroizing, generate_wireguard_keypair};
+
+    /// AQ-115/F2 compile-time contract: the private half of the generated
+    /// keypair is `Zeroizing<Vec<u8>>`, so it is wiped on drop on every path
+    /// (including the success path) and deref-coerces to `&[u8]` at the
+    /// existing key-material call sites. Reverting the return type fails
+    /// this assertion at compile time.
+    // The point of this test IS the exact return type, so the type is written out in
+    // full deliberately; clippy's complexity heuristic would otherwise stop the
+    // `-D warnings` lint gate on a contract that must not be simplified away.
+    #[allow(clippy::type_complexity)]
+    #[test]
+    fn generate_wireguard_keypair_private_half_is_zeroizing() {
+        const CONTRACT: fn() -> Result<(Zeroizing<Vec<u8>>, String), String> =
+            generate_wireguard_keypair;
+        let _ = CONTRACT;
+    }
 }
 
 pub fn apply_interface_private_key(

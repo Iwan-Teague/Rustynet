@@ -10204,11 +10204,16 @@ impl DaemonRuntime {
             .ok_or_else(|| "wg private key path is not configured".to_owned())?;
         let ledger_path = ledger_path_for(runtime_path.as_path());
 
-        let old_runtime_backup = fs::read(&runtime_path).ok();
+        // AQ-115/F1: the runtime + encrypted backups hold the OUTGOING
+        // plaintext WG private key; wrap them in `Zeroizing` so they are
+        // wiped on drop when the rotation scope ends even on the success
+        // path. The public-key backup stays a plain `String` — not secret.
+        let old_runtime_backup = fs::read(&runtime_path).ok().map(zeroize::Zeroizing::new);
         let old_encrypted_backup = self
             .wg_encrypted_private_key_path
             .as_ref()
-            .and_then(|path| fs::read(path).ok());
+            .and_then(|path| fs::read(path).ok())
+            .map(zeroize::Zeroizing::new);
         let old_public_backup = self
             .wg_public_key_path
             .as_ref()
@@ -11388,8 +11393,11 @@ struct DaemonRotationIo<'a> {
     outgoing_epoch: rustynet_control::key_rotation::RotationEpoch,
     outgoing_public_key_hex: String,
     watermark_at_rotation: u64,
-    old_runtime_backup: Option<Vec<u8>>,
-    old_encrypted_backup: Option<Vec<u8>>,
+    // AQ-115/F1: these two backups carry the outgoing plaintext WG private
+    // key (runtime copy) and its encrypted-at-rest form; `Zeroizing` wipes
+    // them on drop when the rotation IO scope ends.
+    old_runtime_backup: Option<zeroize::Zeroizing<Vec<u8>>>,
+    old_encrypted_backup: Option<zeroize::Zeroizing<Vec<u8>>>,
     old_public_backup: Option<String>,
     /// Captured by `prepare_swap` for inclusion in the success
     /// summary returned to the IPC caller.
@@ -11462,8 +11470,10 @@ impl<'a> RotationIo for DaemonRotationIo<'a> {
     fn rollback_key_write(&mut self) -> Result<(), rustynet_control::key_rotation::RotationError> {
         self.daemon
             .restore_key_backups(
-                self.old_runtime_backup.as_deref(),
-                self.old_encrypted_backup.as_deref(),
+                self.old_runtime_backup.as_deref().map(|key| key.as_slice()),
+                self.old_encrypted_backup
+                    .as_deref()
+                    .map(|key| key.as_slice()),
                 self.old_public_backup.as_deref(),
             )
             .map_err(rustynet_control::key_rotation::RotationError::KeyWriteFailed)
@@ -11480,7 +11490,11 @@ impl<'a> RotationIo for DaemonRotationIo<'a> {
         // path. `restore_key_backups` re-writes the prior runtime
         // private key AND re-applies it to the interface.
         self.daemon
-            .restore_key_backups(self.old_runtime_backup.as_deref(), None, None)
+            .restore_key_backups(
+                self.old_runtime_backup.as_deref().map(|key| key.as_slice()),
+                None,
+                None,
+            )
             .map_err(rustynet_control::key_rotation::RotationError::BackendApplyFailed)
     }
 
@@ -38521,5 +38535,42 @@ mod tests {
             super::DEFAULT_RELAY_FLEET_WATERMARK_PATH,
             "/var/lib/rustynet/rustynetd.relay-fleet.watermark"
         );
+    }
+}
+
+#[cfg(test)]
+mod rotation_io_backup_zeroizing_contract {
+    use super::DaemonRotationIo;
+
+    /// AQ-115/F1 field-type probe: resolves only while the rotation rollback
+    /// backups on `DaemonRotationIo` remain `Option<Zeroizing<Vec<u8>>>` so
+    /// the outgoing plaintext WG private key is wiped on drop even on the
+    /// success path. The probe is never called; taking a `fn` pointer to it
+    /// forces the signature (and thus the private field types it projects)
+    /// to resolve at compile time.
+    // Same reason as the key_material contract test: the spelled-out tuple IS the
+    // assertion, and the lint gate runs with -D warnings.
+    #[allow(clippy::type_complexity)]
+    fn backup_field_types<'a>(
+        io: &'a DaemonRotationIo<'a>,
+    ) -> (
+        &'a Option<zeroize::Zeroizing<Vec<u8>>>,
+        &'a Option<zeroize::Zeroizing<Vec<u8>>>,
+    ) {
+        (&io.old_runtime_backup, &io.old_encrypted_backup)
+    }
+
+    // The spelled-out higher-ranked fn pointer IS the assertion here too, so the
+    // complexity lint is allowed at this single test rather than crate-wide.
+    #[allow(clippy::type_complexity)]
+    #[test]
+    fn rotation_io_private_backups_are_zeroizing() {
+        let probe: for<'a> fn(
+            &'a DaemonRotationIo<'a>,
+        ) -> (
+            &'a Option<zeroize::Zeroizing<Vec<u8>>>,
+            &'a Option<zeroize::Zeroizing<Vec<u8>>>,
+        ) = backup_field_types;
+        let _ = probe;
     }
 }
