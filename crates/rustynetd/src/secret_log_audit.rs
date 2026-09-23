@@ -238,12 +238,17 @@ pub(crate) fn scan_source_for_forbidden_placeholders(body: &str) -> Vec<(usize, 
     hits
 }
 
-/// Mirrors the visibility grammar of
-/// `scan_source_for_secret_vocabulary_type_declarations`: an optional `pub`
-/// qualifier — plain, or `pub(<path>)` where `<path>` is non-empty and made
-/// of lowercase ASCII letters or spaces — followed by `struct `/`enum ` and
-/// the type name. Returns the text after the keyword, or `None` when the
-/// line is not a type declaration in that grammar.
+/// THE single shared type-declaration grammar (AQ-201 R3): an optional
+/// `pub` qualifier — plain, or `pub(<path>)` where `<path>` is non-empty
+/// and made of lowercase ASCII letters or spaces — followed by
+/// `struct `/`enum ` and the type name. Returns the text after the
+/// keyword, or `None` when the line is not a type declaration in that
+/// grammar. Both derive scanners and
+/// `scan_source_for_secret_vocabulary_type_declarations` call this
+/// function, so the grammar is written down exactly once. Documented
+/// limits (review R3, pinned by tests below): a second space after the
+/// visibility qualifier, and a raw-identifier type name (`r#…`), do not
+/// match.
 fn strip_type_decl_prefix(trimmed: &str) -> Option<&str> {
     let after_pub = trimmed.strip_prefix("pub").unwrap_or(trimmed);
     let after_visibility = if let Some(rest) = after_pub.strip_prefix('(') {
@@ -260,6 +265,20 @@ fn strip_type_decl_prefix(trimmed: &str) -> Option<&str> {
     after_visibility
         .strip_prefix("struct ")
         .or_else(|| after_visibility.strip_prefix("enum "))
+}
+
+/// AQ-201 R3: the ONE type-name extractor, shared by both derive scanners
+/// and the vocabulary scanner. ASCII by policy: Rust identifiers may be
+/// Unicode, but the audit registries and vocabulary tokens are ASCII, so
+/// the name ends at the first byte that is not ASCII alphanumeric or `_`.
+/// A Unicode-suffixed name (`PrivateKey\u{fc}`) is therefore read as its
+/// ASCII prefix and still matches the registry — the over-catch direction
+/// is the correct one for an audit scanner.
+fn extract_decl_type_name(after_keyword: &str) -> &str {
+    let end = after_keyword
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(after_keyword.len());
+    &after_keyword[..end]
 }
 
 /// `#[derive(... Debug ...)]` or `impl Debug for …` appears for a
@@ -284,16 +303,13 @@ pub(crate) fn scan_source_for_debug_on_secret_types(
             // Search forward for the next `struct`/`enum` name.
             for next in lines.iter().skip(idx + 1).take(4) {
                 if let Some(rest) = strip_type_decl_prefix(next.trim_start()) {
-                    // Extract just the type name (token up to space,
-                    // `<`, `{`, `(`).
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    if secret_type_names.iter().any(|t| *t == name) {
+                    // Extract just the type name via the shared ASCII
+                    // extractor (AQ-201 R3).
+                    let name = extract_decl_type_name(rest);
+                    if secret_type_names.contains(&name) {
                         hits.push((
                             idx + 1,
-                            name.clone(),
+                            name.to_owned(),
                             "derive(Debug) on secret-bearing type".to_owned(),
                         ));
                     }
@@ -809,7 +825,9 @@ const SECRET_VOCABULARY_NAME_TOKENS: &[&str] = &[
 /// `^(pub (…)? )?(struct|enum) [A-Za-z0-9_]+` where the optional
 /// `pub(…)` qualifier contains only lowercase ASCII letters/spaces, and
 /// exactly one space separates each element. Comment-only lines are
-/// skipped.
+/// skipped. AQ-201 R3: the grammar itself lives in
+/// `strip_type_decl_prefix` — this scanner delegates to it rather than
+/// keeping an inline copy.
 pub(crate) fn scan_source_for_secret_vocabulary_type_declarations(
     body: &str,
 ) -> Vec<(usize, String)> {
@@ -819,36 +837,12 @@ pub(crate) fn scan_source_for_secret_vocabulary_type_declarations(
         if trimmed.starts_with("//") || trimmed.starts_with("/*") {
             continue;
         }
-        let mut rest = trimmed;
-        if let Some(after_pub) = rest.strip_prefix("pub") {
-            let after_qualifier = if let Some(after_paren) = after_pub.strip_prefix('(') {
-                let Some(close) = after_paren.find(')') else {
-                    continue;
-                };
-                let inner = &after_paren[..close];
-                if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_lowercase() || c == ' ') {
-                    continue;
-                }
-                &after_paren[close + 1..]
-            } else {
-                after_pub
-            };
-            let Some(after_space) = after_qualifier.strip_prefix(' ') else {
-                continue;
-            };
-            rest = after_space;
-        }
-        let after_keyword = if let Some(r) = rest.strip_prefix("struct ") {
-            r
-        } else if let Some(r) = rest.strip_prefix("enum ") {
-            r
-        } else {
+        // AQ-201 R3: delegate to the ONE shared grammar instead of an
+        // inline copy of it (the drift risk the review called out).
+        let Some(after_keyword) = strip_type_decl_prefix(trimmed) else {
             continue;
         };
-        let name: String = after_keyword
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
+        let name = extract_decl_type_name(after_keyword);
         if name.is_empty() {
             continue;
         }
@@ -857,7 +851,7 @@ pub(crate) fn scan_source_for_secret_vocabulary_type_declarations(
             .iter()
             .any(|token| lowercase_name.contains(token))
         {
-            hits.push((idx + 1, name));
+            hits.push((idx + 1, name.to_owned()));
         }
     }
     hits
@@ -1044,14 +1038,11 @@ pub(crate) fn scan_source_for_display_on_secret_types(
         if trimmed.starts_with("#[") && trimmed.contains("derive(") && trimmed.contains("Display") {
             for next in body.lines().skip(idx + 1).take(4) {
                 if let Some(rest) = strip_type_decl_prefix(next.trim_start()) {
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    if secret_type_names.iter().any(|t| *t == name) {
+                    let name = extract_decl_type_name(rest);
+                    if secret_type_names.contains(&name) {
                         hits.push((
                             idx + 1,
-                            name.clone(),
+                            name.to_owned(),
                             "derive(Display) on secret-bearing type".to_owned(),
                         ));
                     }
@@ -3342,28 +3333,381 @@ fn every_secret_vocabulary_type_is_classified() {
 /// suppression only counts when there is live evidence that actually runs.
 /// Split out pure so negative controls below can prove the checker refuses,
 /// not merely accepts.
+///
+/// AQ-201 rework (review r60 F1-F5), fail closed on doubt. Two refusal
+/// rules, both resting on the blanking being sound, so the gate runs its
+/// own cross-line blanker (`WitnessBlankerState`) instead of the line-local
+/// `strip_string_literal_contents`: plain and raw string contents, char and
+/// byte-char literal contents, and line/block comment contents are blanked
+/// before any brace counting or needle search, with string/comment state
+/// carried across lines (a macro body may legally contain a multiline
+/// string or a nesting block comment, and a `}` inside one must not close
+/// the tracking early — the r60 F1 escape class, of which the reviewed
+/// `'}'` char literal was one instance).
+/// - R1: ANY `#[cfg…` attribute (`#[cfg(`, `#[cfg_attr(`, …) in the
+///   attribute run refuses the witness — whether the fn compiles depends
+///   on configuration the text gate cannot evaluate. The legitimate
+///   module-level `#[cfg(test)] mod tests` shape sits ABOVE the `mod`
+///   line, outside the run, and stays live.
+/// - R2: a fn whose definition line sits inside a `macro_rules!` body
+///   refuses. Tracking is ONE aggregate brace depth from the outermost
+///   definition: a `macro_rules!` body is a token tree, so its braces
+///   balance by construction once comments/strings/literals are blanked —
+///   which is also why a nested definition (r60 F2) must not reset the
+///   depth (its braces simply add) and why a single depth (no stack) is
+///   sufficient. A definition whose `{` sits on a later line (r60 F3)
+///   stays pending until depth turns positive, so its body is tracked.
+///   Over-catch directions are deliberate: a `macro_rules`-shaped mention
+///   outside a real definition cannot narrow refusal, only widen it.
+#[derive(Default)]
+struct WitnessBlankerState {
+    /// Inside a `/* … */` block comment that has not closed yet. Rust
+    /// block comments nest, so the closer scan tracks depth.
+    in_block_comment: bool,
+    /// Inside a string literal that did not terminate on its opening
+    /// line: plain (`"`, `\` escapes honoured) or raw (`r"…"`, `r#"…"#`;
+    /// hash count fixed by the opener, no escapes).
+    in_string: Option<WitnessStringState>,
+}
+
+#[derive(Clone, Copy)]
+enum WitnessStringState {
+    Plain,
+    /// The `usize` is the number of `#` after `r`/`br`.
+    Raw(usize),
+}
+
+/// Blank the contents of a char literal (`'x'`, `'\n'`, `'\''`) so its
+/// braces and quotes never reach brace counting (r60 F1: a verbatim `'}'`
+/// inside a `macro_rules!` body closed the tracking one rule early, and
+/// `b'}'` fared the same through the byte-string shortcut). Recognition
+/// mirrors `strip_string_literal_contents`: escape form `'\x'` (4 chars)
+/// or plain form `'x'` (3 chars); anything else — a lifetime tick, or
+/// `'\u{7d}'`, whose single `\u{…}` brace pair is self-balancing and thus
+/// nets zero — passes through one char at a time.
+fn blank_char_literal_contents(chars: &[char], out: &mut String, i: &mut usize) {
+    let n = chars.len();
+    let escape_form = *i + 4 <= n && chars[*i + 1] == '\\' && chars[*i + 3] == '\'';
+    let plain_form = *i + 3 <= n && chars[*i + 1] != '\\' && chars[*i + 2] == '\'';
+    out.push('\'');
+    if escape_form {
+        out.push(' ');
+        out.push(' ');
+        out.push('\'');
+        *i += 4;
+    } else if plain_form {
+        out.push(' ');
+        out.push('\'');
+        *i += 3;
+    } else {
+        *i += 1;
+    }
+}
+
+impl WitnessBlankerState {
+    /// Blank one line: string/comment/literal CONTENTS become spaces,
+    /// delimiters and code survive (comment tails are dropped — nothing
+    /// after `//` is code). Cross-line state (open block comment,
+    /// unterminated string) is updated, so a `}`, a quote, or a
+    /// `fn name(` inside a multiline literal or comment can never be
+    /// counted or matched.
+    fn blank_line(&mut self, line: &str) -> String {
+        let chars: Vec<char> = line.chars().collect();
+        let n = chars.len();
+        let mut out = String::with_capacity(line.len());
+        let mut i = 0usize;
+        if self.in_block_comment {
+            let mut depth = 1usize;
+            while i < n && depth > 0 {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    out.push(' ');
+                    out.push(' ');
+                    i += 2;
+                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    if depth == 0 {
+                        out.push('*');
+                        out.push('/');
+                    } else {
+                        out.push(' ');
+                        out.push(' ');
+                    }
+                    i += 2;
+                } else {
+                    out.push(' ');
+                    i += 1;
+                }
+            }
+            if depth > 0 {
+                return out;
+            }
+            self.in_block_comment = false;
+        }
+        if let Some(state) = self.in_string {
+            let mut closed = false;
+            match state {
+                WitnessStringState::Plain => {
+                    while i < n {
+                        if chars[i] == '\\' {
+                            out.push(' ');
+                            if i + 1 < n {
+                                out.push(' ');
+                            }
+                            i = (i + 2).min(n);
+                            continue;
+                        }
+                        let c = chars[i];
+                        i += 1;
+                        if c == '"' {
+                            out.push('"');
+                            closed = true;
+                            break;
+                        }
+                        out.push(' ');
+                    }
+                }
+                WitnessStringState::Raw(hashes) => {
+                    while i < n {
+                        let c = chars[i];
+                        i += 1;
+                        if c == '"'
+                            && chars[i..].len() >= hashes
+                            && chars[i..].iter().take(hashes).all(|&h| h == '#')
+                        {
+                            out.push('"');
+                            for _ in 0..hashes {
+                                out.push('#');
+                            }
+                            i += hashes;
+                            closed = true;
+                            break;
+                        }
+                        out.push(' ');
+                    }
+                }
+            }
+            if !closed {
+                return out;
+            }
+            self.in_string = None;
+        }
+        while i < n {
+            match chars[i] {
+                '"' => {
+                    out.push('"');
+                    i += 1;
+                    let mut closed = false;
+                    while i < n {
+                        if chars[i] == '\\' {
+                            out.push(' ');
+                            if i + 1 < n {
+                                out.push(' ');
+                            }
+                            i = (i + 2).min(n);
+                            continue;
+                        }
+                        let c = chars[i];
+                        i += 1;
+                        if c == '"' {
+                            out.push('"');
+                            closed = true;
+                            break;
+                        }
+                        out.push(' ');
+                    }
+                    if !closed {
+                        self.in_string = Some(WitnessStringState::Plain);
+                    }
+                }
+                c @ ('r' | 'b') => {
+                    let prev_is_ident =
+                        i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
+                    let mut j = i + 1;
+                    if c == 'b' {
+                        if chars.get(j) == Some(&'r') {
+                            j += 1;
+                        } else if chars.get(j) == Some(&'\'') {
+                            // Byte char literal `b'x'` / `b'\n'` (r60 F1):
+                            // same blanking as a char literal.
+                            out.push('b');
+                            i += 1;
+                            blank_char_literal_contents(&chars, &mut out, &mut i);
+                            continue;
+                        } else {
+                            // Plain byte string `b"…"`: its quote is
+                            // handled by the string arm next iteration.
+                            out.push(c);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    let mut hashes = 0usize;
+                    while chars.get(j) == Some(&'#') {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if !prev_is_ident && chars.get(j) == Some(&'"') {
+                        out.extend(&chars[i..=j]);
+                        i = j + 1;
+                        let mut closed = false;
+                        while i < n {
+                            if chars[i] == '"'
+                                && chars[i + 1..].len() >= hashes
+                                && chars[i + 1..].iter().take(hashes).all(|&h| h == '#')
+                            {
+                                out.push('"');
+                                for _ in 0..hashes {
+                                    out.push('#');
+                                }
+                                i += 1 + hashes;
+                                closed = true;
+                                break;
+                            }
+                            out.push(' ');
+                            i += 1;
+                        }
+                        if !closed {
+                            self.in_string = Some(WitnessStringState::Raw(hashes));
+                        }
+                    } else {
+                        out.push(c);
+                        i += 1;
+                    }
+                }
+                '\'' => blank_char_literal_contents(&chars, &mut out, &mut i),
+                '/' => match chars.get(i + 1) {
+                    Some('/') => break,
+                    Some('*') => {
+                        let mut depth = 1usize;
+                        i += 2;
+                        while i < n && depth > 0 {
+                            if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                                depth += 1;
+                                i += 2;
+                            } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                                depth -= 1;
+                                i += 2;
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        if depth > 0 {
+                            self.in_block_comment = true;
+                        }
+                    }
+                    _ => {
+                        out.push('/');
+                        i += 1;
+                    }
+                },
+                other => {
+                    out.push(other);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+}
+
+/// True when the blanked line opens a macro DEFINITION: `macro_rules`
+/// followed by optional whitespace and `!`. The whitespace form
+/// (`macro_rules !`) is legal Rust, so a plain `contains("macro_rules!")`
+/// misses it (the original patch's detection). Word-boundary checked on
+/// the left so an identifier mentioning the word cannot trigger it; a
+/// false-positive trigger can only widen refusal, never narrow it.
+fn line_opens_macro_rules_definition(blanked: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(rel) = blanked[from..].find("macro_rules") {
+        let start = from + rel;
+        let end = start + "macro_rules".len();
+        let boundary_before = start == 0
+            || !blanked[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_');
+        if boundary_before && blanked[end..].trim_start().starts_with('!') {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// True when the BLANKED line consists solely of `#[ … ]` attribute
+/// groups separated by whitespace (brackets matched on the blanked text,
+/// so a `]` inside an attribute's string literal cannot end a group
+/// early, and a trailing `//` comment has already been dropped). A
+/// `#[`-prefixed line with trailing code — e.g. `#[test] fn a() {}` — is
+/// refused by the caller: consuming such a line as "attribute run" would
+/// let a one-line test grant liveness to an unrelated fn directly below
+/// it (pre-existing at HEAD, found during this rework).
+fn attr_line_is_attributes_only(blanked: &str) -> bool {
+    let chars: Vec<char> = blanked.trim().chars().collect();
+    let n = chars.len();
+    let mut i = 0usize;
+    while i < n {
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if chars[i] != '#' || chars.get(i + 1) != Some(&'[') {
+            return false;
+        }
+        let mut depth = 1usize;
+        i += 2;
+        while i < n && depth > 0 {
+            match chars[i] {
+                '[' => depth += 1,
+                ']' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if depth > 0 {
+            return false;
+        }
+    }
+    true
+}
+
 fn live_witness_test_in_source(file_body: &str, witness_test_name: &str) -> bool {
     let needle = format!("fn {witness_test_name}(");
     let lines: Vec<&str> = file_body.lines().collect();
-    let mut in_block_comment = false;
-    for (idx, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if in_block_comment {
-            if trimmed.contains("*/") {
-                in_block_comment = false;
+    let mut blanker = WitnessBlankerState::default();
+    let blanked_lines: Vec<String> = lines.iter().map(|l| blanker.blank_line(l)).collect();
+    // AQ-201 R2: ONE aggregate brace depth for the current `macro_rules!`
+    // definition. A nested definition (r60 F2) must NOT reset the depth —
+    // its braces simply add — and a definition whose `{` sits on a later
+    // line (r60 F3) stays pending (`macro_body_opened == false`) until
+    // depth turns positive, so its body is tracked. `macro_body_opened`
+    // is set as soon as a line contributes any `{`, so a one-liner body
+    // still closes at end of line.
+    let mut in_macro_rules = false;
+    let mut macro_brace_depth: usize = 0;
+    let mut macro_body_opened = false;
+    for (idx, blanked) in blanked_lines.iter().enumerate() {
+        let macro_started_here = line_opens_macro_rules_definition(blanked);
+        if macro_started_here && !in_macro_rules {
+            in_macro_rules = true;
+            macro_brace_depth = 0;
+            macro_body_opened = false;
+        }
+        if in_macro_rules {
+            let opens = blanked.matches('{').count();
+            let closes = blanked.matches('}').count();
+            macro_brace_depth = macro_brace_depth
+                .saturating_add(opens)
+                .saturating_sub(closes);
+            if opens > 0 {
+                macro_body_opened = true;
             }
-            continue;
-        }
-        if trimmed.starts_with("//") {
-            continue;
-        }
-        if let Some(after_open) = trimmed.strip_prefix("/*") {
-            if !after_open.contains("*/") {
-                in_block_comment = true;
+            if macro_brace_depth == 0 && macro_body_opened {
+                in_macro_rules = false;
+                macro_body_opened = false;
             }
-            continue;
         }
-        let blanked = strip_string_literal_contents(line);
         let Some(pos) = blanked.find(needle.as_str()) else {
             continue;
         };
@@ -3375,16 +3719,43 @@ fn live_witness_test_in_source(file_body: &str, witness_test_name: &str) -> bool
         {
             continue;
         }
+        // AQ-201 R2: the needle sits inside a `macro_rules!` body (or on
+        // the definition's own line) — refuse, fail closed.
+        if in_macro_rules || macro_started_here {
+            return false;
+        }
         // Definition found on a live code line; require the contiguous
-        // attribute run directly above it to carry #[test] and no #[ignore].
+        // attribute run directly above it to carry #[test] and no
+        // #[ignore].
         let mut saw_test = false;
         let mut ignored = false;
         let mut run = idx;
         while run > 0 {
             run -= 1;
             let attr = lines[run].trim();
+            // AQ-201 rework r60 F4: `///`/`//!` doc comments ARE attributes
+            // (`#[doc = …]`) and attach to the item below, so they must not
+            // break the run. They also cannot open an escape: a line whose
+            // first non-whitespace is `///` or `//!` is entirely comment by
+            // the lexer, so it can neither carry code nor be read as an
+            // attribute (its text is skipped unread), and with the
+            // attributes-only rule below the run can only bridge comment
+            // gaps onto real attribute groups of the very item the
+            // witness fn is. `/** … */` block docs still break the run —
+            // fail closed, documented limit.
+            if attr.starts_with("///") || attr.starts_with("//!") {
+                continue;
+            }
             if !attr.starts_with("#[") {
                 break;
+            }
+            if !attr_line_is_attributes_only(&blanked_lines[run]) {
+                return false;
+            }
+            // AQ-201 R1: refuse on ANY cfg-shaped attribute in the run —
+            // the gate cannot evaluate configuration, so doubt refuses.
+            if attr.starts_with("#[cfg") {
+                return false;
             }
             if attr.starts_with("#[test") {
                 saw_test = true;
@@ -3475,6 +3846,356 @@ fn witness_liveness_checker_refuses_dead_witnesses() {
         "\nfn unrelated_other_test() {}\n",
         "some_witness"
     ));
+}
+
+#[test]
+fn witness_liveness_checker_refuses_cfg_gated_witnesses() {
+    // AQ-201 R1 (review probe w3, proven at gate level): a `#[cfg(any())]`
+    // witness never compiles, yet the old walk only looked for #[test] /
+    // #[ignore] and counted it live, keeping the redacting-impl
+    // suppression green. Any `#[cfg…` attribute in the run refuses (fail
+    // closed).
+    let cfg_after_test = "\n#[test]\n#[cfg(any())]\nfn some_witness() {}\n";
+    assert!(
+        !live_witness_test_in_source(cfg_after_test, "some_witness"),
+        "cfg-gated witness below #[test] must be refused"
+    );
+
+    let cfg_before_test = "\n#[cfg(any())]\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        !live_witness_test_in_source(cfg_before_test, "some_witness"),
+        "cfg-gated witness above #[test] must be refused"
+    );
+
+    let cfg_attr = "\n#[test]\n#[cfg_attr(test, ignore)]\nfn some_witness() {}\n";
+    assert!(
+        !live_witness_test_in_source(cfg_attr, "some_witness"),
+        "cfg_attr in the run must refuse (configuration-dependent semantics)"
+    );
+
+    // A fn-level `#[cfg(test)]` is refused too: whether the fn exists
+    // still depends on configuration the text gate cannot evaluate.
+    // Witness fns belong inside a `#[cfg(test)] mod` block — the
+    // module-level cfg sits above the `mod` line, outside the run.
+    let cfg_test_fn_level = "\n#[cfg(test)]\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        !live_witness_test_in_source(cfg_test_fn_level, "some_witness"),
+        "fn-level cfg(test) must refuse (configuration-dependent existence)"
+    );
+
+    // Regression witness for the legitimate shape: module-level cfg above
+    // the enclosing mod must stay live.
+    let module_cfg = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn some_witness() {}\n}\n";
+    assert!(
+        live_witness_test_in_source(module_cfg, "some_witness"),
+        "module-level #[cfg(test)] mod must keep its witnesses live"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_macro_defined_witnesses() {
+    // AQ-201 R2 (review probe w4): a fn inside a never-invoked
+    // `macro_rules!` body is not evidence that the test exists — whether
+    // it exists depends on invocation the text scanner cannot resolve, so
+    // refusal is the fail-closed choice (chosen over documenting a limit).
+    let in_macro = "\nmacro_rules! witness_shim {\n    #[test]\n    fn some_witness() {}\n}\n";
+    assert!(
+        !live_witness_test_in_source(in_macro, "some_witness"),
+        "witness inside a macro_rules! body must be refused"
+    );
+
+    let in_macro_one_line = "\nmacro_rules! shim { #[test] fn some_witness() {} }\n";
+    assert!(
+        !live_witness_test_in_source(in_macro_one_line, "some_witness"),
+        "same-line macro_rules! body must be refused"
+    );
+
+    // A CLOSED macro elsewhere must not suppress a witness defined after
+    // it: the brace tracking has to return to depth 0.
+    let macro_then_witness =
+        "\nmacro_rules! shim {\n    fn helper() {}\n}\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(macro_then_witness, "some_witness"),
+        "a closed macro_rules! must not suppress later live witnesses"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_nested_macro_rules_bodies() {
+    // r60 F2 (probe EA1): a nested `macro_rules!` definition inside an
+    // open body must not reset the depth — the outer body stays tracked
+    // until the OUTERMOST brace closes.
+    let nested = "\nmacro_rules! outer {\n    () => {};\n    macro_rules! inner {\n        () => {};\n    }\n    #[test]\n    fn some_witness() {}\n}\n";
+    assert!(
+        !live_witness_test_in_source(nested, "some_witness"),
+        "witness after a nested macro_rules! inside the outer body must be refused"
+    );
+
+    // The outer body really does close: a witness after it stays live.
+    let nested_then_live = "\nmacro_rules! outer {\n    macro_rules! inner {\n        () => {};\n    }\n}\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(nested_then_live, "some_witness"),
+        "a witness after the outermost body closes must stay live"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_tracks_macro_brace_on_next_line() {
+    // r60 F3 (probe EA2): `macro_rules! name` with the body brace on a
+    // later line (legal Rust, not rustfmt output) stays pending and the
+    // body IS tracked.
+    let pending = "\nmacro_rules! shim\n{\n    #[test]\n    fn some_witness() {}\n}\n";
+    assert!(
+        !live_witness_test_in_source(pending, "some_witness"),
+        "a definition whose braces start on the next line must still be tracked"
+    );
+
+    // ... and after the pending body closes, witnesses are live again.
+    let after = "\nmacro_rules! shim\n{\n    () => {};\n}\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(after, "some_witness"),
+        "a pending-open macro must close normally once its braces balance"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_blanks_char_literals_for_macro_depth() {
+    // r60 F1 (probe EA3, gate plant 3): a `'}'` char literal inside a
+    // macro body must not deflate the depth and close the body early.
+    let char_close = "\nmacro_rules! shim {\n    () => {\n        let c = '}';\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
+    assert!(
+        !live_witness_test_in_source(char_close, "some_witness"),
+        "a '}}' char literal must not close a macro body early"
+    );
+
+    // The mirror image is fail-closed: a `'{'` must not wedge the tracker
+    // open forever — a witness after the real close stays live.
+    let char_open = "\nmacro_rules! shim {\n    () => {\n        let c = '{';\n    };\n}\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(char_open, "some_witness"),
+        "a '{{' char literal must not wedge the macro tracking open"
+    );
+
+    // Escaped-quote and byte char literals too.
+    let escaped_and_byte = "\nmacro_rules! shim {\n    () => {\n        let q = '\\'';\n        let b = b'}';\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
+    assert!(
+        !live_witness_test_in_source(escaped_and_byte, "some_witness"),
+        "escaped quote and byte b'}}' literals must be blanked for depth counting"
+    );
+
+    // A unicode-escape char literal carries exactly one self-balancing
+    // `\u{…}` pair, so it nets zero: it neither closes the body early nor
+    // wedges it open.
+    let unicode_escape = "\nmacro_rules! shim {\n    () => {\n        let c = '\\u{7d}';\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
+    assert!(
+        !live_witness_test_in_source(unicode_escape, "some_witness"),
+        "balanced unicode-escape braces inside a char literal must net zero"
+    );
+    let unicode_escape_after = "\nmacro_rules! shim {\n    () => {\n        let c = '\\u{7d}';\n    };\n}\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(unicode_escape_after, "some_witness"),
+        "a macro whose extra braces are balanced must close on its real brace"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_blanks_multiline_strings_inside_macro_bodies() {
+    // r60 F1 completion: a `}` inside a MULTILINE string (plain or raw)
+    // is content, not a brace — line-local blanking cannot see this; the
+    // blanker carries the string state across lines.
+    let plain_multiline = "\nmacro_rules! shim {\n    () => {\n        let s = \"\n}\n\";\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
+    assert!(
+        !live_witness_test_in_source(plain_multiline, "some_witness"),
+        "a brace inside a multiline plain string must not close the body early"
+    );
+
+    let raw_multiline = "\nmacro_rules! shim {\n    () => {\n        let s = r#\"\n}\n\"#;\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
+    assert!(
+        !live_witness_test_in_source(raw_multiline, "some_witness"),
+        "a brace inside a multiline raw string must not close the body early"
+    );
+
+    // After the strings terminate normally, tracking still closes.
+    let closes_normally = "\nmacro_rules! shim {\n    () => {\n        let s = \"\n}\n\";\n    };\n}\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(closes_normally, "some_witness"),
+        "multiline strings must terminate tracking state when they close"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_blanks_multiline_block_comments_inside_macro_bodies() {
+    // r60 F1 completion: block comments nest and may span lines inside a
+    // macro body; braces inside them are content.
+    let block_comment = "\nmacro_rules! shim {\n    /* outer /* nested */ still\n       comment } content\n    */\n    () => {};\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
+    assert!(
+        !live_witness_test_in_source(block_comment, "some_witness"),
+        "braces inside a spanning nested block comment must not affect macro depth"
+    );
+
+    let comment_closes = "\nmacro_rules! shim {\n    /* comment\n       }} content\n    */\n    () => {};\n}\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(comment_closes, "some_witness"),
+        "a macro whose comment braces are blanked must close on its real brace"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_whitespace_before_macro_bang() {
+    // Detection hardening: `macro_rules !` with whitespace before the
+    // bang is legal Rust; the original patch's `contains("macro_rules!")`
+    // missed it, leaving the body untracked.
+    let spaced = "\nmacro_rules ! shim {\n    #[test]\n    fn some_witness() {}\n}\n";
+    assert!(
+        !live_witness_test_in_source(spaced, "some_witness"),
+        "macro_rules ! (space before bang) must still open macro tracking"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_sees_doc_comment_between_attributes() {
+    // r60 F4 (probe EA5): `///` doc comments ARE attributes and attach to
+    // the item below; the run must skip them, not break on them.
+    let doc_between = "\n#[test]\n/// docs for the witness\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(doc_between, "some_witness"),
+        "a doc comment between #[test] and the fn must not break the run"
+    );
+
+    let inner_doc = "\n#[test]\n//! inner docs\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(inner_doc, "some_witness"),
+        "an inner doc comment between attrs and the fn must not break the run"
+    );
+
+    // A doc comment CANNOT smuggle liveness: its text is never read as an
+    // attribute, so cfg/ignore/test-shaped text inside it is inert.
+    let doc_poison = "\n#[test]\n/// #[cfg(any())] #[ignore] fn decoy(\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(doc_poison, "some_witness"),
+        "doc-comment text must be inert for the attribute run"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_hybrid_attr_code_lines_in_run() {
+    // Hardening found during the rework (pre-existing at HEAD): the run
+    // consumed `#[test] fn a() {}` as an "attribute" line, so a one-line
+    // test granted liveness to an unrelated fn below it. A `#[`-prefixed
+    // line that is not attributes-only now REFUSES (fail closed).
+    let bridge = "\n#[test] fn unrelated_test() {}\nfn some_witness() {}\n";
+    assert!(
+        !live_witness_test_in_source(bridge, "some_witness"),
+        "a one-line test must not grant liveness to the fn below it"
+    );
+
+    let doc_bridge = "\n#[test] fn unrelated_test() {}\n/// docs\nfn some_witness() {}\n";
+    assert!(
+        !live_witness_test_in_source(doc_bridge, "some_witness"),
+        "a doc comment must not bridge across a hybrid attr+code line"
+    );
+
+    // An attributes-only run stays live, including multi-attribute and
+    // trailing-comment shapes.
+    let multi_attr = "\n#[test]\n#[should_panic]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(multi_attr, "some_witness"),
+        "an attributes-only run stays live"
+    );
+
+    let trailing_comment = "\n#[test] // the witness\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(trailing_comment, "some_witness"),
+        "a trailing comment on an attribute line must not break the run"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_macro_mention_in_comment_or_string_stays_live() {
+    // r60 probes EA10/EA11 pinning: a macro_rules!-shaped mention in a
+    // comment or string, or a witness defined BEFORE a poison-shaped
+    // macro, must stay live.
+    let comment_poison = "\n// macro_rules! poison {\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(comment_poison, "some_witness"),
+        "a macro_rules mention inside a comment must not open tracking"
+    );
+
+    let string_poison =
+        "\nconst POISON: &str = \"macro_rules! shim {\";\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(string_poison, "some_witness"),
+        "a macro_rules mention inside a string must not open tracking"
+    );
+
+    let witness_before =
+        "\n#[test]\nfn some_witness() {}\n\nmacro_rules! poison {\n    fn not_a_test() {}\n}\n";
+    assert!(
+        live_witness_test_in_source(witness_before, "some_witness"),
+        "a witness defined before a macro must stay live"
+    );
+}
+
+#[test]
+fn derive_scanner_name_extraction_is_ascii() {
+    // AQ-201 R3: the derive scanners extracted names with Unicode
+    // `is_alphanumeric`, so `PrivateKey<uuml>` extracted as one name that
+    // never matched the ASCII registry — the type escaped every scanner.
+    // The shared ASCII extractor stops at the non-ASCII byte, so the
+    // registry name still matches (over-catch is the safe direction for
+    // an audit scanner).
+    let debug_body = "#[derive(Debug)]\npub struct PrivateKey\u{fc} {}\n";
+    let debug_hits = scan_source_for_debug_on_secret_types(debug_body, &["PrivateKey"]);
+    assert!(
+        debug_hits.iter().any(|(_, n, _)| n == "PrivateKey"),
+        "Unicode-suffixed secret type must still surface (debug): {debug_hits:?}"
+    );
+
+    let display_body = "#[derive(Display)]\npub struct PrivateKey\u{fc} {}\n";
+    let display_hits = scan_source_for_display_on_secret_types(display_body, &["PrivateKey"]);
+    assert!(
+        display_hits.iter().any(|(_, n, _)| n == "PrivateKey"),
+        "Unicode-suffixed secret type must still surface (display): {display_hits:?}"
+    );
+}
+
+#[test]
+fn decl_scanners_documented_limit_double_space_after_visibility() {
+    // AQ-201 R3, documented limit (review probe p8): a second space after
+    // the visibility qualifier (`pub(crate)  struct`) matches no scanner —
+    // the shared grammar requires exactly one separating space. Pinned
+    // here so the limit stays a recorded decision, not an accident;
+    // widening the grammar is an owner question (review §7.3), not taken.
+    let vocab_body = "pub(crate)  struct FooPrivateKey {}\n";
+    assert!(
+        scan_source_for_secret_vocabulary_type_declarations(vocab_body).is_empty(),
+        "double-space shape is a documented limit; if this fires the grammar widened"
+    );
+
+    let derive_body = "#[derive(Debug)]\npub(crate)  struct PrivateKey {}\n";
+    assert!(
+        scan_source_for_debug_on_secret_types(derive_body, &["PrivateKey"]).is_empty(),
+        "double-space shape is a documented limit; if this fires the grammar widened"
+    );
+}
+
+#[test]
+fn decl_scanners_documented_limit_raw_identifier_name() {
+    // AQ-201 R3, documented limit (review probe p6): a raw-identifier type
+    // name (`r#…`) matches no scanner — the shared extractor reads only
+    // `r` before the `#` stops it. Pinned as a recorded decision; raw-ident
+    // awareness is an owner question (review §7.3), not taken.
+    let vocab_body = "pub struct r#secret_key {}\n";
+    assert!(
+        scan_source_for_secret_vocabulary_type_declarations(vocab_body).is_empty(),
+        "raw-ident shape is a documented limit; if this fires the extractor widened"
+    );
+
+    let derive_body = "#[derive(Debug)]\npub struct r#secret_key {}\n";
+    assert!(
+        scan_source_for_debug_on_secret_types(derive_body, &["secret_key"]).is_empty(),
+        "raw-ident shape is a documented limit; if this fires the extractor widened"
+    );
 }
 
 #[test]
