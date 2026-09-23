@@ -1,11 +1,31 @@
 //! X3 — static no-secret-leakage audit.
 //!
-//! The verifier sweeps the rustynetd + rustynet-cli source tree at test
-//! time and looks for log/print/format call-sites whose format args
-//! interpolate a known secret-bearing identifier (passphrase bytes, a
-//! private-key byte array, a runtime token, etc.). The audit runs as
-//! a regular `cargo test` so any regression that adds a new offender
-//! lands as a named test failure, not a silent leak.
+//! The verifier sweeps EVERY workspace member crate's `src/` tree at
+//! test time and looks for log/print/format call-sites whose format
+//! args interpolate a known secret-bearing identifier (passphrase
+//! bytes, a private-key byte array, a runtime token, etc.). The audit
+//! runs as a regular `cargo test` so any regression that adds a new
+//! offender lands as a named test failure, not a silent leak.
+//!
+//! # Audit scope (AQ-141)
+//!
+//! The audited roots are ALL cargo workspace member crates listed in
+//! the root `Cargo.toml` (`audited_source_roots` /
+//! `WORKSPACE_MEMBER_CRATE_DIRS`), enforced against drift by
+//! `audited_roots_track_workspace_membership`. A GREEN run of these
+//! gates means exactly: "these scanners found nothing under these
+//! roots" — it is NOT a claim about code outside the workspace:
+//! `third_party/` (vendored path deps), `gui/`,
+//! `crates/rustynet-lab-monitor/`, and `fuzz/` are NOT workspace
+//! members (the root manifest `exclude`s the first two; the others
+//! declare their own workspaces) and are NOT audited here. Widening
+//! the scope was AQ-141: before it, the audit walked only 5 crates
+//! while the AQ-108 v2 display sweep found secret-bearing Debug
+//! surfaces in crates the audit never visited (notably
+//! `rustynet-backend-wireguard` and `rustynet-llm-gateway`). Two
+//! sibling sweeps keep their own, separately documented roots: the
+//! secret-equality sweep and the deprecated-crypto-import sweep —
+//! their scope statements live on their own sweep functions.
 //!
 //! Two complementary forms of detection:
 //!
@@ -74,21 +94,57 @@ const LOG_MACRO_NAMES: &[&str] = &[
     "info", "warn", "error", "debug", "trace",
 ];
 
-/// Source roots to walk during the audit. Kept narrow on purpose —
-/// the audit pins the daemon's own log surface; CLI binaries and
-/// shared crates have their own gates (e.g. the existing structured
-/// logger redaction tests in `rustynet-control`).
+/// Cargo-workspace member crate directories, as listed in the root
+/// `Cargo.toml` `members` array. This is the single in-file source of
+/// truth for the audit's scope; `audited_source_roots` derives the
+/// walked directories from it and
+/// `audited_roots_track_workspace_membership` cross-checks it against
+/// the manifest itself so a newly added workspace member cannot ship
+/// unaudited (AQ-141). Deliberately NOT here (not workspace members,
+/// separately gated): `gui`, `crates/rustynet-lab-monitor` (both
+/// `exclude`d in the root manifest), `fuzz` (own workspace), and
+/// `third_party/*` (vendored path deps).
+const WORKSPACE_MEMBER_CRATE_DIRS: &[&str] = &[
+    "crates/rustynet-dns-zone",
+    "crates/rustynet-local-security",
+    "crates/rustynet-control",
+    "crates/rustynetd",
+    "crates/rustynet-cli",
+    "crates/rustynet-relay",
+    "crates/rustynet-nas",
+    "crates/rustynet-llm-gateway",
+    "crates/rustynet-policy",
+    "crates/rustynet-advisor",
+    "crates/rustynet-crypto",
+    "crates/rustynet-windows-native",
+    "crates/rustynet-backend-api",
+    "crates/rustynet-backend-wireguard",
+    "crates/rustynet-backend-stub",
+    "crates/rustynet-backend-userspace",
+    "crates/rustynet-sysinfo",
+    "crates/rustynet-operator",
+    "crates/rustynet-mcp",
+    "crates/rustynet-xtask",
+    "crates/rustynet-netns-probe",
+];
+
+/// Source roots to walk during the audit: every cargo workspace member
+/// crate's `src/` tree (AQ-141). The list was previously only the five
+/// crates that historically held most secret material — the AQ-108 v2
+/// display sweep (2026-09-22) found secret-bearing Debug surfaces in
+/// workspace crates the audit never visited (12 findings suite-wide,
+/// ten outside these roots, including `rustynet-backend-wireguard`'s
+/// `WindowsWireguardBackend` holding `runtime_private_key` behind a
+/// derived Debug and `rustynet-llm-gateway`'s `SessionToken`) — a gap
+/// INSIDE the crate family this audit claims to cover. Keeping an
+/// explicit, cited list (rather than walking `crates/` dynamically)
+/// keeps the scope auditable in review; the liveness test below keeps
+/// the list from drifting out of sync with the manifest.
 fn audited_source_roots(workspace_root: &Path) -> Vec<PathBuf> {
-    vec![
-        workspace_root.join("crates/rustynetd/src"),
-        workspace_root.join("crates/rustynet-cli/src"),
-        // RSA-0026: extend the placeholder / Debug / Display sweep to the
-        // secret-handling crates that were previously out of scope (these hold
-        // the key, token and signing material the gate is meant to protect).
-        workspace_root.join("crates/rustynet-crypto/src"),
-        workspace_root.join("crates/rustynet-control/src"),
-        workspace_root.join("crates/rustynet-relay/src"),
-    ]
+    WORKSPACE_MEMBER_CRATE_DIRS
+        .iter()
+        .map(|dir| workspace_root.join(dir).join("src"))
+        .collect()
 }
 
 /// Files allow-listed from the placeholder scan. The audit module
@@ -322,6 +378,8 @@ const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     "BlindRelayHelloV2", // crates/rustynet-control/src/blind_relay.rs:1009 — hello nonce+signature
     // rustynet-relay
     "AddressValidationKeyRing", // crates/rustynet-relay/src/blind_relay_listener.rs:374 — HMAC keys (Zeroizing<[u8;32]>)
+    // rustynet-llm-gateway
+    "SessionToken", // crates/rustynet-llm-gateway/src/session.rs:74 — derive(Debug) prints the FULL wire form (payload + ed25519 signature) = usable bearer material; sibling RelaySessionToken (control lib.rs:1756) redacts instead. Registered by the AQ-141 whole-workspace scope extension; the redacting impl is the live follow-up and no_debug_derives_on_canonical_secret_types stays red until it lands.
 ];
 
 /// Canonical secret-bearing type names whose `Display`/`ToString` exposure is
@@ -347,6 +405,8 @@ const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[
     "BlindRelayHelloV2",       // crates/rustynet-control/src/blind_relay.rs:1009
     // rustynet-relay
     "AddressValidationKeyRing", // crates/rustynet-relay/src/blind_relay_listener.rs:374
+    // rustynet-llm-gateway
+    "SessionToken", // crates/rustynet-llm-gateway/src/session.rs:74 — forward guard: no Display/ToString today; never add one unreviewed (AQ-141)
 ];
 
 /// Reviewed `(type_name, path_suffix, justification, witness_test)` entries
@@ -435,6 +495,18 @@ const REVIEWED_REDACTING_DEBUG_IMPLS: &[(&str, &str, &str, &str)] = &[
         "crates/rustynet-relay/src/blind_relay_listener.rs",
         "Debug prints only epoch+key count; the HMAC keys are Zeroizing<[u8;32]> (decl :374, impl :379)",
         "address_validation_key_ring_debug_redacts_hmac_keys",
+    ),
+    (
+        "WindowsWireguardBackend",
+        "crates/rustynet-backend-wireguard/src/windows_command.rs",
+        "Debug redacts the in-memory decrypted WireGuard runtime_private_key and the runner; paths, port, peers/routes counts and context are non-secret (decl windows_command.rs:27, impl :51)",
+        "windows_backend_debug_redacts_runtime_private_key",
+    ),
+    (
+        "SessionToken",
+        "crates/rustynet-llm-gateway/src/session.rs",
+        "Debug keeps peer/audience/expiry metadata and redacts the ed25519 signature (decl session.rs:74, impl :82)",
+        "session_token_debug_redacts_signature",
     ),
 ];
 
@@ -638,6 +710,11 @@ const REVIEWED_SECRET_VOCABULARY_TYPE_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "crates/rustynet-relay/src/transport.rs",
         "replay-window store of SEEN wire nonces (decl transport.rs:1150); derives Default only, carries no Debug/Display impl, tracks nonces already observed (AQ-126 nonce-vocabulary widening)",
     ),
+    (
+        "SessionTokenError",
+        "crates/rustynet-llm-gateway/src/session.rs",
+        "error enum (decl session.rs:29); Debug carries only static strings, a u64 clock reading, and a &'static str field name; Display prints static verdict text (AQ-141 workspace-scope classification)",
+    ),
 ];
 
 /// Returns true iff a scanner hit on `name` with reason `why` in file
@@ -705,6 +782,9 @@ fn vocabulary_type_is_classified(name: &str, file_path_label: &str) -> bool {
 ///   derives `Debug` over a 32-byte `circuit_handle`;
 /// - `EncryptedKeyBlob` (crates/rustynet-crypto/src/lib.rs) derives `Debug`
 ///   over `nonce: [u8; 24]` plus ciphertext.
+/// - `AeadSealedBlob` (crates/rustynet-crypto/src/lib.rs) derives `Debug`
+///   over `nonce: [u8; 24]` plus ciphertext — same sealed-blob shape, named
+///   for no vocabulary token (AQ-140 sweep follow-up).
 ///
 /// `seed` and `nonce` were ADDED by AQ-126 (reviewer finding: seed- and
 /// nonce-bearing names escaped the original eight tokens).
@@ -3107,6 +3187,102 @@ fn production_forbidden_lists_flag_planted_exposures() {
             "planted manual impl Display for {name} must fire: {impl_hits:?}"
         );
     }
+}
+
+// ---- AQ-141: scope liveness — the audit must cover the whole workspace ----
+
+/// Pure helper: extract the `crates/<name>` member entries from the
+/// root manifest text. Matches only array-element lines of the
+/// `members` list shape (`"crates/…",`); the `exclude` line and any
+/// other mention do not match because they do not start (after
+/// trimming) with the quoted path followed by a comma. Split out pure
+/// so the self-tests below can pin the parse without touching the
+/// filesystem.
+fn workspace_member_crate_dirs_from_manifest(manifest_text: &str) -> Vec<String> {
+    let mut members = Vec::new();
+    for line in manifest_text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"crates/")
+            && let Some(dir) = rest.strip_suffix("\",")
+        {
+            members.push(format!("crates/{dir}"));
+        }
+    }
+    members
+}
+
+#[test]
+fn manifest_member_parser_extracts_member_lines() {
+    let manifest = "members = [\n  \"crates/rustynetd\",\n  \"crates/rustynet-cli\",\n]\n";
+    assert_eq!(
+        workspace_member_crate_dirs_from_manifest(manifest),
+        vec!["crates/rustynetd", "crates/rustynet-cli"]
+    );
+}
+
+#[test]
+fn manifest_member_parser_ignores_exclude_and_other_lines() {
+    let manifest = "exclude = [\"gui\", \"crates/rustynet-lab-monitor\"]\nmembers = [\n  \"crates/rustynetd\",\n]\n# \"crates/commented-out\",\n";
+    assert_eq!(
+        workspace_member_crate_dirs_from_manifest(manifest),
+        vec!["crates/rustynetd"]
+    );
+}
+
+#[test]
+fn audited_roots_cover_the_in_family_gap_crates() {
+    // AQ-141 witness: the AQ-108 v2 display sweep found secret-bearing
+    // Debug surfaces in these two workspace crates while the audit
+    // walked neither — the gap was inside the audited crate family,
+    // not across projects. Both must now be under the audit's roots.
+    // This test fails against the pre-AQ-141 five-root list.
+    let root = workspace_root();
+    let roots = audited_source_roots(&root);
+    for crate_dir in [
+        "crates/rustynet-backend-wireguard",
+        "crates/rustynet-llm-gateway",
+    ] {
+        let expected = root.join(crate_dir).join("src");
+        assert!(
+            roots.contains(&expected),
+            "audited_source_roots must cover {crate_dir}/src — \
+             a workspace crate holding secret-bearing types is outside the audit"
+        );
+    }
+}
+
+#[test]
+fn audited_roots_track_workspace_membership() {
+    // AQ-141 drift backstop: the walked roots must be EXACTLY the
+    // workspace member set from the root Cargo.toml. A crate added to
+    // the workspace without extending (or removing itself from) this
+    // audit turns this test red — scope can no longer silently lag
+    // the workspace.
+    let root = workspace_root();
+    let manifest_path = root.join("Cargo.toml");
+    let manifest = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("must read root manifest {}: {e}", manifest_path.display()));
+    let mut from_manifest = workspace_member_crate_dirs_from_manifest(&manifest);
+    from_manifest.sort();
+    let mut from_roots: Vec<String> = audited_source_roots(&root)
+        .iter()
+        .filter_map(|p| {
+            p.strip_prefix(&root)
+                .ok()?
+                .to_str()
+                .map(|s| s.trim_end_matches("/src").to_owned())
+        })
+        .collect();
+    from_roots.sort();
+    assert!(
+        !from_manifest.is_empty(),
+        "member parse found nothing — manifest shape drifted; update the parser, do not weaken the gate"
+    );
+    assert_eq!(
+        from_roots, from_manifest,
+        "audited_source_roots must exactly match the root Cargo.toml members — \
+         every workspace crate is in the audit's scope (AQ-141)"
+    );
 }
 
 #[test]
