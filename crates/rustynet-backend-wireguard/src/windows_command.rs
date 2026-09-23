@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +24,6 @@ pub const DEFAULT_WINDOWS_NETSH_EXE_PATH: &str = r"C:\Windows\System32\netsh.exe
 
 const WINDOWS_CONFIG_FILE_SUFFIX: &str = ".conf.dpapi";
 
-#[derive(Debug)]
 pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
     runner: R,
     tunnel_name: String,
@@ -46,6 +46,30 @@ pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
     routes: Vec<Route>,
     context: Option<RuntimeContext>,
     exit_mode: ExitMode,
+}
+
+impl<R: WireguardCommandRunner> fmt::Debug for WindowsWireguardBackend<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindowsWireguardBackend")
+            .field("runner", &"<WireguardCommandRunner>")
+            .field("tunnel_name", &self.tunnel_name)
+            .field("config_path", &self.config_path)
+            .field("private_key_path", &self.private_key_path)
+            .field(
+                "runtime_private_key",
+                &self.runtime_private_key.as_ref().map(|_| "REDACTED"),
+            )
+            .field("wireguard_exe_path", &self.wireguard_exe_path)
+            .field("wg_exe_path", &self.wg_exe_path)
+            .field("netsh_exe_path", &self.netsh_exe_path)
+            .field("listen_port", &self.listen_port)
+            .field("running", &self.running)
+            .field("peers", &self.peers.len())
+            .field("routes", &self.routes.len())
+            .field("context", &self.context)
+            .field("exit_mode", &self.exit_mode)
+            .finish()
+    }
 }
 
 impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
@@ -2820,6 +2844,33 @@ mod tests {
                 .iter()
                 .any(|(_, args)| args.iter().any(|a| a == "/installtunnelservice")),
             "install must not run when the listing is unreadable"
+        );
+    }
+
+    #[test]
+    fn windows_backend_debug_redacts_runtime_private_key() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+
+        let backend = WindowsWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        let secret = "aq140-witness-runtime-private-key";
+        let backend = backend.with_runtime_private_key(Zeroizing::new(secret.to_string()));
+
+        let rendered = format!("{backend:?}");
+        assert!(
+            !rendered.contains(secret),
+            "WindowsWireguardBackend Debug output leaked the runtime private key: {rendered}"
         );
     }
 }
