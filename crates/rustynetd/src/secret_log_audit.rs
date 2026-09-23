@@ -3350,13 +3350,21 @@ fn every_secret_vocabulary_type_is_classified() {
 ///   module-level `#[cfg(test)] mod tests` shape sits ABOVE the `mod`
 ///   line, outside the run, and stays live.
 /// - R2: a fn whose definition line sits inside a `macro_rules!` body
-///   refuses. Tracking is ONE aggregate brace depth from the outermost
-///   definition: a `macro_rules!` body is a token tree, so its braces
-///   balance by construction once comments/strings/literals are blanked —
-///   which is also why a nested definition (r60 F2) must not reset the
-///   depth (its braces simply add) and why a single depth (no stack) is
-///   sufficient. A definition whose `{` sits on a later line (r60 F3)
-///   stays pending until depth turns positive, so its body is tracked.
+///   refuses. Tracking is ONE aggregate delimiter depth from the
+///   outermost definition, counting ALL THREE token-tree brackets
+///   (`(`/`[`/`{` open; `)`/`]`/`}` close): a `macro_rules!` body is a
+///   token tree delimited by any of the three bracket kinds, and they
+///   nest properly and balance by construction once
+///   comments/strings/literals are blanked — which is also why a nested
+///   definition (r60 F2) must not reset the depth (its delimiters
+///   simply add) and why a single depth (no stack) is sufficient.
+///   Brace-only counting never rose for paren/bracket-delimited bodies,
+///   so the witness fn's own balanced `{}` retired tracking and a
+///   never-invoked macro body counted live (r77 F1). A definition whose
+///   first delimiter sits on a later line (r60 F3) stays pending until
+///   depth turns positive, so its body is tracked. A fn's own balanced
+///   `{}`/`()` inside the body nets zero on its line and can never
+///   retire tracking while the body is open (r71 R2 residual).
 ///   Over-catch directions are deliberate: a `macro_rules`-shaped mention
 ///   outside a real definition cannot narrow refusal, only widen it.
 #[derive(Default)]
@@ -3677,33 +3685,44 @@ fn live_witness_test_in_source(file_body: &str, witness_test_name: &str) -> bool
     let lines: Vec<&str> = file_body.lines().collect();
     let mut blanker = WitnessBlankerState::default();
     let blanked_lines: Vec<String> = lines.iter().map(|l| blanker.blank_line(l)).collect();
-    // AQ-201 R2: ONE aggregate brace depth for the current `macro_rules!`
-    // definition. A nested definition (r60 F2) must NOT reset the depth —
-    // its braces simply add — and a definition whose `{` sits on a later
-    // line (r60 F3) stays pending (`macro_body_opened == false`) until
-    // depth turns positive, so its body is tracked. `macro_body_opened`
-    // is set as soon as a line contributes any `{`, so a one-liner body
-    // still closes at end of line.
+    // AQ-201 R2 + r77 F1: ONE aggregate delimiter depth for the current
+    // `macro_rules!` definition, counting ALL THREE token-tree brackets
+    // (`(`/`[`/`{` open; `)`/`]`/`}` close). A `macro_rules!` body is a
+    // token tree delimited by any of the three kinds, so once
+    // comments/strings/literals are blanked the brackets nest properly
+    // and balance by construction — one counter, no stack. Brace-only
+    // counting missed paren/bracket-delimited bodies entirely: no depth
+    // ever rose, so the witness fn's own balanced `{}` set
+    // `macro_body_opened` and retired tracking at depth 0, counting a
+    // never-invoked macro body live (r77 F1). A nested definition (r60
+    // F2) must NOT reset the depth — its delimiters simply add — and a
+    // definition whose first delimiter sits on a later line (r60 F3)
+    // stays pending (`macro_body_opened == false`) until depth turns
+    // positive, so its body is tracked. A fn's own balanced `{}`/`()`
+    // inside the body nets zero on its line and can never retire
+    // tracking while the body is open (r71 R2 residual).
+    // `macro_body_opened` is set as soon as a line contributes any
+    // opener, so a one-liner body still closes at end of line.
     let mut in_macro_rules = false;
-    let mut macro_brace_depth: usize = 0;
+    let mut macro_delim_depth: usize = 0;
     let mut macro_body_opened = false;
     for (idx, blanked) in blanked_lines.iter().enumerate() {
         let macro_started_here = line_opens_macro_rules_definition(blanked);
         if macro_started_here && !in_macro_rules {
             in_macro_rules = true;
-            macro_brace_depth = 0;
+            macro_delim_depth = 0;
             macro_body_opened = false;
         }
         if in_macro_rules {
-            let opens = blanked.matches('{').count();
-            let closes = blanked.matches('}').count();
-            macro_brace_depth = macro_brace_depth
+            let opens = blanked.matches(['(', '[', '{']).count();
+            let closes = blanked.matches([')', ']', '}']).count();
+            macro_delim_depth = macro_delim_depth
                 .saturating_add(opens)
                 .saturating_sub(closes);
             if opens > 0 {
                 macro_body_opened = true;
             }
-            if macro_brace_depth == 0 && macro_body_opened {
+            if macro_delim_depth == 0 && macro_body_opened {
                 in_macro_rules = false;
                 macro_body_opened = false;
             }
@@ -4049,6 +4068,92 @@ fn witness_liveness_checker_refuses_whitespace_before_macro_bang() {
     assert!(
         !live_witness_test_in_source(spaced, "some_witness"),
         "macro_rules ! (space before bang) must still open macro tracking"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_paren_delimited_macro_bodies() {
+    // r77 F1 (probe PA): a `macro_rules!` body delimited by parens is a
+    // token tree exactly like a brace body. Brace-only counting never
+    // raised any depth for it, so the witness fn's own balanced `{}`
+    // set macro_body_opened and retired tracking at depth 0 — a
+    // never-invoked macro body counted live.
+    let paren_body = "\nmacro_rules! paren_shim (\n    (x) => (\n        #[test]\n        fn some_witness() {}\n    )\n);\n";
+    assert!(
+        !live_witness_test_in_source(paren_body, "some_witness"),
+        "a witness inside a paren-delimited macro body must be refused"
+    );
+
+    // Depth must be counted on the BLANKED text: brackets inside string
+    // literals are inert, so this unbalanced-looking pair cannot skew
+    // the count in either direction.
+    let paren_unbalanced_strings = "\nmacro_rules! shim (\n    (x) => ( let a = \")\"; let b = \"(\";\n        #[test]\n        fn some_witness() {}\n    )\n);\n";
+    assert!(
+        !live_witness_test_in_source(paren_unbalanced_strings, "some_witness"),
+        "brackets inside string literals must not skew macro tracking"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_bracket_delimited_macro_bodies() {
+    // r77 F1 (probe PB): same fail-open shape with a bracket-delimited
+    // body — `[]` is a legal `macro_rules!` delimiter.
+    let bracket_body = "\nmacro_rules! bracket_shim [\n    (x) => [\n        #[test]\n        fn some_witness() {}\n    ]\n];\n";
+    assert!(
+        !live_witness_test_in_source(bracket_body, "some_witness"),
+        "a witness inside a bracket-delimited macro body must be refused"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_paren_within_bracket_macro_nesting() {
+    // r77 F1: mixed delimiters nest like any token tree; the aggregate
+    // depth must survive a bracket body containing a nested paren body
+    // (and a nested `macro_rules!` definition must not reset it, r60 F2).
+    let mixed = "\nmacro_rules! outer [\n    (x) => [\n        macro_rules! inner (\n            (y) => (\n                #[test]\n                fn some_witness() {}\n            )\n        );\n    ]\n];\n";
+    assert!(
+        !live_witness_test_in_source(mixed, "some_witness"),
+        "a witness inside nested paren/bracket macro bodies must be refused"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_closed_paren_macro_keeps_following_witness_live() {
+    // r77 F1 (probe PC): a CLOSED paren-delimited macro must retire
+    // tracking so a genuine `#[test]` fn after it stays live. Under the
+    // old brace-only counter the opener line contributed no `{`, so
+    // tracking stayed pending forever and swallowed the whole tail.
+    let closed = "\nmacro_rules! m ();\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(closed, "some_witness"),
+        "a closed paren-delimited macro must not swallow the fn after it"
+    );
+
+    // Same shape with bracket-shaped text in a string: blanking makes it
+    // inert, the body still closes on the same line.
+    let closed_string_bracket = "\nmacro_rules! m (\"(\");\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(closed_string_bracket, "some_witness"),
+        "a bracket-shaped string must not wedge macro tracking open"
+    );
+
+    let mixed_close = "\nmacro_rules! m (\n    (x) => [\n        1 + 1\n    ]\n);\n\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(mixed_close, "some_witness"),
+        "a paren body closing a bracket arm must retire tracking cleanly"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_same_line_witness_in_paren_body() {
+    // r77 F1 (probe PD): a one-line `#[test] fn` inside a paren-delimited
+    // body is refused by the in-macro check before the attribute walk;
+    // delimiter counting must not retire tracking mid-line (the arm's
+    // closing `)` shares the line) and re-admit the witness.
+    let same_line = "\nmacro_rules! shim (\n    (x) => ( #[test] fn some_witness() {} )\n);\n";
+    assert!(
+        !live_witness_test_in_source(same_line, "some_witness"),
+        "a same-line witness inside a paren body must be refused"
     );
 }
 
