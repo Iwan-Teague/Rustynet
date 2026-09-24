@@ -59,9 +59,10 @@
 
 #![cfg(test)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Identifier substrings that must NOT appear as a format placeholder
 /// inside a log/print/format macro call. Each entry is matched as a
@@ -433,12 +434,21 @@ const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[
 /// Every justification must state what the impl prints and cite the
 /// decl/impl sites. AQ-126: the fourth field names the test that pins the
 /// impl's redacted OUTPUT (it constructs a real instance and asserts the
-/// secret bytes are absent);
-/// `every_reviewed_redacting_impl_entry_has_a_live_witness_test` fails
-/// while that witness is missing from the same file, so the suppression
-/// never outlives its evidence. Stated residual: this text gate cannot
-/// read the witness body — gutting a witness's assertions while keeping
-/// its name is caught by the owning crate's suite and review, not here.
+/// secret bytes are absent).
+///
+/// AQ-201 aq201d (review r86 §4): the witness gate runs on COMPILED GROUND
+/// TRUTH for entries in THIS crate. The witness must appear in the
+/// rustynetd lib test binary's own `--list --format terse` output, under
+/// the fully-qualified module path derived from the path suffix, and must
+/// NOT be `#[ignore]`d (live = all tests minus the `--ignored` listing).
+/// Entries in SIBLING crates are checked by the text scanner only — this
+/// binary's listing cannot see other crates' test binaries; promoting them
+/// needs a cross-crate runner (xtask/CI) or witness relocation (owner
+/// question, not taken here). Stated residual for both layers: a witness
+/// whose assertions are gutted while its name survives is caught by the
+/// owning crate's suite and review, not here; and the compiled listing
+/// carries no file identity, so a witness living in a real submodule FILE
+/// of the declared module also matches.
 const REVIEWED_REDACTING_DEBUG_IMPLS: &[(&str, &str, &str, &str)] = &[
     (
         "SecretKey",
@@ -3794,13 +3804,235 @@ fn live_witness_test_in_source(file_body: &str, witness_test_name: &str) -> bool
     false
 }
 
+// ---------------------------------------------------------------------------
+// Compiled ground truth (AQ-201 aq201d, review r86 §4).
+//
+// The text scanner above reads NAMES in SOURCE and is therefore defeat-able
+// by shapes rustc would not compile into a live test (r86 F1′: a
+// `macro_rules` definition that retires tracking on its own opening line let
+// an inert macro-body witness count as live). Ground truth is the COMPILER's
+// own test binary: a registry witness counts as live only if the RUNNING
+// test executable, asked `--list --format terse`, actually contains it —
+// under the fully-qualified module path derived from the registry rel_path,
+// and NOT in the `--ignored` listing (an `#[ignore]`d witness is not live
+// evidence). This works identically under `cargo test` and `cargo nextest`:
+// both spawn this same binary per test, and `current_exe()` + `--list` is a
+// plain self-exec with no cargo involvement (no target-lock contention).
+// The spawn FAILS CLOSED: any error, non-zero exit, unparseable line, or
+// empty all-tests listing aborts the gate. (An empty `--ignored` listing is
+// legitimate — it just means nothing is ignored.)
+// ---------------------------------------------------------------------------
+
+/// Fully-qualified name of this gate inside the rustynetd lib test binary.
+/// Required to appear in the parsed `--list` output as a parse-sanity
+/// sentinel before any registry entry is judged against it.
+const COMPILED_GROUND_TRUTH_GATE_TEST: &str =
+    "secret_log_audit::every_reviewed_redacting_impl_entry_has_a_live_witness_test";
+
+/// A permanent `#[ignore]`d test pinning, end to end, the libtest semantics
+/// the gate depends on: the probe IS in the all-tests listing, IS in the
+/// `--ignored` listing, and is therefore excluded from the live set. If
+/// libtest's `--ignored` semantics ever change, this probe's own assertions
+/// go red BEFORE the registry gate could be fooled into counting an
+/// `#[ignore]`d witness as live.
+#[test]
+#[ignore = "ground-truth probe: pinned as listed-but-not-live; never run by default"]
+fn ground_truth_ignored_witness_probe() {}
+
+/// Parse `--list --format terse` output into the set of fully-qualified
+/// test names. Terse lines are `name: test`. Anything else (empty output,
+/// an unknown kind, a malformed line, a suspicious name, a duplicate) is an
+/// error so the gate fails closed on half-parsed listings.
+fn parse_libtest_listing(stdout: &str) -> Result<BTreeSet<String>, String> {
+    let mut names = BTreeSet::new();
+    for line in stdout.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((name, kind)) = line.rsplit_once(": ") else {
+            return Err(format!("unparseable listing line {line:?}"));
+        };
+        if kind != "test" {
+            return Err(format!("unexpected listing kind {kind:?} on line {line:?}"));
+        }
+        let ident_ok = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+        if !ident_ok {
+            return Err(format!("suspicious test name on line {line:?}"));
+        }
+        if !names.insert(name.to_string()) {
+            return Err(format!("duplicate test name {name:?} in listing"));
+        }
+    }
+    if names.is_empty() {
+        return Err("listing contained no `name: test` lines".to_string());
+    }
+    Ok(names)
+}
+
+/// One self-exec `--list` spawn of the RUNNING test binary.
+/// `include_ignored` selects the `--ignored` listing (which contains ONLY
+/// ignored tests, so live = all − ignored). Fails closed on spawn error,
+/// non-zero exit, non-UTF-8 stdout, or unparseable/empty output.
+fn libtest_listing(include_ignored: bool) -> Result<BTreeSet<String>, String> {
+    let exe = std::env::current_exe().map_err(|err| format!("current_exe failed: {err}"))?;
+    let mut command = Command::new(&exe);
+    command.args(["--list", "--format", "terse"]);
+    if include_ignored {
+        command.arg("--ignored");
+    }
+    // Never inherit the harness's stdin: the child must be inert.
+    command.stdin(Stdio::null());
+    let output = command
+        .output()
+        .map_err(|err| format!("spawn of {exe:?} failed: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "self `--list` exited with {:?}",
+            output.status.code()
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|_| "self `--list` stdout was not UTF-8".to_string())?;
+    parse_libtest_listing(&stdout)
+}
+
+/// Map a registry `rel_path` onto `(crate_name, module_prefix)` for the lib
+/// test target it compiles into: `crates/<crate>/src/lib.rs` →
+/// `(crate, "")`, `…/src/a/b.rs` and `…/src/a/b/mod.rs` → `(crate, "a::b")`.
+/// `None` = the path does not name a module of a lib target (a bin
+/// `main.rs`, an integration `tests/` file, or a foreign shape the gate
+/// does not guess at) — such an entry then fails closed rather than being
+/// silently weakened.
+fn libtest_module_prefix(rel_path: &str) -> Option<(String, String)> {
+    let after_crates = rel_path.strip_prefix("crates/")?;
+    let (crate_name, tail) = after_crates.split_once('/')?;
+    let tail = tail.strip_prefix("src/")?;
+    if tail == "lib.rs" {
+        return Some((crate_name.to_string(), String::new()));
+    }
+    if tail == "main.rs" {
+        return None;
+    }
+    let mut stem = tail.strip_suffix(".rs")?;
+    if let Some(parent_stem) = stem.strip_suffix("/mod") {
+        stem = parent_stem;
+    }
+    if stem.is_empty() {
+        return None;
+    }
+    let prefix = stem
+        .split('/')
+        .map(|segment| segment.strip_prefix("r#").unwrap_or(segment))
+        .collect::<Vec<_>>()
+        .join("::");
+    Some((crate_name.to_string(), prefix))
+}
+
+/// True when `full_name` from the compiled listing is the witness under the
+/// declared module. A root entry (`prefix == ""`) demands an EXACT match —
+/// the strictest form, so a same-named fn in any other module of the binary
+/// never satisfies it. A non-empty prefix additionally admits
+/// plain-identifier intermediate modules between the declared module and
+/// the witness (e.g. a `mod tests` wrapper: `p::tests::<witness>` or
+/// `p::tests::sub::<witness>`) and nothing looser. Stated residual: the
+/// listing carries no file identity, so a witness in a real submodule FILE
+/// of the declared module (`p::decoy`) also matches.
+fn listing_name_matches_module(full_name: &str, module_prefix: &str, witness: &str) -> bool {
+    let rest = if module_prefix.is_empty() {
+        full_name
+    } else {
+        match full_name.strip_prefix(&format!("{module_prefix}::")) {
+            Some(rest) => rest,
+            None => return false,
+        }
+    };
+    if rest == witness {
+        return true;
+    }
+    if module_prefix.is_empty() {
+        return false;
+    }
+    let Some(between) = rest.strip_suffix(witness) else {
+        return false;
+    };
+    let Some(between) = between.strip_suffix("::") else {
+        return false;
+    };
+    !between.is_empty()
+        && between.split("::").all(|segment| {
+            let mut chars = segment.chars();
+            !segment.is_empty()
+                && chars
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// Per-entry compiled-ground-truth verdict for an in-crate (rustynetd)
+/// registry entry: `None` = a live witness is present, `Some(reason)` = why
+/// it is NOT (absent from the binary, or present but `#[ignore]`d —
+/// distinguished so an ignored witness is never mistaken for a deleted
+/// one).
+fn compiled_ground_truth_failure(
+    all_tests: &BTreeSet<String>,
+    live_tests: &BTreeSet<String>,
+    module_prefix: &str,
+    witness: &str,
+) -> Option<String> {
+    let matched: Vec<&String> = all_tests
+        .iter()
+        .filter(|name| listing_name_matches_module(name, module_prefix, witness))
+        .collect();
+    if matched.is_empty() {
+        return Some(format!(
+            "compiled ground truth: no fn `{witness}` under module {module_prefix:?} in this \
+             test binary's `--list` — the redacting-impl suppression has no compiled evidence"
+        ));
+    }
+    let live: Vec<&String> = matched
+        .iter()
+        .copied()
+        .filter(|name| live_tests.contains(*name))
+        .collect();
+    if live.is_empty() {
+        return Some(format!(
+            "compiled ground truth: fn `{witness}` under module {module_prefix:?} is present \
+             but #[ignore]d (excluded via the `--ignored` listing): {matched:?} — an ignored \
+             witness is not live evidence"
+        ));
+    }
+    None
+}
+
 #[test]
 fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
-    // AQ-126: a suppression that outlives its evidence is a silent
-    // allowance. Deleting or renaming a witness test must turn this gate
-    // red. Stated residual: this text gate reads NAMES, not bodies — a
-    // witness whose assertions are gutted while its name survives is the
-    // owning crate's own red test and review's job, not this check's.
+    // AQ-126 + AQ-201 aq201d (review r86 §4): a suppression that outlives
+    // its evidence is a silent allowance. Ground truth is the COMPILER's:
+    // every registry witness must appear in THIS test binary's own
+    // `--list --format terse` output under the module path derived from the
+    // registry rel_path, and must NOT be `#[ignore]`d (live = all-listing
+    // minus `--ignored` listing). Both spawns fail closed; `cargo nextest`
+    // runs this same binary per test, so the self-exec works there too.
+    let all_tests = libtest_listing(false)
+        .unwrap_or_else(|err| panic!("compiled ground truth unavailable, failing closed: {err}"));
+    let ignored_tests = libtest_listing(true)
+        .unwrap_or_else(|err| panic!("compiled ground truth unavailable, failing closed: {err}"));
+    let live_tests: BTreeSet<String> = all_tests.difference(&ignored_tests).cloned().collect();
+    assert!(
+        live_tests.contains(COMPILED_GROUND_TRUTH_GATE_TEST),
+        "parse sanity: this gate's own test \
+         {COMPILED_GROUND_TRUTH_GATE_TEST:?} must appear in the compiled listing before \
+         registry entries are judged against it"
+    );
+    assert!(
+        !live_tests.contains("secret_log_audit::ground_truth_ignored_witness_probe"),
+        "parse sanity: the #[ignore]d ground-truth probe must never be in the live set"
+    );
     let root = workspace_root();
     let mut failures: Vec<String> = Vec::new();
     for (registry_name, registry) in [
@@ -3824,12 +4056,46 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
                 failures.push(format!("{registry_name}: {name}: cannot read {path:?}"));
                 continue;
             };
-            if !live_witness_test_in_source(&body, witness) {
-                failures.push(format!(
-                    "{registry_name}: {name}: no live #[test] fn `{witness}` found in {path:?} — \
-                     the redacting-impl suppression has no live evidence; restore the test or \
-                     re-review the impl"
-                ));
+            match libtest_module_prefix(path) {
+                // In-crate entry: COMPILED ground truth is the arbiter.
+                Some((crate_name, module_prefix)) if crate_name == "rustynetd" => {
+                    if let Some(reason) = compiled_ground_truth_failure(
+                        &all_tests,
+                        &live_tests,
+                        &module_prefix,
+                        witness,
+                    ) {
+                        failures.push(format!("{registry_name}: {name}: {reason}"));
+                    }
+                }
+                // Sibling-crate entry: this binary's listing cannot see the
+                // owning crate's test binaries, so the TEXT scanner stays
+                // the active layer here (early-warning for the suppression,
+                // still refusing comments/macro-bodies/missing #[test]/
+                // #[ignore] and fn-level cfg). Documented residual: it reads
+                // names in source, not compiled identity — promoting these
+                // entries to compiled ground truth needs a cross-crate runner
+                // (xtask/CI) or witness relocation (owner question, not
+                // taken in aq201d).
+                Some(_) => {
+                    if !live_witness_test_in_source(&body, witness) {
+                        failures.push(format!(
+                            "{registry_name}: {name}: no live #[test] fn `{witness}` found in \
+                             {path:?} (text layer; sibling crate) — the redacting-impl \
+                             suppression has no live evidence; restore the test or re-review \
+                             the impl"
+                        ));
+                    }
+                }
+                // Unmappable path shape: refuse loudly rather than silently
+                // weaken the contract (fail closed).
+                None => {
+                    failures.push(format!(
+                        "{registry_name}: {name}: rel_path {path:?} does not map onto a lib \
+                         target module; compiled ground truth cannot arbitrate it — fix the \
+                         path shape (crates/<crate>/src/…)"
+                    ));
+                }
             }
         }
     }
@@ -3837,6 +4103,205 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
         failures.is_empty(),
         "reviewed redacting-impl entries without a live witness test:\n  {}",
         failures.join("\n  ")
+    );
+}
+
+#[test]
+fn ground_truth_ignored_probe_is_listed_but_never_live() {
+    // Pins the libtest semantics the gate relies on (rustc 1.88.0, stable):
+    // `--list` includes #[ignore]d tests indistinguishably,
+    // `--list --ignored` lists ONLY ignored tests, so live = all − ignored,
+    // and the permanent probe sits exactly in the excluded slice.
+    let all_tests =
+        libtest_listing(false).expect("self `--list` must succeed under the test harness");
+    let ignored_tests = libtest_listing(true).expect("self `--list --ignored` must succeed");
+    let probe = "secret_log_audit::ground_truth_ignored_witness_probe";
+    assert!(
+        all_tests.contains(probe),
+        "probe must be in the all listing"
+    );
+    assert!(
+        ignored_tests.contains(probe),
+        "probe must be in the `--ignored` listing"
+    );
+    let live_tests: BTreeSet<String> = all_tests.difference(&ignored_tests).cloned().collect();
+    assert!(
+        !live_tests.contains(probe),
+        "an #[ignore]d test must never be in the live set"
+    );
+}
+
+#[test]
+fn ground_truth_live_test_of_this_module_is_in_live_set() {
+    // Positive control: a real, un-ignored existing test of this module is
+    // in the live set, proving the two-spawn subtraction does not
+    // over-exclude.
+    let all_tests =
+        libtest_listing(false).expect("self `--list` must succeed under the test harness");
+    let ignored_tests = libtest_listing(true).expect("self `--list --ignored` must succeed");
+    let live_tests: BTreeSet<String> = all_tests.difference(&ignored_tests).cloned().collect();
+    assert!(
+        live_tests.contains("secret_log_audit::witness_liveness_checker_refuses_dead_witnesses"),
+        "a plain #[test] of this module must be in the live set"
+    );
+}
+
+#[test]
+fn ground_truth_listing_parser_accepts_terse_test_lines() {
+    let parsed = parse_libtest_listing("a: test\nb::c: test\nspaced: test  \n")
+        .expect("well-formed terse listing must parse");
+    assert_eq!(
+        parsed,
+        BTreeSet::from(["a".to_string(), "b::c".to_string(), "spaced".to_string(),])
+    );
+}
+
+#[test]
+fn ground_truth_listing_parser_fails_closed_on_bad_output() {
+    assert!(
+        parse_libtest_listing("").is_err(),
+        "empty listing must fail closed"
+    );
+    assert!(
+        parse_libtest_listing("garbage without colon\n").is_err(),
+        "unparseable line must fail closed"
+    );
+    assert!(
+        parse_libtest_listing("a: benchmark\n").is_err(),
+        "non-test kind must fail closed"
+    );
+    assert!(
+        parse_libtest_listing("a b: test\n").is_err(),
+        "name with whitespace must fail closed"
+    );
+    assert!(
+        parse_libtest_listing("a: test\na: test\n").is_err(),
+        "duplicate names must fail closed"
+    );
+}
+
+#[test]
+fn ground_truth_module_prefix_derivation_table() {
+    assert_eq!(
+        libtest_module_prefix("crates/rustynetd/src/lib.rs"),
+        Some(("rustynetd".to_string(), String::new()))
+    );
+    assert_eq!(
+        libtest_module_prefix("crates/rustynetd/src/enrollment_token.rs"),
+        Some(("rustynetd".to_string(), "enrollment_token".to_string()))
+    );
+    assert_eq!(
+        libtest_module_prefix("crates/rustynetd/src/a/b.rs"),
+        Some(("rustynetd".to_string(), "a::b".to_string()))
+    );
+    assert_eq!(
+        libtest_module_prefix("crates/rustynetd/src/a/b/mod.rs"),
+        Some(("rustynetd".to_string(), "a::b".to_string()))
+    );
+    // Sibling crates map fine, but never claim the rustynetd binary.
+    assert_eq!(
+        libtest_module_prefix("crates/rustynet-crypto/src/lib.rs"),
+        Some(("rustynet-crypto".to_string(), String::new()))
+    );
+    // Unmappable shapes fail closed.
+    assert_eq!(libtest_module_prefix("crates/rustynetd/src/main.rs"), None);
+    assert_eq!(libtest_module_prefix("crates/rustynetd/tests/it.rs"), None);
+    assert_eq!(libtest_module_prefix("src/lib.rs"), None);
+    assert_eq!(libtest_module_prefix("benches/x.rs"), None);
+}
+
+#[test]
+fn ground_truth_match_rule_table() {
+    // Root entries are exact-match only: a bare name satisfies the root
+    // rule…
+    assert!(listing_name_matches_module(
+        "every_reviewed_redacting_impl_entry_has_a_live_witness_test",
+        "",
+        "every_reviewed_redacting_impl_entry_has_a_live_witness_test",
+    ));
+    // …while the fully-qualified form (a different module) and the SAME
+    // name elsewhere in the binary must not.
+    assert!(!listing_name_matches_module(
+        COMPILED_GROUND_TRUTH_GATE_TEST,
+        "",
+        "every_reviewed_redacting_impl_entry_has_a_live_witness_test",
+    ));
+    assert!(!listing_name_matches_module(
+        "enrollment_token::tests::some_witness",
+        "",
+        "some_witness",
+    ));
+    assert!(!listing_name_matches_module(
+        "secret_log_audit::some_witness",
+        "",
+        "some_witness",
+    ));
+    // Non-root entries admit a plain-ident `mod tests` wrapper…
+    assert!(listing_name_matches_module(
+        "enrollment_token::tests::some_witness",
+        "enrollment_token",
+        "some_witness",
+    ));
+    assert!(listing_name_matches_module(
+        "enrollment_token::tests::sub::some_witness",
+        "enrollment_token",
+        "some_witness",
+    ));
+    assert!(listing_name_matches_module(
+        "enrollment_token::some_witness",
+        "enrollment_token",
+        "some_witness",
+    ));
+    // …but not other modules of the crate, and never a non-boundary
+    // prefix hit.
+    assert!(!listing_name_matches_module(
+        "secret_log_audit::tests::some_witness",
+        "enrollment_token",
+        "some_witness",
+    ));
+    assert!(!listing_name_matches_module(
+        "enrollment_token_extended::tests::some_witness",
+        "enrollment_token",
+        "some_witness",
+    ));
+}
+
+#[test]
+fn ground_truth_per_entry_verdict_table() {
+    let witness = "enrollment_token_debug_output_redacts_tag_and_token_id";
+    let compiled = BTreeSet::from([format!("enrollment_token::tests::{witness}")]);
+    assert_eq!(
+        compiled_ground_truth_failure(&compiled, &compiled, "enrollment_token", witness),
+        None,
+        "a live compiled witness passes"
+    );
+
+    // The r86 F1′ fail-open shape: an inert macro-body "witness" exists
+    // only in source text, never in the compiled listing → absent, fail.
+    let empty = BTreeSet::new();
+    let absent = compiled_ground_truth_failure(&empty, &empty, "enrollment_token", witness)
+        .expect("absent witness must fail");
+    assert!(absent.contains("no fn"), "absent reason: {absent}");
+
+    // An #[ignore]d witness IS in the all-listing but NOT in the live set;
+    // the failure must say so, not claim the witness is missing.
+    let ignored_failure =
+        compiled_ground_truth_failure(&compiled, &empty, "enrollment_token", witness)
+            .expect("ignored witness must fail");
+    assert!(
+        ignored_failure.contains("#[ignore]"),
+        "ignored reason must mention ignore: {ignored_failure}"
+    );
+
+    // A same-named fn in the WRONG module does not satisfy a root entry —
+    // even though the name exists somewhere in the binary.
+    let wrong_module = BTreeSet::from(["secret_log_audit::some_witness".to_string()]);
+    let wrong_module_failure =
+        compiled_ground_truth_failure(&wrong_module, &wrong_module, "", "some_witness")
+            .expect("wrong-module witness must fail");
+    assert!(
+        wrong_module_failure.contains("no fn"),
+        "wrong-module reason: {wrong_module_failure}"
     );
 }
 
