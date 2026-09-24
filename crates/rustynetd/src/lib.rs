@@ -100,3 +100,6 @@ pub mod windows_runtime_boundary;
 pub mod windows_service;
 pub mod windows_service_hardening;
 pub mod windows_tunnel_smoke;
+
+#[cfg(test)]
+mod witness_listing;

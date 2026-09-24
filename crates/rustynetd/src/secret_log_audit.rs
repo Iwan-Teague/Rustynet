@@ -62,7 +62,6 @@
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// Identifier substrings that must NOT appear as a format placeholder
 /// inside a log/print/format macro call. Each entry is matched as a
@@ -441,14 +440,17 @@ const FORBIDDEN_DISPLAY_SECRET_TYPES: &[&str] = &[
 /// rustynetd lib test binary's own `--list --format terse` output, under
 /// the fully-qualified module path derived from the path suffix, and must
 /// NOT be `#[ignore]`d (live = all tests minus the `--ignored` listing).
-/// Entries in SIBLING crates are checked by the text scanner only — this
-/// binary's listing cannot see other crates' test binaries; promoting them
-/// needs a cross-crate runner (xtask/CI) or witness relocation (owner
-/// question, not taken here). Stated residual for both layers: a witness
-/// whose assertions are gutted while its name survives is caught by the
-/// owning crate's suite and review, not here; and the compiled listing
-/// carries no file identity, so a witness living in a real submodule FILE
-/// of the declared module also matches.
+/// AQ-213: entries in SIBLING crates are arbitrated by the SAME compiled
+/// ground truth, executed in each owning crate: `witness_listing.rs` is
+/// `#[path]`-shared into every sibling's lib test binary and its per-crate
+/// gate judges that crate's slice rows against its own listing, while this
+/// module's master gate enforces the one-to-one partition between the
+/// sibling registry entries and the slice table plus the canonical wiring
+/// anchor in each owning crate's lib.rs. Stated residual: a witness whose
+/// assertions are gutted while its name survives is caught by the owning
+/// crate's suite and review, not here; and the compiled listing carries no
+/// file identity, so a witness living in a real submodule FILE of the
+/// declared module also matches.
 const REVIEWED_REDACTING_DEBUG_IMPLS: &[(&str, &str, &str, &str)] = &[
     (
         "SecretKey",
@@ -3335,475 +3337,6 @@ fn every_secret_vocabulary_type_is_classified() {
     }
 }
 
-/// AQ-135 fix (escape 2): pure check that `witness_test_name` names a LIVE
-/// `#[test]` fn in `file_body`: the `fn <name>(` definition must sit on a
-/// non-commented code line and the contiguous attribute run directly above
-/// it must carry `#[test]` and no `#[ignore]`. Commented-out, `#[ignore]`d,
-/// or non-test definitions are refused, so reviewed-redacting-impl
-/// suppression only counts when there is live evidence that actually runs.
-/// Split out pure so negative controls below can prove the checker refuses,
-/// not merely accepts.
-///
-/// AQ-201 rework (review r60 F1-F5), fail closed on doubt. Two refusal
-/// rules, both resting on the blanking being sound, so the gate runs its
-/// own cross-line blanker (`WitnessBlankerState`) instead of the line-local
-/// `strip_string_literal_contents`: plain and raw string contents, char and
-/// byte-char literal contents, and line/block comment contents are blanked
-/// before any brace counting or needle search, with string/comment state
-/// carried across lines (a macro body may legally contain a multiline
-/// string or a nesting block comment, and a `}` inside one must not close
-/// the tracking early — the r60 F1 escape class, of which the reviewed
-/// `'}'` char literal was one instance).
-/// - R1: ANY `#[cfg…` attribute (`#[cfg(`, `#[cfg_attr(`, …) in the
-///   attribute run refuses the witness — whether the fn compiles depends
-///   on configuration the text gate cannot evaluate. The legitimate
-///   module-level `#[cfg(test)] mod tests` shape sits ABOVE the `mod`
-///   line, outside the run, and stays live.
-/// - R2: a fn whose definition line sits inside a `macro_rules!` body
-///   refuses. Tracking is ONE aggregate delimiter depth from the
-///   outermost definition, counting ALL THREE token-tree brackets
-///   (`(`/`[`/`{` open; `)`/`]`/`}` close): a `macro_rules!` body is a
-///   token tree delimited by any of the three bracket kinds, and they
-///   nest properly and balance by construction once
-///   comments/strings/literals are blanked — which is also why a nested
-///   definition (r60 F2) must not reset the depth (its delimiters
-///   simply add) and why a single depth (no stack) is sufficient.
-///   Brace-only counting never rose for paren/bracket-delimited bodies,
-///   so the witness fn's own balanced `{}` retired tracking and a
-///   never-invoked macro body counted live (r77 F1). A definition whose
-///   first delimiter sits on a later line (r60 F3) stays pending until
-///   depth turns positive, so its body is tracked. A fn's own balanced
-///   `{}`/`()` inside the body nets zero on its line and can never
-///   retire tracking while the body is open (r71 R2 residual).
-///   Over-catch directions are deliberate: a `macro_rules`-shaped mention
-///   outside a real definition cannot narrow refusal, only widen it.
-#[derive(Default)]
-struct WitnessBlankerState {
-    /// Inside a `/* … */` block comment that has not closed yet. Rust
-    /// block comments nest, so the closer scan tracks depth.
-    in_block_comment: bool,
-    /// Inside a string literal that did not terminate on its opening
-    /// line: plain (`"`, `\` escapes honoured) or raw (`r"…"`, `r#"…"#`;
-    /// hash count fixed by the opener, no escapes).
-    in_string: Option<WitnessStringState>,
-}
-
-#[derive(Clone, Copy)]
-enum WitnessStringState {
-    Plain,
-    /// The `usize` is the number of `#` after `r`/`br`.
-    Raw(usize),
-}
-
-/// Blank the contents of a char literal (`'x'`, `'\n'`, `'\''`) so its
-/// braces and quotes never reach brace counting (r60 F1: a verbatim `'}'`
-/// inside a `macro_rules!` body closed the tracking one rule early, and
-/// `b'}'` fared the same through the byte-string shortcut). Recognition
-/// mirrors `strip_string_literal_contents`: escape form `'\x'` (4 chars)
-/// or plain form `'x'` (3 chars); anything else — a lifetime tick, or
-/// `'\u{7d}'`, whose single `\u{…}` brace pair is self-balancing and thus
-/// nets zero — passes through one char at a time.
-fn blank_char_literal_contents(chars: &[char], out: &mut String, i: &mut usize) {
-    let n = chars.len();
-    let escape_form = *i + 4 <= n && chars[*i + 1] == '\\' && chars[*i + 3] == '\'';
-    let plain_form = *i + 3 <= n && chars[*i + 1] != '\\' && chars[*i + 2] == '\'';
-    out.push('\'');
-    if escape_form {
-        out.push(' ');
-        out.push(' ');
-        out.push('\'');
-        *i += 4;
-    } else if plain_form {
-        out.push(' ');
-        out.push('\'');
-        *i += 3;
-    } else {
-        *i += 1;
-    }
-}
-
-impl WitnessBlankerState {
-    /// Blank one line: string/comment/literal CONTENTS become spaces,
-    /// delimiters and code survive (comment tails are dropped — nothing
-    /// after `//` is code). Cross-line state (open block comment,
-    /// unterminated string) is updated, so a `}`, a quote, or a
-    /// `fn name(` inside a multiline literal or comment can never be
-    /// counted or matched.
-    fn blank_line(&mut self, line: &str) -> String {
-        let chars: Vec<char> = line.chars().collect();
-        let n = chars.len();
-        let mut out = String::with_capacity(line.len());
-        let mut i = 0usize;
-        if self.in_block_comment {
-            let mut depth = 1usize;
-            while i < n && depth > 0 {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    out.push(' ');
-                    out.push(' ');
-                    i += 2;
-                } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    if depth == 0 {
-                        out.push('*');
-                        out.push('/');
-                    } else {
-                        out.push(' ');
-                        out.push(' ');
-                    }
-                    i += 2;
-                } else {
-                    out.push(' ');
-                    i += 1;
-                }
-            }
-            if depth > 0 {
-                return out;
-            }
-            self.in_block_comment = false;
-        }
-        if let Some(state) = self.in_string {
-            let mut closed = false;
-            match state {
-                WitnessStringState::Plain => {
-                    while i < n {
-                        if chars[i] == '\\' {
-                            out.push(' ');
-                            if i + 1 < n {
-                                out.push(' ');
-                            }
-                            i = (i + 2).min(n);
-                            continue;
-                        }
-                        let c = chars[i];
-                        i += 1;
-                        if c == '"' {
-                            out.push('"');
-                            closed = true;
-                            break;
-                        }
-                        out.push(' ');
-                    }
-                }
-                WitnessStringState::Raw(hashes) => {
-                    while i < n {
-                        let c = chars[i];
-                        i += 1;
-                        if c == '"'
-                            && chars[i..].len() >= hashes
-                            && chars[i..].iter().take(hashes).all(|&h| h == '#')
-                        {
-                            out.push('"');
-                            for _ in 0..hashes {
-                                out.push('#');
-                            }
-                            i += hashes;
-                            closed = true;
-                            break;
-                        }
-                        out.push(' ');
-                    }
-                }
-            }
-            if !closed {
-                return out;
-            }
-            self.in_string = None;
-        }
-        while i < n {
-            match chars[i] {
-                '"' => {
-                    out.push('"');
-                    i += 1;
-                    let mut closed = false;
-                    while i < n {
-                        if chars[i] == '\\' {
-                            out.push(' ');
-                            if i + 1 < n {
-                                out.push(' ');
-                            }
-                            i = (i + 2).min(n);
-                            continue;
-                        }
-                        let c = chars[i];
-                        i += 1;
-                        if c == '"' {
-                            out.push('"');
-                            closed = true;
-                            break;
-                        }
-                        out.push(' ');
-                    }
-                    if !closed {
-                        self.in_string = Some(WitnessStringState::Plain);
-                    }
-                }
-                c @ ('r' | 'b') => {
-                    let prev_is_ident =
-                        i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_');
-                    let mut j = i + 1;
-                    if c == 'b' {
-                        if chars.get(j) == Some(&'r') {
-                            j += 1;
-                        } else if chars.get(j) == Some(&'\'') {
-                            // Byte char literal `b'x'` / `b'\n'` (r60 F1):
-                            // same blanking as a char literal.
-                            out.push('b');
-                            i += 1;
-                            blank_char_literal_contents(&chars, &mut out, &mut i);
-                            continue;
-                        } else {
-                            // Plain byte string `b"…"`: its quote is
-                            // handled by the string arm next iteration.
-                            out.push(c);
-                            i += 1;
-                            continue;
-                        }
-                    }
-                    let mut hashes = 0usize;
-                    while chars.get(j) == Some(&'#') {
-                        hashes += 1;
-                        j += 1;
-                    }
-                    if !prev_is_ident && chars.get(j) == Some(&'"') {
-                        out.extend(&chars[i..=j]);
-                        i = j + 1;
-                        let mut closed = false;
-                        while i < n {
-                            if chars[i] == '"'
-                                && chars[i + 1..].len() >= hashes
-                                && chars[i + 1..].iter().take(hashes).all(|&h| h == '#')
-                            {
-                                out.push('"');
-                                for _ in 0..hashes {
-                                    out.push('#');
-                                }
-                                i += 1 + hashes;
-                                closed = true;
-                                break;
-                            }
-                            out.push(' ');
-                            i += 1;
-                        }
-                        if !closed {
-                            self.in_string = Some(WitnessStringState::Raw(hashes));
-                        }
-                    } else {
-                        out.push(c);
-                        i += 1;
-                    }
-                }
-                '\'' => blank_char_literal_contents(&chars, &mut out, &mut i),
-                '/' => match chars.get(i + 1) {
-                    Some('/') => break,
-                    Some('*') => {
-                        let mut depth = 1usize;
-                        i += 2;
-                        while i < n && depth > 0 {
-                            if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                                depth += 1;
-                                i += 2;
-                            } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                                depth -= 1;
-                                i += 2;
-                            } else {
-                                i += 1;
-                            }
-                        }
-                        if depth > 0 {
-                            self.in_block_comment = true;
-                        }
-                    }
-                    _ => {
-                        out.push('/');
-                        i += 1;
-                    }
-                },
-                other => {
-                    out.push(other);
-                    i += 1;
-                }
-            }
-        }
-        out
-    }
-}
-
-/// True when the blanked line opens a macro DEFINITION: `macro_rules`
-/// followed by optional whitespace and `!`. The whitespace form
-/// (`macro_rules !`) is legal Rust, so a plain `contains("macro_rules!")`
-/// misses it (the original patch's detection). Word-boundary checked on
-/// the left so an identifier mentioning the word cannot trigger it; a
-/// false-positive trigger can only widen refusal, never narrow it.
-fn line_opens_macro_rules_definition(blanked: &str) -> bool {
-    let mut from = 0usize;
-    while let Some(rel) = blanked[from..].find("macro_rules") {
-        let start = from + rel;
-        let end = start + "macro_rules".len();
-        let boundary_before = start == 0
-            || !blanked[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        // The `!` may sit on a LATER line (`macro_rules` alone at the end of
-        // its line is legal Rust, r81 F1): a bare trailing `macro_rules`
-        // starts tracking too. A false trigger only widens refusal.
-        let rest = blanked[end..].trim_start();
-        if boundary_before && (rest.starts_with('!') || rest.is_empty()) {
-            return true;
-        }
-        from = end;
-    }
-    false
-}
-
-/// True when the BLANKED line consists solely of `#[ … ]` attribute
-/// groups separated by whitespace (brackets matched on the blanked text,
-/// so a `]` inside an attribute's string literal cannot end a group
-/// early, and a trailing `//` comment has already been dropped). A
-/// `#[`-prefixed line with trailing code — e.g. `#[test] fn a() {}` — is
-/// refused by the caller: consuming such a line as "attribute run" would
-/// let a one-line test grant liveness to an unrelated fn directly below
-/// it (pre-existing at HEAD, found during this rework).
-fn attr_line_is_attributes_only(blanked: &str) -> bool {
-    let chars: Vec<char> = blanked.trim().chars().collect();
-    let n = chars.len();
-    let mut i = 0usize;
-    while i < n {
-        if chars[i].is_whitespace() {
-            i += 1;
-            continue;
-        }
-        if chars[i] != '#' || chars.get(i + 1) != Some(&'[') {
-            return false;
-        }
-        let mut depth = 1usize;
-        i += 2;
-        while i < n && depth > 0 {
-            match chars[i] {
-                '[' => depth += 1,
-                ']' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        if depth > 0 {
-            return false;
-        }
-    }
-    true
-}
-
-fn live_witness_test_in_source(file_body: &str, witness_test_name: &str) -> bool {
-    let needle = format!("fn {witness_test_name}(");
-    let lines: Vec<&str> = file_body.lines().collect();
-    let mut blanker = WitnessBlankerState::default();
-    let blanked_lines: Vec<String> = lines.iter().map(|l| blanker.blank_line(l)).collect();
-    // AQ-201 R2 + r77 F1: ONE aggregate delimiter depth for the current
-    // `macro_rules!` definition, counting ALL THREE token-tree brackets
-    // (`(`/`[`/`{` open; `)`/`]`/`}` close). A `macro_rules!` body is a
-    // token tree delimited by any of the three kinds, so once
-    // comments/strings/literals are blanked the brackets nest properly
-    // and balance by construction — one counter, no stack. Brace-only
-    // counting missed paren/bracket-delimited bodies entirely: no depth
-    // ever rose, so the witness fn's own balanced `{}` set
-    // `macro_body_opened` and retired tracking at depth 0, counting a
-    // never-invoked macro body live (r77 F1). A nested definition (r60
-    // F2) must NOT reset the depth — its delimiters simply add — and a
-    // definition whose first delimiter sits on a later line (r60 F3)
-    // stays pending (`macro_body_opened == false`) until depth turns
-    // positive, so its body is tracked. A fn's own balanced `{}`/`()`
-    // inside the body nets zero on its line and can never retire
-    // tracking while the body is open (r71 R2 residual).
-    // `macro_body_opened` is set as soon as a line contributes any
-    // opener, so a one-liner body still closes at end of line.
-    let mut in_macro_rules = false;
-    let mut macro_delim_depth: usize = 0;
-    let mut macro_body_opened = false;
-    for (idx, blanked) in blanked_lines.iter().enumerate() {
-        let macro_started_here = line_opens_macro_rules_definition(blanked);
-        if macro_started_here && !in_macro_rules {
-            in_macro_rules = true;
-            macro_delim_depth = 0;
-            macro_body_opened = false;
-        }
-        if in_macro_rules {
-            let opens = blanked.matches(['(', '[', '{']).count();
-            let closes = blanked.matches([')', ']', '}']).count();
-            macro_delim_depth = macro_delim_depth
-                .saturating_add(opens)
-                .saturating_sub(closes);
-            if opens > 0 {
-                macro_body_opened = true;
-            }
-            if macro_delim_depth == 0 && macro_body_opened {
-                in_macro_rules = false;
-                macro_body_opened = false;
-            }
-        }
-        let Some(pos) = blanked.find(needle.as_str()) else {
-            continue;
-        };
-        if pos > 0
-            && blanked[..pos]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_alphanumeric() || c == '_')
-        {
-            continue;
-        }
-        // AQ-201 R2: the needle sits inside a `macro_rules!` body (or on
-        // the definition's own line) — refuse, fail closed.
-        if in_macro_rules || macro_started_here {
-            return false;
-        }
-        // Definition found on a live code line; require the contiguous
-        // attribute run directly above it to carry #[test] and no
-        // #[ignore].
-        let mut saw_test = false;
-        let mut ignored = false;
-        let mut run = idx;
-        while run > 0 {
-            run -= 1;
-            let attr = lines[run].trim();
-            // AQ-201 rework r60 F4: `///`/`//!` doc comments ARE attributes
-            // (`#[doc = …]`) and attach to the item below, so they must not
-            // break the run. They also cannot open an escape: a line whose
-            // first non-whitespace is `///` or `//!` is entirely comment by
-            // the lexer, so it can neither carry code nor be read as an
-            // attribute (its text is skipped unread), and with the
-            // attributes-only rule below the run can only bridge comment
-            // gaps onto real attribute groups of the very item the
-            // witness fn is. `/** … */` block docs still break the run —
-            // fail closed, documented limit.
-            if attr.starts_with("///") || attr.starts_with("//!") {
-                continue;
-            }
-            if !attr.starts_with("#[") {
-                break;
-            }
-            if !attr_line_is_attributes_only(&blanked_lines[run]) {
-                return false;
-            }
-            // AQ-201 R1: refuse on ANY cfg-shaped attribute in the run —
-            // the gate cannot evaluate configuration, so doubt refuses.
-            if attr.starts_with("#[cfg") {
-                return false;
-            }
-            if attr.starts_with("#[test") {
-                saw_test = true;
-            }
-            if attr.starts_with("#[ignore") {
-                ignored = true;
-            }
-        }
-        if saw_test && !ignored {
-            return true;
-        }
-    }
-    false
-}
-
 // ---------------------------------------------------------------------------
 // Compiled ground truth (AQ-201 aq201d, review r86 §4).
 //
@@ -3839,176 +3372,6 @@ const COMPILED_GROUND_TRUTH_GATE_TEST: &str =
 #[ignore = "ground-truth probe: pinned as listed-but-not-live; never run by default"]
 fn ground_truth_ignored_witness_probe() {}
 
-/// Parse `--list --format terse` output into the set of fully-qualified
-/// test names. Terse lines are `name: test`. Anything else (empty output,
-/// an unknown kind, a malformed line, a suspicious name, a duplicate) is an
-/// error so the gate fails closed on half-parsed listings.
-fn parse_libtest_listing(stdout: &str) -> Result<BTreeSet<String>, String> {
-    let mut names = BTreeSet::new();
-    for line in stdout.lines() {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((name, kind)) = line.rsplit_once(": ") else {
-            return Err(format!("unparseable listing line {line:?}"));
-        };
-        if kind != "test" {
-            return Err(format!("unexpected listing kind {kind:?} on line {line:?}"));
-        }
-        let ident_ok = !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
-        if !ident_ok {
-            return Err(format!("suspicious test name on line {line:?}"));
-        }
-        if !names.insert(name.to_string()) {
-            return Err(format!("duplicate test name {name:?} in listing"));
-        }
-    }
-    if names.is_empty() {
-        return Err("listing contained no `name: test` lines".to_string());
-    }
-    Ok(names)
-}
-
-/// One self-exec `--list` spawn of the RUNNING test binary.
-/// `include_ignored` selects the `--ignored` listing (which contains ONLY
-/// ignored tests, so live = all − ignored). Fails closed on spawn error,
-/// non-zero exit, non-UTF-8 stdout, or unparseable/empty output.
-fn libtest_listing(include_ignored: bool) -> Result<BTreeSet<String>, String> {
-    let exe = std::env::current_exe().map_err(|err| format!("current_exe failed: {err}"))?;
-    let mut command = Command::new(&exe);
-    command.args(["--list", "--format", "terse"]);
-    if include_ignored {
-        command.arg("--ignored");
-    }
-    // Never inherit the harness's stdin: the child must be inert.
-    command.stdin(Stdio::null());
-    let output = command
-        .output()
-        .map_err(|err| format!("spawn of {exe:?} failed: {err}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "self `--list` exited with {:?}",
-            output.status.code()
-        ));
-    }
-    let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| "self `--list` stdout was not UTF-8".to_string())?;
-    parse_libtest_listing(&stdout)
-}
-
-/// Map a registry `rel_path` onto `(crate_name, module_prefix)` for the lib
-/// test target it compiles into: `crates/<crate>/src/lib.rs` →
-/// `(crate, "")`, `…/src/a/b.rs` and `…/src/a/b/mod.rs` → `(crate, "a::b")`.
-/// `None` = the path does not name a module of a lib target (a bin
-/// `main.rs`, an integration `tests/` file, or a foreign shape the gate
-/// does not guess at) — such an entry then fails closed rather than being
-/// silently weakened.
-fn libtest_module_prefix(rel_path: &str) -> Option<(String, String)> {
-    let after_crates = rel_path.strip_prefix("crates/")?;
-    let (crate_name, tail) = after_crates.split_once('/')?;
-    let tail = tail.strip_prefix("src/")?;
-    if tail == "lib.rs" {
-        return Some((crate_name.to_string(), String::new()));
-    }
-    if tail == "main.rs" {
-        return None;
-    }
-    let mut stem = tail.strip_suffix(".rs")?;
-    if let Some(parent_stem) = stem.strip_suffix("/mod") {
-        stem = parent_stem;
-    }
-    if stem.is_empty() {
-        return None;
-    }
-    let prefix = stem
-        .split('/')
-        .map(|segment| segment.strip_prefix("r#").unwrap_or(segment))
-        .collect::<Vec<_>>()
-        .join("::");
-    Some((crate_name.to_string(), prefix))
-}
-
-/// True when `full_name` from the compiled listing is the witness under the
-/// declared module. A root entry (`prefix == ""`) demands an EXACT match —
-/// the strictest form, so a same-named fn in any other module of the binary
-/// never satisfies it. A non-empty prefix additionally admits
-/// plain-identifier intermediate modules between the declared module and
-/// the witness (e.g. a `mod tests` wrapper: `p::tests::<witness>` or
-/// `p::tests::sub::<witness>`) and nothing looser. Stated residual: the
-/// listing carries no file identity, so a witness in a real submodule FILE
-/// of the declared module (`p::decoy`) also matches.
-fn listing_name_matches_module(full_name: &str, module_prefix: &str, witness: &str) -> bool {
-    let rest = if module_prefix.is_empty() {
-        full_name
-    } else {
-        match full_name.strip_prefix(&format!("{module_prefix}::")) {
-            Some(rest) => rest,
-            None => return false,
-        }
-    };
-    if rest == witness {
-        return true;
-    }
-    if module_prefix.is_empty() {
-        return false;
-    }
-    let Some(between) = rest.strip_suffix(witness) else {
-        return false;
-    };
-    let Some(between) = between.strip_suffix("::") else {
-        return false;
-    };
-    !between.is_empty()
-        && between.split("::").all(|segment| {
-            let mut chars = segment.chars();
-            !segment.is_empty()
-                && chars
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
-}
-
-/// Per-entry compiled-ground-truth verdict for an in-crate (rustynetd)
-/// registry entry: `None` = a live witness is present, `Some(reason)` = why
-/// it is NOT (absent from the binary, or present but `#[ignore]`d —
-/// distinguished so an ignored witness is never mistaken for a deleted
-/// one).
-fn compiled_ground_truth_failure(
-    all_tests: &BTreeSet<String>,
-    live_tests: &BTreeSet<String>,
-    module_prefix: &str,
-    witness: &str,
-) -> Option<String> {
-    let matched: Vec<&String> = all_tests
-        .iter()
-        .filter(|name| listing_name_matches_module(name, module_prefix, witness))
-        .collect();
-    if matched.is_empty() {
-        return Some(format!(
-            "compiled ground truth: no fn `{witness}` under module {module_prefix:?} in this \
-             test binary's `--list` — the redacting-impl suppression has no compiled evidence"
-        ));
-    }
-    let live: Vec<&String> = matched
-        .iter()
-        .copied()
-        .filter(|name| live_tests.contains(*name))
-        .collect();
-    if live.is_empty() {
-        return Some(format!(
-            "compiled ground truth: fn `{witness}` under module {module_prefix:?} is present \
-             but #[ignore]d (excluded via the `--ignored` listing): {matched:?} — an ignored \
-             witness is not live evidence"
-        ));
-    }
-    None
-}
-
 #[test]
 fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
     // AQ-126 + AQ-201 aq201d (review r86 §4): a suppression that outlives
@@ -4018,9 +3381,9 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
     // registry rel_path, and must NOT be `#[ignore]`d (live = all-listing
     // minus `--ignored` listing). Both spawns fail closed; `cargo nextest`
     // runs this same binary per test, so the self-exec works there too.
-    let all_tests = libtest_listing(false)
+    let all_tests = crate::witness_listing::libtest_listing(false)
         .unwrap_or_else(|err| panic!("compiled ground truth unavailable, failing closed: {err}"));
-    let ignored_tests = libtest_listing(true)
+    let ignored_tests = crate::witness_listing::libtest_listing(true)
         .unwrap_or_else(|err| panic!("compiled ground truth unavailable, failing closed: {err}"));
     let live_tests: BTreeSet<String> = all_tests.difference(&ignored_tests).cloned().collect();
     assert!(
@@ -4033,8 +3396,8 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
         !live_tests.contains("secret_log_audit::ground_truth_ignored_witness_probe"),
         "parse sanity: the #[ignore]d ground-truth probe must never be in the live set"
     );
-    let root = workspace_root();
     let mut failures: Vec<String> = Vec::new();
+    let mut sibling_entries: Vec<(&str, &str, &str, &str)> = Vec::new();
     for (registry_name, registry) in [
         (
             "REVIEWED_REDACTING_DEBUG_IMPLS",
@@ -4051,15 +3414,10 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
         );
         // `*registry` is an unsized `[T]` and is not IntoIterator — this was E0277.
         for (name, path, _why, witness) in registry.iter() {
-            let file = root.join(path);
-            let Ok(body) = fs::read_to_string(&file) else {
-                failures.push(format!("{registry_name}: {name}: cannot read {path:?}"));
-                continue;
-            };
-            match libtest_module_prefix(path) {
+            match crate::witness_listing::libtest_module_prefix(path) {
                 // In-crate entry: COMPILED ground truth is the arbiter.
                 Some((crate_name, module_prefix)) if crate_name == "rustynetd" => {
-                    if let Some(reason) = compiled_ground_truth_failure(
+                    if let Some(reason) = crate::witness_listing::compiled_ground_truth_failure(
                         &all_tests,
                         &live_tests,
                         &module_prefix,
@@ -4068,25 +3426,14 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
                         failures.push(format!("{registry_name}: {name}: {reason}"));
                     }
                 }
-                // Sibling-crate entry: this binary's listing cannot see the
-                // owning crate's test binaries, so the TEXT scanner stays
-                // the active layer here (early-warning for the suppression,
-                // still refusing comments/macro-bodies/missing #[test]/
-                // #[ignore] and fn-level cfg). Documented residual: it reads
-                // names in source, not compiled identity — promoting these
-                // entries to compiled ground truth needs a cross-crate runner
-                // (xtask/CI) or witness relocation (owner question, not
-                // taken in aq201d).
-                Some(_) => {
-                    if !live_witness_test_in_source(&body, witness) {
-                        failures.push(format!(
-                            "{registry_name}: {name}: no live #[test] fn `{witness}` found in \
-                             {path:?} (text layer; sibling crate) — the redacting-impl \
-                             suppression has no live evidence; restore the test or re-review \
-                             the impl"
-                        ));
-                    }
-                }
+                // AQ-213: sibling-crate entries are arbitrated by the owning
+                // crate's own compiled gate (witness_listing, #[path]-shared
+                // into each sibling), which this binary cannot run. What IS
+                // pinned here: the one-to-one partition between the sibling
+                // registry entries and the per-crate slice table, slice-table
+                // integrity, and the canonical wiring anchor in every owning
+                // crate's lib.rs.
+                Some(_) => sibling_entries.push((registry_name, *name, *path, *witness)),
                 // Unmappable path shape: refuse loudly rather than silently
                 // weaken the contract (fail closed).
                 None => {
@@ -4099,11 +3446,149 @@ fn every_reviewed_redacting_impl_entry_has_a_live_witness_test() {
             }
         }
     }
+    failures.extend(sibling_slice_failures(&sibling_entries));
     assert!(
         failures.is_empty(),
         "reviewed redacting-impl entries without a live witness test:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// AQ-213 partition + anchor checks over the SIBLING registry entries
+/// (entries in crates other than rustynetd):
+/// (1) every sibling entry appears exactly once in its owning crate's
+///     slice-table rows;
+/// (2) every sibling slice row corresponds to exactly one sibling
+///     registry entry — in-crate rustynetd rows are exempt, being
+///     arbitrated directly by the compiled arm above;
+/// (3) slice integrity: every row's rel_path maps onto its owning crate
+///     and its declared prefix stays under the rel_path-derived prefix;
+/// (4) wiring anchor: every owning crate's lib.rs carries the canonical
+///     test-only `witness_listing` declaration (`#[path]` + `mod` for
+///     siblings, plain `mod` for rustynetd). Wiring presence is what is
+///     checked here; each wired gate pins its own liveness at its own
+///     runtime via the parse-sanity sentinel, so the combined chain
+///     fails closed: removing the anchor removes the gate AND fails
+///     this check, and a gate that stops seeing its witnesses fails the
+///     crate's own suite.
+fn sibling_slice_failures(entries: &[(&str, &str, &str, &str)]) -> Vec<String> {
+    let mut failures: Vec<String> = Vec::new();
+    let slices = crate::witness_listing::WITNESS_SLICES;
+    for &(registry_name, name, path, witness) in entries {
+        let Some((crate_name, _derived)) = crate::witness_listing::libtest_module_prefix(path)
+        else {
+            failures.push(format!(
+                "{registry_name}: {name}: unmappable rel_path {path:?}"
+            ));
+            continue;
+        };
+        let Some((_, slice)) = slices
+            .iter()
+            .find(|(crate_in_table, _)| *crate_in_table == crate_name)
+        else {
+            failures.push(format!(
+                "{registry_name}: {name}: crate {crate_name:?} owns registry entries but has \
+                 no rows in the witness slice table"
+            ));
+            continue;
+        };
+        let hits = slice
+            .iter()
+            .filter(|(row_path, _, row_witness)| *row_path == path && *row_witness == witness)
+            .count();
+        if hits != 1 {
+            failures.push(format!(
+                "{registry_name}: {name}: slice table for {crate_name:?} lists \
+                 (path={path:?}, witness={witness:?}) {hits} times, expected exactly 1"
+            ));
+        }
+    }
+    for &(crate_name, slice) in slices {
+        if crate_name == "rustynetd" {
+            continue;
+        }
+        for &(rel_path, _declared_prefix, witness) in slice {
+            let hits = entries
+                .iter()
+                .filter(|(_, _, row_path, row_witness)| {
+                    *row_path == rel_path && *row_witness == witness
+                })
+                .count();
+            if hits != 1 {
+                failures.push(format!(
+                    "witness slice table: crate {crate_name:?} row (path={rel_path:?}, \
+                     witness={witness:?}) matches {hits} sibling registry entries, expected \
+                     exactly 1"
+                ));
+            }
+        }
+    }
+    for &(crate_name, slice) in slices {
+        if slice.is_empty() {
+            failures.push(format!(
+                "witness slice table: crate {crate_name:?} slice is empty"
+            ));
+            continue;
+        }
+        for &(rel_path, declared_prefix, witness) in slice {
+            match crate::witness_listing::libtest_module_prefix(rel_path) {
+                Some((mapped_crate, derived_prefix)) if mapped_crate == crate_name => {
+                    if !crate::witness_listing::module_prefix_is_under_rel_path(
+                        &derived_prefix,
+                        declared_prefix,
+                    ) {
+                        failures.push(format!(
+                            "witness slice table: crate {crate_name:?} row (path={rel_path:?}, \
+                             witness={witness:?}) declares prefix {declared_prefix:?} that \
+                             escapes the rel_path-derived prefix {derived_prefix:?}"
+                        ));
+                    }
+                }
+                other => failures.push(format!(
+                    "witness slice table: crate {crate_name:?} row path {rel_path:?} maps to \
+                     {other:?}, not the owning crate"
+                )),
+            }
+        }
+    }
+    let root = workspace_root();
+    for &(crate_name, _slice) in slices {
+        let lib = root
+            .join("crates")
+            .join(crate_name)
+            .join("src")
+            .join("lib.rs");
+        let Ok(body) = fs::read_to_string(&lib) else {
+            failures.push(format!(
+                "witness slice table: cannot read crates/{crate_name}/src/lib.rs to verify \
+                 the witness_listing wiring anchor"
+            ));
+            continue;
+        };
+        let has_path_line = body
+            .lines()
+            .any(|line| line.trim() == "#[path = \"../../rustynetd/src/witness_listing.rs\"]");
+        let has_mod_line = body
+            .lines()
+            .any(|line| line.trim() == "mod witness_listing;");
+        if crate_name == "rustynetd" {
+            if !has_mod_line {
+                failures.push(
+                    "witness slice table: rustynetd lib.rs must declare test-only \
+                     `mod witness_listing;` — the in-crate slice rows would be unchecked"
+                        .to_string(),
+                );
+            }
+        } else if !has_path_line || !has_mod_line {
+            failures.push(format!(
+                "witness slice table: crates/{crate_name}/src/lib.rs must declare the \
+                 canonical test-only pair `#[path = \
+                 \"../../rustynetd/src/witness_listing.rs\"]` + `mod witness_listing;` — the \
+                 crate's own compiled witness gate is not wired"
+            ));
+        }
+    }
+    failures
 }
 
 #[test]
@@ -4112,9 +3597,10 @@ fn ground_truth_ignored_probe_is_listed_but_never_live() {
     // `--list` includes #[ignore]d tests indistinguishably,
     // `--list --ignored` lists ONLY ignored tests, so live = all − ignored,
     // and the permanent probe sits exactly in the excluded slice.
-    let all_tests =
-        libtest_listing(false).expect("self `--list` must succeed under the test harness");
-    let ignored_tests = libtest_listing(true).expect("self `--list --ignored` must succeed");
+    let all_tests = crate::witness_listing::libtest_listing(false)
+        .expect("self `--list` must succeed under the test harness");
+    let ignored_tests = crate::witness_listing::libtest_listing(true)
+        .expect("self `--list --ignored` must succeed");
     let probe = "secret_log_audit::ground_truth_ignored_witness_probe";
     assert!(
         all_tests.contains(probe),
@@ -4136,595 +3622,14 @@ fn ground_truth_live_test_of_this_module_is_in_live_set() {
     // Positive control: a real, un-ignored existing test of this module is
     // in the live set, proving the two-spawn subtraction does not
     // over-exclude.
-    let all_tests =
-        libtest_listing(false).expect("self `--list` must succeed under the test harness");
-    let ignored_tests = libtest_listing(true).expect("self `--list --ignored` must succeed");
+    let all_tests = crate::witness_listing::libtest_listing(false)
+        .expect("self `--list` must succeed under the test harness");
+    let ignored_tests = crate::witness_listing::libtest_listing(true)
+        .expect("self `--list --ignored` must succeed");
     let live_tests: BTreeSet<String> = all_tests.difference(&ignored_tests).cloned().collect();
     assert!(
-        live_tests.contains("secret_log_audit::witness_liveness_checker_refuses_dead_witnesses"),
+        live_tests.contains(COMPILED_GROUND_TRUTH_GATE_TEST),
         "a plain #[test] of this module must be in the live set"
-    );
-}
-
-#[test]
-fn ground_truth_listing_parser_accepts_terse_test_lines() {
-    let parsed = parse_libtest_listing("a: test\nb::c: test\nspaced: test  \n")
-        .expect("well-formed terse listing must parse");
-    assert_eq!(
-        parsed,
-        BTreeSet::from(["a".to_string(), "b::c".to_string(), "spaced".to_string(),])
-    );
-}
-
-#[test]
-fn ground_truth_listing_parser_fails_closed_on_bad_output() {
-    assert!(
-        parse_libtest_listing("").is_err(),
-        "empty listing must fail closed"
-    );
-    assert!(
-        parse_libtest_listing("garbage without colon\n").is_err(),
-        "unparseable line must fail closed"
-    );
-    assert!(
-        parse_libtest_listing("a: benchmark\n").is_err(),
-        "non-test kind must fail closed"
-    );
-    assert!(
-        parse_libtest_listing("a b: test\n").is_err(),
-        "name with whitespace must fail closed"
-    );
-    assert!(
-        parse_libtest_listing("a: test\na: test\n").is_err(),
-        "duplicate names must fail closed"
-    );
-}
-
-#[test]
-fn ground_truth_module_prefix_derivation_table() {
-    assert_eq!(
-        libtest_module_prefix("crates/rustynetd/src/lib.rs"),
-        Some(("rustynetd".to_string(), String::new()))
-    );
-    assert_eq!(
-        libtest_module_prefix("crates/rustynetd/src/enrollment_token.rs"),
-        Some(("rustynetd".to_string(), "enrollment_token".to_string()))
-    );
-    assert_eq!(
-        libtest_module_prefix("crates/rustynetd/src/a/b.rs"),
-        Some(("rustynetd".to_string(), "a::b".to_string()))
-    );
-    assert_eq!(
-        libtest_module_prefix("crates/rustynetd/src/a/b/mod.rs"),
-        Some(("rustynetd".to_string(), "a::b".to_string()))
-    );
-    // Sibling crates map fine, but never claim the rustynetd binary.
-    assert_eq!(
-        libtest_module_prefix("crates/rustynet-crypto/src/lib.rs"),
-        Some(("rustynet-crypto".to_string(), String::new()))
-    );
-    // Unmappable shapes fail closed.
-    assert_eq!(libtest_module_prefix("crates/rustynetd/src/main.rs"), None);
-    assert_eq!(libtest_module_prefix("crates/rustynetd/tests/it.rs"), None);
-    assert_eq!(libtest_module_prefix("src/lib.rs"), None);
-    assert_eq!(libtest_module_prefix("benches/x.rs"), None);
-}
-
-#[test]
-fn ground_truth_match_rule_table() {
-    // Root entries are exact-match only: a bare name satisfies the root
-    // rule…
-    assert!(listing_name_matches_module(
-        "every_reviewed_redacting_impl_entry_has_a_live_witness_test",
-        "",
-        "every_reviewed_redacting_impl_entry_has_a_live_witness_test",
-    ));
-    // …while the fully-qualified form (a different module) and the SAME
-    // name elsewhere in the binary must not.
-    assert!(!listing_name_matches_module(
-        COMPILED_GROUND_TRUTH_GATE_TEST,
-        "",
-        "every_reviewed_redacting_impl_entry_has_a_live_witness_test",
-    ));
-    assert!(!listing_name_matches_module(
-        "enrollment_token::tests::some_witness",
-        "",
-        "some_witness",
-    ));
-    assert!(!listing_name_matches_module(
-        "secret_log_audit::some_witness",
-        "",
-        "some_witness",
-    ));
-    // Non-root entries admit a plain-ident `mod tests` wrapper…
-    assert!(listing_name_matches_module(
-        "enrollment_token::tests::some_witness",
-        "enrollment_token",
-        "some_witness",
-    ));
-    assert!(listing_name_matches_module(
-        "enrollment_token::tests::sub::some_witness",
-        "enrollment_token",
-        "some_witness",
-    ));
-    assert!(listing_name_matches_module(
-        "enrollment_token::some_witness",
-        "enrollment_token",
-        "some_witness",
-    ));
-    // …but not other modules of the crate, and never a non-boundary
-    // prefix hit.
-    assert!(!listing_name_matches_module(
-        "secret_log_audit::tests::some_witness",
-        "enrollment_token",
-        "some_witness",
-    ));
-    assert!(!listing_name_matches_module(
-        "enrollment_token_extended::tests::some_witness",
-        "enrollment_token",
-        "some_witness",
-    ));
-}
-
-#[test]
-fn ground_truth_per_entry_verdict_table() {
-    let witness = "enrollment_token_debug_output_redacts_tag_and_token_id";
-    let compiled = BTreeSet::from([format!("enrollment_token::tests::{witness}")]);
-    assert_eq!(
-        compiled_ground_truth_failure(&compiled, &compiled, "enrollment_token", witness),
-        None,
-        "a live compiled witness passes"
-    );
-
-    // The r86 F1′ fail-open shape: an inert macro-body "witness" exists
-    // only in source text, never in the compiled listing → absent, fail.
-    let empty = BTreeSet::new();
-    let absent = compiled_ground_truth_failure(&empty, &empty, "enrollment_token", witness)
-        .expect("absent witness must fail");
-    assert!(absent.contains("no fn"), "absent reason: {absent}");
-
-    // An #[ignore]d witness IS in the all-listing but NOT in the live set;
-    // the failure must say so, not claim the witness is missing.
-    let ignored_failure =
-        compiled_ground_truth_failure(&compiled, &empty, "enrollment_token", witness)
-            .expect("ignored witness must fail");
-    assert!(
-        ignored_failure.contains("#[ignore]"),
-        "ignored reason must mention ignore: {ignored_failure}"
-    );
-
-    // A same-named fn in the WRONG module does not satisfy a root entry —
-    // even though the name exists somewhere in the binary.
-    let wrong_module = BTreeSet::from(["secret_log_audit::some_witness".to_string()]);
-    let wrong_module_failure =
-        compiled_ground_truth_failure(&wrong_module, &wrong_module, "", "some_witness")
-            .expect("wrong-module witness must fail");
-    assert!(
-        wrong_module_failure.contains("no fn"),
-        "wrong-module reason: {wrong_module_failure}"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_dead_witnesses() {
-    // Negative controls: the checker must REFUSE a witness that is
-    // commented out, block-commented, missing #[test], or #[ignore]d —
-    // and accept the live shape. Raw text presence is not evidence.
-    let live = "\n#[test]\nfn some_witness() {}\n";
-    assert!(live_witness_test_in_source(live, "some_witness"));
-
-    // The demonstrated escape: witness commented out entirely.
-    let commented_out = "\n// #[test]\n// fn some_witness() {}\n";
-    assert!(!live_witness_test_in_source(commented_out, "some_witness"));
-
-    let block_commented = "\n/*\n#[test]\nfn some_witness() {}\n*/\n";
-    assert!(!live_witness_test_in_source(
-        block_commented,
-        "some_witness"
-    ));
-
-    let plain_fn = "\nfn some_witness() {}\n";
-    assert!(!live_witness_test_in_source(plain_fn, "some_witness"));
-
-    // An #[ignore]d test does not prove the gate runs.
-    let ignored_test = "\n#[test]\n#[ignore]\nfn some_witness() {}\n";
-    assert!(!live_witness_test_in_source(ignored_test, "some_witness"));
-
-    assert!(!live_witness_test_in_source(
-        "\nfn unrelated_other_test() {}\n",
-        "some_witness"
-    ));
-}
-
-#[test]
-fn witness_liveness_checker_refuses_cfg_gated_witnesses() {
-    // AQ-201 R1 (review probe w3, proven at gate level): a `#[cfg(any())]`
-    // witness never compiles, yet the old walk only looked for #[test] /
-    // #[ignore] and counted it live, keeping the redacting-impl
-    // suppression green. Any `#[cfg…` attribute in the run refuses (fail
-    // closed).
-    let cfg_after_test = "\n#[test]\n#[cfg(any())]\nfn some_witness() {}\n";
-    assert!(
-        !live_witness_test_in_source(cfg_after_test, "some_witness"),
-        "cfg-gated witness below #[test] must be refused"
-    );
-
-    let cfg_before_test = "\n#[cfg(any())]\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        !live_witness_test_in_source(cfg_before_test, "some_witness"),
-        "cfg-gated witness above #[test] must be refused"
-    );
-
-    let cfg_attr = "\n#[test]\n#[cfg_attr(test, ignore)]\nfn some_witness() {}\n";
-    assert!(
-        !live_witness_test_in_source(cfg_attr, "some_witness"),
-        "cfg_attr in the run must refuse (configuration-dependent semantics)"
-    );
-
-    // A fn-level `#[cfg(test)]` is refused too: whether the fn exists
-    // still depends on configuration the text gate cannot evaluate.
-    // Witness fns belong inside a `#[cfg(test)] mod` block — the
-    // module-level cfg sits above the `mod` line, outside the run.
-    let cfg_test_fn_level = "\n#[cfg(test)]\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        !live_witness_test_in_source(cfg_test_fn_level, "some_witness"),
-        "fn-level cfg(test) must refuse (configuration-dependent existence)"
-    );
-
-    // Regression witness for the legitimate shape: module-level cfg above
-    // the enclosing mod must stay live.
-    let module_cfg = "#[cfg(test)]\nmod tests {\n    #[test]\n    fn some_witness() {}\n}\n";
-    assert!(
-        live_witness_test_in_source(module_cfg, "some_witness"),
-        "module-level #[cfg(test)] mod must keep its witnesses live"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_macro_defined_witnesses() {
-    // AQ-201 R2 (review probe w4): a fn inside a never-invoked
-    // `macro_rules!` body is not evidence that the test exists — whether
-    // it exists depends on invocation the text scanner cannot resolve, so
-    // refusal is the fail-closed choice (chosen over documenting a limit).
-    let in_macro = "\nmacro_rules! witness_shim {\n    #[test]\n    fn some_witness() {}\n}\n";
-    assert!(
-        !live_witness_test_in_source(in_macro, "some_witness"),
-        "witness inside a macro_rules! body must be refused"
-    );
-
-    let in_macro_one_line = "\nmacro_rules! shim { #[test] fn some_witness() {} }\n";
-    assert!(
-        !live_witness_test_in_source(in_macro_one_line, "some_witness"),
-        "same-line macro_rules! body must be refused"
-    );
-
-    // A CLOSED macro elsewhere must not suppress a witness defined after
-    // it: the brace tracking has to return to depth 0.
-    let macro_then_witness =
-        "\nmacro_rules! shim {\n    fn helper() {}\n}\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(macro_then_witness, "some_witness"),
-        "a closed macro_rules! must not suppress later live witnesses"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_nested_macro_rules_bodies() {
-    // r60 F2 (probe EA1): a nested `macro_rules!` definition inside an
-    // open body must not reset the depth — the outer body stays tracked
-    // until the OUTERMOST brace closes.
-    let nested = "\nmacro_rules! outer {\n    () => {};\n    macro_rules! inner {\n        () => {};\n    }\n    #[test]\n    fn some_witness() {}\n}\n";
-    assert!(
-        !live_witness_test_in_source(nested, "some_witness"),
-        "witness after a nested macro_rules! inside the outer body must be refused"
-    );
-
-    // The outer body really does close: a witness after it stays live.
-    let nested_then_live = "\nmacro_rules! outer {\n    macro_rules! inner {\n        () => {};\n    }\n}\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(nested_then_live, "some_witness"),
-        "a witness after the outermost body closes must stay live"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_tracks_macro_brace_on_next_line() {
-    // r60 F3 (probe EA2): `macro_rules! name` with the body brace on a
-    // later line (legal Rust, not rustfmt output) stays pending and the
-    // body IS tracked.
-    let pending = "\nmacro_rules! shim\n{\n    #[test]\n    fn some_witness() {}\n}\n";
-    assert!(
-        !live_witness_test_in_source(pending, "some_witness"),
-        "a definition whose braces start on the next line must still be tracked"
-    );
-
-    // ... and after the pending body closes, witnesses are live again.
-    let after = "\nmacro_rules! shim\n{\n    () => {};\n}\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(after, "some_witness"),
-        "a pending-open macro must close normally once its braces balance"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_blanks_char_literals_for_macro_depth() {
-    // r60 F1 (probe EA3, gate plant 3): a `'}'` char literal inside a
-    // macro body must not deflate the depth and close the body early.
-    let char_close = "\nmacro_rules! shim {\n    () => {\n        let c = '}';\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
-    assert!(
-        !live_witness_test_in_source(char_close, "some_witness"),
-        "a '}}' char literal must not close a macro body early"
-    );
-
-    // The mirror image is fail-closed: a `'{'` must not wedge the tracker
-    // open forever — a witness after the real close stays live.
-    let char_open = "\nmacro_rules! shim {\n    () => {\n        let c = '{';\n    };\n}\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(char_open, "some_witness"),
-        "a '{{' char literal must not wedge the macro tracking open"
-    );
-
-    // Escaped-quote and byte char literals too.
-    let escaped_and_byte = "\nmacro_rules! shim {\n    () => {\n        let q = '\\'';\n        let b = b'}';\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
-    assert!(
-        !live_witness_test_in_source(escaped_and_byte, "some_witness"),
-        "escaped quote and byte b'}}' literals must be blanked for depth counting"
-    );
-
-    // A unicode-escape char literal carries exactly one self-balancing
-    // `\u{…}` pair, so it nets zero: it neither closes the body early nor
-    // wedges it open.
-    let unicode_escape = "\nmacro_rules! shim {\n    () => {\n        let c = '\\u{7d}';\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
-    assert!(
-        !live_witness_test_in_source(unicode_escape, "some_witness"),
-        "balanced unicode-escape braces inside a char literal must net zero"
-    );
-    let unicode_escape_after = "\nmacro_rules! shim {\n    () => {\n        let c = '\\u{7d}';\n    };\n}\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(unicode_escape_after, "some_witness"),
-        "a macro whose extra braces are balanced must close on its real brace"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_blanks_multiline_strings_inside_macro_bodies() {
-    // r60 F1 completion: a `}` inside a MULTILINE string (plain or raw)
-    // is content, not a brace — line-local blanking cannot see this; the
-    // blanker carries the string state across lines.
-    let plain_multiline = "\nmacro_rules! shim {\n    () => {\n        let s = \"\n}\n\";\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
-    assert!(
-        !live_witness_test_in_source(plain_multiline, "some_witness"),
-        "a brace inside a multiline plain string must not close the body early"
-    );
-
-    let raw_multiline = "\nmacro_rules! shim {\n    () => {\n        let s = r#\"\n}\n\"#;\n    };\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
-    assert!(
-        !live_witness_test_in_source(raw_multiline, "some_witness"),
-        "a brace inside a multiline raw string must not close the body early"
-    );
-
-    // After the strings terminate normally, tracking still closes.
-    let closes_normally = "\nmacro_rules! shim {\n    () => {\n        let s = \"\n}\n\";\n    };\n}\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(closes_normally, "some_witness"),
-        "multiline strings must terminate tracking state when they close"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_blanks_multiline_block_comments_inside_macro_bodies() {
-    // r60 F1 completion: block comments nest and may span lines inside a
-    // macro body; braces inside them are content.
-    let block_comment = "\nmacro_rules! shim {\n    /* outer /* nested */ still\n       comment } content\n    */\n    () => {};\n    (x) => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
-    assert!(
-        !live_witness_test_in_source(block_comment, "some_witness"),
-        "braces inside a spanning nested block comment must not affect macro depth"
-    );
-
-    let comment_closes = "\nmacro_rules! shim {\n    /* comment\n       }} content\n    */\n    () => {};\n}\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(comment_closes, "some_witness"),
-        "a macro whose comment braces are blanked must close on its real brace"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_whitespace_before_macro_bang() {
-    // Detection hardening: `macro_rules !` with whitespace before the
-    // bang is legal Rust; the original patch's `contains("macro_rules!")`
-    // missed it, leaving the body untracked.
-    let spaced = "\nmacro_rules ! shim {\n    #[test]\n    fn some_witness() {}\n}\n";
-    assert!(
-        !live_witness_test_in_source(spaced, "some_witness"),
-        "macro_rules ! (space before bang) must still open macro tracking"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_macro_rules_with_bang_on_next_line() {
-    // r81 F1 (probe C41 / plant G6): `macro_rules` alone on its line with
-    // the `!` on the next compiles, and was never tracked, so a witness in
-    // the never-invoked body counted live.
-    let split_bang = "\nmacro_rules\n! split_shim {\n    () => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
-    assert!(
-        !live_witness_test_in_source(split_bang, "some_witness"),
-        "a witness inside a macro whose `!` is on the next line must be refused"
-    );
-    // Liveness guard: an identifier that merely ends in the word stays inert.
-    let ident = "\nlet not_macro_rules\n= 1;\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(ident, "some_witness"),
-        "an identifier ending in macro_rules must not start tracking"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_paren_delimited_macro_bodies() {
-    // r77 F1 (probe PA): a `macro_rules!` body delimited by parens is a
-    // token tree exactly like a brace body. Brace-only counting never
-    // raised any depth for it, so the witness fn's own balanced `{}`
-    // set macro_body_opened and retired tracking at depth 0 — a
-    // never-invoked macro body counted live.
-    let paren_body = "\nmacro_rules! paren_shim (\n    (x) => (\n        #[test]\n        fn some_witness() {}\n    )\n);\n";
-    assert!(
-        !live_witness_test_in_source(paren_body, "some_witness"),
-        "a witness inside a paren-delimited macro body must be refused"
-    );
-
-    // Depth must be counted on the BLANKED text: brackets inside string
-    // literals are inert, so this unbalanced-looking pair cannot skew
-    // the count in either direction.
-    let paren_unbalanced_strings = "\nmacro_rules! shim (\n    (x) => ( let a = \")\"; let b = \"(\";\n        #[test]\n        fn some_witness() {}\n    )\n);\n";
-    assert!(
-        !live_witness_test_in_source(paren_unbalanced_strings, "some_witness"),
-        "brackets inside string literals must not skew macro tracking"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_bracket_delimited_macro_bodies() {
-    // r77 F1 (probe PB): same fail-open shape with a bracket-delimited
-    // body — `[]` is a legal `macro_rules!` delimiter.
-    let bracket_body = "\nmacro_rules! bracket_shim [\n    (x) => [\n        #[test]\n        fn some_witness() {}\n    ]\n];\n";
-    assert!(
-        !live_witness_test_in_source(bracket_body, "some_witness"),
-        "a witness inside a bracket-delimited macro body must be refused"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_paren_within_bracket_macro_nesting() {
-    // r77 F1: mixed delimiters nest like any token tree; the aggregate
-    // depth must survive a bracket body containing a nested paren body
-    // (and a nested `macro_rules!` definition must not reset it, r60 F2).
-    let mixed = "\nmacro_rules! outer [\n    (x) => [\n        macro_rules! inner (\n            (y) => (\n                #[test]\n                fn some_witness() {}\n            )\n        );\n    ]\n];\n";
-    assert!(
-        !live_witness_test_in_source(mixed, "some_witness"),
-        "a witness inside nested paren/bracket macro bodies must be refused"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_closed_paren_macro_keeps_following_witness_live() {
-    // r77 F1 (probe PC): a CLOSED paren-delimited macro must retire
-    // tracking so a genuine `#[test]` fn after it stays live. Under the
-    // old brace-only counter the opener line contributed no `{`, so
-    // tracking stayed pending forever and swallowed the whole tail.
-    let closed = "\nmacro_rules! m ();\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(closed, "some_witness"),
-        "a closed paren-delimited macro must not swallow the fn after it"
-    );
-
-    // Same shape with bracket-shaped text in a string: blanking makes it
-    // inert, the body still closes on the same line.
-    let closed_string_bracket = "\nmacro_rules! m (\"(\");\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(closed_string_bracket, "some_witness"),
-        "a bracket-shaped string must not wedge macro tracking open"
-    );
-
-    let mixed_close = "\nmacro_rules! m (\n    (x) => [\n        1 + 1\n    ]\n);\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(mixed_close, "some_witness"),
-        "a paren body closing a bracket arm must retire tracking cleanly"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_same_line_witness_in_paren_body() {
-    // r77 F1 (probe PD): a one-line `#[test] fn` inside a paren-delimited
-    // body is refused by the in-macro check before the attribute walk;
-    // delimiter counting must not retire tracking mid-line (the arm's
-    // closing `)` shares the line) and re-admit the witness.
-    let same_line = "\nmacro_rules! shim (\n    (x) => ( #[test] fn some_witness() {} )\n);\n";
-    assert!(
-        !live_witness_test_in_source(same_line, "some_witness"),
-        "a same-line witness inside a paren body must be refused"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_sees_doc_comment_between_attributes() {
-    // r60 F4 (probe EA5): `///` doc comments ARE attributes and attach to
-    // the item below; the run must skip them, not break on them.
-    let doc_between = "\n#[test]\n/// docs for the witness\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(doc_between, "some_witness"),
-        "a doc comment between #[test] and the fn must not break the run"
-    );
-
-    let inner_doc = "\n#[test]\n//! inner docs\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(inner_doc, "some_witness"),
-        "an inner doc comment between attrs and the fn must not break the run"
-    );
-
-    // A doc comment CANNOT smuggle liveness: its text is never read as an
-    // attribute, so cfg/ignore/test-shaped text inside it is inert.
-    let doc_poison = "\n#[test]\n/// #[cfg(any())] #[ignore] fn decoy(\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(doc_poison, "some_witness"),
-        "doc-comment text must be inert for the attribute run"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_refuses_hybrid_attr_code_lines_in_run() {
-    // Hardening found during the rework (pre-existing at HEAD): the run
-    // consumed `#[test] fn a() {}` as an "attribute" line, so a one-line
-    // test granted liveness to an unrelated fn below it. A `#[`-prefixed
-    // line that is not attributes-only now REFUSES (fail closed).
-    let bridge = "\n#[test] fn unrelated_test() {}\nfn some_witness() {}\n";
-    assert!(
-        !live_witness_test_in_source(bridge, "some_witness"),
-        "a one-line test must not grant liveness to the fn below it"
-    );
-
-    let doc_bridge = "\n#[test] fn unrelated_test() {}\n/// docs\nfn some_witness() {}\n";
-    assert!(
-        !live_witness_test_in_source(doc_bridge, "some_witness"),
-        "a doc comment must not bridge across a hybrid attr+code line"
-    );
-
-    // An attributes-only run stays live, including multi-attribute and
-    // trailing-comment shapes.
-    let multi_attr = "\n#[test]\n#[should_panic]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(multi_attr, "some_witness"),
-        "an attributes-only run stays live"
-    );
-
-    let trailing_comment = "\n#[test] // the witness\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(trailing_comment, "some_witness"),
-        "a trailing comment on an attribute line must not break the run"
-    );
-}
-
-#[test]
-fn witness_liveness_checker_macro_mention_in_comment_or_string_stays_live() {
-    // r60 probes EA10/EA11 pinning: a macro_rules!-shaped mention in a
-    // comment or string, or a witness defined BEFORE a poison-shaped
-    // macro, must stay live.
-    let comment_poison = "\n// macro_rules! poison {\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(comment_poison, "some_witness"),
-        "a macro_rules mention inside a comment must not open tracking"
-    );
-
-    let string_poison =
-        "\nconst POISON: &str = \"macro_rules! shim {\";\n\n#[test]\nfn some_witness() {}\n";
-    assert!(
-        live_witness_test_in_source(string_poison, "some_witness"),
-        "a macro_rules mention inside a string must not open tracking"
-    );
-
-    let witness_before =
-        "\n#[test]\nfn some_witness() {}\n\nmacro_rules! poison {\n    fn not_a_test() {}\n}\n";
-    assert!(
-        live_witness_test_in_source(witness_before, "some_witness"),
-        "a witness defined before a macro must stay live"
     );
 }
 

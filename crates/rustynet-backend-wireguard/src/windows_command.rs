@@ -1259,6 +1259,8 @@ mod tests {
     /// True when a `0o555` directory actually rejects writes for this
     /// process. Root (the Debian CI container) is exempt from mode bits, so
     /// the read-only-directory tests must skip there instead of failing.
+    /// Unix only: its sole caller is the unix arm of the read-only helper.
+    #[cfg(unix)]
     fn directory_mode_bits_are_enforced(read_only_dir: &std::path::Path) -> bool {
         let probe = read_only_dir.join(".mode-bits-probe");
         match fs::write(&probe, b"") {
@@ -1268,6 +1270,39 @@ mod tests {
             }
             Err(_) => true,
         }
+    }
+
+    /// Manufacture the read-only config-dir precondition for the
+    /// remove-peer retry tests, returning true when the mode bits are
+    /// actually enforced for this process. Unix-only: Windows has no POSIX
+    /// mode bits, so there the precondition cannot be manufactured and the
+    /// caller skips (root-owned CI containers skip the same way).
+    #[cfg(unix)]
+    fn make_dir_read_only_for_test(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+        directory_mode_bits_are_enforced(dir)
+    }
+
+    /// Non-unix counterpart of [`make_dir_read_only_for_test`]: always
+    /// reports "not enforced" so the caller takes its documented skip path.
+    #[cfg(not(unix))]
+    fn make_dir_read_only_for_test(dir: &std::path::Path) -> bool {
+        let _ = dir;
+        false
+    }
+
+    /// Restore a config dir the tests made read-only (no-op on non-unix,
+    /// where [`make_dir_read_only_for_test`] never restricted it).
+    #[cfg(unix)]
+    fn restore_dir_writable_for_test(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+    }
+
+    #[cfg(not(unix))]
+    fn restore_dir_writable_for_test(dir: &std::path::Path) {
+        let _ = dir;
     }
 
     fn sample_peer(name: &str) -> PeerConfig {
@@ -2378,7 +2413,6 @@ mod tests {
         // resurrect the removed peer with its allowed_ips. The retry path
         // (peer absent from the map) must therefore rewrite the persistent
         // config instead of returning Ok while disk and memory disagree.
-        use std::os::unix::fs::PermissionsExt;
         let temp_dir = TempDir::new().expect("temp dir");
         let cfg_dir = temp_dir.path().join("cfgdir");
         fs::create_dir_all(&cfg_dir).expect("cfg dir");
@@ -2404,21 +2438,19 @@ mod tests {
         // Break persistence: a read-only config directory fails the staging
         // write inside write_config_atomically while the runtime `wg set`
         // remove succeeds and the map entry is dropped.
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
-        if !directory_mode_bits_are_enforced(&cfg_dir) {
+        if !make_dir_read_only_for_test(&cfg_dir) {
             // A root-owned test process (the Debian CI container) writes
             // through a 0o555 directory, so the staging failure this test
             // manufactures cannot occur. Skip rather than assert a
             // precondition the host does not provide.
-            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod rw");
+            restore_dir_writable_for_test(&cfg_dir);
             eprintln!("skipped: this process bypasses directory mode bits (root)");
             return;
         }
         backend
             .remove_peer(&gone_id)
             .expect_err("sync failure must fail the removal");
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+        restore_dir_writable_for_test(&cfg_dir);
 
         backend
             .remove_peer(&gone_id)
@@ -2439,7 +2471,6 @@ mod tests {
         // silently leave a [Peer] section on disk that a tunnel-service
         // restart resurrects, which is exactly the divergence this early
         // return exists to close.
-        use std::os::unix::fs::PermissionsExt;
         let temp_dir = TempDir::new().expect("temp dir");
         let cfg_dir = temp_dir.path().join("cfgdir");
         fs::create_dir_all(&cfg_dir).expect("cfg dir");
@@ -2462,14 +2493,12 @@ mod tests {
         let gone_id = peer.node_id.clone();
         backend.configure_peer(peer).expect("configure");
 
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
-        if !directory_mode_bits_are_enforced(&cfg_dir) {
+        if !make_dir_read_only_for_test(&cfg_dir) {
             // A root-owned test process (the Debian CI container) writes
             // through a 0o555 directory, so the staging failure this test
             // manufactures cannot occur. Skip rather than assert a
             // precondition the host does not provide.
-            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod rw");
+            restore_dir_writable_for_test(&cfg_dir);
             eprintln!("skipped: this process bypasses directory mode bits (root)");
             return;
         }
@@ -2489,7 +2518,7 @@ mod tests {
             .remove_peer(&gone_id)
             .expect_err("retry must not report success while convergence failed");
 
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+        restore_dir_writable_for_test(&cfg_dir);
         backend
             .remove_peer(&gone_id)
             .expect("a later retry once the config dir is writable must converge");
