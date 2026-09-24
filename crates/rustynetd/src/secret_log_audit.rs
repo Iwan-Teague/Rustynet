@@ -3352,8 +3352,9 @@ fn every_secret_vocabulary_type_is_classified() {
 // both spawn this same binary per test, and `current_exe()` + `--list` is a
 // plain self-exec with no cargo involvement (no target-lock contention).
 // The spawn FAILS CLOSED: any error, non-zero exit, unparseable line, or
-// empty all-tests listing aborts the gate. (An empty `--ignored` listing is
-// legitimate — it just means nothing is ignored.)
+// empty listing aborts the gate — including an empty `--ignored` listing:
+// the parser refuses ANY empty listing, and the permanent `#[ignore]`d probe
+// guarantees the `--ignored` listing is never legitimately empty (r92 N-2).
 // ---------------------------------------------------------------------------
 
 /// Fully-qualified name of this gate inside the rustynetd lib test binary.
