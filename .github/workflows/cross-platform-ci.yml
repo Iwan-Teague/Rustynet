@@ -316,6 +316,7 @@ jobs:
             -p rustynet-backend-api
             -p rustynet-backend-stub
             -p rustynet-relay
+            -p rustynet-backend-wireguard
             -p rustynet-local-security
           )
           cargo fmt "${PKGS[@]}" -- --check

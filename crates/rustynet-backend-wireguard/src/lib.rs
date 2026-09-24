@@ -33,3 +33,10 @@ pub use windows_command::{
     DEFAULT_WINDOWS_NETSH_EXE_PATH, DEFAULT_WINDOWS_WG_EXE_PATH,
     DEFAULT_WINDOWS_WIREGUARD_EXE_PATH, WindowsWireguardBackend,
 };
+
+// AQ-213: per-crate compiled ground-truth gate for this crate's
+// reviewed-redacting-impl registry entries; the source is shared with
+// rustynetd via #[path] so every host crate runs the same gate.
+#[cfg(test)]
+#[path = "../../rustynetd/src/witness_listing.rs"]
+mod witness_listing;

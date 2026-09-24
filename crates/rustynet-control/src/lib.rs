@@ -8884,3 +8884,10 @@ mod tests {
         assert!(rendered.contains("relay session token nonce"));
     }
 }
+
+// AQ-213: per-crate compiled ground-truth gate for this crate's
+// reviewed-redacting-impl registry entries; the source is shared with
+// rustynetd via #[path] so every host crate runs the same gate.
+#[cfg(test)]
+#[path = "../../rustynetd/src/witness_listing.rs"]
+mod witness_listing;
