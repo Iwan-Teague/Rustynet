@@ -3635,7 +3635,11 @@ fn line_opens_macro_rules_definition(blanked: &str) -> bool {
                 .chars()
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_');
-        if boundary_before && blanked[end..].trim_start().starts_with('!') {
+        // The `!` may sit on a LATER line (`macro_rules` alone at the end of
+        // its line is legal Rust, r81 F1): a bare trailing `macro_rules`
+        // starts tracking too. A false trigger only widens refusal.
+        let rest = blanked[end..].trim_start();
+        if boundary_before && (rest.starts_with('!') || rest.is_empty()) {
             return true;
         }
         from = end;
@@ -4068,6 +4072,24 @@ fn witness_liveness_checker_refuses_whitespace_before_macro_bang() {
     assert!(
         !live_witness_test_in_source(spaced, "some_witness"),
         "macro_rules ! (space before bang) must still open macro tracking"
+    );
+}
+
+#[test]
+fn witness_liveness_checker_refuses_macro_rules_with_bang_on_next_line() {
+    // r81 F1 (probe C41 / plant G6): `macro_rules` alone on its line with
+    // the `!` on the next compiles, and was never tracked, so a witness in
+    // the never-invoked body counted live.
+    let split_bang = "\nmacro_rules\n! split_shim {\n    () => {\n        #[test]\n        fn some_witness() {}\n    };\n}\n";
+    assert!(
+        !live_witness_test_in_source(split_bang, "some_witness"),
+        "a witness inside a macro whose `!` is on the next line must be refused"
+    );
+    // Liveness guard: an identifier that merely ends in the word stays inert.
+    let ident = "\nlet not_macro_rules\n= 1;\n#[test]\nfn some_witness() {}\n";
+    assert!(
+        live_witness_test_in_source(ident, "some_witness"),
+        "an identifier ending in macro_rules must not start tracking"
     );
 }
 
