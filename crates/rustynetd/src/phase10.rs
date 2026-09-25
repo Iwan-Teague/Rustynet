@@ -489,7 +489,7 @@ pub struct ApplyOptions {
     /// posture stays exactly `Untouched` (the zero-leak state).
     /// `FullyProtected` is NEVER deferred by this flag: deferring the full
     /// posture would leave a tunnel-up node resolving general DNS with no pf
-    /// floor and no pins — a real leak window under Requirements.md:186 /
+    /// floor and no pins — a real leak window under Requirements.md:192 /
     /// SecurityMinimumBar §8. Default `false`.
     pub defer_scoped_dns_posture: bool,
 }
