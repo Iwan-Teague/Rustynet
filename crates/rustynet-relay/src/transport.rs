@@ -435,6 +435,339 @@ pub fn serialize_relay_hello_challenge(artifact: &AddressValidationArtifact) -> 
     datagram
 }
 
+// ── v2 relay hello (D3 seams plan §3, step S3) ────────────────────────────────
+//
+// Pure library addition: parser + serializer only, NOT yet reachable from
+// relay dispatch (`main.rs` still refuses `0x08` via its unknown-message-type
+// arm until S4). The layout extends the v1 field sequence with a version
+// byte, a validated padding tail, and the OI-10 artifact field MANDATORY:
+//
+// [0x08][u8 protocol_version = 2][u16 pad_len][u16 node_id_len][node_id]
+// [u16 peer_node_id_len][peer_node_id][u16 token_len][token]
+// [0x07 ++ artifact[32]][pad_len zero bytes]
+
+/// A parsed v2 relay hello.
+///
+/// The artifact is NOT an `Option` here, unlike v1's [`RelayHello`]: §3
+/// makes it mandatory, because a v2 hello that could omit it would let a
+/// client switch message types to bypass the default-on OI-10 pre-auth gate.
+/// The type makes the omission unrepresentable.
+#[derive(Debug, Clone)]
+pub struct RelayHelloV2 {
+    pub node_id: String,
+    pub peer_node_id: String,
+    pub session_token: RelaySessionToken,
+    pub addr_validation_artifact: AddressValidationArtifact,
+    /// Length of the trailing padding region. Every padding byte on the wire
+    /// is `0x00` today — validated, not ignored: an inconsistent tail is a
+    /// refuse, never a shrug.
+    pub pad_len: u16,
+}
+
+/// Fixed byte count around the variable-length fields of a v2 hello:
+/// msg_type (1) + protocol_version (1) + pad_len (2) + the three length
+/// prefixes (6) + the mandatory 33-byte artifact field. `pad_len` is capped
+/// at `MAX_PACKET_SIZE_BYTES` minus this, so padding can never become the
+/// amplification vector RLY-05/AUDIT-031 closed for the identifier fields.
+const RELAY_HELLO_V2_FIXED_FIELD_BYTES: usize = 43;
+
+/// Serializes a v2 relay hello (§3 layout, pad bytes all zero).
+///
+/// Unlike the daemon's unchecked v1 serializer, this fails closed on any
+/// input that would not round-trip through [`parse_relay_hello_v2`] — a
+/// serializer that emitted unparseable frames would make the round-trip
+/// identity a lie at exactly the lengths attackers probe (semantic caps
+/// included, not just the `u16` wire widths).
+pub fn serialize_relay_hello_v2(hello: &RelayHelloV2) -> Result<Vec<u8>, String> {
+    let node_id = hello.node_id.as_bytes();
+    let peer_node_id = hello.peer_node_id.as_bytes();
+    if node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            node_id.len()
+        ));
+    }
+    if peer_node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "peer_node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            peer_node_id.len()
+        ));
+    }
+    let node_id_len = u16::try_from(node_id.len()).map_err(|_| {
+        format!(
+            "node_id length {} exceeds the u16 wire maximum",
+            node_id.len()
+        )
+    })?;
+    let peer_node_id_len = u16::try_from(peer_node_id.len()).map_err(|_| {
+        format!(
+            "peer_node_id length {} exceeds the u16 wire maximum",
+            peer_node_id.len()
+        )
+    })?;
+    let token_wire = serialize_relay_token_wire(&hello.session_token)?;
+    let token_len = u16::try_from(token_wire.len()).map_err(|_| {
+        format!(
+            "token length {} exceeds the u16 wire maximum",
+            token_wire.len()
+        )
+    })?;
+    let pad_len_max = MAX_PACKET_SIZE_BYTES - RELAY_HELLO_V2_FIXED_FIELD_BYTES;
+    if usize::from(hello.pad_len) > pad_len_max {
+        return Err(format!(
+            "pad_len {} exceeds maximum {pad_len_max}",
+            hello.pad_len
+        ));
+    }
+    let total = RELAY_HELLO_V2_FIXED_FIELD_BYTES
+        .checked_add(node_id.len())
+        .and_then(|t| t.checked_add(peer_node_id.len()))
+        .and_then(|t| t.checked_add(token_wire.len()))
+        .and_then(|t| t.checked_add(usize::from(hello.pad_len)))
+        .ok_or_else(|| "relay hello v2 length overflows".to_owned())?;
+    if total > MAX_PACKET_SIZE_BYTES {
+        return Err(format!(
+            "relay hello v2 frame length {total} exceeds maximum {MAX_PACKET_SIZE_BYTES}"
+        ));
+    }
+
+    let mut buf = Vec::with_capacity(total);
+    buf.push(RELAY_HELLO_V2_MSG_TYPE);
+    buf.push(RELAY_PROTOCOL_VERSION);
+    buf.extend_from_slice(&hello.pad_len.to_be_bytes());
+    buf.extend_from_slice(&node_id_len.to_be_bytes());
+    buf.extend_from_slice(node_id);
+    buf.extend_from_slice(&peer_node_id_len.to_be_bytes());
+    buf.extend_from_slice(peer_node_id);
+    buf.extend_from_slice(&token_len.to_be_bytes());
+    buf.extend_from_slice(&token_wire);
+    buf.extend_from_slice(&serialize_relay_hello_artifact_field(
+        &hello.addr_validation_artifact,
+    ));
+    buf.resize(buf.len() + usize::from(hello.pad_len), 0u8);
+    Ok(buf)
+}
+
+/// Wire format of [`parse_relay_token`], mirrored. The daemon has kept a
+/// private copy for the v1 frame (`relay_client.rs`); the library needs its
+/// own so the v2 round-trip does not depend on test helpers. The semantic
+/// caps mirror the parser's (a token this serializer refuses could never
+/// have parsed, so refusing here keeps the round-trip identity exact).
+fn serialize_relay_token_wire(token: &RelaySessionToken) -> Result<Vec<u8>, String> {
+    let node_id = token.node_id.as_bytes();
+    let peer_node_id = token.peer_node_id.as_bytes();
+    let scope = token.scope.as_bytes();
+    if node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            node_id.len()
+        ));
+    }
+    if peer_node_id.len() > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token peer_node_id length {} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}",
+            peer_node_id.len()
+        ));
+    }
+    if scope.len() > RELAY_TOKEN_SCOPE.len() {
+        return Err(format!(
+            "token scope length {} exceeds maximum {}",
+            scope.len(),
+            RELAY_TOKEN_SCOPE.len()
+        ));
+    }
+    let node_id_len = u16::try_from(node_id.len()).map_err(|_| {
+        format!(
+            "token node_id length {} exceeds the u16 wire maximum",
+            node_id.len()
+        )
+    })?;
+    let peer_node_id_len = u16::try_from(peer_node_id.len()).map_err(|_| {
+        format!(
+            "token peer_node_id length {} exceeds the u16 wire maximum",
+            peer_node_id.len()
+        )
+    })?;
+    let scope_len = u16::try_from(scope.len()).map_err(|_| {
+        format!(
+            "token scope length {} exceeds the u16 wire maximum",
+            scope.len()
+        )
+    })?;
+
+    let mut buf = Vec::with_capacity(
+        1 + 2 + node_id.len() + 2 + peer_node_id.len() + 16 + 2 + scope.len() + 16 + 16 + 64,
+    );
+    buf.push(1); // token version, as parse_relay_token demands
+    buf.extend_from_slice(&node_id_len.to_be_bytes());
+    buf.extend_from_slice(node_id);
+    buf.extend_from_slice(&peer_node_id_len.to_be_bytes());
+    buf.extend_from_slice(peer_node_id);
+    buf.extend_from_slice(&token.relay_id);
+    buf.extend_from_slice(&scope_len.to_be_bytes());
+    buf.extend_from_slice(scope);
+    buf.extend_from_slice(&token.issued_at_unix.to_be_bytes());
+    buf.extend_from_slice(&token.expires_at_unix.to_be_bytes());
+    buf.extend_from_slice(&token.nonce);
+    buf.extend_from_slice(&token.signature);
+    Ok(buf)
+}
+
+/// Parses a v2 relay hello (§3 layout).
+///
+/// Same pre-auth discipline as [`parse_relay_hello`] — this function is
+/// attacker-reachable the moment S4 wires dispatch — so every field is
+/// length-bounded before it is copied, nothing is defaulted, and every
+/// deviation from the layout is a typed refusal. In particular:
+///
+/// - `protocol_version` must equal [`RELAY_PROTOCOL_VERSION`] exactly (fail
+///   closed on unknown versions, mirroring the reviewed
+///   `WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION` and gossip watermark checks);
+/// - the OI-10 artifact field is MANDATORY (the reason [`RelayHelloV2`] is
+///   not shaped like [`RelayHello`]);
+/// - exactly `pad_len` bytes must follow the artifact field and every one
+///   must be `0x00`. The two rules are checked together before any
+///   allocation, so a short datagram claiming a huge pad_len refuses on the
+///   length match alone.
+pub fn parse_relay_hello_v2(data: &[u8]) -> Result<RelayHelloV2, String> {
+    if data.len() > MAX_PACKET_SIZE_BYTES {
+        return Err(format!(
+            "relay hello v2 frame length {} exceeds maximum {MAX_PACKET_SIZE_BYTES}",
+            data.len()
+        ));
+    }
+    if data.first().copied() != Some(RELAY_HELLO_V2_MSG_TYPE) {
+        return Err("not a relay hello v2 message".to_owned());
+    }
+    let protocol_version = data
+        .get(1)
+        .copied()
+        .ok_or_else(|| "truncated protocol_version".to_owned())?;
+    if protocol_version != RELAY_PROTOCOL_VERSION {
+        return Err(format!(
+            "unsupported relay hello v2 protocol version: {protocol_version}"
+        ));
+    }
+    let mut pos = 2;
+
+    let pad_len = read_u16_be(data, pos).ok_or_else(|| "truncated pad_len".to_owned())?;
+    pos += 2;
+
+    // Static ceiling on the claimed padding: refuses before any allocation.
+    let pad_len_max = MAX_PACKET_SIZE_BYTES - RELAY_HELLO_V2_FIXED_FIELD_BYTES;
+    if usize::from(pad_len) > pad_len_max {
+        return Err(format!("pad_len {pad_len} exceeds maximum {pad_len_max}"));
+    }
+
+    // Node ID — identical bound and error discipline to the v1 parser
+    // (the pre-auth limiter keys on this value before signature
+    // verification, so the byte cap is the same one).
+    if pos + 2 > data.len() {
+        return Err("truncated node_id length".to_owned());
+    }
+    let node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated node_id length".to_owned())? as usize;
+    pos += 2;
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+    if pos + node_id_len > data.len() {
+        return Err("truncated node_id".to_owned());
+    }
+    let node_id_bytes = data
+        .get(pos..pos + node_id_len)
+        .ok_or_else(|| "truncated node_id".to_owned())?;
+    let node_id = String::from_utf8(node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
+    pos += node_id_len;
+
+    // Peer node ID — same bound (copied out of an unauthenticated datagram,
+    // compared against the signed token later).
+    if pos + 2 > data.len() {
+        return Err("truncated peer_node_id length".to_owned());
+    }
+    let peer_node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated peer_node_id length".to_owned())? as usize;
+    pos += 2;
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated peer_node_id".to_owned());
+    }
+    let peer_node_id_bytes = data
+        .get(pos..pos + peer_node_id_len)
+        .ok_or_else(|| "truncated peer_node_id".to_owned())?;
+    let peer_node_id = String::from_utf8(peer_node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
+    pos += peer_node_id_len;
+
+    // Token — parsed by exactly the v1 token parser, so admission code
+    // stays format-agnostic (§3 property 4).
+    if pos + 2 > data.len() {
+        return Err("truncated token length".to_owned());
+    }
+    let token_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated token length".to_owned())? as usize;
+    pos += 2;
+    if pos + token_len > data.len() {
+        return Err("truncated token".to_owned());
+    }
+    let token_data = data
+        .get(pos..pos + token_len)
+        .ok_or_else(|| "truncated token".to_owned())?;
+    let session_token = parse_relay_token(token_data)?;
+    pos += token_len;
+
+    // MANDATORY artifact field (§3): [0x07] ++ artifact[32]. A v2 hello
+    // without it would let a client opt out of the default-on OI-10 gate by
+    // switching message types — the regression this layout makes
+    // unrepresentable.
+    let rest = data.len() - pos;
+    if rest < 1 + 32 {
+        return Err(format!(
+            "relay hello v2 requires the 33-byte address-validation artifact field, got {rest}"
+        ));
+    }
+    if data.get(pos).copied() != Some(RELAY_HELLO_ARTIFACT_FIELD_TYPE) {
+        return Err(format!(
+            "relay hello v2 artifact field must begin with {:#04x}, got {:#04x}",
+            RELAY_HELLO_ARTIFACT_FIELD_TYPE,
+            data.get(pos).copied().unwrap_or_default()
+        ));
+    }
+    let artifact: [u8; 32] = data
+        .get(pos + 1..pos + 33)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated artifact".to_owned())?;
+    pos += 33;
+
+    // §3 properties 2+3, checked together before anything is allocated:
+    // exactly pad_len bytes must remain, and every one must be zero.
+    let remaining = data.len() - pos;
+    if remaining != usize::from(pad_len) {
+        return Err(format!(
+            "pad_len {pad_len} does not match the {remaining} trailing bytes"
+        ));
+    }
+    let padding = data
+        .get(pos..)
+        .ok_or_else(|| "truncated padding".to_owned())?;
+    if let Some(offset) = padding.iter().position(|&byte| byte != 0) {
+        return Err(format!("padding byte at offset {offset} is not 0x00"));
+    }
+
+    Ok(RelayHelloV2 {
+        node_id,
+        peer_node_id,
+        session_token,
+        addr_validation_artifact: AddressValidationArtifact::from_bytes(artifact),
+        pad_len,
+    })
+}
+
 /// OI-10 helper: domain-separated expansion of the 16-byte token nonce into
 /// the 32-byte client-nonce input the reviewed keyring expects. Domain
 /// separation (`RELAY_ADDR_VALIDATION_DOMAIN` prefix) keeps v1-hello nonce
@@ -2024,6 +2357,381 @@ mod tests {
         // The version constant is a payload value, never a first byte that
         // collides with the v1 hello's framing.
         assert_ne!(RELAY_PROTOCOL_VERSION, RELAY_HELLO_MSG_TYPE);
+    }
+
+    // ── D3 seams plan S3: v2 hello frame library (parser + serializer) ────
+
+    /// The golden v2 layout vector (D3 seams plan §3): node ids
+    /// `node-a`/`node-b`, a deterministic token (relay id `0xAA`×16, scope
+    /// `forward_ciphertext_only`, issued 1_700_000_000 / expires
+    /// 1_700_000_060, nonce `0x11`×16, signature `0x22`×64), artifact
+    /// `0x77`×32 behind the `0x07` tag, `pad_len = 7` zero bytes.
+    /// Derived independently of the serializer and pinned byte-for-byte so
+    /// silent reshuffling of the layout cannot pass.
+    const GOLDEN_V2_HELLO_HEX: &str = concat!(
+        "0802000700066e6f64652d6100066e6f64652d62009a0100066e6f64",
+        "652d6100066e6f64652d62aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa00",
+        "17666f72776172645f636970686572746578745f6f6e6c7900000000",
+        "6553f100000000006553f13c11111111111111111111111111111111",
+        "22222222222222222222222222222222222222222222222222222222",
+        "22222222222222222222222222222222222222222222222222222222",
+        "22222222222222220777777777777777777777777777777777777777",
+        "7777777777777777777777777700000000000000",
+    );
+
+    /// Test-local hex decoder (the crate has no hex dependency).
+    fn unhex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).expect("hex digit");
+                let lo = (pair[1] as char).to_digit(16).expect("hex digit");
+                ((hi << 4) | lo) as u8
+            })
+            .collect()
+    }
+
+    /// The deterministic v2 hello the golden vector was derived from.
+    fn sample_v2_hello() -> RelayHelloV2 {
+        RelayHelloV2 {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: RelaySessionToken {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: [0xAA; 16],
+                scope: RELAY_TOKEN_SCOPE.to_owned(),
+                issued_at_unix: 1_700_000_000,
+                expires_at_unix: 1_700_000_060,
+                nonce: [0x11; 16],
+                signature: [0x22; 64],
+            },
+            addr_validation_artifact: AddressValidationArtifact::from_bytes([0x77; 32]),
+            pad_len: 7,
+        }
+    }
+
+    /// Field-wise equality (RelaySessionToken deliberately has no
+    /// PartialEq, so the token compares via its wire bytes).
+    fn assert_v2_round_trip_eq(parsed: &RelayHelloV2, expected: &RelayHelloV2) {
+        assert_eq!(parsed.node_id, expected.node_id);
+        assert_eq!(parsed.peer_node_id, expected.peer_node_id);
+        assert_eq!(parsed.pad_len, expected.pad_len);
+        assert_eq!(
+            parsed.addr_validation_artifact.as_bytes(),
+            expected.addr_validation_artifact.as_bytes()
+        );
+        assert_eq!(
+            token_wire_bytes(&parsed.session_token),
+            token_wire_bytes(&expected.session_token)
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_golden_layout() {
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+        assert_eq!(golden.len(), 216);
+
+        // Serialize is byte-exact against the pinned vector.
+        let hello = sample_v2_hello();
+        let bytes = serialize_relay_hello_v2(&hello).expect("golden hello serializes");
+        assert_eq!(bytes, golden, "serializer diverged from the pinned layout");
+
+        // Parse is its exact inverse, and re-serializing is stable.
+        let parsed = parse_relay_hello_v2(&golden).expect("golden frame parses");
+        assert_v2_round_trip_eq(&parsed, &hello);
+        let again = serialize_relay_hello_v2(&parsed).expect("re-serialize");
+        assert_eq!(again, golden);
+
+        // Field offsets pinned by assertion, not only via round-trip.
+        assert_eq!(golden[0], RELAY_HELLO_V2_MSG_TYPE);
+        assert_eq!(golden[1], RELAY_PROTOCOL_VERSION);
+        assert_eq!(&golden[2..4], &7u16.to_be_bytes());
+        assert_eq!(&golden[4..6], &6u16.to_be_bytes());
+        assert_eq!(&golden[6..12], b"node-a");
+        assert_eq!(&golden[12..14], &6u16.to_be_bytes());
+        assert_eq!(&golden[14..20], b"node-b");
+        assert_eq!(&golden[20..22], &154u16.to_be_bytes());
+        assert_eq!(golden[22], 1); // token version byte
+        let artifact_at = 22 + 154;
+        assert_eq!(golden[artifact_at], RELAY_HELLO_ARTIFACT_FIELD_TYPE);
+        assert_eq!(&golden[artifact_at + 1..artifact_at + 33], &[0x77; 32]);
+        assert_eq!(&golden[artifact_at + 33..], &[0u8; 7]);
+    }
+
+    #[test]
+    fn relay_hello_v2_round_trip_is_identity() {
+        for pad_len in [0u16, 1, 7, 64, 4096] {
+            let mut hello = sample_v2_hello();
+            hello.pad_len = pad_len;
+            let bytes = serialize_relay_hello_v2(&hello).expect("serializes");
+            assert_eq!(bytes.len(), 209 + usize::from(pad_len));
+            let parsed = parse_relay_hello_v2(&bytes).expect("round-trips");
+            assert_v2_round_trip_eq(&parsed, &hello);
+            assert_eq!(parsed.pad_len, pad_len);
+            assert_eq!(
+                serialize_relay_hello_v2(&parsed).expect("re-serialize"),
+                bytes
+            );
+        }
+
+        // The serializer's total-size ceiling: this hello's fixed part is
+        // 209 bytes, so pad 65327 fills the datagram exactly and 65328
+        // refuses.
+        let mut hello = sample_v2_hello();
+        hello.pad_len = 65_327;
+        let bytes = serialize_relay_hello_v2(&hello).expect("max legal padding serializes");
+        assert_eq!(bytes.len(), MAX_PACKET_SIZE_BYTES);
+        assert!(parse_relay_hello_v2(&bytes).is_ok());
+        hello.pad_len = 65_328;
+        let err = serialize_relay_hello_v2(&hello).expect_err("over-ceiling padding refuses");
+        assert!(err.contains("exceeds maximum"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn relay_hello_v2_unknown_version_rejected() {
+        for version in [0u8, 1, 3, 0xff] {
+            let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+            frame[1] = version;
+            let err =
+                parse_relay_hello_v2(&frame).expect_err("unknown protocol version must refuse");
+            assert!(
+                err.contains(&format!(
+                    "unsupported relay hello v2 protocol version: {version}"
+                )),
+                "wrong error for version {version}: {err}"
+            );
+        }
+        // A frame with no version byte refuses distinctly.
+        let err = parse_relay_hello_v2(&[RELAY_HELLO_V2_MSG_TYPE])
+            .expect_err("missing version must refuse");
+        assert!(
+            err.contains("truncated protocol_version"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_missing_artifact_field() {
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+        // Cut the artifact field but keep the 7 claimed pad bytes: the
+        // missing mandatory artifact refuses (never "parses as padding").
+        let after_token = golden.len() - 7 - 33;
+        let mut frame = golden[..after_token].to_vec();
+        frame.extend_from_slice(&[0u8; 7]);
+        let err = parse_relay_hello_v2(&frame)
+            .expect_err("a v2 hello with no artifact field must refuse");
+        assert!(
+            err.contains("address-validation artifact"),
+            "unexpected: {err}"
+        );
+
+        // A 32-byte tail (tag + 31) is a truncated artifact, refused too.
+        let mut short = golden[..after_token].to_vec();
+        short.extend_from_slice(&[0x07u8; 32]);
+        let err = parse_relay_hello_v2(&short).expect_err("short artifact must refuse");
+        assert!(
+            err.contains("address-validation artifact"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_artifact_field_with_wrong_tag() {
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        let artifact_at = frame.len() - 7 - 33;
+        frame[artifact_at] = RELAY_HELLO_CHALLENGE_MSG_TYPE; // 0x06, not 0x07
+        let err = parse_relay_hello_v2(&frame).expect_err("wrong artifact tag must refuse");
+        assert!(
+            err.contains("artifact field must begin with 0x07"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_padding_length_lies() {
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+
+        // Claimed 7, actual 6: truncate one pad byte.
+        let mut short = golden.clone();
+        short.pop();
+        let err = parse_relay_hello_v2(&short).expect_err("short padding must refuse");
+        assert!(
+            err.contains("pad_len 7 does not match the 6 trailing bytes"),
+            "unexpected: {err}"
+        );
+
+        // Claimed 7, actual 8: one appended byte.
+        let mut long = golden.clone();
+        long.push(0);
+        let err = parse_relay_hello_v2(&long).expect_err("extra trailing byte must refuse");
+        assert!(
+            err.contains("pad_len 7 does not match the 8 trailing bytes"),
+            "unexpected: {err}"
+        );
+
+        // Claimed 0 with 7 real pad bytes.
+        let mut zero = golden.clone();
+        zero[2..4].copy_from_slice(&0u16.to_be_bytes());
+        let err = parse_relay_hello_v2(&zero).expect_err("pad_len lie must refuse");
+        assert!(
+            err.contains("pad_len 0 does not match the 7 trailing bytes"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_nonzero_padding() {
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        let last = frame.len() - 1;
+        frame[last] = 0x01;
+        let err = parse_relay_hello_v2(&frame).expect_err("non-zero padding must refuse");
+        assert!(
+            err.contains("padding byte at offset 6 is not 0x00"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_oversize_input() {
+        let oversized = vec![0u8; MAX_PACKET_SIZE_BYTES + 1];
+        let err = parse_relay_hello_v2(&oversized).expect_err("oversize datagram must refuse");
+        assert!(err.contains("exceeds maximum 65536"), "unexpected: {err}");
+
+        // A pad_len beyond the static ceiling refuses before any allocation.
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        frame[2..4].copy_from_slice(&65_494u16.to_be_bytes());
+        let err = parse_relay_hello_v2(&frame).expect_err("over-ceiling pad_len must refuse");
+        assert!(
+            err.contains("pad_len 65494 exceeds maximum 65493"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_refuses_oversize_node_id() {
+        let mut frame = unhex(GOLDEN_V2_HELLO_HEX);
+        frame[4..6].copy_from_slice(&129u16.to_be_bytes());
+        let err = parse_relay_hello_v2(&frame).expect_err("over-cap node_id must refuse");
+        assert!(
+            err.contains("node_id length 129 exceeds maximum 128"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_and_v1_are_distinct_dialects() {
+        // Neither parser accepts the other's dialect (differential pin:
+        // the two parsers share the token parser and nothing else).
+        let (sk, _) = make_test_keypair();
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let artifact = AddressValidationArtifact::from_bytes([0x77; 32]);
+        let v1 = serialize_hello_bytes(&hello, Some(&artifact));
+        assert!(parse_relay_hello(&v1).is_ok(), "v1 sanity");
+        assert!(parse_relay_hello_v2(&v1).is_err(), "v1 bytes are not v2");
+
+        let v2 = serialize_relay_hello_v2(&sample_v2_hello()).expect("serializes");
+        assert!(parse_relay_hello_v2(&v2).is_ok(), "v2 sanity");
+        assert!(parse_relay_hello(&v2).is_err(), "v2 bytes are not v1");
+    }
+
+    #[test]
+    fn relay_hello_v2_witness_no_panic_over_mutations() {
+        // Deterministic xorshift64: no new dependency, reproducible run to
+        // run. Every input must yield a well-typed Ok or Err — never a
+        // panic, never a partially-read frame.
+        struct Xorshift64(u64);
+        impl Xorshift64 {
+            fn next_u64(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn below(&mut self, bound: usize) -> usize {
+                ((self.next_u64() >> 16) % bound as u64) as usize
+            }
+        }
+        let mut rng = Xorshift64(0x2026_0925_DEAD_BEEF);
+        let golden = unhex(GOLDEN_V2_HELLO_HEX);
+        assert!(
+            parse_relay_hello_v2(&golden).is_ok(),
+            "pristine golden frame sanity"
+        );
+
+        let mut checked = 0usize;
+
+        // 1. Truncations at EVERY length.
+        for len in 0..=golden.len() {
+            let _ = parse_relay_hello_v2(&golden[..len]);
+            checked += 1;
+        }
+
+        // 2. Every single-bit flip of every byte.
+        for byte_idx in 0..golden.len() {
+            for bit in 0..8u8 {
+                let mut frame = golden.clone();
+                frame[byte_idx] ^= 1 << bit;
+                let _ = parse_relay_hello_v2(&frame);
+                checked += 1;
+            }
+        }
+
+        // 3. Length lies at all four length fields (pad_len at 2..4,
+        //    node_id_len at 4..6, peer_node_id_len at 12..14, token_len at
+        //    20..22): zero, one-off, huge, u16 max.
+        for off in [2usize, 4, 12, 20] {
+            for &lie in &[
+                0u16, 1, 5, 6, 7, 8, 32, 33, 153, 154, 155, 0x00ff, 0x1000, 0x7fff, 0xfffe, 0xffff,
+            ] {
+                let mut frame = golden.clone();
+                frame[off..off + 2].copy_from_slice(&lie.to_be_bytes());
+                let _ = parse_relay_hello_v2(&frame);
+                checked += 1;
+            }
+        }
+
+        // 4. Random frames: half shaped like a v2 hello, half pure noise.
+        while checked < 20_000 {
+            let len = rng.below(400);
+            let mut frame = vec![0u8; len];
+            for byte in frame.iter_mut() {
+                *byte = rng.next_u64() as u8;
+            }
+            if len >= 2 && rng.below(2) == 0 {
+                frame[0] = RELAY_HELLO_V2_MSG_TYPE;
+                frame[1] = RELAY_PROTOCOL_VERSION;
+            }
+            let _ = parse_relay_hello_v2(&frame);
+            checked += 1;
+        }
+
+        // 5. Multi-byte random mutations of a valid frame (1-8 writes).
+        for _ in 0..5_000 {
+            let mut frame = golden.clone();
+            for _ in 0..(1 + rng.below(8)) {
+                let at = rng.below(frame.len());
+                frame[at] = rng.next_u64() as u8;
+            }
+            let _ = parse_relay_hello_v2(&frame);
+            checked += 1;
+        }
+
+        // 6. Oversize noise datagrams around the MAX_PACKET_SIZE_BYTES
+        //    boundary (both sides of the refusal edge).
+        for _ in 0..1_000 {
+            let len = 65_000 + rng.below(2_000);
+            let frame = vec![0x08u8; len];
+            let _ = parse_relay_hello_v2(&frame);
+            checked += 1;
+        }
+
+        assert!(
+            checked >= 20_000,
+            "witness ran {checked} inputs, wanted at least 20,000"
+        );
     }
 
     const TEST_RELAY_ID: [u8; 16] = [0xAA; 16];
