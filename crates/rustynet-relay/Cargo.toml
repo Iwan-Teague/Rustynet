@@ -54,5 +54,15 @@ required-features = ["daemon"]
 name = "relay_forward"
 harness = false
 
-[lints]
-workspace = true
+# AQ-08 step 2 (charter/governance/action-queue.md): panic-family clippy
+# lints enforced here ahead of workspace-wide adoption. All other crates
+# still use `[lints] workspace = true`; once [workspace.lints.clippy] is
+# adopted at the workspace root, replace this table with it.
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
