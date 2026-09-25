@@ -1278,42 +1278,268 @@ fn collect_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// Crates whose `unsafe` blocks the no-unsafe scanner is permitted to
-/// see. Rustynet's general policy is `#![forbid(unsafe_code)]` across
-/// every workspace crate, but a small set of crates wrap unavoidable
-/// platform FFI (Windows-sys, DPAPI, named-pipe SDDL inspection,
-/// `WinVerifyTrust`, etc.) where every Win32 call is itself an `unsafe`
-/// extern "system" function. Routing those through a single audited
-/// FFI crate keeps the rest of the workspace genuinely unsafe-free
-/// while still letting the daemon talk to the OS.
+/// Unsafe-code scopes permitted under OI-20 (decision log "Owner
+/// decisions — round 2"; T2 security-bar §B1): the workspace pins
+/// `unsafe_code = "deny"`, `forbid` applies only where a crate holds
+/// zero unsafe, every unsafe site carries an adjacent `// SAFETY:`
+/// comment, and `unsafe` is legal ONLY inside the explicitly scoped
+/// `#[allow(unsafe_code)]` regions inventoried here. Anything else
+/// fails this gate — the check stays fail-closed.
+///
+/// Each entry is (path prefix relative to `--root`, rationale). The
+/// textual scan is file-granular; the compile-level pins are the
+/// exact-scope backstop: each member crate carries its own
+/// `[lints.rust]` pin (forbid where the crate holds zero unsafe, deny
+/// where it holds the audited FFI unsafe), so `unsafe` planted outside
+/// the source-level `#[allow(unsafe_code)]` region fails `cargo
+/// check`/`clippy` even when this textual gate sees the file.
 ///
 /// To extend this list:
-/// 1. The crate's whole purpose must be platform FFI / `unsafe`-bearing
-///    syscalls, with the unsafe code reviewable in isolation.
-/// 2. The crate must keep `#![deny(unsafe_op_in_unsafe_fn)]` or stronger
-///    locally so each unsafe block has its own explicit safety
-///    justification.
-/// 3. Document the rationale in the same commit that adds it here.
-///
-/// Each entry matches the leading segments of the path **as the
-/// scanner emits it** — i.e. relative to `--root`. The orchestrator
-/// invokes the gate with `--root crates/`, so paths arrive shaped like
-/// `<crate-name>/src/...`. Including `crates/` in the prefix would
-/// mismatch.
-const UNSAFE_SCAN_ALLOWED_CRATE_PREFIXES: &[&str] = &[
-    // Win32 FFI bindings: WinVerifyTrust, DPAPI, named-pipe SDDL
-    // inspection, and similar platform calls land here. Adding
-    // `#![forbid(unsafe_code)]` to this crate is impossible — every
-    // windows-sys call is unsafe by Rust's FFI rules — so the gate
-    // accepts unsafe in this crate by name and relies on per-crate
-    // review for safety.
-    "rustynet-windows-native/",
+/// 1. The unsafe must live inside one narrowly scoped
+///    `#[allow(unsafe_code)]` region (one module, one FFI concern).
+/// 2. Every unsafe site must carry an adjacent `// SAFETY:` comment
+///    stating the invariant that makes it sound.
+/// 3. The crate must pin `unsafe_code = "deny"` in its own
+///    `[lints.rust]` so the allow cannot spread silently.
+/// 4. Document the rationale here, in the same commit.
+const UNSAFE_SCAN_ALLOWED_SCOPES: &[(&str, &str)] = &[
+    // macOS utun FFI isolation module: SCM_RIGHTS fd passing for the
+    // privileged-helper path (AQ-72). Scoped `#[allow(unsafe_code)]` on
+    // the `mod macos_utun_helper_unsafe` declaration
+    // (`cfg(target_os = "macos")`) in crates/rustynetd/src/lib.rs; the
+    // crate pins deny via its own `[lints.rust]`. Every site carries
+    // `// SAFETY:`.
+    (
+        "rustynetd/src/macos_utun_helper_unsafe.rs",
+        "macOS utun FFI isolation module (SCM_RIGHTS fd passing); scoped #[allow(unsafe_code)] on the module decl in crates/rustynetd/src/lib.rs (cfg target_os = macos); AQ-72",
+    ),
+    // cfg(windows) `mod imp`, inline at the tail of src/lib.rs: the
+    // Win32 FFI half of the crate (DPAPI, WFP, IpHelper, RPC,
+    // registry). Scoped `#[allow(unsafe_code)]` on `mod imp`; the crate
+    // pins deny via its own `[lints.rust]`. Every site carries
+    // `// SAFETY:`. The textual scope is the whole file (the module is
+    // an inline tail); the crate-level deny is the exact backstop for
+    // unsafe planted outside `mod imp`.
+    (
+        "rustynet-windows-native/src/lib.rs",
+        "cfg(windows) `mod imp` Win32 FFI (DPAPI, WFP, IpHelper, RPC, registry); scoped #[allow(unsafe_code)] on `mod imp` in this file; crate [lints.rust] pins deny outside the module",
+    ),
 ];
 
 fn unsafe_scan_path_is_allowlisted(repo_relative: &str) -> bool {
-    UNSAFE_SCAN_ALLOWED_CRATE_PREFIXES
+    UNSAFE_SCAN_ALLOWED_SCOPES
         .iter()
-        .any(|prefix| repo_relative.starts_with(prefix))
+        .any(|(prefix, _)| repo_relative.starts_with(prefix))
+}
+
+/// OI-20 §B1: every unsafe site needs an adjacent `// SAFETY:` comment —
+/// on the same line as the unsafe token, or inside the contiguous `//`
+/// comment block ending on the line directly above it (multi-line
+/// SAFETY justifications are the tree's real style; all 123 audited
+/// sites satisfy this). Any non-comment line — blank line or code —
+/// between the block and the site breaks adjacency (fail closed).
+fn unsafe_site_has_adjacent_safety_comment(lines: &[&str], site_index: usize) -> bool {
+    if lines[site_index].contains("// SAFETY:") {
+        return true;
+    }
+    let mut index = site_index;
+    while index > 0 {
+        index -= 1;
+        match lines[index].trim_start().strip_prefix("//") {
+            Some(comment) => {
+                if comment.contains("SAFETY:") {
+                    return true;
+                }
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
+/// Extract the body of one top-level TOML table (`header` without
+/// brackets) as the lines from its header to the next `[` header at
+/// line start (or end of file). Deliberately textual: the pin this
+/// guards is one static line, not a general TOML parser.
+fn toml_table_section<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
+    let header_line = format!("[{header}]");
+    let mut start: Option<usize> = None;
+    let mut end = manifest.len();
+    let mut offset = 0usize;
+    for line in manifest.lines() {
+        let trimmed = line.trim_start();
+        if start.is_none() {
+            if trimmed == header_line {
+                start = Some(offset);
+            }
+        } else if trimmed.starts_with('[') {
+            end = offset;
+            break;
+        }
+        offset += line.len() + 1;
+    }
+    let start = start?;
+    Some(&manifest[start..end])
+}
+
+/// OI-20 §B1 structural half: the workspace manifest must pin the exact
+/// line `unsafe_code = "forbid"` under `[workspace.lints.rust]`. OI-20
+/// reads "deny + mandatory SAFETY comment as the bar; forbid only where
+/// a project has zero unsafe" — at rustynet this is satisfied by the
+/// STRICTER root: `forbid` at the workspace root, and every member that
+/// actually holds an unsafe site must declare its own `[lints.rust]
+/// unsafe_code = "deny"` (checked by [`verify_member_unsafe_lints`]),
+/// because inherited workspace lints cannot be overridden per crate and
+/// forbid admits no `#[allow(unsafe_code)]`. The only members holding
+/// unsafe (rustynetd, rustynet-windows-native) carry exactly that own
+/// deny table and do not inherit the workspace lints, so the root
+/// `forbid` means "forbid wherever a crate holds zero unsafe". Fails
+/// closed on a missing manifest — a scan root outside a rustynet
+/// workspace is a configuration error, not a pass.
+fn verify_workspace_unsafe_pin(workspace_manifest: &Path) -> Result<(), String> {
+    let manifest = fs::read_to_string(workspace_manifest).map_err(|err| {
+        format!(
+            "OI-20 unsafe policy: cannot read workspace manifest {}: {err}",
+            workspace_manifest.display()
+        )
+    })?;
+    let section = toml_table_section(&manifest, "workspace.lints.rust").ok_or_else(|| {
+        format!(
+            "OI-20 unsafe policy: workspace manifest {} has no [workspace.lints.rust] table (T2 security-bar B1 requires unsafe_code = \"forbid\")",
+            workspace_manifest.display()
+        )
+    })?;
+    let pinned = section
+        .lines()
+        .any(|line| line.trim() == "unsafe_code = \"forbid\"");
+    if !pinned {
+        return Err(format!(
+            "OI-20 unsafe policy: [workspace.lints.rust] in {} must pin the exact line unsafe_code = \"forbid\" (OI-20: deny is carried per crate — every member holding an unsafe site must declare its own [lints.rust] unsafe_code = \"deny\", so the root stays forbid wherever a crate holds zero unsafe)",
+            workspace_manifest.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Extract the quoted entries of the `members = [ ... ]` array inside
+/// the `[workspace]` table. Deliberately textual and fail-closed: a
+/// glob entry (or a members array outside `[workspace]`) is a
+/// configuration error, not an empty member list.
+fn workspace_member_paths(workspace_manifest_text: &str) -> Result<Vec<String>, String> {
+    let section = toml_table_section(workspace_manifest_text, "workspace")
+        .ok_or_else(|| "OI-20 unsafe policy: manifest has no [workspace] table".to_string())?;
+    let mut members: Vec<String> = Vec::new();
+    let mut in_array = false;
+    let mut array_closed = false;
+    for line in section.lines() {
+        let trimmed = line.trim();
+        if !in_array {
+            let Some(rest) = trimmed.strip_prefix("members") else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('[') else {
+                return Err("OI-20 unsafe policy: [workspace] members must be an array".to_string());
+            };
+            in_array = true;
+            array_closed = push_member_entries(rest, &mut members)?;
+            if array_closed {
+                return Ok(members);
+            }
+            continue;
+        }
+        array_closed = push_member_entries(trimmed, &mut members)?;
+        if array_closed {
+            return Ok(members);
+        }
+    }
+    if in_array && array_closed {
+        Ok(members)
+    } else if in_array {
+        Err(
+            "OI-20 unsafe policy: [workspace] members array is unterminated (fail closed)"
+                .to_string(),
+        )
+    } else {
+        Err("OI-20 unsafe policy: manifest has no [workspace] members array".to_string())
+    }
+}
+
+/// Consume comma-separated member entries from one line of the members
+/// array. Returns `true` when the line closed the array with `]`. A
+/// glob entry fails closed with a named error.
+fn push_member_entries(line: &str, members: &mut Vec<String>) -> Result<bool, String> {
+    for segment in line.split(',') {
+        let segment = segment.trim();
+        let (entry_text, closed) = match segment.split_once(']') {
+            Some((before, _)) => (before.trim(), true),
+            None => (segment, false),
+        };
+        let entry = entry_text.trim_matches(|c| c == '"' || c == '\'');
+        if !entry.is_empty() {
+            if entry.contains('*') || entry.contains('?') {
+                return Err(format!(
+                    "OI-20 unsafe policy: workspace member glob {entry:?} cannot be resolved fail-closed; list members explicitly"
+                ));
+            }
+            members.push(entry.to_string());
+        }
+        if closed {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// OI-20 §B1 per-crate half: every workspace member whose sources hold
+/// an `unsafe` site must declare its OWN `[lints.rust]` table with the
+/// exact line `unsafe_code = "deny"` (never `[lints] workspace = true`
+/// inheritance: inherited workspace lints cannot be overridden per
+/// crate, so an inheriting member under the root `forbid` pin cannot
+/// host a scoped `#[allow(unsafe_code)]` at all). Fail-closed with a
+/// named error naming the member.
+fn verify_member_unsafe_lints(workspace_root: &Path) -> Result<(), String> {
+    let workspace_manifest = workspace_root.join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&workspace_manifest).map_err(|err| {
+        format!(
+            "OI-20 unsafe policy: cannot read workspace manifest {}: {err}",
+            workspace_manifest.display()
+        )
+    })?;
+    for member in workspace_member_paths(&manifest_text)? {
+        let member_dir = workspace_root.join(&member);
+        let sources = collect_rust_source_paths(member_dir.as_path())?;
+        let holds_unsafe = sources.iter().any(|source_path| {
+            fs::read_to_string(source_path)
+                .map(|source| !scan_rust_source_text_for_unsafe(source.as_str()).is_empty())
+                .unwrap_or(false)
+        });
+        if !holds_unsafe {
+            continue;
+        }
+        let member_manifest = member_dir.join("Cargo.toml");
+        let member_text = fs::read_to_string(&member_manifest).map_err(|err| {
+            format!(
+                "OI-20 unsafe policy: member {member} holds unsafe sites but its manifest {} cannot be read: {err}",
+                member_manifest.display()
+            )
+        })?;
+        let owns_deny = toml_table_section(&member_text, "lints.rust")
+            .map(|section| {
+                section
+                    .lines()
+                    .any(|line| line.trim() == "unsafe_code = \"deny\"")
+            })
+            .unwrap_or(false);
+        if !owns_deny {
+            return Err(format!(
+                "OI-20 unsafe policy: workspace member {member} holds unsafe sites but does not declare its own [lints.rust] unsafe_code = \"deny\" (OI-20: the workspace root pins forbid, forbid admits no #[allow(unsafe_code)], and [lints] workspace = true inheritance cannot be overridden per crate — a member holding unsafe must pin deny in its own manifest)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn execute_ops_check_no_unsafe_rust_sources(
@@ -1322,6 +1548,24 @@ pub fn execute_ops_check_no_unsafe_rust_sources(
     run_unsafe_scanner_self_tests()?;
 
     let root = phase1_resolve_path(config.root.to_string_lossy().as_ref())?;
+    let workspace_manifest = root
+        .parent()
+        .map(|parent| parent.join("Cargo.toml"))
+        .ok_or_else(|| {
+            format!(
+                "OI-20 unsafe policy: scan root {} has no parent workspace",
+                root.display()
+            )
+        })?;
+    verify_workspace_unsafe_pin(&workspace_manifest)?;
+    let workspace_root = workspace_manifest.parent().ok_or_else(|| {
+        format!(
+            "OI-20 unsafe policy: workspace manifest {} has no parent directory",
+            workspace_manifest.display()
+        )
+    })?;
+    verify_member_unsafe_lints(workspace_root)?;
+
     let rust_sources = collect_rust_source_paths(root.as_path())?;
     let mut findings = Vec::new();
 
@@ -1330,22 +1574,33 @@ pub fn execute_ops_check_no_unsafe_rust_sources(
             |_| source_path.to_string_lossy().to_string(),
             |relative| relative.to_string_lossy().replace('\\', "/"),
         );
-        if unsafe_scan_path_is_allowlisted(repo_relative.as_str()) {
-            continue;
-        }
+        let allowlisted = unsafe_scan_path_is_allowlisted(repo_relative.as_str());
         let source = fs::read_to_string(&source_path)
             .map_err(|err| format!("read Rust source failed ({}): {err}", source_path.display()))?;
+        let lines: Vec<&str> = source.lines().collect();
         for (line, column) in scan_rust_source_text_for_unsafe(source.as_str()) {
-            findings.push(format!(
-                "{}:{line}:{column}: unsafe keyword detected",
-                source_path.display()
-            ));
+            // The SAFETY half of OI-20 applies to every site, including
+            // the permitted scopes — check it first so an allowlisted
+            // site without a justification still fails the gate.
+            if !unsafe_site_has_adjacent_safety_comment(&lines, line.saturating_sub(1)) {
+                findings.push(format!(
+                    "{}:{line}:{column}: unsafe site has no adjacent // SAFETY: comment (OI-20/T2 security-bar B1)",
+                    source_path.display()
+                ));
+                continue;
+            }
+            if !allowlisted {
+                findings.push(format!(
+                    "{}:{line}:{column}: unsafe outside a permitted OI-20 scope (see UNSAFE_SCAN_ALLOWED_SCOPES: scoped #[allow(unsafe_code)] + // SAFETY: required)",
+                    source_path.display()
+                ));
+            }
         }
     }
 
     if !findings.is_empty() {
         return Err(format!(
-            "unsafe keyword usage is forbidden in repository Rust sources:\n{}",
+            "unsafe policy violation (OI-20/T2 security-bar B1): unsafe is permitted only inside explicitly scoped #[allow(unsafe_code)] regions (rustynetd macos_utun_helper_unsafe module, rustynet-windows-native cfg(windows) mod imp) and every site needs an adjacent // SAFETY: comment:\n{}",
             findings.join("\n")
         ));
     }
@@ -2432,13 +2687,15 @@ mod secret_removal_rule_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CheckDependencyExceptionsConfig, CheckPerfRegressionConfig, Phase1MetricEntryView,
-        Phase1ValidateReportView, execute_ops_check_dependency_exceptions,
-        execute_ops_check_perf_regression, extract_bearer_excerpt,
-        extract_secret_assignment_excerpt, line_contains_forbidden_inline_passphrase_flag,
-        parse_bool_value, parse_mktemp_secret_variable, parse_utc_to_unix,
-        phase1_collect_measured_input_from_source, phase1_validate_report,
-        phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
+        CheckDependencyExceptionsConfig, CheckNoUnsafeRustSourcesConfig, CheckPerfRegressionConfig,
+        Phase1MetricEntryView, Phase1ValidateReportView, execute_ops_check_dependency_exceptions,
+        execute_ops_check_no_unsafe_rust_sources, execute_ops_check_perf_regression,
+        extract_bearer_excerpt, extract_secret_assignment_excerpt,
+        line_contains_forbidden_inline_passphrase_flag, parse_bool_value,
+        parse_mktemp_secret_variable, parse_utc_to_unix, phase1_collect_measured_input_from_source,
+        phase1_validate_report, phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
+        unsafe_scan_path_is_allowlisted, unsafe_site_has_adjacent_safety_comment,
+        verify_member_unsafe_lints, verify_workspace_unsafe_pin, workspace_member_paths,
     };
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -2888,5 +3145,229 @@ mod tests {
             Some("signing_secret_tmp".to_owned())
         );
         assert_eq!(parse_mktemp_secret_variable("tmp=$(mktemp)"), None);
+    }
+
+    #[test]
+    fn unsafe_allowlist_matches_exactly_the_two_oi20_scopes() {
+        assert!(unsafe_scan_path_is_allowlisted(
+            "rustynetd/src/macos_utun_helper_unsafe.rs"
+        ));
+        assert!(unsafe_scan_path_is_allowlisted(
+            "rustynet-windows-native/src/lib.rs"
+        ));
+        assert!(!unsafe_scan_path_is_allowlisted("rustynetd/src/daemon.rs"));
+        assert!(!unsafe_scan_path_is_allowlisted(
+            "rustynet-windows-native/src/imp.rs"
+        ));
+        assert!(!unsafe_scan_path_is_allowlisted(
+            "rustynet-relay/src/lib.rs"
+        ));
+        assert!(!unsafe_scan_path_is_allowlisted(
+            "third_party/rustynet-tun/src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_same_line_counts() {
+        let lines = vec![
+            "fn f() {",
+            "    let p = std::ptr::null_mut::<u8>(); // SAFETY: never dereferenced",
+            "}",
+        ];
+        assert!(unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_multiline_block_counts() {
+        // Mirrors the real tree style (e.g. rustynet-windows-native
+        // read_token_user_sid): SAFETY opens a contiguous block whose
+        // last line sits directly above the site.
+        let lines = vec![
+            "fn f() {",
+            "    // SAFETY: `bytes` was sized + filled by GetTokenInformation for",
+            "    // the TokenUser class, so `*token_user` is a valid TOKEN_USER",
+            "    let sid = std::ptr::null_mut::<u8>();",
+            "}",
+        ];
+        assert!(unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_no_comment_fails_closed() {
+        let lines = vec!["fn f() {", "    let p = std::ptr::null_mut::<u8>();", "}"];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_blank_line_breaks_block() {
+        let lines = vec![
+            "fn f() {",
+            "    // SAFETY: orphaned by the blank line below.",
+            "",
+            "    let p = std::ptr::null_mut::<u8>();",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_code_between_safety_and_site_fails_closed() {
+        let lines = vec![
+            "fn f() {",
+            "    // SAFETY: separated from the site by a code line.",
+            "    setup();",
+            "    let p = std::ptr::null_mut::<u8>();",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    fn write_synthetic_workspace_manifest(manifest: &str) -> PathBuf {
+        let workspace_dir = unique_temp_path("rustynet-oi20-ws", "");
+        std::fs::create_dir_all(&workspace_dir).expect("create workspace dir");
+        std::fs::write(workspace_dir.join("Cargo.toml"), manifest).expect("write manifest");
+        std::fs::create_dir_all(workspace_dir.join("crates/probe/src")).expect("create probe src");
+        workspace_dir
+    }
+
+    #[test]
+    fn workspace_unsafe_pin_accepts_forbid() {
+        let dir = write_synthetic_workspace_manifest(
+            "[workspace]\nmembers = []\n\n[workspace.lints.rust]\nunsafe_code = \"forbid\"\n",
+        );
+        verify_workspace_unsafe_pin(&dir.join("Cargo.toml")).expect("forbid pin must verify");
+    }
+
+    #[test]
+    fn workspace_unsafe_pin_rejects_deny() {
+        let dir = write_synthetic_workspace_manifest(
+            "[workspace]\n\n[workspace.lints.rust]\nunsafe_code = \"deny\"\n",
+        );
+        let err = verify_workspace_unsafe_pin(&dir.join("Cargo.toml"))
+            .expect_err("deny pin must fail: the root stays forbid under OI-20");
+        assert!(err.contains("unsafe_code = \"forbid\""), "err: {err}");
+    }
+
+    #[test]
+    fn workspace_unsafe_pin_rejects_missing_table() {
+        let dir = write_synthetic_workspace_manifest("[workspace]\nmembers = []\n");
+        let err = verify_workspace_unsafe_pin(&dir.join("Cargo.toml"))
+            .expect_err("missing table must fail closed");
+        assert!(err.contains("[workspace.lints.rust]"), "err: {err}");
+    }
+
+    #[test]
+    fn workspace_unsafe_pin_rejects_missing_manifest() {
+        let missing = unique_temp_path("rustynet-oi20-missing", ".toml");
+        let err =
+            verify_workspace_unsafe_pin(&missing).expect_err("missing manifest must fail closed");
+        assert!(err.contains("cannot read workspace manifest"), "err: {err}");
+    }
+
+    #[test]
+    fn workspace_member_paths_parse_explicit_lists_and_fail_closed_on_globs() {
+        let multi_line = "[workspace]\nmembers = [\n  \"crates/a\",\n  \"crates/b\",\n]\n";
+        assert_eq!(
+            workspace_member_paths(multi_line).expect("multi-line members parse"),
+            vec!["crates/a".to_string(), "crates/b".to_string()]
+        );
+        let single_line = "[workspace]\nmembers = [\"crates/a\", \"crates/b\"]\n";
+        assert_eq!(
+            workspace_member_paths(single_line).expect("single-line members parse"),
+            vec!["crates/a".to_string(), "crates/b".to_string()]
+        );
+        let glob = "[workspace]\nmembers = [\"crates/*\"]\n";
+        let err = workspace_member_paths(glob).expect_err("glob member must fail closed");
+        assert!(err.contains("glob"), "err: {err}");
+        let no_members = "[workspace]\nresolver = \"2\"\n";
+        let err = workspace_member_paths(no_members).expect_err("missing members must fail closed");
+        assert!(err.contains("members"), "err: {err}");
+    }
+
+    #[test]
+    fn member_with_unsafe_site_requires_own_deny_lints_table() {
+        // A member holding an unsafe site without its own
+        // [lints.rust] unsafe_code = "deny" fails with a named error.
+        let dir = write_synthetic_workspace_manifest(
+            "[workspace]\nmembers = [\"crates/probe\"]\n\n[workspace.lints.rust]\nunsafe_code = \"forbid\"\n",
+        );
+        let lib = dir.join("crates/probe/src/lib.rs");
+        std::fs::write(
+            &lib,
+            "pub fn f() {\n    // SAFETY: witness pointer is never dereferenced.\n    let p = unsafe { 0 as *const u8 };\n}\n",
+        )
+        .expect("write lib.rs");
+        std::fs::write(
+            dir.join("crates/probe/Cargo.toml"),
+            "[package]\nname = \"probe\"\n",
+        )
+        .expect("write manifest without lints table");
+        let err = verify_member_unsafe_lints(&dir).expect_err("missing own deny must fail");
+        assert!(err.contains("crates/probe"), "err: {err}");
+        assert!(err.contains("unsafe_code = \"deny\""), "err: {err}");
+
+        // Inheriting the workspace lints instead ([lints] workspace =
+        // true) is exactly the failure the check exists to name.
+        std::fs::write(
+            dir.join("crates/probe/Cargo.toml"),
+            "[package]\nname = \"probe\"\n\n[lints]\nworkspace = true\n",
+        )
+        .expect("write inheriting manifest");
+        let err = verify_member_unsafe_lints(&dir).expect_err("inheriting member must still fail");
+        assert!(err.contains("crates/probe"), "err: {err}");
+
+        // With its own deny table the member verifies.
+        std::fs::write(
+            dir.join("crates/probe/Cargo.toml"),
+            "[package]\nname = \"probe\"\n\n[lints.rust]\nunsafe_code = \"deny\"\n",
+        )
+        .expect("write own-deny manifest");
+        verify_member_unsafe_lints(&dir).expect("own deny table must verify");
+
+        // A member with zero unsafe needs no own table at all.
+        std::fs::write(&lib, "pub fn f() -> usize { 3 }\n").expect("clean lib.rs");
+        std::fs::remove_file(dir.join("crates/probe/Cargo.toml")).expect("remove manifest");
+        verify_member_unsafe_lints(&dir).expect("zero-unsafe member without own table must verify");
+    }
+
+    #[test]
+    fn no_unsafe_check_enforces_safety_comment_scope_and_pass_on_clean_tree() {
+        // Planted unsafe without a SAFETY comment: the SAFETY half fires
+        // before the scope half.
+        let dir = write_synthetic_workspace_manifest(
+            "[workspace]\nmembers = []\n\n[workspace.lints.rust]\nunsafe_code = \"forbid\"\n",
+        );
+        let lib = dir.join("crates/probe/src/lib.rs");
+        std::fs::write(&lib, "pub fn f() { let p = unsafe { 0 as *const u8 }; }\n")
+            .expect("write lib.rs");
+        let err = execute_ops_check_no_unsafe_rust_sources(CheckNoUnsafeRustSourcesConfig {
+            root: dir.join("crates"),
+        })
+        .expect_err("unsafe without SAFETY must fail");
+        assert!(err.contains("no adjacent // SAFETY:"), "err: {err}");
+
+        // With a SAFETY comment the site is sound per B1 but outside the
+        // permitted scopes, so the scope half fires.
+        std::fs::write(
+            &lib,
+            "pub fn f() {\n    // SAFETY: witness pointer is never dereferenced.\n    let p = unsafe { 0 as *const u8 };\n}\n",
+        )
+        .expect("rewrite lib.rs");
+        let err = execute_ops_check_no_unsafe_rust_sources(CheckNoUnsafeRustSourcesConfig {
+            root: dir.join("crates"),
+        })
+        .expect_err("unsafe with SAFETY outside scopes must still fail");
+        assert!(
+            err.contains("outside a permitted OI-20 scope"),
+            "err: {err}"
+        );
+
+        // Clean tree passes.
+        std::fs::write(&lib, "pub fn f() -> usize { 3 }\n").expect("clean lib.rs");
+        let ok = execute_ops_check_no_unsafe_rust_sources(CheckNoUnsafeRustSourcesConfig {
+            root: dir.join("crates"),
+        })
+        .expect("clean tree must pass");
+        assert!(ok.contains("Unsafe code checks: PASS"), "ok: {ok}");
     }
 }
