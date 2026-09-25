@@ -1368,6 +1368,25 @@ pub fn render_membership_snapshot_body(
     state: &MembershipState,
     attestation: Option<&MembershipHeadAttestation>,
 ) -> Result<String, MembershipError> {
+    render_membership_snapshot_body_ext(state, attestation, None)
+}
+
+/// [`render_membership_snapshot_body`] with the OPTIONAL relay-protocol
+/// negotiation key `relay_proto_max=<u8>` (D3 seams plan, seam 1 / S2).
+///
+/// The key rides AFTER the `digest=` line and BEFORE the attestation block,
+/// exactly like the attestation extension before it: the digest pre-image
+/// stays EXACTLY `version=...\nstate_hex=...\n`, so the stored digest and
+/// every existing reader's recomputed digest are byte-identical whether or
+/// not the key is present (the F4 old-client-safety property). Old daemons
+/// store the unknown key via `parse_key_values` and never read it;
+/// `snapshot_bytes_relay_proto_max` is the new reader. Like the keyless
+/// render, the same inputs always render to the same bytes.
+pub fn render_membership_snapshot_body_ext(
+    state: &MembershipState,
+    attestation: Option<&MembershipHeadAttestation>,
+    relay_proto_max: Option<u8>,
+) -> Result<String, MembershipError> {
     use std::fmt::Write as _;
     let state_payload = state.canonical_payload()?;
     let state_hex = hex_encode(state_payload.as_bytes());
@@ -1375,6 +1394,12 @@ pub fn render_membership_snapshot_body(
         format!("version={MEMBERSHIP_SCHEMA_VERSION}\nstate_hex={state_hex}\n");
     let digest = sha256_hex(body_without_digest.as_bytes());
     let mut body = format!("{body_without_digest}digest={digest}\n");
+    if let Some(max) = relay_proto_max {
+        // Post-digest placement is load-bearing: this line must never move
+        // above the `digest=` line, or every existing snapshot's recomputed
+        // digest changes (see the F4 witness tests below).
+        let _ = writeln!(body, "relay_proto_max={max}");
+    }
     if let Some(attestation) = attestation {
         if attestation.network_id != state.network_id
             || attestation.epoch != state.epoch
@@ -1564,6 +1589,31 @@ pub fn snapshot_bytes_state_identity(bytes: &[u8]) -> Option<(u64, String)> {
     let state = parse_snapshot_content(content).ok()?;
     let root = state.state_root_hex().ok()?;
     Some((state.epoch, root))
+}
+
+/// Return the optional relay-protocol advertisement (`relay_proto_max=<u8>`,
+/// D3 seams plan seam 1) carried in the given snapshot bytes, or `None`.
+///
+/// Style-matched to [`snapshot_bytes_have_capability`] /
+/// [`snapshot_bytes_node_capabilities`]: fails closed — `None` — on every
+/// failure mode: non-utf8 bytes, an oversized snapshot, a digest mismatch,
+/// a malformed or invalid state, an ABSENT key, or a value that is not
+/// exactly one `u8`. A missing or malformed advertisement means v1 — the
+/// fail direction is toward the status quo, never guess-forward; the
+/// client-side chooser then refuses anything except exactly 2. The key is
+/// post-digest (outside the canonical pre-image), so its presence or value
+/// never changes digest or attestation verification; this reader still
+/// re-runs the same structural parse + digest self-check as the other
+/// readers, so a tampered snapshot can never yield a version hint. Does
+/// not perform file-security checks — caller owns the source trust.
+pub fn snapshot_bytes_relay_proto_max(bytes: &[u8]) -> Option<u8> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    if content.len() > MAX_MEMBERSHIP_SNAPSHOT_BYTES {
+        return None;
+    }
+    parse_snapshot_content(content).ok()?;
+    let fields = parse_key_values(content).ok()?;
+    fields.get("relay_proto_max")?.parse::<u8>().ok()
 }
 
 /// Parse the optional `attestation.*` block of a snapshot's key/value map.
@@ -3763,6 +3813,227 @@ mod tests {
             .expect("render with attestation");
         assert_eq!(on_disk, rendered.into_bytes());
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    // ── D3 seams plan S2: the optional post-digest `relay_proto_max` key.
+    // The F4 old-client-safety property is load-bearing: the canonical
+    // digest pre-image is EXACTLY `version=` + `state_hex=`, so the key's
+    // presence, absence, or a garbage value must never move the digest
+    // line, any existing reader's verdict, or attestation verification.
+
+    #[test]
+    fn relay_proto_max_key_is_a_byte_exact_post_digest_prefix() {
+        let state = base_state();
+
+        let without = super::render_membership_snapshot_body(&state, None).expect("render");
+        let with =
+            super::render_membership_snapshot_body_ext(&state, None, Some(2)).expect("render");
+        // The keyed body is the unkeyed body plus exactly one trailing line.
+        assert_eq!(with, format!("{without}relay_proto_max=2\n"));
+        // The digest line — every existing reader's integrity anchor — is
+        // byte-identical with and without the key.
+        let digest_line = |body: &str| {
+            body.lines()
+                .find(|line| line.starts_with("digest="))
+                .expect("digest line")
+                .to_owned()
+        };
+        assert_eq!(digest_line(&without), digest_line(&with));
+
+        // With a head attestation the key lands BETWEEN the digest line and
+        // the attestation block — inside neither.
+        let attestation = head_attestation_for_state(
+            &state,
+            150,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        let att_without = super::render_membership_snapshot_body(&state, Some(&attestation))
+            .expect("render attested");
+        let att_with =
+            super::render_membership_snapshot_body_ext(&state, Some(&attestation), Some(2))
+                .expect("render attested with key");
+        let key_idx = att_with
+            .lines()
+            .position(|line| line == "relay_proto_max=2")
+            .expect("key line");
+        let digest_idx = att_with
+            .lines()
+            .position(|line| line.starts_with("digest="))
+            .expect("digest line");
+        let attestation_idx = att_with
+            .lines()
+            .position(|line| line.starts_with("attestation."))
+            .expect("attestation block");
+        assert!(digest_idx < key_idx);
+        assert!(key_idx < attestation_idx);
+        // Removing exactly the key line restores the unkeyed bytes.
+        assert_eq!(att_with.replace("relay_proto_max=2\n", ""), att_without);
+    }
+
+    #[test]
+    fn relay_proto_max_never_changes_any_existing_reader_or_verification() {
+        let state = base_state();
+        let attestation = head_attestation_for_state(
+            &state,
+            1000,
+            &[
+                ("owner-1", &owner_signing_key()),
+                ("guardian-1", &guardian_signing_key()),
+            ],
+        );
+        let without = super::render_membership_snapshot_body(&state, Some(&attestation))
+            .expect("render attested")
+            .into_bytes();
+        let with = super::render_membership_snapshot_body_ext(&state, Some(&attestation), Some(2))
+            .expect("render attested with key")
+            .into_bytes();
+
+        // Old reader 1: the capability gate, a true positive.
+        assert!(super::snapshot_bytes_have_capability(
+            &without,
+            "node-a",
+            RoleCapability::Anchor
+        ));
+        assert_eq!(
+            super::snapshot_bytes_have_capability(&with, "node-a", RoleCapability::Anchor),
+            super::snapshot_bytes_have_capability(&without, "node-a", RoleCapability::Anchor)
+        );
+        // Old reader 2: the canonical capability set.
+        assert_eq!(
+            super::snapshot_bytes_node_capabilities(&with, "node-a"),
+            super::snapshot_bytes_node_capabilities(&without, "node-a")
+        );
+        // Old reader 3: structural parse — identical state including the
+        // digest self-check.
+        let state_without =
+            super::parse_snapshot_content(std::str::from_utf8(&without).expect("utf8"))
+                .expect("parse without key");
+        let state_with = super::parse_snapshot_content(std::str::from_utf8(&with).expect("utf8"))
+            .expect("parse with key");
+        assert_eq!(state_with, state_without);
+
+        // Old verifier: head-attestation verification — identical verdict
+        // and identical state identity with and without the key.
+        let now_unix = 1000u64;
+        let verify = |bytes: &[u8]| {
+            super::verify_attested_snapshot(
+                bytes,
+                &pinned_owner_hex(),
+                now_unix,
+                None,
+                MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+            )
+            .expect("attested snapshot must verify")
+        };
+        let verified_without = verify(&without);
+        let verified_with = verify(&with);
+        assert_eq!(verified_with.network_id, verified_without.network_id);
+        assert_eq!(verified_with.epoch, verified_without.epoch);
+        assert_eq!(
+            verified_with.state_root_hex().expect("root"),
+            verified_without.state_root_hex().expect("root")
+        );
+
+        // A MALFORMED advertisement value also leaves verification untouched:
+        // same digest line, same verification result, reads as absent.
+        let att_banana = String::from_utf8(with.clone())
+            .expect("utf8")
+            .replace("relay_proto_max=2", "relay_proto_max=banana")
+            .into_bytes();
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&att_banana), None);
+        assert_eq!(
+            super::verify_attested_snapshot(
+                &att_banana,
+                &pinned_owner_hex(),
+                now_unix,
+                None,
+                MEMBERSHIP_HEAD_ATTESTATION_MAX_AGE_SECS,
+            )
+            .expect("attested snapshot with malformed key must verify")
+            .state_root_hex()
+            .expect("root"),
+            verified_without.state_root_hex().expect("root")
+        );
+    }
+
+    #[test]
+    fn snapshot_bytes_relay_proto_max_reader_roundtrip_absent_and_malformed() {
+        let state = base_state();
+        let absent = super::render_membership_snapshot_body(&state, None)
+            .expect("render")
+            .into_bytes();
+        let keyed = super::render_membership_snapshot_body_ext(&state, None, Some(2))
+            .expect("render")
+            .into_bytes();
+
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&keyed), Some(2));
+        // Absent advertisement = v1 = None (never a guess).
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&absent), None);
+
+        let digest_line = |bytes: &[u8]| {
+            String::from_utf8(bytes.to_vec())
+                .expect("utf8")
+                .lines()
+                .find(|line| line.starts_with("digest="))
+                .expect("digest line")
+                .to_owned()
+        };
+        // Malformed values: non-numeric and u8-overflow both read as absent
+        // and change neither the digest line nor any old reader's verdict.
+        for replacement in [
+            "relay_proto_max=banana",
+            "relay_proto_max=256",
+            "relay_proto_max=",
+        ] {
+            let malformed = String::from_utf8(keyed.clone())
+                .expect("utf8")
+                .replace("relay_proto_max=2", replacement)
+                .into_bytes();
+            assert_eq!(
+                super::snapshot_bytes_relay_proto_max(&malformed),
+                None,
+                "{replacement} must read as absent"
+            );
+            assert_eq!(digest_line(&malformed), digest_line(&keyed));
+            assert!(super::snapshot_bytes_have_capability(
+                &malformed,
+                "node-a",
+                RoleCapability::Anchor
+            ));
+            assert_eq!(
+                super::parse_snapshot_content(std::str::from_utf8(&malformed).expect("utf8"))
+                    .expect("parse malformed-advertisement snapshot"),
+                super::parse_snapshot_content(std::str::from_utf8(&keyed).expect("utf8"))
+                    .expect("parse keyed snapshot")
+            );
+        }
+
+        // A tampered STATE fails closed even with a well-formed-looking
+        // advertisement: the reader re-runs the digest self-check.
+        let mut content = String::from_utf8(keyed.clone()).expect("utf8");
+        let flip_at = content.find("state_hex=").expect("state line") + "state_hex=".len() + 2;
+        let flipped = if content.as_bytes()[flip_at] == b'a' {
+            "b"
+        } else {
+            "a"
+        };
+        content.replace_range(flip_at..flip_at + 1, flipped);
+        assert_eq!(
+            super::snapshot_bytes_relay_proto_max(content.as_bytes()),
+            None
+        );
+
+        // A duplicated key line is refused wholesale (parse_key_values
+        // refuses duplicates) — reads as absent, never as either value.
+        let duplicated = format!(
+            "{}relay_proto_max=3\n",
+            String::from_utf8(keyed.clone()).expect("utf8")
+        )
+        .into_bytes();
+        assert_eq!(super::snapshot_bytes_relay_proto_max(&duplicated), None);
     }
 
     #[test]

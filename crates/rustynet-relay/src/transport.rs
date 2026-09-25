@@ -64,6 +64,23 @@ pub const RELAY_HELLO_CHALLENGE_MSG_TYPE: u8 = 0x06;
 /// `[0x07] ++ artifact[32]`. Any OTHER trailing byte is a parse error
 /// (wire tightening; see the parse-site comment).
 pub const RELAY_HELLO_ARTIFACT_FIELD_TYPE: u8 = 0x07;
+/// Wire-format message-type byte for the v2 relay hello (D3 seams plan,
+/// seam 1). The allocation is pinned HERE, once, so no lane re-derives
+/// "next free" independently: at the plan's base `0x08` is unused as a
+/// first-byte discriminator across `rustynet-relay/`,
+/// `rustynetd/src/relay_client.rs`, and `rustynet-control/`. An un-upgraded
+/// relay falls through to its `unknown message type` refusal on `0x08`, so
+/// a mis-negotiated v2 send is a dropped hello, never a misparse.
+/// Negotiation rides the membership snapshot (`relay_proto_max`), never a
+/// probe on the pre-auth relay port.
+pub const RELAY_HELLO_V2_MSG_TYPE: u8 = 0x08;
+/// Wire-format `protocol_version` byte carried inside a v2 relay hello.
+/// Receivers refuse any value other than exactly this constant (fail
+/// closed, mirroring `WINDOWS_PRIVILEGED_IPC_PROTOCOL_VERSION` and the
+/// gossip watermark version check); the client-side chooser
+/// (`pick_relay_hello_version`) only ever picks this value when the
+/// membership snapshot advertises exactly it (`relay_proto_max = 2`).
+pub const RELAY_PROTOCOL_VERSION: u8 = 2;
 /// Domain-separation tag for the v1 relay-hello address-validation HMAC.
 /// Deliberately distinct from the blind listener's
 /// `BLIND_ADDR_VALIDATION_DOMAIN`: an artifact minted by one protocol is
@@ -1990,6 +2007,24 @@ impl SourceHelloLimiter {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
+
+    /// D3 seams plan seam 1: the v2 message-type byte allocation is pinned
+    /// by a test, not just by the plan's prose. If a future change takes
+    /// `0x08` (or shifts `RELAY_PROTOCOL_VERSION`), this fails and the
+    /// allocation record must be renegotiated deliberately.
+    #[test]
+    fn relay_hello_v2_consts_pin_the_allocated_byte_space() {
+        assert_eq!(RELAY_HELLO_V2_MSG_TYPE, 0x08);
+        assert_eq!(RELAY_PROTOCOL_VERSION, 2);
+        // Distinct from every message-type byte already allocated in this
+        // file (v1 hello, OI-10 challenge, OI-10 artifact field).
+        assert_ne!(RELAY_HELLO_V2_MSG_TYPE, RELAY_HELLO_MSG_TYPE);
+        assert_ne!(RELAY_HELLO_V2_MSG_TYPE, RELAY_HELLO_CHALLENGE_MSG_TYPE);
+        assert_ne!(RELAY_HELLO_V2_MSG_TYPE, RELAY_HELLO_ARTIFACT_FIELD_TYPE);
+        // The version constant is a payload value, never a first byte that
+        // collides with the v1 hello's framing.
+        assert_ne!(RELAY_PROTOCOL_VERSION, RELAY_HELLO_MSG_TYPE);
+    }
 
     const TEST_RELAY_ID: [u8; 16] = [0xAA; 16];
 
