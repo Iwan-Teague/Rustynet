@@ -55,8 +55,14 @@
 #                               of the payload it verifies. Default when
 #                               unset: the already-installed ${RUSTYNET_BIN}
 #                               (itself built from previously-verified
-#                               source); a first-ever bootstrap with no
-#                               installed verifier FAILS CLOSED instead.
+#                               source); with neither available the
+#                               bootstrap builds `rustynet-cli` from the
+#                               LOCAL source checkout this script itself
+#                               runs from (never from the downloaded
+#                               payload — AQ-11 F4 provenance refusal
+#                               still applies) and uses that build as the
+#                               verifier BEFORE any download is trusted.
+#                               That build fails closed on failure.
 #   RUSTYNET_RELEASE_MANIFEST — signed release-manifest.json covering
 #                               SOURCE_ARCHIVE. The archive is verified BY
 #                               NAME (`--require-artifact <basename>`): the
@@ -67,20 +73,18 @@
 #                               that file).
 #   RUSTYNET_RELEASE_PINNED_KEY_HEX | RUSTYNET_RELEASE_PINNED_KEY_FILE
 #                             — pinned Ed25519 verifier key (exactly one).
-#                               REQUIRED: this script embeds NO default key
-#                               (a trust anchor is never invented). When
-#                               BOTH are unset the bootstrap STOPS (fail
-#                               closed): no release verifier key is pinned
-#                               yet — supply the project's published
-#                               release public key via one of these
-#                               options. The default pinned key is pending
-#                               owner decision OI-47
-#                               (charter/governance/owner-inbox.md). The
-#                               verifier CLI + pinned key are REFUSED if
-#                               they resolve inside any payload directory
-#                               (artifacts dir / RN_PREBUILT_DIR /
-#                               BUILD_DIR): the payload can never vouch
-#                               for itself (AQ-11 F4).
+#                               OPTIONAL: with neither set the bootstrap
+#                               pins its embedded DEFAULT release verifier
+#                               key (RUSTYNET_DEFAULT_RELEASE_VERIFIER_
+#                               KEY_HEX below — the owner-generated public
+#                               key accepted by owner decision OI-47,
+#                               2026-09-25). An explicit hex/file always
+#                               wins over the default. The verifier CLI +
+#                               pinned key are REFUSED if they resolve
+#                               inside any payload directory (artifacts
+#                               dir / RN_PREBUILT_DIR / BUILD_DIR): the
+#                               payload can never vouch for itself
+#                               (AQ-11 F4).
 #   RN_PREBUILT_BINARIES=1 + RN_PREBUILT_DIR
 #                             — host-cross staging; requires a co-located
 #                               release-manifest.json inside RN_PREBUILT_DIR
@@ -143,12 +147,12 @@ readonly PLIST_PATH="${LAUNCHDAEMON_DIR}/com.rustynet.daemon.plist"
 readonly PLIST_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly BUILD_DIR="/private/var/tmp/rustynet-build-$$"
 
-# Pinned release verifier key: NOT embedded here. A trust anchor is never
-# invented — the default pinned key is pending owner decision OI-47
-# (charter/governance/owner-inbox.md). Until that decision lands, an operator
-# MUST supply the project's published release public key via
-# RUSTYNET_RELEASE_PINNED_KEY_HEX / RUSTYNET_RELEASE_PINNED_KEY_FILE; with
-# neither set, every payload-verification path below STOPS (fail closed).
+# AQ-247 / OI-47 (accepted 2026-09-25): the owner-generated Ed25519 PUBLIC
+# release verifier key, embedded as the DEFAULT pin for every payload-
+# verification path below. An explicit RUSTYNET_RELEASE_PINNED_KEY_HEX /
+# RUSTYNET_RELEASE_PINNED_KEY_FILE always overrides it. The matching PRIVATE
+# signing seed is held by the owner only and never appears in this tree.
+readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723"
 
 # On Apple Silicon brew lives at /opt/homebrew; on Intel at /usr/local.
 BREW_PREFIX=""
@@ -983,6 +987,50 @@ refuse_payload_provenance() {
   done
 }
 
+# AQ-247 / OI-47: verifier-from-source fallback. When neither an explicit
+# RUSTYNET_VERIFY_CLI nor the already-installed ${RUSTYNET_BIN} is usable,
+# build `rustynet-cli` from the LOCAL source checkout this bootstrap script
+# itself runs from (PLIST_SCRIPT_DIR/../../..) — never from the downloaded
+# payload — with the Rust toolchain the bootstrap already requires, running
+# as the non-root real user, and use that binary as the verifier BEFORE any
+# download is trusted. Every failure here is a named hard failure: the
+# bootstrap never falls back to an unverified extract.
+rn_build_local_verifier_cli() {
+  local artifacts_dir="$1"
+  local checkout="${PLIST_SCRIPT_DIR}/../../.."
+  checkout="$(cd "${checkout}" && pwd)" || {
+    echo "[bootstrap] FATAL: cannot resolve the local source checkout below ${PLIST_SCRIPT_DIR}" >&2
+    return 1
+  }
+  if [[ ! -f "${checkout}/Cargo.toml" || ! -d "${checkout}/crates/rustynet-cli" ]]; then
+    echo "[bootstrap] FATAL: no out-of-band verifier CLI available and ${checkout} is not a rustynet source checkout (missing Cargo.toml or crates/rustynet-cli)" >&2
+    echo "[bootstrap]        provision a trusted verifier (export RUSTYNET_VERIFY_CLI=<absolute-path>) and retry" >&2
+    return 1
+  fi
+  # AQ-11 F4: a checkout that IS the payload (or lives inside it) can never
+  # vouch for itself. The provenance refusal must precede the build: building
+  # executes the checkout's own build scripts, so refusing only the finished
+  # binary would already have run payload-chosen code.
+  refuse_payload_provenance "${checkout}/Cargo.toml" "verifier source checkout" "${artifacts_dir}" || return 1
+  local brew_rustup="${BREW_PREFIX}/opt/rustup/bin/rustup"
+  if [[ ! -x "${brew_rustup}" ]]; then
+    echo "[bootstrap] FATAL: cannot build the verifier from source: rustup not found at ${brew_rustup} (the prerequisite phase must run first)" >&2
+    return 1
+  fi
+  echo "[bootstrap] no out-of-band verifier CLI available; building rustynet-cli from the local checkout ${checkout} (AQ-247/OI-47)" >&2
+  if ! as_user "${brew_rustup}" run stable cargo build --release --locked -p rustynet-cli --manifest-path "${checkout}/Cargo.toml"; then
+    echo "[bootstrap] FATAL: verifier build from local source failed — refusing to verify or extract any download (fail closed)" >&2
+    return 1
+  fi
+  local built="${checkout}/target/release/rustynet-cli"
+  if [[ ! -x "${built}" ]]; then
+    echo "[bootstrap] FATAL: verifier build produced no binary at ${built}" >&2
+    return 1
+  fi
+  refuse_payload_provenance "${built}" "built verifier CLI" "${artifacts_dir}" || return 1
+  printf '%s' "${built}"
+}
+
 verify_downloaded_payload() {
   local label="$1"
   local manifest="$2"
@@ -998,28 +1046,28 @@ verify_downloaded_payload() {
 
   # F4: resolve the verifier CLI out-of-band. Explicit env wins; the
   # default is the ALREADY-INSTALLED rustynet (built from previously-verified
-  # source); no installed verifier at all is a hard failure, never a fallback
-  # into the payload.
+  # source); with neither available the verifier is BUILT from the local
+  # source checkout this script runs from (AQ-247/OI-47), never from the
+  # payload. No verifier at all is a hard failure, never a fallback into the
+  # payload.
   local rn_verify_cli="${RUSTYNET_VERIFY_CLI:-${RUSTYNET_BIN}}"
   if [[ "${rn_verify_cli}" != /* ]]; then
     echo "[bootstrap] FATAL: verifier CLI must be an absolute path: ${rn_verify_cli}" >&2
     exit 1
   fi
   if [[ ! -x "${rn_verify_cli}" ]]; then
-    echo "[bootstrap] FATAL: no out-of-band verifier CLI available: ${rn_verify_cli}" >&2
-    echo "[bootstrap]        provision one (a previously installed rustynet, or an operator-staged copy) and export RUSTYNET_VERIFY_CLI=<absolute-path>" >&2
-    echo "[bootstrap]        (AQ-11 F4: the verifier is built from verified source on the host BEFORE any download is trusted)" >&2
-    exit 1
+    rn_verify_cli="$(rn_build_local_verifier_cli "${artifacts_dir}")" || {
+      echo "[bootstrap] FATAL: no out-of-band verifier CLI available and no verifier could be built from the local source checkout" >&2
+      exit 1
+    }
   fi
 
-  # F4: resolve the pinned key. A pinned key is REQUIRED: explicit env (hex
-  # or file), exactly one — this script embeds NO default key (a trust anchor
-  # is never invented; the default pinned key is pending owner decision
-  # OI-47). With neither option set the bootstrap STOPS before any payload is
-  # verified. The resolved key is passed as an explicit flag so the helper's
-  # environment fallback can never be fed by the env-file sourced at the top
-  # of this script (a payload-chosen key would make verification
-  # self-vouching).
+  # F4: resolve the pinned key. Explicit env (hex or file), exactly one,
+  # wins; with neither set the bootstrap pins its embedded DEFAULT release
+  # verifier key (AQ-247/OI-47: the owner-generated Ed25519 public key). The
+  # resolved key is passed as an explicit flag so the helper's environment
+  # fallback can never be fed by the env-file sourced at the top of this
+  # script (a payload-chosen key would make verification self-vouching).
   local rn_key_hex="${RUSTYNET_RELEASE_PINNED_KEY_HEX:-}"
   local rn_key_file="${RUSTYNET_RELEASE_PINNED_KEY_FILE:-}"
   if [[ -n "${rn_key_hex}" && -n "${rn_key_file}" ]]; then
@@ -1037,10 +1085,9 @@ verify_downloaded_payload() {
     refuse_payload_provenance "${rn_key_file}" "pinned key file" "${artifacts_dir}" || exit 1
     rn_key_args=(--pinned-key-file "${rn_key_file}")
   else
-    echo "[bootstrap] FATAL: no release verifier key is pinned yet" >&2
-    echo "[bootstrap]        supply the project's published release public key via RUSTYNET_RELEASE_PINNED_KEY_HEX (64-hex) or RUSTYNET_RELEASE_PINNED_KEY_FILE" >&2
-    echo "[bootstrap]        the default pinned key is pending owner decision OI-47 (charter/governance/owner-inbox.md); refusing to verify any download" >&2
-    exit 1
+    rn_key_hex="${RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX}"
+    echo "[bootstrap] no explicit release verifier key given; pinning the embedded default release key (AQ-247/OI-47)" >&2
+    rn_key_args=(--pinned-key-hex "${rn_key_hex}")
   fi
 
   refuse_payload_provenance "${rn_verify_cli}" "verifier CLI" "${artifacts_dir}" || exit 1
