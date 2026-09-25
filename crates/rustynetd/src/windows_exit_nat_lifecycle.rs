@@ -10,7 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -245,13 +245,9 @@ fn current_unix_seconds() -> i64 {
 
 #[cfg(windows)]
 fn capture_windows_netnat_json(nat_name: &str) -> Result<String, String> {
-    run_powershell_with_args(
-        r#"param([string]$Name)
-$nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue
-if ($null -eq $nat) { exit 0 }
-$nat | Select-Object Name,InternalIPInterfaceAddressPrefix | ConvertTo-Json -Compress
-"#,
-        &[nat_name],
+    run_powershell_with_env(
+        WINDOWS_LIFECYCLE_PS_NETNAT_JSON,
+        &[("RUSTYNET_LIFECYCLE_NAME", nat_name)],
     )
 }
 
@@ -262,11 +258,9 @@ fn capture_windows_netnat_json(_nat_name: &str) -> Result<String, String> {
 
 #[cfg(windows)]
 fn capture_windows_forwarding_state(alias: &str) -> Result<String, String> {
-    run_powershell_with_args(
-        r#"param([string]$Alias)
-[string]((Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding)
-"#,
-        &[alias],
+    run_powershell_with_env(
+        WINDOWS_LIFECYCLE_PS_FORWARDING,
+        &[("RUSTYNET_LIFECYCLE_ALIAS", alias)],
     )
     .map(|value| normalize_forwarding_state(value.as_str()))
 }
@@ -278,14 +272,9 @@ fn capture_windows_forwarding_state(_alias: &str) -> Result<String, String> {
 
 #[cfg(windows)]
 fn capture_windows_default_egress_alias(tunnel_alias: &str) -> Result<String, String> {
-    run_powershell_with_args(
-        r#"param([string]$TunnelAlias)
-[string](Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-  Where-Object { $_.InterfaceAlias -ne $TunnelAlias } |
-  Sort-Object -Property RouteMetric,InterfaceMetric |
-  Select-Object -First 1 -ExpandProperty InterfaceAlias)
-"#,
-        &[tunnel_alias],
+    run_powershell_with_env(
+        WINDOWS_LIFECYCLE_PS_EGRESS_ALIAS,
+        &[("RUSTYNET_LIFECYCLE_TUNNEL_ALIAS", tunnel_alias)],
     )
 }
 
@@ -321,8 +310,38 @@ fn capture_windows_portproxy_summary() -> Result<String, String> {
     Ok(String::new())
 }
 
-#[cfg(windows)]
-fn run_powershell_with_args(script: &str, values: &[&str]) -> Result<String, String> {
+/// Follow-up to RSA-0046 (review REVIEW-rsa0046-0026-2026-09-25): the
+/// `-Command` text is ALWAYS a compile-time constant; every caller-supplied
+/// value is read inside the script as `$env:NAME` and passed through the
+/// child process environment by [`powershell_capture_command`] — never
+/// appended after `-Command`, where powershell.exe would re-tokenize it as
+/// command text (same channel and same fix as
+/// `phase10::windows_powershell_constant_command` and
+/// `rustynet-sysinfo::powershell_constant_command`).
+#[cfg(any(windows, test))]
+const WINDOWS_LIFECYCLE_PS_NETNAT_JSON: &str = r#"
+$nat = Get-NetNat -Name $env:RUSTYNET_LIFECYCLE_NAME -ErrorAction SilentlyContinue
+if ($null -eq $nat) { exit 0 }
+$nat | Select-Object Name,InternalIPInterfaceAddressPrefix | ConvertTo-Json -Compress
+"#;
+
+#[cfg(any(windows, test))]
+const WINDOWS_LIFECYCLE_PS_FORWARDING: &str = r#"
+[string]((Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_LIFECYCLE_ALIAS -AddressFamily IPv4 -ErrorAction Stop).Forwarding)
+"#;
+
+#[cfg(any(windows, test))]
+const WINDOWS_LIFECYCLE_PS_EGRESS_ALIAS: &str = r#"
+[string](Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+  Where-Object { $_.InterfaceAlias -ne $env:RUSTYNET_LIFECYCLE_TUNNEL_ALIAS } |
+  Sort-Object -Property RouteMetric,InterfaceMetric |
+  Select-Object -First 1 -ExpandProperty InterfaceAlias)
+"#;
+
+/// Build the capture `powershell` invocation: constant `-Command` text,
+/// values only via the child environment.
+#[cfg(any(windows, test))]
+fn powershell_capture_command(script: &str, env: &[(&'static str, &str)]) -> Command {
     let mut command = Command::new(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
     command.args([
         "-NoProfile",
@@ -332,8 +351,15 @@ fn run_powershell_with_args(script: &str, values: &[&str]) -> Result<String, Str
         "-Command",
         script,
     ]);
-    command.args(values);
-    let output = command
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command
+}
+
+#[cfg(windows)]
+fn run_powershell_with_env(script: &str, env: &[(&'static str, &str)]) -> Result<String, String> {
+    let output = powershell_capture_command(script, env)
         .output()
         .map_err(|err| format!("PowerShell capture failed to start: {err}"))?;
     if !output.status.success() {
@@ -349,6 +375,90 @@ fn run_powershell_with_args(script: &str, values: &[&str]) -> Result<String, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn powershell_capture_command_keeps_values_out_of_command_text() {
+        // Follow-up to RSA-0046 (REVIEW-rsa0046-0026-2026-09-25): the capture
+        // scripts previously bound values via `param(...)` fed by trailing
+        // `-Command` positionals — which powershell.exe re-tokenizes as
+        // command text. Values must now travel ONLY through the environment
+        // and be read back as `$env:NAME`; a value carrying PowerShell
+        // metacharacters (single quote, `;`, backtick, `$(...)`, newline)
+        // must not be able to alter the command text in any way.
+        const SITES: [(&str, &[(&str, &str)]); 3] = [
+            (
+                WINDOWS_LIFECYCLE_PS_NETNAT_JSON,
+                &[("RUSTYNET_LIFECYCLE_NAME", "RustyNetExit-rustynet0")],
+            ),
+            (
+                WINDOWS_LIFECYCLE_PS_FORWARDING,
+                &[("RUSTYNET_LIFECYCLE_ALIAS", "Ethernet 2")],
+            ),
+            (
+                WINDOWS_LIFECYCLE_PS_EGRESS_ALIAS,
+                &[("RUSTYNET_LIFECYCLE_TUNNEL_ALIAS", "rustynet0")],
+            ),
+        ];
+        const EVIL: [&str; 6] = [
+            "'; Start-Process calc; '",
+            "a;b",
+            "back`tick",
+            "$(calc)",
+            "line1\nline2",
+            "x'`$(whoami);' with \"dquotes\"",
+        ];
+        for (script, env) in SITES {
+            // The constant scripts read each value back by name and keep no
+            // `param()` binding (the old injection channel).
+            for (name, _) in env {
+                assert!(
+                    script.contains(&format!("$env:{name}")),
+                    "script must read its value back as $env:{name}"
+                );
+            }
+            assert!(!script.contains("param("));
+            for evil in EVIL {
+                let env: Vec<(&'static str, &str)> =
+                    env.iter().map(|(name, _)| (*name, evil)).collect();
+                let command = powershell_capture_command(script, &env);
+                let args: Vec<String> = command
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(args.first().map(String::as_str), Some("-NoProfile"));
+                assert_eq!(args.get(1).map(String::as_str), Some("-NonInteractive"));
+                assert_eq!(args.get(2).map(String::as_str), Some("-ExecutionPolicy"));
+                assert_eq!(args.get(3).map(String::as_str), Some("Bypass"));
+                assert_eq!(args.get(4).map(String::as_str), Some("-Command"));
+                assert_eq!(
+                    args.get(5).map(String::as_str),
+                    Some(script),
+                    "script text must stay byte-identical for value {evil:?}"
+                );
+                assert_eq!(args.len(), 6);
+                assert!(
+                    args.iter().all(|a| !a.contains(evil)),
+                    "untrusted value reached command text: {evil:?}"
+                );
+                let envs: Vec<(String, String)> = command
+                    .get_envs()
+                    .filter_map(|(k, v)| {
+                        v.map(|v| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.to_string_lossy().into_owned(),
+                            )
+                        })
+                    })
+                    .collect();
+                let expected: Vec<(String, String)> = env
+                    .iter()
+                    .map(|(name, _)| (name.to_string(), evil.to_string()))
+                    .collect();
+                assert_eq!(envs, expected, "values must travel only via env");
+            }
+        }
+    }
 
     /// Regression: no production callsite in this module may invoke `netsh.exe`
     /// by bare program name. Win32 `CreateProcess` resolves bare names via the

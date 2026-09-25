@@ -6130,12 +6130,14 @@ impl WindowsCommandSystem {
     fn run_powershell(
         &self,
         script: &'static str,
-        args: &[String],
+        env: &[(&'static str, String)],
     ) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_powershell_binary()?;
-        let command_args = windows_powershell_command_args(script, args);
-        let mut command = Command::new(&binary);
-        command.args(&command_args);
+        let env_refs: Vec<(&'static str, &str)> = env
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let command = windows_powershell_constant_command(&binary, script, &env_refs);
         let output = run_helper_command_with_timeout(command, WINDOWS_HELPER_COMMAND_TIMEOUT)
             .map_err(|err| {
                 SystemError::Io(format!(
@@ -6153,9 +6155,9 @@ impl WindowsCommandSystem {
     fn run_powershell_success(
         &self,
         script: &'static str,
-        args: &[String],
+        env: &[(&'static str, String)],
     ) -> Result<(), SystemError> {
-        let output = self.run_powershell(script, args)?;
+        let output = self.run_powershell(script, env)?;
         if output.success() {
             return Ok(());
         }
@@ -6168,9 +6170,9 @@ impl WindowsCommandSystem {
     fn run_powershell_stdout(
         &self,
         script: &'static str,
-        args: &[String],
+        env: &[(&'static str, String)],
     ) -> Result<String, SystemError> {
-        let output = self.run_powershell(script, args)?;
+        let output = self.run_powershell(script, env)?;
         if output.success() {
             return Ok(output.stdout);
         }
@@ -6196,7 +6198,7 @@ impl WindowsCommandSystem {
         for attempt in 1..=WINDOWS_TUNNEL_IP_READY_ATTEMPTS {
             let stdout = self.run_powershell_stdout(
                 WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS,
-                std::slice::from_ref(&self.interface_name),
+                &[("RUSTYNET_PS_ALIAS", self.interface_name.clone())],
             )?;
             if !stdout.trim().is_empty() {
                 if attempt > 1 {
@@ -6427,8 +6429,10 @@ impl WindowsCommandSystem {
         validate_windows_interface_alias(interface_alias).map_err(|message| {
             SystemError::NatApplyFailed(format!("invalid Windows interface alias: {message}"))
         })?;
-        let stdout =
-            self.run_powershell_stdout(WINDOWS_PS_GET_FORWARDING, &[interface_alias.to_owned()])?;
+        let stdout = self.run_powershell_stdout(
+            WINDOWS_PS_GET_FORWARDING,
+            &[("RUSTYNET_PS_ALIAS", interface_alias.to_owned())],
+        )?;
         WindowsForwardingState::parse(stdout.trim())
     }
 
@@ -6443,8 +6447,8 @@ impl WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_SET_FORWARDING,
             &[
-                interface_alias.to_owned(),
-                state.as_powershell_value().to_owned(),
+                ("RUSTYNET_PS_ALIAS", interface_alias.to_owned()),
+                ("RUSTYNET_PS_STATE", state.as_powershell_value().to_owned()),
             ],
         )
     }
@@ -6471,13 +6475,19 @@ impl WindowsCommandSystem {
                 })?;
         }
 
-        self.run_powershell_success(WINDOWS_PS_REMOVE_NAT, std::slice::from_ref(&self.nat_name))
-            .map_err(|err| {
-                SystemError::NatApplyFailed(format!("remove stale RustyNet NAT failed: {err}"))
-            })?;
+        self.run_powershell_success(
+            WINDOWS_PS_REMOVE_NAT,
+            &[("RUSTYNET_PS_NAME", self.nat_name.clone())],
+        )
+        .map_err(|err| {
+            SystemError::NatApplyFailed(format!("remove stale RustyNet NAT failed: {err}"))
+        })?;
         self.run_powershell_success(
             WINDOWS_PS_NEW_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_owned()],
+            &[
+                ("RUSTYNET_PS_NAME", self.nat_name.clone()),
+                ("RUSTYNET_PS_PREFIX", mesh_cidr.to_owned()),
+            ],
         )
         .map_err(|err| {
             SystemError::NatApplyFailed(format!("create Windows NetNat failed: {err}"))
@@ -6485,7 +6495,10 @@ impl WindowsCommandSystem {
 
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_owned()],
+            &[
+                ("RUSTYNET_PS_NAME", self.nat_name.clone()),
+                ("RUSTYNET_PS_PREFIX", mesh_cidr.to_owned()),
+            ],
         )
         .map_err(|err| {
             SystemError::NatApplyFailed(format!("verify Windows NetNat failed: {err}"))
@@ -6493,7 +6506,7 @@ impl WindowsCommandSystem {
         for interface_alias in [&self.interface_name, &self.egress_interface] {
             self.run_powershell_success(
                 WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
-                std::slice::from_ref(interface_alias),
+                &[("RUSTYNET_PS_ALIAS", interface_alias.clone())],
             )
             .map_err(|err| {
                 SystemError::NatApplyFailed(format!(
@@ -6526,35 +6539,46 @@ const WINDOWS_DNS_RULE_BLOCK_LAN_TCP: &str = "RustyNetDNS-BlockLanTcp";
 /// IPv4, so they are unaffected.
 const WINDOWS_IPV6_RULE_BLOCK_LAN: &str = "RustyNetKS-BlockIpv6Lan";
 const WINDOWS_PS_REQUIRE_EXIT_CMDLETS: &str = "& { $ErrorActionPreference = 'Stop'; Get-Command Set-NetIPInterface | Out-Null; Get-Command Get-NetIPInterface | Out-Null; Get-Command New-NetNat | Out-Null; Get-Command Get-NetNat | Out-Null; Get-Command Remove-NetNat | Out-Null; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' } }";
-const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { param($TunnelAlias, $EgressAlias) $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' }; if ($TunnelAlias -eq $EgressAlias) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $TunnelAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $EgressAlias -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $EgressAlias -ErrorAction Stop | Out-Null }";
-/// §10.7 — the (script, args) command plan for flushing residual Windows exit
+const WINDOWS_PS_PREFLIGHT_EXIT_SERVING: &str = "& { $ErrorActionPreference = 'Stop'; $identity = [Security.Principal.WindowsIdentity]::GetCurrent(); $principal = New-Object Security.Principal.WindowsPrincipal($identity); if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'RustyNet exit serving requires an elevated administrator or service token' }; foreach ($cmd in @('Set-NetIPInterface','Get-NetIPInterface','New-NetNat','Get-NetNat','Remove-NetNat','Get-NetRoute')) { Get-Command $cmd -ErrorAction Stop | Out-Null }; try { Get-CimClass -Namespace root/standardcimv2 -ClassName MSFT_NetNat -ErrorAction Stop | Out-Null } catch { throw 'RustyNet exit serving requires the Windows WinNAT WMI provider (MSFT_NetNat in root/standardcimv2); this host lacks the Host Network Service / WinNAT networking stack, so New-NetNat fails with Invalid class. Install the WinNAT/HNS networking component to serve as a full-tunnel exit.' }; if ($env:RUSTYNET_PS_TUNNEL_ALIAS -eq $env:RUSTYNET_PS_EGRESS_ALIAS) { throw 'RustyNet tunnel and outbound interface aliases must be distinct' }; Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_TUNNEL_ALIAS -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_EGRESS_ALIAS -AddressFamily IPv4 -ErrorAction Stop | Out-Null; Get-NetRoute -DestinationPrefix '0.0.0.0/0' -InterfaceAlias $env:RUSTYNET_PS_EGRESS_ALIAS -ErrorAction Stop | Out-Null }";
+/// §10.7 — the (script, env) command plan for flushing residual Windows exit
 /// NAT + forwarding when a generation does NOT serve an exit. Empty when it
 /// does serve, so it can never race the `activate_exit_nat` (`New-NetNat`) load
 /// that happens later in the same apply. Pure so the residue policy is
 /// unit-testable on any host without executing PowerShell (the actual
-/// `Get-NetNat`/`Set-NetIPInterface` run requires a Windows guest).
+/// `Get-NetNat`/`Set-NetIPInterface` run requires a Windows guest). Values
+/// travel only as `($env-NAME, value)` pairs for
+/// `windows_powershell_constant_command` — never as command text.
 fn windows_exit_nat_residue_plan(
     serving_exit: bool,
     nat_name: &str,
     tunnel_alias: &str,
     egress_alias: &str,
-) -> Vec<(&'static str, Vec<String>)> {
+) -> Vec<(&'static str, Vec<(&'static str, String)>)> {
     if serving_exit {
         return Vec::new();
     }
     vec![
         // Remove the fixed-name NetNat (no-op if absent; safe on a non-WinNAT host
         // because WINDOWS_PS_REMOVE_NAT swallows the Get-NetNat lookup error).
-        (WINDOWS_PS_REMOVE_NAT, vec![nat_name.to_owned()]),
+        (
+            WINDOWS_PS_REMOVE_NAT,
+            vec![("RUSTYNET_PS_NAME", nat_name.to_owned())],
+        ),
         // Drive forwarding back to the secure default on both interfaces a former
         // exit would have enabled it on (a non-exit node must not forward).
         (
             WINDOWS_PS_SET_FORWARDING,
-            vec![tunnel_alias.to_owned(), "Disabled".to_owned()],
+            vec![
+                ("RUSTYNET_PS_ALIAS", tunnel_alias.to_owned()),
+                ("RUSTYNET_PS_STATE", "Disabled".to_owned()),
+            ],
         ),
         (
             WINDOWS_PS_SET_FORWARDING,
-            vec![egress_alias.to_owned(), "Disabled".to_owned()],
+            vec![
+                ("RUSTYNET_PS_ALIAS", egress_alias.to_owned()),
+                ("RUSTYNET_PS_STATE", "Disabled".to_owned()),
+            ],
         ),
     ]
 }
@@ -6562,11 +6586,11 @@ fn windows_exit_nat_residue_plan(
 /// Used by `apply_dns_loopback`'s tunnel-IP-readiness wait. `SilentlyContinue`
 /// (not `Stop`) so a not-yet-bound address is an empty string, not a thrown
 /// error the caller would have to parse out of stderr.
-const WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPAddress -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress }";
-const WINDOWS_PS_GET_FORWARDING: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
-const WINDOWS_PS_SET_FORWARDING: &str = "& { param($Alias, $State) $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -Forwarding $State -ErrorAction Stop }";
-const WINDOWS_PS_REMOVE_NAT: &str = "& { param($Name) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
-const WINDOWS_PS_NEW_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; New-NetNat -Name $Name -InternalIPInterfaceAddressPrefix $Prefix -ErrorAction Stop | Out-Null }";
+const WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS: &str = "& { $ErrorActionPreference = 'Stop'; (Get-NetIPAddress -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -ErrorAction SilentlyContinue | Select-Object -First 1).IPAddress }";
+const WINDOWS_PS_GET_FORWARDING: &str = "& { $ErrorActionPreference = 'Stop'; (Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -ErrorAction Stop).Forwarding }";
+const WINDOWS_PS_SET_FORWARDING: &str = "& { $ErrorActionPreference = 'Stop'; Set-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -Forwarding $env:RUSTYNET_PS_STATE -ErrorAction Stop }";
+const WINDOWS_PS_REMOVE_NAT: &str = "& { $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $env:RUSTYNET_PS_NAME -ErrorAction SilentlyContinue; if ($null -ne $nat) { $nat | Remove-NetNat -Confirm:$false -ErrorAction Stop } }";
+const WINDOWS_PS_NEW_NAT: &str = "& { $ErrorActionPreference = 'Stop'; New-NetNat -Name $env:RUSTYNET_PS_NAME -InternalIPInterfaceAddressPrefix $env:RUSTYNET_PS_PREFIX -ErrorAction Stop | Out-Null }";
 // QH-29 coupling note (Windows): the runtime self-assertions
 // (`assert_dns_protection` / `assert_killswitch` / `assert_exit_serving`)
 // do NOT pattern-match generated rule text. They query LIVE OS state
@@ -6577,20 +6601,20 @@ const WINDOWS_PS_NEW_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreferen
 // coupling is therefore compile-time (one constant per rule name) and needs
 // no separate agreement test; renaming a rule constant renames both sides in
 // the same commit.
-const WINDOWS_PS_ASSERT_NAT: &str = "& { param($Name, $Prefix) $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $Name -ErrorAction Stop; if ($nat.InternalIPInterfaceAddressPrefix -ne $Prefix) { throw 'RustyNet NAT prefix mismatch' } }";
-const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { param($Alias) $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $Alias -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
+const WINDOWS_PS_ASSERT_NAT: &str = "& { $ErrorActionPreference = 'Stop'; $nat = Get-NetNat -Name $env:RUSTYNET_PS_NAME -ErrorAction Stop; if ($nat.InternalIPInterfaceAddressPrefix -ne $env:RUSTYNET_PS_PREFIX) { throw 'RustyNet NAT prefix mismatch' } }";
+const WINDOWS_PS_ASSERT_FORWARDING_ENABLED: &str = "& { $ErrorActionPreference = 'Stop'; $state = (Get-NetIPInterface -InterfaceAlias $env:RUSTYNET_PS_ALIAS -AddressFamily IPv4 -ErrorAction Stop).Forwarding; if ($state -ne 'Enabled') { throw 'RustyNet IP forwarding not enabled' } }";
 /// Verify the OS still has every reviewed killswitch rule in place AND the
 /// global default outbound policy is still `Block`.  Each rule name and the
 /// expected attributes are passed as `PowerShell` parameters so no value is
 /// interpolated into the script body.  Throws on the first drift detected.
-const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { param($LoopbackName, $EgressName) $ErrorActionPreference = 'Stop'; $loopback = @(Get-NetFirewallRule -DisplayName $LoopbackName -ErrorAction Stop); if ($loopback.Count -ne 1) { throw \"rule $LoopbackName count is $($loopback.Count), expected 1\" }; $egress = @(Get-NetFirewallRule -DisplayName $EgressName -ErrorAction Stop); if ($egress.Count -lt 1) { throw \"rule $EgressName count is $($egress.Count), expected >= 1\" }; foreach ($rule in @($loopback) + @($egress)) { if ($rule.Action -ne 'Allow') { throw \"rule $($rule.DisplayName) action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $($rule.DisplayName) direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $($rule.DisplayName) is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
+const WINDOWS_PS_ASSERT_KILLSWITCH: &str = "& { $ErrorActionPreference = 'Stop'; $loopback = @(Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_LOOPBACK_NAME -ErrorAction Stop); if ($loopback.Count -ne 1) { throw \"rule $env:RUSTYNET_PS_LOOPBACK_NAME count is $($loopback.Count), expected 1\" }; $egress = @(Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_EGRESS_NAME -ErrorAction Stop); if ($egress.Count -lt 1) { throw \"rule $env:RUSTYNET_PS_EGRESS_NAME count is $($egress.Count), expected >= 1\" }; foreach ($rule in @($loopback) + @($egress)) { if ($rule.Action -ne 'Allow') { throw \"rule $($rule.DisplayName) action is not Allow\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $($rule.DisplayName) direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $($rule.DisplayName) is not Enabled\" } }; foreach ($p in (Get-NetFirewallProfile -ErrorAction Stop)) { if ($p.DefaultOutboundAction -ne 'Block') { throw \"profile $($p.Name) default outbound is not Block\" } } }";
 
 /// Verify the reviewed DNS-block rules (the baseline plaintext-DNS protection,
 /// parity with the Linux `udp dport 53 oifname != tunnel drop`) are still
 /// present, Outbound, Block, and Enabled.  Rule names are passed as `PowerShell`
 /// parameters so no value is interpolated into the script body.  Throws on the
 /// first drift detected.
-const WINDOWS_PS_ASSERT_DNS: &str = "& { param($UdpName, $TcpName) $ErrorActionPreference = 'Stop'; foreach ($displayName in @($UdpName, $TcpName)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Block') { throw \"rule $displayName action is not Block\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } } }";
+const WINDOWS_PS_ASSERT_DNS: &str = "& { $ErrorActionPreference = 'Stop'; foreach ($displayName in @($env:RUSTYNET_PS_UDP_NAME, $env:RUSTYNET_PS_TCP_NAME)) { $rules = @(Get-NetFirewallRule -DisplayName $displayName -ErrorAction Stop); if ($rules.Count -ne 1) { throw \"rule $displayName count is $($rules.Count), expected 1\" }; $rule = $rules[0]; if ($rule.Action -ne 'Block') { throw \"rule $displayName action is not Block\" }; if ($rule.Direction -ne 'Outbound') { throw \"rule $displayName direction is not Outbound\" }; if ($rule.Enabled -ne 'True') { throw \"rule $displayName is not Enabled\" } } }";
 
 /// Loopback name servers as the NRPT `GenericDNSServers` value expects them:
 /// IPv4 `127.0.0.1` (the rustynet resolver) + IPv6 `::1`, semicolon-separated.
@@ -6652,13 +6676,13 @@ impl DataplaneSystem for WindowsCommandSystem {
         // swallows a missing NAT, and Set-NetIPInterface to the already-Disabled
         // default is idempotent). It runs only when NOT serving an exit, so it can
         // never race the `activate_exit_nat` load later in the same apply.
-        for (script, args) in windows_exit_nat_residue_plan(
+        for (script, env) in windows_exit_nat_residue_plan(
             serving_exit,
             &self.nat_name,
             &self.interface_name,
             &self.egress_interface,
         ) {
-            let _ = self.run_powershell(script, &args);
+            let _ = self.run_powershell(script, &env);
         }
         Ok(())
     }
@@ -6686,7 +6710,10 @@ impl DataplaneSystem for WindowsCommandSystem {
         validate_windows_nat_prefix(mesh_cidr)?;
         self.run_powershell_success(
             WINDOWS_PS_PREFLIGHT_EXIT_SERVING,
-            &[self.interface_name.clone(), self.egress_interface.clone()],
+            &[
+                ("RUSTYNET_PS_TUNNEL_ALIAS", self.interface_name.clone()),
+                ("RUSTYNET_PS_EGRESS_ALIAS", self.egress_interface.clone()),
+            ],
         )
         .map_err(|err| {
             SystemError::PrerequisiteCheckFailed(format!(
@@ -6868,7 +6895,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         if self.nat_applied {
             self.run_powershell_success(
                 WINDOWS_PS_REMOVE_NAT,
-                std::slice::from_ref(&self.nat_name),
+                &[("RUSTYNET_PS_NAME", self.nat_name.clone())],
             )
             .map_err(|err| {
                 SystemError::RollbackFailed(format!("remove Windows NetNat failed: {err}"))
@@ -6974,8 +7001,14 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_DNS,
             &[
-                WINDOWS_DNS_RULE_BLOCK_LAN_UDP.to_owned(),
-                WINDOWS_DNS_RULE_BLOCK_LAN_TCP.to_owned(),
+                (
+                    "RUSTYNET_PS_UDP_NAME",
+                    WINDOWS_DNS_RULE_BLOCK_LAN_UDP.to_owned(),
+                ),
+                (
+                    "RUSTYNET_PS_TCP_NAME",
+                    WINDOWS_DNS_RULE_BLOCK_LAN_TCP.to_owned(),
+                ),
             ],
         )
         .map_err(|err| {
@@ -7090,8 +7123,11 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_KILLSWITCH,
             &[
-                WINDOWS_KS_RULE_LOOPBACK.to_owned(),
-                WINDOWS_KS_RULE_EGRESS.to_owned(),
+                (
+                    "RUSTYNET_PS_LOOPBACK_NAME",
+                    WINDOWS_KS_RULE_LOOPBACK.to_owned(),
+                ),
+                ("RUSTYNET_PS_EGRESS_NAME", WINDOWS_KS_RULE_EGRESS.to_owned()),
             ],
         )
         .map_err(|err| {
@@ -7140,7 +7176,10 @@ impl DataplaneSystem for WindowsCommandSystem {
         self.assert_killswitch()?;
         self.run_powershell_success(
             WINDOWS_PS_ASSERT_NAT,
-            &[self.nat_name.clone(), mesh_cidr.to_owned()],
+            &[
+                ("RUSTYNET_PS_NAME", self.nat_name.clone()),
+                ("RUSTYNET_PS_PREFIX", mesh_cidr.to_owned()),
+            ],
         )
         .map_err(|err| {
             SystemError::KillSwitchAssertionFailed(format!(
@@ -7150,7 +7189,7 @@ impl DataplaneSystem for WindowsCommandSystem {
         for interface_alias in [&self.interface_name, &self.egress_interface] {
             self.run_powershell_success(
                 WINDOWS_PS_ASSERT_FORWARDING_ENABLED,
-                std::slice::from_ref(interface_alias),
+                &[("RUSTYNET_PS_ALIAS", interface_alias.clone())],
             )
             .map_err(|err| {
                 SystemError::KillSwitchAssertionFailed(format!(
@@ -9391,15 +9430,39 @@ fn validate_windows_nat_prefix(value: &str) -> Result<&str, SystemError> {
     Ok(value)
 }
 
-fn windows_powershell_command_args(script: &'static str, args: &[String]) -> Vec<String> {
-    let mut command_args = vec![
-        "-NoProfile".to_owned(),
-        "-NonInteractive".to_owned(),
-        "-Command".to_owned(),
-        script.to_owned(),
-    ];
-    command_args.extend_from_slice(args);
-    command_args
+/// Follow-up to RSA-0046 (review REVIEW-rsa0046-0026-2026-09-25, the
+/// `rustynetd/src/phase10.rs` row): build the `powershell` invocation so the
+/// `-Command` text is ALWAYS the compile-time constant `script`; every
+/// caller-supplied value is passed through the child process environment and
+/// read inside the script as `$env:NAME`.
+///
+/// Why environment variables (the same channel the RSA-0046 fix chose in
+/// `rustynet-sysinfo::powershell_constant_command`): the value never appears
+/// in any command text, so PowerShell's tokenizer never sees it — `'`, `;`,
+/// `` ` ``, `$()`, newlines are inert data, and there is no quoting scheme to
+/// get wrong. Appending a value as a trailing positional after `-Command`
+/// does NOT bind it as a discrete argument: powershell.exe concatenates the
+/// remaining command-line tokens onto the script text, so a value carrying
+/// `;` or `$(...)` would be re-tokenized as script. `-File` would require
+/// shipping a script file next to the binary, and `-EncodedCommand` still
+/// carries the value inside script text unless the value separately flows
+/// through `$env:` — so the environment is the channel with no script-text
+/// exposure. A NUL byte in a value cannot inject anything either:
+/// `std::process::Command::env` makes the spawn fail with an error, which
+/// every call site already handles like any other spawn failure. The
+/// metacharacter battery in `mod tests` pins that no value can alter the
+/// command text.
+fn windows_powershell_constant_command(
+    binary: &Path,
+    script: &'static str,
+    env: &[(&'static str, &str)],
+) -> Command {
+    let mut command = Command::new(binary);
+    command.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command
 }
 
 fn validate_windows_binary_path(raw: &str, label: &str) -> Result<(), SystemError> {
@@ -15199,50 +15262,87 @@ mod tests {
         );
         // Not serving ⇒ remove the fixed-name NAT + force forwarding Disabled on
         // both the tunnel and egress interfaces (the secure default for a node
-        // that must not forward), in that order.
+        // that must not forward), in that order. Values travel as env pairs.
         let plan = windows_exit_nat_residue_plan(false, "RustyNetExit-wg0", "wg0", "Ethernet");
         assert_eq!(plan.len(), 3);
         assert_eq!(plan[0].0, WINDOWS_PS_REMOVE_NAT);
-        assert_eq!(plan[0].1, vec!["RustyNetExit-wg0".to_owned()]);
+        assert_eq!(
+            plan[0].1,
+            vec![("RUSTYNET_PS_NAME", "RustyNetExit-wg0".to_owned())]
+        );
         assert_eq!(
             plan[1],
             (
                 WINDOWS_PS_SET_FORWARDING,
-                vec!["wg0".to_owned(), "Disabled".to_owned()]
+                vec![
+                    ("RUSTYNET_PS_ALIAS", "wg0".to_owned()),
+                    ("RUSTYNET_PS_STATE", "Disabled".to_owned())
+                ]
             )
         );
         assert_eq!(
             plan[2],
             (
                 WINDOWS_PS_SET_FORWARDING,
-                vec!["Ethernet".to_owned(), "Disabled".to_owned()]
+                vec![
+                    ("RUSTYNET_PS_ALIAS", "Ethernet".to_owned()),
+                    ("RUSTYNET_PS_STATE", "Disabled".to_owned())
+                ]
             )
         );
     }
 
     #[test]
-    fn windows_exit_powershell_invocation_keeps_values_as_args() {
-        let args = windows_powershell_command_args(
-            WINDOWS_PS_NEW_NAT,
-            &[
-                "RustyNetExit-rustynet0".to_owned(),
-                "100.64.0.0/10".to_owned(),
-            ],
-        );
-
+    fn windows_exit_powershell_invocation_keeps_values_out_of_command_text() {
+        // Phase10 PowerShell follow-up (REVIEW-rsa0046-0026-2026-09-25): a
+        // trailing positional after `-Command` is re-tokenized as command
+        // text, so caller values must travel ONLY through the environment.
+        let env = [
+            ("RUSTYNET_PS_NAME", "RustyNetExit-rustynet0"),
+            ("RUSTYNET_PS_PREFIX", "100.64.0.0/10"),
+        ];
+        let command =
+            windows_powershell_constant_command(Path::new("powershell"), WINDOWS_PS_NEW_NAT, &env);
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args[0], "-NoProfile");
         assert_eq!(args[1], "-NonInteractive");
         assert_eq!(args[2], "-Command");
         assert_eq!(args[3], WINDOWS_PS_NEW_NAT);
-        assert_eq!(args[4], "RustyNetExit-rustynet0");
-        assert_eq!(args[5], "100.64.0.0/10");
+        assert_eq!(args.len(), 4, "no value may reach argv: {args:?}");
+        // The script must read each value back by name — otherwise a caller
+        // could pass an env var the script never consumes (silent no-op).
+        assert!(WINDOWS_PS_NEW_NAT.contains("$env:RUSTYNET_PS_NAME"));
+        assert!(WINDOWS_PS_NEW_NAT.contains("$env:RUSTYNET_PS_PREFIX"));
         assert!(
-            WINDOWS_PS_NEW_NAT.contains("param($Name, $Prefix)"),
-            "script must bind untrusted values as PowerShell parameters"
+            !WINDOWS_PS_NEW_NAT.contains("param("),
+            "param() binding was the trailing-positional injection channel"
         );
-        assert!(
-            !WINDOWS_PS_NEW_NAT.contains("100.64.0.0/10"),
-            "script must not interpolate operator-provided CIDRs"
+        let envs: Vec<(String, String)> = command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![
+                (
+                    "RUSTYNET_PS_NAME".to_string(),
+                    "RustyNetExit-rustynet0".to_string()
+                ),
+                (
+                    "RUSTYNET_PS_PREFIX".to_string(),
+                    "100.64.0.0/10".to_string()
+                ),
+            ]
         );
     }
 
@@ -15299,7 +15399,7 @@ mod tests {
             "Remove-NetNat",
             "Get-NetRoute",
             "DestinationPrefix '0.0.0.0/0'",
-            "$TunnelAlias -eq $EgressAlias",
+            "$env:RUSTYNET_PS_TUNNEL_ALIAS -eq $env:RUSTYNET_PS_EGRESS_ALIAS",
         ] {
             assert!(
                 WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains(required),
@@ -15307,8 +15407,9 @@ mod tests {
             );
         }
         assert!(
-            WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("param($TunnelAlias, $EgressAlias)"),
-            "preflight must bind interface aliases as PowerShell parameters"
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$env:RUSTYNET_PS_TUNNEL_ALIAS")
+                && WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$env:RUSTYNET_PS_EGRESS_ALIAS"),
+            "preflight must read interface aliases from the environment"
         );
         assert!(
             WINDOWS_PS_PREFLIGHT_EXIT_SERVING.contains("$ErrorActionPreference = 'Stop'"),
@@ -15329,10 +15430,11 @@ mod tests {
     }
 
     #[test]
-    fn windows_exit_powershell_scripts_use_stop_error_action_and_param_binding() {
+    fn windows_exit_powershell_scripts_use_stop_error_action_and_env_binding() {
         // Every PowerShell helper that touches NAT / forwarding state must:
         //  - run with `$ErrorActionPreference = 'Stop'` so failures propagate (no silent skip);
-        //  - bind operator-controlled values via `param(...)` rather than string interpolation;
+        //  - read operator-controlled values via `$env:NAME` passed through the
+        //    child environment, never as `-Command` text or string interpolation;
         //  - explicitly use `-ErrorAction Stop` on cmdlets so missing/incorrect
         //    state does not silently no-op.
         for (label, script) in [
@@ -15355,8 +15457,8 @@ mod tests {
                 "{label} must use $ErrorActionPreference = 'Stop'"
             );
             assert!(
-                script.contains("param("),
-                "{label} must bind values as PowerShell parameters"
+                script.contains("$env:RUSTYNET_PS_"),
+                "{label} must read values from the environment"
             );
         }
 
@@ -15394,10 +15496,11 @@ mod tests {
 
     #[test]
     fn windows_ps_get_tunnel_ipv4_address_binds_alias_and_tolerates_absence() {
-        // Bound via param(), not string interpolation (argv-only discipline).
-        assert!(WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("param($Alias)"));
+        // Read from the environment, not string interpolation (argv-only
+        // discipline: the value never appears in command text).
+        assert!(WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("$env:RUSTYNET_PS_ALIAS"));
         assert!(
-            WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("-InterfaceAlias $Alias"),
+            WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS.contains("-InterfaceAlias $env:RUSTYNET_PS_ALIAS"),
             "must query the SAME interface the caller names, not a hardcoded alias"
         );
         // Deliberately SilentlyContinue, not Stop: a not-yet-bound address must
@@ -15414,7 +15517,7 @@ mod tests {
     fn windows_exit_powershell_scripts_do_not_interpolate_known_data_values() {
         // Ensure none of the operator-controlled or runtime-derived data values are
         // hard-coded into a script body.  This is a static guard that complements
-        // `windows_exit_powershell_invocation_keeps_values_as_args`, which checks
+        // `windows_exit_powershell_invocation_keeps_values_out_of_command_text`, which checks
         // the runtime invocation path.
         for (label, script, forbidden) in [
             (
@@ -15467,26 +15570,28 @@ mod tests {
     }
 
     #[test]
-    fn windows_assert_killswitch_script_uses_param_and_stop_error_action() {
+    fn windows_assert_killswitch_script_uses_env_binding_and_stop_error_action() {
         // The new OS-state-verifying assert_killswitch script must:
-        //  - bind every rule name as a PowerShell parameter (no
+        //  - read every rule name from the environment (no
         //    interpolation of identifiers into the script body);
         //  - use $ErrorActionPreference = 'Stop' and -ErrorAction Stop on
         //    every cmdlet so a missing rule or query failure is surfaced
         //    as a thrown exception, not a silently-empty result.
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH.contains("param($LoopbackName, $EgressName)"),
-            "assert_killswitch script must bind rule names as parameters"
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_LOOPBACK_NAME")
+                && WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_EGRESS_NAME"),
+            "assert_killswitch script must read rule names from the environment"
         );
         assert!(
             WINDOWS_PS_ASSERT_KILLSWITCH.contains("$ErrorActionPreference = 'Stop'"),
             "assert_killswitch script must use $ErrorActionPreference = 'Stop'"
         );
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH
-                .contains("Get-NetFirewallRule -DisplayName $LoopbackName -ErrorAction Stop")
-                && WINDOWS_PS_ASSERT_KILLSWITCH
-                    .contains("Get-NetFirewallRule -DisplayName $EgressName -ErrorAction Stop"),
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains(
+                "Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_LOOPBACK_NAME -ErrorAction Stop",
+            ) && WINDOWS_PS_ASSERT_KILLSWITCH.contains(
+                "Get-NetFirewallRule -DisplayName $env:RUSTYNET_PS_EGRESS_NAME -ErrorAction Stop",
+            ),
             "Get-NetFirewallRule must use -DisplayName and -ErrorAction Stop on the loopback and egress lookups"
         );
         assert!(
@@ -15524,12 +15629,13 @@ mod tests {
 
     #[test]
     fn windows_assert_dns_script_checks_block_outbound_enabled() {
-        // The DNS-block verifier must bind rule names as parameters, fail closed,
+        // The DNS-block verifier must read rule names from the environment, fail closed,
         // and reject a rule whose attributes drifted from Outbound/Block/Enabled
         // or whose count != 1 (missing/duplicate).
         assert!(
-            WINDOWS_PS_ASSERT_DNS.contains("param($UdpName, $TcpName)"),
-            "DNS assert must bind rule names as parameters"
+            WINDOWS_PS_ASSERT_DNS.contains("$env:RUSTYNET_PS_UDP_NAME")
+                && WINDOWS_PS_ASSERT_DNS.contains("$env:RUSTYNET_PS_TCP_NAME"),
+            "DNS assert must read rule names from the environment"
         );
         assert!(
             WINDOWS_PS_ASSERT_DNS.contains("$ErrorActionPreference = 'Stop'"),
@@ -15567,13 +15673,14 @@ mod tests {
         // MULTIPLE scoped allow rules (RN-06), so it must be present (count >= 1)
         // rather than exactly one.
         assert!(
-            WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $LoopbackName")
-                && WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $EgressName"),
+            WINDOWS_PS_ASSERT_KILLSWITCH.contains("-DisplayName $env:RUSTYNET_PS_LOOPBACK_NAME")
+                && WINDOWS_PS_ASSERT_KILLSWITCH
+                    .contains("-DisplayName $env:RUSTYNET_PS_EGRESS_NAME"),
             "assert_killswitch must verify the netsh-created display names"
         );
         assert!(
-            !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $LoopbackName")
-                && !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $EgressName"),
+            !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $env:RUSTYNET_PS_LOOPBACK_NAME")
+                && !WINDOWS_PS_ASSERT_KILLSWITCH.contains("-Name $env:RUSTYNET_PS_EGRESS_NAME"),
             "assert_killswitch must not query the internal PowerShell rule Name"
         );
         assert!(
@@ -15589,7 +15696,7 @@ mod tests {
     #[test]
     fn windows_assert_killswitch_does_not_interpolate_rule_names() {
         // The reviewed rule-name constants must NOT appear in the script
-        // body — the script binds them as parameters at invocation time.
+        // body — the script reads them from the environment at run time.
         // Hard-coded rule names would let a bug rename the constant
         // without renaming the script reference, silently breaking the
         // verifier.
@@ -15606,24 +15713,149 @@ mod tests {
     }
 
     #[test]
-    fn windows_assert_killswitch_runtime_args_pass_rule_names_as_separate_argv() {
-        // The runtime invocation must build argv where each rule name is a
-        // distinct argument, not concatenated or interpolated into a single
-        // string.  This pins the safety contract of the script-parameter
-        // binding at the call site.
-        let args = windows_powershell_command_args(
+    fn windows_assert_killswitch_runtime_args_pass_rule_names_via_env() {
+        // The runtime invocation must keep the rule names OUT of argv — the
+        // environment is the only channel — and the script must read them
+        // back by name.
+        let env = [
+            ("RUSTYNET_PS_LOOPBACK_NAME", WINDOWS_KS_RULE_LOOPBACK),
+            ("RUSTYNET_PS_EGRESS_NAME", WINDOWS_KS_RULE_EGRESS),
+        ];
+        let command = windows_powershell_constant_command(
+            Path::new("powershell"),
             WINDOWS_PS_ASSERT_KILLSWITCH,
-            &[
-                WINDOWS_KS_RULE_LOOPBACK.to_owned(),
-                WINDOWS_KS_RULE_EGRESS.to_owned(),
-            ],
+            &env,
         );
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args[0], "-NoProfile");
         assert_eq!(args[1], "-NonInteractive");
         assert_eq!(args[2], "-Command");
         assert_eq!(args[3], WINDOWS_PS_ASSERT_KILLSWITCH);
-        assert_eq!(args[4], WINDOWS_KS_RULE_LOOPBACK);
-        assert_eq!(args[5], WINDOWS_KS_RULE_EGRESS);
+        assert_eq!(args.len(), 4, "no value may reach argv: {args:?}");
+        assert!(WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_LOOPBACK_NAME"));
+        assert!(WINDOWS_PS_ASSERT_KILLSWITCH.contains("$env:RUSTYNET_PS_EGRESS_NAME"));
+        for rule in [WINDOWS_KS_RULE_LOOPBACK, WINDOWS_KS_RULE_EGRESS] {
+            assert!(
+                args.iter().all(|a| !a.contains(rule)),
+                "rule name reached command text: {rule:?}"
+            );
+        }
+    }
+
+    /// Every `WINDOWS_PS_*` script that consumes values, paired with the env
+    /// names its `$env:` reads expect. Kept next to the battery below: a new
+    /// value-consuming script must register here or the battery cannot vouch
+    /// for it.
+    const PS_ENV_CHANNELS: [(&str, &[&str]); 10] = [
+        (
+            WINDOWS_PS_PREFLIGHT_EXIT_SERVING,
+            &["RUSTYNET_PS_TUNNEL_ALIAS", "RUSTYNET_PS_EGRESS_ALIAS"],
+        ),
+        (WINDOWS_PS_GET_TUNNEL_IPV4_ADDRESS, &["RUSTYNET_PS_ALIAS"]),
+        (WINDOWS_PS_GET_FORWARDING, &["RUSTYNET_PS_ALIAS"]),
+        (
+            WINDOWS_PS_SET_FORWARDING,
+            &["RUSTYNET_PS_ALIAS", "RUSTYNET_PS_STATE"],
+        ),
+        (WINDOWS_PS_REMOVE_NAT, &["RUSTYNET_PS_NAME"]),
+        (
+            WINDOWS_PS_NEW_NAT,
+            &["RUSTYNET_PS_NAME", "RUSTYNET_PS_PREFIX"],
+        ),
+        (
+            WINDOWS_PS_ASSERT_NAT,
+            &["RUSTYNET_PS_NAME", "RUSTYNET_PS_PREFIX"],
+        ),
+        (WINDOWS_PS_ASSERT_FORWARDING_ENABLED, &["RUSTYNET_PS_ALIAS"]),
+        (
+            WINDOWS_PS_ASSERT_KILLSWITCH,
+            &["RUSTYNET_PS_LOOPBACK_NAME", "RUSTYNET_PS_EGRESS_NAME"],
+        ),
+        (
+            WINDOWS_PS_ASSERT_DNS,
+            &["RUSTYNET_PS_UDP_NAME", "RUSTYNET_PS_TCP_NAME"],
+        ),
+    ];
+
+    #[test]
+    fn windows_powershell_scripts_bind_every_env_channel() {
+        // Each script must read back every env name its callers pass
+        // (`$env:NAME` present in the script text), and the two value-free
+        // scripts must carry no `param(` binding at all.
+        for (script, names) in PS_ENV_CHANNELS {
+            for name in names {
+                assert!(
+                    script.contains(&format!("$env:{name}")),
+                    "script must read its value back as $env:{name}: {script:?}"
+                );
+            }
+        }
+        assert!(!WINDOWS_PS_REQUIRE_EXIT_CMDLETS.contains("param("));
+        assert!(!WINDOWS_PS_REQUIRE_EXIT_CMDLETS.contains("$env:RUSTYNET_PS_"));
+    }
+
+    #[test]
+    fn windows_powershell_metacharacter_values_cannot_alter_command_text() {
+        // Phase10 follow-up to the RSA-0046 battery: a caller value carrying
+        // PowerShell metacharacters must never appear in the command text —
+        // a trailing positional after `-Command` is re-tokenized as script,
+        // the environment never is. Newlines included: PowerShell treats a
+        // newline in command text as a statement terminator.
+        const EVIL: [&str; 6] = [
+            "'; Start-Process calc; '",
+            "a;b",
+            "back`tick",
+            "$(calc)",
+            "line1\nline2",
+            "x'`$(whoami);' with \"dquotes\"",
+        ];
+        for (script, names) in PS_ENV_CHANNELS {
+            for evil in EVIL {
+                let env: Vec<(&'static str, &str)> =
+                    names.iter().map(|name| (*name, evil)).collect();
+                let command =
+                    windows_powershell_constant_command(Path::new("powershell"), script, &env);
+                let args: Vec<String> = command
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(args.first().map(String::as_str), Some("-NoProfile"));
+                assert_eq!(args.get(1).map(String::as_str), Some("-NonInteractive"));
+                assert_eq!(args.get(2).map(String::as_str), Some("-Command"));
+                assert_eq!(
+                    args.get(3).map(String::as_str),
+                    Some(script),
+                    "script text must stay byte-identical for value {evil:?}"
+                );
+                assert_eq!(args.len(), 4);
+                assert!(
+                    args.iter().all(|a| !a.contains(evil)),
+                    "untrusted value reached command text: {evil:?}"
+                );
+                let mut envs: Vec<(String, String)> = command
+                    .get_envs()
+                    .filter_map(|(k, v)| {
+                        v.map(|v| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.to_string_lossy().into_owned(),
+                            )
+                        })
+                    })
+                    .collect();
+                let mut expected: Vec<(String, String)> = names
+                    .iter()
+                    .map(|name| (name.to_string(), evil.to_string()))
+                    .collect();
+                // `Command::get_envs` iterates in unspecified order.
+                envs.sort();
+                expected.sort();
+                assert_eq!(envs, expected, "values must travel only via env");
+            }
+        }
     }
 
     #[test]
