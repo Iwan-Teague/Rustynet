@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 1: test code is exempt from the panic-family lints (deny via [lints]
+// in Cargo.toml); non-test code must propagate errors instead.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::error::Error;
 use std::fmt;
@@ -1367,10 +1378,19 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, CryptoError> {
 
     let mut out = Vec::with_capacity(bytes.len() / 2);
     for pair in bytes.chunks_exact(2) {
-        let hi = (pair[0] as char)
+        // AQ-08: `chunks_exact(2)` yields exactly two bytes per pair, so the
+        // `ok_or` arms below are unreachable; `first`/`get(1)` replace direct
+        // indexing to keep the indexing_slicing lint denied.
+        let hi = (pair
+            .first()
+            .copied()
+            .ok_or(CryptoError::AttestationVerificationFailed)? as char)
             .to_digit(16)
             .ok_or(CryptoError::AttestationVerificationFailed)?;
-        let lo = (pair[1] as char)
+        let lo = (pair
+            .get(1)
+            .copied()
+            .ok_or(CryptoError::AttestationVerificationFailed)? as char)
             .to_digit(16)
             .ok_or(CryptoError::AttestationVerificationFailed)?;
         out.push(((hi << 4) | lo) as u8);
@@ -1378,6 +1398,11 @@ fn hex_decode(value: &str) -> Result<Vec<u8>, CryptoError> {
     Ok(out)
 }
 
+// AQ-08: this legacy entry point has no production callers — it is retained
+// only for test fixtures (see the doc comment), so it is compiled solely
+// under `cfg(test)` where the panic-family lints are exempted. Production
+// callers must use `try_generate_key_custody_material`.
+#[cfg(test)]
 pub fn generate_key_custody_material() -> ([u8; 16], [u8; 24]) {
     // Legacy infallible entry point retained for existing test fixtures and
     // dev-tool wiring. Production code paths MUST use
@@ -1390,7 +1415,10 @@ pub fn generate_key_custody_material() -> ([u8; 16], [u8; 24]) {
     }
 }
 
-/// Fallible analogue of [`generate_key_custody_material`].
+/// Fallible analogue of the test-only `generate_key_custody_material`
+/// wrapper (that wrapper is `#[cfg(test)]`-gated because only this crate's
+/// unit tests call it, so linking it here would dangle outside test
+/// rustdoc).
 ///
 /// `salt` is consumed by Argon2 for per-blob KDF stretching; if a salt
 /// repeats across blobs, an attacker that compromises one passphrase can
@@ -1857,7 +1885,10 @@ fn encode_encrypted_blob(blob: &EncryptedKeyBlob) -> Result<Vec<u8>, CryptoError
 fn decode_encrypted_blob(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> {
     // v1: [version:1][salt:16][nonce:24][len:4][ct] — min 45 bytes, version != 0
     // v0: [salt:16][nonce:24][len:4][ct] — min 44 bytes, version implicitly 0
-    if bytes.len() >= 45 && bytes[0] != 0 {
+    // AQ-08: `get(..)` + `ok_or` replaces direct slicing. Every range below
+    // is inside the `len >= 44` bound checked above, so the error arms are
+    // unreachable for any input that reaches them; behavior is unchanged.
+    if bytes.len() >= 45 && bytes.first() != Some(&0) {
         return decode_encrypted_blob_v1(bytes);
     }
     decode_encrypted_blob_v0(bytes)
@@ -1868,12 +1899,12 @@ fn decode_encrypted_blob_v0(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
         return Err(CryptoError::InvalidLength);
     }
     let mut salt = [0u8; 16];
-    salt.copy_from_slice(&bytes[0..16]);
+    salt.copy_from_slice(bytes.get(0..16).ok_or(CryptoError::InvalidLength)?);
     let mut nonce = [0u8; 24];
-    nonce.copy_from_slice(&bytes[16..40]);
+    nonce.copy_from_slice(bytes.get(16..40).ok_or(CryptoError::InvalidLength)?);
 
     let mut length_bytes = [0u8; 4];
-    length_bytes.copy_from_slice(&bytes[40..44]);
+    length_bytes.copy_from_slice(bytes.get(40..44).ok_or(CryptoError::InvalidLength)?);
     let ciphertext_len = u32::from_be_bytes(length_bytes) as usize;
     // CRY-12: checked add. The declared length is attacker-controlled up to
     // u32::MAX; on a 32-bit target (armv7 relay/exit nodes are a documented
@@ -1890,7 +1921,7 @@ fn decode_encrypted_blob_v0(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
         version: 0,
         salt,
         nonce,
-        ciphertext: bytes[44..].to_vec(),
+        ciphertext: bytes.get(44..).ok_or(CryptoError::InvalidLength)?.to_vec(),
     })
 }
 
@@ -1898,17 +1929,19 @@ fn decode_encrypted_blob_v1(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
     if bytes.len() < 45 {
         return Err(CryptoError::InvalidLength);
     }
-    let version = bytes[0];
+    // AQ-08: same `get` + `ok_or` pattern as the v0 decoder; the length gate
+    // above makes the error arms unreachable.
+    let version = bytes.first().copied().ok_or(CryptoError::InvalidLength)?;
     if version == 0 {
         return Err(CryptoError::InvalidLength);
     }
     let mut salt = [0u8; 16];
-    salt.copy_from_slice(&bytes[1..17]);
+    salt.copy_from_slice(bytes.get(1..17).ok_or(CryptoError::InvalidLength)?);
     let mut nonce = [0u8; 24];
-    nonce.copy_from_slice(&bytes[17..41]);
+    nonce.copy_from_slice(bytes.get(17..41).ok_or(CryptoError::InvalidLength)?);
 
     let mut length_bytes = [0u8; 4];
-    length_bytes.copy_from_slice(&bytes[41..45]);
+    length_bytes.copy_from_slice(bytes.get(41..45).ok_or(CryptoError::InvalidLength)?);
     let ciphertext_len = u32::from_be_bytes(length_bytes) as usize;
     // CRY-12: see the v0 decoder — checked add for the same reason.
     let expected_len = ciphertext_len
@@ -1922,7 +1955,7 @@ fn decode_encrypted_blob_v1(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoErro
         version,
         salt,
         nonce,
-        ciphertext: bytes[45..].to_vec(),
+        ciphertext: bytes.get(45..).ok_or(CryptoError::InvalidLength)?.to_vec(),
     })
 }
 

@@ -83,7 +83,12 @@ fn scheme_reference_present(lowered: &str, scheme: &str) -> bool {
     let mut from = 0;
     while let Some(pos) = lowered[from..].find(scheme) {
         let abs = from + pos;
-        let boundary_before = abs == 0 || !bytes[abs - 1].is_ascii_alphanumeric();
+        // `abs` is an index into `bytes` by construction (`find` over
+        // `lowered[from..]`), so the `None` arm is unreachable.
+        let boundary_before = abs == 0
+            || !bytes
+                .get(abs - 1)
+                .is_some_and(|&byte| byte.is_ascii_alphanumeric());
         let after = &lowered[abs + scheme.len()..];
         if boundary_before && after.starts_with(' ') || after.starts_with('\t') {
             return true;
@@ -336,10 +341,15 @@ impl TamperEvidentAuditLog {
             if entry.index != position as u64 {
                 return false;
             }
+            // position comes from enumerate(), so `position - 1` is always
+            // a valid index into `self.entries`; the fallback is unreachable.
             let expected_previous = if position == 0 {
                 "genesis".to_owned()
             } else {
-                self.entries[position - 1].entry_hash.clone()
+                self.entries
+                    .get(position - 1)
+                    .map(|previous| previous.entry_hash.clone())
+                    .unwrap_or_default()
             };
             if entry.previous_hash != expected_previous {
                 return false;
@@ -407,20 +417,30 @@ impl TamperEvidentAuditLog {
             }
             if let Some(value) = line.strip_prefix("entry=") {
                 let fields = value.split('|').collect::<Vec<_>>();
-                if fields.len() != 6 {
+                let Ok(
+                    [
+                        index_raw,
+                        timestamp_raw,
+                        actor,
+                        action,
+                        previous_hash,
+                        entry_hash,
+                    ],
+                ) = <[&str; 6]>::try_from(fields.as_slice())
+                else {
                     return Err(OperationsError::InvalidFormat);
-                }
+                };
                 let entry = AuditEntry {
-                    index: fields[0]
+                    index: index_raw
                         .parse::<u64>()
                         .map_err(|_| OperationsError::InvalidFormat)?,
-                    timestamp_unix: fields[1]
+                    timestamp_unix: timestamp_raw
                         .parse::<u64>()
                         .map_err(|_| OperationsError::InvalidFormat)?,
-                    actor: fields[2].to_owned(),
-                    action: fields[3].to_owned(),
-                    previous_hash: fields[4].to_owned(),
-                    entry_hash: fields[5].to_owned(),
+                    actor: actor.to_owned(),
+                    action: action.to_owned(),
+                    previous_hash: previous_hash.to_owned(),
+                    entry_hash: entry_hash.to_owned(),
                 };
                 entries.push(entry);
                 body_without_digest.push_str(line);

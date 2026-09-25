@@ -200,12 +200,20 @@ fn sha256_hex(data: &[u8]) -> String {
 /// `format!` allocation). Byte-identical to the previous formatter;
 /// the hash-chain determinism tests pin it.
 fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = Vec::with_capacity(bytes.len() * 2);
+    let mut out = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
-        out.push(HEX_LOWER[(byte >> 4) as usize]);
-        out.push(HEX_LOWER[(byte & 0x0f) as usize]);
+        // Each nibble is a 4-bit value and HEX_LOWER has exactly 16 entries,
+        // so `get` always yields the digit and the fallback is unreachable;
+        // the output is byte-identical to the previous indexed form.
+        let hi = HEX_LOWER.get((byte >> 4) as usize).copied().unwrap_or(b'0');
+        let lo = HEX_LOWER
+            .get((byte & 0x0f) as usize)
+            .copied()
+            .unwrap_or(b'0');
+        out.push(hi as char);
+        out.push(lo as char);
     }
-    String::from_utf8(out).expect("hex alphabet is valid ASCII")
+    out
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, RoleAuditError> {
@@ -318,8 +326,14 @@ pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAudit
     let mut capped = vec![0u8; MAX_ROLE_AUDIT_LOG_BYTES + 1];
     let mut filled = 0usize;
     loop {
+        // `filled` never exceeds `capped.len()` (the `filled == capped.len()`
+        // check below stops the loop), so the range is always valid and the
+        // `else` arm is unreachable.
+        let Some(unfilled) = capped.get_mut(filled..) else {
+            break;
+        };
         let read = file
-            .read(&mut capped[filled..])
+            .read(unfilled)
             .map_err(|err| RoleAuditError::Io(format!("read: {err}")))?;
         if read == 0 {
             break;
@@ -417,10 +431,15 @@ pub fn verify_role_audit_chain(entries: &[RoleAuditEntry]) -> Result<(), RoleAud
                 entry.index
             )));
         }
+        // position comes from enumerate(), so `position - 1` is always a
+        // valid index into `entries`; the fallback is unreachable.
         let expected_previous = if position == 0 {
             GENESIS_PREVIOUS_HASH.to_owned()
         } else {
-            entries[position - 1].entry_hash.clone()
+            entries
+                .get(position - 1)
+                .map(|previous| previous.entry_hash.clone())
+                .unwrap_or_default()
         };
         if entry.previous_hash != expected_previous {
             return Err(RoleAuditError::ChainBroken(format!(

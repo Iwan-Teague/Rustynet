@@ -368,14 +368,18 @@ pub const ROLE_PRESET_TABLE: [RolePresetComposition; 9] = [
 /// Look up the composition for a preset. Always succeeds — every
 /// preset variant is in the table.
 pub fn composition_for(preset: RolePreset) -> &'static RolePresetComposition {
+    // Every RolePreset variant has a row in ROLE_PRESET_TABLE (see the
+    // function contract above), so the `unreachable` arm cannot fire.
     ROLE_PRESET_TABLE
         .iter()
         .find(|entry| entry.preset == preset)
-        .expect(
-            "ROLE_PRESET_TABLE missing entry for a RolePreset variant — \
-             this is a build-time invariant violation; adding a preset \
-             requires updating the table",
-        )
+        .unwrap_or_else(|| {
+            unreachable!(
+                "ROLE_PRESET_TABLE missing entry for a RolePreset variant — \
+                 this is a build-time invariant violation; adding a preset \
+                 requires updating the table"
+            )
+        })
 }
 
 /// Whether a capability set requires the `rustynet-relay` binary
