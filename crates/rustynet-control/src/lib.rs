@@ -13,7 +13,6 @@
 
 pub mod admin;
 pub mod atrest;
-pub mod atrest_bix;
 pub mod atrest_key;
 pub mod blind_relay;
 pub mod credential_unwrap;
@@ -2547,7 +2546,6 @@ impl ControlPlaneCore {
 
         let user_row = persistence::UserRow {
             user_id: owner.clone(),
-            email: owner.clone(),
             mfa_enabled: false,
             updated_at_unix: request.now_unix,
             created_at_unix: request.now_unix,
@@ -5199,7 +5197,7 @@ mod tests {
                 hostname: "mini-pc-1".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.10:51820".to_owned(),
                 public_key: [3; 32],
                 now_unix: 120,
@@ -5221,7 +5219,7 @@ mod tests {
             hostname: "mini-pc-2".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.11:51820".to_owned(),
             public_key: [4; 32],
             now_unix: 125,
@@ -5248,7 +5246,7 @@ mod tests {
             hostname: "mini-pc-sign".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.20:51820".to_owned(),
             public_key: [8; 32],
             now_unix: 120,
@@ -5301,7 +5299,7 @@ mod tests {
             hostname: "node-a".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.40:51820".to_owned(),
             public_key: [41; 32],
             now_unix: 120,
@@ -5313,7 +5311,7 @@ mod tests {
             hostname: "node-b".to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: "198.51.100.41:51820".to_owned(),
             public_key: [42; 32],
             now_unix: 121,
@@ -5443,7 +5441,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5517,7 +5515,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5595,7 +5593,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5786,7 +5784,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5867,7 +5865,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -5950,7 +5948,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -6028,7 +6026,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
@@ -6087,7 +6085,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
@@ -6400,7 +6398,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -6930,7 +6928,7 @@ mod tests {
                     hostname: node_id.to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: endpoint.to_owned(),
                     public_key,
                     now_unix: 120,
@@ -7140,7 +7138,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -7206,7 +7204,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -7276,7 +7274,7 @@ mod tests {
                 hostname: node_id.to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: endpoint.to_owned(),
                 public_key,
                 now_unix: 120,
@@ -7504,7 +7502,6 @@ mod tests {
         persistence
             .upsert_user(&super::persistence::UserRow {
                 user_id: "admin".to_owned(),
-                email: "admin@example.local".to_owned(),
                 mfa_enabled: false,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -7547,7 +7544,7 @@ mod tests {
                     hostname: "mini-pc-persist".to_owned(),
                     os: "linux".to_owned(),
                     tags: vec!["servers".to_owned()],
-                    owner: "alice@example.local".to_owned(),
+                    owner: "alice".to_owned(),
                     endpoint: "198.51.100.30:51820".to_owned(),
                     public_key: [7; 32],
                     now_unix: 150,
@@ -7559,7 +7556,7 @@ mod tests {
         assert_eq!(response.node_id, "node-persist");
         assert!(
             persistence
-                .user_exists("alice@example.local")
+                .user_exists("alice")
                 .expect("user lookup should succeed")
         );
         assert!(
@@ -7596,7 +7593,7 @@ mod tests {
                 hostname: "node-missing-db".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.31:51820".to_owned(),
                 public_key: [9; 32],
                 now_unix: 150,
@@ -7621,7 +7618,6 @@ mod tests {
         persistence
             .upsert_user(&super::persistence::UserRow {
                 user_id: "admin".to_owned(),
-                email: "admin@example.local".to_owned(),
                 mfa_enabled: false,
                 created_at_unix: 100,
                 updated_at_unix: 100,
@@ -7660,7 +7656,7 @@ mod tests {
                 hostname: "node-persist-once-a".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.33:51820".to_owned(),
                 public_key: [11; 32],
                 now_unix: 150,
@@ -7676,7 +7672,7 @@ mod tests {
                 hostname: "node-persist-once-b".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.34:51820".to_owned(),
                 public_key: [12; 32],
                 now_unix: 151,
@@ -7746,20 +7742,20 @@ mod tests {
     #[test]
     fn token_claims_debug_redacts_sensitive_fields() {
         let claims = TokenClaims {
-            subject: "alice@example.local".to_owned(),
+            subject: "alice".to_owned(),
             issued_at_unix: 100,
             expires_at_unix: 200,
             nonce: "nonce-secret".to_owned(),
         };
         let rendered = format!("{claims:?}");
-        assert!(!rendered.contains("alice@example.local"));
+        assert!(!rendered.contains("alice"));
         assert!(!rendered.contains("nonce-secret"));
         assert!(rendered.contains("REDACTED"));
     }
 
     fn claims(issued_at_unix: u64, expires_at_unix: u64, nonce: &str) -> TokenClaims {
         TokenClaims {
-            subject: "alice@example.local".to_owned(),
+            subject: "alice".to_owned(),
             issued_at_unix,
             expires_at_unix,
             nonce: nonce.to_owned(),
@@ -7833,7 +7829,7 @@ mod tests {
                 hostname: "mini-pc-token".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.60:51820".to_owned(),
                 public_key: [60; 32],
                 now_unix: 120,
@@ -7851,7 +7847,7 @@ mod tests {
         assert_eq!(replay.err(), Some(AuthError::ReplayDetected));
 
         let mut tampered = response.access_token.clone();
-        tampered.claims.subject = "mallory@example.local".to_owned();
+        tampered.claims.subject = "mallory".to_owned();
         let tampered_result = core.validate_signed_token_and_nonce(&mut guard, &tampered, 123);
         assert_eq!(
             tampered_result.err(),
@@ -7888,7 +7884,7 @@ mod tests {
                 hostname: "mini-pc-token-a".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.60:51820".to_owned(),
                 public_key: [61; 32],
                 now_unix: 120,
@@ -7902,7 +7898,7 @@ mod tests {
                 hostname: "mini-pc-token-b".to_owned(),
                 os: "linux".to_owned(),
                 tags: vec!["servers".to_owned()],
-                owner: "alice@example.local".to_owned(),
+                owner: "alice".to_owned(),
                 endpoint: "198.51.100.61:51820".to_owned(),
                 public_key: [62; 32],
                 now_unix: 120,
@@ -8090,7 +8086,7 @@ mod tests {
             hostname: node_id.to_owned(),
             os: "linux".to_owned(),
             tags: vec!["servers".to_owned()],
-            owner: "alice@example.local".to_owned(),
+            owner: "alice".to_owned(),
             endpoint: format!("198.51.100.{public_key_byte}:51820"),
             public_key: [public_key_byte; 32],
             now_unix: 120,

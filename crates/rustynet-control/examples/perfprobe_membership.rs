@@ -42,7 +42,7 @@ fn sample_state() -> MembershipState {
         .map(|i| MembershipNode {
             node_id: format!("node-{i:03}"),
             node_pubkey_hex: pubkey_hex(i as u8),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:members".to_owned()],
             capabilities: vec![RoleCapability::Client],
