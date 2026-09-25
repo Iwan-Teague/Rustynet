@@ -156,8 +156,8 @@ impl ValueCipher {
     }
 
     /// Open a §3 envelope, returning the plaintext wrapped in `Zeroizing`
-    /// so the heap copy is wiped on drop — these values are PII (e.g.
-    /// `users.email`) and this mirrors the tree's own habit for unwrapped
+    /// so the heap copy is wiped on drop — these values are sensitive
+    /// column data and this mirrors the tree's own habit for unwrapped
     /// secrets (`credential_unwrap.rs`, same crate). Refuses with the single
     /// opaque [`ValueEnvelopeError`] when the version byte is wrong, the AAD
     /// does not match the sealing one, or the Poly1305 tag fails.
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn round_trip_property_across_lengths() {
         let c = cipher();
-        let a = aad("users", "email", "user-1");
+        let a = aad("users", "user_id", "user-1");
         for len in [
             0usize, 1, 2, 15, 16, 17, 24, 25, 31, 255, 4096, 65_536, 1_048_576,
         ] {
@@ -253,8 +253,8 @@ mod tests {
     #[test]
     fn nonce_uniqueness_over_many_seals() {
         let c = cipher();
-        let a = aad("users", "email", "user-1");
-        let plaintext = b"alice@example.local";
+        let a = aad("users", "user_id", "user-1");
+        let plaintext = b"alice";
         let mut nonces = std::collections::HashSet::new();
         let mut first: Option<Vec<u8>> = None;
         for _ in 0..512 {
@@ -274,21 +274,21 @@ mod tests {
     #[test]
     fn aad_mismatch_refuses_open() {
         let c = cipher();
-        let plaintext = b"alice@example.local";
+        let plaintext = b"alice";
         let sealed = c
-            .seal(&aad("users", "email", "user-1"), plaintext)
+            .seal(&aad("users", "user_id", "user-1"), plaintext)
             .expect("seal must succeed");
         assert!(
-            c.open(&aad("users", "email", "user-1"), &sealed).is_ok(),
+            c.open(&aad("users", "user_id", "user-1"), &sealed).is_ok(),
             "identical AAD must open"
         );
         // Different row, column, table, database id, and format version each
         // refuse with the same single error.
         let aad_mismatches = [
-            ("users", "email", "user-2"),
+            ("users", "user_id", "user-2"),
             ("users", "display_name", "user-1"),
-            ("auth_events", "email", "user-1"),
-            ("users", "email", "user-1x"),
+            ("auth_events", "user_id", "user-1"),
+            ("users", "user_id", "user-1x"),
         ];
         for (table, column, row_key) in aad_mismatches {
             let err = c
@@ -296,14 +296,14 @@ mod tests {
                 .expect_err("cross-context open must be refused");
             assert_eq!(err, ValueEnvelopeError);
         }
-        let mut other_db = aad("users", "email", "user-1");
+        let mut other_db = aad("users", "user_id", "user-1");
         other_db.db_id = [0x22; 16];
         assert_eq!(
             c.open(&other_db, &sealed)
                 .expect_err("cross-db open must be refused"),
             ValueEnvelopeError
         );
-        let mut other_fmt = aad("users", "email", "user-1");
+        let mut other_fmt = aad("users", "user_id", "user-1");
         other_fmt.fmt = 0x02;
         assert_eq!(
             c.open(&other_fmt, &sealed)
@@ -315,15 +315,15 @@ mod tests {
     #[test]
     fn envelope_corruption_and_wrong_version_refuse() {
         let c = cipher();
-        let plaintext = b"alice@example.local";
+        let plaintext = b"alice";
         let sealed = c
-            .seal(&aad("users", "email", "user-1"), plaintext)
+            .seal(&aad("users", "user_id", "user-1"), plaintext)
             .expect("seal must succeed");
         // Wrong version byte.
         let mut wrong_version = sealed.clone();
         wrong_version[0] = 0x02;
         assert_eq!(
-            c.open(&aad("users", "email", "user-1"), &wrong_version)
+            c.open(&aad("users", "user_id", "user-1"), &wrong_version)
                 .expect_err("wrong version byte must be refused"),
             ValueEnvelopeError
         );
@@ -331,7 +331,7 @@ mod tests {
         for cut in [1usize, 1 + NONCE_LEN, sealed.len() - 1] {
             let truncated = sealed.get(..cut).expect("cut within envelope").to_vec();
             assert_eq!(
-                c.open(&aad("users", "email", "user-1"), &truncated)
+                c.open(&aad("users", "user_id", "user-1"), &truncated)
                     .expect_err("truncated envelope must be refused"),
                 ValueEnvelopeError
             );
@@ -341,13 +341,13 @@ mod tests {
         let last = flipped.len() - 1;
         flipped[last] ^= 0x01;
         assert_eq!(
-            c.open(&aad("users", "email", "user-1"), &flipped)
+            c.open(&aad("users", "user_id", "user-1"), &flipped)
                 .expect_err("tampered envelope must be refused"),
             ValueEnvelopeError
         );
         // Empty envelope.
         assert_eq!(
-            c.open(&aad("users", "email", "user-1"), &[])
+            c.open(&aad("users", "user_id", "user-1"), &[])
                 .expect_err("empty envelope must be refused"),
             ValueEnvelopeError
         );
@@ -356,10 +356,10 @@ mod tests {
     #[test]
     fn seal_refuses_aad_with_foreign_format_version() {
         let c = cipher();
-        let mut a = aad("users", "email", "user-1");
+        let mut a = aad("users", "user_id", "user-1");
         a.fmt = 0x02;
         assert_eq!(
-            c.seal(&a, b"alice@example.local")
+            c.seal(&a, b"alice")
                 .expect_err("seal must refuse a non-0x01 AAD format"),
             ValueEnvelopeError
         );
@@ -369,10 +369,8 @@ mod tests {
     fn different_keys_do_not_interchange() {
         let c1 = ValueCipher::from_key(Zeroizing::new([0x01; 32]));
         let c2 = ValueCipher::from_key(Zeroizing::new([0x02; 32]));
-        let a = aad("users", "email", "user-1");
-        let sealed = c1
-            .seal(&a, b"alice@example.local")
-            .expect("seal must succeed");
+        let a = aad("users", "user_id", "user-1");
+        let sealed = c1.seal(&a, b"alice").expect("seal must succeed");
         assert_eq!(
             c2.open(&a, &sealed)
                 .expect_err("open under the wrong key must be refused"),
@@ -390,12 +388,10 @@ mod tests {
     fn key_never_appears_in_formatted_output() {
         let c = cipher();
         let key = witness_key();
-        let a = aad("users", "email", "user-1");
-        let sealed = c
-            .seal(&a, b"alice@example.local")
-            .expect("seal must succeed");
+        let a = aad("users", "user_id", "user-1");
+        let sealed = c.seal(&a, b"alice").expect("seal must succeed");
         let err = c
-            .open(&aad("users", "email", "user-2"), &sealed)
+            .open(&aad("users", "user_id", "user-2"), &sealed)
             .expect_err("open must fail for a different row");
         let surfaces: [Vec<u8>; 5] = [
             format!("{c:?}").into_bytes(),
@@ -438,7 +434,7 @@ mod tests {
     #[test]
     fn envelope_boundary_lengths_reject() {
         let c = cipher();
-        let a = aad("users", "email", "user-1");
+        let a = aad("users", "user_id", "user-1");
         for len in [0usize, 1, 24, 25, 40, 41] {
             let mut env = vec![0xA5u8; len];
             if len > 0 {

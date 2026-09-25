@@ -6,7 +6,6 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
-    email TEXT NOT NULL UNIQUE,
     mfa_enabled INTEGER NOT NULL DEFAULT 0,
     created_at_unix INTEGER NOT NULL,
     updated_at_unix INTEGER NOT NULL

@@ -6033,7 +6033,7 @@ mod daemon {
                 nodes: vec![MembershipNode {
                     node_id: node_id.to_owned(),
                     node_pubkey_hex: hex_encode(&[9u8; 32]),
-                    owner: "owner@example.local".to_owned(),
+                    owner: "owner".to_owned(),
                     status: rustynet_control::membership::MembershipNodeStatus::Active,
                     roles: vec!["tag:servers".to_owned()],
                     capabilities: capabilities.to_vec(),

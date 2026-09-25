@@ -3419,7 +3419,7 @@ mod tests {
         MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[pubkey_byte; 32]),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:servers".to_owned()],
             capabilities: vec![RoleCapability::Anchor],
@@ -3475,7 +3475,7 @@ mod tests {
         state.nodes = vec![MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[9; 32]),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status,
             roles: vec!["tag:servers".to_owned()],
             capabilities,
@@ -4181,7 +4181,7 @@ mod tests {
             operation: MembershipOperation::AddNode(MembershipNode {
                 node_id: "node-b".to_owned(),
                 node_pubkey_hex: hex_encode(&[7; 32]),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: vec!["tag:members".to_owned()],
                 capabilities: vec![RoleCapability::Client],
@@ -4323,7 +4323,7 @@ mod tests {
         let operation = MembershipOperation::AddNode(MembershipNode {
             node_id: "node-blind".to_owned(),
             node_pubkey_hex: hex_encode(&[9; 32]),
-            owner: "blind@example.local".to_owned(),
+            owner: "blind".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec![],
             capabilities: vec![RoleCapability::RelayHost, RoleCapability::BlindRelay],

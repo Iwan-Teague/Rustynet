@@ -20873,7 +20873,7 @@ mod tests {
             nodes: vec![MembershipNode {
                 node_id: node_id.to_owned(),
                 node_pubkey_hex: "aa".repeat(32),
-                owner: "owner@test.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: vec![],
                 capabilities,
@@ -20975,7 +20975,7 @@ mod tests {
         let senior_unpinned = MembershipNode {
             node_id: "node-senior".to_owned(),
             node_pubkey_hex: "aa".repeat(32),
-            owner: "owner@test.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec![],
             capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
@@ -20985,7 +20985,7 @@ mod tests {
         let junior_pinned = MembershipNode {
             node_id: "node-pinned".to_owned(),
             node_pubkey_hex: "cc".repeat(32),
-            owner: "owner@test.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec![],
             capabilities: vec![
@@ -21020,7 +21020,7 @@ mod tests {
         let pinned_revoked = MembershipNode {
             node_id: "node-pinned".to_owned(),
             node_pubkey_hex: "aa".repeat(32),
-            owner: "owner@test.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Revoked,
             roles: vec![],
             capabilities: vec![
@@ -21033,7 +21033,7 @@ mod tests {
         let senior = MembershipNode {
             node_id: "node-senior".to_owned(),
             node_pubkey_hex: "bb".repeat(32),
-            owner: "owner@test.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec![],
             capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
@@ -21043,7 +21043,7 @@ mod tests {
         let junior = MembershipNode {
             node_id: "node-junior".to_owned(),
             node_pubkey_hex: "cc".repeat(32),
-            owner: "owner@test.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec![],
             capabilities: vec![RoleCapability::AnchorPortMappingAuthoritative],
@@ -22120,7 +22120,7 @@ mod tests {
                 MembershipNode {
                     node_id: local_node_id.to_owned(),
                     node_pubkey_hex: hex_encode(&[9; 32]),
-                    owner: "owner@example.local".to_owned(),
+                    owner: "owner".to_owned(),
                     status: MembershipNodeStatus::Active,
                     roles: vec![],
                     capabilities: local_capabilities,
@@ -22130,7 +22130,7 @@ mod tests {
                 MembershipNode {
                     node_id: "exit-node".to_owned(),
                     node_pubkey_hex: hex_encode(&[11; 32]),
-                    owner: "owner@example.local".to_owned(),
+                    owner: "owner".to_owned(),
                     status: MembershipNodeStatus::Active,
                     roles: vec![],
                     capabilities: vec![RoleCapability::ExitServer],
@@ -24097,7 +24097,7 @@ mod tests {
             MembershipNode {
                 node_id: local_node_id.to_owned(),
                 node_pubkey_hex: hex_encode(&[9; 32]),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: vec!["tag:servers".to_owned()],
                 capabilities: local_caps,
@@ -24107,7 +24107,7 @@ mod tests {
             MembershipNode {
                 node_id: "node-exit".to_owned(),
                 node_pubkey_hex: hex_encode(&[11; 32]),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: vec!["tag:exit".to_owned()],
                 capabilities: vec![RoleCapability::ExitServer],
@@ -24192,7 +24192,7 @@ mod tests {
         let mut state_nodes = vec![MembershipNode {
             node_id: local_node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[9; 32]),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:servers".to_owned()],
             capabilities: vec![RoleCapability::Anchor, RoleCapability::Client],
@@ -24204,7 +24204,7 @@ mod tests {
             state_nodes.push(MembershipNode {
                 node_id: (*node_id).to_owned(),
                 node_pubkey_hex: hex_encode(&[pubkey_byte; 32]),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: *status,
                 roles: vec!["tag:exit".to_owned()],
                 capabilities: vec![RoleCapability::ExitServer],
@@ -24275,7 +24275,7 @@ mod tests {
             nodes: vec![MembershipNode {
                 node_id: local_node_id.to_owned(),
                 node_pubkey_hex: hex_encode(&[9; 32]),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status,
                 roles: vec!["tag:servers".to_owned()],
                 capabilities,
@@ -32933,7 +32933,7 @@ mod tests {
         let member = |node_id: &str, key: &ed25519_dalek::VerifyingKey| MembershipNode {
             node_id: node_id.to_owned(),
             node_pubkey_hex: hex_encode(key.as_bytes()),
-            owner: "owner@test.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec![],
             capabilities: vec![RoleCapability::Client],
@@ -38051,7 +38051,7 @@ mod tests {
             nodes: vec![MembershipNode {
                 node_id: "daemon-local".to_owned(),
                 node_pubkey_hex: hex_encode(&[9u8; 32]),
-                owner: "owner@example.local".to_owned(),
+                owner: "owner".to_owned(),
                 status: MembershipNodeStatus::Active,
                 roles: vec!["tag:servers".to_owned()],
                 capabilities: vec![RoleCapability::Anchor, RoleCapability::Client],
@@ -38146,7 +38146,7 @@ mod tests {
         let new_node = MembershipNode {
             node_id: new_node_id.to_owned(),
             node_pubkey_hex: hex_encode(&[new_node_pubkey_byte; 32]),
-            owner: "owner@example.local".to_owned(),
+            owner: "owner".to_owned(),
             status: MembershipNodeStatus::Active,
             roles: vec!["tag:members".to_owned()],
             capabilities: vec![RoleCapability::Client],
