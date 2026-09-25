@@ -13,6 +13,7 @@
 
 pub mod admin;
 pub mod atrest;
+pub mod atrest_bix;
 pub mod atrest_key;
 pub mod blind_relay;
 pub mod credential_unwrap;
