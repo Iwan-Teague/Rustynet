@@ -455,6 +455,10 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
             args.push("persistent-keepalive".to_owned());
             args.push(interval_secs.to_string());
         }
+        // Default-deny (plan §4.8): `peer.preshared_key` is deliberately NOT
+        // emitted here — kernel-attach PSK configuration is owner-gated (S8)
+        // and must never be configured through wg(8) by this backend. The
+        // field is stored with the peer but never read into args.
         self.runner.run("wg", &args)?;
 
         self.peers.insert(peer.node_id.clone(), peer);
@@ -801,6 +805,7 @@ mod tests {
             public_key: [7; 32],
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -889,6 +894,83 @@ mod tests {
             }),
             "Some(21) must emit `persistent-keepalive 21`"
         );
+    }
+
+    #[test]
+    fn linux_backend_ignores_preshared_key_and_never_emits_key_material() {
+        // Plan §4.8: the command (kernel) backend stays default-deny — a
+        // configured PSK must produce byte-identical wg(8) args to a peer
+        // without one, and no encoding of the key bytes may leak into any
+        // executed arg.
+        let psk_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8) ^ 0xA5);
+        let psk = rustynet_backend_api::PresharedKey::new(zeroize::Zeroizing::new(psk_bytes));
+
+        let runner = RecordingRunner::default();
+        let mut backend = LinuxWireguardBackend::new(runner, "rustynet0", "/tmp/wg.key", 51820)
+            .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+
+        let mut peer = sample_peer("peer-a");
+        peer.preshared_key = Some(psk);
+        backend
+            .configure_peer(peer)
+            .expect("peer configure should work");
+        // The peer's `wg set` call is identified by its public-key argument
+        // (start()'s interface `wg set` call carries only private-key path +
+        // listen-port, so pubkey membership selects exactly the peer call).
+        let peer_public_key = encode_wg_public_key_base64(&[7; 32]);
+        let peer_set_args = |calls: &[(String, Vec<String>)], label: &'static str| {
+            calls
+                .iter()
+                .find(|(program, args)| {
+                    program == "wg" && args.iter().any(|arg| arg == &peer_public_key)
+                })
+                .map(|(_, args)| args.clone())
+                .unwrap_or_else(|| panic!("{label} wg set call should be recorded"))
+        };
+        let args_with_psk = peer_set_args(&backend.runner.calls, "Some(psk)");
+        backend.runner.calls.clear();
+
+        let bare = sample_peer("peer-a");
+        backend
+            .configure_peer(bare)
+            .expect("peer configure should work");
+        let args_without_psk = peer_set_args(&backend.runner.calls, "None");
+
+        assert_eq!(
+            args_with_psk, args_without_psk,
+            "Some(psk) must produce byte-identical wg args to None (backend ignores the field)"
+        );
+
+        let hex_lower: String = psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = psk_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let base64 = encode_wg_public_key_base64(&psk_bytes);
+        let decimal_commas = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let decimal_spaces = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for arg in &args_with_psk {
+            for (label, encoding) in [
+                ("lowercase hex", hex_lower.as_str()),
+                ("uppercase hex", hex_upper.as_str()),
+                ("base64", base64.as_str()),
+                ("decimal (comma-joined)", decimal_commas.as_str()),
+                ("decimal (space-joined)", decimal_spaces.as_str()),
+            ] {
+                assert!(
+                    !arg.contains(encoding),
+                    "wg arg {arg:?} must not contain PSK {label} encoding"
+                );
+            }
+        }
     }
 
     #[test]

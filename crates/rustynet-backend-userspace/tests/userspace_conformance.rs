@@ -153,6 +153,7 @@ fn userspace_backend_tun_conformance_requires_env() {
         public_key: [7u8; 32],
         allowed_ips: vec!["100.64.1.0/24".to_string()],
         persistent_keepalive_secs: None,
+        preshared_key: None,
     };
 
     let mut backend = make_backend(&key_path);
@@ -229,6 +230,7 @@ fn userspace_backend_rejects_ops_before_start() {
         public_key: [1u8; 32],
         allowed_ips: vec!["100.64.2.0/24".to_string()],
         persistent_keepalive_secs: None,
+        preshared_key: None,
     };
 
     let err = backend

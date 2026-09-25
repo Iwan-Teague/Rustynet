@@ -6,6 +6,7 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+zeroize = "1"
 rustynet-backend-api = { path = "../rustynet-backend-api" }
 
 [dev-dependencies]
