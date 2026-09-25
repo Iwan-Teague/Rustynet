@@ -784,6 +784,76 @@ pub fn parse_relay_hello_v2(data: &[u8]) -> Result<RelayHelloV2, String> {
     })
 }
 
+/// The all-zero artifact value a v2 FIRST-CONTACT client sends in the
+/// mandatory artifact field.
+///
+/// The v2 layout cannot omit the artifact (that omission is exactly the
+/// gate-bypass S3 closed), so a first-contact client needs a distinguished
+/// "no artifact yet" value. All-zero is that value, by construction: issued
+/// artifacts are keyed HMAC outputs over the source address and token nonce,
+/// so the all-zero string is not producible by the issuer, and the blind-v2
+/// O2 envelope parse rejects all-zero challenge values for the same reason.
+/// On relay admission the conversion below maps it back to v1's `None`, so
+/// the OI-10 gate treats a v2 first contact EXACTLY like a v1 one
+/// (`AddressValidationRequired` → challenge → retry).
+pub const RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT: [u8; 32] = [0u8; 32];
+
+impl RelayHelloV2 {
+    /// True iff this hello carries the first-contact placeholder artifact
+    /// ([`RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT`]).
+    pub fn artifact_is_first_contact_placeholder(&self) -> bool {
+        self.addr_validation_artifact.as_bytes() == &RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT
+    }
+}
+
+/// Relay-side admission conversion (D3 seams §7 step S4): a dispatched v2
+/// hello becomes the SAME [`RelayHello`] the v1 admit path already
+/// validates, so gates, signature verification, replay and commit stay
+/// format-agnostic (§3 property 4). The mandatory v2 artifact maps back to
+/// v1's optional one: the all-zero first-contact placeholder becomes
+/// `None` (the gate then issues a challenge, identically to v1 first
+/// contact), and ANY other value — including a wrong one — is passed
+/// through as `Some`, so the gate still refuses it as
+/// `AddressValidationInvalid`. A v2 client can no more skip the gate by
+/// encoding a bad artifact than a v1 client can.
+impl From<RelayHelloV2> for RelayHello {
+    fn from(v2: RelayHelloV2) -> Self {
+        let addr_validation_artifact = if v2.artifact_is_first_contact_placeholder() {
+            None
+        } else {
+            Some(v2.addr_validation_artifact)
+        };
+        Self {
+            node_id: v2.node_id,
+            peer_node_id: v2.peer_node_id,
+            session_token: v2.session_token,
+            addr_validation_artifact,
+        }
+    }
+}
+
+/// Client-side serialization conversion (D3 seams §7 step S4): the hello the
+/// client already builds for v1 becomes a v2 frame with `pad_len = 0`. A
+/// `None` artifact (first contact) is serialized as the all-zero placeholder
+/// so the mandatory field stays present and the relay's gate maps it back to
+/// `None` — the OI-10 challenge flow is identical across dialects.
+///
+/// Padding is `0` today (the shortest valid frame); a non-zero pad choice is
+/// a future owner decision and changes nothing structural.
+impl From<&RelayHello> for RelayHelloV2 {
+    fn from(hello: &RelayHello) -> Self {
+        Self {
+            node_id: hello.node_id.clone(),
+            peer_node_id: hello.peer_node_id.clone(),
+            session_token: hello.session_token.clone(),
+            addr_validation_artifact: hello.addr_validation_artifact.clone().unwrap_or_else(|| {
+                AddressValidationArtifact::from_bytes(RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT)
+            }),
+            pad_len: 0,
+        }
+    }
+}
+
 /// OI-10 helper: domain-separated expansion of the 16-byte token nonce into
 /// the 32-byte client-nonce input the reviewed keyring expects. Domain
 /// separation (`RELAY_ADDR_VALIDATION_DOMAIN` prefix) keeps v1-hello nonce
@@ -2583,6 +2653,105 @@ mod tests {
         assert_eq!(
             token_wire_bytes(&parsed.session_token),
             token_wire_bytes(&expected.session_token)
+        );
+    }
+
+    #[test]
+    fn relay_hello_v2_first_contact_conversion_maps_placeholder_to_none() {
+        let mut first_contact = sample_v2_hello();
+        first_contact.addr_validation_artifact =
+            AddressValidationArtifact::from_bytes(RELAY_HELLO_V2_FIRST_CONTACT_ARTIFACT);
+        first_contact.pad_len = 0;
+
+        let v1 = RelayHello::from(first_contact);
+        assert!(v1.addr_validation_artifact.is_none());
+        assert_eq!(v1.node_id, "node-a");
+        assert_eq!(v1.peer_node_id, "node-b");
+    }
+
+    #[test]
+    fn relay_hello_v2_conversion_keeps_non_placeholder_artifact_gated() {
+        // Any non-placeholder value — including a WRONG one — must reach the
+        // OI-10 gate as `Some`, so the gate refuses it as invalid instead of
+        // re-issuing a challenge. A v2 client cannot skip the gate by
+        // encoding a bad artifact.
+        let mut hostile = sample_v2_hello();
+        hostile.addr_validation_artifact = AddressValidationArtifact::from_bytes([0xDE; 32]);
+        hostile.pad_len = 0;
+        let v1 = RelayHello::from(hostile);
+        assert_eq!(
+            v1.addr_validation_artifact
+                .as_ref()
+                .expect("non-placeholder artifact is preserved")
+                .as_bytes(),
+            &[0xDE; 32]
+        );
+    }
+
+    #[test]
+    fn relay_hello_v1_first_contact_becomes_placeholder_v2_and_survives_the_wire() {
+        let v1 = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: RelaySessionToken {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: [0xAA; 16],
+                scope: RELAY_TOKEN_SCOPE.to_owned(),
+                issued_at_unix: 1_700_000_000,
+                expires_at_unix: 1_700_000_060,
+                nonce: [0x11; 16],
+                signature: [0x22; 64],
+            },
+            addr_validation_artifact: None,
+        };
+
+        let v2 = RelayHelloV2::from(&v1);
+        assert_eq!(v2.pad_len, 0);
+        assert!(v2.artifact_is_first_contact_placeholder());
+
+        let wire = serialize_relay_hello_v2(&v2).expect("converted hello serializes");
+        let parsed = parse_relay_hello_v2(&wire).expect("converted hello parses");
+        let back = RelayHello::from(parsed);
+        assert!(back.addr_validation_artifact.is_none());
+        assert_eq!(back.node_id, v1.node_id);
+        assert_eq!(back.peer_node_id, v1.peer_node_id);
+        assert_eq!(
+            token_wire_bytes(&back.session_token),
+            token_wire_bytes(&v1.session_token)
+        );
+    }
+
+    #[test]
+    fn relay_hello_v1_challenge_retry_artifact_survives_v2_wire() {
+        let artifact = AddressValidationArtifact::from_bytes([0x77; 32]);
+        let v1 = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: RelaySessionToken {
+                node_id: "node-a".to_owned(),
+                peer_node_id: "node-b".to_owned(),
+                relay_id: [0xAA; 16],
+                scope: RELAY_TOKEN_SCOPE.to_owned(),
+                issued_at_unix: 1_700_000_000,
+                expires_at_unix: 1_700_000_060,
+                nonce: [0x11; 16],
+                signature: [0x22; 64],
+            },
+            addr_validation_artifact: Some(artifact.clone()),
+        };
+
+        let v2 = RelayHelloV2::from(&v1);
+        assert!(!v2.artifact_is_first_contact_placeholder());
+        let parsed = parse_relay_hello_v2(&serialize_relay_hello_v2(&v2).expect("serialize"))
+            .expect("parse");
+        let back = RelayHello::from(parsed);
+        assert_eq!(
+            back.addr_validation_artifact
+                .as_ref()
+                .expect("kept")
+                .as_bytes(),
+            artifact.as_bytes()
         );
     }
 

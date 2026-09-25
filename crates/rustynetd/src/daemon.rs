@@ -139,8 +139,8 @@ use rustynet_backend_wireguard::{WireguardCommandOutput, WireguardCommandRunner}
 use rustynet_control::membership::{
     MAX_MEMBERSHIP_SNAPSHOT_BYTES, MembershipNodeStatus, MembershipState, MembershipWatermark,
     load_membership_log, load_membership_snapshot, load_membership_watermark,
-    membership_watermark_is_replay, persist_membership_watermark,
-    replay_membership_snapshot_and_log,
+    membership_watermark_is_replay, persist_membership_watermark, read_membership_snapshot_bytes,
+    replay_membership_snapshot_and_log, snapshot_bytes_relay_proto_max,
 };
 use rustynet_control::roles::{RoleCapability, parse_role_capability_csv};
 use rustynet_control::{
@@ -343,6 +343,7 @@ const ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_ENV: &str =
     "RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE";
 const RELAY_SESSION_LOCAL_TOKEN_ISSUER_ENV: &str = "RUSTYNET_RELAY_SESSION_LOCAL_TOKEN_ISSUER";
 const RELAY_SESSION_TOKEN_SPOOL_DIR_ENV: &str = "RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR";
+const RELAY_V1_FALLBACK_ENABLED_ENV: &str = "RUSTYNET_RELAY_V1_FALLBACK_ENABLED";
 // macOS: traversal bundle/verifier/watermark live under `${STATE_ROOT}/trust/`
 // (installer `--traversal-bundle/-verifier-key/-watermark` at
 // `Install-RustyNetMacosService.sh:452-457`). Relay-fleet has NO plist flag yet
@@ -2626,6 +2627,16 @@ pub struct DaemonConfig {
     pub relay_session_signing_secret_passphrase_path: Option<PathBuf>,
     pub relay_session_local_token_issuer_enabled: bool,
     pub relay_session_token_spool_dir: Option<PathBuf>,
+    /// D3 seams §7 step S4 (review of 2026-09-25): operator posture switch for
+    /// the client-side bounded v1 hello fallback, read from
+    /// `RUSTYNET_RELAY_V1_FALLBACK_ENABLED` (parse_bool; default `true` while
+    /// the fleet default still accepts v1). `false` makes the fallback
+    /// unreachable — a timed-out v2 hello surfaces as a hard
+    /// `RelayClientError::Timeout` and no v1 frame is ever sent — so a
+    /// v2-required deployment can enforce AGENTS.md §3's one-execution-path
+    /// rule without a code change (the client half of the Q3 v1 sunset, the
+    /// mirror of the relay's `--no-relay-accept-v1`).
+    pub relay_v1_fallback_enabled: bool,
     pub relay_session_token_ttl_secs: NonZeroU64,
     pub relay_session_refresh_margin_secs: NonZeroU64,
     pub relay_session_idle_timeout_secs: NonZeroU64,
@@ -2783,6 +2794,10 @@ impl Default for DaemonConfig {
             .unwrap_or(false),
             relay_session_token_spool_dir: std::env::var_os(RELAY_SESSION_TOKEN_SPOOL_DIR_ENV)
                 .map(PathBuf::from),
+            relay_v1_fallback_enabled: std::env::var(RELAY_V1_FALLBACK_ENABLED_ENV)
+                .ok()
+                .and_then(|value| parse_bool(value.as_str()))
+                .unwrap_or(true),
             relay_session_token_ttl_secs: NonZeroU64::new(DEFAULT_RELAY_SESSION_TOKEN_TTL_SECS)
                 .expect("default relay session token ttl must be non-zero"),
             relay_session_refresh_margin_secs: NonZeroU64::new(
@@ -5111,7 +5126,10 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
             NodeId::new(config.node_id.clone())
                 .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
             Arc::new(issuer),
-            RelayClientConfig::default(),
+            RelayClientConfig {
+                relay_v1_fallback_enabled: config.relay_v1_fallback_enabled,
+                ..RelayClientConfig::default()
+            },
         );
         return Ok(Some(relay_client));
     }
@@ -5143,7 +5161,10 @@ fn load_relay_client(config: &DaemonConfig) -> Result<Option<RelayClient>, Daemo
                 NodeId::new(config.node_id.clone())
                     .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?,
                 Arc::new(signing_key),
-                RelayClientConfig::default(),
+                RelayClientConfig {
+                    relay_v1_fallback_enabled: config.relay_v1_fallback_enabled,
+                    ..RelayClientConfig::default()
+                },
             );
             Ok(Some(relay_client))
         }
@@ -8171,16 +8192,25 @@ impl DaemonRuntime {
         let mut relay_client = self.relay_client.take().ok_or_else(|| {
             "relay client unavailable during establish (concurrent probe or state reset)".to_owned()
         })?;
+        // D3 seams plan §7 S4: the relay-protocol advertisement comes from
+        // the SAME signed membership snapshot the daemon already trusts. An
+        // unreadable/absent advertisement is `None`, which the client reads
+        // as v1 — the fail direction stays toward the status quo.
+        let advertised_relay_proto_max =
+            read_membership_snapshot_bytes(&self.membership_snapshot_path)
+                .ok()
+                .and_then(|bytes| snapshot_bytes_relay_proto_max(&bytes));
         let endpoint = relay_client.establish_session_with_round_trip(
             remote_node_id,
             relay_candidate.endpoint,
             relay_candidate.relay_id,
             self.relay_session_token_ttl_secs,
+            advertised_relay_proto_max,
             |remote_addr, payload, timeout| {
                 self.controller
                     .authoritative_transport_round_trip(remote_addr, payload, timeout)
                     .map(|response| (response.payload, response.remote_addr))
-                    .map_err(|err| RelayClientError::AuthoritativeTransport(err.to_string()))
+                    .map_err(|err| classify_transport_error_for_relay(err.to_string()))
             },
         );
         self.relay_client = Some(relay_client);
@@ -16839,6 +16869,23 @@ fn select_runtime_relay_candidate(
     select_runtime_relay_candidate_with_verified_fleet(candidates, None)
 }
 
+/// Classifies an authoritative-transport failure for the relay client so the
+/// D3 S4 bounded v1 fallback can tell "no admission reply within the hello
+/// timeout" (the ONLY fallback-eligible outcome) apart from an explicit
+/// reject or any other transport fault. The discriminator is textual because
+/// the backend surfaces its error as a formatted string; the shape is pinned
+/// by both reviewed transports (`userspace_shared/runtime.rs` and its macos
+/// twin end their round-trip timeout message with "timed out", and
+/// `BackendError`'s Display appends the message LAST), so a non-timeout
+/// fault can never degrade into a downgrade trigger.
+fn classify_transport_error_for_relay(message: String) -> RelayClientError {
+    if message.ends_with("timed out") {
+        RelayClientError::Timeout
+    } else {
+        RelayClientError::AuthoritativeTransport(message)
+    }
+}
+
 fn select_runtime_relay_candidate_with_verified_fleet(
     candidates: &[TraversalCandidate],
     relay_fleet: Option<&SignedRelayFleetBundle>,
@@ -18154,6 +18201,43 @@ fn race_outcome_classes(
 
 #[cfg(all(test, not(windows)))]
 mod tests {
+    // ── D3 S4: relay transport timeout classification (bounded v1 fallback) ──
+
+    /// Only a typed "no reply within timeout" may become
+    /// `RelayClientError::Timeout` — the single fallback-eligible outcome —
+    /// and the message shape is pinned to the reviewed transports' wording
+    /// (`userspace_shared/runtime.rs` and its macos twin both END the
+    /// round-trip timeout message with "timed out"; `BackendError`'s Display
+    /// appends the message last). Any other fault keeps its message and can
+    /// never trigger a downgrade.
+    #[test]
+    fn classify_transport_error_for_relay_maps_only_timeouts() {
+        let timeout = super::classify_transport_error_for_relay(
+            "linux userspace-shared authoritative transport round trip to 10.0.0.1:4500 timed out"
+                .to_owned(),
+        );
+        assert!(matches!(timeout, RelayClientError::Timeout));
+
+        let macos_timeout = super::classify_transport_error_for_relay(
+            "macos userspace-shared authoritative transport round trip to 10.0.0.1:4500 timed out"
+                .to_owned(),
+        );
+        assert!(matches!(macos_timeout, RelayClientError::Timeout));
+
+        let reject = super::classify_transport_error_for_relay(
+            "wireguard backend refused the handshake: invalid token".to_owned(),
+        );
+        match reject {
+            RelayClientError::AuthoritativeTransport(message) => {
+                assert_eq!(
+                    message,
+                    "wireguard backend refused the handshake: invalid token"
+                );
+            }
+            other => panic!("non-timeout fault must preserve its message: {other:?}"),
+        }
+    }
+
     // ── QH-40: shutdown-rollback residue reporting ───────────────────────────
 
     /// A failed shutdown rollback must produce the durable marker AND a
@@ -23433,6 +23517,7 @@ mod tests {
                 keepalive_interval: Duration::from_secs(25),
                 max_sessions_per_peer: 2,
                 recv_timeout,
+                relay_v1_fallback_enabled: true,
                 local_port: None,
             },
         );
@@ -25667,6 +25752,134 @@ mod tests {
 
         assert_eq!(client.local_port(), None);
         assert!(!client.is_bound());
+    }
+
+    /// Builds a daemon config + spool wired to `signing_key`, with one
+    /// one-use preissued token artifact for ("node-a", "peer-b", relay_id),
+    /// so `load_relay_client` reaches the transport closure during
+    /// `establish_session_with_round_trip`. Shared by the two fallback-posture
+    /// witnesses below (review of 2026-09-25: the §3 posture switch must be
+    /// reachable from the PRODUCTION constructor, not only from unit tests).
+    fn spool_relay_client_with_fallback_posture(
+        dir: &std::path::Path,
+        relay_v1_fallback_enabled: bool,
+    ) -> RelayClient {
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let verifier_path = dir.join("traversal.pub");
+        std::fs::write(
+            &verifier_path,
+            hex_encode(signing_key.verifying_key().as_bytes()),
+        )
+        .expect("write verifier key");
+        let spool_dir = dir.join("relay-token-spool");
+        std::fs::create_dir(&spool_dir).expect("create spool dir");
+        std::fs::set_permissions(&spool_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let token = rustynet_control::RelaySessionToken::sign_at(
+            &signing_key,
+            "node-a",
+            "peer-b",
+            [0xCC; 16],
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs(),
+            60,
+        );
+        let token_path = spool_dir.join("0001.relay-token");
+        std::fs::write(
+            &token_path,
+            rustynet_control::relay_session_token_to_wire(&token),
+        )
+        .expect("write token");
+        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let config = DaemonConfig {
+            node_id: "node-a".to_owned(),
+            traversal_verifier_key_path: verifier_path,
+            relay_session_token_spool_dir: Some(spool_dir),
+            relay_session_signing_secret_path: None,
+            relay_session_signing_secret_passphrase_path: None,
+            relay_session_local_token_issuer_enabled: false,
+            relay_v1_fallback_enabled,
+            ..DaemonConfig::default()
+        };
+        load_relay_client(&config)
+            .expect("preissued token spool should configure relay client")
+            .expect("relay client should be present")
+    }
+
+    #[test]
+    fn load_relay_client_disabled_v1_fallback_keeps_v2_failures_fatal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut client = spool_relay_client_with_fallback_posture(dir.path(), false);
+        let peer = NodeId::new("peer-b".to_owned()).expect("peer id");
+        let relay_addr: std::net::SocketAddr = "192.0.2.10:4500".parse().unwrap();
+        let mut calls = 0usize;
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer,
+                relay_addr,
+                [0xCC; 16],
+                60,
+                Some(2),
+                |_target, payload, _timeout| {
+                    calls += 1;
+                    // The v2-required posture must never put a v1 hello
+                    // (0x01) on the wire, even after a v2 timeout.
+                    assert_eq!(
+                        payload.first(),
+                        Some(&0x08u8),
+                        "no v1 frame may be attempted with the fallback disabled"
+                    );
+                    Err(RelayClientError::Timeout)
+                },
+            )
+            .expect_err("disabled fallback must keep the v2 failure fatal");
+
+        assert!(matches!(err, RelayClientError::Timeout));
+        assert_eq!(calls, 1);
+        assert_eq!(client.v1_fallback_events_total(), 0);
+        assert!(!client.has_session(&peer));
+    }
+
+    #[test]
+    fn load_relay_client_enabled_v1_fallback_falls_back_after_v2_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut client = spool_relay_client_with_fallback_posture(dir.path(), true);
+        let peer = NodeId::new("peer-b".to_owned()).expect("peer id");
+        let relay_addr: std::net::SocketAddr = "192.0.2.10:4500".parse().unwrap();
+        let mut calls = 0usize;
+
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer,
+                relay_addr,
+                [0xCC; 16],
+                60,
+                Some(2),
+                |target, payload, _timeout| {
+                    calls += 1;
+                    if calls == 1 {
+                        assert_eq!(payload.first(), Some(&0x08u8));
+                        return Err(RelayClientError::Timeout);
+                    }
+                    assert_eq!(
+                        payload.first(),
+                        Some(&0x01u8),
+                        "the default posture falls back to a v1 hello"
+                    );
+                    let mut ack = vec![0x02u8];
+                    ack.extend_from_slice(&[0x66; 16]);
+                    ack.extend_from_slice(&5010u16.to_be_bytes());
+                    Ok((ack, target))
+                },
+            )
+            .expect("default posture should establish via the bounded v1 fallback");
+
+        assert_eq!(calls, 2);
+        assert_eq!(endpoint.port, 5010);
+        assert_eq!(client.v1_fallback_events_total(), 1);
     }
 
     #[test]

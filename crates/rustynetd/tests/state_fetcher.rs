@@ -61,6 +61,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         relay_session_signing_secret_passphrase_path: None,
         relay_session_local_token_issuer_enabled: false,
         relay_session_token_spool_dir: None,
+        relay_v1_fallback_enabled: true,
         relay_session_token_ttl_secs: std::num::NonZeroU64::new(120).unwrap(),
         relay_session_refresh_margin_secs: std::num::NonZeroU64::new(15).unwrap(),
         relay_session_idle_timeout_secs: std::num::NonZeroU64::new(30).unwrap(),
