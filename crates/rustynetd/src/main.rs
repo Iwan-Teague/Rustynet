@@ -312,6 +312,11 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "daemon" => {
                 let config = parse_daemon_config(rest)?;
                 init_daemon_logging(daemon_log_file_path(&config).as_deref());
+                // AQ-40 (B8 / R-SEC-15): disable core dumps + debugger-friendly
+                // dumpable state BEFORE any key material is loaded. Fatal on
+                // failure (fail-closed); RUSTYNET_ALLOW_CORE_DUMPS=1 is the
+                // reviewed lab-debugging opt-out.
+                rustynetd::core_hardening::apply_startup_hardening()?;
                 run_daemon(config).map_err(|err| {
                     log::error!("rustynetd startup: daemon exited fatally: {err}");
                     err.to_string()
@@ -535,6 +540,9 @@ fn init_daemon_logging(log_file: Option<&Path>) {
 fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
     let config = parse_daemon_config(args)?;
     init_daemon_logging(daemon_log_file_path(&config).as_deref());
+    // AQ-40 (B8 / R-SEC-15): same Linux core-dump hardening as the standard
+    // daemon arm; the Windows SCM host must carry the identical posture.
+    rustynetd::core_hardening::apply_startup_hardening()?;
     run_daemon(config).map_err(|err| {
         // A fatal startup error is otherwise returned only to the SCM (and lost
         // — the Windows service discards stderr), leaving the durable log
@@ -3186,6 +3194,19 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
             }
         };
     }
+    if let Ok(value) =
+        std::env::var(rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV)
+    {
+        config.allow_plaintext_enrollment_secret =
+            rustynetd::enrollment_secret_custody::parse_allow_plaintext_value(&value).map_err(
+                |err| {
+                    format!(
+                        "invalid {} value: {err}",
+                        rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+                    )
+                },
+            )?;
+    }
     let mut index = 0usize;
     while index < args.len() {
         match args.get(index).map(String::as_str) {
@@ -3409,6 +3430,21 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 } else {
                     Some(value.into())
                 };
+                index += 2;
+            }
+            Some("--allow-plaintext-enrollment-secret") => {
+                // AQ-68 — lab-only escape hatch: accept the enrollment
+                // secret from a plaintext file at rest instead of
+                // requiring OS-keystore custody. Strict vocabulary; no
+                // silent fallback.
+                let value = args.get(index + 1).ok_or_else(|| {
+                    "--allow-plaintext-enrollment-secret requires a value".to_owned()
+                })?;
+                config.allow_plaintext_enrollment_secret =
+                    rustynetd::enrollment_secret_custody::parse_allow_plaintext_value(value)
+                        .map_err(|err| {
+                            format!("invalid --allow-plaintext-enrollment-secret value: {err}")
+                        })?;
                 index += 2;
             }
             Some("--enrollment-ledger") => {
@@ -4714,7 +4750,7 @@ fn help_text() -> String {
     [
         "rustynetd usage:",
         windows_service_help_line(),
-        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--gossip-watermark <path>] [--gossip-signing-secret <path>] [--gossip-signing-secret-passphrase <path>] [--enrollment-secret <path>] [--enrollment-ledger <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--traversal-prior-rerank <true|false>] [--traversal-flap-breaker <true|false>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--port-mapping-mode <auto|keepalive|disabled>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
+        "  rustynetd daemon [--node-id <id>] [--node-role <admin|client|blind_exit>] [--socket <path>] [--state <path>] [--trust-evidence <path>] [--trust-verifier-key <path>] [--trust-watermark <path>] [--membership-snapshot <path>] [--membership-log <path>] [--membership-watermark <path>] [--gossip-watermark <path>] [--gossip-signing-secret <path>] [--gossip-signing-secret-passphrase <path>] [--enrollment-secret <path>] [--allow-plaintext-enrollment-secret <true|false>] [--enrollment-ledger <path>] [--auto-tunnel-enforce <true|false>] [--auto-tunnel-bundle <path>] [--auto-tunnel-verifier-key <path>] [--auto-tunnel-watermark <path>] [--auto-tunnel-max-age-secs <secs>] [--dns-zone-bundle <path>] [--dns-zone-verifier-key <path>] [--dns-zone-watermark <path>] [--dns-zone-max-age-secs <secs>] [--dns-zone-name <name>] [--dns-resolver-bind-addr <addr:port>] [--traversal-bundle <path>] [--traversal-verifier-key <path>] [--traversal-watermark <path>] [--relay-fleet-bundle <path>] [--relay-fleet-watermark <path>] [--disable-relay-fleet] [--traversal-max-age-secs <secs>] [--traversal-stun-servers <ip:port[,ip:port...]>] [--traversal-stun-gather-timeout-ms <ms>] [--traversal-probe-max-candidates <n>] [--traversal-probe-max-pairs <n>] [--traversal-probe-rounds <n>] [--traversal-probe-round-spacing-ms <ms>] [--traversal-probe-relay-switch-after-failures <n>] [--traversal-probe-handshake-freshness-secs <secs>] [--traversal-probe-reprobe-interval-secs <secs>] [--traversal-prior-rerank <true|false>] [--traversal-flap-breaker <true|false>] [--backend <linux-wireguard|linux-wireguard-userspace-shared|macos-wireguard|macos-wireguard-userspace-shared|windows-unsupported|windows-wireguard-nt>] [--wg-interface <name>] [--wg-listen-port <1-65535>] [--wg-private-key <path>] [--wg-encrypted-private-key <path>] [--wg-key-passphrase <path>] [--wg-public-key <path>] [--relay-session-local-token-issuer <true|false>] [--relay-session-token-spool-dir <path>] [--egress-interface <name|auto>] [--remote-ops-token-verifier-key <path>] [--remote-ops-expected-subject <subject>] [--auto-port-forward-exit <true|false>] [--auto-port-forward-lease-secs <secs>] [--dataplane-mode <shell|hybrid-native>] [--port-mapping-mode <auto|keepalive|disabled>] [--privileged-helper-socket <path>] [--privileged-helper-timeout-ms <ms>] [--reconcile-interval-ms <ms>] [--max-reconcile-failures <n>] [--fail-closed-ssh-allow <true|false>] [--fail-closed-ssh-allow-cidrs <cidr[,cidr...]>] [--max-requests <n>]",
         "  rustynetd privileged-helper [--socket <path>] [--allowed-uid <uid>] [--allowed-gid <gid>] [--timeout-ms <ms>]",
         "  rustynetd key init [--runtime-private-key <path>] [--encrypted-private-key <path>] [--public-key <path>] [--passphrase-file <path>] [--force]",
         "  rustynetd key init-gossip --gossip-signing-secret <path> [--passphrase-file <path>] [--force]",
@@ -6335,6 +6371,52 @@ mod tests {
         let err = parse_daemon_config(&args)
             .expect_err("invalid enrollment allow-lan value should fail parsing");
         assert!(err.contains("invalid --anchor-enrollment-allow-lan value"));
+    }
+
+    /// AQ-68: the plaintext-custody escape hatch is opt-in, strict, and
+    /// defaults to refusal.
+    #[test]
+    fn parse_daemon_config_defaults_to_refusing_plaintext_enrollment_secret() {
+        let config = parse_daemon_config(&[]).expect("empty args should parse");
+        assert!(
+            !config.allow_plaintext_enrollment_secret,
+            "plaintext custody must be refused by default"
+        );
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_allow_plaintext_enrollment_secret_true() {
+        for raw in ["true", "1", "yes"] {
+            let args = vec![
+                "--allow-plaintext-enrollment-secret".to_owned(),
+                raw.to_owned(),
+            ];
+            let config = parse_daemon_config(&args).expect("flag should parse");
+            assert!(config.allow_plaintext_enrollment_secret, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_daemon_config_parses_allow_plaintext_enrollment_secret_false() {
+        for raw in ["false", "0", "no"] {
+            let args = vec![
+                "--allow-plaintext-enrollment-secret".to_owned(),
+                raw.to_owned(),
+            ];
+            let config = parse_daemon_config(&args).expect("flag should parse");
+            assert!(!config.allow_plaintext_enrollment_secret, "{raw}");
+        }
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_allow_plaintext_enrollment_secret() {
+        let args = vec![
+            "--allow-plaintext-enrollment-secret".to_owned(),
+            "maybe".to_owned(),
+        ];
+        let err = parse_daemon_config(&args)
+            .expect_err("invalid plaintext opt-in value should fail parsing");
+        assert!(err.contains("invalid --allow-plaintext-enrollment-secret value"));
     }
 
     #[test]

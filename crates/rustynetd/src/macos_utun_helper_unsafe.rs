@@ -93,6 +93,8 @@ fn recv_fd_from_stream(stream: &UnixStream) -> Result<OwnedFd, String> {
     // Inline error payload: 0xFF marker + up to RNUF_MAX_ERROR_BYTES text.
     let mut data_buf = vec![0u8; 1 + RNUF_MAX_ERROR_BYTES];
     // CMSG_SPACE for one fd: libc::CMSG_SPACE(size_of::<RawFd>()) = 16 on macOS
+    // SAFETY: CMSG_SPACE is a pure compile-time size macro — plain integer arithmetic over
+    // SAFETY: its argument with no pointer access — so expanding it is unconditionally valid.
     let cmsg_buf_size = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
     let mut cmsg_buf = vec![0u8; cmsg_buf_size];
 
@@ -185,6 +187,10 @@ fn recvmsg_one_fd(
         msg_flags: 0,
     };
 
+    // SAFETY: `sock_fd` is a valid open fd borrowed from the live `UnixStream`; `msghdr` is
+    // SAFETY: fully initialised above with one iovec over `data_buf`, msg_control pointing at
+    // SAFETY: the `cmsg_buf` allocation sized by CMSG_SPACE, and flags 0. All buffers outlive
+    // SAFETY: the synchronous call.
     let nbytes = unsafe { libc::recvmsg(sock_fd, &mut msghdr, 0) };
     if nbytes < 0 {
         return Err(format!(
@@ -195,6 +201,11 @@ fn recvmsg_one_fd(
 
     // Walk ancillary data looking for SCM_RIGHTS
     let mut fd_opt: Option<OwnedFd> = None;
+    // SAFETY: The kernel wrote well-formed ancillary data into `msghdr` during the successful
+    // SAFETY: recvmsg above, so CMSG_FIRSTHDR/CMSG_NXTHDR walk a valid cmsg list within the
+    // SAFETY: filled msghdr bounds. CMSG_DATA yields a byte-aligned slot, hence read_unaligned
+    // SAFETY: for the RawFd. Ownership transfers to OwnedFd::from_raw_fd only once, only for a
+    // SAFETY: non-negative fd (checked below), and the walk breaks after the first SCM_RIGHTS.
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msghdr);
         while !cmsg.is_null() {
@@ -232,6 +243,9 @@ pub(crate) fn open_utun_and_send_fd(
     // SCM_RIGHTS dup'd the fd into the peer process. Our local fd is now
     // surplus; closing it does NOT invalidate the dup the peer holds.
     // Always run the close, even on send failure, to avoid an fd leak.
+    // SAFETY: `raw_fd` came from SyncDevice::into_raw_fd and sendmsg (SCM_RIGHTS) duplicated
+    // SAFETY: it into the peer without consuming our copy, so it is still open and is closed
+    // SAFETY: here exactly once on every path.
     let close_result = unsafe { libc::close(raw_fd) };
     if close_result < 0 {
         // Surface the close failure if the sendmsg itself succeeded —
@@ -247,6 +261,8 @@ pub(crate) fn open_utun_and_send_fd(
 fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
     use std::os::fd::AsRawFd;
 
+    // SAFETY: CMSG_SPACE is a pure compile-time size macro — plain integer arithmetic over
+    // SAFETY: its argument with no pointer access — so expanding it is unconditionally valid.
     let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) } as usize;
     let mut cmsg_buf = vec![0u8; cmsg_space];
 
@@ -270,6 +286,11 @@ fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
         msg_flags: 0,
     };
 
+    // SAFETY: `cmsg_buf` is sized CMSG_SPACE(one RawFd), so CMSG_FIRSTHDR returns a non-null
+    // SAFETY: writable header for msg_controllen > 0; the writes follow the documented
+    // SAFETY: SCM_RIGHTS layout (cmsg_level/cmsg_type/cmsg_len), and write_unaligned stores one
+    // SAFETY: RawFd into the byte-aligned CMSG_DATA slot. `fd` is a valid open fd and sendmsg
+    // SAFETY: reads `stream`'s valid fd with the iovec over `dummy` still alive.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msghdr);
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
@@ -299,6 +320,9 @@ fn sendmsg_fd(stream: &UnixStream, fd: RawFd) -> Result<(), String> {
 pub(crate) fn peek_first_4_bytes(stream: &UnixStream) -> io::Result<[u8; 4]> {
     use std::os::fd::AsRawFd;
     let mut buf = [0u8; 4];
+    // SAFETY: `stream.as_raw_fd()` is a valid open socket fd; `buf` is a 4-byte stack array
+    // SAFETY: whose pointer and length are passed exactly, and MSG_PEEK peeks without
+    // SAFETY: consuming, leaving the stream position intact.
     let nbytes = unsafe {
         libc::recv(
             stream.as_raw_fd(),
@@ -391,6 +415,8 @@ mod tests {
         // fd is acceptable as the test payload (we just verify the
         // transfer mechanics work, not what kind of fd it is).
         let mut pipe_fds = [0i32; 2];
+        // SAFETY: `pipe_fds` is a valid out-array of two i32; pipe() fills it with a fresh fd pair
+        // SAFETY: and the return code is asserted zero before use.
         let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
         assert_eq!(rc, 0, "pipe() failed");
         let read_fd = pipe_fds[0];
@@ -399,6 +425,8 @@ mod tests {
         let server_thread = thread::spawn(move || {
             test_send_fd(&server, read_fd).expect("sendmsg_fd must succeed");
             // Close our local copy of the fd (peer now owns a dup).
+            // SAFETY: `read_fd` was opened by pipe() above and its ownership was transferred to the
+            // SAFETY: peer via SCM_RIGHTS, so this local copy is closed exactly once here.
             unsafe { libc::close(read_fd) };
             drop(server);
         });
@@ -407,6 +435,8 @@ mod tests {
         // Sanity: writing into the pipe (write_fd is still ours) should
         // be readable through the dup'd fd we just received.
         let payload = b"hello-utun";
+        // SAFETY: `write_fd` is the still-open write end from pipe(); `payload` is a live slice
+        // SAFETY: whose pointer and length are passed exactly.
         let n = unsafe {
             libc::write(
                 write_fd,
@@ -415,9 +445,13 @@ mod tests {
             )
         };
         assert_eq!(n, payload.len() as isize);
+        // SAFETY: `write_fd` is the open write end created above; it is closed exactly once here
+        // SAFETY: after the final write.
         unsafe { libc::close(write_fd) };
 
         let mut buf = [0u8; 32];
+        // SAFETY: `received.as_raw_fd()` is a valid open fd owned by the just-received OwnedFd;
+        // SAFETY: `buf` is a stack array whose pointer and length are passed exactly.
         let n = unsafe {
             libc::read(
                 received.as_raw_fd(),
@@ -475,6 +509,8 @@ mod tests {
             .unwrap();
 
         let mut pipe_fds = [0i32; 2];
+        // SAFETY: `pipe_fds` is a valid out-array of two i32; pipe() fills it with a fresh fd pair
+        // SAFETY: and the return code is asserted zero before use.
         let rc = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
         assert_eq!(rc, 0);
         let read_fd = pipe_fds[0];
@@ -482,7 +518,11 @@ mod tests {
 
         let server_thread = thread::spawn(move || {
             test_send_fd(&server, read_fd).expect("sendmsg_fd must succeed");
+            // SAFETY: `read_fd` was created by pipe() above; SCM_RIGHTS already duplicated it to the
+            // SAFETY: peer, so closing this local copy exactly once is correct.
             unsafe { libc::close(read_fd) };
+            // SAFETY: `write_fd` was created by pipe() above and is closed exactly once here; the peer
+            // SAFETY: only received a dup of read_fd, never this descriptor.
             unsafe { libc::close(write_fd) };
             drop(server);
         });
@@ -549,18 +589,24 @@ mod tests {
             .unwrap();
 
         let mut pipe_fds = [0i32; 2];
+        // SAFETY: `pipe_fds` is a valid out-array of two i32; pipe() fills it and the return code
+        // SAFETY: is asserted zero before use.
         assert_eq!(unsafe { libc::pipe(pipe_fds.as_mut_ptr()) }, 0);
         let read_fd = pipe_fds[0];
         let write_fd = pipe_fds[1];
 
         sendmsg_fd(&server, read_fd).expect("sendmsg must succeed");
         // Close local copy AFTER sendmsg: kernel already dup'd into peer.
+        // SAFETY: `read_fd` was opened by pipe() above and its ownership was transferred to the
+        // SAFETY: peer via SCM_RIGHTS, so this local copy is closed exactly once here.
         unsafe { libc::close(read_fd) };
 
         // Write into the pipe; the peer's dup of read_fd should still
         // see the data.
         let payload = b"x";
         assert_eq!(
+            // SAFETY: `write_fd` is the still-open write end from pipe(); `payload` is a live slice
+            // SAFETY: whose pointer and length are passed exactly.
             unsafe {
                 libc::write(
                     write_fd,
@@ -570,10 +616,14 @@ mod tests {
             },
             1
         );
+        // SAFETY: `write_fd` is the open write end created above; it is closed exactly once here
+        // SAFETY: after the final write.
         unsafe { libc::close(write_fd) };
 
         let received = recv_fd_from_stream(&client).expect("recv_fd succeeds");
         let mut buf = [0u8; 4];
+        // SAFETY: `received.as_raw_fd()` is a valid open fd owned by the just-received OwnedFd;
+        // SAFETY: `buf` is a stack array whose pointer and length are passed exactly.
         let n = unsafe {
             libc::read(
                 received.as_raw_fd(),

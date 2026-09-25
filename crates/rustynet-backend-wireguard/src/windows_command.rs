@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +24,6 @@ pub const DEFAULT_WINDOWS_NETSH_EXE_PATH: &str = r"C:\Windows\System32\netsh.exe
 
 const WINDOWS_CONFIG_FILE_SUFFIX: &str = ".conf.dpapi";
 
-#[derive(Debug)]
 pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
     runner: R,
     tunnel_name: String,
@@ -46,6 +46,30 @@ pub struct WindowsWireguardBackend<R: WireguardCommandRunner> {
     routes: Vec<Route>,
     context: Option<RuntimeContext>,
     exit_mode: ExitMode,
+}
+
+impl<R: WireguardCommandRunner> fmt::Debug for WindowsWireguardBackend<R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WindowsWireguardBackend")
+            .field("runner", &"<WireguardCommandRunner>")
+            .field("tunnel_name", &self.tunnel_name)
+            .field("config_path", &self.config_path)
+            .field("private_key_path", &self.private_key_path)
+            .field(
+                "runtime_private_key",
+                &self.runtime_private_key.as_ref().map(|_| "REDACTED"),
+            )
+            .field("wireguard_exe_path", &self.wireguard_exe_path)
+            .field("wg_exe_path", &self.wg_exe_path)
+            .field("netsh_exe_path", &self.netsh_exe_path)
+            .field("listen_port", &self.listen_port)
+            .field("running", &self.running)
+            .field("peers", &self.peers.len())
+            .field("routes", &self.routes.len())
+            .field("context", &self.context)
+            .field("exit_mode", &self.exit_mode)
+            .finish()
+    }
 }
 
 impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
@@ -1235,6 +1259,8 @@ mod tests {
     /// True when a `0o555` directory actually rejects writes for this
     /// process. Root (the Debian CI container) is exempt from mode bits, so
     /// the read-only-directory tests must skip there instead of failing.
+    /// Unix only: its sole caller is the unix arm of the read-only helper.
+    #[cfg(unix)]
     fn directory_mode_bits_are_enforced(read_only_dir: &std::path::Path) -> bool {
         let probe = read_only_dir.join(".mode-bits-probe");
         match fs::write(&probe, b"") {
@@ -1244,6 +1270,39 @@ mod tests {
             }
             Err(_) => true,
         }
+    }
+
+    /// Manufacture the read-only config-dir precondition for the
+    /// remove-peer retry tests, returning true when the mode bits are
+    /// actually enforced for this process. Unix-only: Windows has no POSIX
+    /// mode bits, so there the precondition cannot be manufactured and the
+    /// caller skips (root-owned CI containers skip the same way).
+    #[cfg(unix)]
+    fn make_dir_read_only_for_test(dir: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+        directory_mode_bits_are_enforced(dir)
+    }
+
+    /// Non-unix counterpart of [`make_dir_read_only_for_test`]: always
+    /// reports "not enforced" so the caller takes its documented skip path.
+    #[cfg(not(unix))]
+    fn make_dir_read_only_for_test(dir: &std::path::Path) -> bool {
+        let _ = dir;
+        false
+    }
+
+    /// Restore a config dir the tests made read-only (no-op on non-unix,
+    /// where [`make_dir_read_only_for_test`] never restricted it).
+    #[cfg(unix)]
+    fn restore_dir_writable_for_test(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+    }
+
+    #[cfg(not(unix))]
+    fn restore_dir_writable_for_test(dir: &std::path::Path) {
+        let _ = dir;
     }
 
     fn sample_peer(name: &str) -> PeerConfig {
@@ -2354,7 +2413,6 @@ mod tests {
         // resurrect the removed peer with its allowed_ips. The retry path
         // (peer absent from the map) must therefore rewrite the persistent
         // config instead of returning Ok while disk and memory disagree.
-        use std::os::unix::fs::PermissionsExt;
         let temp_dir = TempDir::new().expect("temp dir");
         let cfg_dir = temp_dir.path().join("cfgdir");
         fs::create_dir_all(&cfg_dir).expect("cfg dir");
@@ -2380,21 +2438,19 @@ mod tests {
         // Break persistence: a read-only config directory fails the staging
         // write inside write_config_atomically while the runtime `wg set`
         // remove succeeds and the map entry is dropped.
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
-        if !directory_mode_bits_are_enforced(&cfg_dir) {
+        if !make_dir_read_only_for_test(&cfg_dir) {
             // A root-owned test process (the Debian CI container) writes
             // through a 0o555 directory, so the staging failure this test
             // manufactures cannot occur. Skip rather than assert a
             // precondition the host does not provide.
-            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod rw");
+            restore_dir_writable_for_test(&cfg_dir);
             eprintln!("skipped: this process bypasses directory mode bits (root)");
             return;
         }
         backend
             .remove_peer(&gone_id)
             .expect_err("sync failure must fail the removal");
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+        restore_dir_writable_for_test(&cfg_dir);
 
         backend
             .remove_peer(&gone_id)
@@ -2415,7 +2471,6 @@ mod tests {
         // silently leave a [Peer] section on disk that a tunnel-service
         // restart resurrects, which is exactly the divergence this early
         // return exists to close.
-        use std::os::unix::fs::PermissionsExt;
         let temp_dir = TempDir::new().expect("temp dir");
         let cfg_dir = temp_dir.path().join("cfgdir");
         fs::create_dir_all(&cfg_dir).expect("cfg dir");
@@ -2438,14 +2493,12 @@ mod tests {
         let gone_id = peer.node_id.clone();
         backend.configure_peer(peer).expect("configure");
 
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
-        if !directory_mode_bits_are_enforced(&cfg_dir) {
+        if !make_dir_read_only_for_test(&cfg_dir) {
             // A root-owned test process (the Debian CI container) writes
             // through a 0o555 directory, so the staging failure this test
             // manufactures cannot occur. Skip rather than assert a
             // precondition the host does not provide.
-            fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod rw");
+            restore_dir_writable_for_test(&cfg_dir);
             eprintln!("skipped: this process bypasses directory mode bits (root)");
             return;
         }
@@ -2465,7 +2518,7 @@ mod tests {
             .remove_peer(&gone_id)
             .expect_err("retry must not report success while convergence failed");
 
-        fs::set_permissions(&cfg_dir, std::fs::Permissions::from_mode(0o755)).expect("chmod rw");
+        restore_dir_writable_for_test(&cfg_dir);
         backend
             .remove_peer(&gone_id)
             .expect("a later retry once the config dir is writable must converge");
@@ -2820,6 +2873,33 @@ mod tests {
                 .iter()
                 .any(|(_, args)| args.iter().any(|a| a == "/installtunnelservice")),
             "install must not run when the listing is unreadable"
+        );
+    }
+
+    #[test]
+    fn windows_backend_debug_redacts_runtime_private_key() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+
+        let backend = WindowsWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        let secret = "aq140-witness-runtime-private-key";
+        let backend = backend.with_runtime_private_key(Zeroizing::new(secret.to_string()));
+
+        let rendered = format!("{backend:?}");
+        assert!(
+            !rendered.contains(secret),
+            "WindowsWireguardBackend Debug output leaked the runtime private key: {rendered}"
         );
     }
 }

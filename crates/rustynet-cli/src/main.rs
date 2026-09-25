@@ -607,6 +607,13 @@ pub enum EnrollmentCliCommand {
     /// learns the new identity through the same trust channel that
     /// authorises every other peer.
     Admit(Box<AdmitConfig>),
+    /// `rustynet enrollment migrate-secret --secret <path>` — AQ-68
+    /// one-time operator migration: moves the 32-byte minting secret
+    /// from the plaintext file into the OS keystore (verified
+    /// round-trip) and then shreds the plaintext file. Idempotent;
+    /// refuses to touch anything when the keystore is unavailable or
+    /// already holds a diverging value.
+    MigrateSecret { secret_path: PathBuf },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6530,6 +6537,16 @@ fn parse_enrollment_command(args: &[String]) -> Result<EnrollmentCliCommand, Str
                 apply,
             })))
         }
+        "migrate-secret" => {
+            // AQ-68: explicit one-time migration of the enrollment
+            // secret from plaintext-at-rest into the OS keystore.
+            let secret = parser
+                .required("--secret")
+                .map_err(|_| "--secret <path> is required".to_owned())?;
+            Ok(EnrollmentCliCommand::MigrateSecret {
+                secret_path: PathBuf::from(secret),
+            })
+        }
         _ => Err(format!("unknown enrollment subcommand: {subcommand}")),
     }
 }
@@ -6873,7 +6890,7 @@ fn execute_assignment(command: AssignmentCommand) -> Result<String, String> {
                     .collect::<Vec<_>>(),
             };
 
-            let core = ControlPlaneCore::new(signing_secret, policy);
+            let core = ControlPlaneCore::new((*signing_secret).clone(), policy);
             for node in nodes {
                 core.nodes
                     .upsert(NodeMetadata {
@@ -6980,7 +6997,7 @@ fn execute_dns_zone_issue(command: DnsZoneIssueCommand) -> Result<String, String
             .collect::<Vec<_>>(),
     };
 
-    let core = ControlPlaneCore::new(signing_secret, policy);
+    let core = ControlPlaneCore::new((*signing_secret).clone(), policy);
     for node in nodes {
         core.nodes
             .upsert(NodeMetadata {
@@ -7071,7 +7088,7 @@ fn execute_traversal_issue(command: TraversalIssueCommand) -> Result<String, Str
             .collect::<Vec<_>>(),
     };
 
-    let core = ControlPlaneCore::new(signing_secret, policy);
+    let core = ControlPlaneCore::new((*signing_secret).clone(), policy);
     for node in nodes {
         core.nodes
             .upsert(NodeMetadata {
@@ -8229,14 +8246,19 @@ fn unix_now_nanos_for_temp_name() -> u128 {
 }
 
 fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
-    use rustynetd::enrollment_token::{inspect_token, load_ledger, load_secret, mint_token};
+    use rustynetd::enrollment_token::{inspect_token, load_ledger, mint_token};
     match command {
         EnrollmentCliCommand::Mint {
             secret_path,
             ttl_secs,
             output_path,
         } => {
-            let secret = load_secret(&secret_path).map_err(|err| err.to_string())?;
+            // AQ-68: resolved through the OS-keystore custody path; a
+            // plaintext secret file is refused unless the operator opted
+            // in via RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET.
+            let secret = rustynetd::enrollment_secret_custody::resolve_enrollment_secret_platform(
+                &secret_path,
+            )?;
             let (_token, encoded) = mint_token(&secret, ttl_secs).map_err(|err| err.to_string())?;
             if let Some(path) = output_path {
                 // ENR-13 / AUDIT-011: the minted token is a single-use bearer
@@ -8258,7 +8280,10 @@ fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
             ledger_path,
             token,
         } => {
-            let secret = load_secret(&secret_path).map_err(|err| err.to_string())?;
+            // AQ-68: same keystore-custody resolution as mint/admit.
+            let secret = rustynetd::enrollment_secret_custody::resolve_enrollment_secret_platform(
+                &secret_path,
+            )?;
             let ledger = match ledger_path.as_deref() {
                 Some(path) => load_ledger(path).map_err(|err| err.to_string())?,
                 None => rustynetd::enrollment_token::ConsumedTokenLedger::new(),
@@ -8302,6 +8327,19 @@ fn execute_enrollment(command: EnrollmentCliCommand) -> Result<String, String> {
             }
         }
         EnrollmentCliCommand::Admit(config) => execute_enrollment_admit(*config),
+        EnrollmentCliCommand::MigrateSecret { secret_path } => {
+            // AQ-68: explicit one-time migration. Fail-closed — any
+            // keystore error leaves the plaintext file exactly as it
+            // was; a diverging keystore value refuses the migration.
+            rustynetd::enrollment_secret_custody::migrate_plaintext_secret_to_keystore(
+                &rustynet_crypto::PlatformOsSecureStore,
+                &secret_path,
+            )?;
+            Ok(format!(
+                "enrollment secret migrated to the OS keystore; plaintext file shredded ({})",
+                secret_path.display()
+            ))
+        }
     }
 }
 
@@ -8334,7 +8372,6 @@ fn consume_enrollment_token_locked(
 fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
     use rustynet_control::enrollment::{EnrolleeAdmitContext, build_add_node_record_for_enrollee};
     use rustynet_control::membership::validate_membership_payload_field;
-    use rustynetd::enrollment_token::load_secret;
     let now_unix = unix_now();
     // Decode the enrollee pubkey early so a malformed input fails
     // before we burn a token.
@@ -8361,8 +8398,11 @@ fn execute_enrollment_admit(config: AdmitConfig) -> Result<String, String> {
 
     // Step 1 — verify + consume the token + persist ledger under the ledger
     // lock so concurrent admits cannot double-spend a single-use token
-    // (RSA-0023).
-    let secret = load_secret(&config.secret_path).map_err(|err| err.to_string())?;
+    // (RSA-0023). AQ-68: the secret is resolved through the OS-keystore
+    // custody path; plaintext at rest is refused without the env opt-in.
+    let secret = rustynetd::enrollment_secret_custody::resolve_enrollment_secret_platform(
+        &config.secret_path,
+    )?;
     consume_enrollment_token_locked(&config.ledger_path, &config.token, &secret)?;
 
     // Step 2 — load current membership state.
@@ -22814,6 +22854,27 @@ mod tests {
     /// `/private/var/run/...` socket (the launchd plist `--socket`), not the
     /// Linux `/run/...` path the deleted CLI-local constant hardcoded.
     #[cfg(target_os = "macos")]
+    /// Shape #1b: AQ-68 `enrollment migrate-secret` parses the required
+    /// `--secret` path into the migration command.
+    #[test]
+    fn parse_enrollment_migrate_secret_requires_and_carries_secret_path() {
+        let err = super::parse_enrollment_command(&["migrate-secret".to_owned()])
+            .expect_err("--secret must be required");
+        assert!(err.contains("--secret"), "{err}");
+        let parsed = super::parse_enrollment_command(&[
+            "migrate-secret".to_owned(),
+            "--secret".to_owned(),
+            "/keys/enrollment.secret".to_owned(),
+        ])
+        .expect("valid migrate-secret should parse");
+        assert_eq!(
+            parsed,
+            super::EnrollmentCliCommand::MigrateSecret {
+                secret_path: PathBuf::from("/keys/enrollment.secret")
+            }
+        );
+    }
+
     #[test]
     fn macos_cli_daemon_socket_default_is_rustynetd_installer_path() {
         assert_eq!(
@@ -27834,6 +27895,11 @@ mod tests {
         }
     }
 
+    // The verbs below live in `parse_ops_command` arms that are
+    // `#[cfg(feature = "vm-lab")]`-gated (RNQ-17 default-off), so the tripwire
+    // itself must be gated the same way or it fails on verbs that legitimately
+    // do not exist in a default build (wave-13 Fable review F1, AQ-85).
+    #[cfg(feature = "vm-lab")]
     #[test]
     fn every_ops_verb_the_harness_invokes_parses() {
         // MAC-D6 audit: each `ops <verb>` the live-lab harnesses shell out to

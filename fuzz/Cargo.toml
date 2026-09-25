@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 rustynetd = { path = "../crates/rustynetd" }
 rustynet-control = { path = "../crates/rustynet-control" }
+rustynet-relay = { path = "../crates/rustynet-relay" }
 
 [[bin]]
 name = "ipc_parse_command"
@@ -29,6 +30,13 @@ bench = false
 [[bin]]
 name = "membership_decode_signed_update"
 path = "fuzz_targets/membership_decode_signed_update.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_hello_parse"
+path = "fuzz_targets/relay_hello_parse.rs"
 test = false
 doc = false
 bench = false

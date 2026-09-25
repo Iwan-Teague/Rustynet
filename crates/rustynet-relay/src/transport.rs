@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -47,6 +47,20 @@ const IDLE_SESSION_TIMEOUT_SECS: u64 = 30;
 /// Maximum forwarded-payload size.  Packets larger than this are dropped
 /// silently rather than returned as an error (to avoid amplification).
 const MAX_PACKET_SIZE_BYTES: usize = 65_536;
+/// Wire-format message-type byte for a relay hello, matching
+/// `relay_client.rs` (moved here with `parse_relay_hello` so the library
+/// parser and the daemon dispatch share one constant).
+pub const RELAY_HELLO_MSG_TYPE: u8 = 0x01;
+/// Maximum accepted byte length of `node_id` / `peer_node_id` in a relay
+/// hello, enforced at parse time before either value is copied or used as a
+/// pre-auth map key (RLY-05).
+///
+/// Node ids in this deployment are hostname-style slugs (`exit-1`,
+/// `client-1`, `relay-1`), so 128 bytes is far above any legitimate value
+/// while cutting the pre-authentication memory a hostile sender can park from
+/// ~65 KB per entry to ~128 B — a ~500x reduction against
+/// `MAX_HELLO_LIMITER_ENTRIES` retained keys.
+pub const MAX_RELAY_NODE_ID_BYTES: usize = 128;
 /// How long we retain nonces in the replay-prevention store: must cover the
 /// entire window in which a token can still be accepted, so a nonce cannot be
 /// recycled while its token remains valid.
@@ -109,6 +123,21 @@ const _: () = assert!(
 /// Maximum `handle_hello` calls accepted per node within a one-second window
 /// before the hello itself is rejected (separate from packet rate limiting).
 const MAX_HELLOS_PER_NODE_PER_SEC: u32 = 5;
+/// Maximum `handle_hello` calls admitted per SOURCE ADDRESS within a
+/// one-second window before the hello is shed BEFORE any crypto work
+/// (AQ-69). Deliberately equal to the daemon assembly's per-source-IP
+/// pre-auth shed (`MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC`), so this in-transport
+/// gate never rejects a hello the daemon would have admitted — legitimate
+/// traffic decisions are unchanged — while the shed now sits immediately in
+/// front of the ed25519 verify it protects, inside the crate that performs
+/// the verify.
+const MAX_HELLOS_PER_SOURCE_PER_SEC: u32 = 50;
+/// Hard cap on the number of distinct source addresses the per-source shed
+/// tracks, mirroring the daemon's `MAX_PRE_AUTH_HELLO_SOURCE_IPS` posture:
+/// a pre-auth flood rotating source addresses must not grow the table
+/// without limit, and an overflow REJECTS (fail closed) rather than evicting
+/// or exceeding the bound (RSA-0037).
+const MAX_HELLO_SOURCE_ENTRIES: usize = 4096;
 /// Default global active session cap. Production daemons may lower or raise this
 /// during startup, but the transport must always retain a total cap.
 const DEFAULT_MAX_TOTAL_SESSIONS: usize = 4096;
@@ -156,6 +185,237 @@ pub struct RelayHello {
     pub session_token: RelaySessionToken,
 }
 
+/// Parses a `RelayHello` from wire format.
+///
+/// This is the attacker-reachable pre-auth parser for the relay's UDP hello
+/// path (run before any signature verification), which is why every field it
+/// copies is length-bounded (RLY-05 / AUDIT-031). It is `pub` in the library
+/// so the fuzz target `fuzz/fuzz_targets/relay_hello_parse.rs` can exercise
+/// it directly; the daemon dispatches through this same function.
+pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
+    if data.is_empty() || data[0] != RELAY_HELLO_MSG_TYPE {
+        return Err("not a hello message".to_owned());
+    }
+
+    let mut pos = 1;
+
+    // Node ID
+    if pos + 2 > data.len() {
+        return Err("truncated node_id length".to_owned());
+    }
+    let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Bound the identifier BEFORE it is copied (RLY-05 / AUDIT-031).
+    //
+    // `validate_hello`'s first check keys the pre-auth `HelloLimiter` on this
+    // value — `counts.entry(node_id.to_owned())` — which happens BEFORE the
+    // signature is verified. `MAX_HELLO_LIMITER_ENTRIES` bounds how many
+    // entries that map holds, but nothing bounded how large each key was, and
+    // the only ceiling here was the 64 KiB datagram. 16384 entries x ~65 KB
+    // measured at ~1015 MiB of unverified attacker-chosen bytes resident
+    // pre-authentication.
+    //
+    // AUDIT-031 ("cap the relay pre-auth map") is on the before-release list;
+    // RSA-0037 capped the entry COUNT, and this caps the byte size, which was
+    // the remaining half.
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + node_id_len > data.len() {
+        return Err("truncated node_id".to_owned());
+    }
+    let node_id =
+        String::from_utf8(data[pos..pos + node_id_len].to_vec()).map_err(|e| e.to_string())?;
+    pos += node_id_len;
+
+    // Peer node ID
+    if pos + 2 > data.len() {
+        return Err("truncated peer_node_id length".to_owned());
+    }
+    let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Same bound as `node_id` above: `peer_node_id` is likewise copied out of
+    // an unauthenticated datagram, and both are compared against the signed
+    // token later, so neither can legitimately exceed the protocol cap.
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated peer_node_id".to_owned());
+    }
+    let peer_node_id =
+        String::from_utf8(data[pos..pos + peer_node_id_len].to_vec()).map_err(|e| e.to_string())?;
+    pos += peer_node_id_len;
+
+    // Token
+    if pos + 2 > data.len() {
+        return Err("truncated token length".to_owned());
+    }
+    let token_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    if pos + token_len > data.len() {
+        return Err("truncated token".to_owned());
+    }
+    let token_data = &data[pos..pos + token_len];
+    let session_token = parse_relay_token(token_data)?;
+
+    Ok(RelayHello {
+        node_id,
+        peer_node_id,
+        session_token,
+    })
+}
+
+/// Parses a `RelaySessionToken` from wire format.
+///
+/// Like `parse_relay_hello`, this runs on an unauthenticated datagram before
+/// signature verification, so every embedded field is length-bounded before
+/// it is copied (same pre-auth memory bound as the hello fields).
+pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
+    let mut pos = 0;
+
+    // Version
+    if pos >= data.len() {
+        return Err("missing version".to_owned());
+    }
+    let version = data[pos];
+    if version != 1 {
+        return Err(format!("unsupported token version: {version}"));
+    }
+    pos += 1;
+
+    // Node ID
+    if pos + 2 > data.len() {
+        return Err("truncated token node_id length".to_owned());
+    }
+    let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Bound the token-embedded identifier BEFORE it is copied. This is the
+    // same pre-auth memory bound RLY-05 applied to the outer hello fields,
+    // which `parse_relay_token` missed: this function runs on an
+    // unauthenticated datagram BEFORE signature verification, and without a
+    // bound each of `node_id` / `peer_node_id` / `scope` could be declared
+    // up to 64 KiB inside one ~64 KiB hello, forcing ~3x that in heap
+    // `String`s per datagram. No legitimate token can hit these caps: any
+    // session that would pass validation has token ids equal (constant-time
+    // compared) to hello fields already capped at
+    // `MAX_RELAY_NODE_ID_BYTES`, and scope equal to `RELAY_TOKEN_SCOPE`, so
+    // a longer value could never authenticate.
+    if node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token node_id length {node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + node_id_len > data.len() {
+        return Err("truncated token node_id".to_owned());
+    }
+    let node_id = String::from_utf8(data[pos..pos + node_id_len].to_vec())
+        .map_err(|e| format!("invalid token node_id: {e}"))?;
+    pos += node_id_len;
+
+    // Peer node ID
+    if pos + 2 > data.len() {
+        return Err("truncated token peer_node_id length".to_owned());
+    }
+    let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Same bound as the token's node_id above.
+    if peer_node_id_len > MAX_RELAY_NODE_ID_BYTES {
+        return Err(format!(
+            "token peer_node_id length {peer_node_id_len} exceeds maximum {MAX_RELAY_NODE_ID_BYTES}"
+        ));
+    }
+
+    if pos + peer_node_id_len > data.len() {
+        return Err("truncated token peer_node_id".to_owned());
+    }
+    let peer_node_id = String::from_utf8(data[pos..pos + peer_node_id_len].to_vec())
+        .map_err(|e| format!("invalid token peer_node_id: {e}"))?;
+    pos += peer_node_id_len;
+
+    // Relay ID (16 bytes)
+    if pos + 16 > data.len() {
+        return Err("truncated relay_id".to_owned());
+    }
+    let relay_id: [u8; 16] = data[pos..pos + 16]
+        .try_into()
+        .map_err(|_| "invalid relay_id")?;
+    pos += 16;
+
+    // Scope
+    if pos + 2 > data.len() {
+        return Err("truncated scope length".to_owned());
+    }
+    let scope_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    // Scope is compared for exact equality against `RELAY_TOKEN_SCOPE`
+    // during validation, so anything longer can never authenticate — cap
+    // the copy at that length (same pre-auth memory bound as above).
+    if scope_len > RELAY_TOKEN_SCOPE.len() {
+        return Err(format!(
+            "token scope length {scope_len} exceeds maximum {}",
+            RELAY_TOKEN_SCOPE.len()
+        ));
+    }
+
+    if pos + scope_len > data.len() {
+        return Err("truncated scope".to_owned());
+    }
+    let scope = String::from_utf8(data[pos..pos + scope_len].to_vec())
+        .map_err(|e| format!("invalid scope: {e}"))?;
+    pos += scope_len;
+
+    // Timestamps
+    if pos + 16 > data.len() {
+        return Err("truncated timestamps".to_owned());
+    }
+    let issued_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+    let expires_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    pos += 8;
+
+    // Nonce (16 bytes)
+    if pos + 16 > data.len() {
+        return Err("truncated nonce".to_owned());
+    }
+    let nonce: [u8; 16] = data[pos..pos + 16]
+        .try_into()
+        .map_err(|_| "invalid nonce")?;
+    pos += 16;
+
+    // Signature (64 bytes)
+    if pos + 64 > data.len() {
+        return Err("truncated signature".to_owned());
+    }
+    let signature: [u8; 64] = data[pos..pos + 64]
+        .try_into()
+        .map_err(|_| "invalid signature")?;
+
+    Ok(RelaySessionToken {
+        node_id,
+        peer_node_id,
+        relay_id,
+        scope,
+        issued_at_unix,
+        expires_at_unix,
+        nonce,
+        signature,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayHelloAck {
     pub session_id: SessionId,
@@ -196,6 +456,7 @@ pub struct RelayTransport {
     control_verifier_key: VerifyingKey,
     nonce_store: NonceStore,
     hello_limiter: HelloLimiter,
+    source_hello_limiter: SourceHelloLimiter,
     clock_skew_tolerance_secs: u64,
     max_sessions_per_node: usize,
     max_total_sessions: usize,
@@ -232,6 +493,7 @@ impl RelayTransport {
             control_verifier_key,
             nonce_store: NonceStore::default(),
             hello_limiter: HelloLimiter::new(MAX_HELLOS_PER_NODE_PER_SEC),
+            source_hello_limiter: SourceHelloLimiter::new(MAX_HELLOS_PER_SOURCE_PER_SEC),
             clock_skew_tolerance_secs,
             max_sessions_per_node,
             max_total_sessions: DEFAULT_MAX_TOTAL_SESSIONS,
@@ -302,16 +564,18 @@ impl RelayTransport {
     pub fn validate_hello_from_tuple(
         &mut self,
         hello: &RelayHello,
-        _observed_addr: SocketAddr,
+        observed_addr: SocketAddr,
     ) -> Result<(), RejectReason> {
-        self.validate_hello(hello, true)
+        self.validate_hello(hello, observed_addr.ip(), true)
     }
 
     /// Process a session establishment request with a daemon-owned allocated port.
     ///
     /// All security checks are performed in a deliberate order:
     ///
-    /// 1. Hello rate limit (cheap, no crypto — shed load before signature work)
+    /// 0. Per-source-address hello shed (identity-free, cheap, no crypto —
+    ///    the verify-protecting gate; AQ-69 / blind-v2 step-2 pattern)
+    /// 1. Hello rate limit per node_id (cheap, no crypto — shed load before signature work)
     /// 2. Signature verification (ed25519, inherently constant-time)
     /// 3. TTL bound check (max 120 s)
     /// 4. Token freshness / expiry
@@ -329,7 +593,7 @@ impl RelayTransport {
         observed_addr: SocketAddr,
         allocated_port: u16,
     ) -> RelayHelloResponse {
-        if let Err(reason) = self.validate_hello(&hello, false) {
+        if let Err(reason) = self.validate_hello(&hello, observed_addr.ip(), false) {
             return RelayHelloResponse::Rejected(reason);
         }
         if allocated_port == 0 {
@@ -382,8 +646,21 @@ impl RelayTransport {
     fn validate_hello(
         &mut self,
         hello: &RelayHello,
+        source_ip: IpAddr,
         record_hello_rate: bool,
     ) -> Result<(), RejectReason> {
+        // Check 0: Per-source shed — identity-free, cheap, before ANY crypto
+        // work (AQ-69; blind-v2 admission step-2 pattern). Keyed on the
+        // observed source address rather than any attacker-supplied field,
+        // so rotating `node_id` per packet cannot defeat it: at most
+        // MAX_HELLOS_PER_SOURCE_PER_SEC hellos per source per window ever
+        // reach the ed25519 verify below. Consumed on the same
+        // `record_hello_rate` arm as the per-node_id limiter, so the commit
+        // pass's re-validation does not double-charge the budget.
+        if record_hello_rate && !self.source_hello_limiter.check(source_ip) {
+            return Err(RejectReason::RateLimitExceeded);
+        }
+
         // Check 1: Hello rate limit — shed before any crypto work
         if record_hello_rate && !self.hello_limiter.check(&hello.node_id) {
             return Err(RejectReason::RateLimitExceeded);
@@ -826,6 +1103,12 @@ impl RelayTransport {
         // longer needs an entry, so a churn of distinct pre-auth node_ids cannot
         // accumulate stale windows between cleanups.
         self.hello_limiter.prune_elapsed(now);
+
+        // Prune the per-source shed's address windows on the same cadence
+        // (AQ-69 / RSA-0037): a source whose one-second window has elapsed
+        // no longer needs an entry, so source-address churn cannot
+        // accumulate stale windows between cleanups.
+        self.source_hello_limiter.prune_elapsed(now);
 
         removed
     }
@@ -1303,6 +1586,80 @@ impl HelloLimiter {
     /// DOS-1 flood audit (`crate::hello_limiter_audit`) to observe the map
     /// size without reaching into the private `counts` field.
     #[cfg(feature = "daemon")]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.counts.len()
+    }
+}
+
+/// Identity-free per-source-address hello shed (AQ-69) — the v1-path analogue
+/// of blind-v2 admission step 2 ("per-SOURCE-PREFIX pre-auth rate limit ...
+/// shed before any crypto", `blind_relay_listener.rs`): keyed on the OBSERVED
+/// source address, the only pre-auth key an attacker cannot rewire per
+/// packet. The per-node_id [`HelloLimiter`] above is checked first in spirit
+/// but its key is attacker-supplied — its own capacity comment concedes a
+/// flood rotates `node_id` per packet — so it bounds memory, not verify
+/// volume. This limiter bounds the verify volume: at most
+/// `MAX_HELLOS_PER_SOURCE_PER_SEC` hellos per source per window ever reach
+/// [`RelayTransport::validate_hello`]'s ed25519 check.
+///
+/// Mechanically mirrors `HelloLimiter` (and the daemon's per-IP
+/// `PreAuthHelloLimiter`): one-second windows, capacity-checked insert that
+/// prunes elapsed windows first and REJECTS while still full (fail closed),
+/// lazy window reset on access.
+pub(crate) struct SourceHelloLimiter {
+    max_per_sec: u32,
+    max_entries: usize,
+    counts: HashMap<IpAddr, (u32, Instant)>,
+}
+
+impl SourceHelloLimiter {
+    pub(crate) fn new(max_per_sec: u32) -> Self {
+        Self {
+            max_per_sec,
+            max_entries: MAX_HELLO_SOURCE_ENTRIES,
+            counts: HashMap::new(),
+        }
+    }
+
+    /// Returns `true` if the hello should be admitted to the crypto work,
+    /// `false` if it is shed before any signature work.
+    pub(crate) fn check(&mut self, source: IpAddr) -> bool {
+        let now = Instant::now();
+
+        // Fail closed at the table bound, mirroring `HelloLimiter::check`
+        // (RSA-0037): a NEW source arriving at capacity first drops elapsed
+        // windows; if the table is still full the new source is shed rather
+        // than growing the map. Tracked sources always keep their lookup.
+        if self.counts.len() >= self.max_entries && !self.counts.contains_key(&source) {
+            self.prune_elapsed(now);
+            if self.counts.len() >= self.max_entries {
+                return false;
+            }
+        }
+
+        let entry = self.counts.entry(source).or_insert((0, now));
+
+        // Reset counter if the one-second window has elapsed
+        if now.duration_since(entry.1) >= Duration::from_secs(1) {
+            *entry = (0, now);
+        }
+
+        if entry.0 >= self.max_per_sec {
+            return false;
+        }
+        entry.0 += 1;
+        true
+    }
+
+    /// Drop entries whose one-second window has elapsed, mirroring
+    /// `HelloLimiter::prune_elapsed` (RSA-0037).
+    fn prune_elapsed(&mut self, now: Instant) {
+        self.counts
+            .retain(|_, (_, started)| now.duration_since(*started) < Duration::from_secs(1));
+    }
+
+    /// Distinct sources currently tracked; test seam only.
+    #[cfg(test)]
     pub(crate) fn entry_count(&self) -> usize {
         self.counts.len()
     }
@@ -2779,6 +3136,139 @@ mod tests {
         assert!(
             accepted <= MAX_HELLOS_PER_NODE_PER_SEC as usize,
             "accepted count must not exceed rate limit"
+        );
+    }
+
+    /// AQ-69 (relay preauth CPU DoS): N unauthenticated hellos from ONE
+    /// source, each rotating the attacker-chosen `node_id` (which defeats
+    /// the per-node_id limiter BY DESIGN — the key is attacker-supplied),
+    /// must cost at most K ed25519 verifies. The verify only ever runs for
+    /// a packet the identity-free per-source shed admitted, so counting
+    /// `InvalidToken` rejections counts verifies: at most K of the N
+    /// packets may reach the signature check.
+    #[test]
+    fn per_source_shed_bounds_unauthenticated_hello_verifies() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        let from = observed_addr([203, 0, 113, 10], 5000);
+
+        const N: usize = 200;
+        const K: usize = MAX_HELLOS_PER_SOURCE_PER_SEC as usize;
+
+        let mut invalid_token = 0usize; // shed passed -> ed25519 verify ran
+        let mut rate_limited = 0usize; // shed rejected -> no crypto work
+
+        for i in 0..N {
+            // A fresh attacker-chosen node_id per packet: the pre-existing
+            // per-node_id limiter must NOT be what bounds this flood.
+            let mut token = make_valid_token(&sk, &format!("rot-{i}"), "peer", 60);
+            token.signature = [99u8; 64]; // unauthenticated: garbage signature
+            let hello = RelayHello {
+                node_id: format!("rot-{i}"),
+                peer_node_id: "peer".to_owned(),
+                session_token: token,
+            };
+            match transport.validate_hello_from_tuple(&hello, from) {
+                Err(RejectReason::InvalidToken) => invalid_token += 1,
+                Err(RejectReason::RateLimitExceeded) => rate_limited += 1,
+                other => panic!("unexpected outcome for packet {i}: {other:?}"),
+            }
+        }
+
+        assert_eq!(
+            invalid_token + rate_limited,
+            N,
+            "every unauthenticated hello must be rejected"
+        );
+        assert!(
+            invalid_token <= K,
+            "at most K={K} verifies may run for N={N} unauthenticated packets \
+             from one source (ran {invalid_token})"
+        );
+        assert_eq!(rate_limited, N - invalid_token);
+    }
+
+    /// AQ-69 companion: the per-source shed must not change legitimate
+    /// behaviour — a valid hello still validates, a second source is not
+    /// punished for the first source's flood, and a source that exhausted
+    /// its own budget is shed exactly as the daemon's per-IP gate would
+    /// shed it (same constant, same window).
+    #[test]
+    fn per_source_shed_preserves_legitimate_traffic_and_isolates_sources() {
+        let (sk, _) = make_test_keypair();
+        let mut transport = make_transport(&sk);
+        let honest = observed_addr([198, 51, 100, 7], 5001);
+        let flooder = observed_addr([203, 0, 113, 10], 5002);
+
+        // (a) A valid hello from an honest source is accepted, untouched.
+        assert!(
+            transport
+                .validate_hello_from_tuple(&make_hello(&sk, "node-a", "node-b"), honest)
+                .is_ok(),
+            "valid hello must still validate"
+        );
+
+        // (b) The flooder exhausts its OWN budget with unauthenticated
+        // rotating-node_id packets (all rejected).
+        for i in 0..200 {
+            let mut token = make_valid_token(&sk, &format!("rot-{i}"), "peer", 60);
+            token.signature = [99u8; 64];
+            let hello = RelayHello {
+                node_id: format!("rot-{i}"),
+                peer_node_id: "peer".to_owned(),
+                session_token: token,
+            };
+            assert!(
+                transport
+                    .validate_hello_from_tuple(&hello, flooder)
+                    .is_err(),
+                "unauthenticated hello {i} must be rejected"
+            );
+        }
+
+        // (c) The honest source is unaffected by the other source's flood.
+        assert!(
+            transport
+                .validate_hello_from_tuple(&make_hello(&sk, "node-a2", "node-b2"), honest)
+                .is_ok(),
+            "honest source must not be shed for another source's flood"
+        );
+
+        // (d) The flooder's NEXT hello — even a perfectly valid one — is
+        // shed before any crypto: the same per-source policy the daemon's
+        // per-IP gate already applies, now enforced at the verify too.
+        assert_eq!(
+            transport.validate_hello_from_tuple(&make_hello(&sk, "node-c", "node-d"), flooder),
+            Err(RejectReason::RateLimitExceeded),
+            "exhausted source must be shed before the signature check"
+        );
+    }
+
+    /// The per-source shed's table is hard-bounded (fail closed) so a
+    /// source-address churn flood cannot grow it without limit (RSA-0037
+    /// posture, mirroring the daemon's `MAX_PRE_AUTH_HELLO_SOURCE_IPS`).
+    #[test]
+    fn source_hello_limiter_bounds_tracked_source_table() {
+        let mut limiter = SourceHelloLimiter::new(MAX_HELLOS_PER_SOURCE_PER_SEC);
+
+        let mut admitted = 0;
+        for i in 0..(MAX_HELLO_SOURCE_ENTRIES + 512) {
+            // Distinct address per probe (last octet wraps; two octets give
+            // enough distinct addresses for the cap + overflow probes).
+            let ip = IpAddr::from([198u8, 51, (i / 256) as u8, (i % 256) as u8]);
+            if limiter.check(ip) {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(
+            admitted, MAX_HELLO_SOURCE_ENTRIES,
+            "exactly the table bound may be admitted; the rest fail closed"
+        );
+        assert_eq!(
+            limiter.entry_count(),
+            MAX_HELLO_SOURCE_ENTRIES,
+            "the table must never exceed its bound"
         );
     }
 

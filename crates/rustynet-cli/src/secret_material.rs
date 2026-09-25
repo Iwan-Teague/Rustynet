@@ -89,21 +89,20 @@ pub(crate) fn load_encrypted_secret_material(
         .parent()
         .ok_or_else(|| format!("{label} path has no parent: {}", path.display()))?;
     let permission_policy = encrypted_secret_permission_policy(path);
-    let secret = read_encrypted_key_file(parent, path, passphrase.as_str(), permission_policy)
-        .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))?;
-    Ok(Zeroizing::new(secret))
+    read_encrypted_key_file(parent, path, passphrase.as_str(), permission_policy)
+        .map_err(|err| format!("decrypt {label} failed ({}): {err}", path.display()))
 }
 
 pub(crate) fn load_assignment_signing_secret(
     path: &Path,
     passphrase_path: &Path,
-) -> Result<Vec<u8>, String> {
+) -> Result<Zeroizing<Vec<u8>>, String> {
     let secret =
         load_encrypted_secret_material(path, passphrase_path, "assignment signing secret")?;
     if secret.len() < 32 {
         return Err("assignment signing secret must be at least 32 bytes".to_owned());
     }
-    Ok(secret.to_vec())
+    Ok(secret)
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -119,4 +118,53 @@ pub(crate) fn generate_assignment_nonce() -> u64 {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     (nanos & u128::from(u64::MAX)) as u64
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use rustynet_crypto::write_encrypted_key_file;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    const TEST_PASSPHRASE: &str = "aq84 unit test passphrase material";
+
+    fn write_secret_fixture(dir: &Path, secret: &[u8]) -> (PathBuf, PathBuf) {
+        let secret_path = dir.join("assignment_signing.secret");
+        let passphrase_path = dir.join("assignment_signing.passphrase");
+        fs::write(&passphrase_path, TEST_PASSPHRASE).expect("write passphrase fixture");
+        fs::set_permissions(&passphrase_path, fs::Permissions::from_mode(0o600))
+            .expect("restrict passphrase fixture permissions");
+        write_encrypted_key_file(
+            dir,
+            &secret_path,
+            secret,
+            TEST_PASSPHRASE,
+            encrypted_secret_permission_policy(&secret_path),
+        )
+        .expect("write encrypted signing secret fixture");
+        (secret_path, passphrase_path)
+    }
+
+    #[test]
+    fn load_assignment_signing_secret_returns_zeroizing_wrapped_secret() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) = write_secret_fixture(dir.path(), &secret_bytes);
+
+        let loaded: Zeroizing<Vec<u8>> =
+            load_assignment_signing_secret(&secret_path, &passphrase_path)
+                .expect("load assignment signing secret");
+        assert_eq!(loaded.as_slice(), secret_bytes.as_slice());
+    }
+
+    #[test]
+    fn load_assignment_signing_secret_rejects_short_secret_fail_closed() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let (secret_path, passphrase_path) = write_secret_fixture(dir.path(), &[9u8; 16]);
+
+        let err = load_assignment_signing_secret(&secret_path, &passphrase_path)
+            .expect_err("short secret must be rejected");
+        assert!(err.contains("at least 32 bytes"), "unexpected error: {err}");
+    }
 }

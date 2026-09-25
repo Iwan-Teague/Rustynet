@@ -2319,6 +2319,15 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "lo",
             "accept",
         ] if is_owned_failclosed_table_token(table) => Ok(()),
+        // AQ-70/F2: the established/related accepts are THREE scoped rules —
+        // tcp and udp with `dport != { 53, 853 }` so an established DNS/DoT/
+        // DoQ flow can never be accepted ahead of the (later) DNS drops by
+        // first-match, plus a non-tcp/udp rule preserving established ICMP/
+        // PMTU-style v4 traffic. All three are `meta nfproto ipv4`-scoped:
+        // the historical unqualified `ct state established,related accept`
+        // shape admitted established IPv6 in an IPv4-only posture and is
+        // deliberately NOT in this allowlist (RN-12 precedent — the helper
+        // refuses the legacy shape instead of carrying it).
         [
             "add",
             "rule",
@@ -2328,6 +2337,58 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "ct",
             "state",
             "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+            "tcp",
+            "dport",
+            "!=",
+            "{",
+            "53,",
+            "853",
+            "}",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "ct",
+            "state",
+            "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+            "udp",
+            "dport",
+            "!=",
+            "{",
+            "53,",
+            "853",
+            "}",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "ct",
+            "state",
+            "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+            "meta",
+            "l4proto",
+            "!=",
+            "{",
+            "tcp,",
+            "udp",
+            "}",
             "accept",
         ] if is_owned_failclosed_table_token(table) => Ok(()),
         // RN-12/IPV-01/RN-29: scoped exit-node egress rules. The historical
@@ -2348,7 +2409,10 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "ipv4",
             "udp",
             "dport",
-            "53",
+            "{",
+            "53,",
+            "853",
+            "}",
             "drop",
         ] if is_owned_failclosed_table_token(table) && is_interface_name(interface) => Ok(()),
         [
@@ -2387,6 +2451,8 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "ipv4",
             "accept",
         ] if is_owned_failclosed_table_token(table) && is_interface_name(interface) => Ok(()),
+        // AQ-70/F2: forward-chain established/related accepts, scoped exactly
+        // like their killswitch siblings above (same rationale).
         [
             "add",
             "rule",
@@ -2396,6 +2462,58 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "ct",
             "state",
             "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+            "tcp",
+            "dport",
+            "!=",
+            "{",
+            "53,",
+            "853",
+            "}",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "forward",
+            "ct",
+            "state",
+            "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+            "udp",
+            "dport",
+            "!=",
+            "{",
+            "53,",
+            "853",
+            "}",
+            "accept",
+        ] if is_owned_failclosed_table_token(table) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "forward",
+            "ct",
+            "state",
+            "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+            "meta",
+            "l4proto",
+            "!=",
+            "{",
+            "tcp,",
+            "udp",
+            "}",
             "accept",
         ] if is_owned_failclosed_table_token(table) => Ok(()),
         [
@@ -2593,6 +2711,10 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "killswitch",
             "oifname",
             interface,
+            // AQ-70/F3: IPv4-only, mirroring the scoped emitter shape.
+            "meta",
+            "nfproto",
+            "ipv4",
             "udp",
             "dport",
             port,
@@ -2617,6 +2739,10 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             "killswitch",
             "oifname",
             interface,
+            // AQ-70/F3: IPv4-only, mirroring the scoped emitter shape.
+            "meta",
+            "nfproto",
+            "ipv4",
             "udp",
             "sport",
             port,
@@ -4033,27 +4159,86 @@ mod tests {
     fn validate_request_accepts_killswitch_established_related_rule() {
         // Cross-pins the emitter-side QH-29 regression pin in `phase10`
         // (`established_related_rule_argv_is_helper_allowlist_shaped`): the
-        // established/related killswitch rule must reach this allowlist as
+        // established/related killswitch rules must reach this allowlist as
         // per-token nft keywords. The 2026-08-29 live-lab failure shipped an
         // emitter that sent `"ct state established,related"` as ONE argv
         // element — this arm refused it, every Linux reconcile apply failed,
         // and the node restricted permanently — while a `join(" ")` of the
         // refused argv rendered identically to this accepted spelling.
-        validate_request(
-            PrivilegedCommandProgram::Nft,
-            &[
-                "add",
-                "rule",
-                "inet",
-                "rustynet_g1",
-                "killswitch",
-                "ct",
-                "state",
-                "established,related",
-                "accept",
-            ],
-        )
-        .expect("per-token established/related killswitch rule should be accepted");
+        //
+        // AQ-70/F2: the emitter now sends THREE scoped rules (tcp/udp
+        // `dport != { 53, 853 }` + non-tcp/udp), each accepted here.
+        let head = [
+            "add",
+            "rule",
+            "inet",
+            "rustynet_g1",
+            "killswitch",
+            "ct",
+            "state",
+            "established,related",
+            "meta",
+            "nfproto",
+            "ipv4",
+        ];
+        let scoped_rules: Vec<Vec<&str>> = vec![
+            [
+                head.as_slice(),
+                &["tcp", "dport", "!=", "{", "53,", "853", "}", "accept"],
+            ]
+            .concat(),
+            [
+                head.as_slice(),
+                &["udp", "dport", "!=", "{", "53,", "853", "}", "accept"],
+            ]
+            .concat(),
+            [
+                head.as_slice(),
+                &["meta", "l4proto", "!=", "{", "tcp,", "udp", "}", "accept"],
+            ]
+            .concat(),
+        ];
+        for argv in &scoped_rules {
+            validate_request(PrivilegedCommandProgram::Nft, argv).unwrap_or_else(|err| {
+                panic!("scoped established/related rule {argv:?} should be accepted: {err}")
+            });
+        }
+        // The same three shapes are accepted on the `forward` chain.
+        for argv in &scoped_rules {
+            let mut forward_argv = argv.clone();
+            forward_argv[4] = "forward";
+            validate_request(PrivilegedCommandProgram::Nft, &forward_argv).unwrap_or_else(|err| {
+                panic!("forward scoped rule {forward_argv:?} should be accepted: {err}")
+            });
+        }
+    }
+
+    /// AQ-70/F2 fail-closed pin: the historical UNQUALIFIED
+    /// `ct state established,related accept` shape is no longer in this
+    /// allowlist — it admitted established IPv6 in an IPv4-only posture and
+    /// first-match-shadowed the DNS drops. The helper must refuse it so a
+    /// regression back to the unscoped form fails at the privileged boundary
+    /// (RN-12 precedent) instead of silently reinstalling the hole.
+    #[test]
+    fn validate_request_rejects_unscoped_established_related_rule() {
+        for chain in ["killswitch", "forward"] {
+            let err = validate_request(
+                PrivilegedCommandProgram::Nft,
+                &[
+                    "add",
+                    "rule",
+                    "inet",
+                    "rustynet_g1",
+                    chain,
+                    "ct",
+                    "state",
+                    "established,related",
+                    "accept",
+                ],
+            )
+            .expect_err("unscoped established/related accept should be refused");
+            assert!(err.contains("unsupported nft add rule argument schema"));
+        }
     }
 
     /// RN-12/IPV-01/RN-29: every scoped exit-node egress rule the emitter
@@ -4076,7 +4261,11 @@ mod tests {
             "ipv4",
         ];
         let scoped_rules: Vec<Vec<&str>> = vec![
-            [head.as_slice(), &["udp", "dport", "53", "drop"]].concat(),
+            [
+                head.as_slice(),
+                &["udp", "dport", "{", "53,", "853", "}", "drop"],
+            ]
+            .concat(),
             [
                 head.as_slice(),
                 &["tcp", "dport", "{", "53,", "853", "}", "drop"],
@@ -4603,7 +4792,49 @@ mod tests {
 
     #[test]
     fn validate_request_accepts_wireguard_listen_port_egress_allow_rule() {
+        // AQ-70/F3: the scoped emitter shape (`meta nfproto ipv4`) is the
+        // accepted form; the unscoped legacy shape is refused below.
         validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "oifname",
+                "enp0s1",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "udp",
+                "dport",
+                "51820",
+                "accept",
+            ],
+        )
+        .expect("wireguard listen port egress allow rule schema should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Nft,
+            &[
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "killswitch",
+                "oifname",
+                "enp0s1",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "udp",
+                "sport",
+                "51820",
+                "accept",
+            ],
+        )
+        .expect("wireguard source port egress allow rule schema should be accepted");
+        let err = validate_request(
             PrivilegedCommandProgram::Nft,
             &[
                 "add",
@@ -4619,7 +4850,8 @@ mod tests {
                 "accept",
             ],
         )
-        .expect("wireguard listen port egress allow rule schema should be accepted");
+        .expect_err("unscoped wireguard port allow should be refused");
+        assert!(err.contains("unsupported nft add rule argument schema"));
     }
 
     #[test]
@@ -4634,6 +4866,9 @@ mod tests {
                 "killswitch",
                 "oifname",
                 "enp0s1",
+                "meta",
+                "nfproto",
+                "ipv4",
                 "udp",
                 "dport",
                 "notaport",

@@ -3,10 +3,12 @@
 pub mod anchor_port_mapping_status;
 pub mod anchor_tls;
 pub mod blind_exit_reversal_audit;
+pub mod core_hardening;
 pub mod daemon;
 pub mod dataplane_candidates;
 pub mod enrollment_consume;
 pub mod enrollment_replay_audit;
+pub mod enrollment_secret_custody;
 pub mod enrollment_token;
 pub mod exit_codes;
 pub mod fetcher;
@@ -98,3 +100,6 @@ pub mod windows_runtime_boundary;
 pub mod windows_service;
 pub mod windows_service_hardening;
 pub mod windows_tunnel_smoke;
+
+#[cfg(test)]
+mod witness_listing;

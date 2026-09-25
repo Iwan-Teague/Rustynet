@@ -23,3 +23,15 @@ windows-sys = { version = "0.59.0", features = [
     "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
+
+[lints.rust]
+# Downgrade the workspace `unsafe_code = "forbid"` (root Cargo.toml:47-48) to
+# `deny` — the same scoped-override pattern rustynetd uses (crates/rustynetd/
+# Cargo.toml:58-65) — so the `#[allow(unsafe_code)]` on the `imp` module in
+# src/lib.rs can take effect. `[lints] workspace = true` is deliberately NOT
+# used: inherited workspace lints cannot be overridden per crate (cargo:
+# "cannot override `workspace.lints` in `lints`"), and forbid admits no allow.
+# That cfg(windows) `imp` module is the only place in this crate permitted to
+# use unsafe (Windows FFI: DPAPI, WFP, IpHelper, RPC, registry); every site in
+# it carries a `// SAFETY:` comment.
+unsafe_code = "deny"
