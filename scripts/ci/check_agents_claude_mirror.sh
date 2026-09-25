@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Fail if AGENTS.md and CLAUDE.md have drifted apart.
 #
 # The two files are intentionally byte-identical: different tools read each by
@@ -13,9 +13,12 @@
 #   - CI: the "Repo hygiene gates" step of .github/workflows/cross-platform-ci.yml
 #   - the commit-staleness pre-commit hook: scripts/git-hooks/pre-commit
 
-set -eu
+set -euo pipefail
 
-root=$(git rev-parse --show-toplevel)
+# Resolve the rustynet project root from this script's location (scripts/ci/ -> ../..):
+# `git rev-parse --show-toplevel` returns the SUPERPROJECT root when rustynet is
+# in-tree in rustysuite, where no AGENTS.md exists, so the gate failed there.
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if cmp -s "$root/AGENTS.md" "$root/CLAUDE.md"; then
   echo "AGENTS.md == CLAUDE.md (mirror OK)"

@@ -1304,10 +1304,10 @@ pub fn execute_ops_run_phase10_hp2_gates() -> Result<String, String> {
         )?;
     }
     let backend_tests = [
-        "tests::latest_handshake_parser_rejects_oversized_or_malformed_output",
-        "tests::linux_backend_reads_latest_handshake_for_configured_peer",
-        "tests::linux_backend_reports_transport_socket_identity_blocker",
-        "tests::macos_backend_reports_transport_socket_identity_blocker",
+        "linux_command::tests::latest_handshake_parser_rejects_oversized_or_malformed_output",
+        "linux_command::tests::linux_backend_reads_latest_handshake_for_configured_peer",
+        "linux_command::tests::linux_backend_reports_transport_socket_identity_blocker",
+        "macos_command::tests::macos_backend_reports_transport_socket_identity_blocker",
     ];
     for test_name in backend_tests {
         run_logged_test(

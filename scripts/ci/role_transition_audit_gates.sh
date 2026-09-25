@@ -44,7 +44,7 @@ run_required_test -p rustynet-control role_audit::tests::reordering_entries_brea
 run_required_test -p rustynet-control role_audit::tests::capability_mutation_payload_contains_capability
 
 # Eight-preset vocabulary feeding the audit events.
-run_required_test -p rustynet-control role_presets::tests::preset_table_has_exactly_eight_entries
+run_required_test -p rustynet-control role_presets::tests::preset_table_has_exactly_nine_entries
 run_required_test -p rustynet-control role_presets::tests::capability_str_round_trip
 
 echo "Role-transition audit gates: PASS"
