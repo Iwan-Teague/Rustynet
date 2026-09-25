@@ -1408,6 +1408,14 @@ enum OpsCommand {
         artifacts_dir: Option<PathBuf>,
         require_artifacts: Vec<String>,
     },
+    // AQ-11 N-B (v2): `ops verify-release-manifest --help` used to die with
+    // bad_args "missing required option: --manifest" because this arm had no
+    // help handling at all. This variant prints the subcommand's usage line
+    // (which advertises --require-artifact). Deliberately NOT load-bearing
+    // for the macOS bootstrap: its capability probe is behavioural (it runs
+    // the real verify), so a CLI that advertises the flag without enforcing
+    // it is still refused.
+    VerifyReleaseManifestHelp,
     ApplyManagedDnsRouting,
     ClearManagedDnsRouting,
     DisconnectCleanup,
@@ -2321,6 +2329,11 @@ fn parse_command(args: &[String]) -> CliCommand {
         rest => CliCommand::UsageError(format!("unknown command: {}", rest.join(" "))),
     }
 }
+
+/// The single usage line for `ops verify-release-manifest`, shared verbatim
+/// by the top-level help text and the subcommand's own `--help` (AQ-11 N-B
+/// v2) so the two can never drift.
+const OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE: &str = "  ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>] [--require-artifact <filename>]...";
 
 fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
     if args.is_empty() {
@@ -5444,13 +5457,22 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 generated_at_unix,
             })
         }
-        "verify-release-manifest" => Ok(OpsCommand::VerifyReleaseManifest {
-            manifest: parser.required_path("--manifest")?,
-            pinned_verifier_key_hex: parser.value("--pinned-verifier-key-hex"),
-            pinned_verifier_key_file: parser.optional_path("--pinned-verifier-key-file"),
-            artifacts_dir: parser.optional_path("--artifacts-dir"),
-            require_artifacts: collect_repeated_option_values(&args[1..], "--require-artifact"),
-        }),
+        "verify-release-manifest" => {
+            // AQ-11 N-B (v2): `--help`/`-h` prints this subcommand's usage
+            // line (which includes --require-artifact) instead of failing
+            // with bad_args "missing required option: --manifest". A help
+            // request is never a usage error.
+            if args[1..].iter().any(|arg| arg == "--help") {
+                return Ok(OpsCommand::VerifyReleaseManifestHelp);
+            }
+            Ok(OpsCommand::VerifyReleaseManifest {
+                manifest: parser.required_path("--manifest")?,
+                pinned_verifier_key_hex: parser.value("--pinned-verifier-key-hex"),
+                pinned_verifier_key_file: parser.optional_path("--pinned-verifier-key-file"),
+                artifacts_dir: parser.optional_path("--artifacts-dir"),
+                require_artifacts: collect_repeated_option_values(&args[1..], "--require-artifact"),
+            })
+        }
         "apply-managed-dns-routing" => {
             if args.len() != 1 {
                 return Err("ops apply-managed-dns-routing does not accept options".to_owned());
@@ -9314,6 +9336,11 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             pinned_verifier_key_file,
             artifacts_dir,
             require_artifacts,
+        ),
+        OpsCommand::VerifyReleaseManifestHelp => Ok(
+            OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE
+                .trim()
+                .to_owned(),
         ),
         OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
         OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
@@ -20544,7 +20571,7 @@ fn help_text() -> String {
         "  ops check-assignment-refresh-availability",
         "  ops install-trust-material --verifier-source <absolute-path> --trust-source <absolute-path> --verifier-dest <absolute-path> --trust-dest <absolute-path> [--daemon-group <group>]",
         "  ops create-release-manifest --artifact <name>:<target>:<path> [--artifact ...] --signing-seed-file <path> --output <path> [--release-track <track>] [--key-id <id>] [--generated-at-unix <secs>]",
-        "  ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>] [--require-artifact <filename>]...",
+        OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE,
         "  ops apply-managed-dns-routing",
         "  ops clear-managed-dns-routing",
         "  ops disconnect-cleanup",
@@ -22827,13 +22854,13 @@ mod guest_claim_wiring_tests {
 mod tests {
     use super::{
         AnchorCommand, CliCommand, DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, MembershipCommand,
-        MembershipEvidenceSummary, MembershipOperation, PHASE6_MAX_EVIDENCE_AGE_SECS,
-        Phase6Platform, Phase6ProbeMetadataView, RoleCapability,
-        build_membership_audit_replay_json, build_membership_evidence_diff_json,
+        MembershipEvidenceSummary, MembershipOperation, OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE,
+        OpsCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, Phase6ProbeMetadataView,
+        RoleCapability, build_membership_audit_replay_json, build_membership_evidence_diff_json,
         classify_cli_error, command_supports_json_render, consume_enrollment_token_locked,
         contains_ip_rule_lookup_table, detect_tampered_log, execute,
-        execute_macos_relay_service_action, extract_json_flag, finalize_role_audit, help_text,
-        is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
+        execute_macos_relay_service_action, execute_ops, extract_json_flag, finalize_role_audit,
+        help_text, is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
         load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
         parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
@@ -27967,6 +27994,45 @@ mod tests {
         assert!(matches!(parse(&["help"]), CliCommand::Help));
         assert!(matches!(parse(&["--help"]), CliCommand::Help));
         assert!(matches!(parse(&["-h"]), CliCommand::Help));
+    }
+
+    #[test]
+    fn ops_verify_release_manifest_help_is_help_not_bad_args() {
+        // AQ-11 N-B (2026-09-25): `ops verify-release-manifest --help` used to
+        // die with bad_args "missing required option: --manifest" — the arm
+        // had no --help handling at all, so a help request was indistinguishable
+        // from a misuse and the macOS bootstrap's capability probe could never
+        // pass against a real build. A help request must parse as help, never
+        // as a usage error.
+        for argv in [&["ops", "verify-release-manifest", "--help"][..]] {
+            match parse(argv) {
+                CliCommand::Ops(command) => assert!(
+                    matches!(*command, OpsCommand::VerifyReleaseManifestHelp),
+                    "`{argv:?}` must parse as VerifyReleaseManifestHelp, got {command:?}"
+                ),
+                other => panic!("expected CliCommand::Ops for {argv:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn ops_verify_release_manifest_help_advertises_require_artifact() {
+        // The usage line the subcommand help prints must advertise the
+        // --require-artifact flag, and it must be the SAME line the top-level
+        // help text lists (one shared constant, so they cannot drift).
+        let text = execute_ops(OpsCommand::VerifyReleaseManifestHelp).expect("help executes Ok");
+        assert!(
+            text.contains("--require-artifact"),
+            "subcommand help must advertise --require-artifact: {text}"
+        );
+        assert!(
+            text.contains("ops verify-release-manifest"),
+            "subcommand help must name the subcommand: {text}"
+        );
+        assert!(
+            help_text().contains(OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE),
+            "top-level help must carry the shared usage line verbatim"
+        );
     }
 
     #[test]

@@ -2788,6 +2788,190 @@ mod tests {
         );
     }
 
+    /// AQ-247 / OI-47 (accepted 2026-09-25): the owner generated the release
+    /// signing key and relayed its Ed25519 PUBLIC half, so the bootstrap and
+    /// its orchestrator wrapper now embed that key as the DEFAULT pinned
+    /// verifier key. An explicit `RUSTYNET_RELEASE_PINNED_KEY_HEX` /
+    /// `RUSTYNET_RELEASE_PINNED_KEY_FILE` (bootstrap) or
+    /// `--verifier-key-hex` / `--verifier-key-file` (wrapper) still wins.
+    /// These pins supersede the old fail-closed contract ("no release
+    /// verifier key is pinned yet" — correct at AQ-11 landing time, when the
+    /// key did not yet exist). The key below is the ONLY 64-hex key constant
+    /// these scripts may embed; the matching private seed is owner-held and
+    /// never enters this tree.
+    const AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX: &str =
+        "720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723";
+
+    #[test]
+    fn aq247_bootstrap_pins_owner_release_verifier_key_as_embedded_default() {
+        let key_line = format!(
+            "readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX=\"{AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX}\""
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(&key_line),
+            "bootstrap must embed the owner release verifier key (AQ-247/OI-47) as the \
+             readonly default pin, character for character"
+        );
+        // Exactly once: a duplicated key constant would make later rotation
+        // ambiguous (which copy is authoritative?).
+        assert_eq!(
+            BOOTSTRAP_SCRIPT
+                .matches(AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX)
+                .count(),
+            1,
+            "the owner release verifier key must be embedded exactly once in the bootstrap"
+        );
+        // The default must actually be USED when no explicit key is given.
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("rn_key_hex=\"${RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX}\""),
+            "bootstrap must fall back to the embedded default key when neither \
+             RUSTYNET_RELEASE_PINNED_KEY_HEX nor RUSTYNET_RELEASE_PINNED_KEY_FILE is set"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_key_args=(--pinned-key-hex \"${rn_key_hex}\")"),
+            "the resolved (default or explicit) key must reach the verifier as an explicit \
+             --pinned-key-hex flag, never via ambient environment"
+        );
+    }
+
+    #[test]
+    fn aq247_bootstrap_dropped_the_old_keyless_fail_closed_message() {
+        for forbidden in [
+            "no release verifier key is pinned yet",
+            "pending owner decision OI-47",
+            "a trust anchor is never invented",
+        ] {
+            assert!(
+                !BOOTSTRAP_SCRIPT.contains(forbidden),
+                "the old keyless fail-closed message {forbidden:?} must be gone now that \
+                 the owner key is pinned (AQ-247); re-add it ONLY if the default key is \
+                 ever removed again"
+            );
+        }
+        // The explicit-key override paths must survive unchanged.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_key_args=(--pinned-key-hex \"${rn_key_hex}\")")
+                && BOOTSTRAP_SCRIPT.contains("rn_key_args=(--pinned-key-file \"${rn_key_file}\")"),
+            "explicit key overrides (--pinned-key-hex / --pinned-key-file) must still exist"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(
+                "both RUSTYNET_RELEASE_PINNED_KEY_HEX and RUSTYNET_RELEASE_PINNED_KEY_FILE set"
+            ),
+            "giving BOTH explicit keys must still be refused (AQ-247 keeps every other \
+             fail-closed path)"
+        );
+    }
+
+    #[test]
+    fn aq247_bootstrap_builds_verifier_from_local_checkout_never_payload() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_build_local_verifier_cli"),
+            "bootstrap must have a verifier-from-source fallback (AQ-247/OI-47)"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("cargo build --release --locked -p rustynet-cli --manifest-path"),
+            "the verifier fallback must build rustynet-cli with `cargo build --release \
+             --locked -p rustynet-cli`"
+        );
+        // Provenance refusal BEFORE the build: building executes the
+        // checkout's own build scripts, so refusing only the finished binary
+        // would already have run payload-chosen code.
+        let refuse_idx = BOOTSTRAP_SCRIPT
+            .find(
+                "refuse_payload_provenance \"${checkout}/Cargo.toml\" \"verifier source checkout\"",
+            )
+            .expect("verifier fallback must refuse a payload-sourced checkout");
+        let build_idx = BOOTSTRAP_SCRIPT
+            .find("cargo build --release --locked -p rustynet-cli --manifest-path")
+            .expect("verifier fallback must build rustynet-cli from source");
+        assert!(
+            refuse_idx < build_idx,
+            "the verifier source checkout must be provenance-refused BEFORE cargo runs \
+             (AQ-11 F4: building executes build scripts)"
+        );
+        // The build runs as the non-root real user (the bootstrap's own
+        // as_user wrapper), never as root.
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("as_user \"${brew_rustup}\" run stable cargo build --release --locked -p rustynet-cli"),
+            "the verifier build must run via as_user (non-root real user), never as root"
+        );
+    }
+
+    #[test]
+    fn aq247_wrapper_pins_owner_release_verifier_key_as_embedded_default() {
+        let key_line = format!(
+            "readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX=\"{AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX}\""
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains(&key_line),
+            "rn_bootstrap_macos.sh must embed the owner release verifier key (AQ-247/OI-47) \
+             as the readonly default pin, character for character"
+        );
+        assert_eq!(
+            MACOS_BOOTSTRAP_WRAPPER
+                .matches(AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX)
+                .count(),
+            1,
+            "the owner release verifier key must be embedded exactly once in the wrapper"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER
+                .contains("VERIFIER_KEY_HEX=\"${RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX}\""),
+            "wrapper must fall back to the embedded default key when neither \
+             --verifier-key-hex nor --verifier-key-file is given"
+        );
+        // ...and forward the resolved default to the bootstrap via the env
+        // file, so both stages verify under the SAME pinned key.
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER
+                .contains("printf 'RUSTYNET_RELEASE_PINNED_KEY_HEX=%q\\n' \"$VERIFIER_KEY_HEX\""),
+            "wrapper must forward the resolved key (default or explicit) to the bootstrap \
+             env file so both stages verify under the same pinned key"
+        );
+        for forbidden in [
+            "no release verifier key is pinned yet",
+            "pending owner decision OI-47",
+        ] {
+            assert!(
+                !MACOS_BOOTSTRAP_WRAPPER.contains(forbidden),
+                "the old keyless fail-closed message {forbidden:?} must be gone from the \
+                 wrapper now that the owner key is pinned (AQ-247)"
+            );
+        }
+    }
+
+    #[test]
+    fn aq247_wrapper_builds_verifier_from_local_checkout_never_payload() {
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains("rn_build_local_verifier_cli"),
+            "wrapper must have a verifier-from-source fallback (AQ-247/OI-47)"
+        );
+        assert!(
+            MACOS_BOOTSTRAP_WRAPPER.contains(
+                "\"${cargo_bin}\" build --release --locked -p rustynet-cli --manifest-path"
+            ),
+            "the wrapper verifier fallback must build rustynet-cli with `cargo build \
+             --release --locked -p rustynet-cli` (${{cargo_bin}} = the resolved cargo) \
+             from the LOCAL checkout"
+        );
+        let refuse_idx = MACOS_BOOTSTRAP_WRAPPER
+            .find(
+                "refuse_payload_provenance \"${checkout}/Cargo.toml\" \"verifier source checkout\"",
+            )
+            .expect("wrapper verifier fallback must refuse a payload-sourced checkout");
+        let build_idx = MACOS_BOOTSTRAP_WRAPPER
+            .find("\"${cargo_bin}\" build --release --locked -p rustynet-cli --manifest-path")
+            .expect("wrapper verifier fallback must build rustynet-cli from source");
+        assert!(
+            refuse_idx < build_idx,
+            "the verifier source checkout must be provenance-refused BEFORE cargo runs \
+             (AQ-11 F4: building executes build scripts)"
+        );
+    }
+
     /// HIGH 1 reviewer fold-in (Phase 21 follow-up).
     ///
     /// The `chmod 0600` MUST happen BEFORE `openssl rand` writes any

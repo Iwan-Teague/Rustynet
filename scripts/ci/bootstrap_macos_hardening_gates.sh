@@ -350,8 +350,11 @@ fi
 # and the extracted object are the same private file and the shared
 # received path is never consumed. The runtime verify must also read the
 # stage (`--artifacts-dir "$RN_VERIFY_STAGE"`) and require the archive by
-# name (`--require-artifact`). The `--help` capability probe (AQ-11 N-B) is
-# not the runtime verify and is excluded (AQ-11 NE-1). Fail-closed: a
+# name (`--require-artifact`). The N-B capability probe (BEHAVIOURAL since
+# the AQ-11 N-B v2 fix: the real verify against
+# `__rustynet_require_artifact_probe__`, a name no signed manifest lists) is
+# not the runtime verify and is excluded by its probe-name token
+# (AQ-11 NE-1). Fail-closed: a
 # missing call, stage, verify or tar, a wrong ORDER, or a verify that does
 # not read the stage is a failure.
 for f in "${targets[@]}"; do
@@ -368,10 +371,15 @@ for f in "${targets[@]}"; do
   # `set -o pipefail` before the diagnostic is printed.
   call_line="$(printf '%s\n' "${code_lines}" | grep -E '^[0-9]+:[[:space:]]*verify_source_archive[[:space:]]*$' | head -1 | cut -d: -f1 || true)"
   tar_line="$(printf '%s\n' "${code_lines}" | grep -E 'tar[[:space:]]+-xzf.*VERIFY_STAGED_ARCHIVE' | head -1 | cut -d: -f1 || true)"
-  # AQ-11 NE-1: the wrapper also runs `ops verify-release-manifest --help`
-  # as its N-B capability probe, EARLIER in the file; the ordering must be
-  # measured on the runtime verify, so the probe line is excluded.
-  verify_cmd_lines="$(printf '%s\n' "${code_lines}" | grep -E 'ops[[:space:]]+verify-release-manifest' | grep -v -- '--help' || true)"
+  # AQ-11 NE-1 / N-B v2: the wrapper also runs `ops verify-release-manifest`
+  # as its N-B capability probe EARLIER in the file — behavioural since the
+  # v2 fix: the real verify with `--require-artifact
+  # "__rustynet_require_artifact_probe__"` (a name no signed manifest
+  # lists). The ordering must be measured on the runtime verify, so the
+  # probe line is excluded by its probe-name token. Never weakened: exactly
+  # one NON-probe runtime verify is still required, and a decoy verify that
+  # merely mentions the probe name cannot satisfy the count.
+  verify_cmd_lines="$(printf '%s\n' "${code_lines}" | grep -E 'ops[[:space:]]+verify-release-manifest' | grep -v -- '__rustynet_require_artifact_probe__' || true)"
   stage_lines="$(printf '%s\n' "${code_lines}" | grep -E 'install[[:space:]]+-m[[:space:]]+0600' || true)"
   verify_cmd_line="$(printf '%s\n' "${verify_cmd_lines}" | head -1 | cut -d: -f1)"
   stage_line="$(printf '%s\n' "${stage_lines}" | head -1 | cut -d: -f1)"
@@ -411,8 +419,9 @@ for f in "${targets[@]}"; do
     continue
   fi
   # AQ-11 NE-1: the v4 assertion demanded verify BEFORE stage, the inverse
-  # of the shipped order, and only passed because it measured the --help
-  # probe. The required order is stage < verify < tar.
+  # of the shipped order, and only passed because it measured the N-B
+  # capability probe (then a `--help` grep, now behavioural). The required
+  # order is stage < verify < tar.
   if [[ "${stage_line}" -ge "${verify_cmd_line}" ]]; then
     echo "FAIL verify-before-extract [${f}]: private staging copy at line ${stage_line} is NOT before 'ops verify-release-manifest' at line ${verify_cmd_line} (AQ-11 N-A: stage FIRST, then verify the staged copy)" >&2
     status=1
