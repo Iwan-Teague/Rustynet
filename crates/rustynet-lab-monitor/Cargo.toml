@@ -22,8 +22,8 @@ name = "rustynet-lab-monitor"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.28"
-crossterm = { version = "0.28", features = ["event-stream"] }
+ratatui = "0.30"
+crossterm = { version = "0.29", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
