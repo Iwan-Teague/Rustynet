@@ -320,9 +320,285 @@ pub struct EncryptedKeyBlob {
     pub ciphertext: Vec<u8>,
 }
 
+/// The result of asking a secure store *whether an item exists* without
+/// treating "cannot answer" as "absent" (AQ-45 step 2, design
+/// `charter/design/rustynet-control-db-atrest-v0.2.md` §4).
+///
+/// [`OsSecureStore::load_key`] collapses three different answers into one
+/// `Err`: the item is absent, the store is broken, and the platform backend
+/// cannot distinguish the two. A caller that must decide whether to mint a
+/// fresh key — and must never overwrite an existing one — needs the
+/// distinction, so the lookup surface reports all three:
+///
+/// - [`OsStoreLookup::Found`] — the item exists; the payload is the same
+///   byte sequence [`OsSecureStore::load_key`] would return.
+/// - [`OsStoreLookup::ProvedAbsent`] — every platform mechanism the load
+///   path consults answered, and all of them positively reported "no such
+///   item". Only this variant may trigger key minting.
+/// - [`OsStoreLookup::Unavailable`] — the store could not answer (backend
+///   failure, missing OS facility, transport error, or a load-path mechanism
+///   that failed for a reason other than item-not-found). A caller must
+///   treat this as "unknown", never as "absent".
+#[derive(Clone, PartialEq, Eq)]
+pub enum OsStoreLookup {
+    Found(Zeroizing<Vec<u8>>),
+    ProvedAbsent,
+    Unavailable,
+}
+
+impl fmt::Debug for OsStoreLookup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Found payloads are key material; the Debug must never carry the
+        // bytes (same discipline as `SecretKey` / `ValueCipher`).
+        match self {
+            OsStoreLookup::Found(_) => f.write_str("Found(REDACTED)"),
+            OsStoreLookup::ProvedAbsent => f.write_str("ProvedAbsent"),
+            OsStoreLookup::Unavailable => f.write_str("Unavailable"),
+        }
+    }
+}
+
+/// Platform-independent classification of the macOS Security framework's
+/// numeric status codes (AQ-45 step 2). Kept out of the `cfg(macos)` block so
+/// its unit tests — and the failure-mode contract they pin — compile and run
+/// on every platform.
+// The classifiers are compiled (and unit-tested) on every platform so the
+// absence-proof contract is pinned everywhere; their non-test call sites are
+// inside per-platform lookup paths, so on the other platforms they are
+// deliberately unreferenced outside tests.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacKeychainProbe {
+    /// The framework/CLI positively reported that no matching item exists.
+    ItemNotFound,
+    /// Any other outcome: the keychain could not be consulted.
+    Unavailable,
+}
+
+/// `errSecItemNotFound` (Security.framework `SecBase.h`; verified at
+/// MacOSX.sdk `Security.framework/Headers/SecBase.h:353`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const MACOS_ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+/// Exit code `/usr/bin/security find-generic-password` returns for a missing
+/// item ("The specified item could not be found in the keychain."), verified
+/// empirically on the macOS host; `security(1)` documents no exit-status
+/// table, so this constant is pinned by test rather than by manpage.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const MACOS_SECURITY_CLI_EXIT_ITEM_NOT_FOUND: i32 = 44;
+
+/// Classify a Security.framework status code: only `errSecItemNotFound`
+/// counts as a positive "absent" answer; every other code (including
+/// `errSecNoDefaultKeychain`) means the keychain could not be consulted.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_macos_framework_status(code: i32) -> MacKeychainProbe {
+    if code == MACOS_ERR_SEC_ITEM_NOT_FOUND {
+        MacKeychainProbe::ItemNotFound
+    } else {
+        MacKeychainProbe::Unavailable
+    }
+}
+
+/// Classify a `/usr/bin/security` exit status. `None` (terminated by signal)
+/// and any unrecognized code are inconclusive.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_macos_cli_exit(exit: Option<i32>) -> MacKeychainProbe {
+    match exit {
+        Some(code) if code == MACOS_SECURITY_CLI_EXIT_ITEM_NOT_FOUND => {
+            MacKeychainProbe::ItemNotFound
+        }
+        _ => MacKeychainProbe::Unavailable,
+    }
+}
+
+/// `errSecNoDefaultKeychain` (Security.framework `SecBase.h`): the process
+/// has no default keychain, which is the normal state for a headless
+/// launchd daemon (AQ-45 step-2 review finding F6; owner decision OI-21
+/// blesses daemons on the file-based System keychain).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const MACOS_ERR_SEC_NO_DEFAULT_KEYCHAIN: i32 = -25307;
+
+/// Outcome of macOS lookup probe 1 (framework read of the session's DEFAULT
+/// keychain) for absence-conjunction purposes (AQ-45 review finding F6).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MacosDefaultKeychainProbe {
+    /// The default keychain was consulted and does not hold the item.
+    ItemNotFound,
+    /// The process has NO default keychain (`errSecNoDefaultKeychain`,
+    /// -25307): the probe did not consult any keychain, and on the OI-21(a)
+    /// daemon deployment shape that is expected, not a store failure. This
+    /// outcome is NOT APPLICABLE and must not poison the absence
+    /// conjunction; the System-keychain probes (2 and 3) still have to prove
+    /// absence positively on their own.
+    NotApplicableNoDefaultKeychain,
+    /// Any other failure: a keychain was there but could not be consulted.
+    Unavailable,
+}
+
+/// Classify macOS probe 1's framework status code. ONLY
+/// [`MACOS_ERR_SEC_NO_DEFAULT_KEYCHAIN`] is not-applicable; any other error
+/// (including [`MACOS_ERR_SEC_ITEM_NOT_FOUND`], handled here for
+/// completeness) keeps its existing meaning, and every other code stays
+/// `Unavailable`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_macos_default_keychain_probe(code: i32) -> MacosDefaultKeychainProbe {
+    if code == MACOS_ERR_SEC_NO_DEFAULT_KEYCHAIN {
+        MacosDefaultKeychainProbe::NotApplicableNoDefaultKeychain
+    } else {
+        match classify_macos_framework_status(code) {
+            MacKeychainProbe::ItemNotFound => MacosDefaultKeychainProbe::ItemNotFound,
+            MacKeychainProbe::Unavailable => MacosDefaultKeychainProbe::Unavailable,
+        }
+    }
+}
+
+/// The absence conjunction across macOS lookup probes 1/2/3 (AQ-45 review
+/// finding F6): `true` (candidate for `ProvedAbsent`) only when every
+/// APPLICABLE probe positively answered item-not-found. A probe-1
+/// not-applicable (`errSecNoDefaultKeychain`, headless daemon) does not
+/// poison the conjunction, but BOTH System-keychain probes (2 and 3) must
+/// still prove absence positively; any other probe-1 error — and any
+/// probe-2/3 failure — makes the conjunction false (`Unavailable`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn combine_macos_absence_probes(
+    probe1_default_keychain: MacosDefaultKeychainProbe,
+    probe2_system_owned: MacKeychainProbe,
+    probe3_system_cli: MacKeychainProbe,
+) -> bool {
+    let probe1_ok = matches!(
+        probe1_default_keychain,
+        MacosDefaultKeychainProbe::ItemNotFound
+            | MacosDefaultKeychainProbe::NotApplicableNoDefaultKeychain
+    );
+    probe1_ok
+        && probe2_system_owned == MacKeychainProbe::ItemNotFound
+        && probe3_system_cli == MacKeychainProbe::ItemNotFound
+}
+
+/// Platform-independent classification of a `secret-tool search --all`
+/// invocation (AQ-45 step 2), compiled on every platform for the same reason
+/// as [`classify_macos_framework_status`].
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinuxSecretToolProbe {
+    /// `search --all` succeeded and printed nothing: no item carries the
+    /// attribute among the items VISIBLE to the session's secret service.
+    /// On a host with no reachable secret service the same outcome occurs
+    /// vacuously (verified live: exit 0, empty stdout), so this alone is NOT
+    /// an absence proof — [`lookup_linux_secret_service`] additionally
+    /// requires [`classify_linux_secrets_name_has_owner`] to confirm that
+    /// `org.freedesktop.secrets` actually has an owner on the session bus.
+    ProvedNoItems,
+    /// Success with output (item exists — inconclusive for absence) or any
+    /// failure (no reachable secret service, transport error).
+    Inconclusive,
+}
+
+/// Classify `secret-tool search --all <attr> <value>`: an empty result is
+/// only the search half of the absence proof. `secret-tool lookup` cannot
+/// play any role here: it exits non-zero both for absent items and for
+/// "could not connect" (verified live), so its failure is ambiguous.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_linux_secret_tool_search(
+    success: bool,
+    stdout_empty: bool,
+) -> LinuxSecretToolProbe {
+    if success && stdout_empty {
+        LinuxSecretToolProbe::ProvedNoItems
+    } else {
+        LinuxSecretToolProbe::Inconclusive
+    }
+}
+
+/// Outcome of the `org.freedesktop.secrets` name-owner check that turns a
+/// `LinuxSecretToolProbe::ProvedNoItems` search result into an absence
+/// proof (AQ-45 review finding F2).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LinuxSecretServicePresence {
+    /// `org.freedesktop.secrets` has an owner on the session bus: a secret
+    /// service is actually running and the empty search result is meaningful.
+    Owned,
+    /// The name has no owner, `dbus-send` is not installed, or the check
+    /// failed for any reason (no session bus, non-zero exit, malformed
+    /// reply). The empty search result is vacuous; the lookup is
+    /// `Unavailable`.
+    Unavailable,
+}
+
+/// Classify a `dbus-send --session --print-reply --dest=org.freedesktop.DBus
+/// /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner
+/// string:org.freedesktop.secrets` outcome. `reply_says_owned` is
+/// `Some(true)`/`Some(false)` when the daemon answered with a D-Bus boolean,
+/// and `None` for every failure shape: `dbus-send` missing (spawn error),
+/// no session bus, non-zero exit, or an unparseable reply. ONLY an owned
+/// name completes the absence proof; every other outcome is `Unavailable`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_linux_secrets_name_has_owner(
+    reply_says_owned: Option<bool>,
+) -> LinuxSecretServicePresence {
+    match reply_says_owned {
+        Some(true) => LinuxSecretServicePresence::Owned,
+        Some(false) | None => LinuxSecretServicePresence::Unavailable,
+    }
+}
+
+/// Platform-independent classification of a Windows file-stat failure
+/// (AQ-45 step 2).
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowsDpapiProbe {
+    /// The DPAPI blob file does not exist.
+    ItemNotFound,
+    /// Any other stat failure (permission, I/O).
+    Unavailable,
+}
+
+/// Classify a `symlink_metadata` error kind for a DPAPI blob path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn classify_windows_dpapi_item_missing(kind: std::io::ErrorKind) -> WindowsDpapiProbe {
+    if kind == std::io::ErrorKind::NotFound {
+        WindowsDpapiProbe::ItemNotFound
+    } else {
+        WindowsDpapiProbe::Unavailable
+    }
+}
+
 pub trait OsSecureStore {
     fn store_key(&self, key_id: &str, key_material: &[u8]) -> Result<(), CryptoError>;
     fn load_key(&self, key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError>;
+
+    /// Ask the store whether `key_id` exists, preserving the "cannot answer"
+    /// case ([`OsStoreLookup`]).
+    ///
+    /// The provided default is deliberately conservative: it can report
+    /// `Found` or `Unavailable` but never `ProvedAbsent`, because a
+    /// `load_key` error cannot distinguish "absent" from "broken". Only
+    /// backends whose platform mechanisms can *prove* absence override this;
+    /// every existing implementor therefore keeps its exact previous
+    /// behavior and can never cause a caller to mint replacement keys.
+    fn lookup_key(&self, key_id: &str) -> OsStoreLookup {
+        match self.load_key(key_id) {
+            Ok(value) => OsStoreLookup::Found(value),
+            Err(_) => OsStoreLookup::Unavailable,
+        }
+    }
+
+    /// Store `key_material` under `key_id` refusing to overwrite an existing
+    /// item ("create-only").
+    ///
+    /// The provided default refuses unconditionally: a backend that cannot
+    /// prove create-only semantics must not silently degrade to the upsert
+    /// behavior of [`OsSecureStore::store_key`]. An `Err` here means "did not
+    /// store"; the item, if any, is untouched.
+    fn store_key_create_only(
+        &self,
+        _key_id: &str,
+        _key_material: &[u8],
+    ) -> Result<(), CryptoError> {
+        Err(CryptoError::OsStoreUnavailable)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +660,46 @@ impl OsSecureStore for PlatformOsSecureStore {
         #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             let _ = key_id;
+            Err(CryptoError::OsStoreUnavailable)
+        }
+    }
+
+    fn lookup_key(&self, key_id: &str) -> OsStoreLookup {
+        #[cfg(target_os = "macos")]
+        {
+            lookup_macos_keychain(key_id)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            lookup_linux_secret_service(key_id)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            lookup_windows_dpapi(key_id)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let _ = key_id;
+            OsStoreLookup::Unavailable
+        }
+    }
+
+    fn store_key_create_only(&self, key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
+        #[cfg(target_os = "macos")]
+        {
+            store_in_macos_keychain_create_only(key_id, key_material)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            store_in_linux_secret_service_create_only(key_id, key_material)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            store_in_windows_dpapi_create_only(key_id, key_material)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        {
+            let _ = (key_id, key_material);
             Err(CryptoError::OsStoreUnavailable)
         }
     }
@@ -985,6 +1301,223 @@ fn delete_macos_system_keychain_generic_password_via_cli(service: &str, account:
         .status();
 }
 
+/// Normalize a macOS keychain payload the same way
+/// [`load_from_macos_keychain`] does (hex-decode-if-hex, legacy compat), so a
+/// [`OsStoreLookup::Found`] payload is byte-identical to what
+/// [`OsSecureStore::load_key`] would have returned for the same item.
+#[cfg(target_os = "macos")]
+fn normalize_macos_keychain_payload(mut value: Vec<u8>) -> Vec<u8> {
+    if let Ok(text) = std::str::from_utf8(&value) {
+        let trimmed = text.trim();
+        let maybe_hex_decoded = (!trimmed.is_empty()
+            && (trimmed.len() & 1) == 0
+            && trimmed.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| hex_decode(trimmed))
+        .and_then(Result::ok);
+        if let Some(decoded) = maybe_hex_decoded {
+            value.zeroize();
+            return decoded;
+        }
+    }
+    value
+}
+
+/// Classifying lookup across the same three mechanisms
+/// [`load_macos_generic_password`] consults, in the same order, preserving
+/// the load path's fallback semantics: the first mechanism that *finds* the
+/// item wins. `ProvedAbsent` is returned only when every APPLICABLE
+/// mechanism positively answered "no such item" (see
+/// [`combine_macos_absence_probes`]): probe 1's `errSecNoDefaultKeychain`
+/// (-25307, the headless-launchd state; OI-21(a) daemons use the file-based
+/// System keychain) is NOT APPLICABLE and does not poison the conjunction,
+/// but the System-keychain probes 2 and 3 must both still prove absence
+/// positively. If any probe fails for any other reason (keychain locked,
+/// spawn failure, signal), the answer is `Unavailable` — a control-plane key
+/// must never be re-minted because one probe could not run.
+#[cfg(target_os = "macos")]
+fn lookup_macos_keychain(key_id: &str) -> OsStoreLookup {
+    if !is_valid_key_identifier(key_id) {
+        return OsStoreLookup::Unavailable;
+    }
+    let service = format!("rustynet.{key_id}");
+    let account = "rustynet";
+
+    // 1. Framework query against the session default keychain search list —
+    //    same call `load_macos_generic_password` makes first.
+    let probe1_default_keychain = match get_generic_password(service.as_str(), account) {
+        Ok(payload) => {
+            return OsStoreLookup::Found(Zeroizing::new(normalize_macos_keychain_payload(payload)));
+        }
+        Err(err) => classify_macos_default_keychain_probe(err.code()),
+    };
+
+    // 2. Owned `SecItemCopyMatching` scoped to the System keychain.
+    let probe2_system_owned =
+        match probe_macos_system_keychain_owned_payload(service.as_str(), account) {
+            Ok(payload) => {
+                return OsStoreLookup::Found(Zeroizing::new(normalize_macos_keychain_payload(
+                    payload,
+                )));
+            }
+            Err(probe) => probe,
+        };
+
+    // 3. `/usr/bin/security find-generic-password` against the System
+    //    keychain (legacy `-A` items).
+    let probe3_system_cli = match load_macos_security_cli_payload(service.as_str(), account) {
+        Ok(payload) => {
+            return OsStoreLookup::Found(Zeroizing::new(normalize_macos_keychain_payload(payload)));
+        }
+        Err(probe) => probe,
+    };
+
+    if combine_macos_absence_probes(
+        probe1_default_keychain,
+        probe2_system_owned,
+        probe3_system_cli,
+    ) {
+        OsStoreLookup::ProvedAbsent
+    } else {
+        OsStoreLookup::Unavailable
+    }
+}
+
+/// Data-carrying counterpart of [`macos_system_keychain_generic_password_present`]:
+/// the owned System-keychain search [`load_macos_generic_password_system_keychain_owned`]
+/// performs, with the framework error code preserved so item-not-found is
+/// distinguishable from "keychain could not be opened/searched".
+#[cfg(target_os = "macos")]
+fn probe_macos_system_keychain_owned_payload(
+    service: &str,
+    account: &str,
+) -> Result<Vec<u8>, MacKeychainProbe> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
+    if service.trim().is_empty() || account.trim().is_empty() {
+        return Err(MacKeychainProbe::Unavailable);
+    }
+    let keychain =
+        SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH).map_err(|_| MacKeychainProbe::Unavailable)?;
+    let keychains = [keychain];
+    match ItemSearchOptions::new()
+        .keychains(&keychains)
+        .class(ItemClass::generic_password())
+        .service(service)
+        .account(account)
+        .load_data(true)
+        .limit(1i64)
+        .search()
+    {
+        Ok(results) => {
+            for result in results {
+                if let SearchResult::Data(data) = result {
+                    return Ok(data);
+                }
+            }
+            // With load_data(true) a hit always carries data; an empty hit
+            // list is not an "absent" proof, so it stays inconclusive
+            // (mirrors load_macos_generic_password_system_keychain_owned).
+            Err(MacKeychainProbe::Unavailable)
+        }
+        Err(err) if err.code() == MACOS_ERR_SEC_ITEM_NOT_FOUND => {
+            Err(MacKeychainProbe::ItemNotFound)
+        }
+        Err(_) => Err(MacKeychainProbe::Unavailable),
+    }
+}
+
+/// `/usr/bin/security find-generic-password -w` payload read with the exit
+/// code preserved: exit 44 is the CLI's item-not-found answer (verified
+/// empirically; see [`MACOS_SECURITY_CLI_EXIT_ITEM_NOT_FOUND`]).
+#[cfg(target_os = "macos")]
+fn load_macos_security_cli_payload(
+    service: &str,
+    account: &str,
+) -> Result<Vec<u8>, MacKeychainProbe> {
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "find-generic-password",
+            "-a",
+            account,
+            "-s",
+            service,
+            "-w",
+            "/Library/Keychains/System.keychain",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map_err(|_| MacKeychainProbe::Unavailable)?;
+    if output.status.success() {
+        let mut bytes = output.stdout;
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+        }
+        return Ok(bytes);
+    }
+    Err(match classify_macos_cli_exit(output.status.code()) {
+        MacKeychainProbe::ItemNotFound => MacKeychainProbe::ItemNotFound,
+        MacKeychainProbe::Unavailable => MacKeychainProbe::Unavailable,
+    })
+}
+
+/// Create-only store into the macOS **System** keychain via `SecItemAdd`:
+/// [`store_macos_generic_password_system_keychain_owned`] minus the
+/// delete-then-add. A pre-existing item is never removed or replaced —
+/// `SecItemAdd` fails (typically `errSecDuplicateItem`, -25299) and that
+/// failure — like every other add failure — is a refusal. AQ-45 step 2 uses
+/// this for control-database DEKs, which must never be silently re-keyed.
+#[cfg(target_os = "macos")]
+pub fn store_macos_generic_password_create_only(
+    service: &str,
+    account: &str,
+    secret: &[u8],
+) -> Result<(), CryptoError> {
+    use core_foundation::data::CFData;
+    use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass, Location};
+    validate_macos_keychain_label("service", service)?;
+    validate_macos_keychain_label("account", account)?;
+    if secret.contains(&0) || service.as_bytes().contains(&0) || account.as_bytes().contains(&0) {
+        return Err(CryptoError::OsStoreUnavailable);
+    }
+    let mut keychain = SecKeychain::open(MACOS_SYSTEM_KEYCHAIN_PATH)
+        .map_err(|_| CryptoError::OsStoreUnavailable)?;
+    // Best-effort no-op when already unlocked (see the owned store path).
+    let _ = keychain.unlock(Some(""));
+    let mut opts = ItemAddOptions::new(ItemAddValue::Data {
+        class: ItemClass::generic_password(),
+        data: CFData::from_buffer(secret),
+    });
+    opts.set_service(service)
+        .set_account_name(account)
+        .set_location(Location::FileKeychain(keychain));
+    // No pre-delete here — that is the entire point. ANY add failure,
+    // including errSecDuplicateItem, is a refusal, not an overwrite.
+    opts.add().map_err(|_| CryptoError::OsStoreUnavailable)?;
+    // Fail-closed read-back through the same SecItemCopyMatching path the
+    // daemon's loader uses (same discipline as the owned store path). The
+    // compare is constant-time for uniformity with `load_or_provision`'s
+    // authoritative adopt-or-refuse compare (AQ-45 review finding F4).
+    match load_macos_generic_password_system_keychain_owned(service, account) {
+        Ok(got) if bool::from(got.as_slice().ct_eq(secret)) => Ok(()),
+        _ => Err(CryptoError::OsStoreUnavailable),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn store_in_macos_keychain_create_only(
+    key_id: &str,
+    key_material: &[u8],
+) -> Result<(), CryptoError> {
+    if !is_valid_key_identifier(key_id) {
+        return Err(CryptoError::InvalidLength);
+    }
+    store_macos_generic_password_create_only(
+        format!("rustynet.{key_id}").as_str(),
+        "rustynet",
+        key_material,
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
     let mut child = Command::new("secret-tool")
@@ -1030,6 +1563,100 @@ fn load_from_linux_secret_service(key_id: &str) -> Result<Zeroizing<Vec<u8>>, Cr
     };
     value.zeroize();
     decoded.map(Zeroizing::new)
+}
+
+/// Classifying lookup for the secret service. `secret-tool lookup` exits
+/// non-zero both for absent items and for transport failures (verified live:
+/// without a running secret service the same exit 1 and stderr appear), so a
+/// failed lookup falls through to `secret-tool search --all`. An empty
+/// search result alone is NOT an absence proof — on a host with no secret
+/// service it is vacuously empty — so `ProvedAbsent` additionally requires a
+/// `dbus-send NameHasOwner` check confirming that `org.freedesktop.secrets`
+/// has an owner on the session bus. The owner check runs AFTER the search so
+/// that D-Bus activation triggered by the search itself counts. Anything
+/// else stays `Unavailable` (fail-closed; containment for a phantom absence
+/// would otherwise be only the later create failure).
+#[cfg(target_os = "linux")]
+fn lookup_linux_secret_service(key_id: &str) -> OsStoreLookup {
+    match load_from_linux_secret_service(key_id) {
+        Ok(value) => OsStoreLookup::Found(value),
+        Err(_) => {
+            let output = Command::new("secret-tool")
+                .args(["search", "--all", "rustynet-key-id", key_id])
+                .stdin(Stdio::null())
+                .output();
+            let probe = match output {
+                Ok(output) => classify_linux_secret_tool_search(
+                    output.status.success(),
+                    output.stdout.is_empty(),
+                ),
+                Err(_) => LinuxSecretToolProbe::Inconclusive,
+            };
+            match probe {
+                // Empty search: only meaningful when a secret service is
+                // actually there to have searched (F2). Checked after the
+                // search so activation-by-search counts.
+                LinuxSecretToolProbe::ProvedNoItems => {
+                    match classify_linux_secrets_name_has_owner(linux_secrets_name_has_owner()) {
+                        LinuxSecretServicePresence::Owned => OsStoreLookup::ProvedAbsent,
+                        LinuxSecretServicePresence::Unavailable => OsStoreLookup::Unavailable,
+                    }
+                }
+                LinuxSecretToolProbe::Inconclusive => OsStoreLookup::Unavailable,
+            }
+        }
+    }
+}
+
+/// `dbus-send NameHasOwner(org.freedesktop.secrets)` against the session
+/// bus. `Some(true)`/`Some(false)` — the bus answered with a boolean; `None`
+/// — `dbus-send` missing, no session bus, non-zero exit, or a malformed
+/// reply (all `Unavailable` downstream).
+#[cfg(target_os = "linux")]
+fn linux_secrets_name_has_owner() -> Option<bool> {
+    let output = Command::new("dbus-send")
+        .args([
+            "--session",
+            "--print-reply",
+            "--dest=org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.NameHasOwner",
+            "string:org.freedesktop.secrets",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let reply = String::from_utf8(output.stdout).ok()?;
+    if reply.contains("boolean true") {
+        Some(true)
+    } else if reply.contains("boolean false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// `secret-tool` has no create-only verb — its `store` subcommand upserts.
+/// The read-back compare in `load_or_provision` does NOT close this race:
+/// two processes can each adopt a DIFFERENT key. A and B both probe Absent;
+/// A stores KA and reads back KA (match — A adopts KA and may seal columns
+/// with it); B then stores KB, overwriting, and reads back KB (match — B
+/// adopts KB). Both succeed, the store ends holding KB, and A's sealed
+/// writes are orphaned; the divergence is caught at the NEXT open (fail-
+/// closed mismatch), but the columns sealed under KA are lost. The store is
+/// therefore only safe when first provisioning is serialized:
+/// `load_or_provision` documents that REQUIREMENT, and the step 5/6 open
+/// path must satisfy it by provisioning only while holding the control.db
+/// write lock (`BEGIN IMMEDIATE`) — not implemented in this step.
+#[cfg(target_os = "linux")]
+fn store_in_linux_secret_service_create_only(
+    key_id: &str,
+    key_material: &[u8],
+) -> Result<(), CryptoError> {
+    store_in_linux_secret_service(key_id, key_material)
 }
 
 #[cfg(target_os = "windows")]
@@ -1080,6 +1707,72 @@ fn load_from_windows_dpapi(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoErr
         .map(Zeroizing::new);
     protected.zeroize();
     result
+}
+
+/// Classifying lookup for the DPAPI blob store: a missing blob *file* (with
+/// the custody root already validated) is a positive "absent" answer; any
+/// other stat failure or decrypt failure is `Unavailable`.
+#[cfg(target_os = "windows")]
+fn lookup_windows_dpapi(key_id: &str) -> OsStoreLookup {
+    let root = match windows_dpapi_root() {
+        Ok(root) => root,
+        Err(_) => return OsStoreLookup::Unavailable,
+    };
+    if validate_windows_dpapi_root(root.as_path()).is_err() {
+        return OsStoreLookup::Unavailable;
+    }
+    let path = match windows_dpapi_file_path(root.as_path(), key_id) {
+        Ok(path) => path,
+        Err(_) => return OsStoreLookup::Unavailable,
+    };
+    match std::fs::symlink_metadata(path.as_path()) {
+        Err(err) => match classify_windows_dpapi_item_missing(err.kind()) {
+            WindowsDpapiProbe::ItemNotFound => OsStoreLookup::ProvedAbsent,
+            WindowsDpapiProbe::Unavailable => OsStoreLookup::Unavailable,
+        },
+        Ok(_) => match load_from_windows_dpapi(key_id) {
+            Ok(value) => OsStoreLookup::Found(value),
+            Err(_) => OsStoreLookup::Unavailable,
+        },
+    }
+}
+
+/// Create-only DPAPI store: refuses when a blob already exists instead of the
+/// remove-and-rename used by [`store_in_windows_dpapi`]. The final write uses
+/// `create_new(true)`, which fails atomically if a concurrent writer created
+/// the file after our probe — the check-then-create race fails closed.
+#[cfg(target_os = "windows")]
+fn store_in_windows_dpapi_create_only(
+    key_id: &str,
+    key_material: &[u8],
+) -> Result<(), CryptoError> {
+    use std::io::Write;
+    let root = windows_dpapi_root()?;
+    validate_windows_dpapi_root(root.as_path())?;
+    let path = windows_dpapi_file_path(root.as_path(), key_id)?;
+    match std::fs::symlink_metadata(path.as_path()) {
+        Ok(_) => return Err(CryptoError::OsStoreUnavailable),
+        Err(err) => {
+            if classify_windows_dpapi_item_missing(err.kind()) != WindowsDpapiProbe::ItemNotFound {
+                return Err(CryptoError::OsStoreUnavailable);
+            }
+        }
+    }
+    let mut protected = dpapi_protect(
+        key_material,
+        // Same LocalMachine-scope rationale as store_in_windows_dpapi.
+        WindowsDpapiScope::LocalMachine,
+        &format!("RustyNet key {key_id}"),
+    )
+    .map_err(|_| CryptoError::EncryptionFailed)?;
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path.as_path())
+        .and_then(|mut file| file.write_all(&protected))
+        .map_err(|_| CryptoError::Io);
+    protected.zeroize();
+    write_result
 }
 
 #[cfg(target_os = "windows")]
@@ -5569,6 +6262,257 @@ mod tests {
         hasher.update(&data[3333..]);
         let incremental = hasher.finalize();
         assert_eq!(one_shot.as_slice(), incremental.as_slice());
+    }
+}
+
+// AQ-45 step 2: lookup / create-only custody surface.
+#[cfg(test)]
+mod atrest_key_lookup_tests {
+    use super::*;
+
+    #[test]
+    fn classify_macos_framework_status_only_item_not_found_proves_absence() {
+        assert_eq!(
+            classify_macos_framework_status(MACOS_ERR_SEC_ITEM_NOT_FOUND),
+            MacKeychainProbe::ItemNotFound
+        );
+        // errSecDuplicateItem and errSecNoDefaultKeychain are not absence proofs.
+        assert_eq!(
+            classify_macos_framework_status(-25299),
+            MacKeychainProbe::Unavailable
+        );
+        assert_eq!(
+            classify_macos_framework_status(-25307),
+            MacKeychainProbe::Unavailable
+        );
+        assert_eq!(
+            classify_macos_framework_status(0),
+            MacKeychainProbe::Unavailable
+        );
+    }
+
+    #[test]
+    fn classify_macos_cli_exit_pins_empirical_exit_44() {
+        assert_eq!(
+            classify_macos_cli_exit(Some(MACOS_SECURITY_CLI_EXIT_ITEM_NOT_FOUND)),
+            MacKeychainProbe::ItemNotFound
+        );
+        assert_eq!(MACOS_SECURITY_CLI_EXIT_ITEM_NOT_FOUND, 44);
+        assert_eq!(MACOS_ERR_SEC_ITEM_NOT_FOUND, -25300);
+        assert_eq!(
+            classify_macos_cli_exit(Some(0)),
+            MacKeychainProbe::Unavailable
+        );
+        assert_eq!(
+            classify_macos_cli_exit(Some(1)),
+            MacKeychainProbe::Unavailable
+        );
+        // Terminated by a signal: no exit code, inconclusive.
+        assert_eq!(classify_macos_cli_exit(None), MacKeychainProbe::Unavailable);
+    }
+
+    #[test]
+    fn classify_linux_secret_tool_search_only_success_with_empty_stdout_proves_absence() {
+        assert_eq!(
+            classify_linux_secret_tool_search(true, true),
+            LinuxSecretToolProbe::ProvedNoItems
+        );
+        // Success WITH output means an item exists: inconclusive for absence.
+        assert_eq!(
+            classify_linux_secret_tool_search(true, false),
+            LinuxSecretToolProbe::Inconclusive
+        );
+        // Failure (no secret service, transport error): inconclusive — verified
+        // live, `search --all` exits 1 with "Could not connect" in that state.
+        assert_eq!(
+            classify_linux_secret_tool_search(false, true),
+            LinuxSecretToolProbe::Inconclusive
+        );
+        assert_eq!(
+            classify_linux_secret_tool_search(false, false),
+            LinuxSecretToolProbe::Inconclusive
+        );
+    }
+
+    #[test]
+    fn classify_windows_dpapi_item_missing_only_not_found_proves_absence() {
+        assert_eq!(
+            classify_windows_dpapi_item_missing(std::io::ErrorKind::NotFound),
+            WindowsDpapiProbe::ItemNotFound
+        );
+        assert_eq!(
+            classify_windows_dpapi_item_missing(std::io::ErrorKind::PermissionDenied),
+            WindowsDpapiProbe::Unavailable
+        );
+    }
+
+    #[test]
+    fn os_store_lookup_debug_redacts_found_payload() {
+        let sentinel = vec![0xABu8; 32];
+        let rendered = format!("{:?}", OsStoreLookup::Found(Zeroizing::new(sentinel)));
+        assert!(rendered.contains("REDACTED"), "rendered: {rendered}");
+        assert!(!rendered.contains("171"), "rendered: {rendered}");
+        assert!(!rendered.contains("ab"), "rendered: {rendered}");
+        assert_eq!(format!("{:?}", OsStoreLookup::ProvedAbsent), "ProvedAbsent");
+        assert_eq!(format!("{:?}", OsStoreLookup::Unavailable), "Unavailable");
+    }
+
+    struct FailingStore;
+
+    impl OsSecureStore for FailingStore {
+        fn store_key(&self, _key_id: &str, _key_material: &[u8]) -> Result<(), CryptoError> {
+            Err(CryptoError::OsStoreUnavailable)
+        }
+        fn load_key(&self, _key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+            Err(CryptoError::OsStoreUnavailable)
+        }
+    }
+
+    struct FixedStore;
+
+    impl OsSecureStore for FixedStore {
+        fn store_key(&self, _key_id: &str, _key_material: &[u8]) -> Result<(), CryptoError> {
+            Err(CryptoError::OsStoreUnavailable)
+        }
+        fn load_key(&self, _key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+            Ok(Zeroizing::new(vec![7u8, 8, 9]))
+        }
+    }
+
+    #[test]
+    fn default_lookup_key_never_reports_proved_absent() {
+        // A backend that only implements the original two methods must never
+        // trigger key minting in a caller: its lookup can be Found/Unavailable
+        // only.
+        assert_eq!(
+            FailingStore.lookup_key("any-id"),
+            OsStoreLookup::Unavailable
+        );
+        match FixedStore.lookup_key("any-id") {
+            OsStoreLookup::Found(payload) => assert_eq!(&*payload, &[7u8, 8, 9]),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    struct UpsertingStore {
+        writes: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl OsSecureStore for UpsertingStore {
+        fn store_key(&self, key_id: &str, _key_material: &[u8]) -> Result<(), CryptoError> {
+            self.writes.lock().unwrap().push(key_id.to_string());
+            Ok(())
+        }
+        fn load_key(&self, _key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+            Err(CryptoError::OsStoreUnavailable)
+        }
+    }
+
+    #[test]
+    fn default_store_key_create_only_refuses() {
+        assert_eq!(
+            FailingStore.store_key_create_only("any-id", &[1u8; 32]),
+            Err(CryptoError::OsStoreUnavailable)
+        );
+        assert_eq!(
+            FixedStore.store_key_create_only("any-id", &[1u8; 32]),
+            Err(CryptoError::OsStoreUnavailable)
+        );
+        // Discriminating fixture: `store_key` SUCCEEDS here, so a default
+        // that degraded to the `store_key` upsert would return Ok and land
+        // a write. FailingStore/FixedStore both refuse in `store_key`, so
+        // they cannot detect that regression.
+        let up = UpsertingStore {
+            writes: std::sync::Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            up.store_key_create_only("any-id", &[1u8; 32]),
+            Err(CryptoError::OsStoreUnavailable)
+        );
+        assert!(
+            up.writes.lock().unwrap().is_empty(),
+            "create-only default must not write"
+        );
+    }
+
+    #[test]
+    fn classify_linux_secrets_name_has_owner_only_owned_completes_absence_proof() {
+        // A secret service actually answered: the empty search result is
+        // meaningful and completes the absence proof.
+        assert_eq!(
+            classify_linux_secrets_name_has_owner(Some(true)),
+            LinuxSecretServicePresence::Owned
+        );
+        // The name exists on the bus but has NO owner: no secret service is
+        // running, so the empty search result was vacuous.
+        assert_eq!(
+            classify_linux_secrets_name_has_owner(Some(false)),
+            LinuxSecretServicePresence::Unavailable
+        );
+        // dbus-send missing (spawn error), no session bus, non-zero exit, or
+        // a malformed reply all collapse to None: Unavailable.
+        assert_eq!(
+            classify_linux_secrets_name_has_owner(None),
+            LinuxSecretServicePresence::Unavailable
+        );
+    }
+
+    #[test]
+    fn classify_macos_default_keychain_probe_pins_no_default_keychain_not_applicable() {
+        assert_eq!(MACOS_ERR_SEC_NO_DEFAULT_KEYCHAIN, -25307);
+        // Headless launchd daemon: not-applicable, never poisons absence.
+        assert_eq!(
+            classify_macos_default_keychain_probe(MACOS_ERR_SEC_NO_DEFAULT_KEYCHAIN),
+            MacosDefaultKeychainProbe::NotApplicableNoDefaultKeychain
+        );
+        assert_eq!(
+            classify_macos_default_keychain_probe(MACOS_ERR_SEC_ITEM_NOT_FOUND),
+            MacosDefaultKeychainProbe::ItemNotFound
+        );
+        // Any other probe-1 error stays Unavailable.
+        assert_eq!(
+            classify_macos_default_keychain_probe(-25299),
+            MacosDefaultKeychainProbe::Unavailable
+        );
+        assert_eq!(
+            classify_macos_default_keychain_probe(0),
+            MacosDefaultKeychainProbe::Unavailable
+        );
+    }
+
+    #[test]
+    fn combine_macos_absence_probes_not_applicable_probe1_does_not_poison() {
+        // -25307 on probe 1 with BOTH System-keychain probes positively
+        // absent: the conjunction holds (ProvedAbsent candidate).
+        assert!(combine_macos_absence_probes(
+            MacosDefaultKeychainProbe::NotApplicableNoDefaultKeychain,
+            MacKeychainProbe::ItemNotFound,
+            MacKeychainProbe::ItemNotFound,
+        ));
+        // -25307 with a System-keychain probe failing: Unavailable.
+        assert!(!combine_macos_absence_probes(
+            MacosDefaultKeychainProbe::NotApplicableNoDefaultKeychain,
+            MacKeychainProbe::Unavailable,
+            MacKeychainProbe::ItemNotFound,
+        ));
+        assert!(!combine_macos_absence_probes(
+            MacosDefaultKeychainProbe::NotApplicableNoDefaultKeychain,
+            MacKeychainProbe::ItemNotFound,
+            MacKeychainProbe::Unavailable,
+        ));
+        // ANY other probe-1 error stays Unavailable even with both System
+        // probes absent.
+        assert!(!combine_macos_absence_probes(
+            MacosDefaultKeychainProbe::Unavailable,
+            MacKeychainProbe::ItemNotFound,
+            MacKeychainProbe::ItemNotFound,
+        ));
+        // All three applicable and all positively absent: conjunction holds.
+        assert!(combine_macos_absence_probes(
+            MacosDefaultKeychainProbe::ItemNotFound,
+            MacKeychainProbe::ItemNotFound,
+            MacKeychainProbe::ItemNotFound,
+        ));
     }
 }
 

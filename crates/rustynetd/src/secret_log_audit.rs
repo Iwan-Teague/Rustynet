@@ -695,6 +695,16 @@ const REVIEWED_SECRET_VOCABULARY_TYPE_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "policy descriptor",
     ),
     (
+        "LinuxSecretToolProbe",
+        "crates/rustynet-crypto/src/lib.rs",
+        "payload-free classification enum (ProvedNoItems / Inconclusive) of a secret-tool search (AQ-45 step 2); name-only match, no secret bytes",
+    ),
+    (
+        "LinuxSecretServicePresence",
+        "crates/rustynet-crypto/src/lib.rs",
+        "payload-free enum (Owned / Unavailable) for the org.freedesktop.secrets name-owner check (AQ-45 step 2); name-only match, no secret bytes",
+    ),
+    (
         "TokenBucket",
         "crates/rustynet-relay/src/rate_limit.rs",
         "rate limiter; 'token' is the rate-limit token bucket, false-positive vocabulary match",
