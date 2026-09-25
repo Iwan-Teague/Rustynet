@@ -1477,13 +1477,16 @@ pub fn encrypt_private_key_envelope(
 
 /// Decrypt a key envelope, supporting both v0 (legacy, no AAD) and
 /// v1 (AAD-bound) blobs. v0 decryption uses empty AAD; v1 uses the
-/// constant magic `b"RNET"` + version byte. A v0 blob re-encrypted
-/// becomes a v1 blob on the next write cycle.
+/// constant magic `b"RNET"` + version byte.
 ///
-/// The permanent v0 empty-AAD decrypt branch is an OPEN owner decision
-/// (AQ-67 F2): retiring it fail-closed requires a fleet audit confirming
-/// no v0 blobs remain plus a re-encrypt-on-read migration window. This
-/// implementation keeps the pre-decision behaviour unchanged.
+/// OI-13 (owner decision, 2026-09-24): the v0 empty-AAD decrypt branch is
+/// RETIRED via a re-encrypt-on-read window — [`read_encrypted_key_file`]
+/// re-seals every v0 blob it sees as v1 and persists the upgrade atomically,
+/// so each v0 blob is read as v0 at most once. THIS BRANCH IS REMOVED IN THE
+/// NEXT RELEASE: once the fleet's `v0_envelope_reads_total()` counter has
+/// settled at zero, the `0` arm below must be deleted and v0 must fail
+/// closed (`CryptoError::DeniedAlgorithm`). Until that cutover, the only
+/// sanctioned reader of the v0 arm is the migration window.
 pub fn decrypt_private_key_envelope(
     blob: &EncryptedKeyBlob,
     passphrase: &str,
@@ -1499,9 +1502,15 @@ pub fn decrypt_private_key_envelope(
             XNonce::from_slice(&blob.nonce),
             chacha20poly1305::aead::Payload {
                 msg: blob.ciphertext.as_ref(),
-                // AQ-67 F2 (owner decision pending): the legacy v0 envelope
-                // predates AAD binding, so its ciphertext carries none. Kept
-                // byte-for-byte identical to the pre-decision behaviour.
+                // DEPRECATED (OI-13, owner decision 2026-09-24): the legacy v0
+                // envelope predates AAD binding, so its ciphertext carries
+                // none. This arm exists ONLY for the re-encrypt-on-read
+                // migration window in `read_encrypted_key_file` and is
+                // REMOVED IN THE NEXT RELEASE: after the cutover this match
+                // arm must be deleted and version 0 must fail closed with
+                // `CryptoError::DeniedAlgorithm`, never decrypt. Kept
+                // byte-for-byte identical to the pre-window behaviour until
+                // then.
                 aad: b"",
             },
         ),
@@ -1635,7 +1644,7 @@ pub fn write_encrypted_key_file(
     // against the AEAD.
     let (salt, nonce) = try_generate_key_custody_material()?;
     let blob = encrypt_private_key_envelope(plaintext, passphrase, salt, nonce)?;
-    let encoded = encode_encrypted_blob(&blob);
+    let encoded = encode_encrypted_blob(&blob)?;
 
     if directory.exists() {
         let directory_link_metadata =
@@ -1730,11 +1739,73 @@ fn temp_path_for(path: &Path) -> PathBuf {
 /// state cannot drive allocation proportional to file size.
 const MAX_ENCRYPTED_KEY_FILE_BYTES: u64 = 64 * 1024;
 
+/// OI-13 migration telemetry: how many v0 (legacy, empty-AAD) key-envelope
+/// blobs have been observed ON DISK by `read_encrypted_key_file` during the
+/// re-encrypt-on-read window. Every v0 blob seen counts exactly once, even
+/// when the read is then rejected (tampered blob, wrong passphrase) — those
+/// show up here but never upgrade, so a counter that stalls above zero means
+/// an operator should audit that node's key files. No secret material is
+/// counted or logged: this is a single unsigned integer.
+static V0_ENVELOPE_READS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// OI-13 migration telemetry: v0 reads whose v1 re-seal could NOT be made
+/// durable (the persist call failed). The key is still returned to the caller
+/// and the v0 file is left untouched, so the same blob is re-counted and the
+/// upgrade re-attempted on the next read. A value stuck above zero means the
+/// migration is wedged for at least one blob.
+static V0_ENVELOPE_UPGRADE_FAILURES_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// OI-13: v0 envelopes observed on disk so far (see
+/// [`V0_ENVELOPE_READS_TOTAL`]). Operators watch this settle at zero — with
+/// [`v0_envelope_upgrade_failures_total`] also at zero — to confirm the
+/// migration finished before the v0 decrypt branch is removed in the next
+/// release.
+pub fn v0_envelope_reads_total() -> u64 {
+    V0_ENVELOPE_READS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// OI-13: v0 reads whose v1 re-seal failed to persist (see
+/// [`V0_ENVELOPE_UPGRADE_FAILURES_TOTAL`]).
+pub fn v0_envelope_upgrade_failures_total() -> u64 {
+    V0_ENVELOPE_UPGRADE_FAILURES_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// OI-13: the only production persist path for the re-encrypt-on-read
+/// upgrade — the same `write_encrypted_key_file` used for every other key
+/// write (fresh CSPRNG salt+nonce, v1 AAD-bound seal, temp + fsync + rename,
+/// custody modes re-applied and re-validated). Injected as a function value
+/// so tests can simulate persist failure without touching the filesystem.
+fn persist_v1_upgrade(
+    directory: &Path,
+    file: &Path,
+    plaintext: &[u8],
+    passphrase: &str,
+    policy: KeyCustodyPermissionPolicy,
+) -> Result<(), CryptoError> {
+    write_encrypted_key_file(directory, file, plaintext, passphrase, policy)
+}
+
+/// The persist side of [`persist_v1_upgrade`], abstracted for the
+/// persist-failure test.
+type PersistKeyFileFn =
+    dyn Fn(&Path, &Path, &[u8], &str, KeyCustodyPermissionPolicy) -> Result<(), CryptoError>;
+
 pub fn read_encrypted_key_file(
     directory: &Path,
     file: &Path,
     passphrase: &str,
     policy: KeyCustodyPermissionPolicy,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    read_encrypted_key_file_inner(directory, file, passphrase, policy, &persist_v1_upgrade)
+}
+
+fn read_encrypted_key_file_inner(
+    directory: &Path,
+    file: &Path,
+    passphrase: &str,
+    policy: KeyCustodyPermissionPolicy,
+    persist_upgrade: &PersistKeyFileFn,
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     validate_key_custody_permissions(directory, file, policy)?;
     let encoded_len = std::fs::metadata(file).map_err(|_| CryptoError::Io)?.len();
@@ -1743,26 +1814,44 @@ pub fn read_encrypted_key_file(
     }
     let encoded = std::fs::read(file).map_err(|_| CryptoError::Io)?;
     let blob = decode_encrypted_blob(&encoded)?;
+    if blob.version == 0 {
+        // OI-13 re-encrypt-on-read window: a v0 blob on disk is decrypted via
+        // the (deprecated) empty-AAD branch and immediately re-sealed as v1
+        // with fresh CSPRNG salt+nonce, persisted through the atomic
+        // temp+fsync+rename writer. The v0 bytes stay on disk untouched until
+        // the rename, so a failed persist never loses the key — the caller
+        // still gets the plaintext and the next read retries the upgrade.
+        V0_ENVELOPE_READS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plaintext = decrypt_private_key_envelope(&blob, passphrase)?;
+        if persist_upgrade(directory, file, plaintext.as_slice(), passphrase, policy).is_err() {
+            V0_ENVELOPE_UPGRADE_FAILURES_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        return Ok(plaintext);
+    }
     decrypt_private_key_envelope(&blob, passphrase)
 }
 
-fn encode_encrypted_blob(blob: &EncryptedKeyBlob) -> Vec<u8> {
-    if blob.version == 0 {
-        let mut out = Vec::with_capacity(16 + 24 + 4 + blob.ciphertext.len());
-        out.extend_from_slice(&blob.salt);
-        out.extend_from_slice(&blob.nonce);
-        out.extend_from_slice(&(blob.ciphertext.len() as u32).to_be_bytes());
-        out.extend_from_slice(&blob.ciphertext);
-        out
-    } else {
-        let mut out = Vec::with_capacity(1 + 16 + 24 + 4 + blob.ciphertext.len());
-        out.push(blob.version);
-        out.extend_from_slice(&blob.salt);
-        out.extend_from_slice(&blob.nonce);
-        out.extend_from_slice(&(blob.ciphertext.len() as u32).to_be_bytes());
-        out.extend_from_slice(&blob.ciphertext);
-        out
+/// OI-13: the encoder emits v1 (AAD-bound) blobs ONLY. Anything that is not
+/// exactly version 1 is refused (`DeniedAlgorithm`) instead of encoded, so no
+/// caller — current or future — can persist a v0 envelope: during the
+/// migration window the v0 population on disk can only shrink. (Proof that
+/// every writer reaches the disk through here: `write_encrypted_key_file` is
+/// the crate's single key-file writer, and its blob comes from
+/// `encrypt_private_key_envelope`, which is v1-only by construction — pinned
+/// by `encrypted_envelope_is_v1_aad_bound_and_fails_closed_on_version_tamper`.)
+/// `decode_encrypted_blob` still READS v0 until the OI-13 cutover in the next
+/// release, when the v0 decoder is deleted and v0 fails closed at decode.
+fn encode_encrypted_blob(blob: &EncryptedKeyBlob) -> Result<Vec<u8>, CryptoError> {
+    if blob.version != KEY_ENVELOPE_VERSION_V1 {
+        return Err(CryptoError::DeniedAlgorithm);
     }
+    let mut out = Vec::with_capacity(1 + 16 + 24 + 4 + blob.ciphertext.len());
+    out.push(blob.version);
+    out.extend_from_slice(&blob.salt);
+    out.extend_from_slice(&blob.nonce);
+    out.extend_from_slice(&(blob.ciphertext.len() as u32).to_be_bytes());
+    out.extend_from_slice(&blob.ciphertext);
+    Ok(out)
 }
 
 fn decode_encrypted_blob(bytes: &[u8]) -> Result<EncryptedKeyBlob, CryptoError> {
@@ -2440,8 +2529,9 @@ mod tests {
     // them as unused.
     #[cfg(unix)]
     use super::{
-        OsStoreFallbackPolicy, read_encrypted_key_file, validate_key_custody_permissions,
-        write_encrypted_key_file,
+        OsStoreFallbackPolicy, read_encrypted_key_file, read_encrypted_key_file_inner,
+        v0_envelope_reads_total, v0_envelope_upgrade_failures_total,
+        validate_key_custody_permissions, write_encrypted_key_file,
     };
 
     #[test]
@@ -2959,7 +3049,8 @@ mod tests {
         assert_eq!(blob.version, 1, "encrypt must emit a v1 AAD-bound envelope");
 
         // (2) Round-trip through the real on-disk encoding + decode router.
-        let encoded = super::encode_encrypted_blob(&blob);
+        let encoded = super::encode_encrypted_blob(&blob)
+            .expect("a v1 blob must encode (OI-13: v1 is the only encodable version)");
         assert_eq!(
             encoded[0], 1,
             "v1 encoding carries an explicit version byte"
@@ -3054,6 +3145,287 @@ mod tests {
             upgraded.version, 1,
             "new writes must always be v1 AAD-bound envelopes"
         );
+    }
+
+    // ---- OI-13: re-encrypt-on-read migration window -------------------------
+    //
+    // The v0-read counters are process-global atomics and libtest runs test
+    // threads in parallel, so every test below that performs a v0 disk read
+    // takes this mutex: without it, concurrent tests bump the counter while a
+    // delta assertion is in flight and the exact-once check flakes.
+    static OI13_V0_DISK_READ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Fixture builders and disk-level tests for the v0 -> v1 key-envelope
+    // migration. The v0 framing is `[salt:16][nonce:24][len:4][ct]` with no
+    // version byte and empty AEAD AAD; the fixture seals with the same empty
+    // AAD the legacy v0 decrypt branch expects.
+
+    #[cfg(unix)]
+    fn oi13_v0_fixture(passphrase: &str, plaintext: &[u8]) -> Vec<u8> {
+        use super::{Argon2, XChaCha20Poly1305, XNonce};
+        use chacha20poly1305::aead::{Aead, KeyInit};
+        use zeroize::Zeroize;
+
+        // The first salt byte MUST be zero: `decode_encrypted_blob` routes any
+        // 45+ byte blob whose first byte is non-zero to the v1 decoder, so a
+        // v0 fixture of realistic length is only recognised as v0 when it
+        // starts with a zero byte (pre-existing framing rule).
+        let mut salt = [0u8; 16];
+        salt[1] = 0x0d;
+        salt[15] = 0xf0;
+        let nonce = [0x42u8; 24];
+
+        let mut key = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(passphrase.as_bytes(), &salt, &mut key)
+            .expect("kdf should succeed");
+        let cipher = XChaCha20Poly1305::new((&key).into());
+        let ciphertext = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                chacha20poly1305::aead::Payload {
+                    msg: plaintext,
+                    aad: b"",
+                },
+            )
+            .expect("legacy v0 seal should succeed");
+        key.zeroize();
+
+        let mut out = Vec::with_capacity(44 + ciphertext.len());
+        out.extend_from_slice(&salt);
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&(ciphertext.len() as u32).to_be_bytes());
+        out.extend_from_slice(&ciphertext);
+        out
+    }
+
+    #[cfg(unix)]
+    fn oi13_write_custody_file(directory: &std::path::Path, file: &std::path::Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::create_dir_all(directory).expect("custody directory should be created");
+        std::fs::write(file, bytes).expect("key file should be written");
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .expect("directory mode should be set");
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+            .expect("file mode should be set");
+    }
+
+    #[cfg(unix)]
+    fn oi13_temp_custody_dir(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let unique = format!(
+            "rustynet-oi13-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let file = directory.join("node-key.enc");
+        (directory, file)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v0_key_file_is_upgraded_to_v1_on_disk_by_read() {
+        let (directory, file) = oi13_temp_custody_dir("upgrade");
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let v0_bytes = oi13_v0_fixture("oi13-pass", b"oi13-disk-secret");
+        oi13_write_custody_file(&directory, &file, &v0_bytes);
+
+        let plaintext = read_encrypted_key_file(
+            &directory,
+            &file,
+            "oi13-pass",
+            KeyCustodyPermissionPolicy::default(),
+        )
+        .expect("v0 envelope must still decrypt during the OI-13 window");
+        assert_eq!(plaintext.as_slice(), b"oi13-disk-secret".as_slice());
+
+        let on_disk = std::fs::read(&file).expect("upgraded file should be readable");
+        let blob =
+            super::decode_encrypted_blob(&on_disk).expect("the re-sealed blob must decode cleanly");
+        assert_eq!(
+            blob.version, 1,
+            "OI-13: reading a v0 key file must re-seal it as v1 on disk"
+        );
+        let again = decrypt_private_key_envelope(&blob, "oi13-pass")
+            .expect("the v1 re-seal must decrypt under the same passphrase");
+        assert_eq!(again.as_slice(), b"oi13-disk-secret".as_slice());
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn second_read_of_upgraded_file_takes_the_v1_path() {
+        let (directory, file) = oi13_temp_custody_dir("second-read");
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let v0_bytes = oi13_v0_fixture("oi13-pass", b"oi13-second-secret");
+        oi13_write_custody_file(&directory, &file, &v0_bytes);
+
+        let policy = KeyCustodyPermissionPolicy::default();
+        let first = read_encrypted_key_file(&directory, &file, "oi13-pass", policy)
+            .expect("first (v0) read should succeed");
+        assert_eq!(first.as_slice(), b"oi13-second-secret".as_slice());
+
+        let after_first = std::fs::read(&file).expect("file should be readable");
+        let first_blob = super::decode_encrypted_blob(&after_first)
+            .expect("blob after the first read must decode");
+        assert_eq!(
+            first_blob.version, 1,
+            "first read must have upgraded the file"
+        );
+
+        let second = read_encrypted_key_file(&directory, &file, "oi13-pass", policy)
+            .expect("second read should take the v1 path");
+        assert_eq!(second.as_slice(), b"oi13-second-secret".as_slice());
+
+        let after_second = std::fs::read(&file).expect("file should be readable");
+        assert_eq!(
+            after_second, after_first,
+            "the v1 file must be byte-stable across a second read"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    // BEFORE-RUN SHELF (OI-13): encoder test restored with the fix.
+    #[test]
+    fn encoder_never_emits_v0_blobs() {
+        // OI-13: the on-disk writer must be physically unable to persist a v0
+        // envelope, so the migration window can only shrink the v0 fleet.
+        let v0_blob = super::EncryptedKeyBlob {
+            version: 0,
+            salt: [7u8; 16],
+            nonce: [9u8; 24],
+            ciphertext: vec![1, 2, 3],
+        };
+        assert_eq!(
+            super::encode_encrypted_blob(&v0_blob).err(),
+            Some(CryptoError::DeniedAlgorithm),
+            "OI-13: no code path may encode a v0 envelope for persistence"
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn tampered_v0_key_file_is_rejected_and_left_unmodified() {
+        let (directory, file) = oi13_temp_custody_dir("tamper-v0");
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let mut v0_bytes = oi13_v0_fixture("oi13-pass", b"oi13-tamper-secret");
+        let last = v0_bytes.len() - 1;
+        v0_bytes[last] ^= 0x01;
+        oi13_write_custody_file(&directory, &file, &v0_bytes);
+
+        let result = read_encrypted_key_file(
+            &directory,
+            &file,
+            "oi13-pass",
+            KeyCustodyPermissionPolicy::default(),
+        );
+        assert_eq!(
+            result.err(),
+            Some(CryptoError::DecryptionFailed),
+            "a tampered v0 envelope must fail the AEAD tag check"
+        );
+        assert_eq!(
+            std::fs::read(&file).expect("file should survive a rejected read"),
+            v0_bytes,
+            "a rejected v0 read must not rewrite the file"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tampered_v1_key_file_is_rejected() {
+        let (directory, file) = oi13_temp_custody_dir("tamper-v1");
+        let policy = KeyCustodyPermissionPolicy::default();
+        write_encrypted_key_file(&directory, &file, b"oi13-v1-secret", "oi13-pass", policy)
+            .expect("v1 write should succeed");
+
+        let mut on_disk = std::fs::read(&file).expect("v1 file should be readable");
+        let last = on_disk.len() - 1;
+        on_disk[last] ^= 0x01;
+        std::fs::write(&file, &on_disk).expect("tampered file should be written");
+
+        let result = read_encrypted_key_file(&directory, &file, "oi13-pass", policy);
+        assert_eq!(
+            result.err(),
+            Some(CryptoError::DecryptionFailed),
+            "a tampered v1 envelope must fail the AEAD tag check"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn v0_reads_are_counted_and_v1_reads_are_not() {
+        let (directory, file) = oi13_temp_custody_dir("counter");
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let v0_bytes = oi13_v0_fixture("oi13-pass", b"oi13-counter-secret");
+        oi13_write_custody_file(&directory, &file, &v0_bytes);
+        let policy = KeyCustodyPermissionPolicy::default();
+
+        let before = v0_envelope_reads_total();
+        read_encrypted_key_file(&directory, &file, "oi13-pass", policy)
+            .expect("v0 read should succeed during the OI-13 window");
+        assert_eq!(
+            v0_envelope_reads_total(),
+            before + 1,
+            "exactly one v0 disk read must be counted"
+        );
+
+        let mid = v0_envelope_reads_total();
+        read_encrypted_key_file(&directory, &file, "oi13-pass", policy)
+            .expect("second (v1) read should succeed");
+        assert_eq!(
+            v0_envelope_reads_total(),
+            mid,
+            "the v1 path must not advance the v0 counter"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_v1_persist_keeps_v0_file_and_still_returns_key() {
+        let (directory, file) = oi13_temp_custody_dir("persist-failure");
+        let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
+        let v0_bytes = oi13_v0_fixture("oi13-pass", b"oi13-durable-secret");
+        oi13_write_custody_file(&directory, &file, &v0_bytes);
+        let policy = KeyCustodyPermissionPolicy::default();
+
+        let before_failures = v0_envelope_upgrade_failures_total();
+        let refusing_persist: &super::PersistKeyFileFn = &|_, _, _, _, _| Err(CryptoError::Io);
+
+        let result =
+            read_encrypted_key_file_inner(&directory, &file, "oi13-pass", policy, refusing_persist);
+        let plaintext =
+            result.expect("a failed v1 persist must NOT lose the already-authenticated key");
+        assert_eq!(plaintext.as_slice(), b"oi13-durable-secret".as_slice());
+
+        assert_eq!(
+            std::fs::read(&file).expect("v0 file should survive the failed persist"),
+            v0_bytes,
+            "OI-13: the v0 file must stay on disk until the v1 write is durable"
+        );
+        assert_eq!(
+            v0_envelope_upgrade_failures_total(),
+            before_failures + 1,
+            "the failed upgrade must be visible to operators"
+        );
+
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
     }
 
     #[cfg(unix)]
