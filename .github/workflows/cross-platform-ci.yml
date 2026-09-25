@@ -53,6 +53,15 @@ jobs:
             exit 1
           }
           echo "repo hygiene: doc pair identical, pre-commit hook present"
+      - name: macOS bootstrap hardening gates (AQ-11)
+        # The macOS bootstrap runs as root on a fresh host, so it is only as
+        # hardened as the gate that holds it there: no sudo-policy edits, no
+        # download of any kind in the macOS lane outside the named exemptions,
+        # and stage < verify < extract with the verify reading the private
+        # stage. A gate CI never runs protects nothing. macOS leg only: the
+        # gate installs shellcheck through Homebrew when it is missing.
+        run: |
+          bash scripts/ci/bootstrap_macos_hardening_gates.sh
       - name: Shipped-binary feature gate
         # Everything above builds --all-features, so nothing here ever compiles
         # the CLI the way it actually ships. That gap is not cosmetic: features
