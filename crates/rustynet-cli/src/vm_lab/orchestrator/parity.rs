@@ -348,7 +348,7 @@ fn report_from_orchestrate_result(report_dir: &Path) -> Option<(RunStatus, Vec<S
 /// `YYYY-MM-DDTHH:MM:SSZ`. Returns Unix milliseconds from the epoch, or None.
 fn parse_stage_iso8601_ms(s: &str) -> Option<u64> {
     let s = s.trim();
-    if s.len() < 20 {
+    if s.len() < 20 || !s.is_ascii() {
         return None;
     }
     let (date_part, time_part) = s.split_at(10);
@@ -673,6 +673,11 @@ mod tests {
     use super::*;
     use crate::vm_lab::orchestrator::report::{NodeStatus, ValidatorResult};
     use std::collections::HashMap;
+
+    #[test]
+    fn parse_stage_iso8601_ms_refuses_multibyte_without_panicking() {
+        assert!(parse_stage_iso8601_ms("2026-09-2\u{c911}T00:00:00Z").is_none());
+    }
 
     fn stage(id: &str, outcome: StageOutcomeRecord) -> StageReport {
         StageReport {

@@ -1432,7 +1432,7 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
             .find_map(|(index, ch)| (index > 10 && (ch == '+' || ch == '-')).then_some(index))
             .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
         let (base, zone) = trimmed.split_at(tz_start);
-        if zone.len() != 6 {
+        if zone.len() != 6 || !zone.is_ascii() {
             return Err(format!("invalid UTC timestamp for {field}: {value}"));
         }
         if &zone[3..4] != ":" {
@@ -5001,6 +5001,13 @@ mod tests {
         write_phase10_provenance_keypair,
     };
     use ed25519_dalek::SigningKey;
+
+    #[test]
+    fn parse_utc_to_unix_refuses_multibyte_offset_without_panicking() {
+        let err = super::parse_utc_to_unix("2026-01-01T00:00:00+\u{c911}:1", "timestamp")
+            .expect_err("must fail");
+        assert!(err.contains("invalid UTC timestamp"));
+    }
 
     // X2: Cycle 73 typed view tests for Phase 10 perf-budget report
     // shape. Same DRY pattern as Phase1MetricEntryView — one
