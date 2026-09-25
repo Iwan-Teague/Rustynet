@@ -49,7 +49,7 @@ If this document conflicts with implementation plans, [Requirements.md](./Requir
     gap. Do not delete." and cited `Requirements.md:166` as mandating TLS 1.3 for
     the control plane. That mandate was amended by the owner on 2026-07-27 to
     "authenticated, encrypted transport and signed peer maps"
-    (`Requirements.md:168`), so there is no longer an unmet TLS requirement to
+    (`Requirements.md:174`; it was :168 before the 2026-09-25 D3 profile-scoping bullet was inserted above it), so there is no longer an unmet TLS requirement to
     record here, and reinstating one would be a product decision rather than a
     documentation edit. Corrected because the audit that wrote this block was
     working from a base that predated the amendment.
