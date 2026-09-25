@@ -108,6 +108,36 @@ pub fn inspect_file_sddl(_path: &Path) -> Result<String, String> {
     Err("Windows ACL inspection is only available on Windows hosts".to_owned())
 }
 
+/// RSA-0025 — write-time DACL. Creates `path` as a brand-new file that
+/// already carries the DACL described by `security_sddl`: the
+/// SECURITY_ATTRIBUTES built from the SDDL are passed to the very
+/// `CreateFileW` call that creates the file, so there is no window in
+/// which it exists on disk under an inherited or host-default broad
+/// ACL. Disposition is `CREATE_NEW` (fails atomically if the path
+/// already exists — the same create-only race posture the daemon's
+/// stores use) and the share mode is 0 (exclusive). The returned
+/// `std::fs::File` owns the handle, so the caller's ordinary
+/// write/sync/rename flow proceeds unchanged. Off-Windows this is a
+/// fail-closed platform stub.
+#[cfg(not(windows))]
+pub fn create_new_file_with_sddl(
+    _path: &Path,
+    _security_sddl: &str,
+) -> Result<std::fs::File, String> {
+    Err("Windows ACL-protected file creation is only available on Windows hosts".to_owned())
+}
+
+/// RSA-0025 — write-time DACL. Rewrites `path`'s DACL to exactly the one
+/// described by `security_sddl`, with inheritance disabled via
+/// `PROTECTED_DACL_SECURITY_INFORMATION` so the parent directory's ACEs
+/// (a host-default broad ACL among them) cannot reappear below the
+/// rewrite. Owner and group are untouched. Idempotent; fails closed on
+/// any API error. Off-Windows this is a fail-closed platform stub.
+#[cfg(not(windows))]
+pub fn apply_protected_dacl_to_path(_path: &Path, _security_sddl: &str) -> Result<(), String> {
+    Err("Windows protected-DACL application is only available on Windows hosts".to_owned())
+}
+
 /// W4 — Registry-key ACL inspector. On Windows the implementation
 /// opens the named registry key via `RegOpenKeyExW`, reads its
 /// security descriptor via `RegGetKeySecurity`, and converts to
@@ -300,8 +330,8 @@ mod imp {
     use std::time::Duration;
     use windows_sys::Win32::Foundation::{
         CloseHandle, ERROR_BROKEN_PIPE, ERROR_BUFFER_OVERFLOW, ERROR_INSUFFICIENT_BUFFER,
-        ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
-        LocalFree, NO_ERROR,
+        ERROR_MORE_DATA, ERROR_PIPE_CONNECTED, ERROR_SUCCESS, GENERIC_WRITE, GetLastError, HANDLE,
+        INVALID_HANDLE_VALUE, LocalFree, NO_ERROR,
     };
     use windows_sys::Win32::NetworkManagement::IpHelper::{
         GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
@@ -314,21 +344,22 @@ mod imp {
     use windows_sys::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-        SDDL_REVISION_1, SE_FILE_OBJECT,
+        SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN,
         CryptProtectData, CryptUnprotectData,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
-        GetTokenInformation, LookupAccountNameW, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        ACL, DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, GetFileSecurityW,
+        GetSecurityDescriptorDacl, GetTokenInformation, LookupAccountNameW,
+        OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
         RevertToSelf, SECURITY_ATTRIBUTES, SID_AND_ATTRIBUTES, TOKEN_GROUPS, TOKEN_QUERY,
         TOKEN_USER, TokenGroups, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers,
-        PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE,
+        FILE_FLAGS_AND_ATTRIBUTES, FlushFileBuffers, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::Pipes::{
         CallNamedPipeW, ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
@@ -562,6 +593,106 @@ mod imp {
             buffer.as_mut_ptr().cast::<c_void>(),
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         )
+    }
+
+    /// RSA-0025 — write-time DACL. Creates `path` as a brand-new file whose
+    /// security descriptor is built from `security_sddl` in the SAME
+    /// `CreateFileW` call that creates it (SECURITY_ATTRIBUTES on create),
+    /// so there is no window in which the file sits on disk under an
+    /// inherited or host-default ACL. Disposition `CREATE_NEW` fails if the
+    /// path already exists; share mode 0 makes the handle exclusive; the
+    /// handle is handed to `std::fs::File` so the caller's ordinary
+    /// write_all/sync_all/rename flow owns the close.
+    pub fn create_new_file_with_sddl(
+        path: &Path,
+        security_sddl: &str,
+    ) -> Result<std::fs::File, String> {
+        use std::os::windows::io::{FromRawHandle, RawHandle};
+
+        let security = OwnedSecurityAttributes::from_sddl(security_sddl)?;
+        let wide_path = to_wide_os(path.as_os_str());
+        // SAFETY: `wide_path` is NUL-terminated and outlives the call; `security` points at a
+        // SAFETY: fully initialised SECURITY_ATTRIBUTES owned by OwnedSecurityAttributes whose
+        // SAFETY: descriptor backing outlives this call; the share mode of 0 grants no concurrent
+        // SAFETY: opener, and the template-handle parameter must be null for FILE_ATTRIBUTE_NORMAL
+        // SAFETY: (documented requirement).
+        let raw = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                security.as_ptr(),
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
+        let owned = OwnedHandle::new(raw).ok_or_else(|| {
+            // SAFETY: GetLastError takes no arguments and performs no memory access; it only
+            // SAFETY: reads the calling thread's last-error slot. The closure runs only on the
+            // SAFETY: failure path, so the call timing is unchanged.
+            let err = unsafe { GetLastError() };
+            format!("CreateFileW failed with Windows error {err}")
+        })?;
+        // ManuallyDrop so OwnedHandle's Drop never closes the handle that the
+        // returned File now owns (double-close would be a use-after-free).
+        let owned = std::mem::ManuallyDrop::new(owned);
+        // SAFETY: `owned.raw()` is a valid open file handle: it came from CreateFileW above and
+        // SAFETY: passed the OwnedHandle::new null/INVALID_HANDLE_VALUE check. Ownership moves to
+        // SAFETY: the returned File, which closes it exactly once on drop; the ManuallyDrop wrapper
+        // SAFETY: guarantees OwnedHandle's own Drop does not also close it.
+        Ok(unsafe { std::fs::File::from_raw_handle(owned.raw() as RawHandle) })
+    }
+
+    /// RSA-0025 — write-time DACL. Rewrites `path`'s DACL to exactly the one
+    /// built from `security_sddl`, with inheritance disabled via
+    /// `PROTECTED_DACL_SECURITY_INFORMATION` so a broad host-default or
+    /// parent-inherited ACL cannot reappear during or after the rewrite.
+    /// The DACL comes from the same `ConvertStringSecurityDescriptor`
+    /// machinery the named-pipe server uses at pipe-creation time; owner
+    /// and group are left untouched.
+    pub fn apply_protected_dacl_to_path(path: &Path, security_sddl: &str) -> Result<(), String> {
+        let security = OwnedSecurityAttributes::from_sddl(security_sddl)?;
+        let mut dacl_present = 0i32;
+        let mut dacl: *mut ACL = null_mut();
+        let mut dacl_defaulted = 0i32;
+        // SAFETY: `security.descriptor` is the non-null self-relative security descriptor
+        // SAFETY: allocated by ConvertStringSecurityDescriptorToSecurityDescriptorW (checked in
+        // SAFETY: OwnedSecurityAttributes::from_sddl) and still owned by `security`;
+        // SAFETY: GetSecurityDescriptorDacl only reads it and writes the three out-parameters.
+        let ok = unsafe {
+            GetSecurityDescriptorDacl(
+                security.descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        };
+        if ok == 0 || dacl_present == 0 || dacl.is_null() {
+            return Err("security descriptor built from SDDL carries no DACL".to_string());
+        }
+        let wide_path = to_wide_os(path.as_os_str());
+        // SAFETY: `wide_path` is NUL-terminated and outlives the call; `dacl` points inside the
+        // SAFETY: descriptor still alive in `security`; the owner/group parameters are null so
+        // SAFETY: only the DACL is replaced, and PROTECTED_DACL_SECURITY_INFORMATION disables
+        // SAFETY: inheritable-ACE propagation as part of the same atomic API call.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                wide_path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl as *const ACL,
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "SetNamedSecurityInfoW failed with Windows error {status}"
+            ));
+        }
+        Ok(())
     }
 
     /// Split an operator-visible registry-key path into its root
@@ -2998,8 +3129,9 @@ pub mod wfp_filter_shape {
 
 #[cfg(windows)]
 pub use imp::{
-    apply_wfp_tunnel_permit, assert_forwarded_traffic_admitted, call_named_pipe, dpapi_protect,
-    dpapi_unprotect, extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
+    apply_protected_dacl_to_path, apply_wfp_tunnel_permit, assert_forwarded_traffic_admitted,
+    call_named_pipe, create_new_file_with_sddl, dpapi_protect, dpapi_unprotect,
+    extract_signer_thumbprint_sha256, get_adapters_addresses, inspect_file_sddl,
     inspect_named_pipe_sddl, inspect_registry_key_sddl, lookup_account_sid_string,
     remove_wfp_tunnel_permit, serve_named_pipe_one_message,
     serve_named_pipe_one_message_authorized, verify_authenticode_chain, wfp_tunnel_permit_present,
@@ -3087,6 +3219,38 @@ mod tests {
         );
         let err = select_default_gateway_from_adapters(&[bad]).expect_err("no gateway");
         assert!(err.contains("no usable Windows default gateway"));
+    }
+}
+
+// RSA-0025: pin the exact Win32 flag bits the write-time-DACL helpers
+// pass to `CreateFileW` / `SetNamedSecurityInfoW`. The values mirror
+// winnt.h via windows-sys; a windows-sys upgrade that ever moves one
+// fails here instead of silently changing the ACL semantics of
+// key-custody writes. The constants are Windows-only, so this module
+// builds on every Windows target and runs on Windows hosts; the pure
+// SDDL half of the RSA-0025 surface is unit-tested in rustynet-crypto
+// on every platform.
+#[cfg(windows)]
+#[cfg(test)]
+mod rsa0025_dacl_flag_tests {
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, GENERIC_WRITE};
+    use windows_sys::Win32::Security::{
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+
+    #[test]
+    fn rsa0025_protected_dacl_flag_bits_match_reviewed_mask() {
+        assert_eq!(DACL_SECURITY_INFORMATION, 0x0000_0004);
+        assert_eq!(PROTECTED_DACL_SECURITY_INFORMATION, 0x8000_0000);
+    }
+
+    #[test]
+    fn rsa0025_create_file_flag_bits_match_reviewed_mask() {
+        assert_eq!(CREATE_NEW, 1);
+        assert_eq!(GENERIC_WRITE, 0x4000_0000);
+        assert_eq!(FILE_ATTRIBUTE_NORMAL, 0x0000_0080);
+        assert_eq!(ERROR_SUCCESS, 0);
     }
 }
 

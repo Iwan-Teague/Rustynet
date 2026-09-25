@@ -1142,7 +1142,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - Proposed enforcement (review-only — do NOT apply): apply an explicit SYSTEM/Administrators-only DACL (via `rustynet_windows_native`) at `.enc` creation, and verify it (closes the RSA-0002 read-side too). Fail closed if the ACL cannot be set.
 - Justification / source: SecurityMinimumBar §3.4/§5; CWE-732 — https://cwe.mitre.org/data/definitions/732.html (accessed 2026-06-18). Re-confirms AUDIT-027/RN-33.
 - Verification method: Windows test asserting the created `.enc` rejects non-admin read / has the expected DACL.
-- Status: **open** (re-confirms AUDIT-027/RN-33; 2026-06-18)
+- Status: **applied** (2026-09-25) — on Windows the key file is created with a protected DACL at creation time (CreateFileW with security attributes; `D:P(A;;FA;;;SY)(A;;FA;;;BA)`, no owner or group asserted, so a non-SYSTEM writer is not refused). A custody directory is given the same protected DACL only when this write creates it; an existing directory is never rewritten (that could lock a non-elevated owner out of a shared or personal folder), only validated afterwards, and the write fails closed if the directory is too broad. The existing SDDL validation stays as the post-condition. Compiled for x86_64-pc-windows-gnu; live Windows execution not verified.
 
 ### RSA-0031 — Exit-NAT teardown verification is fail-open: pfctl/forwarding-capture exec failure is reported as teardown-succeeded, masking residual exit NAT
 - File: `crates/rustynetd/src/macos_exit_nat_lifecycle.rs:94-111,181-201`; `crates/rustynetd/src/windows_exit_nat_lifecycle.rs:58-72,118-120,172-183`
