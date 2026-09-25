@@ -63,8 +63,8 @@ mod daemon {
     };
     use rustynet_relay::session::SessionId;
     use rustynet_relay::transport::{
-        RELAY_HELLO_MSG_TYPE, RelayForwardError, RelayHelloResponse, RelayTransport,
-        parse_relay_hello,
+        RELAY_HELLO_MSG_TYPE, RejectReason, RelayForwardError, RelayHelloResponse, RelayTransport,
+        parse_relay_hello, serialize_relay_hello_challenge,
     };
 
     // `MAX_RELAY_NODE_ID_BYTES` and `RELAY_HELLO_MSG_TYPE` moved to
@@ -84,6 +84,10 @@ mod daemon {
     #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     const MAX_WINDOWS_RELAY_ENV_FILE_BYTES: u64 = 32 * 1024;
     static RELAY_STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+    /// OI-10: process-lifetime count of address-validation challenges
+    /// issued. Diagnostic only (visibility for operators confirming the
+    /// gate is live); never parsed for correctness.
+    static RELAY_ADDR_VALIDATION_CHALLENGES_ISSUED: AtomicU64 = AtomicU64::new(0);
 
     pub fn reset_relay_stop_requested() {
         RELAY_STOP_REQUESTED.store(false, Ordering::SeqCst);
@@ -181,6 +185,11 @@ mod daemon {
         pub blind_issuer_key_id: String,
         /// Public profile ids the blind listener admits (must be non-empty).
         pub blind_profiles: Vec<String>,
+        /// OI-10: require a pre-auth address-validation artifact (HMAC over
+        /// the observed source address + token nonce) on every relay hello
+        /// BEFORE the ed25519 signature is verified. DEFAULT-ON; the only
+        /// opt-out is `--no-require-addr-validation`, which logs a warning.
+        pub require_addr_validation: bool,
     }
 
     impl Default for RelayConfig {
@@ -203,6 +212,9 @@ mod daemon {
                 blind_replay_store_path: String::new(),
                 blind_issuer_key_id: String::new(),
                 blind_profiles: Vec::new(),
+                // OI-10 DEFAULT-ON (owner decision OI-10): the pre-auth
+                // address-validation gate starts enabled.
+                require_addr_validation: true,
             }
         }
     }
@@ -647,14 +659,19 @@ mod daemon {
                 .await
                 .map_err(|e| format!("failed to bind control socket: {e}"))?;
 
-            let mut transport = RelayTransport::new_with_replay_store_path(
+            let transport = RelayTransport::new_with_replay_store_path(
                 config.relay_id,
                 verifier_key,
                 config.max_sessions_per_node,
                 config.clock_skew_tolerance_secs,
                 config.replay_store_path.clone(),
             )
-            .map_err(|e| format!("failed to initialize relay replay store: {e}"))?;
+            .map_err(|e| format!("failed to initialize relay transport: {e}"))?;
+            // OI-10: apply the operator's gate posture. Default is ON; the
+            // deliberate `--no-require-addr-validation` opt-out was already
+            // logged at parse time (warn level).
+            let mut transport =
+                transport.with_require_addr_validation(config.require_addr_validation);
             transport.set_max_total_sessions(config.max_total_sessions)?;
 
             // O1 open-from-runtime: resolve the blind-relay v2 listener from
@@ -978,21 +995,81 @@ mod daemon {
         }
 
         /// Handles a `RelayHello` message.
+        ///
+        /// OI-10 challenge flow: a hello rejected with
+        /// `AddressValidationRequired` (gate on, no artifact yet) gets a
+        /// `[0x06] ++ artifact[32]` challenge instead of the generic
+        /// reject. Issuance runs under the transport lock (synchronous —
+        /// never held across the `.await`) and is bounded by the per-source
+        /// pre-auth shed that already ran, mirroring the blind-v2 O2
+        /// issuance pattern. `AddressValidationInvalid` and every other
+        /// rejection still get the generic reject.
         async fn handle_hello(&self, data: &[u8], from_addr: SocketAddr) -> Result<(), String> {
             let hello = parse_relay_hello(data)?;
 
-            if let Err(reason) = {
+            let validation = {
                 let mut transport = lock_transport(&self.transport);
                 transport.validate_hello_from_tuple(&hello, from_addr)
-            } {
-                let reject_bytes = serialize_relay_reject();
-                self.control_socket
-                    .send_to(&reject_bytes, from_addr)
-                    .await
-                    .map_err(|e| format!("failed to send reject: {e}"))?;
-
-                eprintln!("session rejected from {from_addr}: {reason:?}");
-                return Ok(());
+            };
+            match validation {
+                Ok(()) => {}
+                Err(RejectReason::AddressValidationRequired) => {
+                    // Mint the challenge artifact for THIS exchange, then
+                    // reply after dropping the lock. Parse already ran, so
+                    // the token nonce exists; no clock or issuance failure
+                    // degrades into a challenge — fail closed with the
+                    // generic reject instead.
+                    let challenge = {
+                        let transport = lock_transport(&self.transport);
+                        checked_unix_now().and_then(|now| {
+                            transport
+                                .issue_hello_validation_artifact(
+                                    &from_addr,
+                                    &hello.session_token.nonce,
+                                    now,
+                                )
+                                .ok()
+                        })
+                    };
+                    match challenge {
+                        Some(artifact) => {
+                            let reply = serialize_relay_hello_challenge(&artifact);
+                            self.control_socket
+                                .send_to(&reply, from_addr)
+                                .await
+                                .map_err(|e| {
+                                    format!("failed to send address-validation challenge: {e}")
+                                })?;
+                            eprintln!(
+                                "address-validation challenge issued to {from_addr} ({} pending)",
+                                RELAY_ADDR_VALIDATION_CHALLENGES_ISSUED
+                                    .fetch_add(1, Ordering::Relaxed)
+                                    + 1
+                            );
+                            return Ok(());
+                        }
+                        None => {
+                            let reject_bytes = serialize_relay_reject();
+                            self.control_socket
+                                .send_to(&reject_bytes, from_addr)
+                                .await
+                                .map_err(|e| format!("failed to send reject: {e}"))?;
+                            eprintln!(
+                                "session rejected from {from_addr}: challenge issuance failed"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(reason) => {
+                    let reject_bytes = serialize_relay_reject();
+                    self.control_socket
+                        .send_to(&reject_bytes, from_addr)
+                        .await
+                        .map_err(|e| format!("failed to send reject: {e}"))?;
+                    eprintln!("session rejected from {from_addr}: {reason:?}");
+                    return Ok(());
+                }
             }
 
             Self::prune_inactive_allocated_sockets(&self.allocated_sockets, &self.transport).await;
@@ -2854,6 +2931,15 @@ mod daemon {
                     }
                     config.blind_profiles = profiles;
                 }
+                "--no-require-addr-validation" => {
+                    // OI-10 deliberate opt-out. Logged here (warn) so the
+                    // posture change is visible in daemon startup output;
+                    // the daemon applies it after transport construction.
+                    config.require_addr_validation = false;
+                    eprintln!(
+                        "warn: --no-require-addr-validation DISABLES the pre-auth address-validation gate (OI-10 default-on); relay hellos will no longer require a challenge artifact and the pre-ed25519 DoS protection is OFF"
+                    );
+                }
                 "--help" | "-h" => {
                     eprintln!(
                         "Usage: rustynet-relay [OPTIONS]\n\n\
@@ -2872,6 +2958,7 @@ mod daemon {
                           --blind-replay-store <PATH> Durable replay store for the blind listener\n  \
                           --blind-issuer-key-id <ID> Token issuer key id accepted for blind legs\n  \
                           --blind-profiles <CSV>     Public profile ids the blind listener admits\n  \
+                          --no-require-addr-validation  Opt OUT of the pre-auth address-validation gate (OI-10, default ON; logs a warning)\n  \
                           --help                     Show this help"
                     );
                     std::process::exit(0);
@@ -3685,6 +3772,49 @@ mod daemon {
                 Some("127.0.0.1:9100".parse().unwrap())
             );
             assert_eq!(config.max_total_sessions, 32);
+        }
+
+        #[test]
+        fn config_defaults_to_require_addr_validation_on() {
+            // OI-10: the default posture of the relay binary is gate-ON.
+            assert!(RelayConfig::default().require_addr_validation);
+        }
+
+        #[test]
+        fn parse_args_from_no_require_addr_validation_opts_out() {
+            let config = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+                "--no-require-addr-validation".to_owned(),
+            ])
+            .expect("opt-out args should parse");
+            assert!(
+                !config.require_addr_validation,
+                "the only documented opt-out must flip the gate off"
+            );
+        }
+
+        #[test]
+        fn parse_args_from_defaults_require_addr_validation_true() {
+            let config = super::parse_args_from([
+                "rustynet-relay".to_owned(),
+                "--relay-id".to_owned(),
+                "relay-eu-1".to_owned(),
+                "--verifier-key".to_owned(),
+                os_abs_path("rustynet-relay-verifier.pub"),
+                "--replay-store".to_owned(),
+                os_abs_path("rustynet-relay-replay.store"),
+            ])
+            .expect("plain args should parse");
+            assert!(
+                config.require_addr_validation,
+                "plain startup keeps the OI-10 gate ON"
+            );
         }
 
         #[test]
@@ -4681,12 +4811,10 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -4742,12 +4870,10 @@ mod daemon {
             };
             let health_addr = listener.local_addr().expect("health addr should exist");
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets =
                 Arc::new(RwLock::new(HashMap::<u16, (Arc<UdpSocket>, _)>::new()));
             let forward_stats = Arc::new(ForwardStats::default());
@@ -4815,6 +4941,7 @@ mod daemon {
                     relay_id,
                     90,
                 ),
+                addr_validation_artifact: None,
             }
         }
 
@@ -4834,12 +4961,10 @@ mod daemon {
             let socket = Arc::new(socket);
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -4886,12 +5011,10 @@ mod daemon {
             let port = socket.local_addr().expect("local addr").port();
 
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
-            let transport = Arc::new(Mutex::new(RelayTransport::new(
-                [1u8; 16],
-                signing_key.verifying_key(),
-                8,
-                90,
-            )));
+            let transport = Arc::new(Mutex::new(
+                RelayTransport::new([1u8; 16], signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init"),
+            ));
             let allocated_sockets = Arc::new(RwLock::new(HashMap::new()));
             let forward_stats = Arc::new(ForwardStats::default());
 
@@ -4966,7 +5089,11 @@ mod daemon {
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
             let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init")
+                    // This test exercises token/forward machinery with
+                    // artifact-less hellos; the OI-10 gate has its own tests.
+                    .with_require_addr_validation(false);
             let from_addr: std::net::SocketAddr = "127.0.0.1:41000".parse().unwrap();
             let hello = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner
@@ -5037,7 +5164,11 @@ mod daemon {
             let signing_key = SigningKey::from_bytes(&[9u8; 32]);
             let relay_id = [1u8; 16];
             let mut transport_inner =
-                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90);
+                RelayTransport::new(relay_id, signing_key.verifying_key(), 8, 90)
+                    .expect("relay transport init")
+                    // This test exercises token/forward machinery with
+                    // artifact-less hellos; the OI-10 gate has its own tests.
+                    .with_require_addr_validation(false);
 
             let hello_a = make_signed_hello(&signing_key, relay_id, "a", "b");
             transport_inner

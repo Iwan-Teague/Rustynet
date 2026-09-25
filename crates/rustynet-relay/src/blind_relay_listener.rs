@@ -433,6 +433,7 @@ impl AddressValidationKeyRing {
 
     fn artifact_tag(
         key: &[u8; 32],
+        domain: &[u8],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
         privacy_epoch: u64,
@@ -441,7 +442,7 @@ impl AddressValidationKeyRing {
     ) -> Result<[u8; BLIND_ADDR_VALIDATION_TAG_LEN], AddressArtifactError> {
         let mut mac = Hmac::<Sha256>::new_from_slice(key)
             .map_err(|_| AddressArtifactError::InvalidArtifact)?;
-        mac.update(BLIND_ADDR_VALIDATION_DOMAIN);
+        mac.update(domain);
         mac.update(&key_epoch.to_be_bytes());
         mac.update(&expires_at_unix.to_be_bytes());
         mac.update(addr_octets(observed).as_slice());
@@ -455,9 +456,31 @@ impl AddressValidationKeyRing {
 
     /// Issue the 32-byte address-validation artifact a client presents back as
     /// its hello `relay_challenge`. Bound to the observed source address, the
-    /// client nonce, the privacy epoch, and a short expiry.
+    /// client nonce, the privacy epoch, and a short expiry. HMAC input is
+    /// domain-separated with [`BLIND_ADDR_VALIDATION_DOMAIN`].
     pub fn issue_artifact(
         &self,
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        privacy_epoch: u64,
+        now_unix: u64,
+    ) -> Result<[u8; 32], AddressArtifactError> {
+        self.issue_artifact_for_domain(
+            BLIND_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            now_unix,
+        )
+    }
+
+    /// [`Self::issue_artifact`] under an EXPLICIT HMAC domain tag. OI-10:
+    /// the v1 relay-hello gate mints artifacts under its own
+    /// `RELAY_ADDR_VALIDATION_DOMAIN` so an artifact issued by one protocol
+    /// can never verify on the other (cross-protocol artifact replay).
+    pub fn issue_artifact_for_domain(
+        &self,
+        domain: &[u8],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
         privacy_epoch: u64,
@@ -477,6 +500,7 @@ impl AddressValidationKeyRing {
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let tag = Self::artifact_tag(
             key,
+            domain,
             observed,
             client_nonce,
             privacy_epoch,
@@ -493,9 +517,34 @@ impl AddressValidationKeyRing {
     /// Verify a presented artifact against the observed address, the hello's
     /// client nonce, and the token's privacy epoch. Uses constant-time tag
     /// comparison. Expired means expired PAST the skew window; artifacts never
-    /// extend any session's life.
+    /// extend any session's life. HMAC input is domain-separated with
+    /// [`BLIND_ADDR_VALIDATION_DOMAIN`].
     pub fn verify_artifact(
         &self,
+        observed: &SocketAddr,
+        client_nonce: &[u8; 32],
+        privacy_epoch: u64,
+        artifact: &[u8; 32],
+        now_unix: u64,
+        clock_skew_tolerance_secs: u64,
+    ) -> Result<(), AddressArtifactError> {
+        self.verify_artifact_for_domain(
+            BLIND_ADDR_VALIDATION_DOMAIN,
+            observed,
+            client_nonce,
+            privacy_epoch,
+            artifact,
+            now_unix,
+            clock_skew_tolerance_secs,
+        )
+    }
+
+    /// [`Self::verify_artifact`] under an EXPLICIT HMAC domain tag (OI-10
+    /// domain separation; see [`Self::issue_artifact_for_domain`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_artifact_for_domain(
+        &self,
+        domain: &[u8],
         observed: &SocketAddr,
         client_nonce: &[u8; 32],
         privacy_epoch: u64,
@@ -526,6 +575,7 @@ impl AddressValidationKeyRing {
             .ok_or(AddressArtifactError::UnknownKeyEpoch)?;
         let expected = Self::artifact_tag(
             key,
+            domain,
             observed,
             client_nonce,
             privacy_epoch,
