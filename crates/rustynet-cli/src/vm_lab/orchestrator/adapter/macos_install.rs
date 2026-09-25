@@ -2762,31 +2762,29 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_removes_temporary_sudoers_grant_on_every_exit_path() {
-        // RSA-0063: the temporary `NOPASSWD: ALL` sudoers grant used so the
-        // Homebrew installer's sudo check passes must be removed on EVERY exit
-        // path — including a `curl|bash` failure under `set -e` or a SIGINT — so
-        // a failed/aborted bootstrap never leaves passwordless root on disk
-        // (local privilege-escalation residue, CWE-250/CWE-279). Assert the EXIT
-        // trap is registered, and that it appears BEFORE the curl|bash installer
-        // and is cleared on the success path.
-        let trap_idx = BOOTSTRAP_SCRIPT
-            .find("trap 'rm -f \"${sudoers_tmp}\"' EXIT")
-            .expect("bootstrap must register an EXIT trap to remove the temporary sudoers grant");
-        let write_idx = BOOTSTRAP_SCRIPT
-            .find("> \"${sudoers_tmp}\"")
-            .expect("bootstrap must write the temporary sudoers grant");
-        let curl_idx = BOOTSTRAP_SCRIPT
-            .find("install.sh)")
-            .expect("bootstrap must run the Homebrew installer via curl");
+    fn bootstrap_never_grants_sudo_or_downloads_homebrew() {
+        // AQ-11 / R-SEC-10, superseding the RSA-0063 pin that asserted an EXIT
+        // trap around a temporary `NOPASSWD` grant: the bootstrap no longer
+        // writes sudo policy at all and no longer pipes a downloaded Homebrew
+        // installer into bash, so there is nothing left to clean up. Homebrew
+        // is a prerequisite and its absence fails closed with instructions.
+        // (The lab-only grant the orchestrator pushes over SSH,
+        // PRIME_SUDOERS_REMOTE_COMMAND above, is the named vm-lab exemption
+        // and is not part of the embedded bootstrap.)
+        for forbidden in [
+            "NOPASSWD",
+            "sudoers",
+            "install.sh)",
+            "raw.githubusercontent.com/Homebrew",
+        ] {
+            assert!(
+                !BOOTSTRAP_SCRIPT.contains(forbidden),
+                "the embedded bootstrap must not contain {forbidden:?} (AQ-11)"
+            );
+        }
         assert!(
-            write_idx < trap_idx && trap_idx < curl_idx,
-            "the sudoers EXIT trap must be registered after the grant is written and \
-             before the curl|bash installer (write@{write_idx} trap@{trap_idx} curl@{curl_idx})"
-        );
-        assert!(
-            BOOTSTRAP_SCRIPT.contains("trap - EXIT"),
-            "bootstrap must clear the EXIT trap on the success path"
+            BOOTSTRAP_SCRIPT.contains("[prereqs] FATAL: Homebrew is not installed"),
+            "a missing Homebrew must fail closed with instructions (AQ-11)"
         );
     }
 
