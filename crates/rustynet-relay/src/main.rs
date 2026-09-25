@@ -46,7 +46,7 @@
 mod daemon {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::fs;
-    use std::net::{IpAddr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -349,6 +349,14 @@ mod daemon {
     /// starts with `RELAY_HELLO_MSG_TYPE` (0x01) and can never match.
     const BLIND_RELAY_V2_HELLO_WIRE_PREFIX: &[u8] = b"version=2\ntoken_kind=blind_relay_leg\n";
     const MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC: u32 = 50;
+    /// Bound on how many DISTINCT source keys `PreAuthHelloLimiter` tracks
+    /// before it fails closed. RSA-0087: the key for an IPv6 source is its
+    /// /64 prefix (`pre_auth_limiter_key`), so one routed prefix — however
+    /// many 2^64 addresses it holds — consumes ONE of these entries with
+    /// one `MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC` budget; IPv4 sources still
+    /// key on the full address (after IPv4-mapped/NAT64 canonicalisation).
+    /// The table therefore counts routable attacker units, not spoofable
+    /// addresses.
     const MAX_PRE_AUTH_HELLO_SOURCE_IPS: usize = 4096;
     /// Per-source-IP ceiling on what the relay emits — reject datagram or log
     /// line — in response to packets from an unvalidated source address.
@@ -369,6 +377,26 @@ mod daemon {
     /// under 2% of the loop, while leaving normal operation (which never
     /// approaches it) completely unbudgeted.
     const MAX_PRE_AUTH_NOTICES_PER_SEC: u32 = 4096;
+
+    /// RSA-0083: explicit `SO_RCVBUF` for the pre-auth control socket.
+    ///
+    /// Sizing: without it the socket inherits the OS default (on Linux
+    /// ~208 KiB via `net.core.rmem_default`, on macOS ~786 KiB), which a
+    /// pre-auth flood can drain faster than the single serialized control
+    /// loop can shed it, dropping legitimate hellos before any admission
+    /// code runs. 1 MiB is a deliberate middle ground: at the 65536-byte
+    /// maximum hello datagram the parser already bounds, it buffers ~16
+    /// max-size datagrams (or ~20k minimal `0x01` probe datagrams) of
+    /// headroom above the OS default, while staying far below any
+    /// `rmem_max` a mainstream kernel ships, so the "fail soft if the OS
+    /// clamps" path stays a true edge case rather than the norm.
+    ///
+    /// Fail-soft by design: a kernel that clamps (small `rmem_max`, a
+    /// container cap, an embedded target) must not stop the relay from
+    /// binding — the effective size is logged instead, and admission
+    /// behaviour is identical either way. This is availability tuning on a
+    /// best-effort datagram socket, not a security control.
+    const RELAY_CONTROL_SOCKET_RECV_BUFFER_BYTES: usize = 1_048_576;
 
     /// Maps allocated ports to session IDs for ciphertext forwarding.
     struct PortAllocation {
@@ -478,6 +506,12 @@ mod daemon {
         /// cheaper than `tokio::sync::RwLock`'s async wake/schedule
         /// machinery on every single frame — see `lock_transport`.
         transport: Arc<Mutex<RelayTransport>>,
+        /// RSA-0086: an unlocked copy of the control-plane verifying key
+        /// (`VerifyingKey` is `Copy` and never changes after construction —
+        /// the transport holds the same value). This is what lets the hello
+        /// signature be verified WITHOUT taking the transport lock: the
+        /// verify needs the parsed hello plus this key and nothing else.
+        control_verifier_key: VerifyingKey,
         control_socket: UdpSocket,
         pre_auth_hello_limiter: Arc<RwLock<PreAuthHelloLimiter>>,
         /// Budget for *responding at all* to a packet whose source address
@@ -542,6 +576,56 @@ mod daemon {
         listener: &Mutex<Option<BlindRelayListener>>,
     ) -> MutexGuard<'_, Option<BlindRelayListener>> {
         listener.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Binds the relay's UDP control socket with an explicit `SO_RCVBUF`
+    /// (RSA-0083).
+    ///
+    /// std/tokio do not expose `SO_RCVBUF`, so the socket is created as a
+    /// `std::net::UdpSocket`, configured through `socket2` — already in the
+    /// dependency tree of three workspace crates (`rustynet-backend-wireguard`,
+    /// `rustynet-cli`, `rustynet-mcp`, all pinned `"0.6"`, so this adds no
+    /// new crate to the lockfile) — and then handed to tokio.
+    ///
+    /// Fail-soft: if the OS refuses or clamps the requested size (small
+    /// `rmem_max`, container cap, embedded target), the bind still succeeds
+    /// and the effective size is returned and logged; the relay's admission
+    /// behaviour is identical either way. Returns the effective buffer size
+    /// alongside the socket so tests can assert the request was honoured.
+    fn bind_control_socket(bind_addr: SocketAddr) -> Result<(UdpSocket, usize), String> {
+        bind_control_socket_with_recv_buffer(bind_addr, RELAY_CONTROL_SOCKET_RECV_BUFFER_BYTES)
+    }
+
+    /// [`bind_control_socket`] with the requested receive-buffer size as a
+    /// parameter, so the witness test can also request a size BELOW the
+    /// host default and see the effective buffer drop. That is the only
+    /// portable proof that the set is applied: on a stock Linux host
+    /// `rmem_default == rmem_max`, so a lost 1 MiB request and a clamped
+    /// one read back the same value.
+    fn bind_control_socket_with_recv_buffer(
+        bind_addr: SocketAddr,
+        recv_buffer_bytes: usize,
+    ) -> Result<(UdpSocket, usize), String> {
+        let std_socket = std::net::UdpSocket::bind(bind_addr)
+            .map_err(|e| format!("failed to bind control socket: {e}"))?;
+        let socket = socket2::Socket::from(std_socket);
+        if let Err(err) = socket.set_recv_buffer_size(recv_buffer_bytes) {
+            eprintln!(
+                "warn relay: control socket SO_RCVBUF could not be set to \
+                 {recv_buffer_bytes} bytes ({err}); \
+                  continuing with the OS-managed receive buffer"
+            );
+        }
+        let effective = socket.recv_buffer_size().unwrap_or(0);
+        let std_socket: std::net::UdpSocket = socket.into();
+        // tokio's `from_std` requires a non-blocking fd (it registers the
+        // socket with the runtime's readiness-based reactor).
+        std_socket
+            .set_nonblocking(true)
+            .map_err(|e| format!("failed to configure control socket: {e}"))?;
+        let control_socket = UdpSocket::from_std(std_socket)
+            .map_err(|e| format!("failed to bind control socket: {e}"))?;
+        Ok((control_socket, effective))
     }
 
     /// Cheap pre-parse discriminator for blind-relay v2 hello datagrams.
@@ -665,10 +749,19 @@ mod daemon {
 
             let verifier_key = load_control_verifier_key(&config.verifier_key_path)?;
 
-            // Bind control socket
-            let control_socket = UdpSocket::bind(config.bind_addr)
-                .await
-                .map_err(|e| format!("failed to bind control socket: {e}"))?;
+            // Bind control socket. RSA-0083: bind through socket2 so an
+            // explicit SO_RCVBUF is requested before the socket goes live —
+            // fail-soft (log the effective size, never fail the bind); see
+            // `RELAY_CONTROL_SOCKET_RECV_BUFFER_BYTES` and
+            // `bind_control_socket`. The returned effective size feeds the
+            // hello-admission sizing comments; the socket is the daemon's
+            // single serialized control-plane receiver.
+            let (control_socket, control_socket_recv_buffer_bytes) =
+                bind_control_socket(config.bind_addr)?;
+            eprintln!(
+                "relay: control socket SO_RCVBUF effective size: \
+                 {control_socket_recv_buffer_bytes} bytes"
+            );
 
             let transport = RelayTransport::new_with_replay_store_path(
                 config.relay_id,
@@ -718,6 +811,7 @@ mod daemon {
             Ok(Self {
                 config: config.clone(),
                 transport: Arc::new(Mutex::new(transport)),
+                control_verifier_key: verifier_key,
                 control_socket,
                 pre_auth_hello_limiter: Arc::new(RwLock::new(PreAuthHelloLimiter::new(
                     MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
@@ -1028,11 +1122,38 @@ mod daemon {
         async fn handle_hello(&self, data: &[u8], from_addr: SocketAddr) -> Result<(), String> {
             let hello = parse_relay_hello(data)?;
 
-            let validation = {
-                let mut transport = lock_transport(&self.transport);
-                transport.validate_hello_from_tuple(&hello, from_addr)
+            // RSA-0086: the transport lock is held ONLY for cheap admission
+            // state — the per-source shed, the per-node_id limiter and the
+            // OI-10 address-validation gate first (all pre-verify, exactly
+            // the historical order), then — after the ed25519 verify runs
+            // with NO lock held — the post-signature predicates. The verify
+            // itself (`verify_hello_token_signature`) takes no transport
+            // state by construction, so verify latency now stalls only its
+            // own caller instead of every forward task sharing the mutex.
+            // The admission checks and their order are unchanged: a hello
+            // still meets gates → signature → post-signature predicates, in
+            // that order, and gets the same reject reason it always did.
+            let validated = {
+                let gates = {
+                    let mut transport = lock_transport(&self.transport);
+                    transport.validate_hello_gates_from_tuple(&hello, from_addr)
+                };
+                gates
+                    .and_then(|()| {
+                        // Lock released: the verify below needs no transport
+                        // state, only the parsed hello and the immutable
+                        // control-plane verifying key (`self.control_verifier_key`).
+                        RelayTransport::verify_hello_token_signature(
+                            &hello,
+                            &self.control_verifier_key,
+                        )
+                    })
+                    .and_then(|()| {
+                        let transport = lock_transport(&self.transport);
+                        transport.validate_hello_post_signature(&hello)
+                    })
             };
-            match validation {
+            match validated {
                 Ok(()) => {}
                 Err(RejectReason::AddressValidationRequired) => {
                     // Mint the challenge artifact for THIS exchange, then
@@ -1101,7 +1222,12 @@ mod daemon {
 
             let response = {
                 let mut transport = lock_transport(&self.transport);
-                transport.handle_hello_from_tuple_with_allocated_port(
+                // RSA-0086: commit under the lock WITHOUT re-verifying — the
+                // signature was already checked above, outside the lock.
+                // `commit_hello_from_tuple_with_allocated_port` re-runs the
+                // stateful admission checks (OI-10 gate, replay, bindings,
+                // capacities) exactly as the old combined path did.
+                transport.commit_hello_from_tuple_with_allocated_port(
                     hello,
                     from_addr,
                     allocated_port,
@@ -1347,6 +1473,43 @@ mod daemon {
     /// The per-source-IP counting window.
     const PRE_AUTH_HELLO_WINDOW: Duration = Duration::from_secs(1);
 
+    /// RSA-0087: the pre-auth limiter key for a UDP source address. IPv4
+    /// sources key on the full address (unchanged); IPv6 sources key on
+    /// their /64 prefix — the smallest routable unit, so everything one
+    /// attacker can actually source maps to one limiter entry. IPv4-mapped
+    /// sources (`::ffff:a.b.c.d`, what a dual-stack `bindv6only=0` socket
+    /// reports for IPv4 senders) and NAT64 well-known-prefix sources
+    /// (`64:ff9b::/96` + IPv4) canonicalise to their embedded IPv4 address
+    /// FIRST: their first four segments are constant, so raw /64 keying
+    /// would collapse every IPv4 sender (or every NAT64 client on the
+    /// internet) into one shared budget. The remaining IPv6 space keys on
+    /// its /64: a network-specific RFC6052 translator collapses its whole
+    /// site into one entry per translator prefix, and Teredo collapses per
+    /// server prefix — both bounded by the same per-entry budget every
+    /// other source gets. Pure and total: every address maps to exactly
+    /// one key, and the mapping never merges two different /64s (or any
+    /// two distinct IPv4 addresses with each other).
+    fn pre_auth_limiter_key(ip: IpAddr) -> IpAddr {
+        // Canonicalise first: an IPv4-mapped address becomes a plain IPv4
+        // address, so it keys like every other IPv4 source.
+        let ip = ip.to_canonical();
+        match ip {
+            IpAddr::V4(_) => ip,
+            IpAddr::V6(v6) => {
+                let seg = v6.segments();
+                // NAT64 well-known prefix 64:ff9b::/96: `to_canonical` does
+                // not touch it (it is not v4-mapped), so unwrap the embedded
+                // IPv4 address here or every NAT64 client on the internet
+                // would share the single key `64:ff9b:0:0::`.
+                if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 {
+                    let embedded = (u32::from(seg[6]) << 16) | u32::from(seg[7]);
+                    return IpAddr::V4(Ipv4Addr::from(embedded));
+                }
+                IpAddr::V6(Ipv6Addr::new(seg[0], seg[1], seg[2], seg[3], 0, 0, 0, 0))
+            }
+        }
+    }
+
     struct PreAuthHelloLimiter {
         max_per_sec: u32,
         counts: HashMap<IpAddr, (u32, Instant)>,
@@ -1380,6 +1543,20 @@ mod daemon {
         /// `check` with the clock injected, so the equivalence and expiry
         /// tests can drive an exact timeline instead of racing the wall clock.
         fn check_at(&mut self, ip: IpAddr, now: Instant) -> bool {
+            // RSA-0087: key IPv6 sources on their routed /64 prefix, not the
+            // full address. A single host holding a routed /64 can present
+            // 2^64 distinct source addresses, so per-address keying let one
+            // machine fill the bounded 4096-entry table (which fails closed)
+            // and lock out every new legitimate source. With /64 keying, the
+            // entire prefix consumes ONE entry whose budget is the same
+            // `max_per_sec` every other source gets — the per-/64 budget is
+            // exactly the per-source budget, and a /64 flood is now as cheap
+            // to shed as a single-host flood. IPv4 is unchanged (keyed on the
+            // full address: a /32 IS the routable unit an attacker holds);
+            // `pre_auth_limiter_key` canonicalises IPv4-mapped and NAT64
+            // sources to their embedded IPv4 address first, so dual-stack
+            // binds never collapse distinct IPv4 senders into one key.
+            let ip = pre_auth_limiter_key(ip);
             // Keep the lower bound valid without assuming anything about the
             // clock. A production `check` only ever supplies a monotonically
             // non-decreasing `Instant::now()`, so this never fires there; it
@@ -3323,18 +3500,20 @@ mod daemon {
     mod tests {
         use super::{
             BLIND_RELAY_V2_ADDR_VALIDATION_RESPONSE_MSG_TYPE, ForwardStats, HealthSnapshot,
-            MAX_PRE_AUTH_HELLO_SOURCE_IPS, PRE_AUTH_HELLO_WINDOW, PortAllocation,
-            PreAuthHelloLimiter, PreAuthNoticeBudget, PreAuthStats, RELAY_HELLO_MSG_TYPE,
-            RELAY_KEEPALIVE_MSG_TYPE, RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE,
-            RelayConfig, RelayDaemon, RelayForwardError, RelayHelloResponse,
-            RelayHostEntrySelection, RelayTransport, WindowsRelayServiceHardeningSnapshot,
-            WindowsRelayServiceOptions, bind_health_listener, build_blind_listener_config,
-            build_windows_relay_service_hardening_report, evaluate_windows_relay_service_hardening,
-            http_request_path, is_blind_relay_hello_v2_frame, load_control_verifier_key,
-            parse_relay_hello, parse_relay_id_arg, parse_windows_image_path_argv, record_forward,
-            render_health_json, render_metrics, run_hello_limiter_audit_command,
-            select_relay_host_entry, serialize_blind_relay_addr_validation_response,
-            serialize_relay_reject, serve_health_endpoint, should_prune_on_forward_error,
+            MAX_PRE_AUTH_HELLO_SOURCE_IPS, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+            PRE_AUTH_HELLO_WINDOW, PortAllocation, PreAuthHelloLimiter, PreAuthNoticeBudget,
+            PreAuthStats, RELAY_HELLO_MSG_TYPE, RELAY_KEEPALIVE_MSG_TYPE,
+            RELAY_REJECT_GENERIC_REASON, RELAY_REJECT_MSG_TYPE, RelayConfig, RelayDaemon,
+            RelayForwardError, RelayHelloResponse, RelayHostEntrySelection, RelayTransport,
+            WindowsRelayServiceHardeningSnapshot, WindowsRelayServiceOptions, bind_control_socket,
+            bind_control_socket_with_recv_buffer, bind_health_listener,
+            build_blind_listener_config, build_windows_relay_service_hardening_report,
+            evaluate_windows_relay_service_hardening, http_request_path,
+            is_blind_relay_hello_v2_frame, load_control_verifier_key, parse_relay_hello,
+            parse_relay_id_arg, parse_windows_image_path_argv, record_forward, render_health_json,
+            render_metrics, run_hello_limiter_audit_command, select_relay_host_entry,
+            serialize_blind_relay_addr_validation_response, serialize_relay_reject,
+            serve_health_endpoint, should_prune_on_forward_error,
         };
         use rustynet_control::roles::RoleCapability;
         use rustynet_relay::transport::MAX_RELAY_NODE_ID_BYTES;
@@ -3612,7 +3791,7 @@ mod daemon {
         use rustynet_relay::transport::RelayHello;
         use std::collections::HashMap;
         use std::fs;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
         use std::path::{Path, PathBuf};
@@ -5405,6 +5584,270 @@ mod daemon {
             // have expired and skips the sweep.
             limiter.earliest_window_start = aged;
             assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+        }
+
+        /// RSA-0087 witness: IPv6 sources inside one routed /64 must share a
+        /// single limiter entry (and therefore a single per-second budget),
+        /// while different /64s — and every IPv4 address — stay independent.
+        /// On the pre-fix limiter (per-address keying) the 4096-host loop
+        /// below gets 4096 separate budgets and fills the table, so the
+        /// budget and `counts.len()` assertions fail.
+        #[test]
+        fn pre_auth_hello_limiter_keys_ipv6_sources_on_their_slash64_prefix() {
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            // 4096 distinct hosts inside 2001:db8:a::/64. All of them map to
+            // ONE limiter key, so exactly `MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC`
+            // hellos are admitted and the rest of the prefix flood is shed.
+            let mut admitted = 0u32;
+            for index in 0..4096usize {
+                let ip = IpAddr::V6(Ipv6Addr::new(
+                    0x2001,
+                    0x0db8,
+                    0x000a,
+                    0,
+                    0,
+                    0,
+                    0,
+                    index as u16,
+                ));
+                if limiter.check(ip) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+                "the whole /64 must share one per-source budget"
+            );
+            assert_eq!(
+                limiter.counts.len(),
+                1,
+                "a /64 flood must consume a single source-table entry"
+            );
+
+            // A different /64 is a different key (and still has budget).
+            assert!(limiter.check(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0x000b, 0, 0, 0, 0, 1
+            ))));
+            assert_eq!(limiter.counts.len(), 2);
+
+            // IPv4 keying is unchanged: each address is its own entry.
+            assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))));
+            assert!(limiter.check(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11))));
+            assert_eq!(limiter.counts.len(), 4);
+        }
+
+        /// RSA-0087 witness: one host spraying 4096 addresses out of a single
+        /// /64 must NOT be able to fill the bounded source table. Pre-fix,
+        /// each address is its own entry, the table reaches its 4096 cap, and
+        /// the fresh IPv4 source at the end is refused (fail-closed) — the
+        /// exact lock-out this fix exists to prevent.
+        #[test]
+        fn pre_auth_hello_limiter_slash64_flood_cannot_exhaust_the_source_table() {
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                let ip = IpAddr::V6(Ipv6Addr::new(
+                    0x2001,
+                    0x0db8,
+                    0x000a,
+                    0,
+                    0,
+                    0,
+                    0,
+                    index as u16,
+                ));
+                let _ = limiter.check(ip);
+            }
+
+            // The whole flood collapsed into one /64 entry...
+            assert_eq!(
+                limiter.counts.len(),
+                1,
+                "4096 addresses out of one /64 must be one table entry"
+            );
+            // ...so every other source still gets admitted.
+            assert!(
+                limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))),
+                "a /64 flood must not lock out fresh sources"
+            );
+            assert!(limiter.check(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0x000b, 0, 0, 0, 0, 1
+            ))));
+            assert_eq!(limiter.counts.len(), 3);
+        }
+
+        /// The fix must not weaken the existing bound: once the table holds
+        /// 4096 DISTINCT /64s, the next /64 — and any IPv4 source — is still
+        /// refused (fail-closed), exactly like the IPv4 variant above.
+        #[test]
+        fn pre_auth_hello_limiter_still_fail_closed_once_full_of_slash64_sources() {
+            // Literal, not the symbol — same reasoning as
+            // `pre_auth_hello_limiter_bounds_source_ip_table`.
+            assert_eq!(
+                MAX_PRE_AUTH_HELLO_SOURCE_IPS, 4096,
+                "the source-IP cap is the property under test; changing it must \
+                 be deliberate and must update this test"
+            );
+
+            let mut limiter = PreAuthHelloLimiter::new(1);
+            // 4096 distinct /64 prefixes: vary the 4th group (the /64
+            // boundary is the first four groups).
+            for index in 0..MAX_PRE_AUTH_HELLO_SOURCE_IPS {
+                let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, index as u16, 0, 0, 0, 1));
+                assert!(limiter.check(ip));
+            }
+
+            assert!(!limiter.check(IpAddr::V6(Ipv6Addr::new(
+                0x2001, 0x0db8, 0, 4096, 0, 0, 0, 1
+            ))));
+            assert!(!limiter.check(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 30))));
+        }
+
+        /// RSA-0087 follow-up: IPv4-mapped IPv6 sources (`::ffff:a.b.c.d`,
+        /// which is what a dual-stack `bindv6only=0` control socket reports
+        /// for plain IPv4 senders) must key on their EMBEDDED IPv4 address.
+        /// Their first four segments are all zero, so keying them on the /64
+        /// prefix collapses EVERY IPv4 sender on a dual-stack bind into the
+        /// single key `::` — one sender at the per-source rate then locks
+        /// out all of IPv4.
+        #[test]
+        fn ipv4_mapped_sources_do_not_collapse_into_a_single_prefix_key() {
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            let sender_a = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 10).to_ipv6_mapped());
+            let sender_b = IpAddr::V6(Ipv4Addr::new(198, 51, 100, 30).to_ipv6_mapped());
+
+            let mut admitted = 0u32;
+            for _ in 0..MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC {
+                if limiter.check(sender_a) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+                "sender A must get its full per-source budget"
+            );
+            assert!(
+                !limiter.check(sender_a),
+                "sender A must be rate limited at the per-source budget"
+            );
+            assert!(
+                limiter.check(sender_b),
+                "IPv4-mapped sources must key on their embedded IPv4 address, \
+                 not share one ::/64 key"
+            );
+            assert_eq!(
+                limiter.counts.len(),
+                2,
+                "two distinct IPv4 senders must be two table entries"
+            );
+        }
+
+        /// RSA-0087 follow-up: NAT64 clients arrive at the relay as
+        /// `64:ff9b::/96` + their IPv4 address. Their first four segments are
+        /// `64:ff9b:0:0`, so /64 keying would collapse EVERY NAT64 client on
+        /// the internet into one budget. Key on the embedded IPv4 address.
+        #[test]
+        fn nat64_well_known_prefix_sources_key_on_their_embedded_ipv4() {
+            fn nat64_wkp(v4: Ipv4Addr) -> IpAddr {
+                let octets = u32::from(v4);
+                IpAddr::V6(Ipv6Addr::new(
+                    0x0064,
+                    0xff9b,
+                    0,
+                    0,
+                    0,
+                    0,
+                    (octets >> 16) as u16,
+                    octets as u16,
+                ))
+            }
+
+            let mut limiter = PreAuthHelloLimiter::new(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC);
+
+            let client_a = nat64_wkp(Ipv4Addr::new(203, 0, 113, 10));
+            let client_b = nat64_wkp(Ipv4Addr::new(198, 51, 100, 30));
+
+            let mut admitted = 0u32;
+            for _ in 0..MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC {
+                if limiter.check(client_a) {
+                    admitted += 1;
+                }
+            }
+            assert_eq!(
+                admitted, MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC,
+                "NAT64 client A must get its full per-source budget"
+            );
+            assert!(
+                limiter.check(client_b),
+                "NAT64 sources must key on their embedded IPv4 address, not \
+                 share one 64:ff9b::/96 key"
+            );
+            assert_eq!(
+                limiter.counts.len(),
+                2,
+                "two distinct NAT64 clients must be two table entries"
+            );
+        }
+
+        /// RSA-0087 reachability witness: the control bind accepts the
+        /// dual-stack wildcard `[::]` (Linux `bindv6only=0` then delivers
+        /// IPv4 senders as `::ffff:a.b.c.d`), so limiter keying MUST handle
+        /// IPv4-mapped sources — this configuration is reachable in
+        /// production, not a hypothetical.
+        #[test]
+        fn relay_config_accepts_a_dual_stack_wildcard_ipv6_bind() {
+            let mut config = valid_config();
+            config.bind_addr = "[::]:4500"
+                .parse()
+                .expect("the dual-stack wildcard bind address should parse");
+            config
+                .validate()
+                .expect("a dual-stack [::] control bind must pass validation");
+        }
+
+        /// RSA-0083: the daemon's UDP control socket must be bound with an
+        /// explicit SO_RCVBUF. Needs a tokio runtime because the bound std
+        /// socket is converted with `UdpSocket::from_std`.
+        #[tokio::test]
+        async fn control_socket_sets_explicit_recv_buffer() {
+            let bind_addr: SocketAddr = "127.0.0.1:0".parse().expect("valid bind addr");
+            let (_socket, effective) = bind_control_socket(bind_addr).expect("bind control socket");
+
+            // The kernel is free to clamp the request: Linux clamps it to
+            // net.core.rmem_max and reports double the value in its byte
+            // accounting, and a STOCK Linux host defaults
+            // rmem_default=rmem_max=212_992 (setsockopt read-back 425_984).
+            // What must hold PORTABLY is that the explicit set took effect
+            // at all: the effective buffer is at least what a plain socket
+            // gets by default on THIS host. On macOS, whose default
+            // (~786_896) sits below the configured floor, this still pins
+            // the floor: the daemon's request is honoured and yields
+            // >= 1_048_576 there.
+            let plain = std::net::UdpSocket::bind("127.0.0.1:0").expect("plain socket bind");
+            let host_default = socket2::SockRef::from(&plain)
+                .recv_buffer_size()
+                .expect("read plain socket SO_RCVBUF");
+            assert!(
+                effective >= host_default,
+                "the explicit SO_RCVBUF was lost: effective {effective} is \
+                 below this host's plain-socket default {host_default}"
+            );
+
+            // The check above cannot tell a lost set from a clamped one on a
+            // stock Linux host, where the default already equals the clamp.
+            // A request far BELOW the default must visibly lower the
+            // effective buffer on every platform (macOS reads back the
+            // request; Linux reads back double it, floored at its minimum),
+            // which proves the set path is applied rather than skipped.
+            let (_small, small_effective) =
+                bind_control_socket_with_recv_buffer(bind_addr, 4096).expect("bind small socket");
+            assert!(
+                small_effective < host_default,
+                "a 4096-byte SO_RCVBUF request did not lower the buffer: \
+                 effective {small_effective}, host default {host_default}"
+            );
         }
 
         fn test_ip(index: usize) -> IpAddr {

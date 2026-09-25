@@ -28,8 +28,24 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::cell::Cell;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+// RSA-0086 test hook: counts ed25519 hello-signature verifications so the
+// witness tests can prove the daemon's locked commit path performs ZERO of
+// them (and that the standalone `verify_hello_token_signature` performs
+// exactly the unlocked ones). Per-THREAD on purpose: the witness observes
+// only the signature work performed by its own execution thread, so a test
+// running in another thread (cargo runs test threads in parallel) can
+// never drift an observation — a process-global counter here was racy by
+// construction. Never compiled outside `cfg(test)`; never read for any
+// admission decision.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static RELAY_HELLO_SIG_VERIFY_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 use ed25519_dalek::VerifyingKey;
 use rand::TryRngCore;
@@ -1187,6 +1203,61 @@ impl RelayTransport {
         self.validate_hello(hello, observed_addr, true)
     }
 
+    /// RSA-0086: the PRE-SIGNATURE admission gates only — checks 0, 1 and 2
+    /// of the ordered list on `handle_hello_from_tuple_with_allocated_port`
+    /// (per-source shed, per-node_id hello rate limit, OI-10
+    /// address-validation gate). The relay daemon runs these under the
+    /// transport lock, drops the lock, and only then performs the ed25519
+    /// verify with `verify_hello_token_signature`, so verify latency can
+    /// never stall a forward in flight. The ordering contract is unchanged:
+    /// the OI-10 gate stays strictly pre-verify, and both rate limiters are
+    /// charged here, exactly as the single-pass `validate_hello_from_tuple`
+    /// charged them.
+    pub fn validate_hello_gates_from_tuple(
+        &mut self,
+        hello: &RelayHello,
+        observed_addr: SocketAddr,
+    ) -> Result<(), RejectReason> {
+        self.check_hello_gates(hello, observed_addr, true)
+    }
+
+    /// RSA-0086: the POST-SIGNATURE admission checks only — checks 4
+    /// through 12 of the ordered list (TTL bound, freshness, future-dating,
+    /// self-pairing, replay, the three ct_eq bindings, scope, both session
+    /// capacities). Read-only: takes `&self`, so it proves in its own
+    /// signature that it mutates no rate limiter and records nothing — the
+    /// daemon may run it under the transport lock with zero admission side
+    /// effects beyond the reject itself.
+    pub fn validate_hello_post_signature(&self, hello: &RelayHello) -> Result<(), RejectReason> {
+        self.check_hello_post_signature(hello)
+    }
+
+    /// RSA-0086: the ed25519 token signature check (check 3 of the ordered
+    /// list), deliberately an associated function taking NO transport
+    /// state. The type signature is the guarantee the relay daemon depends
+    /// on: verification touches only the parsed hello and the (immutable,
+    /// `Copy`) control-plane verifying key, so it needs no transport lock —
+    /// the daemon calls this BETWEEN its locked sections, and verify
+    /// latency stalls nothing but the verifying caller.
+    ///
+    /// Check ordering is unchanged: the daemon runs the OI-10 gate and both
+    /// rate limiters (see `validate_hello_gates_from_tuple`) BEFORE this,
+    /// and the post-signature checks (see `validate_hello_post_signature`)
+    /// AFTER it, exactly the order `validate_hello` has always enforced.
+    pub fn verify_hello_token_signature(
+        hello: &RelayHello,
+        control_verifier_key: &VerifyingKey,
+    ) -> Result<(), RejectReason> {
+        #[cfg(test)]
+        RELAY_HELLO_SIG_VERIFY_CALLS.with(|calls| calls.set(calls.get() + 1));
+        // Check 2: Verify token signature (ed25519, constant-time internally)
+        if let Err(e) = hello.session_token.verify_signature(control_verifier_key) {
+            eprintln!("Relay hello rejected: invalid signature: {e}");
+            return Err(RejectReason::InvalidToken);
+        }
+        Ok(())
+    }
+
     /// Process a session establishment request with a daemon-owned allocated port.
     ///
     /// All security checks are performed in a deliberate order:
@@ -1212,15 +1283,74 @@ impl RelayTransport {
     /// 11. Global session capacity
     /// 12. Per-node session capacity
     /// 13. Daemon-supplied allocated port validation
+    ///
+    /// RSA-0086: this method's internal check order (gates → verify →
+    /// post-signature checks → commit) is byte-for-byte the historical one,
+    /// so every direct caller keeps the exact admission results and reject
+    /// reasons it always got. The relay DAEMON no longer calls this method
+    /// under its transport lock: it runs the gates and the post-signature
+    /// checks locked via `validate_hello_gates_from_tuple` /
+    /// `validate_hello_post_signature`, performs check 3 UNLOCKED via
+    /// `verify_hello_token_signature`, and commits with
+    /// `commit_hello_from_tuple_with_allocated_port` — same checks, same
+    /// order, no ed25519 work under the lock.
     pub fn handle_hello_from_tuple_with_allocated_port(
         &mut self,
         hello: RelayHello,
         observed_addr: SocketAddr,
         allocated_port: u16,
     ) -> RelayHelloResponse {
-        if let Err(reason) = self.validate_hello(&hello, observed_addr, false) {
+        if let Err(reason) = self.check_hello_gates(&hello, observed_addr, false) {
             return RelayHelloResponse::Rejected(reason);
         }
+        if let Err(reason) = Self::verify_hello_token_signature(&hello, &self.control_verifier_key)
+        {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        if let Err(reason) = self.check_hello_post_signature(&hello) {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        self.commit_checked_hello(hello, observed_addr, allocated_port)
+    }
+
+    /// RSA-0086: the daemon's locked commit step. The caller MUST already
+    /// have run `verify_hello_token_signature` OUTSIDE the transport lock
+    /// and it MUST have returned `Ok(())` for this exact hello — this
+    /// method does NOT verify (that is the point: no ed25519 work runs
+    /// under the lock). It re-runs the cheap stateful checks — the OI-10
+    /// gate (an artifact can expire between the gate pass and the commit)
+    /// and every post-signature predicate (capacity, replay, bindings can
+    /// all change while the lock was released) — then commits state, so
+    /// the admission guarantees of
+    /// `handle_hello_from_tuple_with_allocated_port` are unchanged. A
+    /// caller that skips its own unlocked verify has NO verified hello:
+    /// the signature would then never be checked, so this method is
+    /// documented fail-closed for that caller, not safe by default.
+    pub fn commit_hello_from_tuple_with_allocated_port(
+        &mut self,
+        hello: RelayHello,
+        observed_addr: SocketAddr,
+        allocated_port: u16,
+    ) -> RelayHelloResponse {
+        if let Err(reason) = self.check_hello_gates(&hello, observed_addr, false) {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        if let Err(reason) = self.check_hello_post_signature(&hello) {
+            return RelayHelloResponse::Rejected(reason);
+        }
+        self.commit_checked_hello(hello, observed_addr, allocated_port)
+    }
+
+    /// Shared tail of both commit paths above: the port sanity check, the
+    /// replay-nonce record, and the session allocation. Runs only after
+    /// every admission check (including the signature, wherever the caller
+    /// chose to run it) has passed.
+    fn commit_checked_hello(
+        &mut self,
+        hello: RelayHello,
+        observed_addr: SocketAddr,
+        allocated_port: u16,
+    ) -> RelayHelloResponse {
         if allocated_port == 0 {
             eprintln!("Relay hello rejected: allocated port 0");
             return RelayHelloResponse::Rejected(RejectReason::InvalidAllocatedPort);
@@ -1268,7 +1398,29 @@ impl RelayTransport {
         })
     }
 
+    /// The full admission sequence: gates, signature, post-signature
+    /// checks. RSA-0086 split this into `check_hello_gates`,
+    /// `verify_hello_token_signature` and `check_hello_post_signature`;
+    /// this composition keeps the exact check order for callers that hold
+    /// the transport lock anyway (library callers, tests,
+    /// `validate_hello_from_tuple`).
     fn validate_hello(
+        &mut self,
+        hello: &RelayHello,
+        observed_addr: SocketAddr,
+        record_hello_rate: bool,
+    ) -> Result<(), RejectReason> {
+        self.check_hello_gates(hello, observed_addr, record_hello_rate)?;
+        Self::verify_hello_token_signature(hello, &self.control_verifier_key)?;
+        self.check_hello_post_signature(hello)
+    }
+
+    /// RSA-0086: checks 0, 1 and 1.5 of the admission walk-through — the
+    /// identity-free per-source shed, the per-node_id hello rate limit,
+    /// and the OI-10 address-validation gate. All cheap (no ed25519 work)
+    /// and all stateful (`&mut self`: the two rate limiters are charged
+    /// here, exactly once, on the `record_hello_rate` arm).
+    fn check_hello_gates(
         &mut self,
         hello: &RelayHello,
         observed_addr: SocketAddr,
@@ -1331,15 +1483,22 @@ impl RelayTransport {
             }
         }
 
-        // Check 2: Verify token signature (ed25519, constant-time internally)
-        if let Err(e) = hello
-            .session_token
-            .verify_signature(&self.control_verifier_key)
-        {
-            eprintln!("Relay hello rejected: invalid signature: {e}");
-            return Err(RejectReason::InvalidToken);
-        }
+        // Check 2 — the ed25519 signature — lives in
+        // `verify_hello_token_signature` (RSA-0086): an associated function
+        // with no `self`, so it can run without the transport lock.
+        // `validate_hello` composes it between the gates above and the
+        // checks below, preserving the historical order.
+        Ok(())
+    }
 
+    /// RSA-0086: everything that only makes sense on a
+    /// signature-authenticated hello — TTL bound, freshness/future-dating,
+    /// self-pairing, replay, the three ct_eq bindings, scope, and both
+    /// session capacities (checks 3 through 11 of the admission
+    /// walk-through). Read-only (`&self`): nothing here records state, so
+    /// the daemon may run it under the transport lock with no admission
+    /// side effect beyond the reject itself.
+    fn check_hello_post_signature(&self, hello: &RelayHello) -> Result<(), RejectReason> {
         // Check 3: Verify token TTL bound (max 120 s)
         let ttl = hello.session_token.ttl_secs();
         if ttl > MAX_RELAY_TTL_SECS {
@@ -2828,6 +2987,128 @@ mod tests {
     }
 
     // ── Signature / basic token validity ─────────────────────────────────────
+
+    /// RSA-0086 witness: with the transport mutex HELD for the whole
+    /// admission sequence, no ed25519 verification may run. The daemon's
+    /// locked sections are exactly `validate_hello_gates_from_tuple`,
+    /// `validate_hello_post_signature` and
+    /// `commit_hello_from_tuple_with_allocated_port` — none may touch the
+    /// verify counter — and the unlock-then-verify step bumps it by one.
+    /// The counter is per-thread, so concurrent test threads cannot drift
+    /// these exact-count observations.
+    #[test]
+    fn rsa0086_no_signature_verification_under_the_transport_lock() {
+        let (sk, _) = make_test_keypair();
+        let transport = std::sync::Mutex::new(make_transport(&sk));
+        let hello = make_hello(&sk, "node-a", "node-b");
+        let from_addr = observed_addr([203, 0, 113, 10], 45_000);
+
+        // Hold the transport lock across the entire locked admission
+        // sequence, like the daemon does between its two locked sections.
+        let mut guard = transport.lock().expect("transport mutex poisoned");
+        let baseline = RELAY_HELLO_SIG_VERIFY_CALLS.with(Cell::get);
+
+        guard
+            .validate_hello_gates_from_tuple(&hello, from_addr)
+            .expect("pre-signature gates pass");
+        guard
+            .validate_hello_post_signature(&hello)
+            .expect("post-signature checks pass");
+        match guard.commit_hello_from_tuple_with_allocated_port(hello.clone(), from_addr, 45_001) {
+            RelayHelloResponse::Accepted(_) => {}
+            other => panic!("expected accepted commit, got {other:?}"),
+        }
+
+        assert_eq!(
+            RELAY_HELLO_SIG_VERIFY_CALLS.with(Cell::get),
+            baseline,
+            "no ed25519 verify may run while the transport lock is held"
+        );
+        drop(guard);
+
+        // The daemon's between-sections step: verify OUTSIDE the lock.
+        RelayTransport::verify_hello_token_signature(&hello, &sk.verifying_key())
+            .expect("valid token verifies");
+        assert_eq!(
+            RELAY_HELLO_SIG_VERIFY_CALLS.with(Cell::get),
+            baseline + 1,
+            "the out-of-lock verify is the only signature work"
+        );
+    }
+
+    /// RSA-0086 soundness witness: the daemon's flow is gates (locked) →
+    /// signature verify (UNLOCKED) → commit (locked). N copies of one
+    /// verified hello racing that flow must produce exactly one Accepted
+    /// session: the nonce insert runs under the lock inside the commit, so
+    /// every loser is rejected as a replayed nonce and no session pair is
+    /// double-allocated — the unlock window cannot buy a second admission.
+    #[test]
+    fn rsa0086_concurrent_identical_hellos_admit_exactly_one_session() {
+        let (sk, _) = make_test_keypair();
+        let verifier_key = std::sync::Arc::new(sk.verifying_key());
+        let transport = std::sync::Arc::new(std::sync::Mutex::new(make_transport(&sk)));
+        let hello = std::sync::Arc::new(make_hello(&sk, "node-a", "node-b"));
+        let from_addr = observed_addr([203, 0, 113, 10], 45_000);
+
+        // The daemon pre-verifies each hello once before the commit race:
+        // gates under the lock, signature outside it.
+        {
+            let mut guard = transport.lock().expect("transport mutex poisoned");
+            guard
+                .validate_hello_gates_from_tuple(&hello, from_addr)
+                .expect("pre-signature gates pass");
+        }
+        RelayTransport::verify_hello_token_signature(&hello, &verifier_key)
+            .expect("valid token verifies");
+
+        const RACERS: usize = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(RACERS));
+        let mut handles = Vec::new();
+        for index in 0..RACERS {
+            let transport = std::sync::Arc::clone(&transport);
+            let hello = std::sync::Arc::clone(&hello);
+            let verifier_key = std::sync::Arc::clone(&verifier_key);
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                // Each racer re-verifies OUTSIDE the lock (the daemon's
+                // between-sections step), then takes the lock only for the
+                // commit.
+                RelayTransport::verify_hello_token_signature(&hello, &verifier_key)
+                    .expect("valid token verifies");
+                let mut guard = transport.lock().expect("transport mutex poisoned");
+                guard.commit_hello_from_tuple_with_allocated_port(
+                    (*hello).clone(),
+                    from_addr,
+                    45_001 + index as u16,
+                )
+            }));
+        }
+
+        let mut accepted = 0usize;
+        let mut replayed = 0usize;
+        for handle in handles {
+            match handle.join().expect("racer thread should not panic") {
+                RelayHelloResponse::Accepted(_) => accepted += 1,
+                RelayHelloResponse::Rejected(RejectReason::ReplayedNonce) => replayed += 1,
+                other => panic!("unexpected racer response: {other:?}"),
+            }
+        }
+        assert_eq!(accepted, 1, "exactly one racer may win the nonce insert");
+        assert_eq!(
+            replayed,
+            RACERS - 1,
+            "every loser must be rejected as a replayed nonce"
+        );
+        assert_eq!(
+            transport
+                .lock()
+                .expect("transport mutex poisoned")
+                .session_count(),
+            1,
+            "the unlock window must not double-allocate the session"
+        );
+    }
 
     #[test]
     fn test_invalid_signature_token_rejected() {

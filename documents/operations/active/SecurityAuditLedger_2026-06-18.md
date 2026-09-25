@@ -1958,7 +1958,7 @@ Verdict are superseded by their own dates; three statements above no longer hold
 - Date: 2026-07-28 · Severity: **Low** (availability tuning; already CONCERN-rated for embedded targets)
 - Bar mapping: SecurityMinimumBar §3.8. Reachability: **VERIFIED FIRST-HAND** — zero occurrences in the relay binary, so the control socket inherits the OS default receive buffer. Under a pre-auth flood the serialized control loop is the bottleneck, and a small default buffer drops legitimate hellos before the loop can shed the flood.
 - Proposed enforcement: set an explicit `SO_RCVBUF` on the control socket, sized against the documented pre-auth ceiling.
-- Source: 2026-07-27 relay review (residual 6); pre-existing CONCERN in `Arm32BitEmbeddedSupportReference_2026-06-23.md`. Status: **open** (2026-07-28)
+- Source: 2026-07-27 relay review (residual 6); pre-existing CONCERN in `Arm32BitEmbeddedSupportReference_2026-06-23.md`. Status: **applied** (2026-09-25) — `bind_control_socket` requests an explicit 1 MiB `SO_RCVBUF` through socket2, fail-soft (a kernel clamp or refusal is logged, never fatal); the witness also requests a below-default size and checks it takes effect, so it proves the set on stock Linux where `rmem_default == rmem_max`.
 
 ### RSA-0084 — Windows relay installer defaults to a public bind with no firewall rule
 - File: `scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1:15` (`[string]$Bind = '0.0.0.0:4600'`)
@@ -1982,7 +1982,7 @@ Verdict are superseded by their own dates; three statements above no longer hold
 - Bar mapping: SecurityMinimumBar §3.8; CWE-405.
 - Reachability: **RAISED, NOT VERIFIED.** The review reports that `HelloLimiter` keys on `hello.node_id`, which is attacker-controlled and read before signature verification, so it sheds nothing under a flood of distinct ids; and that `lock_transport` is held across the ed25519 verify, so the cost lands on the dataplane too. I confirmed only that the hello parser reads a `u16`-length `node_id` (`main.rs:815-823`) and that `pre_auth_hello_limiter` (the IP-keyed one, `:510`) is a different limiter. The node_id-keyed limiter's call site and the lock scope across the verify were not checked.
 - Proposed enforcement: verify the claim first; if it holds, key the pre-auth limiter on something the attacker cannot vary freely (source IP already is), and move the verify out of the transport lock.
-- Source: 2026-07-27 relay review (residual 2, rated by its own reviewer above the defect that review fixed). Status: **open — needs first-hand confirmation before action** (2026-07-28)
+- Source: 2026-07-27 relay review (residual 2, rated by its own reviewer above the defect that review fixed). Status: **applied** (2026-09-25) — the ed25519 hello verify runs outside the transport mutex and the admission commit re-checks state under the lock; a test-only per-thread counter proves the locked commit path performs zero verifies. Pre-auth shedding is keyed on the source address (RSA-0087), not on `node_id`.
 
 ### RSA-0087 — IPv6: per-IP pre-auth limiters key on the full address, so a routed /64 is a cheap total lockout
 - File: `crates/rustynet-relay/src/main.rs` (`PreAuthHelloLimiter`, `MAX_PRE_AUTH_HELLO_SOURCE_IPS`)
@@ -1990,7 +1990,7 @@ Verdict are superseded by their own dates; three statements above no longer hold
 - Bar mapping: SecurityMinimumBar §3.8; CWE-770.
 - Reachability: **RAISED, NOT VERIFIED.** The review reports that keying on the full IPv6 address lets a single routed /64 present effectively unlimited distinct sources, filling the bounded 4096-entry table — which fails closed — at roughly 4096 packets/s, denying pre-auth to every legitimate peer. Plausible on its face given the table bound is per-address, but the fail-closed-on-full behaviour and the rate were not confirmed here.
 - Proposed enforcement: verify, then key IPv6 sources on a prefix (/64 or /48) rather than the full address, so one routed prefix consumes one entry.
-- Source: 2026-07-27 relay review (residual 4). Status: **open — needs first-hand confirmation** (2026-07-28)
+- Source: 2026-07-27 relay review (residual 4). Status: **applied** (2026-09-25) — IPv6 sources key on their /64; addresses are canonicalised first and NAT64 well-known-prefix sources unwrap to their embedded IPv4, so IPv4-mapped senders on a dual-stack bind and NAT64 clients never collapse into one shared key (witnessed by tests for both).
 
 ### RSA-0088 — `node_id` is length-bounded only by the datagram and becomes a map key before signature verification
 - File: `crates/rustynet-relay/src/main.rs:815-823` (`u16` length prefix, `String::from_utf8` of that many bytes)
