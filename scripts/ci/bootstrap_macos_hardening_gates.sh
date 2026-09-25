@@ -77,6 +77,15 @@
 # with a rule above, add an explicitly NAMED exemption in this file with its
 # justification — never weaken the rule text itself.
 #
+# The one named vm-lab exemption lives in Rust, outside these scripts:
+# crates/rustynet-cli/src/vm_lab/orchestrator/adapter/macos_install.rs
+# (PRIME_SUDOERS_REMOTE_COMMAND) primes a LAB guest with a temporary sudo
+# grant over SSH when `sudo -n true` fails there. It compiles only with the
+# `vm-lab` feature (`#[cfg(feature = "vm-lab")] mod vm_lab;` in the CLI's
+# main.rs and lib.rs), so it is never part of a shipped binary, and it is
+# the vm-lab variant R-SEC-10 accepts by name. The bootstrap scripts
+# themselves carry no such grant.
+#
 # Optional args: an explicit file list (used by witnesses to scan a copy of a
 # script outside the repo, e.g. a pre-fix snapshot; shellcheck scope then
 # applies to whatever listed files fall inside the default macOS scope).
