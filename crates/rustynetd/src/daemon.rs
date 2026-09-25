@@ -1418,30 +1418,14 @@ fn parse_anchor_bundle_pull_have_line(line: &str) -> Option<(u64, String)> {
     Some((epoch, root.to_owned()))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AnchorBundlePullOutcome {
-    token_thumbprint: String,
-}
-
 #[derive(Debug)]
 struct AnchorBundlePullStreamError {
     source: DaemonError,
-    token_thumbprint: Option<String>,
 }
 
 impl AnchorBundlePullStreamError {
-    fn without_token(source: DaemonError) -> Self {
-        Self {
-            source,
-            token_thumbprint: None,
-        }
-    }
-
-    fn with_token(source: DaemonError, token_thumbprint: String) -> Self {
-        Self {
-            source,
-            token_thumbprint: Some(token_thumbprint),
-        }
+    fn new(source: DaemonError) -> Self {
+        Self { source }
     }
 }
 
@@ -1631,6 +1615,32 @@ struct AnchorListenerBinding {
     tls: Option<std::sync::Arc<rustls::ServerConfig>>,
 }
 
+/// E8 (data minimisation, T2 security bar): the anchor control-plane serve
+/// loops keep NO per-flow logs. A per-connection line would have to record
+/// either the peer address or a stable per-client identifier (the token
+/// thumbprint, the enrollee node-id prefix) to be useful, and both are
+/// exactly what a subpoena must not recover from an anchor. Each serve
+/// outcome therefore increments ONE process-wide aggregate counter, keyed
+/// by a static name (never by peer, token, or node id) and never persisted.
+/// Failure paths additionally log a single identity-free reason line.
+struct AnchorServeCounters {
+    bundle_pull_tls_handshake_failures: std::sync::atomic::AtomicU64,
+    bundle_pull_served: std::sync::atomic::AtomicU64,
+    bundle_pull_requests_rejected: std::sync::atomic::AtomicU64,
+    enrollment_tls_handshake_failures: std::sync::atomic::AtomicU64,
+    enrollment_served: std::sync::atomic::AtomicU64,
+    enrollment_requests_refused: std::sync::atomic::AtomicU64,
+}
+
+static ANCHOR_SERVE_COUNTERS: AnchorServeCounters = AnchorServeCounters {
+    bundle_pull_tls_handshake_failures: std::sync::atomic::AtomicU64::new(0),
+    bundle_pull_served: std::sync::atomic::AtomicU64::new(0),
+    bundle_pull_requests_rejected: std::sync::atomic::AtomicU64::new(0),
+    enrollment_tls_handshake_failures: std::sync::atomic::AtomicU64::new(0),
+    enrollment_served: std::sync::atomic::AtomicU64::new(0),
+    enrollment_requests_refused: std::sync::atomic::AtomicU64::new(0),
+};
+
 /// Wrap an accepted connection in the binding's transport. With `tls: Some`
 /// this builds a rustls server connection from the shared TLS-1.3-only
 /// server config and drives the handshake to completion RIGHT HERE, under
@@ -1765,20 +1775,20 @@ fn handle_anchor_bundle_pull_stream(
     token_path: &Path,
     bundle_path: &Path,
     local_node_id: &str,
-) -> Result<AnchorBundlePullOutcome, AnchorBundlePullStreamError> {
+) -> Result<(), AnchorBundlePullStreamError> {
     use rustynet_control::membership::snapshot_bytes_have_bundle_pull_capability;
     use std::io::Write as _;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .map_err(|err| {
-            AnchorBundlePullStreamError::without_token(DaemonError::Io(format!(
+            AnchorBundlePullStreamError::new(DaemonError::Io(format!(
                 "anchor bundle-pull read timeout failed: {err}"
             )))
         })?;
     stream
         .set_write_timeout(Some(Duration::from_secs(2)))
         .map_err(|err| {
-            AnchorBundlePullStreamError::without_token(DaemonError::Io(format!(
+            AnchorBundlePullStreamError::new(DaemonError::Io(format!(
                 "anchor bundle-pull write timeout failed: {err}"
             )))
         })?;
@@ -1786,20 +1796,18 @@ fn handle_anchor_bundle_pull_stream(
     // the client.  Revocation updates the snapshot on disk; loading here
     // (at accept-time) rather than after the network read ensures that a
     // connection accepted before revocation sees the pre-revocation state.
-    let bundle = load_anchor_bundle_pull_bundle(bundle_path)
-        .map_err(AnchorBundlePullStreamError::without_token)?;
+    let bundle =
+        load_anchor_bundle_pull_bundle(bundle_path).map_err(AnchorBundlePullStreamError::new)?;
     if !snapshot_bytes_have_bundle_pull_capability(&bundle, local_node_id) {
         let _ = stream.write_all(b"ERR forbidden after revocation\n");
-        return Err(AnchorBundlePullStreamError::without_token(
-            DaemonError::State("anchor.bundle_pull capability revoked".to_owned()),
-        ));
+        return Err(AnchorBundlePullStreamError::new(DaemonError::State(
+            "anchor.bundle_pull capability revoked".to_owned(),
+        )));
     }
     let presented_token = read_anchor_bundle_pull_request_token(&mut stream)
-        .map_err(AnchorBundlePullStreamError::without_token)?;
-    let token_thumbprint = anchor_bundle_pull_token_thumbprint(&presented_token);
-    let expected_token = load_anchor_bundle_pull_token(token_path).map_err(|source| {
-        AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone())
-    })?;
+        .map_err(AnchorBundlePullStreamError::new)?;
+    let expected_token =
+        load_anchor_bundle_pull_token(token_path).map_err(AnchorBundlePullStreamError::new)?;
     // FIS-0020: optionally read the client's `have <epoch> <root>` line
     // under a SHORT timeout — a pre-FIS-0020 client sends only the token
     // and waits, so the cost of the optional read against an old client is
@@ -1826,13 +1834,8 @@ fn handle_anchor_bundle_pull_stream(
         &bundle,
         client_have.as_deref(),
     )
-    .map_err(|source| AnchorBundlePullStreamError::with_token(source, token_thumbprint.clone()))?;
-    Ok(AnchorBundlePullOutcome { token_thumbprint })
-}
-
-fn anchor_bundle_pull_token_thumbprint(token: &str) -> String {
-    let digest = sha256_digest(token.trim().as_bytes());
-    encode_hex(&digest[..8])
+    .map_err(AnchorBundlePullStreamError::new)?;
+    Ok(())
 }
 
 /// Bind the anchor bundle-pull listener if this node is configured to
@@ -1889,24 +1892,28 @@ fn bind_anchor_bundle_pull_listener(
 /// caller counts it as processed I/O and skips the idle sleep), `Ok(false)` on
 /// `WouldBlock` (no pending connection) or when the token path is unset, and
 /// `Err` only on a genuine (fatal) accept error — matching the inline Unix loop.
-/// Per-request failures (bad/absent token, revoked capability) are logged and
-/// swallowed (still `Ok(true)`): one malformed request must not kill the daemon.
+/// Per-request failures (bad/absent token, revoked capability) are counted in
+/// [`ANCHOR_SERVE_COUNTERS`] and logged WITHOUT any peer address or client
+/// identifier (E8 data minimisation), then swallowed (still `Ok(true)`): one
+/// malformed request must not kill the daemon.
 /// Portable so the Unix + Windows loops share one verified serve path.
 fn poll_anchor_bundle_pull_once(
     binding: &AnchorListenerBinding,
     config: &DaemonConfig,
 ) -> Result<bool, DaemonError> {
+    use std::sync::atomic::Ordering;
     let Some(token_path) = config.anchor_bundle_pull_token_path.as_ref() else {
         return Ok(false);
     };
     match binding.listener.accept() {
-        Ok((stream, peer_addr)) => {
+        Ok((stream, _peer_addr)) => {
             let stream = match anchor_control_stream(stream, binding.tls.as_ref()) {
                 Ok(stream) => stream,
                 Err(err) => {
-                    log::warn!(
-                        "anchor_bundle_pull: TLS setup failed peer={peer_addr} reason={err}"
-                    );
+                    ANCHOR_SERVE_COUNTERS
+                        .bundle_pull_tls_handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::warn!("anchor_bundle_pull: TLS setup failed reason={err}");
                     return Ok(true);
                 }
             };
@@ -1916,22 +1923,16 @@ fn poll_anchor_bundle_pull_once(
                 config.membership_snapshot_path.as_path(),
                 &config.node_id,
             ) {
-                Ok(outcome) => {
-                    log::info!(
-                        "anchor_bundle_pull: served peer={peer_addr} token_thumbprint={}",
-                        outcome.token_thumbprint
-                    );
+                Ok(()) => {
+                    ANCHOR_SERVE_COUNTERS
+                        .bundle_pull_served
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
-                    if let Some(token_thumbprint) = err.token_thumbprint.as_deref() {
-                        log::warn!(
-                            "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint={token_thumbprint} reason={err}"
-                        );
-                    } else {
-                        log::warn!(
-                            "anchor_bundle_pull: request failed peer={peer_addr} token_thumbprint=unavailable reason={err}"
-                        );
-                    }
+                    ANCHOR_SERVE_COUNTERS
+                        .bundle_pull_requests_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::warn!("anchor_bundle_pull: request rejected reason={err}");
                 }
             }
             Ok(true)
@@ -2141,36 +2142,48 @@ fn handle_anchor_enrollment_stream(
 /// non-blocking listener. Same disposition as
 /// [`poll_anchor_bundle_pull_once`]: `Ok(true)` when a connection was
 /// accepted (counted as processed I/O), `Ok(false)` on `WouldBlock`, `Err`
-/// only on a genuine accept error. Per-request failures are logged (one
-/// fixed-vocabulary line per connection — bounded log volume) and swallowed:
-/// one malformed or hostile request must not kill the daemon. Portable so
-/// the Unix + Windows loops share one verified serve path.
+/// only on a genuine accept error. Per-request outcomes are counted in
+/// [`ANCHOR_SERVE_COUNTERS`]; failures additionally log ONE identity-free
+/// fixed-vocabulary line (bounded log volume, no peer address, no enrollee
+/// node-id prefix — E8 data minimisation) and are swallowed: one malformed
+/// or hostile request must not kill the daemon. Portable so the Unix +
+/// Windows loops share one verified serve path.
 fn poll_anchor_enrollment_once(
     binding: &AnchorListenerBinding,
     runtime: &mut DaemonRuntime,
 ) -> Result<bool, DaemonError> {
+    use std::sync::atomic::Ordering;
     match binding.listener.accept() {
-        Ok((stream, peer_addr)) => {
+        Ok((stream, _peer_addr)) => {
             // Same TLS posture as `poll_anchor_bundle_pull_once`: in
             // allow-lan mode the wrapper runs the TLS 1.3 handshake, and a
-            // connection that cannot complete it is logged and dropped —
-            // one hostile handshake must not kill the daemon.
+            // connection that cannot complete it is counted, logged without
+            // any peer identity, and dropped — one hostile handshake must
+            // not kill the daemon.
             let stream = match anchor_control_stream(stream, binding.tls.as_ref()) {
                 Ok(stream) => stream,
                 Err(err) => {
-                    log::warn!("anchor_enrollment: TLS setup failed peer={peer_addr} reason={err}");
+                    ANCHOR_SERVE_COUNTERS
+                        .enrollment_tls_handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::warn!("anchor_enrollment: TLS setup failed reason={err}");
                     return Ok(true);
                 }
             };
             match handle_anchor_enrollment_stream(stream, runtime) {
-                Ok(summary) => {
-                    // `summary` is the handler's fixed-vocabulary success
-                    // line (enrollee node-id prefix + expiry) — no token
-                    // material is ever derived into the log.
-                    log::info!("anchor_enrollment: served peer={peer_addr} outcome={summary}");
+                // E8: the success summary embeds the enrollee's 8-byte
+                // node-id prefix — a stable per-client identifier — so the
+                // success path is counted, never logged.
+                Ok(_summary) => {
+                    ANCHOR_SERVE_COUNTERS
+                        .enrollment_served
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 Err(err) => {
-                    log::warn!("anchor_enrollment: request refused peer={peer_addr} reason={err}");
+                    ANCHOR_SERVE_COUNTERS
+                        .enrollment_requests_refused
+                        .fetch_add(1, Ordering::Relaxed);
+                    log::warn!("anchor_enrollment: request refused reason={err}");
                 }
             }
             Ok(true)
@@ -18595,21 +18608,21 @@ mod tests {
     };
 
     use super::{
-        ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, ANCHOR_TLS_HANDSHAKE_DEADLINE, AnchorControlStream,
-        AnchorListenerBinding, AutoTunnelBundle, AutoTunnelWatermark,
-        DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
-        DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
-        DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
-        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
-        MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
-        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
-        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
+        ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, ANCHOR_SERVE_COUNTERS, ANCHOR_TLS_HANDSHAKE_DEADLINE,
+        AnchorBundlePullStreamError, AnchorControlStream, AnchorListenerBinding, AutoTunnelBundle,
+        AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+        DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
+        DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonError,
+        DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext,
+        MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES,
+        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
+        MAX_RELAY_FLEET_BUNDLE_BYTES, MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole,
         SignedStateRefreshReason, StateFetcher, TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,
         TraversalCandidate, TraversalCandidateType, TrustEvidenceRecord, TrustPolicy,
-        TrustWatermark, anchor_bundle_pull_token_thumbprint, bind_anchor_bundle_pull_listener,
-        bind_anchor_enrollment_listener, build_dns_response, build_gossip_node,
+        TrustWatermark, bind_anchor_bundle_pull_listener, bind_anchor_enrollment_listener,
+        build_dns_response, build_gossip_node,
         collect_traversal_host_candidate_snapshot_with_retry, complete_anchor_tls_handshake,
         enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
         load_anchor_bundle_pull_bundle, load_anchor_bundle_pull_token, load_auto_tunnel_bundle,
@@ -19724,17 +19737,20 @@ mod tests {
     }
 
     #[test]
-    fn anchor_bundle_pull_token_thumbprint_is_trimmed_digest_prefix() {
-        let token = "abcdefghijklmnopqrstuvwxyz012345";
-        let with_newline = format!("{token}\n");
-        let thumbprint = anchor_bundle_pull_token_thumbprint(token);
+    fn anchor_bundle_pull_stream_error_is_identity_free() {
+        // E8 (AQ-44 F2): the serve-loop error wrapper exists only to carry a
+        // reason across the accept loop. Its Display must never leak a
+        // client identifier — the token thumbprint used to ride inside it.
+        let err = AnchorBundlePullStreamError::new(DaemonError::State(
+            "anchor.bundle_pull capability revoked".to_owned(),
+        ));
+        // Display delegates to the source reason only — the wrapper adds
+        // nothing (the thumbprint field used to ride inside it).
         assert_eq!(
-            thumbprint,
-            anchor_bundle_pull_token_thumbprint(&with_newline)
+            format!("{err}"),
+            "state error: anchor.bundle_pull capability revoked"
         );
-        assert_eq!(thumbprint.len(), 16);
-        assert_ne!(thumbprint, token);
-        assert!(thumbprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!format!("{err:?}").contains("token_thumbprint"));
     }
 
     // ── FIS-0020: conditional bundle-pull (have/UNCHANGED) ──────────────────
@@ -20427,7 +20443,8 @@ mod tests {
     /// Honest-path integration through the REWIRED bounded readers: a real
     /// loopback client that sends only the token line (pre-FIS-0020 shape)
     /// still gets the full bundle; the optional have-line read degrades to
-    /// None on its short budget and the serve outcome reports a thumbprint.
+    /// None on its short budget and the serve path reports success WITHOUT
+    /// deriving any client identifier (E8: no thumbprint is produced at all).
     #[test]
     fn anchor_bundle_pull_stream_serves_full_bundle_over_real_socket() {
         use super::handle_anchor_bundle_pull_stream;
@@ -20460,7 +20477,12 @@ mod tests {
 
         let mut response = Vec::new();
         conn.read_to_end(&mut response).expect("read response");
-        let outcome = handle.join().expect("serve thread").expect("serve outcome");
+        // E8: the serve path reports a bare `Ok(())` — no thumbprint, no
+        // per-client identifier is derived or returned at all.
+        handle
+            .join()
+            .expect("serve thread")
+            .expect("serve must succeed");
         let expected_bundle = conditional_pull_snapshot_bytes();
         assert!(
             response.starts_with(b"OK "),
@@ -20476,10 +20498,340 @@ mod tests {
             format!("OK {}", expected_bundle.len()).as_bytes()
         );
         assert_eq!(&response[header_end + 1..], &expected_bundle);
-        assert_eq!(
-            outcome.token_thumbprint,
-            super::anchor_bundle_pull_token_thumbprint("abcdefghijklmnopqrstuvwxyz012345")
+    }
+
+    // ── E8 (AQ-44 F2): serve loops count flows, log no per-flow identity ────
+
+    /// Captures `log` records into a process-wide buffer so tests can assert
+    /// on what the anchor serve loops actually emit. Installed ONCE per test
+    /// binary (`log::set_boxed_logger` succeeds only for the first caller);
+    /// every instance forwards into the same static buffer.
+    struct AnchorLogCapture;
+
+    static ANCHOR_LOG_RECORDS: std::sync::Mutex<Vec<(log::Level, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    static ANCHOR_LOG_INSTALL: std::sync::Once = std::sync::Once::new();
+
+    impl log::Log for AnchorLogCapture {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Info
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                ANCHOR_LOG_RECORDS
+                    .lock()
+                    .expect("anchor log capture lock")
+                    .push((record.level(), record.args().to_string()));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn anchor_log_capture_len() -> usize {
+        ANCHOR_LOG_RECORDS
+            .lock()
+            .expect("anchor log capture lock")
+            .len()
+    }
+
+    fn anchor_log_records_since(marker: usize) -> Vec<String> {
+        ANCHOR_LOG_RECORDS
+            .lock()
+            .expect("anchor log capture lock")
+            .iter()
+            .skip(marker)
+            .map(|(_, message)| message.clone())
+            .collect()
+    }
+
+    fn anchor_serve_counter(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// AQ-44 F2 witness: drives BOTH anchor serve loops over real loopback
+    /// sockets through every outcome class — bundle-pull served + rejected +
+    /// TLS-failure, enrollment served + refused + TLS-failure — and asserts
+    /// (a) each aggregate counter moved accordingly, (b) the success paths
+    /// emit NO log line at all, (c) every emitted failure line is free of
+    /// peer addresses and stable client identifiers (no `peer=`, no IP, no
+    /// token thumbprint, no enrollee node-id prefix). E8: what a subpoena
+    /// yields from an anchor is counters and fixed-vocabulary reasons only.
+    #[test]
+    fn anchor_serve_loops_count_flows_and_log_no_peer_identity() {
+        use std::io::{Read as _, Write as _};
+
+        ANCHOR_LOG_INSTALL.call_once(|| {
+            let _ = log::set_boxed_logger(Box::new(AnchorLogCapture));
+            log::set_max_level(log::LevelFilter::Info);
+        });
+        let records_before = anchor_log_capture_len();
+
+        // ── bundle-pull: served + rejected over ONE plain loopback listener.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("token");
+        std::fs::write(&token_path, "abcdefghijklmnopqrstuvwxyz012345").expect("write token");
+        let bundle_path = dir.path().join("snapshot.v1");
+        std::fs::write(&bundle_path, conditional_pull_snapshot_bytes()).expect("write bundle");
+        let config = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: bundle_path,
+            anchor_bundle_pull_token_path: Some(token_path),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+        let binding = bind_anchor_bundle_pull_listener(&config)
+            .expect("bind must succeed")
+            .expect("configured token path ⇒ a listener");
+        let addr = binding.listener.local_addr().expect("listener addr");
+        let served_before = anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.bundle_pull_served);
+        let rejected_before =
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.bundle_pull_requests_rejected);
+
+        // Served flow: correct token line ⇒ full bundle, counter only.
+        let mut good = std::net::TcpStream::connect(addr).expect("connect good client");
+        good.write_all(b"abcdefghijklmnopqrstuvwxyz012345\n")
+            .expect("send token line");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !poll_anchor_bundle_pull_once(&binding, &config).expect("poll must not error") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bundle-pull listener never accepted the good client"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut response = Vec::new();
+        good.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        good.read_to_end(&mut response).expect("read response");
+        assert!(
+            response.starts_with(b"OK "),
+            "served flow must get the bundle, got {response:?}"
         );
+
+        // Rejected flow: wrong token ⇒ fixed ERR line + counter.
+        let mut bad = std::net::TcpStream::connect(addr).expect("connect bad client");
+        bad.write_all(b"00000000000000000000000000000000\n")
+            .expect("send wrong token");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !poll_anchor_bundle_pull_once(&binding, &config).expect("poll must not error") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bundle-pull listener never accepted the bad client"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mut response = Vec::new();
+        bad.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        bad.read_to_end(&mut response).expect("read response");
+        assert_eq!(response, b"ERR unauthorized\n");
+
+        // TLS-failure flow: a plaintext client against an allow-lan (TLS)
+        // listener. The listener stays up; only counter + warn line result.
+        let tls_dir = tempfile::tempdir().expect("tempdir");
+        let tls_token_path = tls_dir.path().join("token");
+        std::fs::write(&tls_token_path, "abcdefghijklmnopqrstuvwxyz012345").expect("write token");
+        let tls_config = DaemonConfig {
+            membership_snapshot_path: tls_dir.path().join("membership.snapshot"),
+            anchor_bundle_pull_token_path: Some(tls_token_path),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
+            anchor_bundle_pull_allow_lan: true,
+            ..DaemonConfig::default()
+        };
+        let tls_binding = bind_anchor_bundle_pull_listener(&tls_config)
+            .expect("bind must succeed")
+            .expect("allow-lan listener");
+        assert!(
+            tls_binding.tls.is_some(),
+            "allow-lan binding must carry the TLS server config"
+        );
+        let tls_failures_before =
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.bundle_pull_tls_handshake_failures);
+        let tls_addr = tls_binding
+            .listener
+            .local_addr()
+            .expect("tls listener addr");
+        let junk_client = std::thread::spawn(move || {
+            let mut conn = std::net::TcpStream::connect(tls_addr).expect("connect junk client");
+            conn.write_all(b"hello, not a TLS handshake\n")
+                .expect("write junk bytes");
+            let mut sink = Vec::new();
+            let _ = conn.read_to_end(&mut sink);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !poll_anchor_bundle_pull_once(&tls_binding, &tls_config).expect("poll must not error")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "bundle-pull TLS listener never accepted the junk client"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        junk_client.join().expect("junk client thread");
+
+        // ── enrollment: refused + served + TLS failure.
+        let enroll_dir = secure_test_dir("rustynetd-anchor-e8-enroll");
+        let (enroll_config, mut enroll_runtime) =
+            enrollment_listener_fixture(&enroll_dir, anchor_caps_with_enrollment_endpoint());
+        let enroll_binding = bind_anchor_enrollment_listener(&enroll_config)
+            .expect("bind must succeed")
+            .expect("configured addr + capability ⇒ a listener");
+        let enroll_served_before = anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.enrollment_served);
+        let enroll_refused_before =
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.enrollment_requests_refused);
+
+        // Refused flow: non-enrollment verb hits the default-deny whitelist.
+        let response =
+            drive_enrollment_request(&enroll_binding, &mut enroll_runtime, b"status\n".to_vec());
+        assert_eq!(response, "ERR unsupported operation\n");
+
+        // Served flow: a valid minted token ⇒ accepted, counter only.
+        let (_, encoded) =
+            crate::enrollment_token::mint_token(&ENROLLMENT_LISTENER_TEST_SECRET, 600)
+                .expect("mint");
+        let response = drive_enrollment_request(
+            &enroll_binding,
+            &mut enroll_runtime,
+            enrollment_consume_request_line(&encoded),
+        );
+        assert!(
+            response.starts_with("OK enrollment accepted node="),
+            "valid token must be served, got {response}"
+        );
+
+        // Enrollment TLS-failure flow: plaintext client, TLS listener.
+        let enroll_tls_dir = secure_test_dir("rustynetd-anchor-e8-enroll-tls");
+        let (mut enroll_tls_config, mut enroll_tls_runtime) =
+            enrollment_listener_fixture(&enroll_tls_dir, anchor_caps_with_enrollment_endpoint());
+        enroll_tls_config.anchor_enrollment_allow_lan = true;
+        let enroll_tls_binding = bind_anchor_enrollment_listener(&enroll_tls_config)
+            .expect("bind must succeed")
+            .expect("allow-lan enrollment listener");
+        assert!(
+            enroll_tls_binding.tls.is_some(),
+            "allow-lan enrollment binding must carry the TLS server config"
+        );
+        let enroll_tls_failures_before =
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.enrollment_tls_handshake_failures);
+        let enroll_tls_addr = enroll_tls_binding
+            .listener
+            .local_addr()
+            .expect("enrollment tls listener addr");
+        let enroll_junk_client = std::thread::spawn(move || {
+            let mut conn = std::net::TcpStream::connect(enroll_tls_addr)
+                .expect("connect enrollment junk client");
+            conn.write_all(b"hello, not a TLS handshake\n")
+                .expect("write junk bytes");
+            let mut sink = Vec::new();
+            let _ = conn.read_to_end(&mut sink);
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !poll_anchor_enrollment_once(&enroll_tls_binding, &mut enroll_tls_runtime)
+            .expect("poll must not error")
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "enrollment TLS listener never accepted the junk client"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        enroll_junk_client
+            .join()
+            .expect("enrollment junk client thread");
+
+        // ── Verdict 1: every counter moved for its flow class. Enrollment
+        // counters are shared with concurrent tests, so those deltas are
+        // `>= 1`; the bundle-pull deltas are exact.
+        assert_eq!(
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.bundle_pull_served) - served_before,
+            1,
+            "exactly one served bundle-pull flow must be counted"
+        );
+        assert_eq!(
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.bundle_pull_requests_rejected)
+                - rejected_before,
+            1,
+            "exactly one rejected bundle-pull flow must be counted"
+        );
+        assert!(
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.bundle_pull_tls_handshake_failures)
+                > tls_failures_before,
+            "the TLS-failure flow must be counted"
+        );
+        assert!(
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.enrollment_served) > enroll_served_before,
+            "the served enrollment flow must be counted"
+        );
+        assert!(
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.enrollment_requests_refused)
+                > enroll_refused_before,
+            "the refused enrollment flow must be counted"
+        );
+        assert!(
+            anchor_serve_counter(&ANCHOR_SERVE_COUNTERS.enrollment_tls_handshake_failures)
+                > enroll_tls_failures_before,
+            "the enrollment TLS-failure flow must be counted"
+        );
+
+        // ── Verdict 2: the ONLY anchor log lines the run produced are the
+        // four identity-free failure classes (plus the startup bind line,
+        // which names the anchor's OWN listen address, not a client); the
+        // per-flow success lines stay gone, and every failure line is free
+        // of peer addresses and stable client identifiers.
+        let records = anchor_log_records_since(records_before);
+        const FLOW_LINE_PREFIXES: [&str; 4] = [
+            "anchor_bundle_pull: TLS setup failed",
+            "anchor_bundle_pull: request rejected",
+            "anchor_enrollment: TLS setup failed",
+            "anchor_enrollment: request refused",
+        ];
+        for prefix in FLOW_LINE_PREFIXES {
+            assert!(
+                records.iter().any(|message| message.starts_with(prefix)),
+                "the {prefix} path must still log an identity-free reason"
+            );
+        }
+        for message in &records {
+            if message.starts_with("anchor_bundle_pull") || message.starts_with("anchor_enrollment")
+            {
+                assert!(
+                    FLOW_LINE_PREFIXES
+                        .iter()
+                        .any(|prefix| message.starts_with(prefix))
+                        || message.starts_with("anchor_bundle_pull: listening")
+                        || message.starts_with("anchor_enrollment: listening"),
+                    "unexpected anchor log line (per-flow success logging must stay gone, E8): {message}"
+                );
+            }
+            assert!(
+                !message.contains(": served"),
+                "per-flow success logging must stay gone (E8): {message}"
+            );
+        }
+        for message in records.iter().filter(|message| {
+            FLOW_LINE_PREFIXES
+                .iter()
+                .any(|prefix| message.starts_with(*prefix))
+        }) {
+            for forbidden in [
+                "peer=",
+                "127.0.0.1",
+                "token_thumbprint",
+                "thumbprint",
+                "node=",
+                "abcdefghij",
+                "enrollment accepted",
+            ] {
+                assert!(
+                    !message.contains(forbidden),
+                    "anchor log line carries forbidden identifier {forbidden:?}: {message}"
+                );
+            }
+        }
     }
 
     #[test]

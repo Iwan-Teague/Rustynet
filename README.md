@@ -15,15 +15,25 @@
 Rule (charter security bar E8), quoted as written: "Relays/anchors/**rendezvous**:
 no per-flow logs; bounded counters only; retention stated in README"
 (`charter/security-bar/T2-security-bar.md:82`).
-Status: **not yet fully met**; this section states what an operator of the
-`rustynet-relay` binary could be compelled to produce today (audited
-2026-09-22, action-queue AQ-112).
+Status: the **anchor** half is met as of the 2026-09-25 remediation
+(action-queue AQ-44 — the anchor serve loops now keep bounded counters and
+identity-free failure lines only; anchor subsection below); the **relay**
+half is **not yet fully met** — the `rustynet-relay` per-flow stderr lines
+below are still per-flow — and this section states what an operator of that
+binary could be compelled to produce today (first audited 2026-09-22,
+action-queue AQ-112).
 
-**Scope, stated plainly.** This section covers the `rustynet-relay` binary
-only: the default relay listener and the opt-in blind v2 listener. E8 also
-names **anchors** and **rendezvous**. The anchor role is implemented outside
-this binary and is *not assessed* by this section — E8's anchor half remains open, and
-nothing below may be read as clearing it.
+**Scope, stated plainly.** This section covers two surfaces. First, the
+`rustynet-relay` binary: the default relay listener and the opt-in blind v2
+listener. Second, the anchor control plane, which — correcting the earlier
+claim that the anchor role was implemented outside any audited binary — is
+implemented inside `rustynetd` itself: a bundle-pull listener
+(`crates/rustynetd/src/daemon.rs:1858`) and an enrollment-consume listener
+(`daemon.rs:1982`), each bound only when explicitly configured and
+loopback-only unless its matching `--*-allow-lan` flag is set. It is
+assessed in its own bullet below. E8 also names **rendezvous**; no such
+component ships in either binary today, and nothing below may be read as
+clearing that open half.
 
 An operator could be compelled to produce:
 
@@ -64,23 +74,20 @@ An operator could be compelled to produce:
  the Windows service log — is decided by whoever runs the process, and
  those lines live as long as that log does.
  **The complete stderr write-site inventory of this binary, as of commit
- e9e9e2b03e42607355bc71cf7b9ba971b02a7a63.** Every site in production code, enumerated —
- identifier-bearing: `transport.rs:781, 821`, `main.rs:750, 939, 994,
- 1057, 1072, 1492, 1523`; store/operational (the third carries the
- replay-store path, `transport.rs:1395`): `transport.rs:606, 1079, 1395`; identifier-free
- per-event lines (rejection reasons and lifecycle — still a per-flow
- frequency signal, see side channels below): `transport.rs:484, 600, 616,
- 674, 681, 690, 698, 726, 740, 746, 757, 768, 775, 793`,
- `main.rs:671, 675, 681, 799, 825, 830, 835, 1654, 1703, 3126, 6206`,
- plus `crates/rustynet-relay/src/blind_relay_listener.rs:1083`;
- CLI/build output, not daemon logging: the `--help` usage text
- (`main.rs:2858`) and the no-daemon-feature gate message (`main.rs:6213`).
- Counted: 19 sites in `transport.rs` — every `eprintln!` in that file,
- whose test module starts at `:1671`, so all 19 are production (the file
+ 1f2b190be00d799274d157442b69b1bdf84e799c.** Every site in production code, enumerated —
+ identifier-bearing (per-flow source addresses, session-id fragments,
+ token scope strings, node ids): `main.rs: 767, 956, 1043, 1057, 1070, 1134, 1149, 1569, 1600`, `transport.rs: 1046, 1086`;
+ store/operational (config clamps and replay-store upkeep; the last two
+ carry the replay-store path): `transport.rs: 640, 1344, 1660`, `blind_relay_listener.rs: 1133`;
+ identifier-free per-event lines (rejection reasons and lifecycle — still a per-flow
+ frequency signal, see side channels below): `main.rs: 688, 692, 698, 816, 842, 847, 852, 1731, 1780, 3213, 6337`, `transport.rs: 825, 831, 841, 907, 913, 929, 939, 946, 955, 963, 991, 1005, 1011, 1022, 1033, 1040, 1058`;
+ CLI/build output, not daemon logging: `main.rs: 2939, 2944, 6344`.
+ Counted: 22 sites in `transport.rs` — every `eprintln!` in that file,
+ whose test module starts at `:1935`, so all 22 are production (the file
  itself warns that earlier `#[cfg(test)]` attributes sit on production
- helpers, `transport.rs:3512-3513`) — plus 20 in `main.rs` (18 logging
- sites above plus usage and gate) and 1 in
- `blind_relay_listener.rs`: **40 sites, complete for commit e9e9e2b03e42607355bc71cf7b9ba971b02a7a63.** "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
+ helpers, `transport.rs:3843-3848`) — plus 23 in `main.rs` (20 logging
+ sites above plus the flag warning, usage text and feature gate) and 1 in
+ `blind_relay_listener.rs` (whose test module starts at `:1430`): **46 sites, complete for commit 1f2b190be00d799274d157442b69b1bdf84e799c.** "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
  stdout, not stderr: `hello-limiter-audit` (`main.rs:2914-2927`) and
  `windows-service-hardening-check` (`main.rs:2931-2940`). New logging
  code added after the audited commit is a gap until the inventory is
@@ -97,6 +104,62 @@ An operator could be compelled to produce:
  who. Its doc comment says it mirrors the v1 store's discipline — that is
  the durability discipline the default path's store (first bullet) already
  has, not a difference from it.
+- **The anchor control plane in `rustynetd` — per-flow logging removed
+ (AQ-44, 2026-09-25).** Both anchor listeners — bundle-pull
+ (`crates/rustynetd/src/daemon.rs:1858`) and enrollment-consume
+ (`daemon.rs:1982`) — keep bounded aggregate counters instead of per-flow
+ lines: one process-wide `AnchorServeCounters` of six static-named `u64`s
+ (`daemon.rs:1626-1641`: TLS-handshake failures, served flows and
+ rejected/refused requests per listener), incremented by the serve loops
+ (`daemon.rs:1900-1944`, `daemon.rs:2151-2197`) and never persisted.
+ Success flows log NOTHING. The only remaining per-flow-adjacent lines are
+ four fixed-vocabulary failure lines that name neither the peer address
+ nor any client identifier — no IP, no token thumbprint (the thumbprint
+ type and its derivation were deleted outright), no enrollee node-id
+ prefix (`daemon.rs:1916`, `daemon.rs:1935`, `daemon.rs:2169`,
+ `daemon.rs:2186`). A capturing-logger test drives all six counter paths
+ over real loopback sockets and asserts the log stream stays identity-free
+ (`crates/rustynetd/src/daemon.rs:20561`,
+ `anchor_serve_loops_count_flows_and_log_no_peer_identity`). What a
+ compulsion of a running anchor can still reach:
+  - the **consumed-token ledger** (`--enrollment-ledger`): keyless random
+    16-byte token ids plus expiry only
+    (`crates/rustynetd/src/enrollment_token.rs:359-364`), written behind
+    an exclusive advisory lock (`daemon.rs:9947-9951`) into a 0600
+    size-capped spool file (~20k live entries,
+    `enrollment_token.rs:466-469`); expired entries are pruned on every
+    redemption (`enrollment_token.rs:472`), with the honest caveat that
+    legacy v1 entries carry no expiry and are never pruned
+    (`enrollment_token.rs:379-384`). Evidentiary content: "some enrollment
+    token was consumed near time T" — and nothing about who.
+  - the **gossip watermark spool** (`--gossip-watermark` /
+    `RUSTYNET_GOSSIP_WATERMARK`, `daemon.rs:391`, `daemon.rs:2554-2556`):
+    a 0600, 256 KiB-capped file (`crates/rustynetd/src/gossip_runtime.rs:81`,
+    `gossip_runtime.rs:1262-1272`) persisting `GossipWatermark`
+    (`gossip_runtime.rs:136-141`) — the daemon's own sequence counter plus
+    a **durable, deliberately never-pruned per-source
+    highest-accepted-sequence map** (`SeenSequenceState`,
+    `crates/rustynetd/src/peer_gossip.rs:309-313`). That map is the list
+    of gossip source node ids this host has ever accepted a bundle from —
+    a durable record of who the host has HEARD. It is retained on purpose:
+    it is the anti-replay watermark, and pruning it on peer removal would
+    let revoked peers replay old bundles (`gossip_runtime.rs:364-370`).
+    This is the anchor/daemon half's largest standing disclosure and it is
+    bounded only by the number of distinct sources, not by a constant.
+  - the anchor **TLS identity**: a self-signed ECDSA P-256 certificate
+    generated on first boot and shared by both listeners
+    (`crates/rustynetd/src/anchor_tls.rs:7`, loaded at
+    `daemon.rs:1758`), TLS 1.3-only whenever a listener is exposed beyond
+    loopback (`daemon.rs:1651-1660`). The certificate is host-stable and
+    linkable across connections by design (clients pin it) — but it
+    identifies the ANCHOR, never a client.
+  - in-RAM gossip tables that die with the process: rate-limit windows,
+    per-peer routing entries, and counters keyed only by static error
+    names "so we never persist or log PII"
+    (`gossip_runtime.rs:250-257`) — plus the same OS-level swap /
+    core-dump caveat the relay's RAM bullet states above: the program
+    writes none of it to disk, and "not written by the application" is
+    the strongest sentence the code supports here.
 - **Timing and volume side channels — these survive perfect content
  minimisation.** Beyond the replay stores' insertion stamps (bullets one
  and three) and the establishment / last-packet times each live session
@@ -165,9 +228,10 @@ An operator genuinely cannot produce, because it is never retained:
 
 What would have to change for the answer to be "nothing useful": the per-flow
 stderr lines would have to become counters (no addresses, no session-id
-fragments, no node ids, no scope strings). That change is tracked in the
-action queue; until it lands, treat a relay's service-manager log as
-sensitive material and rotate or shred it accordingly.
+fragments, no node ids, no scope strings). On the anchor side of E8 that
+change has landed (AQ-44 — see the anchor bullet above); on the relay side it
+is tracked in the action queue; until it lands, treat a relay's
+service-manager log as sensitive material and rotate or shred it accordingly.
 
 ## Current Focus
 
