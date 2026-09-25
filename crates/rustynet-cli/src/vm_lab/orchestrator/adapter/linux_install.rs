@@ -643,8 +643,9 @@ fn build_bootstrap_env(
     // `ops install-systemd`, which otherwise keeps whatever value the guest's
     // /etc/default/rustynetd already carries (guest history), so the line is
     // only emitted when the operator pinned a backend. The value is one of
-    // the allow-listed literals from `parse_linux_backend` — the env file is
-    // sourced by the bootstrap shell, so nothing else may reach it.
+    // the allow-listed literals from `parse_linux_backend` — the bootstrap's
+    // RSA-0068 env-file parser accepts only the allow-listed keys, so nothing
+    // else may reach it.
     let linux_backend_line = match ctx.linux_backend.as_deref() {
         Some(mode) if crate::vm_lab::LINUX_BACKEND_MODES.contains(&mode) => {
             format!("RUSTYNET_BACKEND={mode}\n")
@@ -793,6 +794,198 @@ mod relay_deploy_hygiene_tests {
 mod tests {
     use super::*;
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+
+    /// RSA-0068 witness: the env-file argument must never be interpreted as
+    /// bash. The old `source "$1"` gave any shell metacharacter in the file
+    /// the script's (sudoer) privileges; the strict KEY=VALUE parser
+    /// replaces it, over a fixed allowlist of exactly the keys this
+    /// orchestrator writes.
+    #[test]
+    fn bootstrap_script_parses_the_env_file_instead_of_sourcing_it() {
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("source \"$1\""),
+            "the env-file argument must not be sourced: that is the RSA-0068 root code-exec sink"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("load_bootstrap_env \"$1\""),
+            "the env file must go through the strict KEY=VALUE parser"
+        );
+        for key in [
+            "ROLE",
+            "NODE_ID",
+            "NETWORK_ID",
+            "SSH_ALLOW_CIDRS",
+            "SOURCE_ARCHIVE",
+            "RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS",
+            "RUSTYNET_LAB_STUN_SERVERS",
+            "RUSTYNET_BACKEND",
+            "RN_PREBUILT_BINARIES",
+            "RN_PREBUILT_DIR",
+        ] {
+            assert!(
+                BOOTSTRAP_SCRIPT.contains(&format!("\n  {key}\n")),
+                "parser allowlist is missing the orchestrator-written key {key}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_rsa0068_test_file(name: &str, contents: &[u8], mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("{}_{}", name, std::process::id()));
+        std::fs::write(&path, contents).expect("write RSA-0068 test file");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .expect("chmod RSA-0068 test file");
+        path
+    }
+
+    /// Well-formed configs must land in the named variables with exactly the
+    /// values `source` used to produce, and optional keys must stay UNSET
+    /// (not merely empty) when absent. Runs ONLY the extracted allowlist
+    /// array + parser under bash — never the bootstrap main flow, which
+    /// would install packages on a real guest.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_env_parser_assigns_exactly_the_allowlisted_values() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_rsa0068_extract.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let env_path = write_rsa0068_test_file(
+            "rn_rsa0068_good.env",
+            concat!(
+                "# orchestrator-written config\n",
+                "\n",
+                "ROLE=admin\n",
+                "NODE_ID=exit-node1-abc123\n",
+                "NETWORK_ID=test-net\n",
+                "SSH_ALLOW_CIDRS=192.168.64.0/24\n",
+                "SOURCE_ARCHIVE=/tmp/rn_source.tar.gz\n",
+                "RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n",
+                "RUSTYNET_LAB_STUN_SERVERS=10.0.0.1:3478\n",
+                "RUSTYNET_BACKEND=userspace\n",
+                "RN_PREBUILT_BINARIES=1\n",
+                "RN_PREBUILT_DIR=/tmp/rn_prebuilt\n",
+            )
+            .as_bytes(),
+            0o600,
+        );
+        let harness = r#"set -euo pipefail
+eval "$(awk '/^RN_BOOTSTRAP_ENV_KEYS=\($/,/^\)$/ {print} /^load_bootstrap_env\(\) \{/,/^\}$/ {print}' "$1")"
+load_bootstrap_env "$2"
+printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+  "${ROLE-UNSET}" "${NODE_ID-UNSET}" "${NETWORK_ID-UNSET}" "${SSH_ALLOW_CIDRS-UNSET}" \
+  "${SOURCE_ARCHIVE-UNSET}" "${RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS-UNSET}" \
+  "${RUSTYNET_LAB_STUN_SERVERS-UNSET}" "${RUSTYNET_BACKEND-UNSET}" \
+  "${RN_PREBUILT_BINARIES-UNSET}" "${RN_PREBUILT_DIR-UNSET}"
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_rsa0068_extract")
+            .arg(script_path.as_os_str())
+            .arg(env_path.as_os_str())
+            .output()
+            .expect("run the extracted RSA-0068 parser under bash");
+        assert!(
+            output.status.success(),
+            "a well-formed config must parse: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "admin|exit-node1-abc123|test-net|192.168.64.0/24|/tmp/rn_source.tar.gz|2|10.0.0.1:3478|userspace|1|/tmp/rn_prebuilt",
+            "values must land in the named variables exactly as `source` produced them"
+        );
+        let _ = std::fs::remove_file(&env_path);
+        let _ = std::fs::remove_file(&script_path);
+    }
+
+    /// Runs the REAL script against hostile or malformed env files. The
+    /// parser is the first thing the script does, so every refusal must
+    /// happen before any other action — proven by a canary value that would
+    /// create a file if the env file were ever interpreted as shell.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_env_parser_refuses_hostile_and_malformed_configs_before_any_execution() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_rsa0068_case.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let canary = std::env::temp_dir().join(format!("rn_rsa0068_canary_{}", std::process::id()));
+        let good = "ROLE=admin\n\
+                    NODE_ID=exit-node1-abc123\n\
+                    NETWORK_ID=test-net\n\
+                    SSH_ALLOW_CIDRS=192.168.64.0/24\n\
+                    SOURCE_ARCHIVE=/tmp/rn_source.tar.gz\n";
+        // (case name, env-file contents, env-file mode)
+        let cases: Vec<(&str, String, u32)> = vec![
+            ("unknown key", format!("{good}EXTRA_KEY=1\n"), 0o600),
+            (
+                "duplicate key",
+                "ROLE=admin\nROLE=client\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\nSOURCE_ARCHIVE=z\n"
+                    .to_string(),
+                0o600,
+            ),
+            (
+                "command substitution",
+                format!(
+                    "ROLE=admin\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\nSOURCE_ARCHIVE=$(touch {})\n",
+                    canary.display()
+                ),
+                0o600,
+            ),
+            (
+                "backtick",
+                format!(
+                    "ROLE=admin\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\nSOURCE_ARCHIVE=`touch {}`\n",
+                    canary.display()
+                ),
+                0o600,
+            ),
+            ("line without equals", format!("{good}JUSTTEXT\n"), 0o600),
+            ("group-writable file", good.to_string(), 0o664),
+            ("world-writable file", good.to_string(), 0o666),
+            (
+                "missing required key",
+                "ROLE=admin\nNODE_ID=n\nNETWORK_ID=x\nSSH_ALLOW_CIDRS=y\n".to_string(),
+                0o600,
+            ),
+        ];
+        for (name, env_body, mode) in cases {
+            let env_path =
+                write_rsa0068_test_file("rn_rsa0068_case.env", env_body.as_bytes(), mode);
+            let _ = std::fs::remove_file(&canary);
+            let output = Command::new("bash")
+                .arg(script_path.as_os_str())
+                .arg(env_path.as_os_str())
+                .output()
+                .expect("run rn_bootstrap.sh under bash");
+            assert!(
+                !output.status.success(),
+                "case {name} must exit non-zero, got {:?}",
+                output.status.code()
+            );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                stderr.contains("refusing"),
+                "case {name} must be refused by the parser, not fail later: {stderr}"
+            );
+            assert!(
+                !canary.exists(),
+                "case {name} executed the env file: the canary file was created"
+            );
+            let _ = std::fs::remove_file(&env_path);
+        }
+        let _ = std::fs::remove_file(&canary);
+        let _ = std::fs::remove_file(&script_path);
+    }
 
     #[test]
     fn bootstrap_env_includes_role_and_node_id() {

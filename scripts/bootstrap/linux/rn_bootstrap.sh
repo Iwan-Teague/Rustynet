@@ -6,7 +6,111 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 
-source "$1"
+# RSA-0068: this script runs with root privileges (sudo -n throughout), so
+# loading the env-file argument with `source` made every shell metacharacter
+# in it a root code-execution sink. The file is now parsed as strict
+# KEY=VALUE over a fixed allowlist of the keys the script actually reads
+# (the set written by the orchestrator's build_bootstrap_env plus the
+# host-cross prebuilt flags). One KEY=VALUE per line; comment lines and
+# blank lines are allowed; unknown keys, duplicate keys, lines without '=',
+# and values containing '$' or a backtick are refused with a non-zero exit
+# before the script performs any other action. Values are bound with
+# printf -v and never evaluated. The file must be owned by the effective
+# user (root, when the script itself runs as root) and must not be
+# group- or world-writable.
+RN_BOOTSTRAP_ENV_KEYS=(
+  ROLE
+  NODE_ID
+  NETWORK_ID
+  SSH_ALLOW_CIDRS
+  SOURCE_ARCHIVE
+  RUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS
+  RUSTYNET_LAB_STUN_SERVERS
+  RUSTYNET_BACKEND
+  RN_PREBUILT_BINARIES
+  RN_PREBUILT_DIR
+)
+
+load_bootstrap_env() {
+  local env_file="$1"
+  local line key value
+  local key_allowed allowed seen_keys required_key
+
+  if [[ ! -r "${env_file}" ]]; then
+    echo "[bootstrap] env file not readable: ${env_file}" >&2
+    exit 2
+  fi
+  # Ownership: accept only a file owned by the effective user — root-owned
+  # when this script runs as root, the invoking admin's own file when the
+  # orchestrator stages it over SSH as a non-root sudoer. Anything owned by
+  # a third local user is refused.
+  if [[ ! -O "${env_file}" ]]; then
+    echo "[bootstrap] refusing env file not owned by root or the invoking user: ${env_file}" >&2
+    exit 1
+  fi
+  # Group- or world-writable is refused: parse the symbolic mode off `ls -l`
+  # (10-char type+perm prefix, identical for GNU and BSD ls) so the check
+  # does not depend on stat's platform-specific flags.
+  local env_mode
+  # shellcheck disable=SC2012
+  env_mode="$(ls -ld -- "${env_file}")"
+  env_mode="${env_mode:0:10}"
+  if [[ "${env_mode:5:1}" == "w" || "${env_mode:8:1}" == "w" ]]; then
+    echo "[bootstrap] refusing group- or world-writable env file (mode ${env_mode}): ${env_file}" >&2
+    exit 1
+  fi
+
+  seen_keys="|"
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "${line//[[:space:]]/}" ]] && continue
+    if [[ "${line}" =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    if [[ "${line}" != *=* ]]; then
+      echo "[bootstrap] refusing env line without '=': ${line}" >&2
+      exit 1
+    fi
+    key="${line%%=*}"
+    value="${line#*=}"
+    if [[ ! "${key}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      echo "[bootstrap] refusing env line with malformed key: ${line}" >&2
+      exit 1
+    fi
+    allowed=0
+    for key_allowed in "${RN_BOOTSTRAP_ENV_KEYS[@]}"; do
+      if [[ "${key}" == "${key_allowed}" ]]; then
+        allowed=1
+        break
+      fi
+    done
+    if [[ "${allowed}" -ne 1 ]]; then
+      echo "[bootstrap] refusing unknown env key: ${key}" >&2
+      exit 1
+    fi
+    if [[ "${seen_keys}" == *"|${key}|"* ]]; then
+      echo "[bootstrap] refusing duplicate env key: ${key}" >&2
+      exit 1
+    fi
+    seen_keys="${seen_keys}${key}|"
+    case "${value}" in
+      *'$'*|*'`'*)
+        echo "[bootstrap] refusing env value with a command-substitution metacharacter for key: ${key}" >&2
+        exit 1
+        ;;
+    esac
+    printf -v "${key}" '%s' "${value}"
+  done < "${env_file}"
+
+  for required_key in ROLE NODE_ID NETWORK_ID SSH_ALLOW_CIDRS SOURCE_ARCHIVE; do
+    if [[ -z "${!required_key+x}" ]]; then
+      echo "[bootstrap] refusing env file missing required key: ${required_key}" >&2
+      exit 1
+    fi
+  done
+}
+
+load_bootstrap_env "$1"
 export PATH="${HOME}/.cargo/bin:${PATH}"
 
 run_root() {

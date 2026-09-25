@@ -9342,6 +9342,8 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             "Sign-RelayBinaryForAuthenticode",
             "signtool.exe",
             "New-SelfSignedCertificate",
+            "Set-RelayDatapathFirewallRule",
+            "New-NetFirewallRule",
             "-RequireLoopback",
             "relay health bind port must not equal",
             "UTF8Encoding($false)",
@@ -9355,6 +9357,75 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             !body.contains("Invoke-Expression"),
             "relay service install script must not use Invoke-Expression"
         );
+    }
+
+    #[test]
+    fn windows_relay_installer_defaults_datapath_to_loopback_and_opens_firewall_only_for_explicit_non_loopback_binds()
+     {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service install script should exist");
+        // RSA-0084: the datapath bind defaults to loopback. The previous
+        // 0.0.0.0 default exposed the relay on every interface with no
+        // firewall rule anywhere in the script.
+        assert!(
+            body.contains("[string]$Bind = '127.0.0.1:4600'"),
+            "the relay datapath must default to loopback (RSA-0084)"
+        );
+        assert!(
+            !body.contains("0.0.0.0:4600"),
+            "no default or fallback may bind the datapath to every interface"
+        );
+        // The health bind keeps its loopback default.
+        assert!(
+            body.contains("[string]$HealthBind = '127.0.0.1:9100'"),
+            "the health bind must keep its loopback default"
+        );
+        // A non-loopback bind opens exactly one inbound rule under a FIXED
+        // name, scoped to the exact protocol + port + local address, so
+        // re-running the installer is idempotent instead of accumulating
+        // rules.
+        assert!(
+            body.contains("New-NetFirewallRule"),
+            "a non-loopback bind must open an explicit inbound firewall rule (RSA-0084)"
+        );
+        assert!(
+            body.contains("'RustyNetRelay-Datapath-Inbound-UDP'"),
+            "the firewall rule must have a fixed name so re-running is idempotent"
+        );
+        assert!(
+            body.contains("Set-RelayDatapathFirewallRule -Bind $Bind"),
+            "the firewall step must run from the install flow, not merely exist"
+        );
+        // Loopback binds open nothing: the loopback decision must precede
+        // rule creation inside the helper.
+        let fn_start = body
+            .find("function Set-RelayDatapathFirewallRule")
+            .expect("the firewall helper must exist");
+        let loopback_check = body[fn_start..]
+            .find("IsLoopback")
+            .expect("the helper must decide on loopback-ness");
+        let rule_create = body[fn_start..]
+            .find("New-NetFirewallRule")
+            .expect("the helper must create the rule for non-loopback binds");
+        assert!(
+            loopback_check < rule_create,
+            "loopback binds must be decided BEFORE any rule is created"
+        );
+        for scoped in [
+            "-Protocol UDP",
+            "-LocalPort $bindPort",
+            "-LocalAddress $bindAddress",
+        ] {
+            assert!(
+                body[fn_start..].contains(scoped),
+                "the firewall rule must be scoped by {scoped}"
+            );
+        }
     }
 
     #[test]
