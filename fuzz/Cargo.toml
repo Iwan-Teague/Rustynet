@@ -12,6 +12,9 @@ libfuzzer-sys = "0.4"
 rustynetd = { path = "../crates/rustynetd" }
 rustynet-control = { path = "../crates/rustynet-control" }
 rustynet-relay = { path = "../crates/rustynet-relay" }
+rustynet-dns-zone = { path = "../crates/rustynet-dns-zone" }
+rustynet-policy = { path = "../crates/rustynet-policy" }
+boringtun = { path = "../third_party/boringtun" }
 
 [[bin]]
 name = "ipc_parse_command"
@@ -37,6 +40,34 @@ bench = false
 [[bin]]
 name = "relay_hello_parse"
 path = "fuzz_targets/relay_hello_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns_zone_bundle_parse"
+path = "fuzz_targets/dns_zone_bundle_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "daemon_signed_bundle_parse"
+path = "fuzz_targets/daemon_signed_bundle_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_selector_evaluate"
+path = "fuzz_targets/policy_selector_evaluate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "boringtun_decapsulate"
+path = "fuzz_targets/boringtun_decapsulate.rs"
 test = false
 doc = false
 bench = false

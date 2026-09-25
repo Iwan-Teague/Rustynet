@@ -11,7 +11,9 @@ set -euo pipefail
 #
 # WHAT IT DOES: `cargo build --bins` from inside fuzz/ compiles every
 # [[bin]] in fuzz/Cargo.toml (ipc_parse_command, membership_decode_state,
-# membership_decode_signed_update, relay_hello_parse) as regular binaries
+# membership_decode_signed_update, relay_hello_parse, dns_zone_bundle_parse,
+# daemon_signed_bundle_parse, policy_selector_evaluate,
+# boringtun_decapsulate) as regular binaries
 # under the repo's
 # pinned stable toolchain (rust-toolchain.toml). libfuzzer-sys' default
 # `link_libfuzzer` feature builds the bundled libFuzzer C++ runtime via
@@ -45,7 +47,7 @@ echo "[1/2] cargo build --bins"
 cargo build --bins
 
 echo "[2/2] fuzz target inventory"
-for target in ipc_parse_command membership_decode_state membership_decode_signed_update relay_hello_parse; do
+for target in ipc_parse_command membership_decode_state membership_decode_signed_update relay_hello_parse dns_zone_bundle_parse daemon_signed_bundle_parse policy_selector_evaluate boringtun_decapsulate; do
   test -f "fuzz_targets/${target}.rs" || {
     echo "fuzz target source missing: fuzz_targets/${target}.rs" >&2
     exit 1
