@@ -6457,7 +6457,7 @@ mod tests {
         // on disk (the OI-13 migration path the misroute used to skip).
         let _oi13_guard = OI13_V0_DISK_READ_LOCK.lock().expect("OI13 lock poisoned");
         let policy = KeyCustodyPermissionPolicy::default();
-        let plaintext = b"rsa0001-wg-key-0123456789abcdef".as_slice();
+        let plaintext = b"rsa0001-key-00-0123456789abcdef".as_slice();
         for first in [0x00u8, 0x01, 0x2a, 0x7f, 0x80, 0xfe, 0xff] {
             let mut salt = [0u8; 16];
             salt[0] = first;

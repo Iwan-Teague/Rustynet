@@ -1,4 +1,4 @@
-//! ML-KEM-768 (FIPS 203) key encapsulation and WireGuard PSK derivation.
+//! ML-KEM-768 (FIPS 203) key encapsulation and tunnel PSK derivation.
 //!
 //! AQ-35 step S6 of `charter/design/rustynet-d3-seams-plan-v0.4.md`:
 //!
@@ -12,9 +12,9 @@
 //!   `Drop`); the raw shared secret is held as [`MlKemSharedSecret`] and
 //!   the derived PSK as `zeroize::Zeroizing`, the bytes the S5
 //!   `PresharedKey` custody wrapper in `rustynet-backend-api` consumes;
-//! * the raw ML-KEM shared secret is NOT a WireGuard PSK. It has its own
+//! * the raw ML-KEM shared secret is NOT a tunnel PSK. It has its own
 //!   type, [`MlKemSharedSecret`], with no `Debug`, no `Clone` and no byte
-//!   accessor outside this crate, and [`derive_wg_psk`] is the only way to
+//!   accessor outside this crate, and [`derive_tunnel_psk`] is the only way to
 //!   turn it into a PSK, so a caller cannot skip the network and node-pair
 //!   binding of plan section 4.5;
 //! * plan section 6 pins `ml-kem` to exactly 0.3.2: pure Rust, no C build
@@ -44,17 +44,17 @@ pub const ML_KEM_768_ENCAPSULATION_KEY_LEN: usize = 1184;
 pub const ML_KEM_768_CIPHERTEXT_LEN: usize = 1088;
 /// Length in bytes of an ML-KEM-768 shared secret.
 pub const ML_KEM_768_SHARED_SECRET_LEN: usize = 32;
-/// Length in bytes of a WireGuard preshared key.
-pub const WG_PSK_LEN: usize = 32;
+/// Length in bytes of a tunnel preshared key (the backend PSK slot).
+pub const TUNNEL_PSK_LEN: usize = 32;
 
 /// The only PSK derivation format version this module understands
 /// (plan section 4.5). It is also the trailing info byte.
-pub const WG_PSK_DERIVATION_VERSION: u16 = 1;
+pub const TUNNEL_PSK_DERIVATION_VERSION: u16 = 1;
 
 /// Domain-separation prefix of the PSK `info` string (plan section 4.5).
-const WG_PSK_INFO_PREFIX: &[u8] = b"rustynet-wg-psk-v1";
+const TUNNEL_PSK_INFO_PREFIX: &[u8] = b"rustynet-tunnel-psk-v1";
 /// Trailing literal version byte of the PSK `info` string (plan section 4.5).
-const WG_PSK_INFO_VERSION_BYTE: u8 = 0x01;
+const TUNNEL_PSK_INFO_VERSION_BYTE: u8 = 0x01;
 
 /// Errors produced by this module.
 ///
@@ -87,9 +87,9 @@ pub enum MlKemError {
     },
     /// The encapsulation key bytes were rejected by ML-KEM's validation.
     EncapsulationKeyRejected,
-    /// The network id handed to [`derive_wg_psk`] was empty.
+    /// The network id handed to [`derive_tunnel_psk`] was empty.
     EmptyNetworkId,
-    /// A node id handed to [`derive_wg_psk`] was empty.
+    /// A node id handed to [`derive_tunnel_psk`] was empty.
     EmptyNodeId,
     /// A node id was longer than `u16::MAX` bytes and therefore cannot be
     /// length-prefixed in the derivation input.
@@ -99,14 +99,14 @@ pub enum MlKemError {
         /// Observed length.
         got: usize,
     },
-    /// [`derive_wg_psk`] was called with a version other than
-    /// [`WG_PSK_DERIVATION_VERSION`].
+    /// [`derive_tunnel_psk`] was called with a version other than
+    /// [`TUNNEL_PSK_DERIVATION_VERSION`].
     UnsupportedPskDerivationVersion {
         /// The refused version.
         got: u16,
     },
     /// HKDF refused to expand to the requested length. Unreachable for a
-    /// [`WG_PSK_LEN`]-byte output; carried so the caller always gets a
+    /// [`TUNNEL_PSK_LEN`]-byte output; carried so the caller always gets a
     /// `Result`.
     PskExpansionFailed,
 }
@@ -133,7 +133,7 @@ impl fmt::Display for MlKemError {
                 write!(f, "node id must be at most {max} bytes, got {got}")
             }
             Self::UnsupportedPskDerivationVersion { got } => {
-                write!(f, "unsupported WireGuard PSK derivation version {got}")
+                write!(f, "unsupported tunnel PSK derivation version {got}")
             }
             Self::PskExpansionFailed => write!(f, "HKDF-Expand refused the PSK length"),
         }
@@ -181,7 +181,7 @@ impl MlKem768EncapsulationKey {
     /// matching decapsulation key derives, unless the ciphertext is modified
     /// in transit (then the decapsulator's implicit rejection takes over and
     /// the handshake fails closed). The secret is not a PSK: pass it to
-    /// [`derive_wg_psk`].
+    /// [`derive_tunnel_psk`].
     pub fn encapsulate<R: CryptoRng + ?Sized>(
         &self,
         rng: &mut R,
@@ -238,8 +238,8 @@ impl MlKem768Ciphertext {
 /// The raw 32-byte ML-KEM-768 shared secret from [`MlKem768EncapsulationKey::encapsulate`]
 /// or [`MlKem768DecapsulationKey::decapsulate`].
 ///
-/// This is NOT a WireGuard preshared key. Plan section 4.5 binds the PSK to
-/// the network and the node pair through HKDF, and [`derive_wg_psk`] is the
+/// This is NOT a tunnel preshared key. Plan section 4.5 binds the PSK to
+/// the network and the node pair through HKDF, and [`derive_tunnel_psk`] is the
 /// only way to turn this secret into one. The type has no `Debug`, no
 /// `Clone` and no byte accessor outside this crate, so the raw secret cannot
 /// be handed to a tunnel by mistake. The bytes are zeroized on drop.
@@ -247,7 +247,7 @@ pub struct MlKemSharedSecret(Zeroizing<[u8; ML_KEM_768_SHARED_SECRET_LEN]>);
 
 impl MlKemSharedSecret {
     /// The raw bytes, for this crate only (the HKDF input of
-    /// [`derive_wg_psk`] and this crate's known-answer tests).
+    /// [`derive_tunnel_psk`] and this crate's known-answer tests).
     pub(crate) fn expose(&self) -> &[u8; ML_KEM_768_SHARED_SECRET_LEN] {
         &self.0
     }
@@ -286,7 +286,7 @@ impl MlKem768DecapsulationKey {
     }
 
     /// Decapsulates a ciphertext into the raw shared secret (not a PSK: pass
-    /// it to [`derive_wg_psk`]).
+    /// it to [`derive_tunnel_psk`]).
     ///
     /// Never panics on malformed *content*: a well-formed-length ciphertext
     /// that was substituted or corrupted decapsulates (via ML-KEM's implicit
@@ -313,13 +313,13 @@ pub fn generate_keypair<R: CryptoRng>(
     (MlKem768DecapsulationKey(dk), MlKem768EncapsulationKey(ek))
 }
 
-/// Derives the WireGuard preshared key binding an ML-KEM-768 shared secret
+/// Derives the tunnel preshared key (the backend PSK slot) binding an ML-KEM-768 shared secret
 /// to a network and an unordered pair of node ids (plan section 4.5).
 ///
 /// ```text
 /// PSK = HKDF-SHA256(ikm   = ss,
 ///                   salt  = network_id as UTF-8 bytes,
-///                   info  = "rustynet-wg-psk-v1"
+///                   info  = "rustynet-tunnel-psk-v1"
 ///                           || u16be(len(node_lo)) || node_lo
 ///                           || u16be(len(node_hi)) || node_hi
 ///                           || 0x01,
@@ -342,14 +342,14 @@ pub fn generate_keypair<R: CryptoRng>(
 /// * [`MlKemError::NodeIdTooLong`] if either node id exceeds `u16::MAX` bytes;
 /// * [`MlKemError::PskExpansionFailed`] if HKDF refuses the output length
 ///   (unreachable for a 32-byte PSK).
-pub fn derive_wg_psk(
+pub fn derive_tunnel_psk(
     shared_secret: &MlKemSharedSecret,
     network_id: &str,
     node_a: &str,
     node_b: &str,
     version: u16,
-) -> Result<Zeroizing<[u8; WG_PSK_LEN]>, MlKemError> {
-    if version != WG_PSK_DERIVATION_VERSION {
+) -> Result<Zeroizing<[u8; TUNNEL_PSK_LEN]>, MlKemError> {
+    if version != TUNNEL_PSK_DERIVATION_VERSION {
         return Err(MlKemError::UnsupportedPskDerivationVersion { got: version });
     }
     if network_id.is_empty() {
@@ -357,16 +357,17 @@ pub fn derive_wg_psk(
     }
     let (node_lo, node_hi) = canonical_node_order(node_a, node_b)?;
 
-    let mut info =
-        Vec::with_capacity(WG_PSK_INFO_PREFIX.len() + 2 + node_lo.len() + 2 + node_hi.len() + 1);
-    info.extend_from_slice(WG_PSK_INFO_PREFIX);
+    let mut info = Vec::with_capacity(
+        TUNNEL_PSK_INFO_PREFIX.len() + 2 + node_lo.len() + 2 + node_hi.len() + 1,
+    );
+    info.extend_from_slice(TUNNEL_PSK_INFO_PREFIX);
     extend_len_prefixed(&mut info, node_lo);
     extend_len_prefixed(&mut info, node_hi);
-    info.push(WG_PSK_INFO_VERSION_BYTE);
+    info.push(TUNNEL_PSK_INFO_VERSION_BYTE);
 
     // Write the PSK straight into its zeroizing buffer: a plain array moved
     // into `Zeroizing` afterwards would leave an unwiped copy behind.
-    let mut okm = Zeroizing::new([0u8; WG_PSK_LEN]);
+    let mut okm = Zeroizing::new([0u8; TUNNEL_PSK_LEN]);
     Hkdf::<Sha256>::new(Some(network_id.as_bytes()), shared_secret.expose())
         .expand(&info, okm.as_mut_slice())
         .map_err(|_| MlKemError::PskExpansionFailed)?;

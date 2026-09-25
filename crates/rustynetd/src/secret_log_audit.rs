@@ -380,7 +380,7 @@ const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     // rustynet-crypto
     "SecretKey", // crates/rustynet-crypto/src/lib.rs:43 — [u8;32] private key, zeroizing Drop :61
     "Ed25519SigningProvider", // crates/rustynet-crypto/src/lib.rs:1191 — holds SigningKey seed :1195
-    "MlKemSharedSecret", // crates/rustynet-crypto/src/mlkem.rs:246 — raw ML-KEM-768 shared secret (the HKDF input of the WireGuard PSK), Zeroizing; NO Debug today, listed to guard forward (no reviewed impl)
+    "MlKemSharedSecret", // crates/rustynet-crypto/src/mlkem.rs:246 — raw ML-KEM-768 shared secret (the HKDF input of the tunnel PSK), Zeroizing; NO Debug today, listed to guard forward (no reviewed impl)
     // rustynetd
     "EnrollmentToken", // crates/rustynetd/src/enrollment_token.rs:104 — bearer token_id+tag, zeroizing Drop :123
     "ConsumedTokenLedger", // crates/rustynetd/src/enrollment_token.rs:363 — keys are consumed token ids (bearer halves)

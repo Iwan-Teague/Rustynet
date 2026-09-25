@@ -1,18 +1,20 @@
-//! Tests for the ML-KEM-768 wrappers and the WireGuard PSK derivation.
+//! Tests for the ML-KEM-768 wrappers and the tunnel PSK derivation.
 //!
 //! Known-answer vectors: RustCrypto/KEMs, tag `ml-kem/v0.3.2`,
 //! `ml-kem/tests/key-gen.json` and `ml-kem/tests/encap-decap.json` — the
 //! ACVP-style vectors the `ml-kem` crate's own suite runs against.
 //! Golden PSK vector: plan section 4.5
-//! (`charter/design/rustynet-d3-seams-plan-v0.4.md`), independently
-//! re-derived with Python's hashlib/hmac before landing.
+//! (`charter/design/rustynet-d3-seams-plan-v0.4.md`), as amended on
+//! 2026-09-25: the info label is "rustynet-tunnel-psk-v1", because the
+//! backend-boundary gate keeps transport names out of this crate. It was
+//! independently re-derived with Python's hashlib/hmac before landing.
 
 use super::*;
 
-const GOLDEN_PSK_HEX: &str = "7a72d2e6d3ae5af44422ab051107d04d09330adafe78fb9b96375218c711ae74";
+const GOLDEN_PSK_HEX: &str = "e8d59b87bd85c5a356a430659f2687a6839afa955975ca2ad0ff2547e69d4bad";
 
 const GOLDEN_INFO_HEX: &str =
-    "72757374796e65742d77672d70736b2d7631000a6e6f64652d616c70686100096e6f64652d6265746101";
+    "72757374796e65742d74756e6e656c2d70736b2d7631000a6e6f64652d616c70686100096e6f64652d6265746101";
 
 const KAT_KEYGEN_D_26_HEX: &str =
     "e34a701c4c87582f42264ee422d3c684d97611f2523efe0c998af05056d693dc";
@@ -58,7 +60,7 @@ fn golden_shared_secret_bytes() -> [u8; ML_KEM_768_SHARED_SECRET_LEN] {
     ss
 }
 
-/// The golden shared secret as the type `derive_wg_psk` accepts.
+/// The golden shared secret as the type `derive_tunnel_psk` accepts.
 fn golden_shared_secret() -> MlKemSharedSecret {
     MlKemSharedSecret::from_bytes(golden_shared_secret_bytes())
 }
@@ -116,7 +118,7 @@ impl rand_core::TryCryptoRng for TestRng {}
 
 #[test]
 fn golden_vector_matches_plan_section_4_5() {
-    let psk = derive_wg_psk(
+    let psk = derive_tunnel_psk(
         &golden_shared_secret(),
         "rustynet-demo",
         "node-alpha",
@@ -124,13 +126,13 @@ fn golden_vector_matches_plan_section_4_5() {
         1,
     )
     .unwrap();
-    let expected: [u8; WG_PSK_LEN] = hex_decode(GOLDEN_PSK_HEX).try_into().unwrap();
+    let expected: [u8; TUNNEL_PSK_LEN] = hex_decode(GOLDEN_PSK_HEX).try_into().unwrap();
     assert_eq!(*psk, expected);
 }
 
 #[test]
 fn golden_vector_info_string_is_exact() {
-    let psk = derive_wg_psk(
+    let psk = derive_tunnel_psk(
         &golden_shared_secret(),
         "rustynet-demo",
         "node-alpha",
@@ -142,7 +144,7 @@ fn golden_vector_info_string_is_exact() {
     // info hex from plan section 4.5.
     let salt = b"rustynet-demo";
     let info = hex_decode(GOLDEN_INFO_HEX);
-    let mut okm = [0u8; WG_PSK_LEN];
+    let mut okm = [0u8; TUNNEL_PSK_LEN];
     Hkdf::<Sha256>::new(Some(salt), &golden_shared_secret_bytes())
         .expand(&info, &mut okm)
         .unwrap();
@@ -163,8 +165,8 @@ fn canonical_order_is_order_independent() {
         ("n1", "n10"),
     ];
     for (a, b) in cases {
-        let ab = derive_wg_psk(&ss, "rustynet-demo", a, b, 1).unwrap();
-        let ba = derive_wg_psk(&ss, "rustynet-demo", b, a, 1).unwrap();
+        let ab = derive_tunnel_psk(&ss, "rustynet-demo", a, b, 1).unwrap();
+        let ba = derive_tunnel_psk(&ss, "rustynet-demo", b, a, 1).unwrap();
         assert_eq!(ab, ba, "order must not matter for ({a}, {b})");
     }
 }
@@ -172,16 +174,16 @@ fn canonical_order_is_order_independent() {
 #[test]
 fn length_prefixes_are_injective_pairing_boundary() {
     let ss = golden_shared_secret();
-    let a_bc = derive_wg_psk(&ss, "rustynet-demo", "a", "bc", 1).unwrap();
-    let ab_c = derive_wg_psk(&ss, "rustynet-demo", "ab", "c", 1).unwrap();
+    let a_bc = derive_tunnel_psk(&ss, "rustynet-demo", "a", "bc", 1).unwrap();
+    let ab_c = derive_tunnel_psk(&ss, "rustynet-demo", "ab", "c", 1).unwrap();
     assert_ne!(a_bc, ab_c, "(a, bc) and (ab, c) must derive different PSKs");
 }
 
 #[test]
 fn network_id_separates_derivations() {
     let ss = golden_shared_secret();
-    let demo = derive_wg_psk(&ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
-    let other = derive_wg_psk(&ss, "rustynet-other", "node-alpha", "node-beta", 1).unwrap();
+    let demo = derive_tunnel_psk(&ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
+    let other = derive_tunnel_psk(&ss, "rustynet-other", "node-alpha", "node-beta", 1).unwrap();
     assert_ne!(demo, other);
 }
 
@@ -190,7 +192,7 @@ fn shared_secret_binds_the_psk() {
     let mut other_bytes = golden_shared_secret_bytes();
     other_bytes[0] ^= 0x01;
     let other_ss = MlKemSharedSecret::from_bytes(other_bytes);
-    let demo = derive_wg_psk(
+    let demo = derive_tunnel_psk(
         &golden_shared_secret(),
         "rustynet-demo",
         "node-alpha",
@@ -198,7 +200,8 @@ fn shared_secret_binds_the_psk() {
         1,
     )
     .unwrap();
-    let other = derive_wg_psk(&other_ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
+    let other =
+        derive_tunnel_psk(&other_ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
     assert_ne!(demo, other);
 }
 
@@ -208,8 +211,8 @@ fn shared_secret_binds_the_psk() {
 fn derive_refuses_unsupported_versions() {
     let ss = golden_shared_secret();
     for version in [0u16, 2, 65535] {
-        let err =
-            derive_wg_psk(&ss, "rustynet-demo", "node-alpha", "node-beta", version).unwrap_err();
+        let err = derive_tunnel_psk(&ss, "rustynet-demo", "node-alpha", "node-beta", version)
+            .unwrap_err();
         assert_eq!(
             err,
             MlKemError::UnsupportedPskDerivationVersion { got: version }
@@ -221,7 +224,7 @@ fn derive_refuses_unsupported_versions() {
 fn derive_refuses_empty_node_ids() {
     let ss = golden_shared_secret();
     for (a, b) in [("", "node-beta"), ("node-alpha", "")] {
-        let err = derive_wg_psk(&ss, "rustynet-demo", a, b, 1).unwrap_err();
+        let err = derive_tunnel_psk(&ss, "rustynet-demo", a, b, 1).unwrap_err();
         assert_eq!(err, MlKemError::EmptyNodeId);
     }
 }
@@ -230,7 +233,7 @@ fn derive_refuses_empty_node_ids() {
 fn derive_refuses_node_ids_longer_than_u16() {
     let ss = golden_shared_secret();
     let too_long: String = "n".repeat(u16::MAX as usize + 1);
-    let err = derive_wg_psk(&ss, "rustynet-demo", "node-alpha", &too_long, 1).unwrap_err();
+    let err = derive_tunnel_psk(&ss, "rustynet-demo", "node-alpha", &too_long, 1).unwrap_err();
     assert_eq!(
         err,
         MlKemError::NodeIdTooLong {
@@ -240,7 +243,7 @@ fn derive_refuses_node_ids_longer_than_u16() {
     );
     // Exactly u16::MAX bytes is accepted (boundary).
     let max_len: String = "n".repeat(u16::MAX as usize);
-    assert!(derive_wg_psk(&ss, "rustynet-demo", "node-alpha", &max_len, 1).is_ok());
+    assert!(derive_tunnel_psk(&ss, "rustynet-demo", "node-alpha", &max_len, 1).is_ok());
 }
 
 #[test]
@@ -404,14 +407,14 @@ fn psk_derivation_composes_with_encapsulation() {
     let (dk, ek) = generate_keypair(&mut TestRng::new(0x5EED_0008));
     let (ct, sender_ss) = ek.encapsulate(&mut TestRng::new(0x5EED_0009));
     let receiver_ss = dk.decapsulate(&ct).unwrap();
-    let a = derive_wg_psk(&sender_ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
-    let b = derive_wg_psk(&receiver_ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
+    let a = derive_tunnel_psk(&sender_ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
+    let b = derive_tunnel_psk(&receiver_ss, "rustynet-demo", "node-alpha", "node-beta", 1).unwrap();
     assert_eq!(a, b);
 }
 
 #[test]
 fn empty_network_id_is_refused() {
-    let err = derive_wg_psk(&golden_shared_secret(), "", "node-alpha", "node-beta", 1)
+    let err = derive_tunnel_psk(&golden_shared_secret(), "", "node-alpha", "node-beta", 1)
         .expect_err("an empty network id must be refused");
     assert_eq!(err, MlKemError::EmptyNetworkId);
 }

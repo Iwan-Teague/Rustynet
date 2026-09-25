@@ -583,7 +583,7 @@ mod daemon {
     ///
     /// std/tokio do not expose `SO_RCVBUF`, so the socket is created as a
     /// `std::net::UdpSocket`, configured through `socket2` — already in the
-    /// dependency tree of three workspace crates (`rustynet-backend-wireguard`,
+    /// dependency tree of three workspace crates (a backend adapter crate,
     /// `rustynet-cli`, `rustynet-mcp`, all pinned `"0.6"`, so this adds no
     /// new crate to the lockfile) — and then handed to tokio.
     ///
