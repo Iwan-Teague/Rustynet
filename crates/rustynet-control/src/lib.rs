@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 1: test code is exempt from the panic-family lints (deny via [lints]
+// in Cargo.toml); non-test code must propagate errors instead.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 pub mod admin;
 pub mod blind_relay;
@@ -1742,7 +1753,12 @@ pub fn canonical_relay_id_from_label(label: &str) -> Result<[u8; 16], String> {
         return Err("relay_id must be at most 16 ASCII bytes".to_owned());
     }
     let mut relay_id = [0u8; 16];
-    relay_id[..trimmed.len()].copy_from_slice(trimmed.as_bytes());
+    // The `trimmed.len() > 16` check above keeps this range in bounds, so
+    // the error arm is unreachable.
+    relay_id
+        .get_mut(..trimmed.len())
+        .ok_or_else(|| "relay_id must be at most 16 ASCII bytes".to_owned())?
+        .copy_from_slice(trimmed.as_bytes());
     Ok(relay_id)
 }
 
@@ -1795,6 +1811,17 @@ impl RelaySessionToken {
     /// Scope is fixed to [`RELAY_TOKEN_SCOPE`].  The nonce is drawn from
     /// `OsRng`.  The returned token has a valid signature over its canonical
     /// payload.
+    ///
+    /// AQ-08: legacy convenience wrapper that MUST stay compiled outside
+    /// `cfg(test)` — downstream crates' tests, bins, benches and examples
+    /// call it (`rustynet-relay` transport/tests/example/bench,
+    /// `rustynetd` relay-client tests, `rustynet-cli` fixtures), and
+    /// `cfg(test)` is not set when another crate compiles against this one.
+    /// The body is panic-family-clean: the clock read uses `unwrap_or(0)`
+    /// (fail-closed — a pre-epoch clock yields `issued_at = 0`, which a
+    /// healthy relay rejects as already-expired) and delegation to
+    /// `sign_at` carries the single deliberate panic allow. Production
+    /// callers should prefer [`RelaySessionToken::try_sign`].
     pub fn sign(
         signing_key: &SigningKey,
         node_id: &str,
@@ -1827,6 +1854,17 @@ impl RelaySessionToken {
         )
     }
 
+    // AQ-08: this legacy entry point MUST stay compiled outside `cfg(test)`
+    // for the same cross-crate reason as `sign` above (callers in
+    // `rustynet-relay`, `rustynetd` and `rustynet-cli` test/bench/example
+    // targets cannot see a `cfg(test)` item). Its single `panic!` is
+    // deliberate and fail-closed, hence the item-scoped allow below: the
+    // error arm is reachable (the kernel CSPRNG can fail), the signature is
+    // infallible by contract, and a loud crash beats silently minting a
+    // relay-token nonce an attacker could predict or replay. Production
+    // callers must use `try_sign_at` so a CSPRNG failure surfaces as a
+    // structured error instead of crashing the long-running daemon.
+    #[allow(clippy::panic)]
     pub fn sign_at(
         signing_key: &SigningKey,
         node_id: &str,
@@ -1835,9 +1873,6 @@ impl RelaySessionToken {
         issued_at_unix: u64,
         ttl_secs: u64,
     ) -> Self {
-        // Legacy panicking entry point retained for test fixtures; production
-        // code paths must call `try_sign_at` so a CSPRNG failure surfaces as
-        // a structured error instead of crashing the long-running daemon.
         match Self::try_sign_at(
             signing_key,
             node_id,
@@ -1891,8 +1926,8 @@ impl RelaySessionToken {
         Ok(token)
     }
 
-    /// Fallible analogue of [`RelaySessionToken::sign`]. See
-    /// [`RelaySessionToken::try_sign_at`] for the fail-closed rationale.
+    /// Fallible analogue of the legacy `RelaySessionToken::sign` wrapper.
+    /// See [`RelaySessionToken::try_sign_at`] for the fail-closed rationale.
     pub fn try_sign(
         signing_key: &SigningKey,
         node_id: &str,
@@ -3638,8 +3673,11 @@ pub fn derive_gossip_signing_key(mut signing_secret: Vec<u8>) -> SigningKey {
 fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     let mut seed = [0u8; 32];
     let hkdf = Hkdf::<Sha256>::new(Some(SIGNING_SEED_HKDF_SALT_V1), secret);
+    // `seed` is a fixed 32-byte output buffer and HKDF-SHA256 accepts any
+    // output length up to 255 * 32 bytes, so `expand` cannot fail here.
+    // The KDF call itself is unchanged.
     hkdf.expand(domain, &mut seed)
-        .expect("hkdf expand length is fixed and valid");
+        .unwrap_or_else(|_| unreachable!("hkdf expand length is fixed and valid"));
     seed
 }
 
@@ -3701,7 +3739,10 @@ fn sha256_digest(payload: &[u8]) -> [u8; 32] {
     hasher.update(payload);
     let digest = hasher.finalize();
     let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..32]);
+    // SHA-256 output is exactly 32 bytes, so this copies the whole digest —
+    // identical to the previous `&digest[..32]` slice without the panicking
+    // range index.
+    out.copy_from_slice(digest.as_slice());
     out
 }
 
@@ -3729,9 +3770,11 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], ()> {
     let raw = trimmed.as_bytes();
     let mut index = 0usize;
     while index < N {
-        let hi = decode_hex_nibble(raw[index * 2])?;
-        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
+        // The `trimmed.len() != N * 2` check above keeps every index below
+        // in bounds, so the `ok_or` arms are unreachable.
+        let hi = decode_hex_nibble(raw.get(index * 2).copied().ok_or(())?)?;
+        let lo = decode_hex_nibble(raw.get(index * 2 + 1).copied().ok_or(())?)?;
+        *bytes.get_mut(index).ok_or(())? = (hi << 4) | lo;
         index += 1;
     }
     Ok(bytes)

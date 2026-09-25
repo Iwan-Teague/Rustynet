@@ -599,12 +599,18 @@ fn validate_audience_relay_id(audience: &[u8; 16]) -> Result<(), ControlPlaneErr
         .iter()
         .position(|&byte| byte == 0)
         .unwrap_or(audience.len());
-    if audience[label_end..].iter().any(|&byte| byte != 0) {
+    // label_end is a position within `audience` or its length, so the split
+    // below is always in bounds and the error arm is unreachable.
+    let Some((label, padding)) = audience.split_at_checked(label_end) else {
+        return Err(ControlPlaneError::Traversal(
+            "blind relay token v2 audience_relay_id is not a zero-padded relay id".to_owned(),
+        ));
+    };
+    if padding.iter().any(|&byte| byte != 0) {
         return Err(ControlPlaneError::Traversal(
             "blind relay token v2 audience_relay_id is not a zero-padded relay id".to_owned(),
         ));
     }
-    let label = &audience[..label_end];
     if label.is_empty() || label.len() > 16 {
         return Err(ControlPlaneError::Traversal(
             "blind relay token v2 audience_relay_id label length is invalid".to_owned(),
@@ -1132,19 +1138,26 @@ pub fn parse_blind_relay_hello_v2_wire(wire: &str) -> Result<BlindRelayHelloV2, 
             "blind relay hello v2 datagram has an invalid line count".to_owned(),
         ));
     }
+    // The line-count check above pins `lines` to BLIND_RELAY_HELLO_V2_WIRE_LINES
+    // (= BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES + 3), so this split is always in
+    // bounds and the error arm is unreachable.
+    let Some((token_lines, envelope_lines)) =
+        lines.split_at_checked(BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES)
+    else {
+        return Err(ControlPlaneError::Traversal(
+            "blind relay hello v2 datagram has an invalid line count".to_owned(),
+        ));
+    };
     // Deterministic split: token document first, then the three envelope
     // lines. Each envelope line must be `key=value` with the exact expected
     // key at its fixed position — anything else (unknown key, duplicate,
     // reorder, extra line) breaks the canonical re-encode check below.
-    let token_wire: String = lines[..BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES]
-        .iter()
-        .map(|line| format!("{line}\n"))
-        .collect();
+    let token_wire: String = token_lines.iter().map(|line| format!("{line}\n")).collect();
     let token = parse_blind_relay_leg_token_v2_wire(&token_wire)?;
 
     let mut envelope_values: BTreeMap<&str, [u8; 32]> = BTreeMap::new();
     let mut pop_signature: Option<[u8; 64]> = None;
-    for line in &lines[BLIND_RELAY_LEG_TOKEN_V2_WIRE_LINES..] {
+    for line in envelope_lines {
         let Some((key, value)) = line.split_once('=') else {
             return Err(ControlPlaneError::Traversal(
                 "blind relay hello v2 envelope line missing key/value separator".to_owned(),

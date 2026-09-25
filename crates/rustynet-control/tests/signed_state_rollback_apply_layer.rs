@@ -1,3 +1,13 @@
+// AQ-08 step 1: integration-test targets are exempt from the panic-family lints.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! GAP-5 offline half: signed-state epoch rollback pinned at the membership
 //! APPLY layer, through the PUBLIC API only.
 //!
