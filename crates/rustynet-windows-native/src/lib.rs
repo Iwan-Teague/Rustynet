@@ -287,6 +287,7 @@ fn gateway_is_usable_for_port_mapping(gateway: IpAddr) -> bool {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 mod imp {
     use super::{
         NativeWindowsNamedPipeClientFacts, WindowsDpapiScope, WindowsNetworkAdapterSnapshot,
