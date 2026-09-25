@@ -1668,7 +1668,7 @@ fn parse_utc_to_unix(value: &str, field: &str) -> Result<i64, String> {
             .find_map(|(index, ch)| (index > 10 && (ch == '+' || ch == '-')).then_some(index))
             .ok_or_else(|| format!("invalid UTC timestamp for {field}: {value}"))?;
         let (base, zone) = trimmed.split_at(tz_start);
-        if zone.len() != 6 || &zone[3..4] != ":" {
+        if zone.len() != 6 || !zone.is_ascii() || &zone[3..4] != ":" {
             return Err(format!("invalid UTC timestamp for {field}: {value}"));
         }
         let sign = if &zone[0..1] == "+" { 1i64 } else { -1i64 };
@@ -3004,6 +3004,13 @@ mod tests {
             parse_utc_to_unix("1970-01-01T01:00:00+01:00", "timestamp").expect("parse offset");
         assert_eq!(zulu, 0);
         assert_eq!(offset, 0);
+    }
+
+    #[test]
+    fn parse_utc_to_unix_refuses_multibyte_offset_without_panicking() {
+        let err = parse_utc_to_unix("2026-01-01T00:00:00+\u{c911}:1", "timestamp")
+            .expect_err("must fail");
+        assert!(err.contains("invalid UTC timestamp"));
     }
 
     #[test]
