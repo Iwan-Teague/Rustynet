@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::fmt;
 use std::net::IpAddr;
@@ -1203,7 +1215,17 @@ fn execute_builtin(
         PrivilegedCommandProgram::DnsFailclosedFile => {
             // `args` validated as exactly `[selector]`; the executor owns the
             // path→content mapping and re-validates the selector defensively.
-            crate::linux_dns_protect::apply_dns_failclosed_file(args[0]).map(|()| {
+            let [selector] = args else {
+                // Unreachable: both execute_builtin callers run
+                // validate_request first, and validate_dns_failclosed_file_args
+                // accepts only an exact one-argument `[selector]` shape for
+                // this program — so `args` has exactly one element here.
+                return Err(
+                    "unsupported dns-failclosed-file argument schema (expected exactly one reviewed selector)"
+                        .to_owned(),
+                );
+            };
+            crate::linux_dns_protect::apply_dns_failclosed_file(selector).map(|()| {
                 PrivilegedCommandOutput {
                     status: 0,
                     stdout: String::new(),

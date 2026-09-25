@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Relay client for daemon-side relay path transport.
 //!
@@ -564,15 +576,18 @@ impl RelayClient {
         // through to `parse_relay_hello_ack` and fails as an unknown
         // response, so a hostile peer cannot keep us in a loop.
         let (response, from_addr) =
-            if response.len() == 33 && response[0] == RELAY_HELLO_CHALLENGE_MSG_TYPE {
+            if response.len() == 33 && response.first() == Some(&RELAY_HELLO_CHALLENGE_MSG_TYPE) {
                 if from_addr != relay_addr {
                     return Err(RelayClientError::InvalidResponse(format!(
                         "unexpected relay response source {from_addr}"
                     )));
                 }
-                let artifact_bytes: [u8; 32] = response[1..].try_into().map_err(|_| {
-                    RelayClientError::InvalidResponse("malformed challenge payload".to_owned())
-                })?;
+                let artifact_bytes: [u8; 32] = response
+                    .get(1..)
+                    .and_then(|w| <[u8; 32]>::try_from(w).ok())
+                    .ok_or_else(|| {
+                        RelayClientError::InvalidResponse("malformed challenge payload".to_owned())
+                    })?;
                 hello.addr_validation_artifact =
                     Some(AddressValidationArtifact::from_bytes(artifact_bytes));
                 let retry_bytes = serialize_relay_hello(&hello);
@@ -1062,24 +1077,33 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
         return Err("empty response".to_owned());
     }
 
-    match data[0] {
-        RELAY_HELLO_ACK_MSG_TYPE => {
+    // data.first() is always Some: the is_empty gate above returned early.
+    // The None arm repeats that same "empty response" error and is
+    // unreachable.
+    match data.first().copied() {
+        Some(RELAY_HELLO_ACK_MSG_TYPE) => {
             if data.len() < 19 {
                 return Err("ack message too short".to_owned());
             }
             if data.len() != 19 {
                 return Err("ack message has trailing bytes".to_owned());
             }
-            // Session ID (16 bytes)
-            let session_id_bytes: [u8; 16] =
-                data[1..17].try_into().map_err(|_| "invalid session id")?;
+            // Session ID (16 bytes). The `len() != 19` gate above makes
+            // get(1..17) always return the full 16-byte window.
+            let session_id_bytes: [u8; 16] = data
+                .get(1..17)
+                .and_then(|w| <[u8; 16]>::try_from(w).ok())
+                .ok_or("invalid session id")?;
             if session_id_bytes == [0u8; 16] {
                 return Err("ack session id must not be all zero".to_owned());
             }
             let session_id = SessionId::from(session_id_bytes);
 
-            // Allocated port (2 bytes)
-            let port_bytes: [u8; 2] = data[17..19].try_into().map_err(|_| "invalid port")?;
+            // Allocated port (2 bytes); same length gate as above.
+            let port_bytes: [u8; 2] = data
+                .get(17..19)
+                .and_then(|w| <[u8; 2]>::try_from(w).ok())
+                .ok_or("invalid port")?;
             let allocated_port = u16::from_be_bytes(port_bytes);
             if allocated_port == 0 {
                 return Err("ack allocated port must not be 0".to_owned());
@@ -1090,15 +1114,16 @@ fn parse_relay_hello_ack(data: &[u8]) -> Result<RelayHelloAck, String> {
                 allocated_port,
             })
         }
-        RELAY_REJECT_MSG_TYPE => {
-            let reason = if data.len() > 1 {
-                String::from_utf8_lossy(&data[1..]).to_string()
+        Some(RELAY_REJECT_MSG_TYPE) => {
+            let reason = if let Some(rest) = data.get(1..).filter(|rest| !rest.is_empty()) {
+                String::from_utf8_lossy(rest).to_string()
             } else {
                 "unknown".to_owned()
             };
             Err(reason)
         }
-        other => Err(format!("unexpected message type: {other:#04x}")),
+        Some(other) => Err(format!("unexpected message type: {other:#04x}")),
+        None => Err("empty response".to_owned()),
     }
 }
 

@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -1250,7 +1262,13 @@ fn scrub_file_contents(path: &Path) -> Result<(), String> {
     let zero_block = [0u8; 8192];
     while remaining > 0 {
         let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
-        file.write_all(&zero_block[..chunk_len])
+        let Some(chunk) = zero_block.get(..chunk_len) else {
+            // Unreachable: chunk_len is std::cmp::min(remaining,
+            // zero_block.len()) immediately above, so it never exceeds
+            // the block length.
+            continue;
+        };
+        file.write_all(chunk)
             .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
         remaining -= chunk_len as u64;
     }

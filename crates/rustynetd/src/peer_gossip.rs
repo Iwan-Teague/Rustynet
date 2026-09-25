@@ -1,4 +1,16 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! D2.5 — Peer-distributed signed-bundle gossip.
 //!
@@ -757,7 +769,17 @@ pub fn deserialise_bundle(bytes: &[u8]) -> Result<GossipBundle, GossipError> {
             available: bytes.len(),
         });
     }
-    let presented_version = bytes[WIRE_VERSION_OFFSET];
+    // The minimum-length gate above pins bytes.len() >= WIRE_CANDIDATES_OFFSET,
+    // so the fixed header is fully covered by `head`; the ok_or arm is
+    // unreachable on every path.
+    let head: &[u8; WIRE_CANDIDATES_OFFSET] =
+        bytes
+            .first_chunk::<WIRE_CANDIDATES_OFFSET>()
+            .ok_or(GossipError::WireTruncated {
+                needed: WIRE_CANDIDATES_OFFSET + WIRE_SIGNATURE_LEN,
+                available: bytes.len(),
+            })?;
+    let presented_version = head[WIRE_VERSION_OFFSET];
     if presented_version != GOSSIP_BUNDLE_WIRE_VERSION {
         return Err(GossipError::WireVersionMismatch {
             expected: GOSSIP_BUNDLE_WIRE_VERSION,
@@ -765,42 +787,23 @@ pub fn deserialise_bundle(bytes: &[u8]) -> Result<GossipBundle, GossipError> {
         });
     }
     let mut source_node_id = [0u8; 32];
-    source_node_id.copy_from_slice(&bytes[WIRE_SOURCE_OFFSET..WIRE_SOURCE_OFFSET + 32]);
-    let sequence = u64::from_be_bytes(
-        bytes[WIRE_SEQUENCE_OFFSET..WIRE_SEQUENCE_OFFSET + 8]
-            .try_into()
-            .expect("slice length is 8"),
-    );
-    let timestamp_unix = u64::from_be_bytes(
-        bytes[WIRE_TIMESTAMP_OFFSET..WIRE_TIMESTAMP_OFFSET + 8]
-            .try_into()
-            .expect("slice length is 8"),
-    );
-    let epoch = u64::from_be_bytes(
-        bytes[WIRE_EPOCH_OFFSET..WIRE_EPOCH_OFFSET + 8]
-            .try_into()
-            .expect("slice length is 8"),
-    );
-    let v4_host_count = u32::from_be_bytes(
-        bytes[WIRE_COUNTS_OFFSET..WIRE_COUNTS_OFFSET + 4]
-            .try_into()
-            .expect("slice length is 4"),
-    ) as usize;
-    let v6_host_count = u32::from_be_bytes(
-        bytes[WIRE_COUNTS_OFFSET + 4..WIRE_COUNTS_OFFSET + 8]
-            .try_into()
-            .expect("slice length is 4"),
-    ) as usize;
-    let v4_srflx_count = u32::from_be_bytes(
-        bytes[WIRE_COUNTS_OFFSET + 8..WIRE_COUNTS_OFFSET + 12]
-            .try_into()
-            .expect("slice length is 4"),
-    ) as usize;
-    let v6_srflx_count = u32::from_be_bytes(
-        bytes[WIRE_COUNTS_OFFSET + 12..WIRE_COUNTS_OFFSET + 16]
-            .try_into()
-            .expect("slice length is 4"),
-    ) as usize;
+    source_node_id.copy_from_slice(&head[WIRE_SOURCE_OFFSET..WIRE_SOURCE_OFFSET + 32]);
+    let mut field = [0u8; 8];
+    field.copy_from_slice(&head[WIRE_SEQUENCE_OFFSET..WIRE_SEQUENCE_OFFSET + 8]);
+    let sequence = u64::from_be_bytes(field);
+    field.copy_from_slice(&head[WIRE_TIMESTAMP_OFFSET..WIRE_TIMESTAMP_OFFSET + 8]);
+    let timestamp_unix = u64::from_be_bytes(field);
+    field.copy_from_slice(&head[WIRE_EPOCH_OFFSET..WIRE_EPOCH_OFFSET + 8]);
+    let epoch = u64::from_be_bytes(field);
+    let mut count_field = [0u8; 4];
+    count_field.copy_from_slice(&head[WIRE_COUNTS_OFFSET..WIRE_COUNTS_OFFSET + 4]);
+    let v4_host_count = u32::from_be_bytes(count_field) as usize;
+    count_field.copy_from_slice(&head[WIRE_COUNTS_OFFSET + 4..WIRE_COUNTS_OFFSET + 8]);
+    let v6_host_count = u32::from_be_bytes(count_field) as usize;
+    count_field.copy_from_slice(&head[WIRE_COUNTS_OFFSET + 8..WIRE_COUNTS_OFFSET + 12]);
+    let v4_srflx_count = u32::from_be_bytes(count_field) as usize;
+    count_field.copy_from_slice(&head[WIRE_COUNTS_OFFSET + 12..WIRE_COUNTS_OFFSET + 16]);
+    let v6_srflx_count = u32::from_be_bytes(count_field) as usize;
     let total_count = v4_host_count
         .checked_add(v6_host_count)
         .and_then(|s| s.checked_add(v4_srflx_count))
@@ -831,32 +834,91 @@ pub fn deserialise_bundle(bytes: &[u8]) -> Result<GossipBundle, GossipError> {
     let mut cursor = WIRE_CANDIDATES_OFFSET;
     let mut v4_host = Vec::with_capacity(v4_host_count);
     for _ in 0..v4_host_count {
-        let ip = read_v4_lane_octets(&bytes[cursor..cursor + 16])?;
+        let Some(octets) = bytes.get(cursor..cursor + 16) else {
+            // Unreachable: `needed == bytes.len()` is enforced above and the
+            // cursor advances in WIRE_CANDIDATE_STRIDE steps over exactly
+            // total_count lanes, so cursor + 16 <= body_end <= needed.
+            return Err(GossipError::WireTruncated {
+                needed: cursor + 16,
+                available: bytes.len(),
+            });
+        };
+        let ip = read_v4_lane_octets(octets)?;
         v4_host.push(IpAddr::V4(ip));
         cursor += WIRE_CANDIDATE_STRIDE;
     }
     let mut v6_host = Vec::with_capacity(v6_host_count);
     for _ in 0..v6_host_count {
-        let ip = read_v6_lane_octets(&bytes[cursor..cursor + 16])?;
+        let Some(octets) = bytes.get(cursor..cursor + 16) else {
+            // Unreachable: same stride bound as the v4 host loop above.
+            return Err(GossipError::WireTruncated {
+                needed: cursor + 16,
+                available: bytes.len(),
+            });
+        };
+        let ip = read_v6_lane_octets(octets)?;
         v6_host.push(IpAddr::V6(ip));
         cursor += WIRE_CANDIDATE_STRIDE;
     }
     let mut v4_srflx = Vec::with_capacity(v4_srflx_count);
     for _ in 0..v4_srflx_count {
-        let ip = read_v4_lane_octets(&bytes[cursor..cursor + 16])?;
-        let port = u16::from_be_bytes([bytes[cursor + 16], bytes[cursor + 17]]);
+        let Some(octets) = bytes.get(cursor..cursor + 16) else {
+            // Unreachable: same stride bound as the v4 host loop above.
+            return Err(GossipError::WireTruncated {
+                needed: cursor + 16,
+                available: bytes.len(),
+            });
+        };
+        let Some(port_bytes) = bytes
+            .get(cursor + 16..cursor + 18)
+            .and_then(|w| <[u8; 2]>::try_from(w).ok())
+        else {
+            // Unreachable: same stride bound — cursor + 18 <= body_end.
+            return Err(GossipError::WireTruncated {
+                needed: cursor + 18,
+                available: bytes.len(),
+            });
+        };
+        let ip = read_v4_lane_octets(octets)?;
+        let port = u16::from_be_bytes(port_bytes);
         v4_srflx.push(SocketAddr::new(IpAddr::V4(ip), port));
         cursor += WIRE_CANDIDATE_STRIDE;
     }
     let mut v6_srflx = Vec::with_capacity(v6_srflx_count);
     for _ in 0..v6_srflx_count {
-        let ip = read_v6_lane_octets(&bytes[cursor..cursor + 16])?;
-        let port = u16::from_be_bytes([bytes[cursor + 16], bytes[cursor + 17]]);
+        let Some(octets) = bytes.get(cursor..cursor + 16) else {
+            // Unreachable: same stride bound as the v4 host loop above.
+            return Err(GossipError::WireTruncated {
+                needed: cursor + 16,
+                available: bytes.len(),
+            });
+        };
+        let Some(port_bytes) = bytes
+            .get(cursor + 16..cursor + 18)
+            .and_then(|w| <[u8; 2]>::try_from(w).ok())
+        else {
+            // Unreachable: same stride bound — cursor + 18 <= body_end.
+            return Err(GossipError::WireTruncated {
+                needed: cursor + 18,
+                available: bytes.len(),
+            });
+        };
+        let ip = read_v6_lane_octets(octets)?;
+        let port = u16::from_be_bytes(port_bytes);
         v6_srflx.push(SocketAddr::new(IpAddr::V6(ip), port));
         cursor += WIRE_CANDIDATE_STRIDE;
     }
-    let mut signature_bytes = [0u8; WIRE_SIGNATURE_LEN];
-    signature_bytes.copy_from_slice(&bytes[body_end..body_end + WIRE_SIGNATURE_LEN]);
+    let Some(signature_bytes) = bytes
+        .get(body_end..body_end + WIRE_SIGNATURE_LEN)
+        .and_then(|w| <[u8; WIRE_SIGNATURE_LEN]>::try_from(w).ok())
+    else {
+        // Unreachable: `needed == bytes.len()` is enforced above and
+        // needed == body_end + WIRE_SIGNATURE_LEN.
+        return Err(GossipError::WireTruncated {
+            needed,
+            available: bytes.len(),
+        });
+    };
     let signature = Signature::from_bytes(&signature_bytes);
     Ok(GossipBundle {
         source_node_id,
@@ -878,17 +940,15 @@ pub fn deserialise_bundle(bytes: &[u8]) -> Result<GossipBundle, GossipError> {
 /// prefix shape (`::ffff:X.X.X.X`) so a malformed wire can't sneak an
 /// arbitrary v6 address into a v4 lane.
 fn read_v4_lane_octets(octets: &[u8]) -> Result<Ipv4Addr, GossipError> {
-    if octets.len() != 16 {
-        return Err(GossipError::WireMalformed("v4 lane octets wrong length"));
-    }
-    if octets[0..10] != [0u8; 10] || octets[10] != 0xff || octets[11] != 0xff {
+    // Same length condition and error as the `len() != 16` gate it replaces.
+    let lane: [u8; 16] = <[u8; 16]>::try_from(octets)
+        .map_err(|_| GossipError::WireMalformed("v4 lane octets wrong length"))?;
+    if lane[0..10] != [0u8; 10] || lane[10] != 0xff || lane[11] != 0xff {
         return Err(GossipError::WireMalformed(
             "v4 lane is not v4-mapped IPv6 prefix",
         ));
     }
-    Ok(Ipv4Addr::new(
-        octets[12], octets[13], octets[14], octets[15],
-    ))
+    Ok(Ipv4Addr::new(lane[12], lane[13], lane[14], lane[15]))
 }
 
 /// Read a v6 lane's 16-byte octets and return an [`Ipv6Addr`].
@@ -896,17 +956,15 @@ fn read_v4_lane_octets(octets: &[u8]) -> Result<Ipv4Addr, GossipError> {
 /// (`::ffff:X.X.X.X`) so a malformed wire can't sneak a v4 address
 /// into a v6 lane.
 fn read_v6_lane_octets(octets: &[u8]) -> Result<Ipv6Addr, GossipError> {
-    if octets.len() != 16 {
-        return Err(GossipError::WireMalformed("v6 lane octets wrong length"));
-    }
-    if octets[0..10] == [0u8; 10] && octets[10] == 0xff && octets[11] == 0xff {
+    // Same length condition and error as the `len() != 16` gate it replaces.
+    let lane: [u8; 16] = <[u8; 16]>::try_from(octets)
+        .map_err(|_| GossipError::WireMalformed("v6 lane octets wrong length"))?;
+    if lane[0..10] == [0u8; 10] && lane[10] == 0xff && lane[11] == 0xff {
         return Err(GossipError::WireMalformed(
             "v6 lane carries v4-mapped IPv6 prefix",
         ));
     }
-    let mut buf = [0u8; 16];
-    buf.copy_from_slice(octets);
-    Ok(Ipv6Addr::from(buf))
+    Ok(Ipv6Addr::from(lane))
 }
 
 /// Pure helper: extract every endpoint (host + srflx, v4 + v6) from a

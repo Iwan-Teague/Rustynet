@@ -1,4 +1,16 @@
 #![allow(clippy::result_large_err)]
+// AQ-08 step 3b: deny the panic-family lints in this module's non-test
+// code. The crate-wide Cargo.toml [lints] table replaces this at the end
+// of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Adversarial self-audit of the signed-membership verify funnel.
 //!
@@ -224,9 +236,14 @@ fn malleate_signature_hex(signature_hex: &str) -> Result<String, String> {
     let mut bytes = decode_hex_64(signature_hex)?;
     // S occupies bytes 32..64 (little-endian). Add the group order with carry.
     let mut carry = 0u16;
-    for i in 0..32 {
-        let sum = bytes[32 + i] as u16 + ED25519_GROUP_ORDER_LE[i] as u16 + carry;
-        bytes[32 + i] = (sum & 0xff) as u8;
+    // split_at_mut(32) on the fixed [u8; 64] buffer is in bounds by
+    // construction; s_lane is 32 bytes, so the zip covers every S byte
+    // exactly once with the 32-byte group order. Same arithmetic as the
+    // indexed loop it replaces (the final carry is dropped either way).
+    let (_, s_lane) = bytes.split_at_mut(32);
+    for (slot, order_byte) in s_lane.iter_mut().zip(ED25519_GROUP_ORDER_LE.iter()) {
+        let sum = *slot as u16 + *order_byte as u16 + carry;
+        *slot = (sum & 0xff) as u8;
         carry = sum >> 8;
     }
     Ok(hex_lower(&bytes))
@@ -240,9 +257,13 @@ fn decode_hex_64(value: &str) -> Result<[u8; 64], String> {
         ));
     }
     let mut out = [0u8; 64];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let hi = value.as_bytes()[i * 2];
-        let lo = value.as_bytes()[i * 2 + 1];
+    // The `len() != 128` gate above makes chunks_exact(2) yield exactly 64
+    // complete pairs, so the zip covers every slot.
+    for (slot, pair) in out.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+        let &[hi, lo] = pair else {
+            // Unreachable: chunks_exact(2) yields only complete pairs.
+            continue;
+        };
         *slot = (hex_nibble(hi)? << 4) | hex_nibble(lo)?;
     }
     Ok(out)
@@ -275,7 +296,13 @@ fn adversarial_corpus() -> Result<Vec<SignatureAuditCase>, String> {
     {
         let (_state, record) = valid_record("update-forged-sig")?;
         let mut signatures = quorum_signatures(&record)?;
-        let sig = &mut signatures[0].signature_hex;
+        // quorum_signatures() always returns a non-empty list — it constructs
+        // the owner and guardian signatures unconditionally — so first_mut()
+        // is always Some here; the else arm is unreachable.
+        let Some(sig) = signatures.first_mut() else {
+            return Err("adversarial corpus case has no signatures".to_owned());
+        };
+        let sig = &mut sig.signature_hex;
         let flipped = if sig.starts_with('f') { "0" } else { "f" };
         sig.replace_range(0..1, flipped);
         cases.push(SignatureAuditCase {
@@ -297,7 +324,13 @@ fn adversarial_corpus() -> Result<Vec<SignatureAuditCase>, String> {
     {
         let (_state, record) = valid_record("update-malleable-s")?;
         let mut signatures = quorum_signatures(&record)?;
-        signatures[0].signature_hex = malleate_signature_hex(&signatures[0].signature_hex)?;
+        // quorum_signatures() always returns a non-empty list — it constructs
+        // the owner and guardian signatures unconditionally — so first_mut()
+        // is always Some here; the else arm is unreachable.
+        let Some(sig) = signatures.first_mut() else {
+            return Err("adversarial corpus case has no signatures".to_owned());
+        };
+        sig.signature_hex = malleate_signature_hex(&sig.signature_hex)?;
         cases.push(SignatureAuditCase {
             id: "malleable_s_signature",
             path: CasePath::Apply,
@@ -483,6 +516,11 @@ fn adversarial_corpus() -> Result<Vec<SignatureAuditCase>, String> {
 fn evaluate_case(case: &SignatureAuditCase) -> SignatureAuditCaseResult {
     let (rejected, reason) = match case.path {
         CasePath::Apply => {
+            // Invariant by construction: adversarial_corpus() builds every
+            // CasePath::Apply case with signed_update = Some(..), so this
+            // cannot be None for any corpus this function receives
+            // (AQ-08 step 3b).
+            #[allow(clippy::expect_used)]
             let signed = case
                 .signed_update
                 .as_ref()
@@ -498,6 +536,11 @@ fn evaluate_case(case: &SignatureAuditCase) -> SignatureAuditCaseResult {
             }
         }
         CasePath::Decode => {
+            // Invariant by construction: adversarial_corpus() builds every
+            // CasePath::Decode case with raw_payload = Some(..), so this
+            // cannot be None for any corpus this function receives
+            // (AQ-08 step 3b).
+            #[allow(clippy::expect_used)]
             let raw = case
                 .raw_payload
                 .as_ref()
