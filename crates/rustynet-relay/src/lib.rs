@@ -17,8 +17,10 @@ pub use blind_relay_listener::{
 pub use rate_limit::RateLimiter;
 pub use session::{RelaySession, SessionId};
 pub use transport::{
-    RejectReason, RelayForwardError, RelayForwardTarget, RelayHello, RelayHelloAck,
-    RelayHelloResponse, RelayTransport,
+    AddressValidationArtifact, RELAY_ADDR_VALIDATION_DOMAIN, RELAY_HELLO_ARTIFACT_FIELD_TYPE,
+    RELAY_HELLO_CHALLENGE_MSG_TYPE, RejectReason, RelayForwardError, RelayForwardTarget,
+    RelayHello, RelayHelloAck, RelayHelloResponse, RelayTransport,
+    serialize_relay_hello_artifact_field, serialize_relay_hello_challenge,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

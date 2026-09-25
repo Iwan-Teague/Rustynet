@@ -137,11 +137,18 @@ pub const WITNESS_SLICES: &[(&str, &[WitnessSliceEntry])] = &[
     ),
     (
         "rustynet-relay",
-        &[(
-            "crates/rustynet-relay/src/blind_relay_listener.rs",
-            "blind_relay_listener::tests",
-            "address_validation_key_ring_debug_redacts_hmac_keys",
-        )],
+        &[
+            (
+                "crates/rustynet-relay/src/blind_relay_listener.rs",
+                "blind_relay_listener::tests",
+                "address_validation_key_ring_debug_redacts_hmac_keys",
+            ),
+            (
+                "crates/rustynet-relay/src/transport.rs",
+                "transport::tests",
+                "address_validation_artifact_debug_redacts_tag_bytes",
+            ),
+        ],
     ),
     (
         "rustynet-backend-wireguard",

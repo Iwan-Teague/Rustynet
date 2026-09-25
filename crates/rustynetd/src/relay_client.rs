@@ -34,7 +34,11 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rustynet_backend_api::{NodeId, SocketEndpoint};
 pub use rustynet_control::MAX_RELAY_SESSION_TOKEN_TTL_SECS;
 use rustynet_control::{RELAY_TOKEN_SCOPE, RelaySessionToken, parse_relay_session_token_wire};
-use rustynet_relay::{RelayHello, RelayHelloAck, SessionId};
+use rustynet_relay::transport::RELAY_HELLO_CHALLENGE_MSG_TYPE;
+use rustynet_relay::{
+    AddressValidationArtifact, RelayHello, RelayHelloAck, SessionId,
+    serialize_relay_hello_artifact_field,
+};
 
 const RELAY_SESSION_TOKEN_CLIENT_CLOCK_SKEW_SECS: u64 = 90;
 const PREISSUED_RELAY_TOKEN_MAX_BYTES: u64 = 4096;
@@ -541,15 +545,41 @@ impl RelayClient {
         }
 
         // Build hello message
-        let hello = RelayHello {
+        let mut hello = RelayHello {
             node_id: self.node_id.as_str().to_owned(),
             peer_node_id: peer_node_id.as_str().to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let hello_bytes = serialize_relay_hello(&hello);
         let (response, from_addr) =
             round_trip(relay_addr, &hello_bytes, self.config.session_timeout)?;
+        // OI-10 challenge-retry: a DEFAULT-ON relay answers a first-contact
+        // hello with `[0x06] ++ artifact[32]`. Recognize it (only from the
+        // relay's own address), attach the artifact, and retry ONCE through
+        // the same closure — the authoritative transport keeps one stable
+        // source socket, so the artifact (bound to the full source address)
+        // verifies on the retry. A second challenge after the retry falls
+        // through to `parse_relay_hello_ack` and fails as an unknown
+        // response, so a hostile peer cannot keep us in a loop.
+        let (response, from_addr) =
+            if response.len() == 33 && response[0] == RELAY_HELLO_CHALLENGE_MSG_TYPE {
+                if from_addr != relay_addr {
+                    return Err(RelayClientError::InvalidResponse(format!(
+                        "unexpected relay response source {from_addr}"
+                    )));
+                }
+                let artifact_bytes: [u8; 32] = response[1..].try_into().map_err(|_| {
+                    RelayClientError::InvalidResponse("malformed challenge payload".to_owned())
+                })?;
+                hello.addr_validation_artifact =
+                    Some(AddressValidationArtifact::from_bytes(artifact_bytes));
+                let retry_bytes = serialize_relay_hello(&hello);
+                round_trip(relay_addr, &retry_bytes, self.config.session_timeout)?
+            } else {
+                (response, from_addr)
+            };
         if from_addr != relay_addr {
             return Err(RelayClientError::InvalidResponse(format!(
                 "unexpected relay response source {from_addr}"
@@ -954,6 +984,13 @@ fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
     buf.extend_from_slice(&(token_bytes.len() as u16).to_be_bytes());
     buf.extend_from_slice(&token_bytes);
 
+    // OI-10: optional trailing address-validation artifact field
+    // (`[0x07] ++ artifact[32]`), appended unprefixed after the token —
+    // exactly the trailing form `parse_relay_hello` accepts.
+    if let Some(artifact) = &hello.addr_validation_artifact {
+        buf.extend_from_slice(&serialize_relay_hello_artifact_field(artifact));
+    }
+
     buf
 }
 
@@ -1117,6 +1154,7 @@ mod tests {
             node_id: "node-a".to_owned(),
             peer_node_id: "node-b".to_owned(),
             session_token: token,
+            addr_validation_artifact: None,
         };
 
         let bytes = serialize_relay_hello(&hello);
@@ -2605,5 +2643,118 @@ mod tests {
         assert_eq!(client.active_session_count(), 1);
         assert!(!client.has_session(&peer_1));
         assert!(client.has_session(&peer_2));
+    }
+    // ── OI-10: challenge-retry + artifact wire framing ──────────────────────
+
+    #[test]
+    fn relay_client_hello_serialization_carries_artifact_field_that_parses() {
+        use rustynet_relay::AddressValidationArtifact;
+        use rustynet_relay::transport::parse_relay_hello;
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let token = RelaySessionToken::sign(&signing_key, "node-a", "node-b", [0xAA; 16], 60);
+        let hello = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: token,
+            addr_validation_artifact: Some(AddressValidationArtifact::from_bytes([0xA1u8; 32])),
+        };
+
+        let bytes = serialize_relay_hello(&hello);
+        let parsed = parse_relay_hello(&bytes).expect("artifact-carrying hello must round-trip");
+        assert_eq!(
+            parsed.addr_validation_artifact.map(|a| *a.as_bytes()),
+            Some([0xA1u8; 32]),
+            "the artifact must survive client serialization + relay parse byte-exact"
+        );
+    }
+
+    #[test]
+    fn relay_client_retries_once_with_artifact_after_challenge() {
+        use rustynet_relay::RELAY_HELLO_CHALLENGE_MSG_TYPE;
+
+        let signing_key = Arc::new(SigningKey::from_bytes(&[12u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let allocated_port: u16 = 5020;
+        let session_id = [0x77; 16];
+
+        let mut calls = 0usize;
+        let mut second_payload_had_artifact = false;
+        let endpoint = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                |_target, payload, _timeout| {
+                    calls += 1;
+                    if calls == 1 {
+                        assert!(
+                            payload.len() > 3,
+                            "first hello must be a well-formed artifact-less hello"
+                        );
+                        let mut challenge = vec![RELAY_HELLO_CHALLENGE_MSG_TYPE];
+                        challenge.extend_from_slice(&[0x5Au8; 32]);
+                        return Ok((challenge, relay_addr));
+                    }
+                    // Retry: last 33 bytes must be the artifact field
+                    // `[0x07] ++ artifact[32]`.
+                    second_payload_had_artifact = payload.len() > 33
+                        && payload[payload.len() - 33]
+                            == rustynet_relay::RELAY_HELLO_ARTIFACT_FIELD_TYPE;
+                    let mut ack = vec![RELAY_HELLO_ACK_MSG_TYPE];
+                    ack.extend_from_slice(&session_id);
+                    ack.extend_from_slice(&allocated_port.to_be_bytes());
+                    Ok((ack, relay_addr))
+                },
+            )
+            .expect("challenge-retry establish should succeed");
+
+        assert_eq!(calls, 2, "exactly one challenge + one retry");
+        assert!(
+            second_payload_had_artifact,
+            "retry must append the artifact field"
+        );
+        assert_eq!(endpoint.port, allocated_port);
+        assert!(client.has_session(&peer_id));
+    }
+
+    #[test]
+    fn relay_client_rejects_challenge_from_wrong_source() {
+        use rustynet_relay::RELAY_HELLO_CHALLENGE_MSG_TYPE;
+
+        let signing_key = Arc::new(SigningKey::from_bytes(&[13u8; 32]));
+        let mut client = RelayClient::new(
+            test_node_id("node-a"),
+            signing_key,
+            RelayClientConfig::default(),
+        );
+        let peer_id = test_node_id("peer-b");
+        let relay_addr: SocketAddr = "192.168.1.1:4500".parse().unwrap();
+        let impostor: SocketAddr = "192.168.1.1:9999".parse().unwrap();
+
+        let err = client
+            .establish_session_with_round_trip(
+                &peer_id,
+                relay_addr,
+                [0xAA; 16],
+                60,
+                |_target, _payload, _timeout| {
+                    let mut challenge = vec![RELAY_HELLO_CHALLENGE_MSG_TYPE];
+                    challenge.extend_from_slice(&[0x5Au8; 32]);
+                    Ok((challenge, impostor))
+                },
+            )
+            .expect_err("a challenge from a non-relay source must fail closed");
+        assert!(
+            matches!(err, RelayClientError::InvalidResponse(_)),
+            "wrong-source challenge must be InvalidResponse: {err:?}"
+        );
     }
 }

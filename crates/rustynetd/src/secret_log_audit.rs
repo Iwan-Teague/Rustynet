@@ -525,6 +525,12 @@ const REVIEWED_REDACTING_DEBUG_IMPLS: &[(&str, &str, &str, &str)] = &[
         "address_validation_key_ring_debug_redacts_hmac_keys",
     ),
     (
+        "AddressValidationArtifact",
+        "crates/rustynet-relay/src/transport.rs",
+        "Debug prints only 'AddressValidationArtifact(REDACTED [32 bytes])'; the HMAC tag bytes are never emitted (decl :224, impl :236)",
+        "address_validation_artifact_debug_redacts_tag_bytes",
+    ),
+    (
         "WindowsWireguardBackend",
         "crates/rustynet-backend-wireguard/src/windows_command.rs",
         "Debug redacts the in-memory decrypted WireGuard runtime_private_key and the runner; paths, port, peers/routes counts and context are non-secret (decl windows_command.rs:27, impl :51)",
