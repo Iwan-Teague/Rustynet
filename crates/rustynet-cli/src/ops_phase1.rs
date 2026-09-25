@@ -1338,14 +1338,190 @@ fn unsafe_scan_path_is_allowlisted(repo_relative: &str) -> bool {
 /// SAFETY justifications are the tree's real style; all 123 audited
 /// sites satisfy this). Any non-comment line — blank line or code —
 /// between the block and the site breaks adjacency (fail closed).
+/// Adjacency is judged on the line text with string and char literal
+/// contents stripped (AQ-248/D1): a `// SAFETY:` inside a literal is
+/// data, not a comment, and never counts.
+/// True when `line` at `r` opens a raw string literal (`r"`, `r#"`,
+/// `r##"`...). The `r` must start a token: not preceded by an
+/// identifier character, except the byte/C-string prefixes `br` and
+/// `cr` whose own preceding character must also be a token boundary.
+fn is_raw_string_open(chars: &[char], r: usize) -> bool {
+    if r > 0 {
+        let prev = chars[r - 1];
+        let in_identifier = prev.is_ascii_alphanumeric() || prev == '_';
+        let prefix = (prev == 'b' || prev == 'c')
+            && (r < 2 || !(chars[r - 2].is_ascii_alphanumeric() || chars[r - 2] == '_'));
+        if in_identifier && !prefix {
+            return false;
+        }
+    }
+    match chars.get(r + 1) {
+        Some('"') => true,
+        Some('#') => {
+            let mut probe = r + 1;
+            while chars.get(probe) == Some(&'#') {
+                probe += 1;
+            }
+            probe > r + 1 && chars.get(probe) == Some(&'"')
+        }
+        _ => false,
+    }
+}
+
+/// True when the `'` at `quote` opens a char literal: either the escape
+/// form `'\n'`, `'\u{...}'` (a closing quote exists before end of
+/// line, backslash pairs skipped) or the plain one-char form `'x'`.
+/// Lifetime apostrophes (`'a`, `'static`) have no same-line closing
+/// quote after one character and are not char literals.
+fn is_char_literal_open(chars: &[char], quote: usize) -> bool {
+    match chars.get(quote + 1) {
+        Some('\\') => {
+            let mut probe = quote + 2;
+            while probe < chars.len() {
+                if chars[probe] == '\\' {
+                    probe += 2;
+                    continue;
+                }
+                if chars[probe] == '\'' {
+                    return true;
+                }
+                probe += 1;
+            }
+            false
+        }
+        Some(_) => chars.get(quote + 2) == Some(&'\''),
+        None => false,
+    }
+}
+
+/// Blank out the contents of string and char literals so a `// SAFETY:`
+/// forged inside a literal cannot satisfy the adjacency check
+/// (AQ-248/D1): literal contents are data, not comments. Literal state
+/// carries across lines — normal `"..."` strings and `'...'` char
+/// literals honor `\` escapes, raw strings `r".."` / `r#".."#` (any
+/// hash count, including the `br`/`cr` prefixed forms) honor none and
+/// may span lines. Quotes delimiting a literal are kept and `//` line
+/// comments are copied verbatim from the `//` on, so comment prose can
+/// neither open nor close literal state. Block comments are not
+/// tracked: `/* // SAFETY: */` is a real comment, so leaving it intact
+/// cannot forge acceptance. A line that cannot be fully scanned (one
+/// ending mid-escape) degrades to more blanking, never to less.
+fn strip_string_and_char_literal_contents(lines: &[&str]) -> Vec<String> {
+    let mut stripped_lines = Vec::with_capacity(lines.len());
+    let mut in_string = false;
+    let mut in_raw_string: Option<usize> = None;
+    for line in lines {
+        let chars: Vec<char> = line.chars().collect();
+        let mut stripped = String::with_capacity(line.len());
+        let mut in_char = false;
+        let mut index = 0;
+        while index < chars.len() {
+            if in_string {
+                match chars[index] {
+                    '"' => {
+                        in_string = false;
+                        stripped.push('"');
+                    }
+                    '\\' => {
+                        stripped.push(' ');
+                        if index + 1 < chars.len() {
+                            stripped.push(' ');
+                            index += 1;
+                        }
+                    }
+                    _ => stripped.push(' '),
+                }
+                index += 1;
+                continue;
+            }
+            if let Some(hashes) = in_raw_string {
+                if chars[index] == '"' {
+                    let mut seen = 0;
+                    while seen < hashes && chars.get(index + 1 + seen) == Some(&'#') {
+                        seen += 1;
+                    }
+                    if seen == hashes {
+                        in_raw_string = None;
+                        stripped.push('"');
+                        for _ in 0..hashes {
+                            stripped.push('#');
+                        }
+                        index += 1 + hashes;
+                    } else {
+                        stripped.push(' ');
+                        index += 1;
+                    }
+                } else {
+                    stripped.push(' ');
+                    index += 1;
+                }
+                continue;
+            }
+            if in_char {
+                match chars[index] {
+                    '\'' => {
+                        in_char = false;
+                        stripped.push('\'');
+                    }
+                    '\\' => {
+                        stripped.push(' ');
+                        if index + 1 < chars.len() {
+                            stripped.push(' ');
+                            index += 1;
+                        }
+                    }
+                    _ => stripped.push(' '),
+                }
+                index += 1;
+                continue;
+            }
+            if chars[index] == '/' && chars.get(index + 1) == Some(&'/') {
+                stripped.extend(chars[index..].iter());
+                break;
+            }
+            match chars[index] {
+                '"' => {
+                    in_string = true;
+                    stripped.push('"');
+                }
+                '\'' if is_char_literal_open(&chars, index) => {
+                    in_char = true;
+                    stripped.push('\'');
+                }
+                'r' if is_raw_string_open(&chars, index) => {
+                    let mut hashes = 0;
+                    let mut probe = index + 1;
+                    while chars.get(probe) == Some(&'#') {
+                        hashes += 1;
+                        probe += 1;
+                    }
+                    in_raw_string = Some(hashes);
+                    stripped.push('r');
+                    for _ in 0..hashes {
+                        stripped.push('#');
+                    }
+                    stripped.push('"');
+                    index = probe + 1;
+                    continue;
+                }
+                other => stripped.push(other),
+            }
+            index += 1;
+        }
+        stripped_lines.push(stripped);
+    }
+    stripped_lines
+}
+
 fn unsafe_site_has_adjacent_safety_comment(lines: &[&str], site_index: usize) -> bool {
-    if lines[site_index].contains("// SAFETY:") {
+    let stripped = strip_string_and_char_literal_contents(lines);
+    if stripped[site_index].contains("// SAFETY:") {
         return true;
     }
     let mut index = site_index;
     while index > 0 {
         index -= 1;
-        match lines[index].trim_start().strip_prefix("//") {
+        match stripped[index].trim_start().strip_prefix("//") {
             Some(comment) => {
                 if comment.contains("SAFETY:") {
                     return true;
@@ -3227,6 +3403,101 @@ mod tests {
             "}",
         ];
         assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_in_same_line_string_literal_fails() {
+        // AQ-248/D1 witness M1: a string literal on the unsafe line
+        // containing "// SAFETY:" is data, not a comment, and must not
+        // satisfy the adjacency check.
+        let lines = vec![
+            "fn f() {",
+            "    let _p = unsafe { std::ptr::null_mut::<u8>() }; let _fake = \"// SAFETY: forged inside a string literal\";",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_in_raw_string_fails() {
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = r\"// SAFETY: forged in a raw string\"; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_in_raw_hash_string_fails() {
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = r#\"// SAFETY: forged, with \"quotes\" inside\"#; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_behind_escaped_quote_fails() {
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = \"escaped \\\"// SAFETY:\\\" quote\"; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_forged_inside_multiline_string_fails() {
+        // The literal spans lines: the forged text sits on its own line
+        // ABOVE the site, so the preceding-line branch must not read it
+        // as a comment either.
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = \"first line",
+            "// SAFETY: forged inside a multi-line string literal",
+            "\"; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_real_same_line_comment_after_string_still_counts() {
+        let lines = vec![
+            "fn f() {",
+            "    let _msg = \"not a safety comment\"; let _p = unsafe { std::ptr::null_mut::<u8>() }; // SAFETY: witness pointer is never dereferenced",
+            "}",
+        ];
+        assert!(unsafe_site_has_adjacent_safety_comment(&lines, 1));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_apostrophes_do_not_disguise_comment_state() {
+        // Lifetime apostrophes in code and apostrophes inside comments
+        // must not put the scanner into char-literal state and blank
+        // out a genuine SAFETY comment.
+        let lines = vec![
+            "fn f<'a, T: 'static>(x: &'a T) -> &'a T where T: Copy { x }",
+            "    // don't drop this; it's the invariant.",
+            "    // SAFETY: witness pointer is never dereferenced",
+            "    let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(unsafe_site_has_adjacent_safety_comment(&lines, 3));
+    }
+
+    #[test]
+    fn safety_comment_adjacency_raw_byte_string_forge_fails() {
+        // br#".."# must be seen as a raw string, not b + a normal
+        // string, or the desync leaves forged text scanned as code.
+        let lines = vec![
+            "fn f() {",
+            "    let _fake = br#\"a\"// SAFETY: forged\"#; let _p = unsafe { std::ptr::null_mut::<u8>() };",
+            "}",
+        ];
+        assert!(!unsafe_site_has_adjacent_safety_comment(&lines, 1));
     }
 
     fn write_synthetic_workspace_manifest(manifest: &str) -> PathBuf {
