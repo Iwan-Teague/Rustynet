@@ -12,6 +12,7 @@
 )]
 
 pub mod admin;
+pub mod atrest;
 pub mod blind_relay;
 pub mod credential_unwrap;
 pub mod enrollment;
