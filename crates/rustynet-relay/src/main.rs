@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 2: test code is exempt from the panic-family lints (deny via
+// [lints] in Cargo.toml); non-test code must propagate errors instead.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 //! Rustynet Relay Daemon
 //!
@@ -195,7 +206,7 @@ mod daemon {
     impl Default for RelayConfig {
         fn default() -> Self {
             Self {
-                bind_addr: "0.0.0.0:4500".parse().unwrap(),
+                bind_addr: SocketAddr::from(([0, 0, 0, 0], 4500)),
                 relay_id: [0; 16],
                 verifier_key_path: String::new(),
                 replay_store_path: String::new(),
@@ -827,7 +838,9 @@ mod daemon {
                     recv_result = self.control_socket.recv_from(&mut buf) => {
                         match recv_result {
                             Ok((len, from_addr)) => {
-                                if let Err(e) = self.handle_control_packet(&buf[..len], from_addr).await {
+                                if let Err(e) =
+                    self.handle_control_packet(buf.get(..len).unwrap_or(&[]), from_addr).await
+                {
                                     log_control_packet_error(
                                         &self.pre_auth_notice_budget,
                                         &self.pre_auth_stats,
@@ -881,8 +894,8 @@ mod daemon {
                 return self.handle_blind_relay_v2_frame(data, from_addr).await;
             }
 
-            match data[0] {
-                RELAY_HELLO_MSG_TYPE => {
+            match data.first().copied() {
+                Some(RELAY_HELLO_MSG_TYPE) => {
                     if !self
                         .pre_auth_hello_limiter
                         .write()
@@ -901,7 +914,10 @@ mod daemon {
                     }
                     self.handle_hello(data, from_addr).await
                 }
-                _ => Err(format!("unknown message type: {:#04x}", data[0])),
+                other => Err(format!(
+                    "unknown message type: {:#04x}",
+                    other.unwrap_or_default()
+                )),
             }
         }
 
@@ -939,7 +955,12 @@ mod daemon {
                     // Closed listener: answer exactly as the legacy
                     // unknown-message-type path would for this datagram —
                     // no new pre-auth surface while dormant.
-                    None => return Err(format!("unknown message type: {:#04x}", data[0])),
+                    None => {
+                        return Err(format!(
+                            "unknown message type: {:#04x}",
+                            data.first().copied().unwrap_or_default()
+                        ));
+                    }
                 };
 
                 // Parse once for the O2 reply inputs. A malformed datagram
@@ -1215,7 +1236,7 @@ mod daemon {
                     // Forward packet through transport
                     let forward_result = {
                         let mut t = lock_transport(&transport);
-                        t.forward_packet(session_id, &buf[..len], from_addr)
+                        t.forward_packet(session_id, buf.get(..len).unwrap_or(&[]), from_addr)
                     };
 
                     match forward_result {
@@ -1226,7 +1247,9 @@ mod daemon {
                                 // Zero-copy forward: send the exact
                                 // received bytes (the transport never
                                 // copies or inspects the payload).
-                                let sent = peer_socket.send_to(&buf[..len], target.peer_addr).await;
+                                let sent = peer_socket
+                                    .send_to(buf.get(..len).unwrap_or(&[]), target.peer_addr)
+                                    .await;
                                 if sent.is_ok() {
                                     record_forward(&forward_stats, len);
                                 }
@@ -1732,7 +1755,10 @@ mod daemon {
                         return;
                     }
                 };
-                let path = http_request_path(&request[..read]).unwrap_or("/");
+                let path = request
+                    .get(..read)
+                    .and_then(|req| http_request_path(req))
+                    .unwrap_or("/");
                 // Each field computed in its own statement, not inline in
                 // the struct literal: a `std::sync::MutexGuard` temporary
                 // inside an aggregate expression lives until the end of the
@@ -1837,7 +1863,7 @@ mod daemon {
             return Ok(None);
         }
         let mut fail_on_drift = true;
-        for flag in &args[2..] {
+        for flag in args.iter().skip(2) {
             match flag.as_str() {
                 "--no-fail-on-drift" => fail_on_drift = false,
                 _ => {
@@ -1862,7 +1888,7 @@ mod daemon {
         if command != "hello-limiter-audit" {
             return Ok(None);
         }
-        for flag in &args[2..] {
+        for flag in args.iter().skip(2) {
             match flag.as_str() {
                 "--no-fail-on-drift" => {}
                 _ => {
@@ -1901,8 +1927,8 @@ mod daemon {
         let mut env_file: Option<PathBuf> = None;
         let mut index = 0usize;
 
-        while index < args.len() {
-            match args[index].as_str() {
+        while let Some(arg) = args.get(index) {
+            match arg.as_str() {
                 "--windows-service" => {
                     windows_service = true;
                     index += 1;
@@ -1922,7 +1948,7 @@ mod daemon {
                     index += 2;
                 }
                 _ => {
-                    relay_args.push(args[index].clone());
+                    relay_args.push(arg.clone());
                     index += 1;
                 }
             }
@@ -2068,8 +2094,8 @@ mod daemon {
     fn validate_windows_relay_service_runtime_arg_shape(args: &[String]) -> Result<(), String> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
         let mut index = 0usize;
-        while index < args.len() {
-            let flag = args[index].as_str();
+        while let Some(arg) = args.get(index) {
+            let flag = arg.as_str();
             if flag == "--help" || flag == "-h" {
                 return Err(
                     "Windows relay service runtime args must not include --help/-h".to_owned(),
@@ -2105,14 +2131,15 @@ mod daemon {
             }
         }
 
-        let relay_id = extract_unique_relay_arg_value(args, "--relay-id")?
-            .expect("required relay id count checked above");
+        let relay_id = extract_unique_relay_arg_value(args, "--relay-id")?.ok_or_else(|| {
+            "Windows relay service runtime args must include --relay-id exactly once".to_owned()
+        })?;
         parse_relay_id_arg(relay_id)?;
 
         let bind_addr = extract_unique_relay_arg_value(args, "--bind")?
             .map(parse_socket_addr_for_windows_relay_service)
             .transpose()?
-            .unwrap_or_else(|| "0.0.0.0:4500".parse().expect("default bind must parse"));
+            .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 4500)));
         if bind_addr.port() == 0 {
             return Err("Windows relay service --bind port must not be 0".to_owned());
         }
@@ -2201,8 +2228,8 @@ mod daemon {
     ) -> Result<Option<&'a str>, String> {
         let mut found = None;
         let mut index = 0usize;
-        while index < args.len() {
-            if args[index] == flag {
+        while let Some(arg) = args.get(index) {
+            if arg.as_str() == flag {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| format!("{flag} requires a value"))?;
@@ -2552,7 +2579,11 @@ mod daemon {
                 snapshot.binary_image_path
             ));
         } else {
-            let exe_path = &snapshot.binary_image_argv[0];
+            let exe_path = snapshot
+                .binary_image_argv
+                .first()
+                .map(String::as_str)
+                .unwrap_or_default();
             let lowered = exe_path.to_ascii_lowercase().replace('/', "\\");
             let install_root_lower = DEFAULT_WINDOWS_INSTALL_ROOT.to_ascii_lowercase();
             if !lowered.starts_with(&format!("{install_root_lower}\\")) {
@@ -2569,7 +2600,7 @@ mod daemon {
                 ));
             }
 
-            let argv_tail = &snapshot.binary_image_argv[1..];
+            let argv_tail = snapshot.binary_image_argv.get(1..).unwrap_or(&[]);
             if !argv_tail.iter().any(|arg| arg == "--windows-service") {
                 reasons.push(
                     "Windows relay service argv must include --windows-service so the SCM host path is taken".to_owned(),
@@ -2720,8 +2751,10 @@ mod daemon {
     fn windows_relay_service_flag_values<'a>(argv_tail: &'a [String], flag: &str) -> Vec<&'a str> {
         argv_tail
             .windows(2)
-            .filter(|&pair| pair[0] == flag)
-            .map(|pair| pair[1].as_str())
+            .filter_map(|pair| match pair {
+                [leader, value] if leader == flag => Some(value.as_str()),
+                _ => None,
+            })
             .collect()
     }
 
@@ -2787,7 +2820,10 @@ mod daemon {
     fn looks_like_windows_absolute_path(text: &str) -> bool {
         let candidate = text.strip_prefix(r"\\?\").unwrap_or(text);
         let bytes = candidate.as_bytes();
-        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'\\'
+        matches!(
+            bytes,
+            [first, b':', third, ..] if first.is_ascii_alphabetic() && *third == b'\\'
+        )
     }
 
     fn is_linux_runtime_root_text(text: &str) -> bool {
@@ -2807,79 +2843,80 @@ mod daemon {
         let mut config = RelayConfig::default();
 
         let mut i = 1;
-        while i < args.len() {
-            match args[i].as_str() {
+        while let Some(flag) = args.get(i) {
+            match flag.as_str() {
                 "--bind" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--bind requires an argument".to_owned());
-                    }
-                    config.bind_addr = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--bind requires an argument".to_owned())?;
+                    config.bind_addr = value
                         .parse()
                         .map_err(|e| format!("invalid bind address: {e}"))?;
                 }
                 "--relay-id" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--relay-id requires an argument".to_owned());
-                    }
-                    config.relay_id = parse_relay_id_arg(&args[i])?;
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--relay-id requires an argument".to_owned())?;
+                    config.relay_id = parse_relay_id_arg(value)?;
                 }
                 "--verifier-key" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--verifier-key requires an argument".to_owned());
-                    }
-                    config.verifier_key_path = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--verifier-key requires an argument".to_owned())?;
+                    config.verifier_key_path = value.clone();
                 }
                 "--replay-store" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--replay-store requires an argument".to_owned());
-                    }
-                    config.replay_store_path = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--replay-store requires an argument".to_owned())?;
+                    config.replay_store_path = value.clone();
                 }
                 "--port-range" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--port-range requires an argument".to_owned());
-                    }
-                    let parts: Vec<&str> = args[i].split('-').collect();
-                    if parts.len() != 2 {
-                        return Err("--port-range must be START-END".to_owned());
-                    }
-                    config.port_range_start = parts[0]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--port-range requires an argument".to_owned())?;
+                    let [start_text, end_text]: [&str; 2] = value
+                        .split('-')
+                        .collect::<Vec<_>>()
+                        .try_into()
+                        .map_err(|_| "--port-range must be START-END".to_owned())?;
+                    config.port_range_start = start_text
                         .parse()
                         .map_err(|e| format!("invalid port range start: {e}"))?;
-                    config.port_range_end = parts[1]
+                    config.port_range_end = end_text
                         .parse()
                         .map_err(|e| format!("invalid port range end: {e}"))?;
                 }
                 "--max-sessions-per-node" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--max-sessions-per-node requires an argument".to_owned());
-                    }
-                    config.max_sessions_per_node = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--max-sessions-per-node requires an argument".to_owned())?;
+                    config.max_sessions_per_node = value
                         .parse()
                         .map_err(|e| format!("invalid max sessions: {e}"))?;
                 }
                 "--max-total-sessions" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--max-total-sessions requires an argument".to_owned());
-                    }
-                    config.max_total_sessions = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--max-total-sessions requires an argument".to_owned())?;
+                    config.max_total_sessions = value
                         .parse()
                         .map_err(|e| format!("invalid max total sessions: {e}"))?;
                 }
                 "--health-bind" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--health-bind requires an argument".to_owned());
-                    }
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--health-bind requires an argument".to_owned())?;
                     config.health_bind_addr = Some(
-                        args[i]
+                        value
                             .parse()
                             .map_err(|e| format!("invalid health bind address: {e}"))?,
                     );
@@ -2889,38 +2926,38 @@ mod daemon {
                 }
                 "--blind-membership-state" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-membership-state requires an argument".to_owned());
-                    }
-                    config.blind_membership_state_path = args[i].clone();
+                    let value = args.get(i).ok_or_else(|| {
+                        "--blind-membership-state requires an argument".to_owned()
+                    })?;
+                    config.blind_membership_state_path = value.clone();
                 }
                 "--blind-node-id" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-node-id requires an argument".to_owned());
-                    }
-                    config.blind_node_id = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-node-id requires an argument".to_owned())?;
+                    config.blind_node_id = value.clone();
                 }
                 "--blind-replay-store" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-replay-store requires an argument".to_owned());
-                    }
-                    config.blind_replay_store_path = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-replay-store requires an argument".to_owned())?;
+                    config.blind_replay_store_path = value.clone();
                 }
                 "--blind-issuer-key-id" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-issuer-key-id requires an argument".to_owned());
-                    }
-                    config.blind_issuer_key_id = args[i].clone();
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-issuer-key-id requires an argument".to_owned())?;
+                    config.blind_issuer_key_id = value.clone();
                 }
                 "--blind-profiles" => {
                     i += 1;
-                    if i >= args.len() {
-                        return Err("--blind-profiles requires an argument".to_owned());
-                    }
-                    let profiles: Vec<String> = args[i]
+                    let value = args
+                        .get(i)
+                        .ok_or_else(|| "--blind-profiles requires an argument".to_owned())?;
+                    let profiles: Vec<String> = value
                         .split(',')
                         .map(str::trim)
                         .filter(|profile| !profile.is_empty())

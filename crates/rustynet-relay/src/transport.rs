@@ -258,6 +258,14 @@ pub struct RelayHello {
     pub addr_validation_artifact: Option<AddressValidationArtifact>,
 }
 
+/// Reads a big-endian `u16` length prefix at `pos`, or `None` when fewer
+/// than two bytes remain (the truncation every call site rejects explicitly).
+fn read_u16_be(data: &[u8], pos: usize) -> Option<u16> {
+    let hi = *data.get(pos)?;
+    let lo = *data.get(pos.checked_add(1)?)?;
+    Some(u16::from_be_bytes([hi, lo]))
+}
+
 /// Parses a `RelayHello` from wire format.
 ///
 /// This is the attacker-reachable pre-auth parser for the relay's UDP hello
@@ -266,7 +274,7 @@ pub struct RelayHello {
 /// so the fuzz target `fuzz/fuzz_targets/relay_hello_parse.rs` can exercise
 /// it directly; the daemon dispatches through this same function.
 pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
-    if data.is_empty() || data[0] != RELAY_HELLO_MSG_TYPE {
+    if data.first().copied() != Some(RELAY_HELLO_MSG_TYPE) {
         return Err("not a hello message".to_owned());
     }
 
@@ -276,7 +284,8 @@ pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
     if pos + 2 > data.len() {
         return Err("truncated node_id length".to_owned());
     }
-    let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    let node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated node_id length".to_owned())? as usize;
     pos += 2;
 
     // Bound the identifier BEFORE it is copied (RLY-05 / AUDIT-031).
@@ -301,15 +310,18 @@ pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
     if pos + node_id_len > data.len() {
         return Err("truncated node_id".to_owned());
     }
-    let node_id =
-        String::from_utf8(data[pos..pos + node_id_len].to_vec()).map_err(|e| e.to_string())?;
+    let node_id_bytes = data
+        .get(pos..pos + node_id_len)
+        .ok_or_else(|| "truncated node_id".to_owned())?;
+    let node_id = String::from_utf8(node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
     pos += node_id_len;
 
     // Peer node ID
     if pos + 2 > data.len() {
         return Err("truncated peer_node_id length".to_owned());
     }
-    let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    let peer_node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated peer_node_id length".to_owned())? as usize;
     pos += 2;
 
     // Same bound as `node_id` above: `peer_node_id` is likewise copied out of
@@ -324,21 +336,26 @@ pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
     if pos + peer_node_id_len > data.len() {
         return Err("truncated peer_node_id".to_owned());
     }
-    let peer_node_id =
-        String::from_utf8(data[pos..pos + peer_node_id_len].to_vec()).map_err(|e| e.to_string())?;
+    let peer_node_id_bytes = data
+        .get(pos..pos + peer_node_id_len)
+        .ok_or_else(|| "truncated peer_node_id".to_owned())?;
+    let peer_node_id = String::from_utf8(peer_node_id_bytes.to_vec()).map_err(|e| e.to_string())?;
     pos += peer_node_id_len;
 
     // Token
     if pos + 2 > data.len() {
         return Err("truncated token length".to_owned());
     }
-    let token_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    let token_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated token length".to_owned())? as usize;
     pos += 2;
 
     if pos + token_len > data.len() {
         return Err("truncated token".to_owned());
     }
-    let token_data = &data[pos..pos + token_len];
+    let token_data = data
+        .get(pos..pos + token_len)
+        .ok_or_else(|| "truncated token".to_owned())?;
     let session_token = parse_relay_token(token_data)?;
     pos += token_len;
 
@@ -355,21 +372,22 @@ pub fn parse_relay_hello(data: &[u8]) -> Result<RelayHello, String> {
     // the frames that MUST fail closed.
     let addr_validation_artifact = if pos == data.len() {
         None
-    } else if data[pos] == RELAY_HELLO_ARTIFACT_FIELD_TYPE {
+    } else if data.get(pos).copied() == Some(RELAY_HELLO_ARTIFACT_FIELD_TYPE) {
         let rest = data.len() - pos;
         if rest != 1 + 32 {
             return Err(format!(
                 "relay hello artifact field must be exactly 1+32 bytes, got {rest}"
             ));
         }
-        let artifact: [u8; 32] = data[pos + 1..pos + 33]
-            .try_into()
-            .map_err(|_| "invalid artifact field")?;
+        let artifact: [u8; 32] = data
+            .get(pos + 1..pos + 33)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or("invalid artifact field")?;
         Some(AddressValidationArtifact::from_bytes(artifact))
     } else {
         return Err(format!(
             "unexpected trailing byte {:#04x} in relay hello",
-            data[pos]
+            data.get(pos).copied().unwrap_or_default()
         ));
     };
 
@@ -417,7 +435,12 @@ fn artifact_nonce_input(token_nonce: &[u8; 16]) -> [u8; 32] {
 /// Binds artifacts to the issuing relay identity so an artifact minted by
 /// relay A cannot be re-presented to relay B that shares an epoch window.
 fn relay_epoch_input(relay_id: &[u8; 16]) -> u64 {
-    u64::from_be_bytes(relay_id[..8].try_into().expect("8-byte slice is 8 bytes"))
+    // `relay_id` is always 16 bytes, so `first_chunk::<8>` is statically
+    // `Some`; the fallback arm is unreachable and fail-closed (epoch 0).
+    match relay_id.first_chunk::<8>() {
+        Some(epoch_bytes) => u64::from_be_bytes(*epoch_bytes),
+        None => 0,
+    }
 }
 
 /// Parses a `RelaySessionToken` from wire format.
@@ -432,7 +455,10 @@ pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
     if pos >= data.len() {
         return Err("missing version".to_owned());
     }
-    let version = data[pos];
+    let version = data
+        .get(pos)
+        .copied()
+        .ok_or_else(|| "missing version".to_owned())?;
     if version != 1 {
         return Err(format!("unsupported token version: {version}"));
     }
@@ -442,7 +468,8 @@ pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
     if pos + 2 > data.len() {
         return Err("truncated token node_id length".to_owned());
     }
-    let node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    let node_id_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated token node_id length".to_owned())? as usize;
     pos += 2;
 
     // Bound the token-embedded identifier BEFORE it is copied. This is the
@@ -465,7 +492,10 @@ pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
     if pos + node_id_len > data.len() {
         return Err("truncated token node_id".to_owned());
     }
-    let node_id = String::from_utf8(data[pos..pos + node_id_len].to_vec())
+    let node_id_bytes = data
+        .get(pos..pos + node_id_len)
+        .ok_or_else(|| "truncated token node_id".to_owned())?;
+    let node_id = String::from_utf8(node_id_bytes.to_vec())
         .map_err(|e| format!("invalid token node_id: {e}"))?;
     pos += node_id_len;
 
@@ -473,7 +503,9 @@ pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
     if pos + 2 > data.len() {
         return Err("truncated token peer_node_id length".to_owned());
     }
-    let peer_node_id_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    let peer_node_id_len = read_u16_be(data, pos)
+        .ok_or_else(|| "truncated token peer_node_id length".to_owned())?
+        as usize;
     pos += 2;
 
     // Same bound as the token's node_id above.
@@ -486,7 +518,10 @@ pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
     if pos + peer_node_id_len > data.len() {
         return Err("truncated token peer_node_id".to_owned());
     }
-    let peer_node_id = String::from_utf8(data[pos..pos + peer_node_id_len].to_vec())
+    let peer_node_id_bytes = data
+        .get(pos..pos + peer_node_id_len)
+        .ok_or_else(|| "truncated token peer_node_id".to_owned())?;
+    let peer_node_id = String::from_utf8(peer_node_id_bytes.to_vec())
         .map_err(|e| format!("invalid token peer_node_id: {e}"))?;
     pos += peer_node_id_len;
 
@@ -494,16 +529,18 @@ pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
     if pos + 16 > data.len() {
         return Err("truncated relay_id".to_owned());
     }
-    let relay_id: [u8; 16] = data[pos..pos + 16]
-        .try_into()
-        .map_err(|_| "invalid relay_id")?;
+    let relay_id: [u8; 16] = data
+        .get(pos..pos + 16)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated relay_id".to_owned())?;
     pos += 16;
 
     // Scope
     if pos + 2 > data.len() {
         return Err("truncated scope length".to_owned());
     }
-    let scope_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    let scope_len =
+        read_u16_be(data, pos).ok_or_else(|| "truncated scope length".to_owned())? as usize;
     pos += 2;
 
     // Scope is compared for exact equality against `RELAY_TOKEN_SCOPE`
@@ -519,35 +556,48 @@ pub fn parse_relay_token(data: &[u8]) -> Result<RelaySessionToken, String> {
     if pos + scope_len > data.len() {
         return Err("truncated scope".to_owned());
     }
-    let scope = String::from_utf8(data[pos..pos + scope_len].to_vec())
-        .map_err(|e| format!("invalid scope: {e}"))?;
+    let scope_bytes = data
+        .get(pos..pos + scope_len)
+        .ok_or_else(|| "truncated scope".to_owned())?;
+    let scope =
+        String::from_utf8(scope_bytes.to_vec()).map_err(|e| format!("invalid scope: {e}"))?;
     pos += scope_len;
 
     // Timestamps
     if pos + 16 > data.len() {
         return Err("truncated timestamps".to_owned());
     }
-    let issued_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    let issued_at_unix = u64::from_be_bytes(
+        data.get(pos..pos + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| "truncated timestamps".to_owned())?,
+    );
     pos += 8;
-    let expires_at_unix = u64::from_be_bytes(data[pos..pos + 8].try_into().unwrap());
+    let expires_at_unix = u64::from_be_bytes(
+        data.get(pos..pos + 8)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or_else(|| "truncated timestamps".to_owned())?,
+    );
     pos += 8;
 
     // Nonce (16 bytes)
     if pos + 16 > data.len() {
         return Err("truncated nonce".to_owned());
     }
-    let nonce: [u8; 16] = data[pos..pos + 16]
-        .try_into()
-        .map_err(|_| "invalid nonce")?;
+    let nonce: [u8; 16] = data
+        .get(pos..pos + 16)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated nonce".to_owned())?;
     pos += 16;
 
     // Signature (64 bytes)
     if pos + 64 > data.len() {
         return Err("truncated signature".to_owned());
     }
-    let signature: [u8; 64] = data[pos..pos + 64]
-        .try_into()
-        .map_err(|_| "invalid signature")?;
+    let signature: [u8; 64] = data
+        .get(pos..pos + 64)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| "truncated signature".to_owned())?;
 
     Ok(RelaySessionToken {
         node_id,
@@ -1190,10 +1240,13 @@ impl RelayTransport {
         }
 
         {
+            // The entry was confirmed above and nothing removes it before
+            // this point; a `None` still fails closed with the same error a
+            // missing session always gets.
             let session = self
                 .sessions
                 .get_mut(&session_id)
-                .expect("session should remain available while forwarding");
+                .ok_or(RelayForwardError::SessionNotFound)?;
             match session.bound_peer_addr {
                 Some(bound_addr) if bound_addr == from_addr => {}
                 Some(_) => return Err(RelayForwardError::UnauthorizedSourceTuple),
@@ -1223,10 +1276,9 @@ impl RelayTransport {
         // pairing, or after the partner was replaced/evicted): the
         // authoritative owned-key pair-index lookup, exactly as before.
         let cached_peer_sid = {
-            let session = self
-                .sessions
-                .get(&session_id)
-                .expect("session should remain available while forwarding");
+            let Some(session) = self.sessions.get(&session_id) else {
+                return Err(RelayForwardError::SessionNotFound);
+            };
             session.paired_session_id.filter(|sid| {
                 self.sessions
                     .get(sid)
@@ -1237,10 +1289,9 @@ impl RelayTransport {
             Some(sid) => sid,
             None => {
                 let (looked_up, current_node_id, current_peer_node_id) = {
-                    let session = self
-                        .sessions
-                        .get(&session_id)
-                        .expect("session should remain available while forwarding");
+                    let Some(session) = self.sessions.get(&session_id) else {
+                        return Err(RelayForwardError::SessionNotFound);
+                    };
                     (
                         self.node_pair_index
                             .get(&(session.peer_node_id.clone(), session.node_id.clone()))
@@ -1770,8 +1821,11 @@ fn parse_nonce_hex(value: &str) -> Result<[u8; 16], String> {
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk)
             .map_err(|err| format!("replay store nonce is not utf8: {err}"))?;
-        nonce[index] = u8::from_str_radix(text, 16)
+        let byte = u8::from_str_radix(text, 16)
             .map_err(|err| format!("replay store nonce is not hex: {err}"))?;
+        *nonce
+            .get_mut(index)
+            .ok_or_else(|| "replay store nonce must be 32 hex characters".to_owned())? = byte;
     }
     Ok(nonce)
 }

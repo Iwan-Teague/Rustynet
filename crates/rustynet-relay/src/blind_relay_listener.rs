@@ -449,8 +449,12 @@ impl AddressValidationKeyRing {
         mac.update(client_nonce);
         mac.update(&privacy_epoch.to_be_bytes());
         let full = mac.finalize().into_bytes();
-        let mut tag = [0u8; BLIND_ADDR_VALIDATION_TAG_LEN];
-        tag.copy_from_slice(&full[..BLIND_ADDR_VALIDATION_TAG_LEN]);
+        // The HMAC-SHA256 output is 32 bytes and the tag is 20, so the slice
+        // cannot be short; a `None` still fails closed on InvalidArtifact.
+        let tag: [u8; BLIND_ADDR_VALIDATION_TAG_LEN] = full
+            .get(..BLIND_ADDR_VALIDATION_TAG_LEN)
+            .and_then(|bytes| bytes.try_into().ok())
+            .ok_or(AddressArtifactError::InvalidArtifact)?;
         Ok(tag)
     }
 
@@ -664,8 +668,11 @@ fn parse_blind_replay_digest_hex(value: &str) -> Result<[u8; 32], String> {
     for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
         let text = std::str::from_utf8(chunk)
             .map_err(|err| format!("blind replay digest is not utf8: {err}"))?;
-        digest[index] = u8::from_str_radix(text, 16)
+        let byte = u8::from_str_radix(text, 16)
             .map_err(|err| format!("blind replay digest is not hex: {err}"))?;
+        *digest
+            .get_mut(index)
+            .ok_or_else(|| "blind replay digest must be 64 hex characters".to_owned())? = byte;
     }
     Ok(digest)
 }
