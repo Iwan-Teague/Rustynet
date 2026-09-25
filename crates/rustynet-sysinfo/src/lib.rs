@@ -5114,13 +5114,56 @@ fn tls_certificate_expiry_all_internal(paths: &[&str]) -> Vec<CertExpiry> {
     results
 }
 
+/// RSA-0046 script constants + builder. The `-Command` text is ALWAYS a
+/// compile-time constant; every caller-supplied value is passed through the
+/// child process environment and read inside the script as `$env:NAME`.
+///
+/// Why environment variables (the strictest of the reviewed options):
+/// the value never appears in any command text, so PowerShell's tokenizer
+/// never sees it — `'`, `;`, `` ` ``, `$()`, newlines are inert data, and
+/// there is no quoting scheme to get wrong (PowerShell escapes `'` by
+/// doubling, but any quoting scheme fails the moment a value is
+/// re-tokenized). `-Command <script> <value>` does not give the discrete
+/// binding `-File` does, `-File` would require shipping a script file next
+/// to the binary, and `-EncodedCommand` still carries the value inside
+/// script text unless the value separately flows through `$env:` — so the
+/// environment is the channel with no script-text exposure. A NUL byte in a
+/// value cannot inject anything: `std::process::Command::env` makes the
+/// spawn fail with an error, which every call site already handles like any
+/// other spawn failure. All four RSA-0046 sites (cert path, TLS target,
+/// dir-size sum/count) go through this one builder; the metacharacter
+/// battery in `mod tests` pins that no value can alter the command text.
+#[cfg(any(target_os = "windows", test))]
+const PS_SCRIPT_CERT_EXPIRY: &str = "$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($env:RUSTYNET_SYSINFO_CERT_PATH); Write-Host $cert.Subject; Write-Host $cert.NotAfter";
+#[cfg(any(target_os = "windows", test))]
+const PS_SCRIPT_TLS_CIPHER: &str = "[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; $req = [System.Net.HttpWebRequest]::Create(('https://' + $env:RUSTYNET_SYSINFO_TLS_TARGET)); $req.GetResponse() | Out-Null";
+#[cfg(any(target_os = "windows", test))]
+const PS_SCRIPT_DIR_SIZE_SUM: &str = "(Get-ChildItem -LiteralPath $env:RUSTYNET_SYSINFO_DIR_PATH -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum";
+#[cfg(any(target_os = "windows", test))]
+const PS_SCRIPT_DIR_SIZE_COUNT: &str = "(Get-ChildItem -LiteralPath $env:RUSTYNET_SYSINFO_DIR_PATH -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count";
+
+#[cfg(any(target_os = "windows", test))]
+fn powershell_constant_command(
+    script: &'static str,
+    env: &[(&'static str, &str)],
+) -> std::process::Command {
+    let mut command = std::process::Command::new("powershell");
+    command.args(["-NoProfile", "-Command", script]);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    command
+}
+
 #[cfg(target_os = "windows")]
 fn tls_certificate_expiry_all_internal(paths: &[&str]) -> Vec<CertExpiry> {
     let mut results = Vec::new();
     for path in paths {
-        if let Ok(output) = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2('{}'); Write-Host $cert.Subject; Write-Host $cert.NotAfter", path)])
-            .output()
+        if let Ok(output) = powershell_constant_command(
+            PS_SCRIPT_CERT_EXPIRY,
+            &[("RUSTYNET_SYSINFO_CERT_PATH", path)],
+        )
+        .output()
         {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 let lines: Vec<&str> = s.lines().collect();
@@ -5503,9 +5546,11 @@ fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo 
 fn tls_cipher_suite_strength_internal(host: &str, port: u16) -> CipherSuiteInfo {
     let target = format!("{}:{}", host, port);
 
-    if let Ok(output) = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &format!("[System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12; $req = [System.Net.HttpWebRequest]::Create('https://{}:{}'); $req.GetResponse() | Out-Null", host, port)])
-        .output()
+    if let Ok(output) = powershell_constant_command(
+        PS_SCRIPT_TLS_CIPHER,
+        &[("RUSTYNET_SYSINFO_TLS_TARGET", target.as_str())],
+    )
+    .output()
     {
         if output.status.success() {
             return CipherSuiteInfo {
@@ -6577,17 +6622,21 @@ fn directory_size_snapshot_internal(paths: &[&str]) -> Vec<DirSize> {
     let mut results = Vec::new();
 
     for path in paths {
-        if let Ok(output) = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &format!("(Get-ChildItem -Path '{}' -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum", path)])
-            .output()
+        if let Ok(output) = powershell_constant_command(
+            PS_SCRIPT_DIR_SIZE_SUM,
+            &[("RUSTYNET_SYSINFO_DIR_PATH", path)],
+        )
+        .output()
         {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 let size = s.trim().parse().unwrap_or(0u64);
 
                 let mut file_count = 0;
-                if let Ok(output) = std::process::Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &format!("(Get-ChildItem -Path '{}' -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count", path)])
-                    .output()
+                if let Ok(output) = powershell_constant_command(
+                    PS_SCRIPT_DIR_SIZE_COUNT,
+                    &[("RUSTYNET_SYSINFO_DIR_PATH", path)],
+                )
+                .output()
                 {
                     if let Ok(s) = String::from_utf8(output.stdout) {
                         file_count = s.trim().parse().unwrap_or(0);
@@ -8590,5 +8639,124 @@ tcp4 0 0 *.22 *.* LISTEN
         let entry = parse_arp_n_row("10.0.0.3 0x1 11:22:33:44:55:66 * brd eth0 REACHABLE")
             .expect("row without PERM must parse");
         assert!(!entry.is_permanent);
+    }
+
+    // ---- RSA-0046 (CWE-78: powershell -Command single-quote interpolation) ----
+    // The `-Command` script text must stay a compile-time constant; every
+    // caller-supplied value travels only through the child process
+    // environment and is read inside the script as `$env:NAME`. A value
+    // carrying PowerShell metacharacters (single quote, semicolon, backtick,
+    // `$(...)`) must not be able to alter the command text in any way.
+
+    const RSA0046_SITES: [(&str, &str); 4] = [
+        (super::PS_SCRIPT_CERT_EXPIRY, "RUSTYNET_SYSINFO_CERT_PATH"),
+        (super::PS_SCRIPT_TLS_CIPHER, "RUSTYNET_SYSINFO_TLS_TARGET"),
+        (super::PS_SCRIPT_DIR_SIZE_SUM, "RUSTYNET_SYSINFO_DIR_PATH"),
+        (super::PS_SCRIPT_DIR_SIZE_COUNT, "RUSTYNET_SYSINFO_DIR_PATH"),
+    ];
+
+    #[test]
+    fn powershell_constant_command_argv_is_noprofile_command_script() {
+        let (script, name) = RSA0046_SITES[0];
+        let command = super::powershell_constant_command(script, &[(name, "/tmp/ok.pem")]);
+        assert_eq!(command.get_program(), "powershell");
+        let args: Vec<String> = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                script.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn powershell_constant_command_carries_value_only_via_env() {
+        let (script, name) = RSA0046_SITES[1];
+        let command = super::powershell_constant_command(script, &[(name, "gateway.internal:443")]);
+        let envs: Vec<(String, String)> = command
+            .get_envs()
+            .filter_map(|(k, v)| {
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            envs,
+            vec![(
+                "RUSTYNET_SYSINFO_TLS_TARGET".to_string(),
+                "gateway.internal:443".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn rsa0046_metacharacter_values_cannot_alter_command_text() {
+        const EVIL: [&str; 6] = [
+            "'; Start-Process calc; '",
+            "a;b",
+            "back`tick",
+            "$(calc)",
+            "x'`$(whoami);'",
+            "path with spaces' and \"dquotes\"",
+        ];
+        for (script, name) in RSA0046_SITES {
+            for evil in EVIL {
+                let command = super::powershell_constant_command(script, &[(name, evil)]);
+                let args: Vec<String> = command
+                    .get_args()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                assert_eq!(args.first().map(String::as_str), Some("-NoProfile"));
+                assert_eq!(args.get(1).map(String::as_str), Some("-Command"));
+                assert_eq!(
+                    args.get(2).map(String::as_str),
+                    Some(script),
+                    "script text must stay byte-identical for value {evil:?}"
+                );
+                assert!(
+                    args.iter().all(|a| !a.contains(evil)),
+                    "untrusted value reached argv: {evil:?}"
+                );
+                let envs: Vec<(String, String)> = command
+                    .get_envs()
+                    .filter_map(|(k, v)| {
+                        v.map(|v| {
+                            (
+                                k.to_string_lossy().into_owned(),
+                                v.to_string_lossy().into_owned(),
+                            )
+                        })
+                    })
+                    .collect();
+                assert_eq!(envs, vec![(name.to_string(), evil.to_string())]);
+            }
+        }
+    }
+
+    #[test]
+    fn rsa0046_site_scripts_bind_values_only_through_env_variables() {
+        for (script, name) in RSA0046_SITES {
+            assert!(
+                script.contains(concat!("$env:", "RUSTYNET_SYSINFO_")),
+                "script does not read its value from the environment: {script}"
+            );
+            assert!(
+                script.contains(name),
+                "script does not read its own declared env var {name}: {script}"
+            );
+            assert!(
+                !script.contains("'{"),
+                "single-quote interpolation channel present: {script}"
+            );
+        }
     }
 }

@@ -395,7 +395,7 @@ const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     // rustynet-relay
     "AddressValidationKeyRing", // crates/rustynet-relay/src/blind_relay_listener.rs:374 — HMAC keys (Zeroizing<[u8;32]>)
     // rustynet-llm-gateway
-    "SessionToken", // crates/rustynet-llm-gateway/src/session.rs:74 — derive(Debug) prints the FULL wire form (payload + ed25519 signature) = usable bearer material; sibling RelaySessionToken (control lib.rs:1756) redacts instead. Registered by the AQ-141 whole-workspace scope extension; the redacting impl is the live follow-up and no_debug_derives_on_canonical_secret_types stays red until it lands.
+    "SessionToken", // crates/rustynet-llm-gateway/src/session.rs:74 — wire form is canonical payload + ed25519 signature = usable bearer material; sibling RelaySessionToken (control lib.rs:1756) redacts instead. Redacting Debug LANDED (impl session.rs:82, signature field REDACTED, witness session_token_debug_redacts_signature session.rs:444; reviewed in REVIEWED_REDACTING_DEBUG_IMPLS). Listed to keep the type forbidden for any future derive(Debug) re-introduction — same forward-guard shape as every other entry here.
 ];
 
 /// Canonical secret-bearing type names whose `Display`/`ToString` exposure is

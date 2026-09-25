@@ -1132,7 +1132,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - Proposed enforcement (review-only — do NOT apply): enumerate the *real* secret-bearing types (derive the list from `#[derive(Zeroize)]`/`Zeroizing<_>` fields or a `#[secret]` marker), make scanners multi-line-aware, and extend coverage to `control`/`relay`/`crypto`. Add a self-test that fails if a known secret type is omitted from the forbidden list.
 - Justification / source: SecurityMinimumBar §3.4; ADR-001; CWE-532 "Insertion of Sensitive Information into Log File" — https://cwe.mitre.org/data/definitions/532.html (accessed 2026-06-18).
 - Verification method: a meta-test asserting every `Zeroizing`/zeroize-deriving type appears in the forbidden lists; `cargo test -p rustynetd secret_log`.
-- Status: **open** (net-new, verified first-hand; 2026-06-18)
+- Status: **applied** (2026-09-25) — the llm-gateway `SessionToken` redacting `Debug` landed on 2026-09-23 (commit 4c5decec1, `session.rs:82`, signature field REDACTED; witness `session_token_debug_redacts_signature` renders a real token with `{:?}` and asserts neither half of its ed25519 signature appears). The `secret_log_audit` entry still said that impl was an open follow-up; it now cites the landed impl and keeps the type listed as a guard against a future `derive(Debug)`. `no_debug_derives_on_canonical_secret_types` and `every_secret_vocabulary_type_is_classified` pass.
 
 ### RSA-0025 — Windows encrypted-key `.enc` backup is written with no file-level ACL hardening at write time
 - File: `crates/rustynetd/src/key_material.rs:545-573` (write path; `:565`)
@@ -1338,7 +1338,7 @@ _Inventory captured from `git ls-files` on 2026-06-18. 581 tracked code/config f
 - Proposed enforcement (review-only — do NOT apply): replace `-Command` string interpolation with argv/typed invocation — pass the path/host via a parameterized PowerShell `-File` script with `param()` binding, or use a native Rust API (e.g. read the cert via `schannel`/`windows-sys`), so no untrusted value is concatenated into a script. Mirror the DnsFailclosed `reg.exe`-argv remediation pattern.
 - Justification / source: CLAUDE.md §4 / SecurityMinimumBar §3.7 (argv-only, no untrusted shell construction); CWE-78 "OS Command Injection" — https://cwe.mitre.org/data/definitions/78.html (accessed 2026-06-18).
 - Verification method: a test that a path/host containing `'` is rejected or safely parameterized (no injected execution); `cargo test -p rustynet-sysinfo` (note: this crate currently has zero tests — see RSA-0050).
-- Status: **open** (net-new, verified first-hand; severity adjusted from agent High; 2026-06-18)
+- Status: **applied** (2026-09-25) — every `powershell -Command` script in `rustynet-sysinfo` is now a compile-time constant; caller values reach it only through the child environment (`$env:NAME`), so no value is ever part of the command text; the directory-size scripts use `-LiteralPath`. Tests assert the built command for values containing a quote, `;`, a backtick and `$()`. A similar latent channel in `rustynetd/src/phase10.rs` (a trailing positional after `-Command`, validated callers today) is a follow-up.
 
 ### RSA-0047 — MCP server reads JSON-RPC requests with unbounded `BufRead::lines()` → memory-exhaustion DoS
 - File: `crates/rustynet-mcp/src/lib.rs:706-727` (`run_server`)
