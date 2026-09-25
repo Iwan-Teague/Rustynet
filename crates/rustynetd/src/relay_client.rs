@@ -34,7 +34,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rustynet_backend_api::{NodeId, SocketEndpoint};
 pub use rustynet_control::MAX_RELAY_SESSION_TOKEN_TTL_SECS;
 use rustynet_control::{RELAY_TOKEN_SCOPE, RelaySessionToken, parse_relay_session_token_wire};
-use rustynet_relay::transport::RELAY_HELLO_CHALLENGE_MSG_TYPE;
+use rustynet_relay::transport::{RELAY_HELLO_CHALLENGE_MSG_TYPE, RELAY_PROTOCOL_VERSION};
 use rustynet_relay::{
     AddressValidationArtifact, RelayHello, RelayHelloAck, SessionId,
     serialize_relay_hello_artifact_field,
@@ -964,6 +964,30 @@ fn current_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Relay-hello protocol version spoken when nothing advertises v2: the v1
+/// frame, exactly as shipped before the D3 seams work (absence is v1).
+const RELAY_HELLO_PROTOCOL_V1: u8 = 1;
+
+/// Choose which relay-hello protocol version to send (D3 seams plan, seam 1
+/// negotiation; S2 plumbing — S4 wires this into the send path).
+///
+/// Fail closed, never guess forward: only an advertisement of EXACTLY
+/// [`RELAY_PROTOCOL_VERSION`] (2) selects v2. An absent advertisement (an
+/// old or unreadable snapshot), and ANY other value — older, or higher
+/// versions this build does not know — selects v1. There is no probing: the
+/// relay port is pre-auth UDP, so the only negotiation input is the
+/// membership snapshot the daemon already loads (read via
+/// `rustynet_control::membership::snapshot_bytes_relay_proto_max`), and the
+/// only "downgrade" available to an attacker on that channel is the status
+/// quo. An advertisement this build cannot pin (e.g. 3) is treated as
+/// absent: a client must never send a frame dialect it cannot construct.
+pub fn pick_relay_hello_version(advertised: Option<u8>) -> u8 {
+    match advertised {
+        Some(RELAY_PROTOCOL_VERSION) => RELAY_PROTOCOL_VERSION,
+        _ => RELAY_HELLO_PROTOCOL_V1,
+    }
+}
+
 /// Serializes a `RelayHello` message for wire transmission.
 fn serialize_relay_hello(hello: &RelayHello) -> Vec<u8> {
     let mut buf = Vec::with_capacity(512);
@@ -1160,6 +1184,77 @@ mod tests {
         let bytes = serialize_relay_hello(&hello);
         assert!(!bytes.is_empty());
         assert_eq!(bytes[0], RELAY_HELLO_MSG_TYPE);
+    }
+
+    /// Decode a pinned hex vector (golden tests only; test module is exempt
+    /// from the panic-family lints).
+    fn unhex(s: &str) -> Vec<u8> {
+        s.as_bytes()
+            .chunks(2)
+            .map(|pair| {
+                u8::from_str_radix(std::str::from_utf8(pair).expect("hex"), 16).expect("hex")
+            })
+            .collect()
+    }
+
+    /// D3 seams S2: the negotiation chooser table. Fail closed — only
+    /// `Some(2)` speaks v2; absence, older, newer, and garbage all stay on
+    /// v1, never guess-forward.
+    #[test]
+    fn pick_relay_hello_version_table() {
+        assert_eq!(pick_relay_hello_version(None), 1);
+        assert_eq!(
+            pick_relay_hello_version(Some(RELAY_PROTOCOL_VERSION)),
+            RELAY_PROTOCOL_VERSION
+        );
+        for advertised in [0u8, 1, 3, 4, 127, 255] {
+            assert_eq!(
+                pick_relay_hello_version(Some(advertised)),
+                1,
+                "advertisement {advertised} must not select v2"
+            );
+        }
+    }
+
+    /// Absence is v1 — golden pin on the UNCHANGED v1 serializer: with no
+    /// advertisement the wire bytes are exactly the pre-D3 v1 hello layout
+    /// (`[0x01][u16 len][node_id][u16 len][peer_node_id][u16 len][token]`,
+    /// no artifact tail). The chooser decision is asserted first so a
+    /// chooser that stopped defaulting to v1 fails this test too, not just
+    /// the table above.
+    #[test]
+    fn absent_advertisement_sends_exact_v1_hello_bytes() {
+        assert_eq!(pick_relay_hello_version(None), RELAY_HELLO_PROTOCOL_V1);
+        let token = RelaySessionToken {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            relay_id: [0xAA; 16],
+            scope: RELAY_TOKEN_SCOPE.to_owned(),
+            issued_at_unix: 1_700_000_000,
+            expires_at_unix: 1_700_000_060,
+            nonce: [0x11; 16],
+            signature: [0x22; 64],
+        };
+        let hello = RelayHello {
+            node_id: "node-a".to_owned(),
+            peer_node_id: "node-b".to_owned(),
+            session_token: token,
+            addr_validation_artifact: None,
+        };
+        let bytes = serialize_relay_hello(&hello);
+        const GOLDEN_V1_HELLO_HEX: &str = concat!(
+            "0100066e6f64652d6100066e6f64652d62009a",
+            "0100066e6f64652d6100066e6f64652d62",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0017666f72776172645f636970686572746578745f6f6e6c79",
+            "000000006553f100000000006553f13c",
+            "11111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        let expected = unhex(GOLDEN_V1_HELLO_HEX);
+        assert_eq!(bytes.len(), expected.len());
+        assert_eq!(bytes, expected);
     }
 
     #[test]
