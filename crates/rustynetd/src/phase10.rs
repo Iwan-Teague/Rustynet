@@ -11426,6 +11426,7 @@ mod tests {
             public_key: [9; 32],
             allowed_ips: vec!["100.100.20.2/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -19038,6 +19039,7 @@ mod tests {
             },
             allowed_ips: Vec::new(),
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
         system
             .apply_peer_endpoint_bypass_routes(&[peer])

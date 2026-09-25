@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::prelude::*;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
-use rustynet_backend_api::{BackendError, NodeId, PeerConfig, SocketEndpoint};
+use rustynet_backend_api::{BackendError, NodeId, PeerConfig, PresharedKey, SocketEndpoint};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -86,6 +86,65 @@ pub(crate) enum ConfigurePeerDisposition {
     Unchanged,
 }
 
+/// F9 (D3 seams plan §7 S5): how a peer's preshared keying changed at the
+/// re-key a `Replaced` rebuild forces. A hardened rollout flips peers to PSK
+/// keying one at a time; until both ends of a pair agree, exactly that pair's
+/// handshakes fail while the rest of the mesh keeps working. Classified
+/// HERE — at the same place peer material is compared — so the condition is
+/// attributable to the pair ("preshared keying changed; handshakes with a
+/// counterpart that did not adopt the same key will fail") instead of
+/// reading as an unexplained mesh outage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PresharedKeyRekeyChange {
+    /// `None` → `Some`: the hardened keying was adopted for this peer.
+    Adopted,
+    /// `Some` → `None`: the keying was REMOVED. The counterpart may still
+    /// hold the old key, so this is the loudest shape — a silent classical
+    /// downgrade of a hardened pair is exactly what the plan forbids
+    /// (§4.3), so it is classified distinctly rather than merged with a
+    /// generic rebuild.
+    Removed,
+    /// `Some` → a different `Some`: keying rotated (or mismatched with the
+    /// counterpart's key until both sides agree).
+    Rotated,
+}
+
+impl fmt::Display for PresharedKeyRekeyChange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Adopted => write!(f, "adopted"),
+            Self::Removed => write!(f, "REMOVED"),
+            Self::Rotated => write!(f, "rotated"),
+        }
+    }
+}
+
+/// One classified PSK re-key: which peer, what changed, and the loud,
+/// operator-facing sentence that names the pair-scoped condition. Recorded
+/// only when the preshared key actually changed — an ordinary rebuild
+/// (public key or routing change) records nothing here, so the
+/// classification stays distinct from generic re-configure noise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PresharedKeyRekeyClassification {
+    pub(crate) node_id: NodeId,
+    pub(crate) change: PresharedKeyRekeyChange,
+}
+
+impl PresharedKeyRekeyClassification {
+    /// The loud error-grade surfacing text. Names the peer and the keying
+    /// condition; never contains key material (there is none here — only
+    /// the change shape).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn message(&self) -> String {
+        format!(
+            "peer {}: preshared keying {} at re-key — tunnel rebuilt, re-handshake \
+             required; until the counterpart carries the SAME preshared key this \
+             peer's handshakes will fail (PSK/profile mismatch, not a mesh outage)",
+            self.node_id, self.change
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct EngineStats {
     pub(crate) bytes_tx: u64,
@@ -141,6 +200,10 @@ pub(crate) struct UserspaceEngine {
     /// down the engine's single worker thread and every live session).
     receiver_index_divergence_drops: u64,
     path_quality: BTreeMap<NodeId, PeerPathQuality>,
+    /// F9: latest PSK re-key classification per peer (latest wins; the
+    /// condition is per-peer and current, not a history). Empty unless a
+    /// re-configure actually changed a peer's preshared keying.
+    preshared_key_rekey_classifications: BTreeMap<NodeId, PresharedKeyRekeyChange>,
     recorded_peer_ciphertext_ingress: Vec<RecordedPeerCiphertextIngress>,
     recorded_tunnel_plaintext_packets: Vec<RecordedTunnelPlaintextPacket>,
     // Long-lived per-engine scratch buffers reused across every packet instead
@@ -161,6 +224,10 @@ struct PeerEngineState {
     peer_static_public: PublicKey,
     endpoint: SocketAddr,
     allowed_ips: Vec<AllowedIpNetwork>,
+    /// The preshared keying this peer's live `Tunn` was built with. Peer
+    /// material: re-configuration compares it exactly (below) so a change
+    /// re-keys instead of silently keeping a mismatched session.
+    preshared_key: Option<PresharedKey>,
     tunnel: Tunn,
     /// Local session index handed to `Tunn::new` (boringtun stores it as
     /// `index << 8`). Inbound handshake responses, cookie replies, and data
@@ -348,6 +415,7 @@ impl UserspaceEngine {
             receiver_index: HashMap::new(),
             receiver_index_divergence_drops: 0,
             path_quality: BTreeMap::new(),
+            preshared_key_rekey_classifications: BTreeMap::new(),
             recorded_peer_ciphertext_ingress: Vec::new(),
             recorded_tunnel_plaintext_packets: Vec::new(),
             decrypt_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
@@ -374,8 +442,15 @@ impl UserspaceEngine {
         // it matches, rebuilding would produce a session equivalent to the one
         // already running — at the cost of discarding its handshake state and,
         // via the runtime's `Replaced` arm, its handshake telemetry. Comparison
-        // is exact rather than approximate: a difference in ANY of the three
+        // is exact rather than approximate: a difference in ANY of the four
         // falls through to the rebuild path below.
+        //
+        // The preshared key is peer material exactly like the static public
+        // key (D3 seams plan §4.8): a change of it means the live session was
+        // built with different keying than the caller just asked for, so it
+        // must classify as `Replaced` — full rebuild, re-handshake — never
+        // `Unchanged`/`EndpointMoved`, which would silently keep a session
+        // that can no longer handshake with the re-keyed counterpart.
         //
         // Note the allowed-IP comparison is ORDER-SENSITIVE, deliberately. The
         // stored form is the parsed sequence, and treating a reordering as
@@ -385,6 +460,7 @@ impl UserspaceEngine {
         if let Some(existing) = self.peer_states.get(&peer.node_id)
             && existing.peer_static_public == peer_static_public
             && existing.allowed_ips == allowed_ips
+            && existing.preshared_key == peer.preshared_key
         {
             if existing.endpoint == endpoint {
                 return Ok(ConfigurePeerDisposition::Unchanged);
@@ -399,10 +475,35 @@ impl UserspaceEngine {
         }
 
         let tunnel_index = self.allocate_tunnel_index()?;
+        // F9: if this rebuild changes an existing peer's preshared keying,
+        // classify it loudly BEFORE building — the classification names the
+        // pair-scoped condition the forced re-key implies (see the type's
+        // doc). An `Added` peer or a rebuild with unchanged keying records
+        // nothing: the classification is distinct from generic rebuilds.
+        let psk_classification = self
+            .peer_states
+            .get(&peer.node_id)
+            .filter(|existing| existing.preshared_key != peer.preshared_key)
+            .map(|existing| {
+                let change = match (&existing.preshared_key, &peer.preshared_key) {
+                    (None, Some(_)) => PresharedKeyRekeyChange::Adopted,
+                    (Some(_), None) => PresharedKeyRekeyChange::Removed,
+                    (Some(_), Some(_)) => PresharedKeyRekeyChange::Rotated,
+                    (None, None) => unreachable!("filtered on keying difference"),
+                };
+                PresharedKeyRekeyClassification {
+                    node_id: peer.node_id.clone(),
+                    change,
+                }
+            });
         let tunnel = Tunn::new(
             self.local_static_private.clone(),
             peer_static_public,
-            None,
+            // D3 seams plan §4.8: the PSK slot passes through to the tunnel
+            // exactly as configured. `None` (today's default everywhere)
+            // builds today's tunnel byte-for-byte; `Some` mixes the key
+            // into the Noise-IKpsk2 handshake per the WireGuard spec.
+            peer.preshared_key.as_ref().map(|key| *key.expose_bytes()),
             // Persistent keepalive, from the peer's own configuration.
             //
             // This argument was hardcoded `None`, so the userspace engine
@@ -457,10 +558,18 @@ impl UserspaceEngine {
                 peer_static_public,
                 endpoint,
                 allowed_ips,
+                preshared_key: peer.preshared_key.clone(),
                 tunnel,
                 tunnel_index,
             },
         );
+        // Record the F9 classification only AFTER every fallible step has
+        // succeeded, so a refused configure never leaves a classified
+        // condition nothing actually caused.
+        if let Some(classification) = psk_classification {
+            self.preshared_key_rekey_classifications
+                .insert(classification.node_id.clone(), classification.change);
+        }
         if let Some((previous_endpoint, _)) = previous {
             self.unlink_endpoint(previous_endpoint, &peer.node_id);
         }
@@ -602,6 +711,8 @@ impl UserspaceEngine {
 
     pub(crate) fn remove_peer(&mut self, node_id: &NodeId) -> bool {
         self.path_quality.remove(node_id);
+        // A removed peer has no live keying condition to classify.
+        self.preshared_key_rekey_classifications.remove(node_id);
         let removed = match self.peer_states.remove(node_id) {
             Some(removed_state) => {
                 // Retire the peer's receiver-index entry beside its endpoint
@@ -848,6 +959,24 @@ impl UserspaceEngine {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn recorded_peer_ciphertext_ingress(&self) -> &[RecordedPeerCiphertextIngress] {
         &self.recorded_peer_ciphertext_ingress
+    }
+
+    /// F9 (plan §4.8): the PSK re-key classifications recorded so far, one
+    /// entry per peer whose keying changed at its most recent rebuild.
+    /// Reconstructed from the change map so callers get the full
+    /// `PresharedKeyRekeyClassification` (peer + change shape + loud
+    /// message). Presence in this map is the distinct, pair-scoped signal —
+    /// an ordinary rebuild records nothing here.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn preshared_key_rekey_classifications(
+        &self,
+    ) -> impl Iterator<Item = PresharedKeyRekeyClassification> + '_ {
+        self.preshared_key_rekey_classifications
+            .iter()
+            .map(|(node_id, change)| PresharedKeyRekeyClassification {
+                node_id: node_id.clone(),
+                change: *change,
+            })
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -1303,6 +1432,10 @@ impl fmt::Debug for UserspaceEngine {
                 "recorded_tunnel_plaintext_packets_count",
                 &self.recorded_tunnel_plaintext_packets.len(),
             )
+            .field(
+                "preshared_key_rekey_classification_count",
+                &self.preshared_key_rekey_classifications.len(),
+            )
             .finish()
     }
 }
@@ -1313,6 +1446,9 @@ impl fmt::Debug for PeerEngineState {
             .field("peer_static_public", &"[REDACTED]")
             .field("endpoint", &self.endpoint)
             .field("allowed_ips", &self.allowed_ips)
+            // Presence-only (plan §4.7): the PSK bytes themselves stay in the
+            // zeroizing wrapper and are never printed.
+            .field("has_preshared_key", &self.preshared_key.is_some())
             .finish()
     }
 }
@@ -1383,6 +1519,7 @@ mod tests {
                     public_key: [pubkey; 32],
                     allowed_ips: vec![format!("100.64.{last_octet}.0/24")],
                     persistent_keepalive_secs: None,
+                    preshared_key: None,
                 })
                 .expect("peer configures");
             node_id
@@ -1466,6 +1603,7 @@ mod tests {
                 public_key: [0x11; 32],
                 allowed_ips: vec!["100.80.169.183/32".to_owned(), "0.0.0.0/0".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("exit configures");
         let peer = NodeId::new("zzz-peer").expect("node id");
@@ -1479,6 +1617,7 @@ mod tests {
                 public_key: [0x22; 32],
                 allowed_ips: vec!["100.123.159.114/32".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
 
@@ -1520,6 +1659,7 @@ mod tests {
                 public_key: [0x22; 32],
                 allowed_ips: vec!["100.64.8.0/24".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
 
@@ -1589,6 +1729,7 @@ mod tests {
             public_key: [3u8; 32],
             allowed_ips: vec!["100.64.0.2/32".to_owned()],
             persistent_keepalive_secs: Some(25),
+            preshared_key: None,
         };
 
         assert_eq!(
@@ -1640,6 +1781,7 @@ mod tests {
             public_key: [6u8; 32],
             allowed_ips: vec!["100.64.0.6/32".to_owned()],
             persistent_keepalive_secs: Some(25),
+            preshared_key: None,
         };
         assert_eq!(
             engine.configure_peer(&config).expect("configure"),
@@ -1673,6 +1815,7 @@ mod tests {
             public_key: [5u8; 32],
             allowed_ips: vec!["100.64.0.5/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         assert_eq!(
@@ -1714,6 +1857,7 @@ mod tests {
             public_key: [pubkey; 32],
             allowed_ips: vec![cidr.to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         for (label, changed) in [
@@ -1731,6 +1875,558 @@ mod tests {
                 engine.configure_peer(&changed).expect("second configure"),
                 super::ConfigurePeerDisposition::Replaced,
                 "a changed {label} must rebuild the session"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // S5 (plan §4.7/§4.8): the preshared-key slot.
+    // ------------------------------------------------------------------
+
+    fn peer_config_with_psk(
+        node_id: &NodeId,
+        psk: Option<rustynet_backend_api::PresharedKey>,
+    ) -> rustynet_backend_api::PeerConfig {
+        rustynet_backend_api::PeerConfig {
+            node_id: node_id.clone(),
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: "203.0.113.8".parse().expect("ip"),
+                port: 51820,
+            },
+            public_key: [4; 32],
+            allowed_ips: vec!["100.64.0.3/32".to_owned()],
+            persistent_keepalive_secs: None,
+            preshared_key: psk,
+        }
+    }
+
+    /// PSK is peer material exactly like the static public key (plan §4.8):
+    /// ANY change must classify the configure as a full `Replaced` rebuild —
+    /// never `Unchanged` and never `EndpointMoved` — while an identical PSK
+    /// (with everything else identical) stays `Unchanged`.
+    #[test]
+    fn preshared_key_change_classifies_as_replaced_not_unchanged_or_moved() {
+        use rustynet_backend_api::PresharedKey;
+        let node_id = NodeId::new("peer-psk").expect("node id");
+
+        // Fresh peer with a PSK: plain Added (nothing to classify yet).
+        let mut engine = fresh_engine(6);
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32])))
+                ))
+                .expect("first configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+
+        // Identical keying: Unchanged — no rebuild for a no-op re-configure.
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32])))
+                ))
+                .expect("no-op configure"),
+            super::ConfigurePeerDisposition::Unchanged,
+            "the same PSK with the same peer material must not rebuild"
+        );
+
+        // Some → a different Some: Replaced (rotation), not Unchanged/Moved.
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0x3C; 32])))
+                ))
+                .expect("rotation configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "a rotated PSK is peer-material change and must rebuild"
+        );
+
+        // Some → None on an EXISTING peer: Replaced (removal), never a
+        // silent classical downgrade (plan §4.3).
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(&node_id, None))
+                .expect("removal configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "dropping the PSK must rebuild, never fall through as Unchanged"
+        );
+
+        // None → Some on an EXISTING peer: Replaced (adoption).
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(
+                    &node_id,
+                    Some(PresharedKey::new(zeroize::Zeroizing::new([0x11; 32])))
+                ))
+                .expect("adoption configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "adopting a PSK on an existing peer must rebuild"
+        );
+    }
+
+    /// REVIEW WITNESS (rustynet-r-aq35-s5-review): with the production value
+    /// (`None` everywhere) the engine's decisions are exactly the pre-S5
+    /// dispositions, and an all-`None` workload never records a PSK re-key
+    /// classification — S5 must be inert unless a PSK actually changes.
+    #[test]
+    fn psk_none_workload_keeps_pre_s5_dispositions_and_classifies_nothing() {
+        let node_id = NodeId::new("peer-none").expect("node id");
+        let mut engine = fresh_engine(6);
+
+        // None-only workload walks the exact pre-S5 disposition sequence.
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(&node_id, None))
+                .expect("first configure"),
+            super::ConfigurePeerDisposition::Added
+        );
+        assert_eq!(
+            engine
+                .configure_peer(&peer_config_with_psk(&node_id, None))
+                .expect("no-op configure"),
+            super::ConfigurePeerDisposition::Unchanged
+        );
+
+        // Endpoint-only move: EndpointMoved, no rebuild, no classification.
+        let mut moved = peer_config_with_psk(&node_id, None);
+        moved.endpoint.port = 51821;
+        assert_eq!(
+            engine.configure_peer(&moved).expect("endpoint move"),
+            super::ConfigurePeerDisposition::EndpointMoved
+        );
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            0,
+            "an all-None workload must never record a PSK classification"
+        );
+
+        // Peer-material change (public key) with keying still None: Replaced,
+        // and STILL no classification — an ordinary rebuild is not a PSK event.
+        let mut rekeyed = peer_config_with_psk(&node_id, None);
+        rekeyed.public_key = [5; 32];
+        assert_eq!(
+            engine.configure_peer(&rekeyed).expect("pubkey rebuild"),
+            super::ConfigurePeerDisposition::Replaced
+        );
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            0,
+            "a None-keyed rebuild must not be classified as a PSK re-key"
+        );
+
+        // Removal drops the peer cleanly.
+        assert!(engine.remove_peer(&node_id));
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            0,
+            "removal must leave no classification behind"
+        );
+    }
+
+    /// F9: every PSK-keying rebuild records a loud, pair-scoped
+    /// classification naming the peer; an ordinary (public-key-only) rebuild
+    /// records NONE, so the hardened-rollout signal stays distinct from
+    /// generic re-configure noise.
+    #[test]
+    fn preshared_key_rebuild_records_loud_classification() {
+        use super::PresharedKeyRekeyChange;
+        use rustynet_backend_api::PresharedKey;
+
+        let mut engine = fresh_engine(7);
+        let node_id = NodeId::new("peer-f9").expect("node id");
+
+        // None → Some: Adopted.
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("baseline configure");
+        assert!(
+            engine
+                .preshared_key_rekey_classifications()
+                .next()
+                .is_none(),
+            "the plain Added must record no PSK classification"
+        );
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32]))),
+            ))
+            .expect("adopt configure");
+        let adopted: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| {
+                (
+                    classification.node_id.clone(),
+                    classification.change,
+                    classification.message(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            adopted,
+            vec![(
+                node_id.clone(),
+                PresharedKeyRekeyChange::Adopted,
+                format!(
+                    "peer {node_id}: preshared keying adopted at re-key — tunnel rebuilt, \
+                     re-handshake required; until the counterpart carries the SAME preshared \
+                     key this peer's handshakes will fail (PSK/profile mismatch, not a mesh \
+                     outage)"
+                )
+            )],
+            "adoption must be classified loudly, naming the peer"
+        );
+
+        // Some → different Some: Rotated (map entry replaced, still one).
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(PresharedKey::new(zeroize::Zeroizing::new([0x3C; 32]))),
+            ))
+            .expect("rotate configure");
+        let rotated: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| (classification.node_id.clone(), classification.change))
+            .collect();
+        assert_eq!(
+            rotated,
+            vec![(node_id.clone(), PresharedKeyRekeyChange::Rotated)],
+            "rotation replaces the earlier classification (latest wins)"
+        );
+
+        // Some → None: Removed — the loudest shape (plan §4.3).
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("remove configure");
+        let removed: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| (classification.node_id.clone(), classification.change))
+            .collect();
+        assert_eq!(
+            removed,
+            vec![(node_id.clone(), PresharedKeyRekeyChange::Removed)],
+            "PSK removal is classified distinctly (no silent downgrade)"
+        );
+        assert!(
+            engine
+                .preshared_key_rekey_classifications()
+                .all(|classification| classification.message().contains("REMOVED")),
+            "the Removed message must surface the removal loudly"
+        );
+
+        // Distinctness: a public-key-only rebuild records NO classification.
+        let mut engine = fresh_engine(7);
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(PresharedKey::new(zeroize::Zeroizing::new([0xA5; 32]))),
+            ))
+            .expect("baseline configure");
+        // Drop the keying: a Removed classification is recorded (the loud
+        // no-silent-downgrade signal).
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("remove configure");
+        assert_eq!(
+            engine.preshared_key_rekey_classifications().count(),
+            1,
+            "fixture sanity: the removal above is classified"
+        );
+        let mut pubkey_only = peer_config_with_psk(&node_id, None);
+        pubkey_only.public_key = [9; 32];
+        assert_eq!(
+            engine
+                .configure_peer(&pubkey_only)
+                .expect("rekey configure"),
+            super::ConfigurePeerDisposition::Replaced,
+            "a public-key change still rebuilds"
+        );
+        let after: Vec<_> = engine
+            .preshared_key_rekey_classifications()
+            .map(|classification| classification.change)
+            .collect();
+        assert_eq!(
+            after,
+            vec![PresharedKeyRekeyChange::Removed],
+            "a rebuild WITHOUT keying change must not raise the PSK signal \
+             (the earlier Removed classification simply persists)"
+        );
+    }
+
+    /// The redaction contract (plan §4.7): `PresharedKey`'s Debug (and the
+    /// Debug of every struct holding one) must never expose the bytes in any
+    /// common encoding — hex (either case), decimal array, or base64 — while
+    /// still identifying the type. The engine's peer state Debug carries
+    /// presence only.
+    #[test]
+    fn preshared_key_debug_redacts_every_encoding() {
+        use rustynet_backend_api::{PeerConfig, PresharedKey, SocketEndpoint};
+
+        let bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(7));
+        let psk = PresharedKey::new(zeroize::Zeroizing::new(bytes));
+
+        let hex_lower: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let decimal_commas = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let decimal_spaces = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let decimal_debug = bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base64 = BASE64_STANDARD.encode(bytes);
+        let encodings: [(&str, &String); 6] = [
+            ("lowercase hex", &hex_lower),
+            ("uppercase hex", &hex_upper),
+            ("decimal comma-joined", &decimal_commas),
+            ("decimal space-joined", &decimal_spaces),
+            ("decimal debug-joined", &decimal_debug),
+            ("base64", &base64),
+        ];
+
+        let psk_debug = format!("{psk:?}");
+        assert!(
+            psk_debug.contains("PresharedKey"),
+            "Debug must still name the type, got {psk_debug:?}"
+        );
+        let config_debug = format!(
+            "{:?}",
+            PeerConfig {
+                node_id: NodeId::new("peer-redact").expect("node id"),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.8".parse().expect("ip"),
+                    port: 51820,
+                },
+                public_key: [4; 32],
+                allowed_ips: vec!["100.64.0.3/32".to_owned()],
+                persistent_keepalive_secs: None,
+                preshared_key: Some(psk),
+            }
+        );
+        for (label, encoding) in encodings {
+            assert!(
+                !psk_debug.contains(encoding.as_str()),
+                "PresharedKey Debug leaked the {label} encoding"
+            );
+            assert!(
+                !config_debug.contains(encoding.as_str()),
+                "PeerConfig Debug leaked the PSK {label} encoding"
+            );
+        }
+        // Sanity for the negative control: the hex encoding genuinely
+        // matches the bytes used here.
+        assert_eq!(hex_lower.len(), 64);
+        assert_ne!(
+            hex_lower.to_uppercase(),
+            hex_lower,
+            "fixture needs mixed case to tell the two hex encodings apart"
+        );
+    }
+
+    /// Engine peer-state Debug carries PRESENCE only (`has_preshared_key`),
+    /// never the bytes, and the default configure path is None.
+    #[test]
+    fn engine_peer_state_debug_reports_psk_presence_only() {
+        let mut engine = fresh_engine(5);
+        let node_id = NodeId::new("peer-presence").expect("node id");
+        engine
+            .configure_peer(&peer_config_with_psk(&node_id, None))
+            .expect("default configure");
+        let state_debug = format!("{:?}", engine.peer_states.get(&node_id).expect("state"));
+        assert!(
+            state_debug.contains("has_preshared_key: false"),
+            "None-configured peer must report absence, got {state_debug:?}"
+        );
+
+        let psk_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8) | 0x80);
+        engine
+            .configure_peer(&peer_config_with_psk(
+                &node_id,
+                Some(rustynet_backend_api::PresharedKey::new(
+                    zeroize::Zeroizing::new(psk_bytes),
+                )),
+            ))
+            .expect("psk configure");
+        let state_debug = format!("{:?}", engine.peer_states.get(&node_id).expect("state"));
+        assert!(
+            state_debug.contains("has_preshared_key: true"),
+            "PSK-configured peer must report presence, got {state_debug:?}"
+        );
+        let hex_lower: String = psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let base64 = BASE64_STANDARD.encode(psk_bytes);
+        assert!(
+            !state_debug.contains(hex_lower.as_str()) && !state_debug.contains(base64.as_str()),
+            "state Debug must not leak the bytes in hex or base64"
+        );
+    }
+
+    fn psk_peer_config_real_key(
+        node_id: &NodeId,
+        peer_public_bytes: [u8; 32],
+        psk: Option<rustynet_backend_api::PresharedKey>,
+    ) -> rustynet_backend_api::PeerConfig {
+        rustynet_backend_api::PeerConfig {
+            node_id: node_id.clone(),
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: "203.0.113.80".parse().expect("ip"),
+                port: 51820,
+            },
+            public_key: peer_public_bytes,
+            allowed_ips: vec!["100.64.8.0/24".to_owned()],
+            persistent_keepalive_secs: Some(1),
+            preshared_key: psk,
+        }
+    }
+
+    /// Plan §8(b) first S5 proof: the configured PSK actually reaches
+    /// `Tunn::new`, and boringtun mixes it into the handshake per the
+    /// WireGuard spec — a counterpart carrying the SAME key completes the
+    /// full three-message handshake and a data frame round-trip; a
+    /// counterpart WITHOUT it (profile mismatch) fails at msg2, exactly the
+    /// pair-scoped condition F9 classifies.
+    #[test]
+    fn preshared_key_reaches_tunnel_construction_and_gates_handshake() {
+        use boringtun::noise::{Tunn, TunnResult};
+        use boringtun::x25519::{PublicKey, StaticSecret};
+
+        let psk: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(11));
+
+        let engine_secret = StaticSecret::from([9u8; 32]);
+        let engine_public = PublicKey::from(&engine_secret);
+        let peer_public_bytes = *PublicKey::from(&StaticSecret::from([0x55; 32])).as_bytes();
+
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 80)), 51820);
+        let node_id = NodeId::new("peer-x").expect("node id");
+
+        // Matching counterpart: handshake completes, data frame round-trips.
+        {
+            let mut engine = fresh_engine(9);
+            engine
+                .configure_peer(&psk_peer_config_real_key(
+                    &node_id,
+                    peer_public_bytes,
+                    Some(rustynet_backend_api::PresharedKey::new(
+                        zeroize::Zeroizing::new(psk),
+                    )),
+                ))
+                .expect("peer configures");
+            let mut counterpart = Tunn::new(
+                StaticSecret::from([0x55; 32]),
+                engine_public,
+                Some(psk),
+                None,
+                0,
+                None,
+            );
+            let mut sink = RecordingSink::default();
+
+            engine
+                .initiate_handshake(&node_id, 1, false, &mut sink)
+                .expect("initiation never errors");
+            let initiation = pop_ciphertext(&mut sink, "handshake initiation");
+            assert_eq!(initiation.len(), 148, "msg1 is a fixed-size message");
+
+            let mut counterpart_buf = vec![0u8; 65_567];
+            let response: Vec<u8> =
+                match counterpart.decapsulate(None, &initiation, &mut counterpart_buf) {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("matching PSK must complete msg2, got {other:?}"),
+                };
+
+            let observed = engine
+                .process_inbound_ciphertext(endpoint, remote_addr(), &response, 1, &mut sink)
+                .expect("msg2 never errors");
+            let (observed_peer, _at) =
+                observed.expect("msg2 completes the session; the handshake timestamps");
+            assert_eq!(observed_peer, node_id);
+            let ack = pop_ciphertext(&mut sink, "post-handshake empty transport packet");
+            assert_eq!(ack.len(), 32);
+            match counterpart.decapsulate(None, &ack, &mut counterpart_buf) {
+                TunnResult::Done => {}
+                other => panic!("counterpart must accept the ack, got {other:?}"),
+            }
+
+            // One real data frame round-trips under the PSK session.
+            let plaintext = ipv4_packet_for_peer(37);
+            engine
+                .inject_plaintext_packet(&plaintext, 1, &mut sink)
+                .expect("frame never errors");
+            let ciphertext = pop_ciphertext(&mut sink, "data frame");
+            let decrypted = match counterpart.decapsulate(None, &ciphertext, &mut counterpart_buf) {
+                TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+                other => panic!("counterpart must decrypt the frame, got {other:?}"),
+            };
+            assert_eq!(decrypted, plaintext, "PSK session must round-trip data");
+        }
+
+        // Mismatched counterpart (no PSK): the responder still answers msg1
+        // (the PSK enters at the response stage), but msg2 is sealed under
+        // ITS keying (no PSK), so the ENGINE's decapsulate — which derives
+        // the symmetric keys WITH the configured PSK — must fail closed:
+        // no completed handshake, no ack emission. This is the spec's PSK
+        // mixing doing its job (plan §8(b)) and exactly the pair-scoped
+        // condition F9 classifies.
+        {
+            let mut engine = fresh_engine(9);
+            engine
+                .configure_peer(&psk_peer_config_real_key(
+                    &node_id,
+                    peer_public_bytes,
+                    Some(rustynet_backend_api::PresharedKey::new(
+                        zeroize::Zeroizing::new(psk),
+                    )),
+                ))
+                .expect("peer configures");
+            let mut counterpart = Tunn::new(
+                StaticSecret::from([0x55; 32]),
+                engine_public,
+                None,
+                None,
+                0,
+                None,
+            );
+            let mut sink = RecordingSink::default();
+
+            engine
+                .initiate_handshake(&node_id, 1, false, &mut sink)
+                .expect("initiation never errors");
+            let initiation = pop_ciphertext(&mut sink, "handshake initiation");
+
+            let mut counterpart_buf = vec![0u8; 65_567];
+            let response: Vec<u8> =
+                match counterpart.decapsulate(None, &initiation, &mut counterpart_buf) {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("counterpart answers msg1 regardless, got {other:?}"),
+                };
+            assert_eq!(
+                response.len(),
+                92,
+                "msg2 is the fixed 92-byte handshake response"
+            );
+
+            let observed = engine
+                .process_inbound_ciphertext(endpoint, remote_addr(), &response, 1, &mut sink)
+                .expect("a mismatched msg2 must fail closed inside the engine, never error out");
+            assert!(
+                observed.is_none(),
+                "a PSK-vs-None mismatch must NOT complete a handshake, got {observed:?}"
+            );
+            assert!(
+                sink.events.is_empty(),
+                "no session means no ack/keepalive emission, got {:?}",
+                sink.events
             );
         }
     }
@@ -1754,6 +2450,7 @@ mod tests {
                 public_key: [pubkey; 32],
                 allowed_ips: vec![allowed_ip.to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
         node_id
@@ -2105,6 +2802,7 @@ mod tests {
             public_key: [pubkey; 32],
             allowed_ips: vec!["100.64.50.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
         let data_packet = |tunnel_index: u32| {
             let mut pkt = vec![4u8, 0, 0, 0];
@@ -3011,6 +3709,7 @@ mod tests {
                 public_key: peer_public_bytes,
                 allowed_ips: vec!["100.64.8.0/24".to_owned()],
                 persistent_keepalive_secs: Some(1),
+                preshared_key: None,
             })
             .expect("peer configures");
         let mut counterpart = Tunn::new(peer_secret, engine_public, None, None, 0, None);

@@ -4665,6 +4665,7 @@ mod tests {
                 public_key: [7; 32],
                 allowed_ips: vec!["100.64.1.0/24".to_owned()],
                 persistent_keepalive_secs: Some(25),
+                preshared_key: None,
             })
             .expect("keepalive-enabled peer configure argv should be allowlisted");
 

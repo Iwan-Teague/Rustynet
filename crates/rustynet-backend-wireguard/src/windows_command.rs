@@ -425,6 +425,10 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
                 rendered.push_str(interval_secs.to_string().as_str());
                 rendered.push('\n');
             }
+            // Default-deny (plan §4.8): `peer.preshared_key` is deliberately
+            // NOT rendered — kernel-attach PSK configuration is owner-gated
+            // (S8) and must never be written to the tunnel conf by this
+            // backend. The field is stored with the peer but never read.
             rendered.push('\n');
         }
 
@@ -477,6 +481,10 @@ impl<R: WireguardCommandRunner> WindowsWireguardBackend<R> {
             args.push("persistent-keepalive".to_owned());
             args.push(interval_secs.to_string());
         }
+        // Default-deny (plan §4.8): `peer.preshared_key` is deliberately NOT
+        // emitted here — kernel-attach PSK configuration is owner-gated (S8)
+        // and must never be configured through wg(8) by this backend. The
+        // field is stored with the peer but never read into args.
         self.runner
             .run(self.wg_exe_path.to_string_lossy().as_ref(), &args)
     }
@@ -1315,6 +1323,7 @@ mod tests {
             public_key: [7; 32],
             allowed_ips: vec!["100.64.10.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 
@@ -1656,6 +1665,105 @@ mod tests {
             written.contains("PersistentKeepalive = 21"),
             "conf stanza must render PersistentKeepalive = 21, got:\n{written}"
         );
+    }
+
+    #[test]
+    fn windows_backend_ignores_preshared_key_and_never_emits_key_material() {
+        // Plan §4.8: the command (kernel) backend stays default-deny — a
+        // configured PSK must produce byte-identical wg args AND an identical
+        // tunnel conf to a peer without one, and no encoding of the key bytes
+        // may leak into any executed arg or written file.
+        let psk_bytes: [u8; 32] = core::array::from_fn(|i| (i as u8) ^ 0xA5);
+        let psk = rustynet_backend_api::PresharedKey::new(zeroize::Zeroizing::new(psk_bytes));
+
+        let temp_dir = TempDir::new().expect("temp dir");
+        let (config_path, private_key_path, wireguard_path, wg_path, netsh_path) =
+            backend_paths(&temp_dir);
+        let runner = RecordingRunner::default();
+        let mut backend = WindowsWireguardBackend::new(
+            runner.clone(),
+            "rustynet0",
+            config_path.to_string_lossy(),
+            private_key_path.to_string_lossy(),
+            wireguard_path.to_string_lossy(),
+            wg_path.to_string_lossy(),
+            netsh_path.to_string_lossy(),
+            51820,
+        )
+        .expect("backend should construct");
+        backend
+            .start(runtime_context())
+            .expect("backend should start successfully");
+
+        let peer_public_key = encode_wg_public_key_base64(&[7; 32]);
+        let mut peer = sample_peer("peer-a");
+        peer.preshared_key = Some(psk);
+        backend.configure_peer(peer).expect("peer should configure");
+        let args_with_psk = runner
+            .recorded()
+            .iter()
+            .find(|(program, args)| {
+                program == &wg_path.to_string_lossy().to_string()
+                    && args.iter().any(|arg| arg == &peer_public_key)
+            })
+            .map(|(_, args)| args.clone())
+            .expect("peer wg set call should be recorded");
+        let conf_with_psk = fs::read_to_string(&config_path).expect("config should be readable");
+        runner.commands.lock().expect("commands").clear();
+
+        let bare = sample_peer("peer-a");
+        backend.configure_peer(bare).expect("peer should configure");
+        let args_without_psk = runner
+            .recorded()
+            .iter()
+            .find(|(program, args)| {
+                program == &wg_path.to_string_lossy().to_string()
+                    && args.iter().any(|arg| arg == &peer_public_key)
+            })
+            .map(|(_, args)| args.clone())
+            .expect("peer wg set call should be recorded");
+        let conf_without_psk = fs::read_to_string(&config_path).expect("config should be readable");
+
+        assert_eq!(
+            args_with_psk, args_without_psk,
+            "Some(psk) must produce byte-identical wg args to None (backend ignores the field)"
+        );
+        assert_eq!(
+            conf_with_psk, conf_without_psk,
+            "Some(psk) must produce a byte-identical tunnel conf to None (backend ignores the field)"
+        );
+
+        let hex_lower: String = psk_bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let hex_upper: String = psk_bytes.iter().map(|b| format!("{b:02X}")).collect();
+        let base64 = encode_wg_public_key_base64(&psk_bytes);
+        let decimal_commas = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let decimal_spaces = psk_bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (label, encoding) in [
+            ("lowercase hex", hex_lower.as_str()),
+            ("uppercase hex", hex_upper.as_str()),
+            ("base64", base64.as_str()),
+            ("decimal (comma-joined)", decimal_commas.as_str()),
+            ("decimal (space-joined)", decimal_spaces.as_str()),
+        ] {
+            for arg in &args_with_psk {
+                assert!(
+                    !arg.contains(encoding),
+                    "wg arg {arg:?} must not contain PSK {label} encoding"
+                );
+            }
+            assert!(
+                !conf_with_psk.contains(encoding),
+                "tunnel conf must not contain PSK {label} encoding"
+            );
+        }
     }
 
     #[test]

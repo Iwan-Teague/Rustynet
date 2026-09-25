@@ -1566,6 +1566,7 @@ mod tests {
                 public_key: [22u8; 32],
                 allowed_ips: vec!["100.64.0.22/32".to_owned()],
                 persistent_keepalive_secs: Some(1),
+                preshared_key: None,
             })
             .expect("configure should succeed even when egress is refused");
 
@@ -1679,6 +1680,7 @@ mod tests {
             public_key: [21u8; 32],
             allowed_ips: vec!["100.64.0.20/32".to_owned()],
             persistent_keepalive_secs: Some(25),
+            preshared_key: None,
         };
 
         state
@@ -1713,6 +1715,7 @@ mod tests {
             public_key: [22u8; 32],
             allowed_ips: vec!["100.64.0.21/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         state.configure_peer(at(51820)).expect("first configure");
@@ -1754,6 +1757,7 @@ mod tests {
             public_key: [pubkey; 32],
             allowed_ips: vec![cidr.to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
         let record_handshake = |state: &mut RuntimeState, node_id: &NodeId| {
             state
@@ -1862,6 +1866,7 @@ mod tests {
                 public_key: [0x33; 32],
                 allowed_ips: vec!["100.64.11.0/24".to_owned()],
                 persistent_keepalive_secs: None,
+                preshared_key: None,
             })
             .expect("peer configures");
 

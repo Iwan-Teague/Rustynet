@@ -1361,12 +1361,16 @@ version = "0.1.0"
 [[package]]
 name = "rustynet-backend-api"
 version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "rustynet-backend-stub"
 version = "0.1.0"
 dependencies = [
  "rustynet-backend-api",
+ "zeroize",
 ]
 
 [[package]]

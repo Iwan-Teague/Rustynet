@@ -1987,6 +1987,7 @@ mod tests {
             public_key: [21u8; 32],
             allowed_ips: vec!["100.64.0.20/32".to_owned()],
             persistent_keepalive_secs: Some(25),
+            preshared_key: None,
         };
 
         state
@@ -2021,6 +2022,7 @@ mod tests {
             public_key: [22u8; 32],
             allowed_ips: vec!["100.64.0.21/32".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         state.configure_peer(at(51820)).expect("first configure");
@@ -2062,6 +2064,7 @@ mod tests {
             public_key: [pubkey; 32],
             allowed_ips: vec![cidr.to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         };
 
         for (label, changed) in [
@@ -2188,6 +2191,7 @@ mod tests {
             public_key: *public_key.as_bytes(),
             allowed_ips: vec!["100.64.1.0/24".to_owned()],
             persistent_keepalive_secs: None,
+            preshared_key: None,
         }
     }
 }
