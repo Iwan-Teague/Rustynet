@@ -1406,6 +1406,7 @@ enum OpsCommand {
         pinned_verifier_key_hex: Option<String>,
         pinned_verifier_key_file: Option<PathBuf>,
         artifacts_dir: Option<PathBuf>,
+        require_artifacts: Vec<String>,
     },
     ApplyManagedDnsRouting,
     ClearManagedDnsRouting,
@@ -5448,6 +5449,7 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             pinned_verifier_key_hex: parser.value("--pinned-verifier-key-hex"),
             pinned_verifier_key_file: parser.optional_path("--pinned-verifier-key-file"),
             artifacts_dir: parser.optional_path("--artifacts-dir"),
+            require_artifacts: collect_repeated_option_values(&args[1..], "--require-artifact"),
         }),
         "apply-managed-dns-routing" => {
             if args.len() != 1 {
@@ -9305,11 +9307,13 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
             pinned_verifier_key_hex,
             pinned_verifier_key_file,
             artifacts_dir,
+            require_artifacts,
         } => ops_release_manifest::execute_ops_verify_release_manifest(
             manifest,
             pinned_verifier_key_hex,
             pinned_verifier_key_file,
             artifacts_dir,
+            require_artifacts,
         ),
         OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
         OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
@@ -20540,7 +20544,7 @@ fn help_text() -> String {
         "  ops check-assignment-refresh-availability",
         "  ops install-trust-material --verifier-source <absolute-path> --trust-source <absolute-path> --verifier-dest <absolute-path> --trust-dest <absolute-path> [--daemon-group <group>]",
         "  ops create-release-manifest --artifact <name>:<target>:<path> [--artifact ...] --signing-seed-file <path> --output <path> [--release-track <track>] [--key-id <id>] [--generated-at-unix <secs>]",
-        "  ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>]",
+        "  ops verify-release-manifest --manifest <path> (--pinned-verifier-key-hex <hex> | --pinned-verifier-key-file <path>) [--artifacts-dir <dir>] [--require-artifact <filename>]...",
         "  ops apply-managed-dns-routing",
         "  ops clear-managed-dns-routing",
         "  ops disconnect-cleanup",
