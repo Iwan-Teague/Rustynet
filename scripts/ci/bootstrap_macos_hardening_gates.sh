@@ -49,10 +49,17 @@
 #          (`curl … > f && sh f`, also glued `…>f`); benign discards
 #          (>/dev/null, 2>&1 etc.) are stripped per occurrence and any
 #          redirect left on the line is a finding.
-#       i) ANY curl|wget|fetch invocation outside a whole-line comment,
-#          unless its line is a NAMED exemption in Gate 3b (exact content).
-#          (e)-(h) enumerate idioms; (i) is the rule that does not depend
-#          on guessing the next one.
+#       i) ANY token of a listed transfer tool or inline interpreter
+#          (curl, wget, fetch, nscurl, ftp, tftp, sftp, scp, rsync, nc,
+#          ncat, socat, osascript, python*, perl, ruby, urlretrieve,
+#          urlopen, and git's network subcommands) outside a whole-line
+#          comment, unless its line is a NAMED exemption in Gate 3b (exact
+#          content). This is a TOKEN rule, not a proof that nothing is
+#          downloaded: a name assembled at runtime (c''url, ${x}url,
+#          printf/eval, a here-doc fed to bash) or a tool missing from the
+#          list passes it. Those stay review discipline; the runtime
+#          verify-before-extract and signed-manifest checks are the trust
+#          boundary this gate only helps to hold.
 #
 #   Scope limit of (c)-(h): the deny covers download-to-SHELL-interpreter
 #   idioms ((ba|z|da|k)sh by name, absolute path, or via env) and
@@ -108,9 +115,14 @@ else
   while IFS= read -r f; do
     targets+=("${f}")
   done < <(find scripts/bootstrap -type f -name '*.sh' 2>/dev/null | sort)
-  if [[ -f scripts/e2e/rn_bootstrap_macos.sh ]]; then
-    targets+=("scripts/e2e/rn_bootstrap_macos.sh")
+  # Gate 4 runs only on this wrapper, so in default mode its absence (a
+  # rename, a move) is a failure, not a silent skip (AQ-11 confirming
+  # review G-4c).
+  if [[ ! -f scripts/e2e/rn_bootstrap_macos.sh ]]; then
+    echo "FAIL: scripts/e2e/rn_bootstrap_macos.sh not found; the verify-before-extract gate (Gate 4) would have nothing to check" >&2
+    exit 1
   fi
+  targets+=("scripts/e2e/rn_bootstrap_macos.sh")
 fi
 
 if [[ ${#targets[@]} -eq 0 ]]; then
@@ -233,17 +245,24 @@ macos_deny_patterns=(
 # the glued `curl …>/tmp/i.sh` never matched (NE-3).
 redirect_pattern='(curl|wget|fetch)[[:space:]][^|]*>'
 redirect_discards='s/[0-9&]?>>?[[:space:]]*\/dev\/(null|stdout|stderr)//g; s/[0-9]?>&[0-9]//g'
-# (i): download-tool INVOCATION. Patterns (e)-(h) enumerate download
-# idioms, and an enumeration always has a next form: combined short flags
-# (`curl -fsSLo f`), wget's default save-to-file (`wget "$u"`), `| tee f`,
-# indirection (`dl=curl; $dl …`), or a flag on a continuation line. Since
-# this lane downloads NOTHING, the decisive rule is simpler: any curl, wget
-# or fetch token outside a whole-line comment is a finding unless its line
-# is one of the NAMED exemptions below, matched by exact content (leading
-# whitespace ignored) including the continuation line where the command
-# spans two. Adding an exemption means adding it here with its reason —
-# never loosening the pattern.
-download_tool_pattern='(^|[^[:alnum:]_.-])(curl|wget|fetch)([^[:alnum:]_.-]|$)'
+# (i): transfer-tool and inline-interpreter TOKENS. Patterns (e)-(h)
+# enumerate download idioms, and an enumeration always has a next form:
+# combined short flags (`curl -fsSLo f`), wget's default save-to-file
+# (`wget "$u"`), `| tee f`, indirection (`dl=curl; $dl …`), a flag on a
+# continuation line. The macOS lane has no raw transfer at all (packages
+# arrive through brew and cargo, the payload over the orchestrator
+# channel), so any token of a listed tool outside a whole-line comment is a
+# finding unless its line is one of the NAMED exemptions below, matched by
+# exact content (leading whitespace ignored) including the continuation
+# line where the command spans two. The list covers the stock macOS
+# transfer tools and interpreters that can fetch in one line (AQ-11
+# confirming review G-1: nscurl, python3 urlretrieve, git clone, scp,
+# osascript and ftp all passed a curl/wget/fetch-only rule). It is still a
+# token rule: names assembled at runtime pass it (review G-2), which is
+# review discipline, not something a line gate can decide. Adding an
+# exemption means adding it here with its reason — never loosening the
+# pattern.
+download_tool_pattern='(^|[^[:alnum:]_.-])(curl|wget|fetch|nscurl|ftp|tftp|sftp|scp|rsync|nc|ncat|socat|osascript|python[0-9.]*|perl|ruby|urlretrieve|urlopen)([^[:alnum:]_.-]|$)|(^|[^[:alnum:]_.-])git([[:space:]]+-[^[:space:]]+)*[[:space:]]+(clone|fetch|pull|submodule|ls-remote|archive)([[:space:]]|$)'
 # The crates.io probe's two lines, pinned verbatim (single-quoted on
 # purpose: compared as text, never expanded).
 # shellcheck disable=SC1003
@@ -341,16 +360,31 @@ for f in "${targets[@]}"; do
     rn_bootstrap_macos.sh) ;;
     *) continue ;;
   esac
+  # Whole-line comments are dropped before every Gate 4 grep, so commented
+  # text cannot stand in for code (AQ-11 confirming review G-4a).
+  code_lines="$(grep -nvE '^[[:space:]]*#' "${f}" || true)"
   # `|| true` inside the substitutions: a no-match grep must yield an empty
   # value (handled below with a named FAIL), not kill this gate silently via
   # `set -o pipefail` before the diagnostic is printed.
-  call_line="$(grep -nE '^[[:space:]]*verify_source_archive[[:space:]]*$' "${f}" | head -1 | cut -d: -f1 || true)"
-  tar_line="$(grep -nE 'tar[[:space:]]+-xzf.*VERIFY_STAGED_ARCHIVE' "${f}" | head -1 | cut -d: -f1 || true)"
+  call_line="$(printf '%s\n' "${code_lines}" | grep -E '^[0-9]+:[[:space:]]*verify_source_archive[[:space:]]*$' | head -1 | cut -d: -f1 || true)"
+  tar_line="$(printf '%s\n' "${code_lines}" | grep -E 'tar[[:space:]]+-xzf.*VERIFY_STAGED_ARCHIVE' | head -1 | cut -d: -f1 || true)"
   # AQ-11 NE-1: the wrapper also runs `ops verify-release-manifest --help`
   # as its N-B capability probe, EARLIER in the file; the ordering must be
   # measured on the runtime verify, so the probe line is excluded.
-  verify_cmd_line="$(grep -nE 'ops[[:space:]]+verify-release-manifest' "${f}" | grep -v -- '--help' | head -1 | cut -d: -f1 || true)"
-  stage_line="$(grep -nE 'install[[:space:]]+-m[[:space:]]+0600' "${f}" | head -1 | cut -d: -f1 || true)"
+  verify_cmd_lines="$(printf '%s\n' "${code_lines}" | grep -E 'ops[[:space:]]+verify-release-manifest' | grep -v -- '--help' || true)"
+  stage_lines="$(printf '%s\n' "${code_lines}" | grep -E 'install[[:space:]]+-m[[:space:]]+0600' || true)"
+  verify_cmd_line="$(printf '%s\n' "${verify_cmd_lines}" | head -1 | cut -d: -f1)"
+  stage_line="$(printf '%s\n' "${stage_lines}" | head -1 | cut -d: -f1)"
+  # Exactly one runtime verify and one staging copy: a decoy placed earlier
+  # could otherwise satisfy the order and content checks on its own
+  # (AQ-11 confirming review G-4b).
+  verify_count="$(printf '%s' "${verify_cmd_lines}" | grep -c . || true)"
+  stage_count="$(printf '%s' "${stage_lines}" | grep -c . || true)"
+  if [[ "${verify_count}" -gt 1 || "${stage_count}" -gt 1 ]]; then
+    echo "FAIL verify-before-extract [${f}]: expected exactly one runtime 'ops verify-release-manifest' and one 'install -m 0600' staging copy, found ${verify_count} and ${stage_count}" >&2
+    status=1
+    continue
+  fi
   if [[ -z "${tar_line}" ]]; then
     echo "FAIL verify-before-extract [${f}]: no 'tar -xzf … VERIFY_STAGED_ARCHIVE' line found (the extraction must read the AQ-11 N-A private stage, not the shared received path)" >&2
     status=1
@@ -392,7 +426,7 @@ for f in "${targets[@]}"; do
   # Content, not only order: the runtime verify must read the private stage
   # and bind the archive by name. A regression that points --artifacts-dir
   # back at the shared received directory keeps every line order intact.
-  verify_block="$(sed -n "${verify_cmd_line},$((verify_cmd_line + 6))p" "${f}")"
+  verify_block="$(sed -n "${verify_cmd_line},$((verify_cmd_line + 6))p" "${f}" | grep -vE '^[[:space:]]*#' || true)"
   if ! printf '%s\n' "${verify_block}" | grep -qE -- '--artifacts-dir[[:space:]]+"?\$\{?RN_VERIFY_STAGE\}?"?([[:space:]]|$)'; then
     echo "FAIL verify-before-extract [${f}]: the runtime verify at line ${verify_cmd_line} does not pass --artifacts-dir \"\$RN_VERIFY_STAGE\" (AQ-11 N-A: verify the staged private copy, never the shared received path)" >&2
     status=1
