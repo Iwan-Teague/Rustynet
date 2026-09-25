@@ -9429,6 +9429,110 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
     }
 
     #[test]
+    fn windows_relay_installer_opens_scoped_session_port_range_rule_for_non_loopback_binds() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Install-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service install script should exist");
+        // RSA-0084 follow-up: a non-loopback relay binds per-session UDP
+        // sockets across --port-range on the bind address (rustynet-relay
+        // default 50_000..59_999, crates/rustynet-relay/src/main.rs), so the
+        // control-port rule alone leaves the data path closed under a
+        // default-deny inbound policy. The installer must therefore open a
+        // SECOND scoped rule for exactly the configured range on exactly the
+        // bind address.
+        assert!(
+            body.contains("[string]$PortRange = '50000-59999'"),
+            "the installer's default port range must match the relay default \
+             (50_000..59_999 in crates/rustynet-relay/src/main.rs)"
+        );
+        // One source of truth: the same $PortRange goes to the relay args and
+        // to the firewall step, so rule and relay cannot disagree.
+        assert!(
+            body.contains("'--port-range', $PortRange,"),
+            "the relay service args must carry the configured port range explicitly"
+        );
+        assert!(
+            body.contains("Set-RelayDatapathFirewallRule -Bind $Bind -PortRange $PortRange"),
+            "the firewall step must receive the port range so the rule matches \
+             the relay's session sockets"
+        );
+        let fn_start = body
+            .find("function Set-RelayDatapathFirewallRule")
+            .expect("the firewall helper must exist");
+        let helper = &body[fn_start..];
+        let loopback_check = helper
+            .find("IsLoopback")
+            .expect("the helper must decide on loopback-ness");
+        let rule_creates: Vec<usize> = helper
+            .match_indices("New-NetFirewallRule")
+            .map(|(at, _)| at)
+            .collect();
+        assert!(
+            rule_creates.len() == 2,
+            "a non-loopback bind opens exactly two rules (control port + \
+             session range); found {}",
+            rule_creates.len()
+        );
+        // Loopback path creates none: the early return must sit before the
+        // first rule creation.
+        assert!(
+            loopback_check < rule_creates[0],
+            "loopback binds must be decided BEFORE any rule is created"
+        );
+        assert!(
+            helper[loopback_check..rule_creates[0]].contains("return"),
+            "loopback binds must RETURN before any rule is created, not merely \
+             be inspected first"
+        );
+        // Order: the control-port rule is created first, the session range
+        // second (each rule name precedes its own creation).
+        let control_rule = helper
+            .find("'RustyNetRelay-Datapath-Inbound-UDP'")
+            .expect("the control-port rule name must exist");
+        let range_rule = helper
+            .find("'RustyNetRelay-Datapath-Range-Inbound-UDP'")
+            .expect("the session range rule name must exist");
+        let control_create = helper[control_rule..]
+            .find("New-NetFirewallRule")
+            .expect("the control-port rule must be created")
+            + control_rule;
+        let range_create = helper[range_rule..]
+            .find("New-NetFirewallRule")
+            .expect("the session range rule must be created")
+            + range_rule;
+        assert!(
+            control_create < range_create,
+            "the control-port rule must be created before the session range rule"
+        );
+        // Idempotent like the control rule: fixed name, remove-then-add.
+        assert!(
+            helper.contains("Remove-NetFirewallRule -Name $portRangeName"),
+            "the session range rule must be replaced on re-run, not accumulated"
+        );
+        // Scoped exactly: UDP, the configured range verbatim, the bind
+        // address only — inside the range rule's creation block.
+        let range_scope_end = helper[range_create..]
+            .find("Write-Host")
+            .expect("the session range rule creation must be reported")
+            + range_create;
+        let range_region = &helper[range_create..range_scope_end];
+        for scoped in [
+            "-Protocol UDP",
+            "-LocalPort $PortRange",
+            "-LocalAddress $bindAddress",
+        ] {
+            assert!(
+                range_region.contains(scoped),
+                "the session range rule must be scoped by {scoped}"
+            );
+        }
+    }
+
+    #[test]
     fn windows_relay_service_uninstall_script_preserves_security_state() {
         let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -9462,6 +9566,55 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         assert!(
             !body.contains("Invoke-Expression"),
             "relay service uninstall script must not use Invoke-Expression"
+        );
+    }
+
+    #[test]
+    fn windows_relay_uninstall_script_removes_datapath_firewall_rules() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("crate manifest should live under crates/rustynet-cli")
+            .join("scripts/bootstrap/windows/Uninstall-RustyNetWindowsRelayService.ps1");
+        let body = std::fs::read_to_string(script_path)
+            .expect("Windows relay service uninstall script should exist");
+        // RSA-0084 follow-up: the relay installer opens TWO fixed-name
+        // inbound firewall rules for a non-loopback bind (control port +
+        // per-session port range, Install-RustyNetWindowsRelayService.ps1
+        // Set-RelayDatapathFirewallRule). A firewall ALLOW rule that outlives
+        // the service it was scoped to is teardown residue; the uninstaller
+        // must remove both by their fixed names.
+        assert!(
+            body.contains("$relayFirewallRuleNames = @("),
+            "the installer's fixed rule names must be listed in one array consumed \
+             by removal and verification"
+        );
+        for rule_name in [
+            "'RustyNetRelay-Datapath-Inbound-UDP'",
+            "'RustyNetRelay-Datapath-Range-Inbound-UDP'",
+        ] {
+            assert!(
+                body.contains(rule_name),
+                "uninstaller must name the installer's fixed firewall rule {rule_name}"
+            );
+        }
+        // Absence-tolerant removal: each removal is guarded by a
+        // SilentlyContinue presence probe, so a re-run (or an install whose
+        // loopback bind never opened rules) still succeeds.
+        assert!(
+            body.contains("Get-NetFirewallRule -Name $Name -ErrorAction SilentlyContinue"),
+            "each rule removal must be guarded by a tolerate-absence presence probe"
+        );
+        assert!(
+            body.contains("Remove-NetFirewallRule -Name $Name -ErrorAction Stop"),
+            "an actual removal failure must throw into the uninstall trap (fail-closed)"
+        );
+        // Fail-closed verification, mirroring the existing service/binary/env
+        // 'verify-removed' checks: a rule that survives uninstall fails it.
+        assert!(
+            body.contains("firewall rule remains after uninstall"),
+            "uninstaller must verify the datapath rules are gone, like the \
+             service/binary/env checks"
         );
     }
 

@@ -8,9 +8,10 @@ param(
     [string]$ReplayStorePath = 'C:\ProgramData\RustyNet\relay\replay.store',
     # RSA-0084: the datapath bind defaults to LOOPBACK so an install never
     # exposes the relay on every interface by default. Passing a non-loopback
-    # -Bind is an explicit operator decision, and that decision also opens a
-    # narrowly scoped inbound firewall rule (exact protocol + port, fixed
-    # rule name) further down — see Set-RelayDatapathFirewallRule.
+    # -Bind is an explicit operator decision, and that decision also opens
+    # narrowly scoped inbound firewall rules (exact protocol + port / port
+    # range, fixed rule names) further down — see
+    # Set-RelayDatapathFirewallRule.
     # NOT 4500: Windows's built-in IKEEXT/IPsec Policy Agent service binds
     # UDP 4500 system-wide (IPsec NAT-Traversal) even for a loopback- or
     # address-specific bind request, so rustynet-relay's UdpSocket::bind
@@ -379,15 +380,27 @@ function Set-RelayDatapathFirewallRule {
     # inbound rule. A non-loopback -Bind is an explicit operator decision;
     # admit exactly that UDP port (and only on that local address) through
     # one inbound rule with a FIXED name, so re-running the installer
-    # replaces the rule instead of accumulating duplicates. Nothing is
+    # replaces the rule instead of accumulating duplicates. A non-loopback
+    # relay ALSO binds one per-session UDP socket across -PortRange on the
+    # bind address (rustynet-relay main.rs default 50000-59999, which this
+    # installer passes through verbatim in the service env args below), so
+    # a second scoped rule with its own FIXED name admits exactly that
+    # range on the same address: under a default-deny inbound policy the
+    # data path would otherwise fail closed after enrollment. Nothing is
     # opened for the health bind: it is loopback-pinned and never exposed.
-    param([Parameter(Mandatory = $true)][string]$Bind)
+    param(
+        [Parameter(Mandatory = $true)][string]$Bind,
+        [Parameter(Mandatory = $true)][string]$PortRange
+    )
     $bindAddress = $Bind.Split(':')[0]
     $bindPort = Get-EndpointPort -Value $Bind
     if ([System.Net.IPAddress]::IsLoopback([System.Net.IPAddress]::Parse($bindAddress))) {
         Write-Host ("[relay-install] datapath bind {0} is loopback; no inbound firewall rule opened" -f $Bind)
         return
     }
+    # Validate the range BEFORE any rule exists, so a malformed -PortRange
+    # fails the install with zero firewall mutation.
+    Test-PortRange -Value $PortRange
     $ruleName = 'RustyNetRelay-Datapath-Inbound-UDP'
     $existing = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
     if ($existing) {
@@ -405,6 +418,23 @@ function Set-RelayDatapathFirewallRule {
         -Enabled True `
         -ErrorAction Stop | Out-Null
     Write-Host ("[relay-install] opened inbound firewall rule '{0}': UDP {1} on {2}" -f $ruleName, $bindPort, $bindAddress)
+    $portRangeName = 'RustyNetRelay-Datapath-Range-Inbound-UDP'
+    $existingRange = Get-NetFirewallRule -Name $portRangeName -ErrorAction SilentlyContinue
+    if ($existingRange) {
+        Remove-NetFirewallRule -Name $portRangeName -ErrorAction Stop
+    }
+    New-NetFirewallRule `
+        -Name $portRangeName `
+        -DisplayName 'RustyNet Relay datapath session ports (UDP inbound)' `
+        -Direction Inbound `
+        -Action Allow `
+        -Protocol UDP `
+        -LocalPort $PortRange `
+        -LocalAddress $bindAddress `
+        -Profile Any `
+        -Enabled True `
+        -ErrorAction Stop | Out-Null
+    Write-Host ("[relay-install] opened inbound firewall rule '{0}': UDP {1} on {2}" -f $portRangeName, $PortRange, $bindAddress)
 }
 
 function Ensure-ServiceSidTypeUnrestricted {
@@ -549,7 +579,7 @@ $script:InstallFailureStep = 'configure-failure-actions'
 Set-RelayServiceFailureActions -ServiceName $ServiceName
 
 $script:InstallFailureStep = 'configure-datapath-firewall'
-Set-RelayDatapathFirewallRule -Bind $Bind
+Set-RelayDatapathFirewallRule -Bind $Bind -PortRange $PortRange
 
 $script:InstallFailureStep = 'verify-service-hardening'
 $hardeningOutput = (& $relayDest windows-service-hardening-check 2>&1) -join "`n"
