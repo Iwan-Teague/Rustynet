@@ -2154,7 +2154,8 @@ pub(crate) fn render_windows_stop_and_wait_services_script(
 /// drives real anchor bundle-pull attempts against a fake bundle server.
 /// `__REMOTE_CLI__` is the on-guest puller binary path — a `Literal` so the
 /// renderer shell-quotes it (the caller never wraps it in quotes).
-const ROGUE_ANCHOR_ATTACK_SCRIPT: ScriptTemplate = ScriptTemplate(r#"
+const ROGUE_ANCHOR_ATTACK_SCRIPT: ScriptTemplate = ScriptTemplate(
+    r#"
 rb_work=/tmp/rustynet-nc-qh87.$$
 mkdir -p "$rb_work" && chmod 700 "$rb_work" || { echo rb_error_stage_failed=1; exit 1; }
 trap 'rm -rf "$rb_work"' EXIT
@@ -2235,7 +2236,8 @@ run_pull f4 "$1" ; shift 2
 run_pull ctrl "$1" ; shift 2
 echo "rb_done=1"
 exit 0
-"#);
+"#,
+);
 
 pub(crate) fn render_rogue_anchor_attack_script(
     remote_cli: &str,
