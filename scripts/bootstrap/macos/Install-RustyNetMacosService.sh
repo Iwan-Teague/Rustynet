@@ -610,7 +610,7 @@ if launchctl print system/com.rustynet.daemon >/dev/null 2>&1; then
   # rollback dials the privileged-helper socket — the helper must outlive the
   # daemon (plan M2, MacosHelperShutdownOrderingImplementationPlan_2026-09-02).
   for _attempt in $(seq 1 20); do
-    if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then
+    if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep 'pid = ' >/dev/null; then
       break
     fi
     sleep 0.5

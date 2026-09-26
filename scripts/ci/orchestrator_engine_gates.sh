@@ -21,7 +21,7 @@ echo "Running Rust-native orchestrator engine gates..."
 
 assert_at_least_one_pass() {
   local out="$1"
-  if ! printf '%s\n' "$out" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
+  if ! grep -Eq 'test result: ok\. [1-9][0-9]* passed' <<<"$out"; then
     echo "GATE DEFECT: test filter matched zero tests" >&2
     return 1
   fi

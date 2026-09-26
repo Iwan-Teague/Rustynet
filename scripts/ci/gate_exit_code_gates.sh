@@ -59,7 +59,7 @@ scan_gate_lines() {
 # binary's own exit status IS the script's exit status — nothing to mask.
 for script in "$CI_DIR"/*.sh; do
     [ "$script" = "$SCRIPT_DIR/$(basename "$0")" ] && continue
-    if grep -Ev '^\s*(#|$)' "$script" | grep -qv '^exec '; then
+    if grep -Ev '^\s*(#|$)' "$script" | grep -v '^exec ' >/dev/null; then
         if ! grep -q 'set -.*pipefail' "$script"; then
             note_failure "$script does not 'set -euo pipefail'"
         fi

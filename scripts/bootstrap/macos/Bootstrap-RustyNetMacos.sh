@@ -777,7 +777,7 @@ provision_enrollment_secret() {
 # fallbacks: DHCP lease router option → any UGH host route with an IPv4 gateway
 # → .1 of the host's primary address on en0.
 ensure_ipv4_default_route_macos() {
-  netstat -rn -f inet 2>/dev/null | grep -q '^default' && return 0
+  netstat -rn -f inet 2>/dev/null | grep '^default' >/dev/null && return 0
   local gw=""
   # 1. networksetup Router field — works for Manual (static) and DHCP configs
   gw="$(networksetup -getinfo "Ethernet" 2>/dev/null | awk '/^Router:/{print $2; exit}')" || true
@@ -861,7 +861,7 @@ clear_residual_state() {
     # rollback dials the privileged-helper socket — the helper must outlive the
     # daemon (plan M2, MacosHelperShutdownOrderingImplementationPlan_2026-09-02).
     for _attempt in $(seq 1 20); do
-      if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep -q 'pid = '; then
+      if ! launchctl print system/com.rustynet.daemon 2>/dev/null | grep 'pid = ' >/dev/null; then
         break
       fi
       sleep 0.5

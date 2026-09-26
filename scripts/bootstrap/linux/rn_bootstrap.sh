@@ -187,7 +187,7 @@ build_bootstrap_prereqs_present() {
   for cand in /usr/lib/*/faketime/libfaketime.so.1 /usr/lib64/faketime/libfaketime.so.1 /usr/lib/faketime/libfaketime.so.1; do
     if [ -r "$cand" ]; then faketime_found=1; break; fi
   done
-  if [ "$faketime_found" = 1 ] || ldconfig -p 2>/dev/null | grep -q libfaketime; then
+  if [ "$faketime_found" = 1 ] || ldconfig -p 2>/dev/null | grep libfaketime >/dev/null; then
     printf "  %-12s ok\n" libfaketime
   else
     echo "  libfaketime  MISSING"; missing=1

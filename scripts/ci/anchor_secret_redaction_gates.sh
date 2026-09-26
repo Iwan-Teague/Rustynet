@@ -84,7 +84,7 @@ run_anchor_test_filter() {
     printf '%s\n' "$anchor_test_output" >&2
     exit 1
   fi
-  if ! printf '%s\n' "$anchor_test_output" | grep -Eq '^test result: ok\. [1-9][0-9]* passed'; then
+  if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed' <<<"$anchor_test_output"; then
     echo "anchor gate: cargo test $anchor_filter_label ran 0 tests (vacuous filter — rename it to a real current test)" >&2
     exit 1
   fi

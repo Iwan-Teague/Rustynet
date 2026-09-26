@@ -3961,8 +3961,8 @@ mod tests {
     }
 
     /// M2 site pin: both installer stop regions boot the helper out only
-    /// after a bounded daemon-exit poll (`launchctl print … | grep -q 'pid = '`
-    /// replaced the bare `sleep 1`), because the daemon's shutdown rollback
+    /// after a bounded daemon-exit poll (`launchctl print … | grep 'pid = '
+    /// \>/dev/null` replaced the bare `sleep 1`), because the daemon's shutdown rollback
     /// dials the helper socket and the helper must outlive the daemon (plan
     /// MacosHelperShutdownOrderingImplementationPlan_2026-09-02 M2,
     /// Install-RustyNetMacosService.sh:604-611 and
@@ -3985,7 +3985,7 @@ mod tests {
             );
             let between = &script[daemon_bootout..helper_bootout];
             assert!(
-                between.contains("grep -q 'pid = '")
+                between.contains("grep 'pid = ' >/dev/null")
                     && between.contains("seq 1 20")
                     && between.contains("sleep 0.5"),
                 "{name}: a bounded daemon-exit pid poll must sit between the daemon \
