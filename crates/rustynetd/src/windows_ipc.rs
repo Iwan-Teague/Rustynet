@@ -1,3 +1,14 @@
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use crate::windows_paths::{is_linux_runtime_root_text, validate_windows_runtime_file_path};
 use rustynet_windows_native::{call_named_pipe, serve_named_pipe_one_message_authorized};
 use serde::{Deserialize, Serialize};
@@ -410,8 +421,10 @@ fn named_pipe_missing_error(reason: &str) -> bool {
         .filter(|t| !t.is_empty())
         .collect();
     for window in tokens.windows(2) {
-        if window[0].eq_ignore_ascii_case("error") && window[1] == "2" {
-            return true;
+        if let [first_token, second_token] = window {
+            if first_token.eq_ignore_ascii_case("error") && *second_token == "2" {
+                return true;
+            }
         }
     }
     // Symbolic form (in case a future error string includes the
@@ -439,8 +452,10 @@ fn allow_ace_principals(sddl: &str) -> Vec<&str> {
             continue;
         };
         let fields = ace.split(';').collect::<Vec<_>>();
-        if fields.len() >= 6 && fields[0] == "A" {
-            principals.push(fields[5]);
+        if fields.len() >= 6 && fields.first() == Some(&"A") {
+            if let Some(principal) = fields.get(5).copied() {
+                principals.push(principal);
+            }
         }
     }
     principals

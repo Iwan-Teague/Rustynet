@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
@@ -2245,8 +2256,8 @@ impl LinuxCommandSystem {
             if negate {
                 tokens.push("!=".into());
             }
-            if dport.len() == 1 {
-                tokens.push(dport[0].into());
+            if let [single] = dport {
+                tokens.push((*single).into());
             } else {
                 // Rendered nft shapes an anonymous set as `{ 53, 853 }`, and
                 // the ruleset matcher matches builder tokens as substrings of
@@ -2392,7 +2403,7 @@ impl LinuxCommandSystem {
             chain.into(),
         ];
         let split_at = rule_tokens.len().saturating_sub(1);
-        argv.extend(rule_tokens[..split_at].iter().cloned());
+        argv.extend(rule_tokens.iter().take(split_at).cloned());
         argv.extend(observability_tokens.iter().map(|token| token.to_string()));
         if let Some(verdict) = rule_tokens.last() {
             argv.push(verdict.clone());
@@ -2468,9 +2479,9 @@ impl LinuxCommandSystem {
             return false;
         }
         let token_vec: Vec<_> = line.split_whitespace().collect();
-        token_vec
-            .windows(2)
-            .any(|window| window[0] == "dev" && window[1] == route.interface_name.as_str())
+        token_vec.windows(2).any(|window| {
+            window.first() == Some(&"dev") && window.get(1) == Some(&route.interface_name.as_str())
+        })
     }
 
     fn assert_expected_bypass_routes(&self) -> Result<(), SystemError> {
@@ -3172,8 +3183,10 @@ impl LinuxCommandSystem {
         let mut tables = Vec::new();
         for line in output.stdout.lines() {
             let parts = line.split_whitespace().collect::<Vec<_>>();
-            if parts.len() == 3 && parts[0] == "table" {
-                tables.push((parts[1].to_owned(), parts[2].to_owned()));
+            if let [kind, name, table] = parts.as_slice() {
+                if *kind == "table" {
+                    tables.push(((*name).to_owned(), (*table).to_owned()));
+                }
             }
         }
         Ok(tables)

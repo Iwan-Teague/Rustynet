@@ -1,5 +1,16 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::collapsible_if)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -2661,6 +2672,11 @@ pub struct DaemonConfig {
 }
 
 impl Default for DaemonConfig {
+    // AQ-08 step 3c: every expect here guards a compile-time DEFAULT_* constant
+    // (non-zero numeric defaults or literal bind addresses), so failure is
+    // statically impossible; DaemonConfig::default() is exercised directly by
+    // unit tests below. No error type exists to plumb into.
+    #[allow(clippy::expect_used)]
     fn default() -> Self {
         Self {
             node_id: DEFAULT_NODE_ID.to_owned(),
@@ -4188,8 +4204,12 @@ impl DaemonBackend {
                 }
             }
             DaemonBackendMode::WindowsUnsupported => Err(DaemonError::InvalidConfig(
-                require_supported_windows_backend(WindowsBackendMode::Unsupported)
-                    .expect_err("windows unsupported backend must fail closed"),
+                match require_supported_windows_backend(WindowsBackendMode::Unsupported) {
+                    // Unsupported is statically rejected by the gate, so the Ok
+                    // arm is unreachable; fail closed if that invariant regresses.
+                    Err(message) => message,
+                    Ok(()) => "windows unsupported backend must fail closed".to_owned(),
+                },
             )),
         }
     }
@@ -5887,7 +5907,9 @@ impl DaemonRuntime {
         hasher.update(self.wg_interface.as_bytes());
         hasher.update(b"dns-zone-refresh");
         let digest = hasher.finalize();
-        u64::from(digest[0]) % MAX_DNS_ZONE_REFRESH_JITTER_SECS
+        // Sha256::finalize always yields [u8; 32], so first() is always Some;
+        // the 0 fallback is an unreachable fail-soft default.
+        u64::from(digest.iter().next().copied().unwrap_or(0)) % MAX_DNS_ZONE_REFRESH_JITTER_SECS
     }
 
     fn dns_zone_preexpiry_refresh_due(&self, now_unix: u64) -> bool {
@@ -6323,7 +6345,9 @@ impl DaemonRuntime {
         hasher.update(self.local_node_id.as_bytes());
         hasher.update(self.wg_interface.as_bytes());
         let digest = hasher.finalize();
-        u64::from(digest[0]) % MAX_TRAVERSAL_REFRESH_JITTER_SECS
+        // Sha256::finalize always yields [u8; 32], so first() is always Some;
+        // the 0 fallback is an unreachable fail-soft default.
+        u64::from(digest.iter().next().copied().unwrap_or(0)) % MAX_TRAVERSAL_REFRESH_JITTER_SECS
     }
 
     fn traversal_preexpiry_refresh_due(&self, now_unix: u64) -> bool {
@@ -8446,29 +8470,28 @@ impl DaemonRuntime {
             .filter(|status| status.decision == TraversalProbeDecision::Relay)
             .count();
         if self.traversal_probe_statuses.len() == 1 {
-            let status = self
-                .traversal_probe_statuses
-                .values()
-                .next()
-                .expect("single traversal probe status should exist");
-            return (
-                status.decision.as_str().to_owned(),
-                status.reason.as_str().to_owned(),
-                status.attempts.to_string(),
-                sanitize_netcheck_value(&format!(
-                    "{}:{}",
-                    status.selected_endpoint.addr, status.selected_endpoint.port
-                )),
-                status
-                    .latest_handshake_unix
-                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-                status
-                    .next_reprobe_unix
-                    .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-                1,
-                direct_peers,
-                relay_peers,
-            );
+            // Unreachable None: the len()==1 gate above guarantees an entry;
+            // fall through to the general summary below if that ever changes.
+            if let Some(status) = self.traversal_probe_statuses.values().next() {
+                return (
+                    status.decision.as_str().to_owned(),
+                    status.reason.as_str().to_owned(),
+                    status.attempts.to_string(),
+                    sanitize_netcheck_value(&format!(
+                        "{}:{}",
+                        status.selected_endpoint.addr, status.selected_endpoint.port
+                    )),
+                    status
+                        .latest_handshake_unix
+                        .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                    status
+                        .next_reprobe_unix
+                        .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+                    1,
+                    direct_peers,
+                    relay_peers,
+                );
+            }
         }
 
         let combined_result = if direct_peers == self.traversal_probe_statuses.len() {
@@ -8591,13 +8614,13 @@ impl DaemonRuntime {
                     programmed_direct_peers = programmed_direct_peers.saturating_add(1);
                     if handshake_fresh {
                         live_direct_peers = live_direct_peers.saturating_add(1);
-                        latest_live_handshake_unix = Some(
-                            latest_live_handshake_unix
-                                .unwrap_or(0)
-                                .max(handshake_unix.expect(
-                                "fresh direct handshake must carry a latest handshake timestamp",
-                            )),
-                        );
+                        // traversal_handshake_is_fresh only returns true for a
+                        // Some timestamp, so this arm is always Some; skip the
+                        // (unreachable) update if that invariant regresses.
+                        if let Some(handshake) = handshake_unix {
+                            latest_live_handshake_unix =
+                                Some(latest_live_handshake_unix.unwrap_or(0).max(handshake));
+                        }
                         if let Some(status) = status {
                             direct_live_reasons.insert(status.reason.as_str());
                         }
@@ -8632,13 +8655,12 @@ impl DaemonRuntime {
                         }
                         if selected_endpoint_matches && handshake_fresh {
                             live_relay_peers = live_relay_peers.saturating_add(1);
-                            latest_live_handshake_unix = Some(
-                                latest_live_handshake_unix
-                                    .unwrap_or(0)
-                                    .max(handshake_unix.expect(
-                                    "fresh relay handshake must carry a latest handshake timestamp",
-                                )),
-                            );
+                            // Same freshness invariant as the direct arm above:
+                            // handshake_fresh implies Some; unreachable skip.
+                            if let Some(handshake) = handshake_unix {
+                                latest_live_handshake_unix =
+                                    Some(latest_live_handshake_unix.unwrap_or(0).max(handshake));
+                            }
                         }
                     }
                 }
@@ -9827,8 +9849,12 @@ impl DaemonRuntime {
                 }
                 DaemonBackendMode::WindowsUnsupported => {
                     return Err(
-                        require_supported_windows_backend(WindowsBackendMode::Unsupported)
-                            .expect_err("windows unsupported backend must fail closed"),
+                        match require_supported_windows_backend(WindowsBackendMode::Unsupported) {
+                            // Unsupported is statically rejected by the gate; the
+                            // Ok arm is unreachable and fails closed.
+                            Err(message) => message,
+                            Ok(()) => "windows unsupported backend must fail closed".to_owned(),
+                        },
                     );
                 }
                 DaemonBackendMode::InMemory => {
@@ -12422,7 +12448,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             loop {
                 match dns_socket.recv_from(&mut dns_buffer) {
                     Ok((length, peer_addr)) => {
-                        if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length])
+                        // recv_from never reports a length beyond the buffer,
+                        // so get(..length) is always Some (identical incl. 0).
+                        if let Some(response) =
+                            build_dns_response(&runtime, dns_buffer.get(..length).unwrap_or(&[]))
                         {
                             // On Windows, `send_to` can return WSAECONNRESET (10054)
                             // when a previous datagram we sent triggered an ICMP
@@ -12732,7 +12761,10 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
             loop {
                 match dns_socket.recv_from(&mut dns_buffer) {
                     Ok((length, peer_addr)) => {
-                        if let Some(response) = build_dns_response(&runtime, &dns_buffer[..length])
+                        // recv_from never reports a length beyond the buffer,
+                        // so get(..length) is always Some (identical incl. 0).
+                        if let Some(response) =
+                            build_dns_response(&runtime, dns_buffer.get(..length).unwrap_or(&[]))
                         {
                             dns_socket.send_to(&response, peer_addr).map_err(|err| {
                                 DaemonError::Io(format!("dns resolver send failed: {err}"))
@@ -12908,7 +12940,9 @@ impl DnsProbeServicer {
         let mut buffer = [0u8; 1536];
         match self.socket.recv_from(&mut buffer) {
             Ok((length, peer_addr)) => {
-                if let Some(response) = build_dns_response_with(&self.state, &buffer[..length]) {
+                if let Some(response) =
+                    build_dns_response_with(&self.state, buffer.get(..length).unwrap_or(&[]))
+                {
                     if let Err(err) = self.socket.send_to(&response, peer_addr) {
                         log::debug!("bootstrap dns probe servicer send failed: {err}");
                     }
@@ -13020,12 +13054,17 @@ fn parse_dns_question(request: &[u8]) -> Result<DnsQuestion, String> {
     if request.len() < DNS_HEADER_BYTES {
         return Err("dns request too short".to_owned());
     }
-    let id = u16::from_be_bytes([request[0], request[1]]);
-    let flags = u16::from_be_bytes([request[2], request[3]]);
+    let [id_hi, id_lo, flags_hi, flags_lo, qd_hi, qd_lo, ..] = request else {
+        // The DNS_HEADER_BYTES (12) gate above guarantees the six header
+        // bytes; this arm is unreachable and fails closed with the same error.
+        return Err("dns request too short".to_owned());
+    };
+    let id = u16::from_be_bytes([*id_hi, *id_lo]);
+    let flags = u16::from_be_bytes([*flags_hi, *flags_lo]);
     if (flags & DNS_FLAG_QR) != 0 {
         return Err("dns request must be a query".to_owned());
     }
-    let qdcount = u16::from_be_bytes([request[4], request[5]]);
+    let qdcount = u16::from_be_bytes([*qd_hi, *qd_lo]);
     if qdcount != 1 {
         return Err("dns request must contain exactly one question".to_owned());
     }
@@ -13810,6 +13849,10 @@ fn normalize_windows_dns_resolver_bind_addr(config: &mut DaemonConfig) {
     if config.backend_mode != DaemonBackendMode::WindowsWireguardNt {
         return;
     }
+    // AQ-08 step 3c: the default bind literal is a compile-time constant that
+    // must parse (it is also exercised via DaemonConfig::default() in tests);
+    // this fn returns () with no error path to plumb into.
+    #[allow(clippy::expect_used)]
     let default_addr: SocketAddr = DEFAULT_DNS_RESOLVER_BIND_ADDR
         .parse()
         .expect("default dns resolver bind addr must parse");
@@ -14968,12 +15011,13 @@ fn decode_hex_to_fixed<const N: usize>(encoded: &str) -> Result<[u8; N], TrustBo
         ));
     }
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_hex_nibble(raw[index * 2])?;
-        let lo = decode_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    for (pair, out) in raw.chunks_exact(2).zip(bytes.iter_mut()) {
+        let &[hi_raw, lo_raw] = pair else {
+            // chunks_exact(2) only yields full pairs; unreachable skip.
+            continue;
+        };
+        // Same left-to-right nibble decode order as the former index loop.
+        *out = (decode_hex_nibble(hi_raw)? << 4) | decode_hex_nibble(lo_raw)?;
     }
     Ok(bytes)
 }
@@ -15639,12 +15683,14 @@ fn decode_auto_tunnel_hex_to_fixed<const N: usize>(
         ));
     }
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_auto_tunnel_hex_nibble(raw[index * 2])?;
-        let lo = decode_auto_tunnel_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    for (pair, out) in raw.chunks_exact(2).zip(bytes.iter_mut()) {
+        let &[hi_raw, lo_raw] = pair else {
+            // chunks_exact(2) only yields full pairs; unreachable skip.
+            continue;
+        };
+        // Same left-to-right nibble decode order as the former index loop.
+        *out =
+            (decode_auto_tunnel_hex_nibble(hi_raw)? << 4) | decode_auto_tunnel_hex_nibble(lo_raw)?;
     }
     Ok(bytes)
 }
@@ -16092,7 +16138,7 @@ fn load_traversal_bundle_set(
             "traversal bundle set contains no endpoint hint entries".to_owned(),
         ));
     };
-    for bundle in &bundles[1..] {
+    for bundle in bundles.iter().skip(1) {
         if bundle.bundle.generated_at_unix != first_bundle.bundle.generated_at_unix
             || bundle.bundle.expires_at_unix != first_bundle.bundle.expires_at_unix
             || bundle.bundle.nonce != first_bundle.bundle.nonce
@@ -16727,9 +16773,11 @@ fn traversal_snapshot_payload_digest(
     coordinations: &[TraversalCoordinationEnvelope],
 ) -> Result<[u8; 32], TraversalBootstrapError> {
     if coordinations.is_empty() && bundles.len() == 1 {
-        return bundles[0]
-            .watermark
-            .payload_digest
+        // The len()==1 gate guarantees first() is Some; and_then keeps the
+        // digest-missing case mapping to the same ReplayDetected error.
+        return bundles
+            .first()
+            .and_then(|bundle| bundle.watermark.payload_digest)
             .ok_or(TraversalBootstrapError::ReplayDetected);
     }
 
@@ -17071,9 +17119,14 @@ fn collect_assignment_mesh_ip_map(
                 peer.node_id
             )));
         }
-        let mesh_ip = mesh_host_ips
-            .pop()
-            .expect("exactly one deduped mesh host ip should remain");
+        let Some(mesh_ip) = mesh_host_ips.pop() else {
+            // The len()!=1 gate above guarantees exactly one deduped entry, so
+            // pop() cannot fail here; fall closed with the same error shape.
+            return Err(DnsZoneBootstrapError::AssignmentMismatch(format!(
+                "peer {} must expose exactly one mesh host cidr in allowed_ips",
+                peer.node_id
+            )));
+        };
         if !seen_ips.insert(mesh_ip.clone()) {
             return Err(DnsZoneBootstrapError::AssignmentMismatch(format!(
                 "duplicate mesh ip {mesh_ip} in signed assignment state",
@@ -17156,12 +17209,13 @@ fn decode_traversal_hex_to_fixed<const N: usize>(
         ));
     }
     let raw = trimmed.as_bytes();
-    let mut index = 0usize;
-    while index < N {
-        let hi = decode_traversal_hex_nibble(raw[index * 2])?;
-        let lo = decode_traversal_hex_nibble(raw[index * 2 + 1])?;
-        bytes[index] = (hi << 4) | lo;
-        index += 1;
+    for (pair, out) in raw.chunks_exact(2).zip(bytes.iter_mut()) {
+        let &[hi_raw, lo_raw] = pair else {
+            // chunks_exact(2) only yields full pairs; unreachable skip.
+            continue;
+        };
+        // Same left-to-right nibble decode order as the former index loop.
+        *out = (decode_traversal_hex_nibble(hi_raw)? << 4) | decode_traversal_hex_nibble(lo_raw)?;
     }
     Ok(bytes)
 }

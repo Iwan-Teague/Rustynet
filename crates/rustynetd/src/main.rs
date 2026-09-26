@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use rustynet_crypto::{KeyCustodyPermissionPolicy, write_encrypted_key_file};
 use rustynetd::daemon::{
@@ -279,10 +290,9 @@ fn run_anchor_bundle_pull_bind_check_command(args: &[String]) -> Result<(), Stri
         "actual": actual,
         "reason": reason,
     });
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&report).expect("bind-check report must serialize")
-    );
+    let report_json = serde_json::to_string_pretty(&report)
+        .map_err(|err| format!("bind-check report failed to serialize: {err}"))?;
+    println!("{report_json}");
     if status == "pass" {
         Ok(())
     } else {
@@ -553,18 +563,18 @@ fn run_service_daemon_args(args: &[String]) -> Result<(), String> {
 }
 
 fn run_key_command(args: &[String]) -> Result<(), String> {
-    if args.is_empty() {
+    let Some((subcommand, rest)) = args.split_first() else {
         return Err(
             "key subcommand is required (supported: init, init-gossip, show-gossip-key, migrate, store-passphrase)"
                 .to_owned(),
         );
-    }
-    match args[0].as_str() {
-        "init" => run_key_init(&args[1..]),
-        "init-gossip" => run_key_init_gossip(&args[1..]),
-        "show-gossip-key" => run_key_show_gossip_key(&args[1..]),
-        "migrate" => run_key_migrate(&args[1..]),
-        "store-passphrase" => run_key_store_passphrase(&args[1..]),
+    };
+    match subcommand.as_str() {
+        "init" => run_key_init(rest),
+        "init-gossip" => run_key_init_gossip(rest),
+        "show-gossip-key" => run_key_show_gossip_key(rest),
+        "migrate" => run_key_migrate(rest),
+        "store-passphrase" => run_key_store_passphrase(rest),
         other => Err(format!("unknown key subcommand: {other}")),
     }
 }
@@ -2875,14 +2885,14 @@ fn run_windows_killswitch_assert_command(args: &[String]) -> Result<(), String> 
             Ok(())
         }
         Err(rustynetd::phase10::SystemError::KillSwitchAssertionFailed(reason)) => {
-            println!(
-                "{}",
-                serde_json::to_string(&serde_json::json!({
-                    "overall_ok": false,
-                    "reason": reason
-                }))
-                .unwrap()
-            );
+            let report_json = serde_json::to_string(&serde_json::json!({
+                "overall_ok": false,
+                "reason": reason
+            }))
+            .map_err(|err| {
+                format!("windows-killswitch-assert report failed to serialize: {err}")
+            })?;
+            println!("{report_json}");
             if fail_on_drift {
                 return Err(format!("windows-killswitch-assert failed: {reason}"));
             }
@@ -4033,11 +4043,13 @@ fn parse_optional_socket_addr_csv_arg(
 }
 
 fn run_membership_command(args: &[String]) -> Result<(), String> {
-    match args.first().map(String::as_str) {
-        Some("init") => run_membership_init(&args[1..]),
-        Some("add-peer") => run_membership_add_peer(&args[1..]),
-        Some(other) => Err(format!("unknown membership subcommand: {other}")),
-        None => Err("membership subcommand required (supported: init, add-peer)".to_owned()),
+    let Some((subcommand, rest)) = args.split_first() else {
+        return Err("membership subcommand required (supported: init, add-peer)".to_owned());
+    };
+    match subcommand.as_str() {
+        "init" => run_membership_init(rest),
+        "add-peer" => run_membership_add_peer(rest),
+        other => Err(format!("unknown membership subcommand: {other}")),
     }
 }
 

@@ -31,6 +31,18 @@
 //!   we always send a one-byte iovec to keep the contract clear).
 //! - On failure: write `[0xFF, error_message_bytes...]` and return Err.
 
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::io;
 use std::net::Shutdown;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -115,10 +127,10 @@ fn recv_fd_from_stream(stream: &UnixStream) -> Result<OwnedFd, String> {
     }
 
     // Inline error reply from helper: first byte is 0xFF, rest is UTF-8 text.
-    if bytes > 0 && data_buf[0] == 0xFF {
+    if bytes > 0 && data_buf.first() == Some(&0xFF) {
         let mut error_text = String::new();
         if bytes > 1 {
-            let payload = &data_buf[1..bytes];
+            let payload = data_buf.get(1..bytes).unwrap_or(&[]);
             error_text.push_str(&String::from_utf8_lossy(payload));
         }
         // Drain any trailing bytes the helper streamed after the first recvmsg
@@ -134,7 +146,8 @@ fn recv_fd_from_stream(stream: &UnixStream) -> Result<OwnedFd, String> {
                 match s.read(&mut extra) {
                     Ok(0) => break,
                     Ok(n) => {
-                        error_text.push_str(&String::from_utf8_lossy(&extra[..n]));
+                        error_text
+                            .push_str(&String::from_utf8_lossy(extra.get(..n).unwrap_or(&[])));
                         if error_text.len() >= RNUF_MAX_ERROR_BYTES {
                             break;
                         }
@@ -337,8 +350,10 @@ pub(crate) fn peek_first_4_bytes(stream: &UnixStream) -> io::Result<[u8; 4]> {
     if (nbytes as usize) < buf.len() {
         // Pad with zeros if fewer than 4 bytes were peekable — caller checks
         // against known 4-byte magics, so partial peek will never match.
-        for byte in &mut buf[nbytes as usize..] {
-            *byte = 0;
+        if let Some(tail) = buf.get_mut(nbytes as usize..) {
+            for byte in tail {
+                *byte = 0;
+            }
         }
     }
     Ok(buf)
@@ -354,7 +369,7 @@ pub(crate) fn send_error_response(stream: &mut UnixStream, message: &str) {
     let _ = stream.write_all(&[0xFF]);
     let bytes = message.as_bytes();
     let len = bytes.len().min(RNUF_MAX_ERROR_BYTES);
-    let _ = stream.write_all(&bytes[..len]);
+    let _ = stream.write_all(bytes.get(..len).unwrap_or(&[]));
     let _ = stream.flush();
 }
 

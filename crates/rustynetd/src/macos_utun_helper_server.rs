@@ -8,6 +8,17 @@
 //! The unsafe SCM_RIGHTS I/O lives in `macos_utun_helper_unsafe.rs`.
 
 #![forbid(unsafe_code)]
+// AQ-08 step 3c: deny the panic-family lints in this module's non-test code.
+// The crate-wide Cargo.toml [lints] table replaces this at the end of AQ-08 step 3.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::os::unix::net::UnixStream;
 
@@ -28,19 +39,26 @@ pub fn handle_utun_open_request(mut stream: UnixStream) -> Result<(), String> {
         .read_exact(&mut header)
         .map_err(|e| format!("utun helper failed to read RNUF header: {e}"))?;
 
-    if header[..4] != RNUF_MAGIC {
+    if header.get(..4) != Some(RNUF_MAGIC.as_slice()) {
         return Err("utun helper received invalid RNUF magic".to_owned());
     }
-    if header[4] != RNUF_VERSION {
-        let msg = format!(
-            "utun helper unsupported RNUF version {}; expected {RNUF_VERSION}",
-            header[4]
-        );
+    let Some(&version) = header.get(4) else {
+        // read_exact filled the whole 6-byte header, so this arm is unreachable;
+        // keep the response fail-closed rather than indexing.
+        return Err("utun helper received invalid RNUF header".to_owned());
+    };
+    if version != RNUF_VERSION {
+        let msg =
+            format!("utun helper unsupported RNUF version {version}; expected {RNUF_VERSION}");
         send_error_response(&mut stream, &msg);
         return Err(msg);
     }
 
-    let name_len = header[5] as usize;
+    let Some(&name_len_raw) = header.get(5) else {
+        // Unreachable for the same reason: the header was fully read above.
+        return Err("utun helper received invalid RNUF header".to_owned());
+    };
+    let name_len = name_len_raw as usize;
     if name_len == 0 {
         let msg = "utun helper received zero-length interface name".to_owned();
         send_error_response(&mut stream, &msg);
