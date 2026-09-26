@@ -3730,7 +3730,7 @@ impl PrivilegedHelperWireguardRunner {
             "ifconfig" => Ok(PrivilegedCommandProgram::Ifconfig),
             "route" => Ok(PrivilegedCommandProgram::Route),
             "wireguard-go" => Ok(PrivilegedCommandProgram::WireguardGo),
-            "kill" => Ok(PrivilegedCommandProgram::Kill),
+            "terminate-wireguard-go" => Ok(PrivilegedCommandProgram::TerminateWireguardGo),
             _ => Err(BackendError::invalid_input(
                 "unsupported privileged wireguard backend command",
             )),

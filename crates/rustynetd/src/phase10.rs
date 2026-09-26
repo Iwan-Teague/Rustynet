@@ -229,7 +229,6 @@ const ROUTE_BINARY_PATH_ENV: &str = "RUSTYNET_ROUTE_BINARY_PATH";
 const PFCTL_BINARY_PATH_ENV: &str = "RUSTYNET_PFCTL_BINARY_PATH";
 const NETWORKSETUP_BINARY_PATH_ENV: &str = "RUSTYNET_NETWORKSETUP_BINARY_PATH";
 const WIREGUARD_GO_BINARY_PATH_ENV: &str = "RUSTYNET_WIREGUARD_GO_BINARY_PATH";
-const KILL_BINARY_PATH_ENV: &str = "RUSTYNET_KILL_BINARY_PATH";
 const WINDOWS_NETSH_BINARY_PATH_ENV: &str = "RUSTYNET_NETSH_BINARY_PATH";
 const WINDOWS_POWERSHELL_BINARY_PATH_ENV: &str = "RUSTYNET_POWERSHELL_BINARY_PATH";
 const WINDOWS_REG_BINARY_PATH_ENV: &str = "RUSTYNET_REG_BINARY_PATH";
@@ -243,7 +242,6 @@ const DEFAULT_PFCTL_BINARY_PATH: &str = "/sbin/pfctl";
 const DEFAULT_NETWORKSETUP_BINARY_PATH: &str =
     crate::macos_dns_sc_protect::NETWORKSETUP_BINARY_PATH;
 const DEFAULT_WIREGUARD_GO_BINARY_PATH: &str = "/usr/local/bin/wireguard-go";
-const DEFAULT_KILL_BINARY_PATH: &str = "/bin/kill";
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32\netsh.exe";
 pub(crate) const DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH: &str =
@@ -9295,11 +9293,10 @@ fn resolve_binary_path_for_program(
             DEFAULT_WIREGUARD_GO_BINARY_PATH,
             PrivilegedCommandProgram::WireguardGo,
         ),
-        PrivilegedCommandProgram::Kill => resolve_binary_path(
-            KILL_BINARY_PATH_ENV,
-            DEFAULT_KILL_BINARY_PATH,
-            PrivilegedCommandProgram::Kill,
-        ),
+        // RSA-0033: the generic kill program is GONE. terminate-wireguard-go
+        // is an in-helper builtin, refused here like the other builtins —
+        // the helper-less direct path runs the same in-process handler via
+        // try_execute_builtin_program above, never a daemon-resolved binary.
         // In-process builtins: handled before binary resolution. Fail closed if
         // either ever reaches here.
         PrivilegedCommandProgram::DnsFailclosedFile => Err(SystemError::PrerequisiteCheckFailed(
@@ -9319,6 +9316,12 @@ fn resolve_binary_path_for_program(
             "linux-conntrack-flush is an in-helper builtin and has no daemon-resolved binary"
                 .to_owned(),
         )),
+        PrivilegedCommandProgram::TerminateWireguardGo => {
+            Err(SystemError::PrerequisiteCheckFailed(
+                "terminate-wireguard-go is an in-helper builtin and has no daemon-resolved binary"
+                    .to_owned(),
+            ))
+        }
     }
 }
 

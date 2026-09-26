@@ -19,7 +19,10 @@ pub use linux_command::{
     TUNNEL_MTU_ENV, WireguardCommandOutput, WireguardCommandRunner, bringup_tunnel_mtu,
     resolve_bringup_tunnel_mtu,
 };
-pub use macos_command::MacosWireguardBackend;
+pub use macos_command::{
+    MacosWireguardBackend, WireguardGoProcessEntry, parse_wireguard_go_process_entries,
+    validate_macos_wireguard_interface_name,
+};
 pub use udp_offload_probe::{
     OffloadSupport, UdpOffloadCapabilities, probe_udp_offload_capabilities,
 };

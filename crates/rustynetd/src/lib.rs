@@ -100,6 +100,7 @@ pub mod windows_runtime_boundary;
 pub mod windows_service;
 pub mod windows_service_hardening;
 pub mod windows_tunnel_smoke;
+pub mod wireguard_go_terminate;
 
 #[cfg(test)]
 mod witness_listing;

@@ -252,7 +252,6 @@ pub enum PrivilegedCommandProgram {
     /// builders use (defense in depth).
     NetworkSetup,
     WireguardGo,
-    Kill,
     /// In-helper file-write builtin for protected-mode DNS fail-closed
     /// (`linux_dns_protect`). NOT an external binary: the single argument is a
     /// fixed selector and the helper owns the path→content mapping, so no path
@@ -286,6 +285,16 @@ pub enum PrivilegedCommandProgram {
     /// long-lived flow) is therefore unrepresentable rather than merely
     /// validated against, as are `-L`, `-E`, and any second filter (QH-47).
     LinuxConntrackFlush,
+    /// In-helper wireguard-go termination builtin (`wireguard_go_terminate`,
+    /// RSA-0033). NOT an external binary from the daemon's point of view: the
+    /// single argument is the validated utun interface name, and the helper —
+    /// never the client — enumerates processes with its own absolute-path
+    /// `ps`, selects only the allowlisted wireguard-go binary serving exactly
+    /// that interface, and signals those alone. The generic `kill` program
+    /// this builtin replaces let a peer-credential-authorized client have the
+    /// root helper SIGTERM any pid > 1 (CWE-250); after this variant there is
+    /// no way for a client to name a pid to the helper at all.
+    TerminateWireguardGo,
 }
 
 impl PrivilegedCommandProgram {
@@ -300,7 +309,9 @@ impl PrivilegedCommandProgram {
             PrivilegedCommandProgram::Pfctl => "pfctl",
             PrivilegedCommandProgram::NetworkSetup => "networksetup",
             PrivilegedCommandProgram::WireguardGo => "wireguard-go",
-            PrivilegedCommandProgram::Kill => "kill",
+            PrivilegedCommandProgram::TerminateWireguardGo => {
+                crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM
+            }
             PrivilegedCommandProgram::DnsFailclosedFile => {
                 crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM
             }
@@ -327,7 +338,9 @@ impl PrivilegedCommandProgram {
             "pfctl" => Some(PrivilegedCommandProgram::Pfctl),
             "networksetup" => Some(PrivilegedCommandProgram::NetworkSetup),
             "wireguard-go" => Some(PrivilegedCommandProgram::WireguardGo),
-            "kill" => Some(PrivilegedCommandProgram::Kill),
+            _ if value == crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM => {
+                Some(PrivilegedCommandProgram::TerminateWireguardGo)
+            }
             _ if value == crate::linux_dns_protect::DNS_FAILCLOSED_FILE_PROGRAM => {
                 Some(PrivilegedCommandProgram::DnsFailclosedFile)
             }
@@ -354,6 +367,7 @@ impl PrivilegedCommandProgram {
                 | PrivilegedCommandProgram::MacosPfLoad
                 | PrivilegedCommandProgram::LinuxFirewalldZone
                 | PrivilegedCommandProgram::LinuxConntrackFlush
+                | PrivilegedCommandProgram::TerminateWireguardGo
         )
     }
 
@@ -386,16 +400,19 @@ impl PrivilegedCommandProgram {
                 "/opt/homebrew/bin/wireguard-go",
                 "/usr/bin/wireguard-go",
             ],
-            PrivilegedCommandProgram::Kill => &["/bin/kill", "/usr/bin/kill"],
             // In-helper builtins: no external binary for the program itself.
             // Routed to their in-process handler before exec; the empty
             // candidate set fails closed if it ever reaches binary resolution.
             // (The macOS pf-load builtin internally resolves `pfctl` via the
-            // Pfctl candidate set, not this one.)
+            // Pfctl candidate set, not this one; the terminate-wireguard-go
+            // builtin internally resolves `ps` and `kill` inside
+            // `wireguard_go_terminate` — the client can never name or redirect
+            // either.)
             PrivilegedCommandProgram::DnsFailclosedFile
             | PrivilegedCommandProgram::MacosPfLoad
             | PrivilegedCommandProgram::LinuxFirewalldZone
-            | PrivilegedCommandProgram::LinuxConntrackFlush => &[],
+            | PrivilegedCommandProgram::LinuxConntrackFlush
+            | PrivilegedCommandProgram::TerminateWireguardGo => &[],
         }
     }
 
@@ -1238,6 +1255,9 @@ fn execute_builtin(
         PrivilegedCommandProgram::LinuxConntrackFlush => execute_linux_conntrack_flush(args),
         #[cfg(not(windows))]
         PrivilegedCommandProgram::LinuxFirewalldZone => execute_linux_firewalld_zone(args),
+        PrivilegedCommandProgram::TerminateWireguardGo => {
+            crate::wireguard_go_terminate::execute_terminate_wireguard_go(args)
+        }
         // No other builtins exist; fail closed if one is added without a handler.
         _ => Err(format!("no in-process handler for builtin {program}")),
     }
@@ -1788,7 +1808,10 @@ pub(crate) fn try_execute_builtin_program(
 }
 
 #[cfg(not(windows))]
-fn validate_privileged_program_binary(path: &Path, label: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_privileged_program_binary(
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!(
             "{label} binary path must be absolute: {}",
@@ -1934,7 +1957,9 @@ pub fn validate_request(program: PrivilegedCommandProgram, args: &[&str]) -> Res
         PrivilegedCommandProgram::Pfctl => validate_pfctl_args(args),
         PrivilegedCommandProgram::NetworkSetup => validate_networksetup_args(args),
         PrivilegedCommandProgram::WireguardGo => validate_wireguard_go_args(args),
-        PrivilegedCommandProgram::Kill => validate_kill_args(args),
+        PrivilegedCommandProgram::TerminateWireguardGo => {
+            crate::wireguard_go_terminate::validate_terminate_wireguard_go_args(args)
+        }
         PrivilegedCommandProgram::DnsFailclosedFile => validate_dns_failclosed_file_args(args),
         PrivilegedCommandProgram::MacosPfLoad => validate_macos_pf_load_args(args),
         PrivilegedCommandProgram::LinuxFirewalldZone => validate_linux_firewalld_zone_args(args),
@@ -3292,13 +3317,6 @@ fn validate_wireguard_go_args(args: &[&str]) -> Result<(), String> {
     }
 }
 
-fn validate_kill_args(args: &[&str]) -> Result<(), String> {
-    match args {
-        ["-TERM", pid] if pid.parse::<u32>().map(|value| value > 1).unwrap_or(false) => Ok(()),
-        _ => Err("unsupported kill argument schema".to_owned()),
-    }
-}
-
 #[cfg(not(windows))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -3604,6 +3622,64 @@ mod tests {
             PrivilegedCommandProgram::parse(program.as_str()),
             Some(program)
         );
+    }
+
+    #[test]
+    fn generic_kill_program_is_removed_from_helper_allowlist() {
+        // RSA-0033: no client may ever name a pid to the helper again. The
+        // generic kill program must fail to parse on every execution path.
+        assert_eq!(PrivilegedCommandProgram::parse("kill"), None);
+    }
+
+    #[test]
+    fn terminate_wireguard_go_builtin_never_resolves_an_external_binary() {
+        // The builtin must never reach the exec path for the PROGRAM itself;
+        // is_builtin classifies it as in-process and resolve_binary must fail
+        // closed. (It execs ps/kill internally, inside wireguard_go_terminate,
+        // with fixed validated paths the client cannot name.)
+        assert!(PrivilegedCommandProgram::TerminateWireguardGo.is_builtin());
+        let err = PrivilegedCommandProgram::TerminateWireguardGo
+            .resolve_binary()
+            .expect_err("builtin must have no external binary");
+        assert!(err.contains("builtin"), "{err}");
+    }
+
+    #[test]
+    fn terminate_wireguard_go_program_token_round_trips() {
+        let program = PrivilegedCommandProgram::TerminateWireguardGo;
+        assert_eq!(
+            program.as_str(),
+            crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM
+        );
+        assert_eq!(
+            PrivilegedCommandProgram::parse(program.as_str()),
+            Some(program)
+        );
+    }
+
+    #[test]
+    fn terminate_wireguard_go_bad_interface_is_refused_before_execution() {
+        // handle_request path: a bad interface is refused at validation and
+        // never reaches the in-process executor (no ps, no kill).
+        let response = handle_request(HelperRequest {
+            program: crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM.to_owned(),
+            args: vec!["en0".to_owned()],
+        });
+        assert!(!response.ok, "non-utun interface must fail");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|err| err.contains("utun")),
+            "refusal must cite the interface rule: {:?}",
+            response.error
+        );
+
+        let response = handle_request(HelperRequest {
+            program: crate::wireguard_go_terminate::TERMINATE_WIREGUARD_GO_PROGRAM.to_owned(),
+            args: vec!["utun7".to_owned(), "extra".to_owned()],
+        });
+        assert!(!response.ok, "extra arguments must fail");
     }
 
     #[test]
@@ -4626,7 +4702,7 @@ mod tests {
                 "ifconfig" => PrivilegedCommandProgram::Ifconfig,
                 "route" => PrivilegedCommandProgram::Route,
                 "wireguard-go" => PrivilegedCommandProgram::WireguardGo,
-                "kill" => PrivilegedCommandProgram::Kill,
+                "terminate-wireguard-go" => PrivilegedCommandProgram::TerminateWireguardGo,
                 other => {
                     return Err(BackendError::invalid_input(format!(
                         "unexpected program {other}"

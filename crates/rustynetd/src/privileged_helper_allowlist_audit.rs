@@ -181,18 +181,6 @@ pub fn allowlist_audit_corpus() -> Vec<AllowlistAuditCase> {
             expectation: Deny,
         },
         AllowlistAuditCase {
-            label: "kill_pid_one",
-            program: "kill",
-            args: &["-TERM", "1"],
-            expectation: Deny,
-        },
-        AllowlistAuditCase {
-            label: "kill_non_term_signal",
-            program: "kill",
-            args: &["-KILL", "4321"],
-            expectation: Deny,
-        },
-        AllowlistAuditCase {
             label: "wg_interface_shell_injection",
             program: "wg",
             args: &["show", "wg0; rm -rf /", "latest-handshakes"],
@@ -294,10 +282,10 @@ pub fn allowlist_audit_corpus() -> Vec<AllowlistAuditCase> {
             expectation: Allow,
         },
         AllowlistAuditCase {
-            label: "kill_term_normal_pid",
+            label: "generic_kill_program_no_longer_parses",
             program: "kill",
             args: &["-TERM", "4321"],
-            expectation: Allow,
+            expectation: Deny,
         },
         AllowlistAuditCase {
             label: "wg_version",
@@ -334,6 +322,26 @@ pub fn allowlist_audit_corpus() -> Vec<AllowlistAuditCase> {
                 "198.51.100.7:51820",
             ],
             expectation: Allow,
+        },
+        // RSA-0033 rework: the purpose-built terminate builtin replaces the
+        // generic kill. A validated utun interface name is the reviewed schema.
+        AllowlistAuditCase {
+            label: "terminate_wireguard_go_valid_interface",
+            program: "terminate-wireguard-go",
+            args: &["utun7"],
+            expectation: Allow,
+        },
+        AllowlistAuditCase {
+            label: "terminate_wireguard_go_non_utun_interface",
+            program: "terminate-wireguard-go",
+            args: &["en0"],
+            expectation: Deny,
+        },
+        AllowlistAuditCase {
+            label: "terminate_wireguard_go_extra_argument",
+            program: "terminate-wireguard-go",
+            args: &["utun7", "-9"],
+            expectation: Deny,
         },
     ]
 }
