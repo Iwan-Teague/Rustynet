@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -906,7 +916,14 @@ impl RuntimeState {
                 break;
             };
             drained += 1;
-            let payload = &scratch[..len];
+            // `try_recv_into` never reports more bytes than the scratch
+            // holds, so this is `Some` on every reachable path; the guard
+            // keeps the per-datagram path panic-free anyway (AQ-08 step 4).
+            let payload = scratch.get(..len).ok_or_else(|| {
+                BackendError::internal(
+                    "authoritative socket receive length exceeds scratch capacity",
+                )
+            })?;
             if self.try_deliver_round_trip_response(remote_addr, payload)? {
                 continue;
             }
@@ -957,7 +974,12 @@ impl RuntimeState {
                 break;
             };
             drained += 1;
-            let packet = &scratch[..len];
+            // `recv_packet_into` never reports more bytes than the scratch
+            // holds, so this is `Some` on every reachable path; the guard
+            // keeps the per-packet path panic-free anyway (AQ-08 step 4).
+            let packet = scratch.get(..len).ok_or_else(|| {
+                BackendError::internal("TUN receive length exceeds scratch capacity")
+            })?;
             let transport_generation = self.authoritative_socket.transport_generation();
             let Self {
                 engine,
@@ -1018,6 +1040,12 @@ impl RuntimeState {
         Ok(())
     }
 
+    // AQ-08 step 4 stated-invariant item allow: `outstanding_round_trip`
+    // is checked `Some` at the top of this function, and nothing between
+    // that check and the `take` can mutate it (the only fallible call,
+    // `local_addr()`, returns early without taking), so the `expect` is
+    // unreachable on every reachable path.
+    #[allow(clippy::expect_used)]
     fn try_deliver_round_trip_response(
         &mut self,
         remote_addr: SocketAddr,

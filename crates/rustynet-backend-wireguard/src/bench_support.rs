@@ -12,6 +12,15 @@
 //! same transport-data code path the worker loop hits per packet.
 
 #![cfg(any(test, feature = "test-harness"))]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -52,6 +61,13 @@ impl EngineIoSink for CapturingIoSink {
     }
 }
 
+/// Bench-only harness. The `expect`s below are allowed at item scope
+/// (AQ-08 step 4): the only inputs are fresh unique paths under
+/// `std::env::temp_dir()` keyed by pid + key byte, so an `expect` can
+/// fire only if the machine's temp directory is broken — there is no
+/// recoverable error channel for a bench fixture, and the documented
+/// contract (see [`DataplaneEnginePair::handshaken`]) is to abort.
+#[allow(clippy::expect_used)]
 fn write_key_file(bytes: &[u8; 32]) -> std::path::PathBuf {
     let encoded = BASE64_STANDARD.encode(bytes);
     let dir = std::env::temp_dir().join(format!(
@@ -71,17 +87,32 @@ fn write_key_file(bytes: &[u8; 32]) -> std::path::PathBuf {
 /// inside `10.0.0.0/8`, padded to `len` bytes. Enough for
 /// `Tunn::dst_address` to route it and for the engine to encrypt it.
 fn sample_ipv4_packet(len: usize) -> Vec<u8> {
-    let mut packet = vec![0u8; len.max(20)];
-    packet[0] = 0x45; // IPv4, IHL=5
-    let total_len = (packet.len() as u16).to_be_bytes();
-    packet[2] = total_len[0];
-    packet[3] = total_len[1];
-    packet[8] = 64; // TTL
-    packet[9] = 17; // UDP
+    let packet_len = len.max(20);
+    // Fixed 20-byte header written as constant array indices (never
+    // out of bounds by construction) instead of `Vec` slicing
+    // (AQ-08 step 4); every other byte stays zero as before.
+    let mut header = [0u8; 20];
+    header[0] = 0x45; // IPv4, IHL=5
+    let total_len = (packet_len as u16).to_be_bytes();
+    header[2] = total_len[0];
+    header[3] = total_len[1];
+    header[8] = 64; // TTL
+    header[9] = 17; // UDP
     // Source 10.0.0.1
-    packet[12..16].copy_from_slice(&[10, 0, 0, 1]);
+    header[12] = 10;
+    header[13] = 0;
+    header[14] = 0;
+    header[15] = 1;
     // Destination 10.0.0.2 (inside the peer's allowed IPs)
-    packet[16..20].copy_from_slice(&[10, 0, 0, 2]);
+    header[16] = 10;
+    header[17] = 0;
+    header[18] = 0;
+    header[19] = 2;
+    let mut packet = vec![0u8; packet_len];
+    // `packet_len >= 20 == header.len()` by the `max` above, so this
+    // copy cannot fail (AQ-08 step 4).
+    let (header_slot, _payload) = packet.split_at_mut(header.len());
+    header_slot.copy_from_slice(&header);
     packet
 }
 
@@ -112,6 +143,14 @@ impl DataplaneEnginePair {
     /// distinct endpoints and allowed-IP ranges that never match the
     /// benchmarked traffic, so the forwarded packets still resolve to
     /// the real peer — only the lookup cost scales with `extra_peers`.
+    // AQ-08 step 4: every fallible call below operates on fixed,
+    // compile-time-valid literals (loopback addresses, node ids,
+    // allowed-IP ranges) fed to freshly constructed engines, so it
+    // cannot fail on any reachable path; the loopback addresses are
+    // built directly instead of parsed. Any `expect` firing means
+    // the harness itself is broken, and the documented contract
+    // (see [`Self::handshaken`]) is to abort the bench.
+    #[allow(clippy::expect_used)]
     pub fn handshaken_with_extra_peers(extra_peers: usize) -> Self {
         let sender_secret = [7u8; 32];
         let receiver_secret = [9u8; 32];
@@ -123,8 +162,12 @@ impl DataplaneEnginePair {
         let mut receiver =
             UserspaceEngine::from_private_key_file(&receiver_key_path).expect("receiver engine");
 
-        let sender_addr: SocketAddr = "127.0.0.1:40001".parse().expect("sender addr");
-        let receiver_addr: SocketAddr = "127.0.0.1:40002".parse().expect("receiver addr");
+        // Direct loopback construction (identical values to the former
+        // `"127.0.0.1:4000x".parse()`; AQ-08 step 4).
+        let sender_addr =
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40_001);
+        let receiver_addr =
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 40_002);
 
         let sender_public = x25519_public(&sender_secret);
         let receiver_public = x25519_public(&receiver_secret);
@@ -195,6 +238,10 @@ impl DataplaneEnginePair {
         pair
     }
 
+    // Same stated-invariant item allow as `handshaken_with_extra_peers`
+    // (AQ-08 step 4): the pair was just built from fixed literals, so the
+    // fixed-generation handshake below cannot fail on any reachable path.
+    #[allow(clippy::expect_used)]
     fn drive_handshake(&mut self) {
         // Sender → receiver handshake initiation.
         let mut init_sink = CapturingIoSink::default();
@@ -256,6 +303,9 @@ impl DataplaneEnginePair {
     /// Returns `None` if the engine produced no data frame this call
     /// (e.g. mid-handshake) — the bench drives a completed handshake
     /// so steady state yields `Some`.
+    // AQ-08 step 4 item allow, same stated invariant as `drive_handshake`:
+    // steady-state engine ops on a completed handshaken pair cannot fail.
+    #[allow(clippy::expect_used)]
     pub fn encrypt_sample(&mut self) -> Option<Vec<u8>> {
         let mut sink = CapturingIoSink::default();
         self.sender
@@ -267,6 +317,9 @@ impl DataplaneEnginePair {
     /// Decrypt one ciphertext datagram through the receiver engine
     /// (inbound hot path). Returns the number of plaintext packets
     /// delivered to the tunnel (1 for a data frame).
+    // AQ-08 step 4 item allow, same stated invariant as `drive_handshake`:
+    // steady-state engine ops on a completed handshaken pair cannot fail.
+    #[allow(clippy::expect_used)]
     pub fn decrypt(&mut self, ciphertext: Vec<u8>) -> usize {
         let mut sink = CapturingIoSink::default();
         self.receiver

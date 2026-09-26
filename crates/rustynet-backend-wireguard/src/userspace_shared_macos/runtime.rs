@@ -1,4 +1,13 @@
 #![cfg_attr(test, allow(dead_code))]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -965,7 +974,14 @@ impl RuntimeState {
                 break;
             };
             drained += 1;
-            let payload = &scratch[..len];
+            // `try_recv_into` never reports more bytes than the scratch
+            // holds, so this is `Some` on every reachable path; the guard
+            // keeps the per-datagram path panic-free anyway (AQ-08 step 4).
+            let payload = scratch.get(..len).ok_or_else(|| {
+                BackendError::internal(
+                    "authoritative socket receive length exceeds scratch capacity",
+                )
+            })?;
             if self.try_deliver_round_trip_response(remote_addr, payload)? {
                 continue;
             }
@@ -1029,7 +1045,12 @@ impl RuntimeState {
                 break;
             };
             drained += 1;
-            let packet = &scratch[..len];
+            // `recv_packet_into` never reports more bytes than the scratch
+            // holds, so this is `Some` on every reachable path; the guard
+            // keeps the per-packet path panic-free anyway (AQ-08 step 4).
+            let packet = scratch.get(..len).ok_or_else(|| {
+                BackendError::internal("TUN receive length exceeds scratch capacity")
+            })?;
             let transport_generation = self.authoritative_socket.transport_generation();
             let Self {
                 engine,

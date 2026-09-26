@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::BTreeMap;
 use std::process::Command;
 
@@ -665,31 +675,14 @@ pub(crate) fn parse_peer_latest_handshake_unix(
 }
 
 pub(crate) fn encode_wg_public_key_base64(value: &[u8; 32]) -> String {
-    const BASE64_TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::with_capacity(44);
-    let mut index = 0usize;
-    while index + 3 <= value.len() {
-        let chunk = (u32::from(value[index]) << 16)
-            | (u32::from(value[index + 1]) << 8)
-            | u32::from(value[index + 2]);
-        output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[(chunk & 0x3f) as usize] as char);
-        index += 3;
-    }
-
-    let remaining = value.len() - index;
-    if remaining == 2 {
-        let chunk = (u32::from(value[index]) << 16) | (u32::from(value[index + 1]) << 8);
-        output.push(BASE64_TABLE[((chunk >> 18) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 12) & 0x3f) as usize] as char);
-        output.push(BASE64_TABLE[((chunk >> 6) & 0x3f) as usize] as char);
-        output.push('=');
-    }
-
-    output
+    // AQ-08 step 4: the hand-rolled table/index encoder (12 indexing
+    // sites) is replaced by the crate's STANDARD encoder, which emits
+    // the identical RFC 4648 alphabet + `=` padding — byte-for-byte the
+    // same 44-character output for every 32-byte input (the only input
+    // length this signature accepts). Verified by the differential
+    // harness (see REVIEW-aq08-step4 report).
+    use base64::Engine as _;
+    base64::prelude::BASE64_STANDARD.encode(value)
 }
 
 #[cfg(test)]

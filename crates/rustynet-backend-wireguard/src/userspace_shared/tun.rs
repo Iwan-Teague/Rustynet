@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::ErrorKind;
@@ -63,14 +73,17 @@ impl TunDevice {
                 let Some(packet) = handle.dequeue_nonempty_inbound_packet() else {
                     return Ok(None);
                 };
-                if packet.len() > scratch.len() {
+                // Single bounds-checked copy: `get_mut` is `None` exactly when
+                // `packet.len() > scratch.len()`, the same condition the explicit
+                // check above rejects (AQ-08 step 4).
+                let Some(slot) = scratch.get_mut(..packet.len()) else {
                     return Err(BackendError::internal(format!(
                         "linux userspace-shared TUN test packet of {} bytes exceeds the {} byte receive scratch",
                         packet.len(),
                         scratch.len()
                     )));
-                }
-                scratch[..packet.len()].copy_from_slice(&packet);
+                };
+                slot.copy_from_slice(&packet);
                 Ok(Some(packet.len()))
             }
         }
@@ -672,55 +685,88 @@ pub(crate) struct TunTestState {
 }
 
 impl TunTestState {
+    // Every `lock()` below recovers from poisoning with
+    // `PoisonError::into_inner` (same pattern as rustynetd's
+    // unix_shutdown_signals, AQ-08 step 4): this is plain test-state
+    // bookkeeping with no error channel, and a panicked writer cannot
+    // corrupt the counters it protects.
+
     fn record_prepare(&self, interface_name: &str, local_cidr: &str) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.prepare_calls += 1;
         inner.last_interface_name = Some(interface_name.to_owned());
         inner.last_local_cidr = Some(local_cidr.to_owned());
     }
 
     fn record_cleanup(&self, interface_name: &str) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.cleanup_calls += 1;
         inner.last_cleanup_interface_name = Some(interface_name.to_owned());
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_next_recv_error(&self, message: impl Into<String>) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.next_recv_error = Some(message.into());
     }
 
     fn increment_live_handles(&self) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.live_handles += 1;
     }
 
     fn decrement_live_handles(&self) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.live_handles = inner.live_handles.saturating_sub(1);
     }
 
     fn record_route_reconcile(&self, interface_name: &str) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_reconcile_calls += 1;
         inner.last_route_interface_name = Some(interface_name.to_owned());
     }
 
     fn clear_programmed_routes(&self) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.programmed_route_cidrs.clear();
     }
 
     #[allow(dead_code)]
     fn queue_inbound_packet(&self, packet: Vec<u8>) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.queued_inbound_packets.push_back(packet);
     }
 
     #[allow(dead_code)]
     fn dequeue_inbound_packet(&self) -> Option<Vec<u8>> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.queued_inbound_packets.pop_front()
     }
 
@@ -736,47 +782,71 @@ impl TunTestState {
 
     #[allow(dead_code)]
     fn take_next_recv_error(&self) -> Option<String> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.next_recv_error.take()
     }
 
     #[allow(dead_code)]
     fn record_outbound_packet(&self, packet: Vec<u8>) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.recorded_outbound_packets.push(packet);
     }
 
     #[allow(dead_code)]
     fn recorded_outbound_packets(&self) -> Vec<Vec<u8>> {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.recorded_outbound_packets.clone()
     }
 
     fn record_exit_mode_reconcile(&self, target_mode: ExitMode) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_reconcile_calls += 1;
         inner.last_exit_mode_target = Some(target_mode);
     }
 
     fn route_behavior(&self) -> TestRouteBehavior {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_behavior.clone()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_route_behavior(&self, behavior: TestRouteBehavior) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.route_behavior = behavior;
     }
 
     fn exit_mode_behavior(&self) -> TestExitModeBehavior {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_behavior.clone()
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_exit_mode_behavior(&self, behavior: TestExitModeBehavior) {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.exit_mode_behavior = behavior;
     }
 
@@ -787,7 +857,10 @@ impl TunTestState {
         route_behavior: &TestRouteBehavior,
         failures_enabled: bool,
     ) -> Result<(), BackendError> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         for cidr in next_programmed {
             if failures_enabled {
@@ -831,7 +904,10 @@ impl TunTestState {
         exit_mode_behavior: &TestExitModeBehavior,
         failures_enabled: bool,
     ) -> Result<(), BackendError> {
-        let mut inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         if failures_enabled {
             maybe_fail_exit_mode_delete_table(exit_mode_behavior)?;
@@ -867,7 +943,10 @@ impl TunTestState {
 
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn snapshot(&self) -> TunTestSnapshot {
-        let inner = self.inner.lock().expect("tun test state mutex poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         TunTestSnapshot {
             prepare_calls: inner.prepare_calls,
             cleanup_calls: inner.cleanup_calls,

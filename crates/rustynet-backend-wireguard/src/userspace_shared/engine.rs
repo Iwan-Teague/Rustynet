@@ -1,3 +1,13 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs;
@@ -890,9 +900,17 @@ impl UserspaceEngine {
             encrypt_scratch,
             ..
         } = self;
-        let peer_state = peer_states
-            .get_mut(&node_id)
-            .expect("selected peer state should exist");
+        // The destination selection above can only return a `NodeId` with
+        // live state in `peer_states`, so this guard never fires on any
+        // reachable path — but the packet path must never panic (a panic
+        // kills the engine's single worker thread), so like the inbound
+        // dispatch below it fails closed with an error instead of
+        // `expect` (AQ-08 step 4).
+        let Some(peer_state) = peer_states.get_mut(&node_id) else {
+            return Err(BackendError::internal(
+                "selected peer state missing after destination selection",
+            ));
+        };
         // Reuse the long-lived scratch buffer; grow only if a packet ever needs
         // more than the standard ceiling (it cannot on this path — the TUN/UDP
         // read buffers cap at 65 535 — but the resize preserves byte-identical
@@ -1080,7 +1098,12 @@ impl UserspaceEngine {
     /// boundaries only (never between the ordered mutation steps, where the
     /// invariant is legitimately mid-flight) and after every mutation in the
     /// random-mutation fuzz test.
+    // AQ-08 step 4: this debug/test-only checker's entire contract is to
+    // abort loudly on receiver-index corruption — its `assert_eq!`s abort
+    // the same way — so the one explicit `panic!` shares that stated
+    // invariant and the allow is item-scoped.
     #[cfg(any(test, debug_assertions))]
+    #[allow(clippy::panic)]
     fn verify_receiver_index_consistent(&self) {
         assert_eq!(
             self.receiver_index.len(),
