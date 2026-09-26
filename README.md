@@ -81,18 +81,18 @@ An operator could be compelled to produce:
  upkeep; the last transport entry carries the replay-store path): `transport.rs: 1126, 1974, 2290`, `blind_relay_listener.rs: 1140`, `main.rs: 637, 785`;
  identifier-free per-event lines (rejection reasons and lifecycle — still a per-flow
  frequency signal, see side channels below): `main.rs: 816, 820, 826, 945, 973, 978, 983, 2043, 2098, 3553, 7508`, `transport.rs: 1325, 1425, 1431, 1441, 1529, 1535, 1551, 1575, 1584, 1592, 1620, 1634, 1640, 1651, 1662, 1669, 1687`;
-  CLI/build output, not daemon logging: `main.rs: 3270, 3283, 7515`.
+ CLI/build output, not daemon logging: `main.rs: 3270, 3283, 7515`.
  Counted: 22 sites in `transport.rs` — every `eprintln!` in that file,
  whose test module starts at `:2568`, so all 22 are production (the file
  itself warns that earlier `#[cfg(test)]` attributes sit on production
  helpers, `transport.rs:5090-5095`) — plus 25 in `main.rs` (20 logging
-  sites above, 2 socket-buffer operational warnings, 1 flag warning, the
-  usage text and the feature gate) and 1 in
- `blind_relay_listener.rs` (whose test module starts at `:1437`): **48 sites**, last machine-audited complete for commit 80ed3efc6b9452836309218a20009d0691dcf082 and pending re-stamp — the `relay_accept_v1` dispatch wiring removed the former `--no-relay-accept-v1` warning site (was main.rs:3247 at the audited commit; 49 sites there), and the pin must be re-stamped to the suite commit that lands this change, until which the gate's at-pin total check reads the stale 49 by design. The line spans above were re-derived by the gate's scanner against this tree (25 `main.rs` sites shifted by the dispatch wiring's inserted lines); only the at-pin total check remains red until the re-stamp. "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
+ sites above, 2 socket-buffer operational warnings, 1 flag warning, the
+ usage text and the feature gate) and 1 in
+ `blind_relay_listener.rs` (whose test module starts at `:1437`): **48 sites, complete for commit a143fbf62e81dc214ceff95e0993ff8da76d7dd5.** The previous audit (commit 80ed3efc6b9452836309218a20009d0691dcf082, 49 sites) still counted the `--no-relay-accept-v1` "not wired" warning, which the `relay_accept_v1` dispatch wiring removed (it was main.rs:3247 there). "Complete" is now a machine claim rather than a promise: `tooling/check_stderr_inventory.sh` re-derives this set on every run and fails on drift in either direction. What it covers, stated so the word is not read wider than it is earned — `eprintln!` and `eprint!` in the relay crate outside `#[cfg(test)]` modules, plus a zero-tolerance check on `io::stderr` and `dbg!`, plus a requirement that the linked first-party lib code carry no `eprintln!` at all. It does NOT see a write made through `libc::write(2, ..)`, a raw fd 2, `panic!`, or a `tracing` sink configured to stderr; those are different mechanisms and are out of this inventory's scope by construction, not by oversight. One-shot subcommands print JSON reports to
  stdout, not stderr: `hello-limiter-audit` (`main.rs:3341-3355`) and
  `windows-service-hardening-check` (`main.rs:3357-3372`). New logging
  code added after the audited commit is a gap until the inventory is
- re-run; do not extend this list by hand. This 2026-09-25 revision is
+ re-run; do not extend this list by hand. This 2026-09-26 revision is
  that re-run, not a hand extension: every line, count and category above
  was re-derived by the gate at the pinned commit. Re-count with
  `tooling/check_stderr_inventory.sh` (witness:
