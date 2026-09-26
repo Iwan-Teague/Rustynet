@@ -4604,7 +4604,6 @@ mod tests {
         parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
-    use rustynet_crypto::{AlgorithmPolicy, CompatibilityException, CryptoAlgorithm};
     use rustynet_policy::{
         MembershipDirectory, MembershipStatus, PolicyRule, PolicySet, Protocol, RuleAction,
     };
@@ -5163,18 +5162,6 @@ mod tests {
             protocol: "tcp".to_owned(),
         });
         assert_eq!(decision, PolicyDecision::Deny);
-    }
-
-    #[test]
-    fn algorithm_policy_rejects_compatibility_exceptions() {
-        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
-            algorithm: CryptoAlgorithm::Sha1,
-            expires_unix_seconds: 150,
-        }]);
-        assert!(result.is_err());
-
-        let policy = AlgorithmPolicy::default();
-        assert!(policy.validate(CryptoAlgorithm::Sha1, 149).is_err());
     }
 
     #[test]

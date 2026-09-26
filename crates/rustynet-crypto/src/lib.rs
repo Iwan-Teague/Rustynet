@@ -92,8 +92,6 @@ pub enum CryptoError {
     InvalidLength,
     WeakMaterial,
     DeniedAlgorithm,
-    ExceptionExpired,
-    InvalidException,
     PermissionDenied,
     PermissionValidationUnavailable,
     OsStoreUnavailable,
@@ -120,8 +118,6 @@ impl fmt::Display for CryptoError {
             CryptoError::InvalidLength => f.write_str("invalid key length"),
             CryptoError::WeakMaterial => f.write_str("weak key material"),
             CryptoError::DeniedAlgorithm => f.write_str("algorithm denied by policy"),
-            CryptoError::ExceptionExpired => f.write_str("compatibility exception has expired"),
-            CryptoError::InvalidException => f.write_str("compatibility exception is invalid"),
             CryptoError::PermissionDenied => f.write_str("key custody permission check failed"),
             CryptoError::PermissionValidationUnavailable => {
                 f.write_str("permission validation unavailable on this platform")
@@ -219,53 +215,26 @@ pub enum CryptoAlgorithm {
     WeakDh,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompatibilityException {
-    pub algorithm: CryptoAlgorithm,
-    pub expires_unix_seconds: u64,
-}
-
+/// RSA-0003 (closed 2026-09-26): the crypto-layer compatibility-exception
+/// facility was deleted (the audit's option (a)). Nothing consumed it, and
+/// repairing its inverted guard would have opened an ungoverned route for
+/// denylisted algorithms. `AlgorithmPolicy` is pure default-deny: allowlisted
+/// algorithms pass, everything else - including every denylisted algorithm -
+/// is refused with [`CryptoError::DeniedAlgorithm`]. Time-bounded
+/// compatibility exceptions remain governed by rustynet-control's
+/// `InsecureCompatibilityException` (`ga.rs`), which acceptance row P1-AT-12
+/// exercises.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AlgorithmPolicy {
-    exceptions: Vec<CompatibilityException>,
-}
+pub struct AlgorithmPolicy {}
 
 impl AlgorithmPolicy {
-    pub fn with_exceptions(exceptions: Vec<CompatibilityException>) -> Result<Self, CryptoError> {
-        if !exceptions.is_empty() {
-            return Err(CryptoError::InvalidException);
-        }
-        for exception in &exceptions {
-            if !is_denylisted(exception.algorithm) {
-                return Err(CryptoError::InvalidException);
-            }
-        }
-
-        Ok(Self { exceptions })
-    }
-
     pub fn validate(
         &self,
         algorithm: CryptoAlgorithm,
-        now_unix_seconds: u64,
+        _now_unix_seconds: u64,
     ) -> Result<(), CryptoError> {
         if is_allowlisted(algorithm) {
             return Ok(());
-        }
-
-        if is_denylisted(algorithm) {
-            if let Some(exception) = self
-                .exceptions
-                .iter()
-                .find(|entry| entry.algorithm == algorithm)
-            {
-                if now_unix_seconds <= exception.expires_unix_seconds {
-                    return Ok(());
-                }
-                return Err(CryptoError::ExceptionExpired);
-            }
-
-            return Err(CryptoError::DeniedAlgorithm);
         }
 
         Err(CryptoError::DeniedAlgorithm)
@@ -291,19 +260,6 @@ fn is_allowlisted(algorithm: CryptoAlgorithm) -> bool {
             | CryptoAlgorithm::Argon2id
             | CryptoAlgorithm::Aes256Gcm
             | CryptoAlgorithm::XChaCha20Poly1305
-    )
-}
-
-fn is_denylisted(algorithm: CryptoAlgorithm) -> bool {
-    matches!(
-        algorithm,
-        CryptoAlgorithm::Md5
-            | CryptoAlgorithm::Sha1
-            | CryptoAlgorithm::Rc4
-            | CryptoAlgorithm::Des
-            | CryptoAlgorithm::TripleDes
-            | CryptoAlgorithm::BlowfishCbc
-            | CryptoAlgorithm::WeakDh
     )
 }
 
@@ -3472,14 +3428,13 @@ mod tests {
     }
 
     use super::{
-        AlgorithmPolicy, CompatibilityException, CryptoAlgorithm, CryptoError,
-        Ed25519SigningProvider, KeyCustodyManager, KeyCustodyPermissionPolicy, NoOsSecureStore,
-        NodeKeyPair, SigningProvider, SigningProviderKind, SigningProviderPolicy,
-        WINDOWS_KEY_CUSTODY_FILE_SDDL, create_provider_attestation, decode_encrypted_blob_v0,
-        decode_encrypted_blob_v1, decrypt_private_key_envelope, encrypt_private_key_envelope,
-        generate_key_custody_material, sddl_ace_principals, try_generate_key_custody_material,
-        validate_signing_provider_policy, verify_provider_attestation,
-        windows_key_custody_sddl_is_hardened,
+        AlgorithmPolicy, CryptoAlgorithm, CryptoError, Ed25519SigningProvider, KeyCustodyManager,
+        KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair, SigningProvider,
+        SigningProviderKind, SigningProviderPolicy, WINDOWS_KEY_CUSTODY_FILE_SDDL,
+        create_provider_attestation, decode_encrypted_blob_v0, decode_encrypted_blob_v1,
+        decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
+        sddl_ace_principals, try_generate_key_custody_material, validate_signing_provider_policy,
+        verify_provider_attestation, windows_key_custody_sddl_is_hardened,
     };
     use ed25519_dalek::SigningKey;
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
@@ -4111,42 +4066,46 @@ mod tests {
     }
 
     #[test]
-    fn denylisted_algorithm_exceptions_are_rejected() {
-        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
-            algorithm: CryptoAlgorithm::Sha1,
-            expires_unix_seconds: 200,
-        }]);
-        assert_eq!(result.err(), Some(CryptoError::InvalidException));
-    }
-
-    #[test]
-    fn denylisted_algorithm_remains_denied_without_exceptions() {
+    fn default_policy_denies_every_denylisted_and_accepts_every_allowlisted_algorithm() {
+        // P1-AT-11 pin: the default policy refuses EVERY denylisted variant
+        // with DeniedAlgorithm and accepts EVERY allowlisted variant.
+        // RSA-0003 (2026-09-26): there is no exception route left to exercise.
         let policy = AlgorithmPolicy::default();
-        let result = policy.validate(CryptoAlgorithm::Sha1, 201);
-        assert_eq!(result.err(), Some(CryptoError::DeniedAlgorithm));
-    }
 
-    #[test]
-    fn denylisted_algorithm_with_expired_exception_is_rejected() {
-        let policy = AlgorithmPolicy {
-            exceptions: vec![CompatibilityException {
-                algorithm: CryptoAlgorithm::Sha1,
-                expires_unix_seconds: 200,
-            }],
-        };
+        for algorithm in [
+            CryptoAlgorithm::Md5,
+            CryptoAlgorithm::Sha1,
+            CryptoAlgorithm::Rc4,
+            CryptoAlgorithm::Des,
+            CryptoAlgorithm::TripleDes,
+            CryptoAlgorithm::BlowfishCbc,
+            CryptoAlgorithm::WeakDh,
+        ] {
+            assert_eq!(
+                policy.validate(algorithm, 0).err(),
+                Some(CryptoError::DeniedAlgorithm),
+                "denylisted {algorithm:?} must be refused with DeniedAlgorithm"
+            );
+        }
 
-        let result = policy.validate(CryptoAlgorithm::Sha1, 201);
-        assert_eq!(result.err(), Some(CryptoError::ExceptionExpired));
-    }
-
-    #[test]
-    fn invalid_exception_for_allowlisted_algorithm_is_rejected() {
-        let result = AlgorithmPolicy::with_exceptions(vec![CompatibilityException {
-            algorithm: CryptoAlgorithm::Tls13,
-            expires_unix_seconds: 200,
-        }]);
-
-        assert_eq!(result.err(), Some(CryptoError::InvalidException));
+        for algorithm in [
+            CryptoAlgorithm::Tls13,
+            CryptoAlgorithm::TunnelTransportAead,
+            CryptoAlgorithm::Ed25519,
+            CryptoAlgorithm::Sha256,
+            CryptoAlgorithm::Sha512,
+            CryptoAlgorithm::Blake2s,
+            CryptoAlgorithm::Blake2b,
+            CryptoAlgorithm::HkdfSha256,
+            CryptoAlgorithm::Argon2id,
+            CryptoAlgorithm::Aes256Gcm,
+            CryptoAlgorithm::XChaCha20Poly1305,
+        ] {
+            assert!(
+                policy.validate(algorithm, 0).is_ok(),
+                "allowlisted {algorithm:?} must be accepted"
+            );
+        }
     }
 
     #[test]

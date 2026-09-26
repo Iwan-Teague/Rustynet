@@ -327,11 +327,15 @@ impl MembershipState {
         // here, once, so every downstream signer-counting site is sound by
         // construction rather than needing its own dedup-by-key logic.
         let mut approver_keys: HashSet<[u8; 32]> = HashSet::new();
+        // RSA-0075: the count stays usize — `count() as u8` wrapped at 256,
+        // reporting 0 active approvers for a well-formed 256-member roster
+        // (and `count % 256` in general). Quorum consumers widen the u8
+        // threshold with usize::from, matching verify_membership_signatures.
         let active_approvers = self
             .approver_set
             .iter()
             .filter(|approver| approver.status == MembershipApproverStatus::Active)
-            .count() as u8;
+            .count();
         for approver in &self.approver_set {
             if approver.approver_id.trim().is_empty() {
                 return Err(MembershipError::InvalidFormat(
@@ -359,7 +363,7 @@ impl MembershipState {
                 "at least one active approver is required".to_owned(),
             ));
         }
-        if self.quorum_threshold > active_approvers {
+        if usize::from(self.quorum_threshold) > active_approvers {
             return Err(MembershipError::InvalidFormat(format!(
                 "quorum threshold {} exceeds active approver count {}",
                 self.quorum_threshold, active_approvers
@@ -6529,6 +6533,56 @@ mod tests {
         let err = state
             .validate()
             .expect_err("quorum above active approver count must be rejected");
+        assert!(
+            matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("exceeds active approver count")),
+            "expected quorum-exceeds-approvers rejection, got {err:?}"
+        );
+    }
+
+    // RSA-0075 witness helpers: distinct 32-byte keys for a large roster
+    // without relying on the single-byte `[byte; 32]` fixture pattern.
+    fn push_bulk_approvers(state: &mut MembershipState, count: u64) {
+        for index in 0..count {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&index.to_be_bytes());
+            state.approver_set.push(MembershipApprover {
+                approver_id: format!("bulk-{index}"),
+                approver_pubkey_hex: hex_encode(&key),
+                role: MembershipApproverRole::Guardian,
+                status: MembershipApproverStatus::Active,
+                created_at_unix: 100,
+            });
+        }
+    }
+
+    #[test]
+    fn validate_accepts_256_active_approvers() {
+        // RSA-0075 witness: `count() as u8` wrapped 256 active approvers to
+        // 0, so validate() spuriously rejected this well-formed roster with
+        // "at least one active approver is required". The count must stay
+        // usize end to end and the threshold comparison must widen the u8.
+        let mut state = base_state();
+        push_bulk_approvers(&mut state, 253);
+        assert_eq!(state.approver_set.len(), 256);
+        state.quorum_threshold = 200;
+
+        state
+            .validate()
+            .expect("256 active approvers must satisfy quorum_threshold 200");
+    }
+
+    #[test]
+    fn validate_still_rejects_quorum_above_real_count_at_scale() {
+        // Widening the count must not weaken the check: 254 real active
+        // approvers cannot satisfy threshold 255.
+        let mut state = base_state();
+        push_bulk_approvers(&mut state, 251);
+        assert_eq!(state.approver_set.len(), 254);
+        state.quorum_threshold = 255;
+
+        let err = state
+            .validate()
+            .expect_err("threshold 255 above 254 active approvers must be rejected");
         assert!(
             matches!(err, MembershipError::InvalidFormat(ref msg) if msg.contains("exceeds active approver count")),
             "expected quorum-exceeds-approvers rejection, got {err:?}"
