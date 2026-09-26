@@ -112,6 +112,11 @@ criteria = "safe-to-run"
 version = "1.1.0"
 criteria = "safe-to-run"
 
+[[exemptions.cmov]]
+version = "0.5.4"
+criteria = "safe-to-deploy"
+notes = "AQ-30: new transitive dep of ml-kem 0.3.2 (module-lattice ctutils backend). No older version is exempted or covered by imports, so this is an exemption rather than a delta audit. Reviewed upstream delta 0.5.3 -> 0.5.4 (cargo vet diff): aarch64 csel macros fixed to tst with 0xff/0xffff masks so 16-bit equality ignores unspecified upper bits (constant-time correctness fix) plus a regression test. Full-source scan of 0.5.4: unsafe confined to the asm! constant-time backends (aarch64/x86/soft), no build.rs, no dependencies, no network/file/process access. Detail: fleet lane b22 REPORT.md (rustynet-b22-cargo-vet-coverage)."
+
 [[exemptions.colorchoice]]
 version = "1.0.5"
 criteria = "safe-to-deploy"
@@ -151,6 +156,11 @@ criteria = "safe-to-run"
 [[exemptions.crypto-common]]
 version = "0.1.7"
 criteria = "safe-to-deploy"
+
+[[exemptions.ctutils]]
+version = "0.4.2"
+criteria = "safe-to-deploy"
+notes = "AQ-30: new transitive dep of ml-kem 0.3.2 (module-lattice ctutils feature). No covered older version, so exemption. Upstream delta 0.4.1 -> 0.4.2 changes the dev-dep proptest 1.9 -> 1.11 only (read via cargo vet diff). Full-source scan of 0.4.2: zero unsafe, no build.rs, no dependencies, no network/file/process access. RustCrypto constant-time comparison utilities. Detail: fleet lane b22 REPORT.md."
 
 [[exemptions.curve25519-dalek]]
 version = "4.1.3"
@@ -236,6 +246,11 @@ criteria = "safe-to-deploy"
 version = "0.12.1"
 criteria = "safe-to-deploy"
 
+[[exemptions.hybrid-array]]
+version = "0.4.15"
+criteria = "safe-to-deploy"
+notes = "AQ-30: new direct dep of ml-kem 0.3.2 and the 0.11/0.12 RustCrypto stack (crypto-common, digest, block-buffer) as the generic-array successor. No covered older version, so exemption. Upstream delta 0.4.14 -> 0.4.15 adds the U513 size alias only (read via cargo vet diff). Full-source scan of 0.4.15: unsafe limited to array-storage/newtype plumbing inherent to the crate (37 sites, pre-existing across the 0.4 line, unchanged by this bump), no build.rs, no dependencies, no network/file/process access. Detail: fleet lane b22 REPORT.md."
+
 [[exemptions.icu_collections]]
 version = "2.2.0"
 criteria = "safe-to-deploy"
@@ -292,6 +307,16 @@ criteria = "safe-to-deploy"
 version = "1.0.17"
 criteria = "safe-to-deploy"
 
+[[exemptions.keccak]]
+version = "0.2.2"
+criteria = "safe-to-deploy"
+notes = "AQ-30: new dep of sha3 0.11.0 (Keccak-f permutation). No covered older version, so exemption. Reviewed upstream delta 0.2.1 -> 0.2.2 (cargo vet diff): round constants moved from a runtime truncation hook to const-evaluated per-lane RC arrays; no unsafe in the delta. Full-source scan of 0.2.2: unsafe confined to the target-gated aarch64 SHA3 backend (NEON intrinsics), no build.rs, no dependencies, no network/file/process access. Detail: fleet lane b22 REPORT.md."
+
+[[exemptions.kem]]
+version = "0.3.0"
+criteria = "safe-to-deploy"
+notes = "AQ-30: new dep of ml-kem 0.3.2 (KEM trait definitions). No covered older version, so exemption. Reviewed upstream delta 0.2.0 -> 0.3.0 (cargo vet diff): crate consolidated into a single lib.rs (errors.rs/kem.rs and the hpke/saber/x3dh example tests removed), API modernized to the 0.3 trait surface. #![forbid(unsafe_code)] - zero unsafe. No build.rs, no dependencies, no network/file/process access. Detail: fleet lane b22 REPORT.md."
+
 [[exemptions.libc]]
 version = "0.2.182"
 criteria = "safe-to-deploy"
@@ -327,6 +352,16 @@ criteria = "safe-to-deploy"
 [[exemptions.mio]]
 version = "1.1.1"
 criteria = "safe-to-deploy"
+
+[[exemptions.ml-kem]]
+version = "0.3.2"
+criteria = "safe-to-deploy"
+notes = "AQ-30: ML-KEM (FIPS 203) implementation behind the rustynet post-quantum KEM work. No covered older version, so exemption. Reviewed upstream delta 0.2.3 -> 0.3.2 (cargo vet diff, 5k lines): ALL prior unsafe removed (unwrap_unchecked/ptr::read array-split helpers deleted) and #![deny(unsafe_code)] plus undocumented_unsafe_blocks lints added, so 0.3.2 contains zero unsafe; the only File::open in the crate is tests/wycheproof.rs test-vector loading, not a shipped code path; no build.rs; no network/process access. Dep changes: hybrid-array 0.2-rc -> 0.4, kem =0.3.0-pre.0 -> 0.3, module-lattice 0.2.3 (ctutils), new optional const-oid 0.10 (db) and pkcs8 for key serialization, zeroize feature-gated. Crypto crate: lander review required per AQ-30. Detail: fleet lane b22 REPORT.md."
+
+[[exemptions.module-lattice]]
+version = "0.2.3"
+criteria = "safe-to-deploy"
+notes = "AQ-30: new dep of ml-kem 0.3.2 (Module-Lattice algebra primitives). No covered older version, so exemption. Reviewed upstream delta 0.2.2 -> 0.2.3 (cargo vet diff): adds MaybeBox, heap offload behind the alloc feature - pure safe code, zero unsafe. Full-source scan of 0.2.3: zero unsafe, no build.rs, no network/file/process access. Detail: fleet lane b22 REPORT.md."
 
 [[exemptions.nix]]
 version = "0.25.1"
@@ -491,6 +526,11 @@ criteria = "safe-to-deploy"
 [[exemptions.sha2]]
 version = "0.10.9"
 criteria = "safe-to-deploy"
+
+[[exemptions.sha3]]
+version = "0.11.0"
+criteria = "safe-to-deploy"
+notes = "AQ-30: SHA-3/SHAKE behind the ML-KEM work. No covered older version, so exemption. Reviewed upstream delta 0.10.8 -> 0.11.0 (cargo vet diff): ported to the digest 0.11 block-api (state.rs/macros.rs replaced by block_api.rs), KAT vectors extended; no unsafe in the delta and 0.11.0 carries #![forbid(unsafe_code)] (verified in source). No build.rs, no network/file/process access. Dep changes: digest 0.10 -> 0.11, keccak 0.1 -> 0.2. Crypto crate: lander review required per AQ-30. Detail: fleet lane b22 REPORT.md."
 
 [[exemptions.signal-hook]]
 version = "0.3.18"
