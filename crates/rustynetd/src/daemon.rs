@@ -11587,20 +11587,20 @@ fn detect_ipv4_default_gateway_for_interface(interface: &str) -> Result<Ipv4Addr
         if fields.len() < 4 {
             continue;
         }
-        if fields[0] != interface {
+        if fields.first().copied() != Some(interface) {
             continue;
         }
-        if fields[1] != "00000000" {
+        if fields.get(1).copied() != Some("00000000") {
             continue;
         }
-        let flags = u16::from_str_radix(fields[3], 16)
+        let flags = u16::from_str_radix(fields.get(3).copied().unwrap_or_default(), 16)
             .map_err(|err| format!("parse route flags failed: {err}"))?;
         let route_is_up = (flags & 0x1) != 0;
         let has_gateway = (flags & 0x2) != 0;
         if !route_is_up || !has_gateway {
             continue;
         }
-        let gateway_u32 = u32::from_str_radix(fields[2], 16)
+        let gateway_u32 = u32::from_str_radix(fields.get(2).copied().unwrap_or_default(), 16)
             .map_err(|err| format!("parse default gateway failed: {err}"))?;
         let octets = gateway_u32.to_le_bytes();
         return Ok(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
@@ -11747,24 +11747,34 @@ fn nat_pmp_map_udp_port(
     if response.len() < 16 {
         return Err("nat-pmp mapping response too short".to_string());
     }
-    if response[0] != 0 || response[1] != 129 {
+    let response_byte = |index: usize| -> Result<u8, String> {
+        response
+            .get(index)
+            .copied()
+            .ok_or_else(|| "nat-pmp mapping response too short".to_string())
+    };
+    if response_byte(0)? != 0 || response_byte(1)? != 129 {
         return Err("nat-pmp mapping response opcode mismatch".to_string());
     }
-    let result_code = u16::from_be_bytes([response[2], response[3]]);
+    let result_code = u16::from_be_bytes([response_byte(2)?, response_byte(3)?]);
     if result_code != 0 {
         return Err(format!(
             "nat-pmp mapping rejected by gateway (code {result_code})"
         ));
     }
-    let returned_internal = u16::from_be_bytes([response[8], response[9]]);
+    let returned_internal = u16::from_be_bytes([response_byte(8)?, response_byte(9)?]);
     if returned_internal != internal_port {
         return Err(format!(
             "nat-pmp internal port mismatch: expected {internal_port}, got {returned_internal}"
         ));
     }
-    let mapped_external = u16::from_be_bytes([response[10], response[11]]);
-    let granted_lease =
-        u32::from_be_bytes([response[12], response[13], response[14], response[15]]);
+    let mapped_external = u16::from_be_bytes([response_byte(10)?, response_byte(11)?]);
+    let granted_lease = u32::from_be_bytes([
+        response_byte(12)?,
+        response_byte(13)?,
+        response_byte(14)?,
+        response_byte(15)?,
+    ]);
     if mapped_external == 0 {
         return Err("nat-pmp gateway returned invalid external port".to_string());
     }
@@ -11790,10 +11800,16 @@ fn nat_pmp_delete_udp_port(
     if response.len() < 16 {
         return Err("nat-pmp delete response too short".to_string());
     }
-    if response[0] != 0 || response[1] != 129 {
+    let response_byte = |index: usize| -> Result<u8, String> {
+        response
+            .get(index)
+            .copied()
+            .ok_or_else(|| "nat-pmp delete response too short".to_string())
+    };
+    if response_byte(0)? != 0 || response_byte(1)? != 129 {
         return Err("nat-pmp delete response opcode mismatch".to_string());
     }
-    let result_code = u16::from_be_bytes([response[2], response[3]]);
+    let result_code = u16::from_be_bytes([response_byte(2)?, response_byte(3)?]);
     if result_code != 0 {
         return Err(format!(
             "nat-pmp delete rejected by gateway (code {result_code})"
@@ -11832,7 +11848,10 @@ fn nat_pmp_round_trip(gateway: Ipv4Addr, request: &[u8]) -> Result<Vec<u8>, Stri
             from.port()
         ));
     }
-    Ok(response[..len].to_vec())
+    Ok(response
+        .get(..len)
+        .ok_or_else(|| "nat-pmp response longer than receive buffer".to_string())?
+        .to_vec())
 }
 
 // Only the `#[cfg(all(test, not(windows)))]` test module calls this; on Windows
@@ -12263,9 +12282,11 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                 }
             }
             bound.ok_or_else(|| {
+                let last_err = last_err
+                    .map(|err| err.to_string())
+                    .unwrap_or_else(|| "no error recorded by the bind loop".to_string());
                 DaemonError::Io(format!(
-                    "dns resolver bind failed after {MAX_BIND_ATTEMPTS} attempts: {}",
-                    last_err.unwrap()
+                    "dns resolver bind failed after {MAX_BIND_ATTEMPTS} attempts: {last_err}"
                 ))
             })?
         };

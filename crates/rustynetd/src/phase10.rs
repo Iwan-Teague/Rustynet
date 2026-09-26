@@ -17660,7 +17660,7 @@ mod tests {
 
         // Matcher-side expectations (the SAME builders assert_firewall_ruleset
         // consumes), paired with the chain the matcher searches for them in.
-        let expectations: Vec<(&str, Vec<String>)> =
+        let mut expectations: Vec<(&str, Vec<String>)> =
             vec![("killswitch", LinuxCommandSystem::loopback_accept_tokens())]
                 .into_iter()
                 .chain(
@@ -17681,7 +17681,8 @@ mod tests {
                         "killswitch",
                         LinuxCommandSystem::wg_listen_port_allow_tokens("sport", "enp0s9", 51820),
                     ),
-                ]);
+                ])
+                .collect();
         // RN-12/IPV-01/RN-29: the egress builder now returns the SCOPED rule
         // set (two DNS drops + one v4 catch-all accept with the posture
         // active); every one of them must appear in the emitted killswitch
@@ -17689,34 +17690,33 @@ mod tests {
         for scoped in LinuxCommandSystem::killswitch_egress_rule_tokens("enp0s9", true) {
             expectations.push(("killswitch", scoped));
         }
-        expectations
-            .extend([
-                (
-                    "killswitch",
-                    LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
-                ),
-                (
-                    "killswitch",
-                    LinuxCommandSystem::dns_off_tunnel_drop_tokens("tcp", "rustynet0"),
-                ),
-                ("killswitch", LinuxCommandSystem::dns_accept_tokens("udp")),
-                ("killswitch", LinuxCommandSystem::dns_accept_tokens("tcp")),
-            ])
-            .chain(
-                LinuxCommandSystem::established_related_accept_tokens()
-                    .into_iter()
-                    .map(|rule| ("forward", rule)),
-            )
-            .chain(vec![
-                (
-                    "forward",
-                    LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
-                ),
-                (
-                    "forward",
-                    LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
-                ),
-            ]);
+        expectations.extend([
+            (
+                "killswitch",
+                LinuxCommandSystem::dns_off_tunnel_drop_tokens("udp", "rustynet0"),
+            ),
+            (
+                "killswitch",
+                LinuxCommandSystem::dns_off_tunnel_drop_tokens("tcp", "rustynet0"),
+            ),
+            ("killswitch", LinuxCommandSystem::dns_accept_tokens("udp")),
+            ("killswitch", LinuxCommandSystem::dns_accept_tokens("tcp")),
+        ]);
+        expectations.extend(
+            LinuxCommandSystem::established_related_accept_tokens()
+                .into_iter()
+                .map(|rule| ("forward", rule)),
+        );
+        expectations.extend([
+            (
+                "forward",
+                LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
+            ),
+            (
+                "forward",
+                LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0"),
+            ),
+        ]);
         for (chain, tokens) in expectations {
             let chain_argv: Vec<String> = command_log
                 .iter()

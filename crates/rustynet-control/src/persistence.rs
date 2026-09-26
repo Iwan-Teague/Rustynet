@@ -386,7 +386,11 @@ fn consume_single_use_credential_tx(
 
 #[cfg(test)]
 mod tests {
-    use super::{CredentialRow, NodeRow, PersistenceError, SqliteStore, UserRow};
+    use super::{CredentialRow, NodeRow, SqliteStore, UserRow};
+    // Only the unix-gated AQ-249 migration test matches on this type; on
+    // other targets the import would be unused.
+    #[cfg(unix)]
+    use super::PersistenceError;
 
     #[cfg(unix)]
     #[test]

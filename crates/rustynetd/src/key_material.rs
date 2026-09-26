@@ -423,7 +423,15 @@ fn decode_windows_dpapi_passphrase_blob(
             "{source_label} is not a reviewed Windows DPAPI passphrase blob",
         ));
     }
-    let version = blob[WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len()];
+    let version = match blob.get(WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len()).copied() {
+        Some(version) => version,
+        None => {
+            blob.zeroize();
+            return Err(format!(
+                "{source_label} is not a reviewed Windows DPAPI passphrase blob",
+            ));
+        }
+    };
     if version != WINDOWS_DPAPI_PASSPHRASE_BLOB_VERSION {
         blob.zeroize();
         return Err(format!(
@@ -431,12 +439,17 @@ fn decode_windows_dpapi_passphrase_blob(
         ));
     }
     let length_offset = WINDOWS_DPAPI_PASSPHRASE_BLOB_MAGIC.len() + 2;
-    let protected_len = u32::from_be_bytes([
-        blob[length_offset],
-        blob[length_offset + 1],
-        blob[length_offset + 2],
-        blob[length_offset + 3],
-    ]) as usize;
+    let protected_len = match blob
+        .get(length_offset..length_offset + 4)
+        .and_then(|len_bytes| <[u8; 4]>::try_from(len_bytes).ok())
+        .map(u32::from_be_bytes)
+    {
+        Some(value) => value as usize,
+        None => {
+            blob.zeroize();
+            return Err(format!("truncated {source_label} Windows DPAPI blob"));
+        }
+    };
     let data_offset = length_offset + 4;
     let actual_len = match blob.len().checked_sub(data_offset) {
         Some(value) => value,

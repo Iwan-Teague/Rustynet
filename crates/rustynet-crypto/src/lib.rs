@@ -4250,6 +4250,9 @@ mod tests {
     // threads in parallel, so every test below that performs a v0 disk read
     // takes this mutex: without it, concurrent tests bump the counter while a
     // delta assertion is in flight and the exact-once check flakes.
+    // Every v0 disk-read test below is #[cfg(unix)], so the lock must be too
+    // or the Windows-target lib-test build fails with dead-code.
+    #[cfg(unix)]
     static OI13_V0_DISK_READ_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     // Fixture builders and disk-level tests for the v0 -> v1 key-envelope
     // migration. The v0 framing is `[salt:16][nonce:24][len:4][ct]` with no

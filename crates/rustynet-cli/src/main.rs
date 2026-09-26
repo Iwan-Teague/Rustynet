@@ -22906,6 +22906,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_cli_daemon_socket_default_is_rustynetd_installer_path() {
         assert_eq!(
