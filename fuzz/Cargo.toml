@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-rustynetd = { path = "../crates/rustynetd" }
+rustynetd = { path = "../crates/rustynetd", features = ["fuzzing"] }
 rustynet-control = { path = "../crates/rustynet-control" }
 rustynet-relay = { path = "../crates/rustynet-relay" }
 rustynet-dns-zone = { path = "../crates/rustynet-dns-zone" }
@@ -68,6 +68,20 @@ bench = false
 [[bin]]
 name = "boringtun_decapsulate"
 path = "fuzz_targets/boringtun_decapsulate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "daemon_custody_bundle_parse"
+path = "fuzz_targets/daemon_custody_bundle_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "membership_custody_snapshot_parse"
+path = "fuzz_targets/membership_custody_snapshot_parse.rs"
 test = false
 doc = false
 bench = false

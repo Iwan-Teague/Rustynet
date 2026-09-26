@@ -54,6 +54,10 @@ windows-service = "0.8"
 
 [features]
 test-harness = ["rustynet-backend-wireguard/test-harness"]
+# AQ-29: exposes #[doc(hidden)] pub mod daemon_custody_fuzz in daemon.rs so the
+# fuzz targets can drive the private local-custody bundle loaders. Empty in
+# production builds; no production surface.
+fuzzing = []
 
 [lints.rust]
 # Downgrade workspace `unsafe_code = "forbid"` to `deny` so the scoped

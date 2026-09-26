@@ -1,6 +1,16 @@
 /target/
 /fuzz/artifacts/
-/fuzz/corpus/
+/fuzz/corpus/*
+# AQ-29: seed corpora are reviewed sources (valid-format fixtures), so they are
+# tracked; everything else libfuzzer writes under fuzz/corpus/ stays ignored.
+!/fuzz/corpus/daemon_custody_bundle_parse/
+# the dir-level negation above lets git descend into the seed dir; this sweep
+# re-ignores everything libfuzzer may write there, and only seed_* is tracked.
+/fuzz/corpus/daemon_custody_bundle_parse/*
+!/fuzz/corpus/daemon_custody_bundle_parse/seed_*
+!/fuzz/corpus/membership_custody_snapshot_parse/
+/fuzz/corpus/membership_custody_snapshot_parse/*
+!/fuzz/corpus/membership_custody_snapshot_parse/seed_*
 /fuzz/coverage/
 /fuzz/target/
 /fuzz/Cargo.lock

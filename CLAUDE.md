@@ -465,7 +465,8 @@ the authoritative map and should be kept in sync when types move.
 - `fuzz/` — `cargo-fuzz` targets (`ipc_parse_command`, `membership_decode_state`,
   `membership_decode_signed_update`, `relay_hello_parse`, `dns_zone_bundle_parse`,
   `daemon_signed_bundle_parse`, `policy_selector_evaluate`,
-  `boringtun_decapsulate`). Its own `[workspace]`.
+  `boringtun_decapsulate`, `daemon_custody_bundle_parse`,
+  `membership_custody_snapshot_parse`). Its own `[workspace]`.
 - `mcp/` (`mcp.json`) and `tools/skills/` — MCP server config and the
   `rustynet-security-auditor` skill (attack catalog, audit checklist, lab
   playbooks) used for security review.

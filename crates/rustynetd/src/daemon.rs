@@ -14494,6 +14494,118 @@ fn validate_membership_log_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "membership log", 0o037, true)
 }
 
+/// AQ-29 fuzzing harness for the daemon's local-custody bundle verify paths.
+///
+/// The hardened daemon never fetches trust state from a URL
+/// (`StateFetcher::new_from_daemon` pins every fetch URL to `None`), so its
+/// real untrusted-bytes consumers are the signed custody artifacts loaded
+/// from local disk. The loaders below are private and read from disk, so
+/// this module (compiled only under the `fuzzing` cargo feature) stages each
+/// artifact and a fixed verifying key into per-execution temporary files and
+/// lets the fuzz targets drive the real parse paths. It adds no production
+/// surface: the module does not exist without the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod daemon_custody_fuzz {
+    use super::{
+        TrustPolicy, load_auto_tunnel_bundle, load_relay_fleet_bundle, load_traversal_bundle_set,
+        load_trust_evidence,
+    };
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The RFC 8032 test-1 verifying key (same fixed key the existing
+    /// dns_zone_bundle_parse target uses), so `VerifyingKey::from_bytes`
+    /// succeeds and every exec reaches the artifact parser + signature
+    /// decode + `verify_strict` path instead of dying at key load.
+    const FUZZ_VERIFIER_KEY_HEX: &str =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    static STAGE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    struct StagedFile(PathBuf);
+
+    impl Drop for StagedFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn stage_artifact(kind: &str, bytes: &[u8]) -> Option<StagedFile> {
+        let seq = STAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "rustynetd-fuzz-{}-{}-{}",
+            std::process::id(),
+            seq,
+            kind
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .ok()?;
+        file.write_all(bytes).ok()?;
+        Some(StagedFile(path))
+    }
+
+    fn stage_verifier_key() -> Option<StagedFile> {
+        stage_artifact(
+            "verifier-key",
+            format!("{FUZZ_VERIFIER_KEY_HEX}\n").as_bytes(),
+        )
+    }
+
+    fn maxed_trust_policy() -> TrustPolicy {
+        TrustPolicy {
+            max_signed_data_age_secs: u64::MAX,
+            max_clock_skew_secs: u64::MAX,
+        }
+    }
+
+    pub fn fuzz_load_trust_evidence(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("trust-evidence", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_trust_evidence(&artifact.0, &key.0, maxed_trust_policy(), None).is_ok()
+    }
+
+    pub fn fuzz_load_auto_tunnel_bundle(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("auto-tunnel", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_auto_tunnel_bundle(&artifact.0, &key.0, u64::MAX, maxed_trust_policy(), None).is_ok()
+    }
+
+    pub fn fuzz_load_traversal_bundle_set(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("traversal", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_traversal_bundle_set(&artifact.0, &key.0, u64::MAX, maxed_trust_policy(), None).is_ok()
+    }
+
+    pub fn fuzz_load_relay_fleet_bundle(artifact: &[u8]) -> bool {
+        let Some(artifact) = stage_artifact("relay-fleet", artifact) else {
+            return false;
+        };
+        let Some(key) = stage_verifier_key() else {
+            return false;
+        };
+        load_relay_fleet_bundle(&artifact.0, &key.0, u64::MAX, maxed_trust_policy(), None).is_ok()
+    }
+}
+
 fn load_trust_evidence(
     path: &Path,
     verifier_key_path: &Path,
