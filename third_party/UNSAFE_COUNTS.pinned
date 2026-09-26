@@ -1,0 +1,57 @@
+# Vendored unsafe-code census pin (AQ-248).
+# Per-file token counts of `unsafe` usage under third_party/. Maintained
+# by scripts/ci/vendored_unsafe_drift_gate.sh (bin
+# crates/rustynet-cli/src/bin/check_vendored_unsafe_counts.rs): the gate fails
+# on ANY difference in EITHER direction - an increase is new unreviewed
+# unsafe code, a decrease means this pin is stale. Review the delta against
+# the pinned upstream tag (the vendor-refresh diff) and update this file in the
+# SAME commit as the vendored change.
+# Every file is censused, not only *.rs: rustc can splice tokens from any
+# UTF-8 file via `include!` or `#[path = "..."]`, so prose files that
+# merely mention `unsafe` can also need a pin line. Files that are not
+# valid UTF-8 cannot be spliced as Rust tokens and are skipped (a
+# non-UTF-8 *.rs is a hard error).
+# Splice SITES are pinned, not their targets: per file, `includes` counts
+# `include!` invocations (any path qualifier, whitespace-tolerant) and
+# `path_attrs` counts `#[path]`/`#![path]` attributes, both outside
+# comments and strings. `cfg_attrs` counts `cfg_attr` occurrences: a
+# `#[cfg_attr(cond, path = "...")]` attribute never spells `#[path`, so
+# the cfg_attr itself is the pinned site. An added, removed or moved
+# splice changes these counts and fails the gate until a human reviews it
+# and updates this pin - whatever the target literal spells (`../…`,
+# raw strings, macro aliases). An `include!` whose argument is not a
+# string literal (concat!/env!/any expression) is REFUSED outright: its
+# target is computed at build time (e.g. OUT_DIR content) and no source
+# census can see what it splices. A secondary raw-source check refuses
+# absolute/`..`-escaping targets outright (defense in depth).
+# This pin is DATA, not code: editing it to match a drift silently
+# re-baselines the gate. A pin change must be human-reviewed in the SAME
+# commit as the change it documents; the gate cannot verify that review.
+# Nothing in this census can enforce that review: it has to come from
+# the repository's own review rules (a required reviewer for this file).
+# Residuals no textual census can see (they need a semantic vendor
+# diff against the pinned upstream tag, not this gate): (1) tokens
+# EMITTED at build time by proc-macro attribute/derive macros - an
+# invocation's own token is visible (it counts as a cfg_attr or plain
+# attribute token only when it spells one), what the macro expands to
+# never is; (2) an in-place rewrite of an existing `unsafe` block that
+# keeps every count equal (e.g. swapping the callee body) drifts nothing.
+# Columns: blocks = `unsafe {`; fns = `unsafe fn`; impls = `unsafe impl`;
+# externs = `unsafe extern` (its items are unsafe fns; the AQ-248 review's
+# boringtun "21 unsafe fns" = fns + externs); includes = `include!`
+# invocations; path_attrs = `#[path]` attributes; cfg_attrs = `cfg_attr`
+# occurrences (all splice-site carriers; `include_str!`/`include_bytes!`
+# splice VALUES not tokens and are not counted). Paths are relative to
+# third_party/ (e.g. `boringtun/src/lib.rs`). Zero-count files are not
+# pinned. Regenerate with: check_vendored_unsafe_counts --generate
+boringtun/src/device/api.rs blocks=2 fns=0 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+boringtun/src/device/drop_privileges.rs blocks=7 fns=0 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+boringtun/src/device/epoll.rs blocks=19 fns=1 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+boringtun/src/device/kqueue.rs blocks=11 fns=1 impls=2 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+boringtun/src/device/mod.rs blocks=4 fns=0 impls=0 externs=0 includes=0 path_attrs=4 cfg_attrs=0
+boringtun/src/device/tun_darwin.rs blocks=15 fns=0 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+boringtun/src/device/tun_linux.rs blocks=11 fns=0 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+boringtun/src/ffi/mod.rs blocks=1 fns=0 impls=0 externs=12 includes=0 path_attrs=0 cfg_attrs=0
+boringtun/src/jni.rs blocks=0 fns=0 impls=0 externs=7 includes=0 path_attrs=0 cfg_attrs=0
+rustynet-alloc-meter/src/lib.rs blocks=4 fns=4 impls=1 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+rustynet-tun/src/lib.rs blocks=19 fns=0 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
