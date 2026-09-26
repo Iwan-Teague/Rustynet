@@ -202,14 +202,14 @@ mod daemon {
         /// BEFORE the ed25519 signature is verified. DEFAULT-ON; the only
         /// opt-out is `--no-require-addr-validation`, which logs a warning.
         pub require_addr_validation: bool,
-        /// D3 seams §7 step S4: operator switch reserved for the later v1
-        /// sunset (Q3). DEFAULT-ON and currently INERT — today's dispatch
-        /// admits v1 hellos unconditionally and the v2 arm is additive, so
-        /// flipping this flag changes no behavior yet. The flag exists now so
-        /// the sunset is a config flip, not a code change, and so operators
-        /// can already assert the posture in deployment manifests. When the
-        /// sunset lands, `false` must make the v1 dispatch arm refuse (fail
-        /// closed), never skip silently.
+        /// D3 seams §7 step S4: operator switch for the v1 sunset (Q3).
+        /// DEFAULT-ON and wired into dispatch (S7f's wiring half, pulled
+        /// forward standalone per the AQ-35 S7-slices review advisory A1):
+        /// `false` makes the v1 dispatch arm refuse every v1 hello at
+        /// control-port admission — fail closed, before any per-session
+        /// state exists — while v2 hellos are admitted unchanged. The flag
+        /// exists so the sunset is a config flip, not a code change, and so
+        /// operators can assert the posture in deployment manifests.
         pub relay_accept_v1: bool,
     }
 
@@ -237,7 +237,8 @@ mod daemon {
                 // address-validation gate starts enabled.
                 require_addr_validation: true,
                 // D3 seams §7 step S4: v1 stays accepted (default ON) until
-                // the reviewed Q3 sunset flips this; the flag is INERT today.
+                // the reviewed Q3 sunset flips this; `false` now refuses v1
+                // hellos at dispatch (see the field's contract).
                 relay_accept_v1: true,
             }
         }
@@ -468,10 +469,14 @@ mod daemon {
         /// having to infer it from missing lines.
         notices_suppressed_total: AtomicU64,
         /// Control packets refused by the unknown-message-type arm (D3 seams
-        /// §7 step S4 / F5): the per-type visibility an operator needs to
-        /// measure v2 rollout — a relay that still counts 0x08 refusals has
-        /// not picked up the v2 dispatch; one that counts 0x09 refusals is
-        /// seeing probes for a dialect that does not exist.
+        /// §7 step S4 / F5), plus — since the v1-sunset switch was wired into
+        /// dispatch — v1 hellos refused by a relay running with
+        /// `--no-relay-accept-v1`. The per-type visibility an operator needs
+        /// to measure v2 rollout — a relay that still counts 0x08 refusals
+        /// has not picked up the v2 dispatch; one that counts 0x09 refusals
+        /// is seeing probes for a dialect that does not exist; one whose
+        /// count climbs only while the sunset switch is set is refusing v1
+        /// by policy, not by ignorance.
         unknown_type_refusals_total: AtomicU64,
     }
 
@@ -1024,6 +1029,31 @@ mod daemon {
                         )
                         .await?;
                         return Ok(());
+                    }
+                    // D3 seams §7 step S7f, pulled forward as a standalone
+                    // default-`true` slice per the AQ-35 S7-slices review
+                    // (advisory A1): the operator v1-sunset switch now
+                    // dispatches. With `relay_accept_v1 == false` every v1
+                    // hello is refused HERE — after the shared pre-auth
+                    // charge above (a refused hello still spends exactly one
+                    // limiter token, same as every other v1 refusal), before
+                    // any parse work or per-session state, with a fixed
+                    // identity-free refusal that never echoes attacker bytes.
+                    // The refusal is counted in the SAME per-relay pre-auth
+                    // refusal counter the S4 unknown-type arm uses
+                    // (`unknown_type_refusals_total`), and it is answered
+                    // with silence on the wire: the error string reaches only
+                    // the budgeted `log_control_packet_error` path, exactly
+                    // like the unknown-type refusal. The default (`true`)
+                    // dispatches byte-identically to the pre-wiring relay.
+                    if !self.config.relay_accept_v1 {
+                        self.pre_auth_stats
+                            .unknown_type_refusals_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        return Err(
+                            "v1 relay hello refused: v1 hello acceptance is disabled on this relay"
+                                .to_owned(),
+                        );
                     }
                     self.handle_hello(data, from_addr).await
                 }
@@ -1970,8 +2000,11 @@ mod daemon {
         pre_auth_hellos_refused_total: u64,
         pre_auth_malformed_packets_total: u64,
         pre_auth_notices_suppressed_total: u64,
-        /// Unknown-message-type refusals (D3 seams §7 S4 / F5): the v2-rollout
-        /// signal — a relay still refusing 0x08 has not picked up v2 dispatch.
+        /// Unknown-message-type refusals (D3 seams §7 S4 / F5) plus v1
+        /// hellos refused by the `--no-relay-accept-v1` sunset switch: the
+        /// v2-rollout signal — a relay still refusing 0x08 has not picked up
+        /// v2 dispatch, and a relay refusing 0x01 while the switch is set is
+        /// refusing v1 by policy.
         pre_auth_unknown_type_refusals_total: u64,
     }
 
@@ -3239,14 +3272,12 @@ mod daemon {
                     );
                 }
                 "--no-relay-accept-v1" => {
-                    // D3 seams §7 step S4: reserved for the v1 sunset (Q3).
-                    // INERT today (dispatch does not consult it yet); parsed
-                    // + defaulted now so the posture is assertable in
-                    // deployment manifests and the sunset becomes a flip.
+                    // D3 seams §7 step S4, wired into dispatch per the
+                    // S7f wiring slice (AQ-35 S7-slices review advisory
+                    // A1): with the switch set, the v1 dispatch arm
+                    // refuses every v1 hello (fail closed) and counts the
+                    // refusal in `unknown_type_refusals_total`.
                     config.relay_accept_v1 = false;
-                    eprintln!(
-                        "warn: --no-relay-accept-v1 recorded; v1 relay hello acceptance is still ON (the v1 sunset switch is not wired into dispatch yet)"
-                    );
                 }
                 "--help" | "-h" => {
                     eprintln!(
@@ -3267,7 +3298,7 @@ mod daemon {
                           --blind-issuer-key-id <ID> Token issuer key id accepted for blind legs\n  \
                           --blind-profiles <CSV>     Public profile ids the blind listener admits\n  \
                           --no-require-addr-validation  Opt OUT of the pre-auth address-validation gate (OI-10, default ON; logs a warning)\n  \
-                          --no-relay-accept-v1       Record opt-out of v1 hello acceptance for the upcoming v1 sunset (currently INERT; v1 stays accepted)\n  \
+                          --no-relay-accept-v1       Refuse all v1 relay hellos (v1 sunset switch; default: v1 accepted, refusals counted)\n  \
                           --help                     Show this help"
                     );
                     std::process::exit(0);
@@ -7200,6 +7231,255 @@ mod daemon {
                 keys.verify_artifact(&observed, &nonce, 7, &[0u8; 32], now, 90)
                     .is_err()
             );
+        }
+
+        // ---- relay_accept_v1 dispatch wiring (the S7f wiring half, pulled
+        // ---- forward standalone per the AQ-35 S7-slices review advisory A1)
+
+        /// Builds a daemon with `relay_accept_v1` set explicitly. The inline
+        /// construction (rather than `build_test_daemon`) is deliberate: the
+        /// flag-off witnesses must compile against the PRE-wiring tree too,
+        /// where the flag exists but is inert — and there they must FAIL.
+        async fn build_test_daemon_with_v1_acceptance(dir: &Path, accept_v1: bool) -> RelayDaemon {
+            let key_path = dir.join("control.pub");
+            write_verifier_key(&key_path);
+            let mut built = None;
+            for _ in 0..16 {
+                let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe bind");
+                let port = probe.local_addr().expect("probe addr").port();
+                drop(probe);
+                let config = RelayConfig {
+                    relay_id: parse_relay_id_arg("relay-test-1").expect("relay id should parse"),
+                    verifier_key_path: key_path.to_str().expect("utf8 path").to_owned(),
+                    replay_store_path: dir
+                        .join("replay.store")
+                        .to_str()
+                        .expect("utf8 path")
+                        .to_owned(),
+                    bind_addr: std::net::SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        port,
+                    ),
+                    port_range_start: 1024,
+                    port_range_end: 5119,
+                    health_bind_addr: None,
+                    relay_accept_v1: accept_v1,
+                    ..RelayConfig::default()
+                };
+                if let Ok(daemon) = RelayDaemon::new(config).await {
+                    built = Some(daemon);
+                    break;
+                }
+            }
+            built.expect("relay daemon should build on a free loopback port")
+        }
+
+        /// WITNESS (fails on the pre-wiring tree, where the flag is inert and
+        /// the hello is admitted): with the v1 sunset switch set, a validly
+        /// signed v1 hello must be refused at dispatch — with the FIXED
+        /// refusal string, exactly one increment on the S4 per-relay refusal
+        /// counter, NO dataplane session, and silence on the wire (the
+        /// refusal reaches only the budgeted log path, it is never answered).
+        #[tokio::test]
+        async fn relay_dispatch_refuses_v1_hello_when_v1_acceptance_is_disabled() {
+            let dir = restricted_temp_dir("v1-sunset-refuse");
+            let daemon = build_test_daemon_with_v1_acceptance(&dir, false).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let before_refusals = daemon
+                .pre_auth_stats
+                .unknown_type_refusals_total
+                .load(Ordering::Relaxed);
+
+            let hello = make_signed_hello(&signing_key, relay_id, "node-sunset", "peer-sunset");
+            let err = daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&hello), peer)
+                .await
+                .expect_err("a v1 hello must be refused when v1 acceptance is disabled");
+            assert_eq!(
+                err, "v1 relay hello refused: v1 hello acceptance is disabled on this relay",
+                "the refusal string is fixed — no attacker bytes echoed"
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                before_refusals + 1,
+                "the refusal must land on the S4 per-relay refusal counter"
+            );
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                0,
+                "a refused hello must create no per-session state"
+            );
+            let mut silence_buf = [0u8; 128];
+            let no_reply = tokio::time::timeout(
+                Duration::from_millis(300),
+                client.recv_from(&mut silence_buf),
+            )
+            .await;
+            assert!(
+                no_reply.is_err(),
+                "the refusal must not be answered on the wire"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// With the flag at its DEFAULT (`true`) the v1 admission path is
+        /// byte-identical to the pre-wiring relay: first contact → `[0x06]`
+        /// challenge → retry with artifact → 19-byte ack + dataplane
+        /// allocation.
+        #[tokio::test]
+        async fn relay_dispatch_admits_v1_hello_when_v1_acceptance_stays_default() {
+            let dir = restricted_temp_dir("v1-sunset-default-admit");
+            let daemon = build_test_daemon(&dir).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+
+            let hello =
+                make_signed_hello(&signing_key, relay_id, "node-sunset-on", "peer-sunset-on");
+            daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&hello), peer)
+                .await
+                .expect("v1 first contact must stay admitted at the default");
+            let challenge = recv_relay_reply(&client).await;
+            assert_eq!(challenge[0], RELAY_HELLO_CHALLENGE_MSG_TYPE);
+            let retry = RelayHello {
+                node_id: hello.node_id.clone(),
+                peer_node_id: hello.peer_node_id.clone(),
+                session_token: hello.session_token.clone(),
+                addr_validation_artifact: Some(AddressValidationArtifact::from_bytes(
+                    challenge[1..33].try_into().expect("32 bytes"),
+                )),
+            };
+            daemon
+                .handle_control_packet(&relay_hello_v1_wire_bytes(&retry), peer)
+                .await
+                .expect("v1 challenge retry must be admitted at the default");
+            let ack = recv_relay_reply(&client).await;
+            assert_eq!(ack.len(), 19, "ack is [0x02] ++ session_id[16] ++ port[2]");
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                1,
+                "the default must keep allocating exactly one dataplane port"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// The sunset switch is a V1 switch: a v2 hello (0x08) must be
+        /// admitted through the unchanged S4 path even when v1 acceptance is
+        /// disabled, and must never be counted as a refusal.
+        #[tokio::test]
+        async fn relay_dispatch_admits_v2_hello_even_when_v1_acceptance_is_disabled() {
+            let dir = restricted_temp_dir("v1-sunset-v2-admit");
+            let daemon = build_test_daemon_with_v1_acceptance(&dir, false).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let before_refusals = daemon
+                .pre_auth_stats
+                .unknown_type_refusals_total
+                .load(Ordering::Relaxed);
+
+            let hello =
+                make_signed_hello(&signing_key, relay_id, "node-sunset-v2", "peer-sunset-v2");
+            let first = serialize_relay_hello_v2(&RelayHelloV2::from(&hello))
+                .expect("v2 serialization should succeed");
+            daemon
+                .handle_control_packet(&first, peer)
+                .await
+                .expect("v2 first contact must be admitted while v1 is disabled");
+            let challenge = recv_relay_reply(&client).await;
+            assert_eq!(challenge[0], RELAY_HELLO_CHALLENGE_MSG_TYPE);
+            let mut retry = RelayHelloV2::from(&hello);
+            retry.addr_validation_artifact = AddressValidationArtifact::from_bytes(
+                challenge[1..33].try_into().expect("32 bytes"),
+            );
+            let retry_frame = serialize_relay_hello_v2(&retry).expect("v2 retry should serialize");
+            daemon
+                .handle_control_packet(&retry_frame, peer)
+                .await
+                .expect("v2 challenge retry must be admitted while v1 is disabled");
+            let ack = recv_relay_reply(&client).await;
+            assert_eq!(ack.len(), 19);
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                1,
+                "v2 admission allocates a dataplane port regardless of the v1 switch"
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                before_refusals,
+                "an admitted v2 hello is never counted as a refusal"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
+        }
+
+        /// RSA-0086/RSA-0087 discipline must survive the sunset refusal: a
+        /// v1 hello refused by the switch spends EXACTLY ONE pre-auth limiter
+        /// token, same as every other v1 refusal. Exactly MAX hellos are
+        /// refused-and-counted, and the MAX+1st is refused by the limiter
+        /// BEFORE the sunset check — a double charge would exhaust the budget
+        /// early (fewer counted refusals), a skipped charge would let the
+        /// MAX+1st reach the sunset check too.
+        #[tokio::test]
+        async fn relay_dispatch_disabled_v1_refusal_charges_the_pre_auth_limiter_exactly_once() {
+            let dir = restricted_temp_dir("v1-sunset-limiter");
+            let daemon = build_test_daemon_with_v1_acceptance(&dir, false).await;
+            let relay_id = parse_relay_id_arg("relay-test-1").expect("relay id should parse");
+            let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+            let client = UdpSocket::bind("127.0.0.1:0").await.expect("client bind");
+            let peer = client.local_addr().expect("client addr");
+            let before_refusals = daemon
+                .pre_auth_stats
+                .unknown_type_refusals_total
+                .load(Ordering::Relaxed);
+            let before_limiter_refused = daemon
+                .pre_auth_stats
+                .hellos_refused_total
+                .load(Ordering::Relaxed);
+
+            for _ in 0..=MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC {
+                let hello =
+                    make_signed_hello(&signing_key, relay_id, "node-sunset-lim", "peer-sunset-lim");
+                // Ok on a limiter refusal AND on a sunset refusal — neither
+                // is an error (same contract as every dispatch arm).
+                let _ = daemon
+                    .handle_control_packet(&relay_hello_v1_wire_bytes(&hello), peer)
+                    .await;
+            }
+
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .unknown_type_refusals_total
+                    .load(Ordering::Relaxed),
+                before_refusals + u64::from(MAX_PRE_AUTH_HELLOS_PER_IP_PER_SEC),
+                "each of the first MAX refused hellos reached the sunset check: exactly one limiter token each"
+            );
+            assert_eq!(
+                daemon
+                    .pre_auth_stats
+                    .hellos_refused_total
+                    .load(Ordering::Relaxed),
+                before_limiter_refused + 1,
+                "the MAX+1st hello must be refused by the limiter, past the sunset check"
+            );
+            assert_eq!(
+                daemon.allocated_sockets.read().await.len(),
+                0,
+                "no refused hello may create per-session state"
+            );
+            fs::remove_dir_all(dir).expect("test dir should be removed");
         }
     }
 }
