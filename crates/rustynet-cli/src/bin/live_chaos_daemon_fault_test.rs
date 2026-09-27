@@ -356,9 +356,13 @@ impl<'a> ClientTrafficGuard<'a> {
 /// (audit I2 finding 2, 2026-09-11). A capture that is missing, empty,
 /// unproven (no provenance marker, or tcpdump never printed its "listening on"
 /// banner into the error file), or backed by a tcpdump stderr containing
-/// anything but the known-benign startup/summary lines is an ERROR: the
-/// zero-plaintext claim would be unmeasured, and an unmeasured claim fails the
-/// stage instead of passing it. On the error path the script prints
+/// anything but the known-benign startup/summary lines is an ERROR. Those lines
+/// include the `tcpdump: verbose output suppressed, …` notice that tcpdump
+/// 4.99 prints on every non-verbose capture; before it was listed, every live
+/// run failed this check on Debian 13 guests (2026-09-27). Without the
+/// whitelist entry the zero-plaintext claim would be unmeasured, and an
+/// unmeasured claim fails the stage instead of passing it. On the error path
+/// the script prints
 /// `<check_var>=error` plus the reason and exits 3 (capture_root surfaces a
 /// non-zero exit as a hard error); the observation parser additionally treats
 /// an in-band `<check_var>=error` as a stage failure naming the reason.
@@ -384,7 +388,7 @@ else
   case "${lines_var}" in ''|*[!0-9]*) {lines_var}=0; {reason_var}=unparseable_capture_tally ;; esac
 fi
 if [ -z "${reason_var}" ]; then
-  tcpdump_err_lines="$(grep -Evc '^(dropped privs to |listening on |[0-9]+ packets (captured|received by filter|dropped by kernel))' {error_path} 2>/dev/null || true)"
+  tcpdump_err_lines="$(grep -Evc '^(dropped privs to |listening on |tcpdump: verbose output suppressed, use -v\[v\]\.\.\. for full protocol decode$|[0-9]+ packets (captured|received by filter|dropped by kernel))' {error_path} 2>/dev/null || true)"
   case "$tcpdump_err_lines" in ''|*[!0-9]*) tcpdump_err_lines=0 ;; esac
   if [ "$tcpdump_err_lines" != "0" ]; then
     {reason_var}=tcpdump_error_file_nonempty
@@ -1295,6 +1299,63 @@ mod tests {
                 "{name}: tally must exclude the provenance marker:\n{script}"
             );
         }
+    }
+
+    /// Run the rendered tally fragment under `sh` against a real capture and a
+    /// given tcpdump stderr, returning its stdout (and whether it exited 3).
+    fn run_tally(error_file_body: &str) -> (String, bool) {
+        let dir = std::env::temp_dir().join(format!(
+            "rn-tally-{}-{}",
+            std::process::id(),
+            error_file_body.len()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let capture = dir.join("capture");
+        let error = dir.join("error");
+        std::fs::write(&capture, "capture_provenance=test\n").expect("capture");
+        std::fs::write(&error, error_file_body).expect("error file");
+        let tally = render_capture_leak_tally_sh(
+            &shell_quote(capture.to_str().expect("utf8")),
+            &shell_quote(error.to_str().expect("utf8")),
+            "lines",
+            "leak_check",
+            "reason",
+        );
+        let script = format!("{tally}printf 'leak_check=%s\\n' \"$leak_check\"\n");
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script)
+            .output()
+            .expect("run sh");
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code() == Some(3),
+        )
+    }
+
+    // 2026-09-27 live lab (UTM Debian 13 and lenovo KVM guests): tcpdump 4.99.5
+    // prints this exact stderr on every non-verbose capture, and the tally
+    // called it an error, so chaos_daemon_fault failed on every node while
+    // capturing zero plaintext. It must pass; a real tcpdump error must not.
+    #[test]
+    fn tally_accepts_tcpdump_499_banner_and_still_rejects_real_errors() {
+        let benign = "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\n\
+                      listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n\
+                      0 packets captured\n0 packets received by filter\n0 packets dropped by kernel\n";
+        let (out, exited_3) = run_tally(benign);
+        assert!(
+            !exited_3,
+            "benign tcpdump stderr must not be an error: {out}"
+        );
+        assert!(out.contains("leak_check=pass"), "{out}");
+
+        let broken = "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\n\
+                      listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n\
+                      tcpdump: pcap_loop: The interface disappeared\n";
+        let (out, exited_3) = run_tally(broken);
+        assert!(exited_3, "a real tcpdump error must fail closed: {out}");
+        assert!(out.contains("reason=tcpdump_error_file_nonempty"), "{out}");
     }
 
     #[test]
