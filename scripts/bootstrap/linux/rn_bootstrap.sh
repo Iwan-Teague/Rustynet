@@ -168,8 +168,42 @@ wait_for_package_manager_idle() {
   exit 1
 }
 
+# EL detection for the dnf family branch: Fedora shares dnf with the EL
+# distros (Rocky/AlmaLinux/CentOS Stream/RHEL/Oracle Linux, matched on ID
+# or on an ID_LIKE of rhel/centos) but keeps carrying packages the EL base
+# repositories lack — libfaketime above all. ID=fedora always wins over any
+# ID_LIKE, so Fedora can never be classed as EL. Takes the parsed
+# os-release ID and ID_LIKE as arguments so the vm_lab pin harness can
+# extract and run it under bash.
+is_el_linux() {
+  local os_id="${1:-}"
+  local os_like="${2:-}"
+  if [[ "${os_id}" == "fedora" ]]; then
+    return 1
+  fi
+  case "${os_id}" in
+    rocky|almalinux|centos|rhel|ol|redhat*)
+      return 0
+      ;;
+  esac
+  case "${os_like}" in
+    *rhel*|*centos*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 build_bootstrap_prereqs_present() {
   local PATH="${HOME}/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH}"
+  local os_id=""
+  local os_like=""
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    os_id="${ID:-}"
+    os_like="${ID_LIKE:-}"
+  fi
   local missing=0
   local cmd
   local llvm_found=0
@@ -183,12 +217,22 @@ build_bootstrap_prereqs_present() {
   # libfaketime is a shared object, not a command: the command loop above
   # cannot see it, so an already-provisioned guest never gained it (katana,
   # 2026-09-11 — chaos_clock_attack reported faketime_lib_present=false).
+  # b30 (live 2026-09-27, rocky-utm-1, Rocky Linux 10 aarch64): the EL base
+  # repositories do not carry libfaketime (it is EPEL-only, and EPEL is
+  # deliberately NOT enabled here per ADR-027), so on EL it is OPTIONAL —
+  # treated as satisfied so the guest does not loop through install_prereqs
+  # on every run, but reported loudly: the chaos clock-attack stage is the
+  # ONLY consumer and must report faketime_lib_present=false (precondition
+  # skip) on such a guest. On Fedora and Debian/Ubuntu it stays REQUIRED.
   faketime_found=0
   for cand in /usr/lib/*/faketime/libfaketime.so.1 /usr/lib64/faketime/libfaketime.so.1 /usr/lib/faketime/libfaketime.so.1; do
     if [ -r "$cand" ]; then faketime_found=1; break; fi
   done
   if [ "$faketime_found" = 1 ] || ldconfig -p 2>/dev/null | grep libfaketime >/dev/null; then
     printf "  %-12s ok\n" libfaketime
+  elif is_el_linux "${os_id}" "${os_like}"; then
+    printf "  %-12s optional (EL: not installed)\n" libfaketime
+    echo "[bootstrap] WARN: libfaketime is unavailable from the base repositories of this EL distro (EPEL-only; deliberately not enabled, ADR-027). Only the chaos clock-attack stage consumes it: that stage will report faketime_lib_present=false and skip as a precondition failure instead of injecting." >&2
   else
     echo "  libfaketime  MISSING"; missing=1
   fi
@@ -296,10 +340,31 @@ install_prereqs() {
   fi
   if [[ "${os_id}" == "fedora" || "${os_like}" == *"fedora"* || "${os_like}" == *"rhel"* ]]; then
     wait_for_package_manager_idle 'dnf|rpm' 'dnf/rpm'
+    # b30: the core transaction deliberately EXCLUDES libfaketime. On EL the
+    # base repositories lack it (EPEL-only; not enabled per ADR-027) and dnf
+    # refuses the WHOLE transaction when any one name is unresolvable (live
+    # 2026-09-27, rocky-utm-1, Rocky Linux 10: "Error: Unable to find a
+    # match: libfaketime" — all other packages resolved). iproute-tc is
+    # named explicitly: on Fedora/EL the tc binary ships in the separate
+    # iproute-tc package, not iproute (live 2026-09-27, fedora-utm-1,
+    # Fedora 44: prerequisite verification failed on the missing tc command
+    # after every listed package had installed).
     run_root_timed 1800 dnf install -y \
       ca-certificates curl git gcc gcc-c++ make pkgconf-pkg-config openssl-devel \
       sqlite-devel clang llvm llvm-devel nftables wireguard-tools tar gzip tcpdump iputils \
-      iproute libfaketime
+      iproute iproute-tc
+    # libfaketime runs as its OWN transaction so it can never fail the core
+    # prerequisites: on Fedora this succeeds and the strict post-install
+    # verification below keeps it REQUIRED there; on EL it may fail, which
+    # is tolerated loudly (the WARN in build_bootstrap_prereqs_present
+    # fires and the chaos clock-attack stage skips).
+    if ! run_root_timed 600 dnf install -y libfaketime; then
+      if is_el_linux "${os_id}" "${os_like}"; then
+        echo "[bootstrap] WARN: optional libfaketime install failed on this EL distro (EPEL-only; deliberately not enabled, ADR-027). Only the chaos clock-attack stage consumes it and will skip (faketime_lib_present=false)." >&2
+      else
+        echo "[bootstrap] libfaketime install failed on ${os_id:-unknown}; prerequisite verification below stays strict for it" >&2
+      fi
+    fi
   elif [[ "${os_id}" == "debian" || "${os_id}" == "ubuntu" || "${os_id}" == "linuxmint" || "${os_like}" == *"debian"* ]] || command -v apt-get >/dev/null 2>&1; then
     run_apt_update_hardened
     run_apt_install_hardened \

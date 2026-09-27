@@ -363,11 +363,15 @@ fn run() -> Result<(), String> {
         .as_str(),
     )?;
 
-    if report
+    let overall_status = report
         .get("overall_status")
         .and_then(Value::as_str)
-        .is_some_and(|status| status == "pass")
-    {
+        .unwrap_or_default();
+    if overall_status == "pass" || overall_status == "skipped" {
+        // b30: a declared precondition skip (overall_status "skipped" with
+        // a recorded skip_reason) is an acceptable outcome: nothing ran on
+        // the host and the report is the evidence. Anything else that is
+        // not a pass fails the stage.
         Ok(())
     } else {
         Err("clock attack chaos stage failed".to_owned())
@@ -460,6 +464,19 @@ stage_marker={stage_marker_q}
 drop_in_dir="/run/systemd/system/${{service}}.d"
 drop_in_file="$drop_in_dir/zz-chaos-clock-attack.conf"
 printf 'stage=%s\n' "$stage_marker"
+command -v systemctl >/dev/null 2>&1 || {{ printf 'missing_systemctl=true\n'; exit 1; }}
+# b30 (live 2026-09-27, EL lab guest): libfaketime is OPTIONAL on EL
+# bootstrap (EPEL deliberately not enabled), so a guest without it is a
+# supported state. The injection must then be a declared precondition skip:
+# print the marker + precise reason and exit ZERO, BEFORE any teardown
+# registration or service mutation. The pre-fix `exit 1` made capture_root
+# error out and the bin crashed without writing any report at all.
+if ! test -r "$faketime_lib"; then
+  printf 'faketime_lib_present=false\n'
+  printf 'precondition_skip=libfaketime shared object not readable at %s on this guest; the lab bootstrap treats libfaketime as optional on EL (EPEL not enabled, ADR-027), so the chaos clock-attack stage cannot inject a clock fault here\n' "$faketime_lib"
+  exit 0
+fi
+printf 'faketime_lib_present=true\n'
 cleanup() {{
   rm -f "$drop_in_file" >/dev/null 2>&1 || true
   rmdir "$drop_in_dir" >/dev/null 2>&1 || true
@@ -472,9 +489,6 @@ cleanup() {{
 }}
 trap cleanup EXIT HUP INT TERM
 printf 'teardown_registered_before_fault=true\n'
-command -v systemctl >/dev/null 2>&1 || {{ printf 'missing_systemctl=true\n'; exit 1; }}
-test -r "$faketime_lib" || {{ printf 'faketime_lib_present=false\n'; exit 1; }}
-printf 'faketime_lib_present=true\n'
 systemctl is-active --quiet "$service" || {{ printf 'baseline_service_active=false\n'; exit 1; }}
 test -S "$socket_path" || {{ printf 'baseline_socket_present=false\n'; exit 1; }}
 status_field() {{
@@ -782,6 +796,11 @@ struct ClockStageObservation {
     stage: Option<String>,
     teardown_registered_before_fault: bool,
     faketime_lib_present: bool,
+    /// b30: precise reason printed by the remote script when the injection
+    /// is skipped as a precondition failure (e.g. libfaketime absent on an
+    /// EL guest whose bootstrap treats it as optional). When set, the fault
+    /// fields below were never produced: nothing ran on the host.
+    precondition_skip: Option<String>,
     recovered: bool,
     measured_recovery_secs: Option<u64>,
     /// Did `rustynetd` come up at all under the injected clock? `false` is
@@ -855,10 +874,25 @@ impl ClockStageObservation {
                 None => Ok(None),
             }
         };
+        // b30: a declared precondition skip exits the remote script before
+        // the fault fields exist. Only stage, faketime_lib_present and the
+        // skip reason are guaranteed; demanding the required fault booleans
+        // here would crash the bin on a parse error instead of reporting
+        // the skip (the pre-fix behaviour).
+        let precondition_skip = value("precondition_skip").map(str::to_owned);
+        if let Some(reason) = precondition_skip {
+            return Ok(Self {
+                stage: value("stage").map(str::to_owned),
+                faketime_lib_present: req_bool("faketime_lib_present")?,
+                precondition_skip: Some(reason),
+                ..Self::default()
+            });
+        }
         Ok(Self {
             stage: value("stage").map(str::to_owned),
             teardown_registered_before_fault: req_bool("teardown_registered_before_fault")?,
             faketime_lib_present: req_bool("faketime_lib_present")?,
+            precondition_skip: None,
             recovered: req_bool("recovered")?,
             measured_recovery_secs: opt_u64("measured_recovery_secs")?,
             daemon_started_under_fault: opt_bool("daemon_started_under_fault")?,
@@ -953,7 +987,11 @@ impl ClockStageObservation {
 
 fn render_live_report(config: &Config, observation: &ClockStageObservation) -> Value {
     let implemented_index = config.stage.stage_index();
-    let implemented_status = if observation.passed(config.stage, config.recovery_deadline_secs) {
+    let implemented_status = if observation.precondition_skip.is_some() {
+        // b30: a declared precondition skip (e.g. libfaketime absent on an
+        // EL guest) is neither a pass nor a fail: nothing ran on the host.
+        "skipped"
+    } else if observation.passed(config.stage, config.recovery_deadline_secs) {
         "pass"
     } else {
         "fail"
@@ -973,6 +1011,7 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
                     "plaintext_leak_check": "not-applicable-clock-attack",
                     "faketime_lib": config.faketime_lib,
                     "faketime_lib_present": observation.faketime_lib_present,
+                    "skip_reason": observation.precondition_skip,
                     "teardown_registered_before_fault": observation.teardown_registered_before_fault,
                     "recovered": observation.recovered,
                     "daemon_started_under_fault": observation.daemon_started_under_fault,
@@ -1008,6 +1047,13 @@ fn render_live_report(config: &Config, observation: &ClockStageObservation) -> V
         "suite": "rustynet-live-lab-chaos",
         "category": CATEGORY,
         "overall_status": implemented_status,
+        // b30r2: the orchestrator's stage runner (stage/chaos.rs
+        // chaos_report_precondition_skip) reads the skip verdict + reason at
+        // the TOP level of this report. A skip carried only inside
+        // stages[0] would fall through to verify_chaos_report_shape (which
+        // accepts exactly "pass") and fail the stage despite the declared
+        // skip, so the reason must live here too.
+        "skip_reason": observation.precondition_skip,
         "summary": "per-process clock-attack fault injected via libfaketime against the live daemon",
         "dry_run": false,
         "generated_at_unix": unix_now(),
@@ -1623,6 +1669,112 @@ mod tests {
         assert_eq!(stages[1]["status"], "fail");
         assert_eq!(stages[0]["status"], "skipped");
         assert_eq!(stages[2]["status"], "skipped");
+    }
+
+    // --- b30: an EL guest without libfaketime must be a declared
+    // --- precondition skip — never a crash (the pre-fix remote script's
+    // --- `exit 1` made capture_root fail and the bin died without writing
+    // --- any report), and never a pass.
+
+    /// Exactly what the remote script prints on a guest whose bootstrap
+    /// treated libfaketime as optional (EL): the fault fields
+    /// (teardown/baseline/recovery) are legitimately absent because nothing
+    /// ran.
+    fn precondition_skip_output() -> &'static str {
+        "stage=chaos_clock_jump_forward_past_max_age\n\
+         faketime_lib_present=false\n\
+         precondition_skip=libfaketime shared object not readable at \
+         /usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1 on this guest; \
+         the lab bootstrap treats libfaketime as optional on EL, so the chaos \
+         clock-attack stage cannot inject a clock fault here\n"
+    }
+
+    #[test]
+    fn precondition_skip_output_parses_without_the_fault_fields() {
+        // On the pre-fix code this parse ERRED ("missing
+        // teardown_registered_before_fault in clock attack output") — the
+        // hard parse failure on top of the remote exit-1 crash is what b30
+        // removes.
+        let observation = ClockStageObservation::parse(precondition_skip_output()).expect("parse");
+        assert!(!observation.faketime_lib_present);
+        assert!(
+            observation.precondition_skip.is_some(),
+            "the skip reason must be carried on the observation"
+        );
+        assert!(!observation.teardown_registered_before_fault);
+        assert!(!observation.recovered);
+    }
+
+    #[test]
+    fn precondition_skip_never_counts_as_a_pass() {
+        let observation = ClockStageObservation::parse(precondition_skip_output()).expect("parse");
+        assert!(
+            !observation.passed(ClockStage::JumpForward, 180),
+            "a skipped injection must never satisfy the jump-forward verdict"
+        );
+    }
+
+    #[test]
+    fn live_report_marks_precondition_skip_with_precise_reason() {
+        let config = parse(&["--dry-run"]).expect("config should parse");
+        let observation = ClockStageObservation::parse(precondition_skip_output()).expect("parse");
+        let report = render_live_report(&config, &observation);
+        assert_eq!(report["overall_status"], "skipped");
+        let stages = report["stages"].as_array().expect("stages array");
+        assert_eq!(stages[0]["status"], "skipped");
+        assert_eq!(stages[0]["faketime_lib_present"], false);
+        let reason = stages[0]["skip_reason"].as_str().expect("skip_reason");
+        assert!(
+            reason.contains("faketime"),
+            "the reason must name the missing faketime object: {reason}"
+        );
+        // b30r2: the orchestrator stage runner (stage/chaos.rs
+        // chaos_report_precondition_skip) reads skip_reason at the TOP level
+        // of the report; without it a declared skip falls through to
+        // verify_chaos_report_shape (which accepts exactly "pass") and FAILS
+        // the stage. Mutation: drop the top-level "skip_reason" key from
+        // render_live_report — this assertion goes red.
+        assert_eq!(
+            report["skip_reason"].as_str(),
+            Some(reason),
+            "the skip reason must be carried at the report TOP level for the stage runner"
+        );
+        assert_eq!(
+            report["security_invariants"]["faketime_lib_present"], false,
+            "the security invariant must keep recording the absent object"
+        );
+    }
+
+    #[test]
+    fn remote_script_skips_cleanly_when_faketime_lib_missing() {
+        let config = parse(&[
+            "--dry-run",
+            "--stage",
+            "jump-forward",
+            "--service-name",
+            "rustynetd.service",
+        ])
+        .expect("config should parse");
+        let script = render_remote_clock_script(&config);
+        let skip_pos = script
+            .find("faketime_lib_present=false")
+            .expect("skip marker present");
+        let trap_pos = script
+            .find("trap cleanup EXIT HUP INT TERM")
+            .expect("trap present");
+        assert!(
+            skip_pos < trap_pos,
+            "the faketime precondition must be decided BEFORE teardown registration: a skip must never register a trap or touch the service"
+        );
+        let window = &script[skip_pos..(skip_pos + 600).min(script.len())];
+        assert!(
+            window.contains("precondition_skip="),
+            "the skip must carry a precise reason: {window}"
+        );
+        assert!(
+            window.contains("exit 0"),
+            "the skip path must exit ZERO — the pre-fix `exit 1` made capture_root error out and the bin crashed with no report at all: {window}"
+        );
     }
 
     #[test]

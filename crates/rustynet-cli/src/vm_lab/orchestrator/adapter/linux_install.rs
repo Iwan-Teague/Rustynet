@@ -1417,6 +1417,134 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         );
     }
 
+    /// b30 (live 2026-09-27, rocky-utm-1 / Rocky Linux 10 aarch64): the EL
+    /// base repositories do not carry libfaketime (it is EPEL-only, and EPEL
+    /// is deliberately NOT enabled per ADR-027), and dnf refuses the WHOLE
+    /// transaction when one name is unresolvable ("Error: Unable to find a
+    /// match: libfaketime"). So libfaketime must not ride the core dnf
+    /// transaction; it stays required on the apt side (Debian/Ubuntu carry
+    /// it) and required on Fedora via the strict post-install verification.
+    /// Witness: the pre-fix script's core dnf block ends in
+    /// `iproute libfaketime`, so every assertion here fails against it.
+    #[test]
+    fn bootstrap_splits_libfaketime_out_of_the_core_dnf_transaction() {
+        fn dnf_core_transaction() -> String {
+            let start = BOOTSTRAP_SCRIPT
+                .find("run_root_timed 1800 dnf install -y")
+                .expect("core dnf transaction must exist");
+            let rest = &BOOTSTRAP_SCRIPT[start..];
+            let mut block = String::new();
+            for line in rest.lines().skip(1) {
+                block.push_str(line);
+                block.push('\n');
+                if !line.trim_end().ends_with('\\') {
+                    break;
+                }
+            }
+            block
+        }
+        let block = dnf_core_transaction();
+        assert!(
+            !block.contains("libfaketime"),
+            "libfaketime must not ride the core dnf transaction (EL base repos lack it; one unresolved name fails the whole transaction): {block}"
+        );
+        assert!(
+            block.contains("iproute iproute-tc"),
+            "tc ships in the separate iproute-tc package on Fedora/EL, not in iproute (live 2026-09-27, fedora-utm-1 / Fedora 44: prerequisite verification failed on the missing tc command after every listed package installed): {block}"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("iproute2 libfaketime"),
+            "libfaketime stays REQUIRED on the Debian/Ubuntu apt side where the package exists"
+        );
+    }
+
+    /// b30: on EL a missing libfaketime must be reported LOUDLY and treated
+    /// as OPTIONAL (so an EL guest does not re-enter install_prereqs on
+    /// every run), while staying required everywhere else. The discriminator
+    /// is the is_el_linux helper; the WARN must name the chaos clock-attack
+    /// stage as the only consumer.
+    #[test]
+    fn bootstrap_treats_libfaketime_as_optional_only_on_el_with_loud_warn() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("is_el_linux() {"),
+            "an EL discriminator must exist for the dnf-family split"
+        );
+        let fn_start = BOOTSTRAP_SCRIPT
+            .find("build_bootstrap_prereqs_present() {")
+            .expect("prereq function must exist");
+        let tail = &BOOTSTRAP_SCRIPT[fn_start..];
+        let fn_len = tail
+            .find("\n}")
+            .expect("prereq function must close at column 0");
+        let body = &tail[..fn_len];
+        assert!(
+            body.contains("is_el_linux"),
+            "build_bootstrap_prereqs_present must branch on is_el_linux for the optional-on-EL treatment: {body}"
+        );
+        assert!(
+            body.contains("[bootstrap] WARN: libfaketime"),
+            "a missing libfaketime on EL must be reported loudly: {body}"
+        );
+        assert!(
+            body.contains("chaos clock-attack"),
+            "the WARN must name the chaos clock-attack stage as the only consumer: {body}"
+        );
+    }
+
+    /// Behavioural witness: run the REAL extracted is_el_linux under bash and
+    /// check the EL/Fedora/Debian classification end to end. On the pre-fix
+    /// script the function does not exist, the awk extraction is empty, and
+    /// the harness fails — this witness cannot pass against the old
+    /// behaviour.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_el_detection_function_classifies_el_fedora_and_debian() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_b30_el_detect.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let harness = r#"set -euo pipefail
+eval "$(awk '/^is_el_linux\(\) \{/,/^\}$/ {print}' "$1")"
+for spec in \
+  'rocky:rhel centos fedora:EL' \
+  'rhel:fedora:EL' \
+  'almalinux:rhel centos:EL' \
+  'centos:rhel fedora:EL' \
+  'ol::EL' \
+  'fedora::NOT-EL' \
+  'fedora:rhel centos:NOT-EL' \
+  'ubuntu:debian:NOT-EL' \
+  '::NOT-EL'; do
+  id="${spec%%:*}"
+  rest="${spec#*:}"
+  like="${rest%%:*}"
+  expected="${rest##*:}"
+  if is_el_linux "$id" "$like"; then got=EL; else got=NOT-EL; fi
+  if [ "$got" != "$expected" ]; then
+    echo "is_el_linux(id=$id, like=$like) = $got, expected $expected" >&2
+    exit 1
+  fi
+done
+echo OK
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_bootstrap_b30_extract")
+            .arg(script_path.as_os_str())
+            .output()
+            .expect("run the extracted EL detector under bash");
+        assert!(
+            output.status.success(),
+            "is_el_linux must classify EL, Fedora and Debian correctly: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_file(&script_path);
+    }
+
     #[test]
     fn bootstrap_root_timeout_wraps_child_command_not_sudo() {
         // `timeout sudo resolvectl ...` can leave the root child alive after
