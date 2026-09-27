@@ -35,6 +35,7 @@ Runs marked "+fix" ran with a reviewed-or-under-review harness or product fix ap
 | linux-u6-blindexit-fix +fix | Mac → UTM | client, exit, blind_exit, aux | 24a184704 +blind_exit fix | 38 pass, 1 fail (enrollment restart, AQ-68 daemon side) — **fix verified live** |
 | linux-u7-blindexit-chaos +fix | Mac → UTM | client, exit, blind_exit | 24a184704 +fixes | **45 pass, 0 fail** |
 | linux-u8-extra-lantoggle +fix | Mac → UTM | client, exit, extra | 24a184704 +fixes | **39 pass, 0 fail** — LAN toggle passes |
+| linux-u9-vxlan-crossnet +fix | Mac → UTM | client, exit, extra; `--cross-network-substrate vxlan` | 24a184704 +fixes | **38 pass, 0 fail**. The vxlan substrate stands up and tears down cleanly. The scenario stages need client + exit + entry + aux, and aux is blocked by Finding 3. |
 | box-l2-chaos | lenovo-bot | client, exit | 128a43b (=a3dfb390a) | 38 pass, 1 fail (AQ-68) |
 | box-l3b-negctl | lenovo-bot | client, exit | 128a43b | 38 pass, 1 fail (AQ-68) |
 | box-l4-chaos +fix | lenovo-bot | client, exit | 128a43b +AQ-68 lab fix | **49 pass**, 2 fail (chaos tcpdump tally) — 7 of 9 chaos stages pass |
@@ -64,7 +65,7 @@ Not reachable tonight:
 - **macOS**, because of CP-1.
 - **mixed topology**, which needs every platform.
 - **extended soak**, which needs exit + client + entry + aux, and aux is blocked by Finding 3.
-- **the rest of the cross-network suite**, which a vxlan-substrate run (linux-u9) was exercising at the time of writing.
+- **the cross-network scenarios.** linux-u9 proved the vxlan substrate itself (38 pass, 0 fail), but the scenarios need an aux node (relay) and an entry/aux node (probe), and aux is blocked by Finding 3.
 
 ## Findings
 
