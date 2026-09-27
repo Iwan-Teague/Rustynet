@@ -125,16 +125,30 @@ fn run() -> Result<(), String> {
     // daemon's enrollment IPC stays fail-closed elsewhere. That is detectable,
     // so it is probed for explicitly and logged. Anything else — an argv the CLI
     // cannot parse, or a mint that fails with the secret present — aborts.
+    //
+    // Since AQ-68 (f8be79deb) the CLI refuses a plaintext enrollment secret
+    // unless it has been migrated into the OS keystore or the operator opts in
+    // with RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET. Headless lab guests have
+    // no keystore to migrate into (on Linux the store is Secret Service, which
+    // needs a desktop session), so this lab mint opts in explicitly, through
+    // `env` on this one command only: nothing on the guest is reconfigured and
+    // the daemon's own custody posture is untouched.
     logger.line("[secrets-log] triggering enrollment token activity")?;
     let secret_present = ctx
         .run_root_allow_failure(&target_host, &["test", "-s", LINUX_ENROLLMENT_SECRET_PATH])
         .map(|out| out.status.success())
         .unwrap_or(false);
     if secret_present {
+        let plaintext_opt_in = format!(
+            "{}=1",
+            rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+        );
         let minted = ctx.rustynet_root_must_succeed(
             &target_host,
             "enrollment mint",
             &[
+                "env",
+                plaintext_opt_in.as_str(),
                 REMOTE_RUSTYNET_BIN,
                 "enrollment",
                 "mint",
