@@ -1,4 +1,13 @@
 //! PKG-G — bounded, observation-only system diagnostics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //!
 //! This module answers one question for an operator or an automated gate:
 //! *"what is this host's networking + firewall + service state right now?"*
@@ -578,11 +587,11 @@ fn parse_netstat_rn_routes(stdout: &str) -> Vec<Route> {
     let mut routes = Vec::new();
     for line in stdout.lines().skip(4) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 {
+        if let [destination, gateway, _, interface, ..] = parts.as_slice() {
             routes.push(Route {
-                destination: parts[0].to_owned(),
-                gateway: parts[1].to_owned(),
-                interface: parts[3].to_owned(),
+                destination: (*destination).to_owned(),
+                gateway: (*gateway).to_owned(),
+                interface: (*interface).to_owned(),
             });
         }
     }
@@ -629,11 +638,11 @@ fn parse_route_print_routes(stdout: &str) -> Vec<Route> {
             continue;
         }
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() >= 4 {
+        if let [destination, _, gateway, interface, ..] = parts.as_slice() {
             routes.push(Route {
-                destination: parts[0].to_owned(),
-                gateway: parts[2].to_owned(),
-                interface: parts[3].to_owned(),
+                destination: (*destination).to_owned(),
+                gateway: (*gateway).to_owned(),
+                interface: (*interface).to_owned(),
             });
         }
     }
@@ -794,9 +803,11 @@ fn parse_netsh_dns(stdout: &str) -> DnsResolverInfo {
         }
         if in_server_list {
             let tokens: Vec<&str> = trimmed.split_whitespace().collect();
-            if tokens.len() == 1 && looks_like_ip_token(tokens[0]) {
-                if !resolvers.contains(&tokens[0].to_owned()) {
-                    resolvers.push(tokens[0].to_owned());
+            if let [token] = tokens.as_slice()
+                && looks_like_ip_token(token)
+            {
+                if !resolvers.contains(&(*token).to_owned()) {
+                    resolvers.push((*token).to_owned());
                 }
             } else {
                 in_server_list = false;
@@ -866,12 +877,15 @@ fn parse_netstat_an_listening_macos(stdout: &str) -> Vec<ListeningSocket> {
     let mut sockets = Vec::new();
     for line in stdout.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 6 && parts[5].contains("LISTEN") {
-            if let Some(dot_idx) = parts[3].rfind('.') {
-                let port: u16 = parts[3][dot_idx + 1..].parse().unwrap_or(0);
+        if parts.len() >= 6
+            && let [protocol, _, _, local, _, state_field, ..] = parts.as_slice()
+            && state_field.contains("LISTEN")
+        {
+            if let Some((address, port_str)) = local.rsplit_once('.') {
+                let port: u16 = port_str.parse().unwrap_or(0);
                 sockets.push(ListeningSocket {
-                    protocol: parts[0].to_owned(),
-                    address: parts[3][..dot_idx].to_owned(),
+                    protocol: (*protocol).to_owned(),
+                    address: address.to_owned(),
                     port,
                     pid: None,
                     process_name: None,
@@ -2220,4 +2234,353 @@ State                                 OFF
         let report = observe_system_diagnostics();
         println!("{}", render_report(&report));
     }
+}
+
+#[cfg(test)]
+mod aq08_step7_differential {
+    //! AQ-08 step 7 (AQ-08 §7, rustynet-sysinfo): seeded-mutation differential
+    //! harness. Each `old_*` function is a verbatim copy of the parser body
+    //! from the pre-step commit (HEAD before this patch), renamed only. For a
+    //! golden fixture plus 2000 deterministic mutations per parser (truncation,
+    //! line delete/duplicate/swap, byte replacement, junk injection, oversize
+    //! padding, multibyte insertion, empty input), the old and new parsers
+    //! must produce identical results. Any divergence fails the test and names
+    //! the parser, the seed and the offending input.
+
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const JUNK: &[&str] = &[
+        "1234567890",
+        "deadbeef",
+        "0",
+        "-",
+        "?",
+        "LISTEN",
+        "ESTAB",
+        "8.8.8.8",
+        "fe80::1%utun0",
+        "\"quoted,comma\"",
+        "0100007F:1F90",
+        "\t",
+        "  ",
+        "4294967295",
+        "18446744073709551616",
+        "-3",
+        "1e9",
+        "0x10",
+        "é",
+        "中",
+        "established",
+        "600",
+        "root:wheel",
+        "*",
+        "[",
+        "]",
+    ];
+
+    fn mutate(input: &str, rng: &mut Rng) -> String {
+        let mut s = input.to_string();
+        match rng.below(10) {
+            0 => {
+                // truncate at a char boundary
+                if !s.is_empty() {
+                    let mut cut = rng.below(s.len());
+                    while cut < s.len() && !s.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    s.truncate(cut);
+                }
+            }
+            1 => {
+                // delete a random line
+                let starts: Vec<usize> = std::iter::once(0)
+                    .chain(s.match_indices('\n').map(|(i, _)| i + 1))
+                    .collect();
+                if starts.len() > 1 || !s.is_empty() {
+                    let k = rng.below(starts.len());
+                    let start = starts[k];
+                    let end = s[start..].find('\n').map_or(s.len(), |p| start + p + 1);
+                    s.replace_range(start..end, "");
+                }
+            }
+            2 => {
+                // duplicate a random line
+                let starts: Vec<usize> = std::iter::once(0)
+                    .chain(s.match_indices('\n').map(|(i, _)| i + 1))
+                    .collect();
+                if !s.is_empty() {
+                    let k = rng.below(starts.len());
+                    let start = starts[k];
+                    let end = s[start..].find('\n').map_or(s.len(), |p| start + p + 1);
+                    let line = s[start..end].to_string();
+                    s.insert_str(end, &line);
+                }
+            }
+            3 => {
+                // replace a random char with a junk token
+                let count = s.chars().count();
+                if count > 0 {
+                    let k = rng.below(count);
+                    let byte_idx = s.char_indices().nth(k).map_or(0, |(i, _)| i);
+                    let ch_len = s[byte_idx..].chars().next().map_or(1, char::len_utf8);
+                    let w = JUNK[rng.below(JUNK.len())];
+                    s.replace_range(byte_idx..byte_idx + ch_len, w);
+                }
+            }
+            4 => {
+                // insert junk at a char boundary
+                let w = JUNK[rng.below(JUNK.len())];
+                let mut pos = rng.below(s.len() + 1);
+                while pos < s.len() && !s.is_char_boundary(pos) {
+                    pos += 1;
+                }
+                s.insert_str(pos, w);
+            }
+            5 => {
+                // append a junk line
+                s.push_str(&format!(
+                    "junk{} {}\n",
+                    rng.next(),
+                    JUNK[rng.below(JUNK.len())]
+                ));
+            }
+            6 => {
+                // empty input
+                s = String::new();
+            }
+            7 => {
+                // oversize padding (wide rows)
+                let big = "0.0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n".repeat(1 + rng.below(64));
+                s.push_str(&big);
+            }
+            8 => {
+                // whitespace attack: run of tabs/spaces at a boundary
+                let mut pos = rng.below(s.len() + 1);
+                while pos < s.len() && !s.is_char_boundary(pos) {
+                    pos += 1;
+                }
+                s.insert_str(pos, " \t \t ");
+            }
+            _ => {
+                // swap two lines
+                let starts: Vec<usize> = std::iter::once(0)
+                    .chain(s.match_indices('\n').map(|(i, _)| i + 1))
+                    .collect();
+                if starts.len() >= 2 {
+                    let a = rng.below(starts.len());
+                    let b = rng.below(starts.len());
+                    let (a, b) = (a.min(b), a.max(b));
+                    let ea = s[starts[a]..]
+                        .find('\n')
+                        .map_or(s.len(), |p| starts[a] + p + 1);
+                    let eb = s[starts[b]..]
+                        .find('\n')
+                        .map_or(s.len(), |p| starts[b] + p + 1);
+                    let la: String = s[starts[a]..ea].to_string();
+                    let lb: String = s[starts[b]..eb].to_string();
+                    s.replace_range(starts[b]..eb, &la);
+                    s.replace_range(starts[a]..ea, &lb);
+                }
+            }
+        }
+        s
+    }
+
+    fn run_diff<T, F, G>(parser: &str, seed: u64, n: usize, golden: &str, old_f: F, new_f: G)
+    where
+        T: PartialEq + std::fmt::Debug,
+        F: Fn(&str) -> T,
+        G: Fn(&str) -> T,
+    {
+        // runtime floor: a future edit cannot silently shrink the mutation
+        // count below one thousand cases per parser
+        assert!(n >= 1_000, "{parser}: mutation count floor");
+        let o = old_f(golden);
+        let w = new_f(golden);
+        assert_eq!(o, w, "DIVERGENCE in {parser} on GOLDEN: {golden:?}");
+        let mut rng = Rng(seed);
+        for i in 0..n {
+            let m = mutate(golden, &mut rng);
+            let o = old_f(&m);
+            let w = new_f(&m);
+            assert_eq!(
+                o, w,
+                "DIVERGENCE in {parser} at mutation {i} (seed {seed}): {m:?}"
+            );
+        }
+        eprintln!("{parser}: {n} mutations + golden OK");
+    }
+    // --- parse_netstat_rn_routes: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_netstat_rn_routes(stdout: &str) -> Vec<Route> {
+        let mut routes = Vec::new();
+        for line in stdout.lines().skip(4) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                routes.push(Route {
+                    destination: parts[0].to_owned(),
+                    gateway: parts[1].to_owned(),
+                    interface: parts[3].to_owned(),
+                });
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn differential_parse_netstat_rn_routes() {
+        run_diff(
+            "parse_netstat_rn_routes",
+            2493007,
+            2000,
+            GOLDEN_PARSE_NETSTAT_RN_ROUTES,
+            old_parse_netstat_rn_routes,
+            parse_netstat_rn_routes,
+        );
+    }
+
+    // --- parse_route_print_routes: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_route_print_routes(stdout: &str) -> Vec<Route> {
+        let mut routes = Vec::new();
+        let mut in_table = false;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Network Destination") {
+                in_table = true;
+                continue;
+            }
+            if !in_table {
+                continue;
+            }
+            if trimmed.starts_with('=') {
+                break;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if parts.len() >= 4 {
+                routes.push(Route {
+                    destination: parts[0].to_owned(),
+                    gateway: parts[2].to_owned(),
+                    interface: parts[3].to_owned(),
+                });
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn differential_parse_route_print_routes() {
+        run_diff(
+            "parse_route_print_routes",
+            2614007,
+            2000,
+            GOLDEN_PARSE_ROUTE_PRINT_ROUTES,
+            old_parse_route_print_routes,
+            parse_route_print_routes,
+        );
+    }
+
+    // --- parse_netsh_dns: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_netsh_dns(stdout: &str) -> DnsResolverInfo {
+        let mut resolvers = Vec::new();
+        let mut in_server_list = false;
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.to_ascii_lowercase().contains("dns server") {
+                in_server_list = true;
+                if let Some(last) = trimmed.split_whitespace().last() {
+                    if looks_like_ip_token(last) && !resolvers.contains(&last.to_owned()) {
+                        resolvers.push(last.to_owned());
+                    }
+                }
+                continue;
+            }
+            if in_server_list {
+                let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+                if tokens.len() == 1 && looks_like_ip_token(tokens[0]) {
+                    if !resolvers.contains(&tokens[0].to_owned()) {
+                        resolvers.push(tokens[0].to_owned());
+                    }
+                } else {
+                    in_server_list = false;
+                }
+            }
+        }
+        DnsResolverInfo {
+            resolvers,
+            search_domains: Vec::new(),
+            method: "netsh interface ip show dns".to_owned(),
+        }
+    }
+
+    #[test]
+    fn differential_parse_netsh_dns() {
+        run_diff(
+            "parse_netsh_dns",
+            1600007,
+            2000,
+            GOLDEN_PARSE_NETSH_DNS,
+            old_parse_netsh_dns,
+            parse_netsh_dns,
+        );
+    }
+
+    // --- parse_netstat_an_listening_macos: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_netstat_an_listening_macos(stdout: &str) -> Vec<ListeningSocket> {
+        let mut sockets = Vec::new();
+        for line in stdout.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 && parts[5].contains("LISTEN") {
+                if let Some(dot_idx) = parts[3].rfind('.') {
+                    let port: u16 = parts[3][dot_idx + 1..].parse().unwrap_or(0);
+                    sockets.push(ListeningSocket {
+                        protocol: parts[0].to_owned(),
+                        address: parts[3][..dot_idx].to_owned(),
+                        port,
+                        pid: None,
+                        process_name: None,
+                    });
+                }
+            }
+        }
+        sockets
+    }
+
+    #[test]
+    fn differential_parse_netstat_an_listening_macos() {
+        run_diff(
+            "parse_netstat_an_listening_macos",
+            3401007,
+            2000,
+            GOLDEN_PARSE_NETSTAT_AN_LISTENING_MACOS,
+            old_parse_netstat_an_listening_macos,
+            parse_netstat_an_listening_macos,
+        );
+    }
+
+    const GOLDEN_PARSE_NETSTAT_RN_ROUTES: &str = "Routing tables\n\nInternet:\nDestination        Gateway            Flags        Refs      Use   Netif\ndefault            10.0.0.1           UGSc          100        0     en0\n10.0.0/24          10.0.0.5           UGSc          12         0     en0\n";
+    const GOLDEN_PARSE_ROUTE_PRINT_ROUTES: &str = "IPv4 Route Table\n===========================================================================\nActive Routes:\nNetwork Destination        Netmask          Gateway       Interface  Metric\n          0.0.0.0          0.0.0.0     10.0.0.1    192.168.1.5      25\n     192.168.1.0    255.255.255.0     10.0.0.1    192.168.1.5      25\n";
+    const GOLDEN_PARSE_NETSH_DNS: &str = "Static DNS servers:\n  DNS server: 8.8.8.8\n  8.8.4.4\nnot a single ip line here\n  1.1.1.1\n";
+    const GOLDEN_PARSE_NETSTAT_AN_LISTENING_MACOS: &str = "Proto Recv-Q Send-Q  Local Address      Foreign Address    (state)\ntcp4       0      0  *.22               *.*                LISTEN\ntcp6       0      0  *.51820            *.*                LISTEN\n";
 }

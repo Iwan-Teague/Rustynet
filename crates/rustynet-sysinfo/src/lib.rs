@@ -1,4 +1,13 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![allow(clippy::collapsible_if)]
 // Tactical lint allowance for the merged Phase-3 diagnostic surface.
 // The functions below were ported in bulk from a parallel agent's work
@@ -460,6 +469,7 @@ pub struct TunnelStatus {
     pub last_handshake_secs: Option<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct WireGuardPeer {
     pub name: String,
     pub ip: String,
@@ -491,6 +501,7 @@ pub struct BandwidthTest {
     pub latency_ms: f64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct InterfaceStats {
     pub name: String,
     pub bytes_in: u64,
@@ -539,6 +550,7 @@ pub struct CpuInfo {
     pub freq_ghz: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct SocketStats {
     pub established: usize,
     pub listening: usize,
@@ -639,6 +651,7 @@ pub struct SystemClockCheck {
     pub status: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct TcpConnection {
     pub local_addr: String,
     pub remote_addr: String,
@@ -760,6 +773,7 @@ pub struct AppArmorProfile {
     pub attached_pids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct KeyPermissionCheck {
     pub path: String,
     pub owner: String,
@@ -998,6 +1012,7 @@ pub struct AnomalyReport {
     pub anomalies: Vec<Anomaly>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegressionAnalysis {
     pub metric: String,
     pub trend: String,
@@ -1540,18 +1555,14 @@ fn get_daemon_uptime() -> Option<u64> {
         let etime = etime.trim();
         let parts: Vec<&str> = etime.split(':').collect();
 
-        let total_secs = if parts.len() == 3 {
-            if let (Ok(h), Ok(m), Ok(s)) = (
-                parts[0].parse::<u64>(),
-                parts[1].parse::<u64>(),
-                parts[2].parse::<u64>(),
-            ) {
+        let total_secs = if let [h, m, s] = parts.as_slice() {
+            if let (Ok(h), Ok(m), Ok(s)) = (h.parse::<u64>(), m.parse::<u64>(), s.parse::<u64>()) {
                 h * 3600 + m * 60 + s
             } else {
                 0
             }
-        } else if parts.len() == 2 {
-            if let (Ok(m), Ok(s)) = (parts[0].parse::<u64>(), parts[1].parse::<u64>()) {
+        } else if let [m, s] = parts.as_slice() {
+            if let (Ok(m), Ok(s)) = (m.parse::<u64>(), s.parse::<u64>()) {
                 m * 60 + s
             } else {
                 0
@@ -1654,8 +1665,8 @@ fn wg_addresses_internal() -> Vec<String> {
                 for line in stdout.lines() {
                     if line.contains("inet ") && !line.contains("inet6") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() > 1 {
-                            addresses.push(parts[1].to_owned());
+                        if let [_, addr, ..] = parts.as_slice() {
+                            addresses.push((*addr).to_owned());
                         }
                     }
                 }
@@ -1694,8 +1705,8 @@ fn parse_ip_addr_inet_addresses(stdout: &str) -> Vec<String> {
     for line in stdout.lines() {
         if line.contains("inet") {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 1 {
-                addresses.push(parts[1].to_string());
+            if let [_, addr, ..] = parts.as_slice() {
+                addresses.push((*addr).to_string());
             }
         }
     }
@@ -1710,9 +1721,9 @@ fn parse_ip_route_show(stdout: &str) -> Vec<Route> {
     let mut routes = Vec::new();
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 3 {
+        if let [destination, _, _, ..] = parts.as_slice() {
             routes.push(Route {
-                destination: parts[0].to_string(),
+                destination: (*destination).to_string(),
                 gateway: parts.get(2).unwrap_or(&"direct").to_string(),
                 interface: parts.get(4).unwrap_or(&"-").to_string(),
             });
@@ -1745,11 +1756,11 @@ fn route_list_internal() -> Vec<Route> {
             .map(|stdout| {
                 for line in stdout.lines().skip(3) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 6 {
+                    if let [destination, gateway, _, _, _, interface, ..] = parts.as_slice() {
                         routes.push(Route {
-                            destination: parts[0].to_owned(),
-                            gateway: parts[1].to_owned(),
-                            interface: parts[5].to_owned(),
+                            destination: (*destination).to_owned(),
+                            gateway: (*gateway).to_owned(),
+                            interface: (*interface).to_owned(),
                         });
                     }
                 }
@@ -1762,11 +1773,11 @@ fn route_list_internal() -> Vec<Route> {
             if let Ok(stdout) = String::from_utf8(output.stdout) {
                 for line in stdout.lines().skip(3) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 4 {
+                    if let [destination, _, gateway, interface, ..] = parts.as_slice() {
                         routes.push(Route {
-                            destination: parts[0].to_string(),
-                            gateway: parts[2].to_string(),
-                            interface: parts[3].to_string(),
+                            destination: (*destination).to_string(),
+                            gateway: (*gateway).to_string(),
+                            interface: (*interface).to_string(),
                         });
                     }
                 }
@@ -1894,9 +1905,9 @@ fn parse_proc_net_dev_bytes(content: &str, interface: &str) -> (u64, u64) {
     for line in content.lines() {
         if line.contains(interface) {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 10 {
-                let bytes_recv = parts[1].parse::<u64>().unwrap_or(0);
-                let bytes_sent = parts[9].parse::<u64>().unwrap_or(0);
+            if let [_, recv_field, _, _, _, _, _, _, _, sent_field, ..] = parts.as_slice() {
+                let bytes_recv = recv_field.parse::<u64>().unwrap_or(0);
+                let bytes_sent = sent_field.parse::<u64>().unwrap_or(0);
                 return (bytes_sent, bytes_recv);
             }
         }
@@ -1932,8 +1943,8 @@ fn get_interface_bytes(_interface: &str) -> (u64, u64) {
 fn parse_wg_latest_handshake_timestamp(stdout: &str) -> Option<u64> {
     stdout.lines().find_map(|line| {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            parts[1].parse::<u64>().ok()
+        if let [_, ts, ..] = parts.as_slice() {
+            ts.parse::<u64>().ok()
         } else {
             None
         }
@@ -2015,16 +2026,20 @@ fn parse_wg_show_peers(stdout: &str) -> Vec<WireGuardPeer> {
     let mut peers = Vec::new();
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
+        if parts.len() >= 4
+            && let [first, _, allowed_ips_field, ip_field, ..] = parts.as_slice()
+            && *first != "interface:"
+            && *first != "public"
+        {
             // `get(..8)` returns None if 8 is not a char boundary (non-ASCII);
             // fall back to the whole field rather than panicking on a byte-slice
             // at a mid-character index. Identical to `[..8]` for ASCII `wg`
             // output where field 0 is a base64 key.
-            let name_prefix = parts[0].get(..8).unwrap_or(parts[0]);
+            let name_prefix = first.get(..8).unwrap_or(*first);
             peers.push(WireGuardPeer {
                 name: format!("peer-{name_prefix}"),
-                ip: parts.get(3).unwrap_or(&"-").to_string(),
-                allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
+                ip: ip_field.to_string(),
+                allowed_ips: allowed_ips_field.to_string(),
                 last_handshake_ago: None,
             });
         }
@@ -2368,15 +2383,29 @@ fn parse_proc_net_dev(content: &str) -> Vec<InterfaceStats> {
     let mut stats = Vec::new();
     for line in content.lines().skip(2) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 11 {
+        if let [
+            name,
+            bytes_in,
+            packets_in,
+            errors,
+            dropped,
+            _,
+            _,
+            _,
+            _,
+            bytes_out,
+            packets_out,
+            ..,
+        ] = parts.as_slice()
+        {
             stats.push(InterfaceStats {
-                name: parts[0].trim_end_matches(':').to_string(),
-                bytes_in: parts[1].parse::<u64>().unwrap_or(0),
-                bytes_out: parts[9].parse::<u64>().unwrap_or(0),
-                packets_in: parts[2].parse::<u64>().unwrap_or(0),
-                packets_out: parts[10].parse::<u64>().unwrap_or(0),
-                errors: parts[3].parse::<u64>().unwrap_or(0),
-                dropped: parts[4].parse::<u64>().unwrap_or(0),
+                name: name.trim_end_matches(':').to_string(),
+                bytes_in: bytes_in.parse::<u64>().unwrap_or(0),
+                bytes_out: bytes_out.parse::<u64>().unwrap_or(0),
+                packets_in: packets_in.parse::<u64>().unwrap_or(0),
+                packets_out: packets_out.parse::<u64>().unwrap_or(0),
+                errors: errors.parse::<u64>().unwrap_or(0),
+                dropped: dropped.parse::<u64>().unwrap_or(0),
             });
         }
     }
@@ -2434,11 +2463,11 @@ fn health_check_internal() -> HealthCheck {
 #[cfg(target_os = "linux")]
 fn parse_proc_loadavg(content: &str) -> (f64, f64, f64) {
     let parts: Vec<&str> = content.split_whitespace().collect();
-    if parts.len() >= 3 {
+    if let [l1, l5, l15, ..] = parts.as_slice() {
         (
-            parts[0].parse().unwrap_or(0.0),
-            parts[1].parse().unwrap_or(0.0),
-            parts[2].parse().unwrap_or(0.0),
+            l1.parse().unwrap_or(0.0),
+            l5.parse().unwrap_or(0.0),
+            l15.parse().unwrap_or(0.0),
         )
     } else {
         (0.0, 0.0, 0.0)
@@ -2478,10 +2507,10 @@ fn system_load_internal() -> SystemLoad {
         && let Some(load_part) = s.split("load average:").nth(1)
     {
         let loads: Vec<&str> = load_part.split(',').collect();
-        if loads.len() >= 3 {
-            load_1 = loads[0].trim().parse().unwrap_or(0.0);
-            load_5 = loads[1].trim().parse().unwrap_or(0.0);
-            load_15 = loads[2].trim().parse().unwrap_or(0.0);
+        if let [l1, l5, l15, ..] = loads.as_slice() {
+            load_1 = l1.trim().parse().unwrap_or(0.0);
+            load_5 = l5.trim().parse().unwrap_or(0.0);
+            load_15 = l15.trim().parse().unwrap_or(0.0);
         }
     }
 
@@ -2635,9 +2664,9 @@ fn memory_info_internal() -> MemoryInfo {
             let lines: Vec<&str> = s.lines().collect();
             for line in lines.iter().skip(2) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    total = parts[0].parse::<u64>().unwrap_or(0);
-                    available = parts[1].parse::<u64>().unwrap_or(0);
+                if let [total_field, available_field, ..] = parts.as_slice() {
+                    total = total_field.parse::<u64>().unwrap_or(0);
+                    available = available_field.parse::<u64>().unwrap_or(0);
                 }
             }
         }
@@ -2678,10 +2707,10 @@ fn disk_info_internal() -> Vec<DiskInfo> {
     {
         for line in s.lines().skip(1) {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let total_kb = parts[1].parse::<u64>().unwrap_or(0);
-                let used_kb = parts[2].parse::<u64>().unwrap_or(0);
-                let available_kb = parts[3].parse::<u64>().unwrap_or(0);
+            if let [_, total_field, used_field, available_field, ..] = parts.as_slice() {
+                let total_kb = total_field.parse::<u64>().unwrap_or(0);
+                let used_kb = used_field.parse::<u64>().unwrap_or(0);
+                let available_kb = available_field.parse::<u64>().unwrap_or(0);
 
                 let total_mb = total_kb / 1024;
                 let used_mb = used_kb / 1024;
@@ -2731,10 +2760,10 @@ fn disk_info_internal() -> Vec<DiskInfo> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(2) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    let drive = parts[0].to_string();
-                    let total = parts[1].parse::<u64>().unwrap_or(0);
-                    let available = parts[2].parse::<u64>().unwrap_or(0);
+                if let [drive_field, total_field, available_field, ..] = parts.as_slice() {
+                    let drive = (*drive_field).to_string();
+                    let total = total_field.parse::<u64>().unwrap_or(0);
+                    let available = available_field.parse::<u64>().unwrap_or(0);
                     let used = total.saturating_sub(available);
                     let percent = if total > 0 { (used as f64 / total as f64) * 100.0 } else { 0.0 };
 
@@ -2842,9 +2871,9 @@ fn cpu_info_internal() -> CpuInfo {
             let lines: Vec<&str> = s.lines().collect();
             for line in lines.iter().skip(2) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    cores = parts[0].parse::<usize>().unwrap_or(1);
-                    model = parts[1..].join(" ");
+                if let [cores_field, model_rest @ ..] = parts.as_slice() {
+                    cores = cores_field.parse::<usize>().unwrap_or(1);
+                    model = model_rest.join(" ");
                 }
             }
         }
@@ -2961,9 +2990,9 @@ fn parse_powershell_tcp_state_groups(output: &str) -> SocketStats {
 
     for line in output.lines().skip(2) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let state = parts[0].to_lowercase();
-            let count = parts[1].parse::<usize>().unwrap_or(0);
+        if let [state_field, count_field, ..] = parts.as_slice() {
+            let state = (*state_field).to_lowercase();
+            let count = count_field.parse::<usize>().unwrap_or(0);
 
             if state.contains("established") {
                 established = count;
@@ -3114,10 +3143,10 @@ fn process_list_internal() -> Vec<ProcessListEntry> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(2) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
-                    let name = parts[0].to_string();
-                    let pid = parts[1].parse::<u32>().unwrap_or(0);
-                    let memory_mb = parts[2].parse::<u64>().unwrap_or(0) / 1024 / 1024;
+                if let [name_field, pid_field, memory_field, ..] = parts.as_slice() {
+                    let name = (*name_field).to_string();
+                    let pid = pid_field.parse::<u32>().unwrap_or(0);
+                    let memory_mb = memory_field.parse::<u64>().unwrap_or(0) / 1024 / 1024;
 
                     procs.push(ProcessListEntry {
                         name,
@@ -3808,8 +3837,8 @@ fn hex_to_ip(hex: &str) -> String {
             .filter_map(|i| hex.get(i * 2..i * 2 + 2))
             .filter_map(|byte_str| u8::from_str_radix(byte_str, 16).ok())
             .collect();
-        if bytes.len() == 4 {
-            return format!("{}.{}.{}.{}", bytes[3], bytes[2], bytes[1], bytes[0]);
+        if let [b0, b1, b2, b3] = bytes.as_slice() {
+            return format!("{b3}.{b2}.{b1}.{b0}");
         }
     }
     "unknown".to_string()
@@ -3827,9 +3856,9 @@ fn parse_proc_net_tcp_connections(content: &str) -> Vec<TcpConnection> {
     let mut connections = Vec::new();
     for line in content.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 4 {
+        let [_, local_field, remote_field, state_field, ..] = fields.as_slice() else {
             continue;
-        }
+        };
         // /proc/net/tcp encodes each address as `<addr_hex>:<port_hex>`
         // (8 hex chars + ':' + 4 hex chars for IPv4). split_once is the
         // direct decoder. The earlier code split into a Vec, then called
@@ -3841,16 +3870,16 @@ fn parse_proc_net_tcp_connections(content: &str) -> Vec<TcpConnection> {
         // and would have been semantically wrong even without the type
         // error, since `local_parts.0` is the port, not the address+port
         // string the slicing presumed.
-        if let Some((local_hex, local_port_hex)) = fields[1].split_once(':') {
+        if let Some((local_hex, local_port_hex)) = local_field.split_once(':') {
             let local_addr = hex_to_ip(local_hex);
             if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
                 let local = format!("{local_addr}:{port}");
 
-                if let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') {
+                if let Some((remote_hex, remote_port_hex)) = remote_field.split_once(':') {
                     let remote_addr = hex_to_ip(remote_hex);
                     if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
                         let remote = format!("{remote_addr}:{port}");
-                        let state = fields[3].to_string();
+                        let state = state_field.to_string();
                         connections.push(TcpConnection {
                             local_addr: local,
                             remote_addr: remote,
@@ -3882,13 +3911,13 @@ fn parse_netstat_tcp_connections_macos(output: &str) -> Vec<TcpConnection> {
     for line in output.lines().skip(1) {
         let fields: Vec<&str> = line.split_whitespace().collect();
         // RSA-0050: indexes fields[5] (state) ⇒ needs >= 6, not >= 4.
-        if fields.len() < 6 {
+        let [_, _, _, local_field, remote_field, state_field, ..] = fields.as_slice() else {
             continue;
-        }
+        };
         connections.push(TcpConnection {
-            local_addr: fields[3].to_owned(),
-            remote_addr: fields[4].to_owned(),
-            state: fields[5].to_owned(),
+            local_addr: (*local_field).to_owned(),
+            remote_addr: (*remote_field).to_owned(),
+            state: (*state_field).to_owned(),
             pid: None,
         });
     }
@@ -3917,21 +3946,29 @@ fn parse_powershell_tcp_connections_csv(output: &str) -> Vec<TcpConnection> {
     let mut connections = Vec::new();
     for line in output.lines().skip(1) {
         let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() >= 5 {
+        if let [
+            local_addr_f,
+            local_port_f,
+            remote_addr_f,
+            remote_port_f,
+            state_f,
+            ..,
+        ] = fields.as_slice()
+        {
             let local = format!(
                 "{}:{}",
-                fields[0].trim_matches('"'),
-                fields[1].trim_matches('"')
+                local_addr_f.trim_matches('"'),
+                local_port_f.trim_matches('"')
             );
             let remote = format!(
                 "{}:{}",
-                fields[2].trim_matches('"'),
-                fields[3].trim_matches('"')
+                remote_addr_f.trim_matches('"'),
+                remote_port_f.trim_matches('"')
             );
             connections.push(TcpConnection {
                 local_addr: local,
                 remote_addr: remote,
-                state: fields[4].trim_matches('"').to_string(),
+                state: state_f.trim_matches('"').to_string(),
                 pid: None,
             });
         }
@@ -4121,9 +4158,9 @@ fn interface_speed_internal() -> Vec<InterfaceSpeed> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let fields: Vec<&str> = line.split(',').collect();
-                if fields.len() >= 3 {
-                    let name = fields[0].trim_matches('"').to_string();
-                    let speed_str = fields[1].trim_matches('"');
+                if let [name_field, speed_field, mtu_field, ..] = fields.as_slice() {
+                    let name = (*name_field).trim_matches('"').to_string();
+                    let speed_str = speed_field.trim_matches('"');
                     let speed_mbps = if speed_str.contains("Mbps") {
                         speed_str.replace(" Mbps", "").parse::<u64>().ok()
                     } else if speed_str.contains("Gbps") {
@@ -4135,7 +4172,7 @@ fn interface_speed_internal() -> Vec<InterfaceSpeed> {
                     } else {
                         None
                     };
-                    let mtu = fields[2].trim_matches('"').parse::<u32>().unwrap_or(1500);
+                    let mtu = mtu_field.trim_matches('"').parse::<u32>().unwrap_or(1500);
                     speeds.push(InterfaceSpeed {
                         name,
                         speed_mbps,
@@ -4155,12 +4192,26 @@ fn disk_io_stats_internal() -> Vec<DiskIoStat> {
     if let Ok(content) = fs::read_to_string("/proc/diskstats") {
         for line in content.lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 14 {
-                let device = fields[2].to_string();
-                let read_ops = fields[3].parse::<u64>().unwrap_or(0);
-                let read_bytes = fields[5].parse::<u64>().unwrap_or(0) * 512;
-                let write_ops = fields[7].parse::<u64>().unwrap_or(0);
-                let write_bytes = fields[9].parse::<u64>().unwrap_or(0) * 512;
+            if fields.len() >= 14
+                && let [
+                    _,
+                    _,
+                    device,
+                    read_ops_field,
+                    _,
+                    read_bytes_field,
+                    _,
+                    write_ops_field,
+                    _,
+                    write_bytes_field,
+                    ..,
+                ] = fields.as_slice()
+            {
+                let device = (*device).to_string();
+                let read_ops = read_ops_field.parse::<u64>().unwrap_or(0);
+                let read_bytes = read_bytes_field.parse::<u64>().unwrap_or(0) * 512;
+                let write_ops = write_ops_field.parse::<u64>().unwrap_or(0);
+                let write_bytes = write_bytes_field.parse::<u64>().unwrap_or(0) * 512;
                 stats.push(DiskIoStat {
                     device,
                     read_ops,
@@ -4242,10 +4293,16 @@ fn process_memory_internal() -> Vec<ProcessMemory> {
         for line in s.lines().skip(1) {
             let fields: Vec<&str> = line.split_whitespace().collect();
             if fields.len() >= 11
-                && let Ok(pid) = fields[1].parse::<u32>()
-                && let Ok(memory_mb) = fields[5].parse::<u64>()
+                && let [_, pid_field, _, _, _, memory_field, name_fields @ ..] = fields.as_slice()
+                && let Ok(pid) = pid_field.parse::<u32>()
+                && let Ok(memory_mb) = memory_field.parse::<u64>()
             {
-                let name = fields[10..].join(" ");
+                let name = name_fields
+                    .iter()
+                    .skip(4)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 mem_data.push((name, pid, memory_mb));
             }
         }
@@ -4277,10 +4334,10 @@ fn process_memory_internal() -> Vec<ProcessMemory> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let fields: Vec<&str> = line.split(',').collect();
-                if fields.len() >= 3 {
-                    let name = fields[0].trim_matches('"').to_string();
-                    if let Ok(pid) = fields[1].trim_matches('"').parse::<u32>() {
-                        if let Ok(memory_bytes) = fields[2].trim_matches('"').parse::<u64>() {
+                if let [name_field, pid_field, memory_field, ..] = fields.as_slice() {
+                    let name = (*name_field).trim_matches('"').to_string();
+                    if let Ok(pid) = pid_field.trim_matches('"').parse::<u32>() {
+                        if let Ok(memory_bytes) = memory_field.trim_matches('"').parse::<u64>() {
                             processes.push(ProcessMemory {
                                 name,
                                 pid,
@@ -4309,9 +4366,9 @@ fn active_network_routes_internal() -> Vec<RouteInfo> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
+                if let [destination, _, _, ..] = parts.as_slice() {
                     routes.push(RouteInfo {
-                        destination: parts[0].to_string(),
+                        destination: (*destination).to_string(),
                         gateway: parts.get(2).unwrap_or(&"direct").to_string(),
                         interface: parts.get(4).unwrap_or(&"-").to_string(),
                         metric: None,
@@ -4330,11 +4387,11 @@ fn active_network_routes_internal() -> Vec<RouteInfo> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(3) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 6 {
+                if let [destination, gateway, _, _, _, interface, ..] = parts.as_slice() {
                     routes.push(RouteInfo {
-                        destination: parts[0].to_owned(),
-                        gateway: parts[1].to_owned(),
-                        interface: parts[5].to_owned(),
+                        destination: (*destination).to_owned(),
+                        gateway: (*gateway).to_owned(),
+                        interface: (*interface).to_owned(),
                         metric: None,
                     });
                 }
@@ -4351,12 +4408,12 @@ fn active_network_routes_internal() -> Vec<RouteInfo> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(3) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 4 {
+                if let [destination, metric_field, gateway, interface, ..] = parts.as_slice() {
                     routes.push(RouteInfo {
-                        destination: parts[0].to_string(),
-                        gateway: parts[2].to_string(),
-                        interface: parts[3].to_string(),
-                        metric: parts.get(1).and_then(|m| m.parse().ok()),
+                        destination: (*destination).to_string(),
+                        gateway: (*gateway).to_string(),
+                        interface: (*interface).to_string(),
+                        metric: metric_field.parse().ok(),
                     });
                 }
             }
@@ -4595,8 +4652,8 @@ fn parse_ss_connection_states(output: &str) -> StateHistogram {
     };
     for line in output.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if !parts.is_empty() {
-            match parts[0] {
+        if let [first, ..] = parts.as_slice() {
+            match *first {
                 "ESTAB" => histogram.established += 1,
                 "TIME-WAIT" => histogram.time_wait += 1,
                 "SYN-RECV" => histogram.syn_recv += 1,
@@ -4781,11 +4838,11 @@ fn arp_table_entries_internal() -> Vec<ArpEntry> {
             for line in s.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 // RSA-0050: needs parts[5] (interface) ⇒ guard >= 6, not >= 5.
-                if parts.len() >= 6 {
+                if let [_, ip_field, _, mac_field, _, interface_field, ..] = parts.as_slice() {
                     entries.push(ArpEntry {
-                        ip: parts[1].trim_matches('(').trim_matches(')').to_owned(),
-                        mac: parts[3].to_owned(),
-                        interface: parts[5].to_owned(),
+                        ip: (*ip_field).trim_matches('(').trim_matches(')').to_owned(),
+                        mac: (*mac_field).to_owned(),
+                        interface: (*interface_field).to_owned(),
                         age_secs: None,
                         is_permanent: line.contains("permanent"),
                     });
@@ -4803,10 +4860,10 @@ fn arp_table_entries_internal() -> Vec<ArpEntry> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 3 {
+                if let [ip_field, mac_field, _, ..] = parts.as_slice() {
                     entries.push(ArpEntry {
-                        ip: parts[0].to_string(),
-                        mac: parts[1].to_string(),
+                        ip: (*ip_field).to_string(),
+                        mac: (*mac_field).to_string(),
                         interface: "-".to_string(),
                         age_secs: None,
                         is_permanent: line.contains("static"),
@@ -4842,12 +4899,13 @@ fn parse_ss_listening_sockets(output: &str) -> Vec<ListeningSocket> {
     for line in output.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 4
-            && let Some(colon_idx) = parts[3].rfind(':')
+            && let [protocol, _, _, local, ..] = parts.as_slice()
+            && let Some((address, port_str)) = local.rsplit_once(':')
         {
-            let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
+            let port: u16 = port_str.parse().unwrap_or(0);
             sockets.push(ListeningSocket {
-                protocol: parts[0].to_string(),
-                address: parts[3][..colon_idx].to_string(),
+                protocol: (*protocol).to_string(),
+                address: address.to_string(),
                 port,
                 pid: None,
                 process_name: None,
@@ -4873,12 +4931,15 @@ fn parse_netstat_listening_sockets_macos(output: &str) -> Vec<ListeningSocket> {
     let mut sockets = Vec::new();
     for line in output.lines().skip(1) {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 && parts[3].contains("LISTEN") {
-            if let Some(colon_idx) = parts[3].rfind('.') {
-                let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
+        if parts.len() >= 4
+            && let [protocol, _, _, local, ..] = parts.as_slice()
+            && local.contains("LISTEN")
+        {
+            if let Some((address, port_str)) = local.rsplit_once('.') {
+                let port: u16 = port_str.parse().unwrap_or(0);
                 sockets.push(ListeningSocket {
-                    protocol: parts[0].to_owned(),
-                    address: parts[3][..colon_idx].to_string(),
+                    protocol: (*protocol).to_owned(),
+                    address: address.to_string(),
                     port,
                     pid: None,
                     process_name: None,
@@ -4911,12 +4972,15 @@ fn parse_netstat_listening_sockets_windows(output: &str) -> Vec<ListeningSocket>
     let mut sockets = Vec::new();
     for line in output.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 && parts[3].contains("LISTEN") {
-            if let Some(colon_idx) = parts[1].rfind(':') {
-                let port: u16 = parts[1][colon_idx + 1..].parse().unwrap_or(0);
+        if parts.len() >= 4
+            && let [protocol, local, _, state_field, ..] = parts.as_slice()
+            && state_field.contains("LISTEN")
+        {
+            if let Some((address, port_str)) = local.rsplit_once(':') {
+                let port: u16 = port_str.parse().unwrap_or(0);
                 sockets.push(ListeningSocket {
-                    protocol: parts[0].to_string(),
-                    address: parts[1][..colon_idx].to_string(),
+                    protocol: (*protocol).to_string(),
+                    address: address.to_string(),
                     port,
                     pid: parts.get(4).and_then(|p| p.parse().ok()),
                     process_name: None,
@@ -5251,9 +5315,7 @@ fn apparmor_profile_status_internal() -> Vec<AppArmorProfile> {
                 for line in s.lines() {
                     if line.contains("profile") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
-                        if parts.len() >= 2 {
-                            let name = parts[parts.len() - 2];
-                            let mode = parts.last().unwrap_or(&"unknown");
+                        if let [.., name, mode] = parts.as_slice() {
                             profiles.push(AppArmorProfile {
                                 name: name.to_string(),
                                 mode: mode.to_string(),
@@ -5333,7 +5395,7 @@ fn key_permission_check_from_stat(
     };
 
     let parts: Vec<&str> = stdout.split_whitespace().collect();
-    if parts.len() < 2 {
+    let [owner_group, mode, ..] = parts.as_slice() else {
         issues.push(format!(
             "{path}: malformed stat output (expected \"owner:group mode\"), got {stdout:?}"
         ));
@@ -5348,10 +5410,7 @@ fn key_permission_check_from_stat(
             is_correct: false,
             issues,
         };
-    }
-
-    let owner_group = parts[0];
-    let mode = parts[1];
+    };
 
     let owner_parts: Vec<&str> = owner_group.split(':').collect();
     let owner = owner_parts
@@ -5664,11 +5723,11 @@ fn open_security_vulnerabilities_internal(advisory_db_path: &str) -> Vulnerabili
         for line in content.lines() {
             if !line.starts_with('#') && !line.is_empty() {
                 let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 3 {
+                if let [name_field, cve_field, _, tail @ ..] = parts.as_slice() {
                     vulnerable_packages.push(VulnPackage {
-                        name: parts[0].to_owned(),
-                        version: parts.get(3..).map(|p| p.join(",")).unwrap_or_default(),
-                        cves: vec![parts[1].to_owned()],
+                        name: (*name_field).to_owned(),
+                        version: tail.join(","),
+                        cves: vec![(*cve_field).to_owned()],
                     });
                 }
             }
@@ -5750,9 +5809,9 @@ fn file_descriptor_usage_internal() -> FdUsage {
 
     if let Ok(content) = fs::read_to_string("/proc/sys/fs/file-nr") {
         let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 2 {
-            used = parts[0].parse().unwrap_or(0);
-            limit = parts[1].parse().unwrap_or(0);
+        if let [used_field, limit_field, ..] = parts.as_slice() {
+            used = used_field.parse().unwrap_or(0);
+            limit = limit_field.parse().unwrap_or(0);
         }
     }
 
@@ -5932,10 +5991,19 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 6 {
-                    let total = parts[1].parse().unwrap_or(0);
-                    let used = parts[2].parse().unwrap_or(0);
-                    let available = parts[3].parse().unwrap_or(0);
+                if let [
+                    _,
+                    total_field,
+                    used_field,
+                    available_field,
+                    _,
+                    filesystem_field,
+                    ..,
+                ] = parts.as_slice()
+                {
+                    let total = total_field.parse().unwrap_or(0);
+                    let used = used_field.parse().unwrap_or(0);
+                    let available = available_field.parse().unwrap_or(0);
                     let percent_used = if total > 0 {
                         (used as f64 / total as f64) * 100.0
                     } else {
@@ -5943,7 +6011,7 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
                     };
 
                     inodes.push(InodeUsage {
-                        filesystem: parts[5].to_string(),
+                        filesystem: (*filesystem_field).to_string(),
                         total_inodes: total as u64,
                         used_inodes: used as u64,
                         available: available as u64,
@@ -5963,10 +6031,19 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 6 {
-                    let total = parts[1].parse().unwrap_or(0);
-                    let used = parts[2].parse().unwrap_or(0);
-                    let available = parts[3].parse().unwrap_or(0);
+                if let [
+                    _,
+                    total_field,
+                    used_field,
+                    available_field,
+                    _,
+                    filesystem_field,
+                    ..,
+                ] = parts.as_slice()
+                {
+                    let total = total_field.parse().unwrap_or(0);
+                    let used = used_field.parse().unwrap_or(0);
+                    let available = available_field.parse().unwrap_or(0);
                     let percent_used = if total > 0 {
                         (f64::from(used) / f64::from(total)) * 100.0
                     } else {
@@ -5974,7 +6051,7 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
                     };
 
                     inodes.push(InodeUsage {
-                        filesystem: parts[5].to_owned(),
+                        filesystem: (*filesystem_field).to_owned(),
                         total_inodes: total as u64,
                         used_inodes: used as u64,
                         available: available as u64,
@@ -5997,9 +6074,9 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
         if let Ok(s) = String::from_utf8(output.stdout) {
             for line in s.lines().skip(1) {
                 let parts: Vec<&str> = line.split(',').collect();
-                if parts.len() >= 3 {
-                    let total = parts[1].trim_matches('"').parse().unwrap_or(0u64);
-                    let available = parts[2].trim_matches('"').parse().unwrap_or(0u64);
+                if let [drive_field, total_field, available_field, ..] = parts.as_slice() {
+                    let total = (*total_field).trim_matches('"').parse().unwrap_or(0u64);
+                    let available = (*available_field).trim_matches('"').parse().unwrap_or(0u64);
                     let used = total.saturating_sub(available);
                     let percent_used = if total > 0 {
                         (used as f64 / total as f64) * 100.0
@@ -6008,7 +6085,7 @@ fn inode_usage_per_filesystem_internal() -> Vec<InodeUsage> {
                     };
 
                     inodes.push(InodeUsage {
-                        filesystem: format!("{}:\\", parts[0].trim_matches('"')),
+                        filesystem: format!("{}:\\", drive_field.trim_matches('"')),
                         total_inodes: total,
                         used_inodes: used,
                         available,
@@ -6350,9 +6427,9 @@ fn systemd_unit_dependency_graph_internal() -> DependencyGraph {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 for line in s.lines().skip(1) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 2 {
+                    if let [name_field, ..] = parts.as_slice() {
                         units.push(UnitDeps {
-                            name: parts[0].to_string(),
+                            name: (*name_field).to_string(),
                             wants: Vec::new(),
                             requires: Vec::new(),
                             blocking_units: Vec::new(),
@@ -6378,9 +6455,9 @@ fn process_cpu_time_distribution_internal() -> ProcessCpuTime {
         if let Ok(s) = String::from_utf8(output.stdout) {
             if let Some(line) = s.lines().nth(1) {
                 let parts: Vec<&str> = line.split(':').collect();
-                if parts.len() >= 2 {
-                    let minutes = parts[0].trim().parse::<u64>().unwrap_or(0);
-                    let seconds = parts[1]
+                if let [minutes_field, seconds_field, ..] = parts.as_slice() {
+                    let minutes = minutes_field.trim().parse::<u64>().unwrap_or(0);
+                    let seconds = seconds_field
                         .split('.')
                         .next()
                         .unwrap_or("0")
@@ -6436,8 +6513,10 @@ fn disk_io_latency_histogram_internal(device: &str, duration_secs: u64) -> IoLat
                     if line.contains("await") {
                         let parts: Vec<&str> = line.split_whitespace().collect();
                         for (i, part) in parts.iter().enumerate() {
-                            if part.contains("await") && i + 1 < parts.len() {
-                                if let Ok(await_val) = parts[i + 1].parse::<f64>() {
+                            if part.contains("await")
+                                && let Some(next_field) = parts.get(i + 1)
+                            {
+                                if let Ok(await_val) = next_field.parse::<f64>() {
                                     p50_ms = (await_val * 0.5).min(p50_ms + await_val);
                                     p95_ms = (await_val * 0.95).min(p95_ms + await_val);
                                     p99_ms = (await_val * 0.99).min(p99_ms + await_val);
@@ -6668,9 +6747,9 @@ fn filesystem_cache_efficiency_internal() -> CacheEfficiency {
             if let Ok(s) = String::from_utf8(output.stdout) {
                 for line in s.lines().skip(1) {
                     let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 3 {
-                        if let Ok(us) = parts[0].parse::<u64>() {
-                            if let Ok(sy) = parts[1].parse::<u64>() {
+                    if let [us_field, sy_field, _, ..] = parts.as_slice() {
+                        if let Ok(us) = us_field.parse::<u64>() {
+                            if let Ok(sy) = sy_field.parse::<u64>() {
                                 cache_hit_rate_percent =
                                     (us as f64 / (us as f64 + sy as f64 + 1.0)) * 100.0;
                             }
@@ -6959,10 +7038,10 @@ fn system_state_snapshot_internal() -> SystemSnapshot {
     let mut load_avg_15 = 0.0;
     if let Ok(content) = fs::read_to_string("/proc/loadavg") {
         let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.len() >= 3 {
-            load_avg_1 = parts[0].parse().unwrap_or(0.0);
-            load_avg_5 = parts[1].parse().unwrap_or(0.0);
-            load_avg_15 = parts[2].parse().unwrap_or(0.0);
+        if let [l1, l5, l15, ..] = parts.as_slice() {
+            load_avg_1 = l1.parse().unwrap_or(0.0);
+            load_avg_5 = l5.parse().unwrap_or(0.0);
+            load_avg_15 = l15.parse().unwrap_or(0.0);
         }
     }
 
@@ -7039,9 +7118,9 @@ fn performance_regression_detection_internal(
     }
 
     for (name, values) in metrics_by_name {
-        if values.len() >= 2 {
-            let first = values[0] as f64;
-            let last = values[values.len() - 1] as f64;
+        if let [first_value, .., last_value] = values.as_slice() {
+            let first = *first_value as f64;
+            let last = *last_value as f64;
             // Guard against a zero first sample (division would yield
             // inf/NaN and never compare true against the threshold).
             if first == 0.0 {
@@ -8759,4 +8838,834 @@ tcp4 0 0 *.22 *.* LISTEN
             );
         }
     }
+}
+
+#[cfg(test)]
+mod aq08_step7_differential {
+    //! AQ-08 step 7 (AQ-08 §7, rustynet-sysinfo): seeded-mutation differential
+    //! harness. Each `old_*` function is a verbatim copy of the parser body
+    //! from the pre-step commit (HEAD before this patch), renamed only. For a
+    //! golden fixture plus 2000 deterministic mutations per parser (truncation,
+    //! line delete/duplicate/swap, byte replacement, junk injection, oversize
+    //! padding, multibyte insertion, empty input), the old and new parsers
+    //! must produce identical results. Any divergence fails the test and names
+    //! the parser, the seed and the offending input.
+
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const JUNK: &[&str] = &[
+        "1234567890",
+        "deadbeef",
+        "0",
+        "-",
+        "?",
+        "LISTEN",
+        "ESTAB",
+        "8.8.8.8",
+        "fe80::1%utun0",
+        "\"quoted,comma\"",
+        "0100007F:1F90",
+        "\t",
+        "  ",
+        "4294967295",
+        "18446744073709551616",
+        "-3",
+        "1e9",
+        "0x10",
+        "é",
+        "中",
+        "established",
+        "600",
+        "root:wheel",
+        "*",
+        "[",
+        "]",
+    ];
+
+    fn mutate(input: &str, rng: &mut Rng) -> String {
+        let mut s = input.to_string();
+        match rng.below(10) {
+            0 => {
+                // truncate at a char boundary
+                if !s.is_empty() {
+                    let mut cut = rng.below(s.len());
+                    while cut < s.len() && !s.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    s.truncate(cut);
+                }
+            }
+            1 => {
+                // delete a random line
+                let starts: Vec<usize> = std::iter::once(0)
+                    .chain(s.match_indices('\n').map(|(i, _)| i + 1))
+                    .collect();
+                if starts.len() > 1 || !s.is_empty() {
+                    let k = rng.below(starts.len());
+                    let start = starts[k];
+                    let end = s[start..].find('\n').map_or(s.len(), |p| start + p + 1);
+                    s.replace_range(start..end, "");
+                }
+            }
+            2 => {
+                // duplicate a random line
+                let starts: Vec<usize> = std::iter::once(0)
+                    .chain(s.match_indices('\n').map(|(i, _)| i + 1))
+                    .collect();
+                if !s.is_empty() {
+                    let k = rng.below(starts.len());
+                    let start = starts[k];
+                    let end = s[start..].find('\n').map_or(s.len(), |p| start + p + 1);
+                    let line = s[start..end].to_string();
+                    s.insert_str(end, &line);
+                }
+            }
+            3 => {
+                // replace a random char with a junk token
+                let count = s.chars().count();
+                if count > 0 {
+                    let k = rng.below(count);
+                    let byte_idx = s.char_indices().nth(k).map_or(0, |(i, _)| i);
+                    let ch_len = s[byte_idx..].chars().next().map_or(1, char::len_utf8);
+                    let w = JUNK[rng.below(JUNK.len())];
+                    s.replace_range(byte_idx..byte_idx + ch_len, w);
+                }
+            }
+            4 => {
+                // insert junk at a char boundary
+                let w = JUNK[rng.below(JUNK.len())];
+                let mut pos = rng.below(s.len() + 1);
+                while pos < s.len() && !s.is_char_boundary(pos) {
+                    pos += 1;
+                }
+                s.insert_str(pos, w);
+            }
+            5 => {
+                // append a junk line
+                s.push_str(&format!(
+                    "junk{} {}\n",
+                    rng.next(),
+                    JUNK[rng.below(JUNK.len())]
+                ));
+            }
+            6 => {
+                // empty input
+                s = String::new();
+            }
+            7 => {
+                // oversize padding (wide rows)
+                let big = "0.0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n".repeat(1 + rng.below(64));
+                s.push_str(&big);
+            }
+            8 => {
+                // whitespace attack: run of tabs/spaces at a boundary
+                let mut pos = rng.below(s.len() + 1);
+                while pos < s.len() && !s.is_char_boundary(pos) {
+                    pos += 1;
+                }
+                s.insert_str(pos, " \t \t ");
+            }
+            _ => {
+                // swap two lines
+                let starts: Vec<usize> = std::iter::once(0)
+                    .chain(s.match_indices('\n').map(|(i, _)| i + 1))
+                    .collect();
+                if starts.len() >= 2 {
+                    let a = rng.below(starts.len());
+                    let b = rng.below(starts.len());
+                    let (a, b) = (a.min(b), a.max(b));
+                    let ea = s[starts[a]..]
+                        .find('\n')
+                        .map_or(s.len(), |p| starts[a] + p + 1);
+                    let eb = s[starts[b]..]
+                        .find('\n')
+                        .map_or(s.len(), |p| starts[b] + p + 1);
+                    let la: String = s[starts[a]..ea].to_string();
+                    let lb: String = s[starts[b]..eb].to_string();
+                    s.replace_range(starts[b]..eb, &la);
+                    s.replace_range(starts[a]..ea, &lb);
+                }
+            }
+        }
+        s
+    }
+
+    fn run_diff<T, F, G>(parser: &str, seed: u64, n: usize, golden: &str, old_f: F, new_f: G)
+    where
+        T: PartialEq + std::fmt::Debug,
+        F: Fn(&str) -> T,
+        G: Fn(&str) -> T,
+    {
+        // runtime floor: a future edit cannot silently shrink the mutation
+        // count below one thousand cases per parser
+        assert!(n >= 1_000, "{parser}: mutation count floor");
+        let o = old_f(golden);
+        let w = new_f(golden);
+        assert_eq!(o, w, "DIVERGENCE in {parser} on GOLDEN: {golden:?}");
+        let mut rng = Rng(seed);
+        for i in 0..n {
+            let m = mutate(golden, &mut rng);
+            let o = old_f(&m);
+            let w = new_f(&m);
+            assert_eq!(
+                o, w,
+                "DIVERGENCE in {parser} at mutation {i} (seed {seed}): {m:?}"
+            );
+        }
+        eprintln!("{parser}: {n} mutations + golden OK");
+    }
+    // --- parse_proc_net_dev_bytes: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_proc_net_dev_bytes(content: &str, interface: &str) -> (u64, u64) {
+        for line in content.lines() {
+            if line.contains(interface) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 10 {
+                    let bytes_recv = parts[1].parse::<u64>().unwrap_or(0);
+                    let bytes_sent = parts[9].parse::<u64>().unwrap_or(0);
+                    return (bytes_sent, bytes_recv);
+                }
+            }
+        }
+        (0, 0)
+    }
+
+    #[test]
+    fn differential_parse_proc_net_dev_bytes() {
+        run_diff(
+            "parse_proc_net_dev_bytes",
+            2552007,
+            2000,
+            GOLDEN_PARSE_PROC_NET_DEV_BYTES,
+            |s| old_parse_proc_net_dev_bytes(s, "eth0"),
+            |s| parse_proc_net_dev_bytes(s, "eth0"),
+        );
+    }
+
+    // --- parse_wg_latest_handshake_timestamp: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_wg_latest_handshake_timestamp(stdout: &str) -> Option<u64> {
+        stdout.lines().find_map(|line| {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                parts[1].parse::<u64>().ok()
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn differential_parse_wg_latest_handshake_timestamp() {
+        run_diff(
+            "parse_wg_latest_handshake_timestamp",
+            3709007,
+            2000,
+            GOLDEN_PARSE_WG_LATEST_HANDSHAKE_TIMESTAMP,
+            old_parse_wg_latest_handshake_timestamp,
+            parse_wg_latest_handshake_timestamp,
+        );
+    }
+
+    // --- parse_wg_show_peers: old (verbatim from HEAD) vs new (production) ---
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(dead_code)]
+    fn old_parse_wg_show_peers(stdout: &str) -> Vec<WireGuardPeer> {
+        let mut peers = Vec::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 && parts[0] != "interface:" && parts[0] != "public" {
+                // `get(..8)` returns None if 8 is not a char boundary (non-ASCII);
+                // fall back to the whole field rather than panicking on a byte-slice
+                // at a mid-character index. Identical to `[..8]` for ASCII `wg`
+                // output where field 0 is a base64 key.
+                let name_prefix = parts[0].get(..8).unwrap_or(parts[0]);
+                peers.push(WireGuardPeer {
+                    name: format!("peer-{name_prefix}"),
+                    ip: parts.get(3).unwrap_or(&"-").to_string(),
+                    allowed_ips: parts.get(2).unwrap_or(&"-").to_string(),
+                    last_handshake_ago: None,
+                });
+            }
+        }
+        peers
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn differential_parse_wg_show_peers() {
+        run_diff(
+            "parse_wg_show_peers",
+            2038007,
+            2000,
+            GOLDEN_PARSE_WG_SHOW_PEERS,
+            old_parse_wg_show_peers,
+            parse_wg_show_peers,
+        );
+    }
+
+    // --- parse_proc_net_dev: old (verbatim from HEAD) vs new (production) ---
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn old_parse_proc_net_dev(content: &str) -> Vec<InterfaceStats> {
+        let mut stats = Vec::new();
+        for line in content.lines().skip(2) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 11 {
+                stats.push(InterfaceStats {
+                    name: parts[0].trim_end_matches(':').to_string(),
+                    bytes_in: parts[1].parse::<u64>().unwrap_or(0),
+                    bytes_out: parts[9].parse::<u64>().unwrap_or(0),
+                    packets_in: parts[2].parse::<u64>().unwrap_or(0),
+                    packets_out: parts[10].parse::<u64>().unwrap_or(0),
+                    errors: parts[3].parse::<u64>().unwrap_or(0),
+                    dropped: parts[4].parse::<u64>().unwrap_or(0),
+                });
+            }
+        }
+        stats
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn differential_parse_proc_net_dev() {
+        run_diff(
+            "parse_proc_net_dev",
+            1906007,
+            2000,
+            GOLDEN_PARSE_PROC_NET_DEV,
+            old_parse_proc_net_dev,
+            parse_proc_net_dev,
+        );
+    }
+
+    // --- parse_proc_loadavg: old (verbatim from HEAD) vs new (production) ---
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn old_parse_proc_loadavg(content: &str) -> (f64, f64, f64) {
+        let parts: Vec<&str> = content.split_whitespace().collect();
+        if parts.len() >= 3 {
+            (
+                parts[0].parse().unwrap_or(0.0),
+                parts[1].parse().unwrap_or(0.0),
+                parts[2].parse().unwrap_or(0.0),
+            )
+        } else {
+            (0.0, 0.0, 0.0)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn differential_parse_proc_loadavg() {
+        run_diff(
+            "parse_proc_loadavg",
+            1899007,
+            2000,
+            GOLDEN_PARSE_PROC_LOADAVG,
+            old_parse_proc_loadavg,
+            parse_proc_loadavg,
+        );
+    }
+
+    // --- parse_powershell_tcp_state_groups: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_powershell_tcp_state_groups(output: &str) -> SocketStats {
+        let mut established = 0usize;
+        let mut listening = 0usize;
+        let mut time_wait = 0usize;
+
+        for line in output.lines().skip(2) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                let state = parts[0].to_lowercase();
+                let count = parts[1].parse::<usize>().unwrap_or(0);
+
+                if state.contains("established") {
+                    established = count;
+                } else if state.contains("listen") {
+                    listening = count;
+                } else if state.contains("time_wait") || state.contains("timewait") {
+                    time_wait = count;
+                }
+            }
+        }
+
+        SocketStats {
+            established,
+            listening,
+            time_wait,
+            total: established + listening + time_wait,
+        }
+    }
+
+    #[test]
+    fn differential_parse_powershell_tcp_state_groups() {
+        run_diff(
+            "parse_powershell_tcp_state_groups",
+            3556007,
+            2000,
+            GOLDEN_PARSE_POWERSHELL_TCP_STATE_GROUPS,
+            old_parse_powershell_tcp_state_groups,
+            parse_powershell_tcp_state_groups,
+        );
+    }
+
+    // --- hex_to_ip: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_hex_to_ip(hex: &str) -> String {
+        let hex = hex.to_lowercase();
+        if hex.len() >= 8 {
+            let bytes: Vec<u8> = (0..4)
+                .filter_map(|i| hex.get(i * 2..i * 2 + 2))
+                .filter_map(|byte_str| u8::from_str_radix(byte_str, 16).ok())
+                .collect();
+            if bytes.len() == 4 {
+                return format!("{}.{}.{}.{}", bytes[3], bytes[2], bytes[1], bytes[0]);
+            }
+        }
+        "unknown".to_string()
+    }
+
+    #[test]
+    fn differential_hex_to_ip() {
+        run_diff(
+            "hex_to_ip",
+            959007,
+            2000,
+            GOLDEN_HEX_TO_IP,
+            old_hex_to_ip,
+            hex_to_ip,
+        );
+    }
+
+    // --- parse_proc_net_tcp_connections: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_proc_net_tcp_connections(content: &str) -> Vec<TcpConnection> {
+        let mut connections = Vec::new();
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 4 {
+                continue;
+            }
+            // /proc/net/tcp encodes each address as `<addr_hex>:<port_hex>`
+            // (8 hex chars + ':' + 4 hex chars for IPv4). split_once is the
+            // direct decoder. The earlier code split into a Vec, then called
+            // split_last (which returns a tuple of `(&last, rest)`), then
+            // tried to index `local_parts[0]` to access the original full
+            // string — that's a tuple-indexing type error
+            //   error[E0608]: cannot index into a value of type
+            //   `(&&str, &[&str])`
+            // and would have been semantically wrong even without the type
+            // error, since `local_parts.0` is the port, not the address+port
+            // string the slicing presumed.
+            if let Some((local_hex, local_port_hex)) = fields[1].split_once(':') {
+                let local_addr = hex_to_ip(local_hex);
+                if let Ok(port) = u16::from_str_radix(local_port_hex, 16) {
+                    let local = format!("{local_addr}:{port}");
+
+                    if let Some((remote_hex, remote_port_hex)) = fields[2].split_once(':') {
+                        let remote_addr = hex_to_ip(remote_hex);
+                        if let Ok(port) = u16::from_str_radix(remote_port_hex, 16) {
+                            let remote = format!("{remote_addr}:{port}");
+                            let state = fields[3].to_string();
+                            connections.push(TcpConnection {
+                                local_addr: local,
+                                remote_addr: remote,
+                                state,
+                                pid: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        connections
+    }
+
+    #[test]
+    fn differential_parse_proc_net_tcp_connections() {
+        run_diff(
+            "parse_proc_net_tcp_connections",
+            3196007,
+            2000,
+            GOLDEN_PARSE_PROC_NET_TCP_CONNECTIONS,
+            old_parse_proc_net_tcp_connections,
+            parse_proc_net_tcp_connections,
+        );
+    }
+
+    // --- parse_netstat_tcp_connections_macos: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_netstat_tcp_connections_macos(output: &str) -> Vec<TcpConnection> {
+        let mut connections = Vec::new();
+        for line in output.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // RSA-0050: indexes fields[5] (state) ⇒ needs >= 6, not >= 4.
+            if fields.len() < 6 {
+                continue;
+            }
+            connections.push(TcpConnection {
+                local_addr: fields[3].to_owned(),
+                remote_addr: fields[4].to_owned(),
+                state: fields[5].to_owned(),
+                pid: None,
+            });
+        }
+        connections
+    }
+
+    #[test]
+    fn differential_parse_netstat_tcp_connections_macos() {
+        run_diff(
+            "parse_netstat_tcp_connections_macos",
+            3735007,
+            2000,
+            GOLDEN_PARSE_NETSTAT_TCP_CONNECTIONS_MACOS,
+            old_parse_netstat_tcp_connections_macos,
+            parse_netstat_tcp_connections_macos,
+        );
+    }
+
+    // --- parse_powershell_tcp_connections_csv: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_powershell_tcp_connections_csv(output: &str) -> Vec<TcpConnection> {
+        let mut connections = Vec::new();
+        for line in output.lines().skip(1) {
+            let fields: Vec<&str> = line.split(',').collect();
+            if fields.len() >= 5 {
+                let local = format!(
+                    "{}:{}",
+                    fields[0].trim_matches('"'),
+                    fields[1].trim_matches('"')
+                );
+                let remote = format!(
+                    "{}:{}",
+                    fields[2].trim_matches('"'),
+                    fields[3].trim_matches('"')
+                );
+                connections.push(TcpConnection {
+                    local_addr: local,
+                    remote_addr: remote,
+                    state: fields[4].trim_matches('"').to_string(),
+                    pid: None,
+                });
+            }
+        }
+        connections
+    }
+
+    #[test]
+    fn differential_parse_powershell_tcp_connections_csv() {
+        run_diff(
+            "parse_powershell_tcp_connections_csv",
+            3858007,
+            2000,
+            GOLDEN_PARSE_POWERSHELL_TCP_CONNECTIONS_CSV,
+            old_parse_powershell_tcp_connections_csv,
+            parse_powershell_tcp_connections_csv,
+        );
+    }
+
+    // --- parse_ip_addr_inet_addresses: old (verbatim from HEAD) vs new (production) ---
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn old_parse_ip_addr_inet_addresses(stdout: &str) -> Vec<String> {
+        let mut addresses = Vec::new();
+        for line in stdout.lines() {
+            if line.contains("inet") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() > 1 {
+                    addresses.push(parts[1].to_string());
+                }
+            }
+        }
+        addresses
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn differential_parse_ip_addr_inet_addresses() {
+        run_diff(
+            "parse_ip_addr_inet_addresses",
+            2937007,
+            2000,
+            GOLDEN_PARSE_IP_ADDR_INET_ADDRESSES,
+            old_parse_ip_addr_inet_addresses,
+            parse_ip_addr_inet_addresses,
+        );
+    }
+
+    // --- parse_ip_route_show: old (verbatim from HEAD) vs new (production) ---
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn old_parse_ip_route_show(stdout: &str) -> Vec<Route> {
+        let mut routes = Vec::new();
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 3 {
+                routes.push(Route {
+                    destination: parts[0].to_string(),
+                    gateway: parts.get(2).unwrap_or(&"direct").to_string(),
+                    interface: parts.get(4).unwrap_or(&"-").to_string(),
+                });
+            }
+        }
+        routes
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn differential_parse_ip_route_show() {
+        run_diff(
+            "parse_ip_route_show",
+            2049007,
+            2000,
+            GOLDEN_PARSE_IP_ROUTE_SHOW,
+            old_parse_ip_route_show,
+            parse_ip_route_show,
+        );
+    }
+
+    // --- parse_ss_listening_sockets: old (verbatim from HEAD) vs new (production) ---
+    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
+    fn old_parse_ss_listening_sockets(output: &str) -> Vec<ListeningSocket> {
+        let mut sockets = Vec::new();
+        for line in output.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4
+                && let Some(colon_idx) = parts[3].rfind(':')
+            {
+                let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
+                sockets.push(ListeningSocket {
+                    protocol: parts[0].to_string(),
+                    address: parts[3][..colon_idx].to_string(),
+                    port,
+                    pid: None,
+                    process_name: None,
+                });
+            }
+        }
+        sockets
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn differential_parse_ss_listening_sockets() {
+        run_diff(
+            "parse_ss_listening_sockets",
+            2791007,
+            2000,
+            GOLDEN_PARSE_SS_LISTENING_SOCKETS,
+            old_parse_ss_listening_sockets,
+            parse_ss_listening_sockets,
+        );
+    }
+
+    // --- parse_netstat_listening_sockets_macos: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_netstat_listening_sockets_macos(output: &str) -> Vec<ListeningSocket> {
+        let mut sockets = Vec::new();
+        for line in output.lines().skip(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 && parts[3].contains("LISTEN") {
+                if let Some(colon_idx) = parts[3].rfind('.') {
+                    let port: u16 = parts[3][colon_idx + 1..].parse().unwrap_or(0);
+                    sockets.push(ListeningSocket {
+                        protocol: parts[0].to_owned(),
+                        address: parts[3][..colon_idx].to_string(),
+                        port,
+                        pid: None,
+                        process_name: None,
+                    });
+                }
+            }
+        }
+        sockets
+    }
+
+    #[test]
+    fn differential_parse_netstat_listening_sockets_macos() {
+        run_diff(
+            "parse_netstat_listening_sockets_macos",
+            3958007,
+            2000,
+            GOLDEN_PARSE_NETSTAT_LISTENING_SOCKETS_MACOS,
+            old_parse_netstat_listening_sockets_macos,
+            parse_netstat_listening_sockets_macos,
+        );
+    }
+
+    // --- parse_netstat_listening_sockets_windows: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_parse_netstat_listening_sockets_windows(output: &str) -> Vec<ListeningSocket> {
+        let mut sockets = Vec::new();
+        for line in output.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 && parts[3].contains("LISTEN") {
+                if let Some(colon_idx) = parts[1].rfind(':') {
+                    let port: u16 = parts[1][colon_idx + 1..].parse().unwrap_or(0);
+                    sockets.push(ListeningSocket {
+                        protocol: parts[0].to_string(),
+                        address: parts[1][..colon_idx].to_string(),
+                        port,
+                        pid: parts.get(4).and_then(|p| p.parse().ok()),
+                        process_name: None,
+                    });
+                }
+            }
+        }
+        sockets
+    }
+
+    #[test]
+    fn differential_parse_netstat_listening_sockets_windows() {
+        run_diff(
+            "parse_netstat_listening_sockets_windows",
+            4206007,
+            2000,
+            GOLDEN_PARSE_NETSTAT_LISTENING_SOCKETS_WINDOWS,
+            old_parse_netstat_listening_sockets_windows,
+            parse_netstat_listening_sockets_windows,
+        );
+    }
+
+    // --- key_permission_check_from_stat: old (verbatim from HEAD) vs new (production) ---
+    #[allow(dead_code)]
+    fn old_key_permission_check_from_stat(
+        path: &str,
+        stat_success: bool,
+        stdout: Option<&str>,
+    ) -> KeyPermissionCheck {
+        let mut issues = Vec::new();
+        if !stat_success {
+            issues.push(format!(
+                "{path}: stat failed (missing or unreadable); permissions NOT verified"
+            ));
+        }
+
+        let Some(stdout) = stdout else {
+            issues.push("stat output unavailable (spawn failure or non-UTF-8)".to_string());
+            return KeyPermissionCheck {
+                path: path.to_string(),
+                owner: "unknown".to_string(),
+                mode: String::new(),
+                context: None,
+                is_correct: false,
+                issues,
+            };
+        };
+
+        let parts: Vec<&str> = stdout.split_whitespace().collect();
+        if parts.len() < 2 {
+            issues.push(format!(
+                "{path}: malformed stat output (expected \"owner:group mode\"), got {stdout:?}"
+            ));
+            return KeyPermissionCheck {
+                path: path.to_string(),
+                owner: parts
+                    .first()
+                    .map(|s| (*s).to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                mode: String::new(),
+                context: None,
+                is_correct: false,
+                issues,
+            };
+        }
+
+        let owner_group = parts[0];
+        let mode = parts[1];
+
+        let owner_parts: Vec<&str> = owner_group.split(':').collect();
+        let owner = owner_parts
+            .first()
+            .copied()
+            .unwrap_or("unknown")
+            .to_string();
+
+        // Non-numeric or overflowing octal is unverifiable, not "maximally open":
+        // report it as incorrect rather than substituting 0o777.
+        let mode_val = match u32::from_str_radix(mode, 8) {
+            Ok(v) => v,
+            Err(_) => {
+                issues.push(format!("{path}: non-octal mode token {mode:?}"));
+                return KeyPermissionCheck {
+                    path: path.to_string(),
+                    owner,
+                    mode: mode.to_string(),
+                    context: None,
+                    is_correct: false,
+                    issues,
+                };
+            }
+        };
+        let is_correct = stat_success && (mode_val & 0o077) == 0;
+
+        if (mode_val & 0o077) != 0 {
+            issues.push("world/group readable".to_string());
+        }
+
+        KeyPermissionCheck {
+            path: path.to_string(),
+            owner,
+            mode: mode.to_string(),
+            context: None,
+            is_correct,
+            issues,
+        }
+    }
+
+    #[test]
+    fn differential_key_permission_check_from_stat() {
+        run_diff(
+            "key_permission_check_from_stat",
+            3196007,
+            2000,
+            GOLDEN_KEY_PERMISSION_CHECK_FROM_STAT,
+            |s| old_key_permission_check_from_stat("path", true, Some(s)),
+            |s| key_permission_check_from_stat("path", true, Some(s)),
+        );
+    }
+
+    const GOLDEN_PARSE_PROC_NET_DEV_BYTES: &str = "Inter-|   Receive                |   Transmit\n face |bytes    packets errs drop|bytes    packets errs\n  eth0: 100000 20 0 0 0 0 0 0 200000 40 0 0 0 0 0 0\n    lo: 500 4 0 0 0 0 0 0 500 4 0 0 0 0 0 0\n";
+    const GOLDEN_PARSE_WG_LATEST_HANDSHAKE_TIMESTAMP: &str = "interface: wg0\n  peer: abc123\n  latest_handshake: 1727000000\n  endpoint: 10.0.0.1:51820\npeer2 xyz 1727000001\n";
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    const GOLDEN_PARSE_WG_SHOW_PEERS: &str = "wg-peer-a 11 10.0.0.2/32 10.0.0.0/24\nwg-peer-b 12 10.0.0.3/32 10.0.1.0/24\ninterface: wg0\npublic abcd1234\n";
+    #[cfg(target_os = "linux")]
+    const GOLDEN_PARSE_PROC_NET_DEV: &str = "Inter-|   Receive                  |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes packets\n  eth0: 100000 20 0 0 0 0 0 0 200000 40 0 0\n    lo: 500 4 0 0 0 0 0 0 500 4 0 0\n";
+    #[cfg(target_os = "linux")]
+    const GOLDEN_PARSE_PROC_LOADAVG: &str = "1.25 0.75 0.35 2/100 12345\n";
+    const GOLDEN_PARSE_POWERSHELL_TCP_STATE_GROUPS: &str =
+        "\n\nEstablished      12\nListen           3\nTimeWait         5\nBound            1\n";
+    const GOLDEN_HEX_TO_IP: &str = "0100007F";
+    const GOLDEN_PARSE_PROC_NET_TCP_CONNECTIONS: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt\n   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000\n   1: 0200007F:0035 08080808:0035 01 00000000:00000000 00:00000000 00000000\n";
+    const GOLDEN_PARSE_NETSTAT_TCP_CONNECTIONS_MACOS: &str = "Proto Recv-Q Send-Q  Local Address      Foreign Address    (state)\ntcp4       0      0  127.0.0.1.8080     10.0.0.1.52341     ESTABLISHED\ntcp6       0      0  *.22               *.*                LISTEN\n";
+    const GOLDEN_PARSE_POWERSHELL_TCP_CONNECTIONS_CSV: &str = "\"LocalAddress\",\"LocalPort\",\"RemoteAddress\",\"RemotePort\",\"State\"\n\"10.0.0.1\",\"445\",\"10.0.0.2\",\"51000\",\"Established\"\n\"127.0.0.1\",\"5040\",\"0.0.0.0\",\"0\",\"Bound\"\n";
+    #[cfg(target_os = "linux")]
+    const GOLDEN_PARSE_IP_ADDR_INET_ADDRESSES: &str = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n    inet 127.0.0.1/8 scope host lo\n    inet6 ::1/128 scope host\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 10.1.2.3/24 brd 10.1.2.255 scope global eth0\n";
+    #[cfg(target_os = "linux")]
+    const GOLDEN_PARSE_IP_ROUTE_SHOW: &str = "default via 10.0.0.1 dev eth0 proto dhcp metric 100\n10.0.0.0/24 dev eth0 proto kernel scope link src 10.0.0.5\n";
+    #[cfg(target_os = "linux")]
+    const GOLDEN_PARSE_SS_LISTENING_SOCKETS: &str = "State   Recv-Q  Send-Q  Local Address:Port  Peer Address:Port\nLISTEN  0       128     0.0.0.0:22          0.0.0.0:*\nLISTEN  0       128     [::]:22             [::]:*\n";
+    const GOLDEN_PARSE_NETSTAT_LISTENING_SOCKETS_MACOS: &str = "Proto Recv-Q Send-Q  Local Address      Foreign Address    (state)\ntcp4       0      0  127.0.0.1.8080.LISTEN *.*            LISTEN\ntcp6       0      0  *.22               *.*                LISTEN\n";
+    const GOLDEN_PARSE_NETSTAT_LISTENING_SOCKETS_WINDOWS: &str = "  Proto  Local Address      Foreign Address    State          PID\n  TCP    0.0.0.0:445        0.0.0.0:0          LISTENING      1234\n  TCP    127.0.0.1:5040     0.0.0.0:0          LISTENING      5678\n";
+    const GOLDEN_KEY_PERMISSION_CHECK_FROM_STAT: &str = "root:wheel 600";
 }
