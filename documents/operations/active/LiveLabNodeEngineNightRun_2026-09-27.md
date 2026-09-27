@@ -4,7 +4,7 @@ Owner direction (2026-09-26, late evening): "keep running live labs all night, l
 
 **Evidence.** Every run appended a row to `documents/operations/live_lab_node_run_matrix.csv`, per-stage rows to `live_lab_node_stage_results.csv`, and triage records to `live_lab_stage_triage.jsonl`. The runs executed in lab worktrees of this repo and on the lenovo-bot host. Their rows were merged into this tree with a multiset-diff port against the unchanged base ledgers. The run ids below are the join key.
 
-The 13 Mac-launched runs are in the ledger now. The five runs launched on lenovo-bot (box-l2 … box-l5) are summarized below from their live logs. Their rows are still on that host, which stopped answering at about 05:00Z (see Findings); they get ported once it is back.
+The 14 Mac-launched runs of 2026-09-26/27 are in the ledger now (r2 started 12:36Z, before the night window; the other 13, from 22:43Z on, are the night itself), alongside two in-progress placeholders for the crashed r1/r3 lenovo attempts. The five runs launched on lenovo-bot (box-l2, box-l3, box-l3b, box-l4, box-l5) are summarized below from their live logs — four in the table, plus box-l3-blindexit, which aborted at preflight ("lab requires exactly 1 Exit node, found 0"; 5 pass, 2 fail). Their rows are still on that host, which stopped answering at about 05:00Z (see Findings); they get ported once it is back.
 
 ## Where runs ran, and why
 
@@ -33,7 +33,7 @@ Runs marked "+fix" ran with a reviewed-or-under-review harness or product fix ap
 | linux-u3-blindexit | Mac → UTM | client, exit, blind_exit | a3dfb390a | 21 pass, 3 fail — **found the blind_exit regression** |
 | linux-u5-chaos +fix | Mac → UTM | client, exit, admin | a3dfb390a +AQ-68 lab fix | 40 pass, 2 fail (chaos tcpdump tally, harness) — the live chain unblocked |
 | linux-u6-blindexit-fix +fix | Mac → UTM | client, exit, blind_exit, aux | 24a184704 +blind_exit fix | 38 pass, 1 fail (enrollment restart, AQ-68 daemon side) — **fix verified live** |
-| linux-u7-blindexit-chaos +fix | Mac → UTM | client, exit, blind_exit | 24a184704 +fixes | **45 pass, 0 fail** |
+| linux-u7-blindexit-chaos +fix | Mac → UTM | client, exit, blind_exit | 24a184704 +fixes | 45 pass, 0 fail, but stopped on request before 30 later stages (4 chaos stages among them: "shutdown was requested"); the ledger marks the run partial. |
 | linux-u8-extra-lantoggle +fix | Mac → UTM | client, exit, extra | 24a184704 +fixes | **39 pass, 0 fail** — LAN toggle passes |
 | linux-u9-vxlan-crossnet +fix | Mac → UTM | client, exit, extra; `--cross-network-substrate vxlan` | 24a184704 +fixes | **38 pass, 0 fail**. The vxlan substrate stands up and tears down cleanly. The scenario stages need client + exit + entry + aux, and aux is blocked by Finding 3. |
 | box-l2-chaos | lenovo-bot | client, exit | 128a43b (=a3dfb390a) | 38 pass, 1 fail (AQ-68) |
@@ -45,14 +45,14 @@ Runs marked "+fix" ran with a reviewed-or-under-review harness or product fix ap
 
 These 51 stages passed at least once in the ported Mac-launched runs:
 
-- **Setup and control plane:** preflight, source archive, SSH reachability, host cleanup, bootstrap, membership, assignment, traversal and DNS-zone distribution, admin issuance.
+- **Setup and control plane:** preflight, source archive, SSH reachability, host cleanup, bootstrap, membership (init and distribution), assignment, traversal and DNS-zone distribution, admin issuance, pubkey collection, per-node cleanup.
 - **Baseline runtime and posture:** enforce and validate baseline runtime, security audit, DNS fail-closed, runtime ACLs, service hardening, key custody, mesh status, gossip convergence, IPv6 leak.
 - **Data path:** traffic matrix, role-switch matrix, exit handoff, active exit, exit DNS fail-closed, exit NAT lifecycle, exit demotion residue.
 - **Relay:** deploy relay service, relay validation, relay hello-limiter flood.
 - **Blind exit** (after the fix): blind_exit and blind_exit dataplane.
 - **Two-hop.**
 - **Live chain:** managed DNS, network flap, reboot recovery, secrets-not-in-logs, live key custody, LAN toggle.
-- **Cross-network:** preflight and NAT classification.
+- **Cross-network:** preflight and NAT classification; vxlan substrate setup and teardown.
 - **Chaos:** crash recovery, daemon fault, daemon SIGSTOP/SIGCONT, membership adversarial, network impairment.
 
 The on-host lenovo runs add, from their live logs:
@@ -91,7 +91,7 @@ Not reachable tonight:
    - Fix: optional-on-EL with a loud WARN, add `iproute-tc`, and the clock-attack stage SKIPs rather than passes without libfaketime. Reviewed SOUND.
    - No repository was added (ADR-027).
 6. **The killswitch-bypass negative control never adjudicated (harness).** It ran one second after the daemon-kill control, mid-restart, and its table selector also matched `rustynet_g1_dns`. Fix reviewed SOUND.
-   - A 5-second nft sampler showed the boot-layer `rustynet_boot` killswitch chain present throughout, so fail-closed held.
+   - A 5-second nft sampler showed the boot-layer `rustynet_boot` killswitch chain present throughout, so fail-closed held. The sampler's output is on lenovo-bot and not yet synced here, so this point is not verifiable from the evidence in this repo until the host is back.
 7. **Libvirt readiness probe timeout (harness).** Remote `virsh` over ssh takes 3–11 s against a 5 s probe, so healthy remote guests were marked unready and rebooted. Reviewed SOUND WITH CORRECTIONS; corrected patch in batch 3.
 8. **Operational.**
    - Mac-launched lenovo runs are unreliable (WAN); launch on the host.

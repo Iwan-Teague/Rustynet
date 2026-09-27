@@ -50,6 +50,7 @@
   "entries": [
     {
       "alias": "debian-headless-2",
+      "platform": "linux",
       "controller": {
         "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-2.utm",
         "type": "local_utm",
@@ -80,6 +81,7 @@
     },
     {
       "alias": "debian-headless-4",
+      "platform": "linux",
       "controller": {
         "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/debian-headless-4.utm",
         "type": "local_utm",
