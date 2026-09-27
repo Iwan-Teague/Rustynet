@@ -438,6 +438,53 @@ const LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS: u64 = 20;
 fn local_process_probe_timeout(operator_timeout: Duration) -> Duration {
     operator_timeout.max(Duration::from_secs(LOCAL_PROCESS_PROBE_TIMEOUT_FLOOR_SECS))
 }
+/// Floor for one `virsh` readiness probe against a REMOTE libvirt host
+/// (`qemu+ssh://`, `qemu+tcp://`, `qemu+tls://`, or any connect URI carrying a
+/// host part).
+///
+/// Measured on 2026-09-26 against `qemu+ssh://ubuntu@192.168.0.29/system`
+/// (lenovo lab host, reached over a Tailscale subnet route): `virsh domstate
+/// <domain>` took 3.3s, 11.0s and 3.9s on three consecutive calls and
+/// `virsh domifaddr --source arp` took 4.7s, while a direct ssh to each guest
+/// stayed under 2s. The readiness gate's previous fixed 5s probe budget
+/// therefore intermittently expired on the HOST round-trip alone, which the
+/// gate read as "domain not running" — and then rebooted a healthy guest.
+/// 30s still bounds the probe fail-closed (an unready host fails within one
+/// allowance instead of failing the run) while absorbing several such
+/// round-trips. Guest-facing ssh/TCP probes keep their caller-supplied
+/// timeout: those are the sub-2s half of the measurement.
+const LIBVIRT_REMOTE_PROBE_TIMEOUT_SECS: u64 = 30;
+
+/// True when a libvirt connect URI reaches its daemon over a REMOTE transport:
+/// an `+ssh`/`+tcp`/`+tls` transport in the scheme, or a host part in the URI
+/// (libvirt's default transport for a host-part URI is remote TLS). The
+/// daemon-socket forms `qemu:///system`, `qemu:///session`,
+/// `qemu+unix:///system` are local.
+fn libvirt_connect_uri_is_remote(connect_uri: &str) -> bool {
+    let Some((scheme, rest)) = connect_uri.split_once("://") else {
+        return false;
+    };
+    if scheme.contains("+ssh") || scheme.contains("+tcp") || scheme.contains("+tls") {
+        return true;
+    }
+    // No named transport: remote only when the authority names a host.
+    // `qemu:///system` -> authority ""; `qemu://host/system` -> "host";
+    // `qemu://user@host/system` -> strip the userinfo.
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    !host.is_empty()
+}
+
+/// Timeout for one `virsh` readiness probe. A remote transport gets the
+/// caller's discovery timeout raised to at least
+/// [`LIBVIRT_REMOTE_PROBE_TIMEOUT_SECS`]; a local URI keeps the current 5s.
+fn libvirt_probe_timeout(connect_uri: &str, discovery_timeout_secs: u64) -> Duration {
+    if libvirt_connect_uri_is_remote(connect_uri) {
+        Duration::from_secs(discovery_timeout_secs.max(LIBVIRT_REMOTE_PROBE_TIMEOUT_SECS))
+    } else {
+        Duration::from_secs(5)
+    }
+}
 const DEFAULT_RESTART_READY_TIMEOUT_SECS: u64 = 300;
 const WINDOWS_UTM_RESULT_PULL_RETRY_BUDGET_SECS: u64 = 300;
 const DEFAULT_ARTIFACT_ROOT: &str = "artifacts/vm_lab";
@@ -31264,9 +31311,17 @@ fn observe_local_utm_target_ready(
             connect_uri,
         } => {
             let virsh_path = Path::new(DEFAULT_VIRSH_BINARY);
-            let process_present =
-                libvirt_domain_running(virsh_path, connect_uri.as_str(), domain.as_str(), timeout)
-                    .unwrap_or(false);
+            // The `virsh` round-trip talks to the libvirt HOST, which over a
+            // remote transport can take tens of seconds per call; `timeout`
+            // continues to bound the guest-facing ssh/TCP probes below.
+            let virsh_timeout = libvirt_probe_timeout(connect_uri.as_str(), timeout.as_secs());
+            let process_present = libvirt_domain_running(
+                virsh_path,
+                connect_uri.as_str(),
+                domain.as_str(),
+                virsh_timeout,
+            )
+            .unwrap_or(false);
             // Only resolve the IP for a running domain: the ip-neigh/ARP rungs
             // can serve a stale cache entry for a powered-off guest, and a
             // stale IP must not be reported (or persisted to the inventory) as
@@ -39315,15 +39370,16 @@ fn kept_after() {}\n\
         execute_ops_vm_lab_discover_local_utm_with_probes,
         execute_ops_vm_lab_validate_live_lab_profile, execute_ops_vm_lab_write_live_lab_profile,
         extract_ip_candidates_for_macs_from_ip_neigh_output, extract_ip_for_mac_from_arp_output,
-        is_macos_metadata_artifact_name, libvirt_ready_state_reason_codes,
-        live_lab_stage_forensics_notes, load_inventory, load_inventory_with_hosts,
-        load_live_lab_profile, local_process_probe_timeout, local_utm_process_present_in_ps_output,
-        local_utm_process_present_with_ps, mac_address_from_utm_config_plist,
-        macos_peer_list_indicates_mesh_join, materialize_orchestration_staging_dir,
-        normalize_mac_address, parse_authorized_keys_fingerprint,
-        parse_libvirt_domifaddr_candidates, parse_libvirt_domiflist_macs,
-        parse_libvirt_domstate_running, parse_libvirt_list_names, parse_live_lab_stage_records,
-        parse_local_utm_list_started_status, parse_membership_active_nodes, parse_vm_lab_topology,
+        is_macos_metadata_artifact_name, libvirt_connect_uri_is_remote, libvirt_probe_timeout,
+        libvirt_ready_state_reason_codes, live_lab_stage_forensics_notes, load_inventory,
+        load_inventory_with_hosts, load_live_lab_profile, local_process_probe_timeout,
+        local_utm_process_present_in_ps_output, local_utm_process_present_with_ps,
+        mac_address_from_utm_config_plist, macos_peer_list_indicates_mesh_join,
+        materialize_orchestration_staging_dir, normalize_mac_address,
+        parse_authorized_keys_fingerprint, parse_libvirt_domifaddr_candidates,
+        parse_libvirt_domiflist_macs, parse_libvirt_domstate_running, parse_libvirt_list_names,
+        parse_live_lab_stage_records, parse_local_utm_list_started_status,
+        parse_membership_active_nodes, parse_vm_lab_topology,
         path_contains_macos_metadata_artifact, persist_local_utm_ready_states_to_inventory,
         pinned_toolchain_channel, privileged_rustynet_cli_script, read_to_string_with_timeout,
         remote_copy_destination_for_target, remote_script_for_ssh_transport,
@@ -41165,6 +41221,87 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
             libvirt_ready_state_reason_codes(&no_auth),
             vec!["ssh-auth-not-ready".to_owned()]
         );
+    }
+
+    /// Witness for the remote-libvirt readiness false-negative (lenovo lab,
+    /// 2026-09-26): over `qemu+ssh://ubuntu@192.168.0.29/system` the gate's
+    /// fixed 5s probe budget expired on the HOST `virsh domstate` round-trip
+    /// alone (measured 3.3s / 11.0s / 3.9s), so a healthy guest was read as not
+    /// running and rebooted. The selector must raise the virsh allowance for a
+    /// remote transport while local URIs keep the current 5s, and the larger of
+    /// the discovery timeout and the 30s floor must win.
+    #[test]
+    fn libvirt_probe_timeout_raises_remote_transport_floor_and_keeps_local_at_five_seconds() {
+        // (a) the measured failing remote transport: floor applies.
+        assert_eq!(
+            libvirt_probe_timeout("qemu+ssh://ubuntu@192.168.0.29/system", 5),
+            Duration::from_secs(30)
+        );
+        // (a) local system/session URIs keep the current 5s.
+        assert_eq!(
+            libvirt_probe_timeout("qemu:///system", 5),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            libvirt_probe_timeout("qemu:///session", 5),
+            Duration::from_secs(5)
+        );
+        // (b) the larger of the discovery timeout and the 30s floor wins.
+        assert_eq!(
+            libvirt_probe_timeout("qemu+ssh://ubuntu@192.168.0.29/system", 45),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            libvirt_probe_timeout("qemu+ssh://ubuntu@192.168.0.29/system", 30),
+            Duration::from_secs(30)
+        );
+        // A host-part-only URI (libvirt defaults its transport to remote TLS)
+        // is remote too.
+        assert_eq!(
+            libvirt_probe_timeout("qemu://192.168.0.29/system", 5),
+            Duration::from_secs(30)
+        );
+        // A local unix-socket transport is not remote.
+        assert_eq!(
+            libvirt_probe_timeout("qemu+unix:///system", 5),
+            Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn libvirt_connect_uri_is_remote_classifies_scheme_transport_and_host() {
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+ssh://ubuntu@192.168.0.29/system"
+        ));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+tcp://192.168.0.29/system"
+        ));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+tls://192.168.0.29/system"
+        ));
+        // No explicit transport, but a host part: remote.
+        assert!(libvirt_connect_uri_is_remote("qemu://192.168.0.29/system"));
+        assert!(!libvirt_connect_uri_is_remote("qemu:///system"));
+        assert!(!libvirt_connect_uri_is_remote("qemu:///session"));
+        assert!(!libvirt_connect_uri_is_remote("qemu+unix:///system"));
+        // No authority at all cannot name a remote host.
+        assert!(!libvirt_connect_uri_is_remote("lxc:///"));
+        // Bracketed IPv6 hosts: with and without userinfo. The classifier only
+        // asks whether SOMETHING follows the last `@` in the authority, so the
+        // brackets themselves need no special parsing — but the readiness
+        // timeout depends on this verdict, so pin both shapes.
+        assert!(libvirt_connect_uri_is_remote("qemu://[2001:db8::1]/system"));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu://ubuntu@[2001:db8::1]/system"
+        ));
+        assert!(libvirt_connect_uri_is_remote(
+            "qemu+ssh://ubuntu@[2001:db8::1]/system"
+        ));
+        // A string without a `://` separator names no remote host at all; it
+        // keeps the local (5s) allowance — the pre-patch behaviour, never a
+        // weaker readiness bar.
+        assert!(!libvirt_connect_uri_is_remote("qemu:system"));
+        assert!(!libvirt_connect_uri_is_remote("not-a-libvirt-uri"));
     }
 
     /// Regression for BUG-BOX-5: a libvirt-backed selected alias (which the UTM
