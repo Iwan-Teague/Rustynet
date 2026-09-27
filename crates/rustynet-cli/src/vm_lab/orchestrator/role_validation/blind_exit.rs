@@ -205,7 +205,17 @@ pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), Stri
             {
                 forward_rule = true;
             }
-            if in_forward_chain && line.contains("ct state established,related accept") {
+            // An established/related ACCEPT in the forward chain counts: the
+            // daemon installs the three AQ-70/F2 IPv4-scoped forms
+            // (`ct state established,related meta nfproto ipv4 … accept`),
+            // and older rulesets carry the unqualified one. The state set must
+            // be exactly `established,related` — a widened set such as
+            // `established,related,new` admits NEW flows and would defeat the
+            // mesh-source scoping — and the verdict must be `accept`.
+            if in_forward_chain
+                && tokens.get(..3) == Some(&["ct", "state", "established,related"][..])
+                && tokens.last() == Some(&"accept")
+            {
                 established_rule = true;
             }
         }
@@ -225,7 +235,7 @@ pub(crate) fn linux_blind_exit_ruleset_verdict(ruleset: &str) -> Result<(), Stri
     if !forward_rule || !established_rule {
         return Err(
             "no blind_exit forward rules (rustynet table forward chain with \
-             `iifname … oifname … saddr … accept` and `ct state established,related accept`) \
+             `iifname … oifname … saddr … accept` and `ct state established,related … accept`) \
              found in nft ruleset"
                 .to_owned(),
         );
@@ -338,6 +348,29 @@ mod tests {
         linux_probe(&shell, 0, LINUX_BLIND_EXIT_RULESET);
         validate_blind_exit_runtime(&shell, VmGuestPlatform::Linux, "node1")
             .expect("blind_exit forward rules present should pass");
+    }
+
+    /// Review of the 2026-09-27 scoped-established change: the relaxed
+    /// established/related match must still refuse a DROP verdict and a
+    /// widened state set, next to an otherwise valid mesh allow.
+    #[test]
+    fn linux_rejects_established_rule_with_drop_verdict_or_widened_states() {
+        for established in [
+            "ct state established,related drop",
+            "ct state established,related,new accept",
+        ] {
+            let ruleset = format!(
+                "table inet rustynet_g3 {{\n\tchain forward {{\n\t\ttype filter hook forward \
+                 priority filter; policy drop;\n\t\t{established}\n\t\tiifname \"rustynet0\" \
+                 oifname \"enp0s1\" ip saddr 100.64.0.0/10 accept\n\t}}\n}}\n"
+            );
+            let err = linux_blind_exit_ruleset_verdict(&ruleset)
+                .expect_err("a non-accept or widened established rule must not count");
+            assert!(
+                err.contains("no blind_exit forward rules"),
+                "{established}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -478,8 +511,9 @@ mod tests {
         }
         assert_eq!(
             rendered.len(),
-            2,
-            "producer emits the established and mesh-forward accepts: {rendered:?}"
+            4,
+            "producer emits the three scoped established accepts and the mesh-forward accept: \
+             {rendered:?}"
         );
         let ruleset = format!(
             "table inet rustynet_g3 {{\n\tchain forward {{\n\t\ttype filter hook forward \

@@ -88,10 +88,21 @@ fn nft_saddr_family_for_cidr(value: &str) -> Result<&'static str, String> {
 /// 1. flushes the `forward` chain (clears the regular-exit unrestricted
 ///    `iifname <tunnel> oifname <egress> accept` rule the base killswitch
 ///    installs, while keeping the chain's `policy drop`),
-/// 2. re-adds the conntrack established/related accept,
+/// 2. re-adds the conntrack established/related accepts: the three AQ-70/F2
+///    IPv4-scoped rules the killswitch and exit chains use (built by
+///    `LinuxCommandSystem::established_related_accept_tokens`, so the shapes
+///    cannot drift apart again). Since AQ-70/F2 the privileged helper refuses
+///    the old unqualified `ct state established,related accept`, and a
+///    blind_exit node that still sent it failed closed on every generation,
+///    restricting itself permanently.
 /// 3. adds the **mesh-source-scoped** final-hop allow only.
 ///
 /// It deliberately emits NO masquerade rule and NO own-egress allow.
+///
+/// The established/related accepts are IPv4-only, like the rest of the
+/// dataplane posture (IPv6 is hard-disabled system-wide). A ULA mesh CIDR
+/// still renders an `ip6 saddr` final-hop allow, but no IPv6
+/// established/related accept exists to carry its return traffic.
 pub fn build_linux_blind_exit_forward_commands(
     config: &LinuxBlindExitConfig,
     table: &str,
@@ -99,41 +110,40 @@ pub fn build_linux_blind_exit_forward_commands(
     validate_linux_blind_exit_config(config)?;
     validate_nft_table_name(table)?;
     let saddr_family = nft_saddr_family_for_cidr(config.mesh_cidr.as_str())?;
-    Ok(vec![
-        vec![
-            "flush".to_owned(),
-            "chain".to_owned(),
-            "inet".to_owned(),
-            table.to_owned(),
-            "forward".to_owned(),
-        ],
-        vec![
+    let mut commands = vec![vec![
+        "flush".to_owned(),
+        "chain".to_owned(),
+        "inet".to_owned(),
+        table.to_owned(),
+        "forward".to_owned(),
+    ]];
+    for rule_tokens in crate::phase10::LinuxCommandSystem::established_related_accept_tokens() {
+        let mut argv = vec![
             "add".to_owned(),
             "rule".to_owned(),
             "inet".to_owned(),
             table.to_owned(),
             "forward".to_owned(),
-            "ct".to_owned(),
-            "state".to_owned(),
-            "established,related".to_owned(),
-            "accept".to_owned(),
-        ],
-        vec![
-            "add".to_owned(),
-            "rule".to_owned(),
-            "inet".to_owned(),
-            table.to_owned(),
-            "forward".to_owned(),
-            "iifname".to_owned(),
-            config.tunnel_interface.clone(),
-            "oifname".to_owned(),
-            config.egress_interface.clone(),
-            saddr_family.to_owned(),
-            "saddr".to_owned(),
-            config.mesh_cidr.clone(),
-            "accept".to_owned(),
-        ],
-    ])
+        ];
+        argv.extend(rule_tokens);
+        commands.push(argv);
+    }
+    commands.push(vec![
+        "add".to_owned(),
+        "rule".to_owned(),
+        "inet".to_owned(),
+        table.to_owned(),
+        "forward".to_owned(),
+        "iifname".to_owned(),
+        config.tunnel_interface.clone(),
+        "oifname".to_owned(),
+        config.egress_interface.clone(),
+        saddr_family.to_owned(),
+        "saddr".to_owned(),
+        config.mesh_cidr.clone(),
+        "accept".to_owned(),
+    ]);
+    Ok(commands)
 }
 
 /// Evaluate a captured `nft list ruleset` dump against the reviewed
@@ -458,14 +468,35 @@ table inet rustynet_g3 {
     #[test]
     fn builder_emits_mesh_scoped_forward_without_nat() {
         let cmds = build_linux_blind_exit_forward_commands(&config(), "rustynet_g3").unwrap();
-        // flush, ct-accept, mesh-scoped accept — exactly three, no masquerade.
-        assert_eq!(cmds.len(), 3);
+        // flush, the three AQ-70/F2 scoped ct-accepts, mesh-scoped accept —
+        // exactly five, no masquerade.
+        assert_eq!(cmds.len(), 5);
         assert_eq!(
             cmds[0],
             ["flush", "chain", "inet", "rustynet_g3", "forward"]
         );
+        for argv in &cmds[1..4] {
+            assert_eq!(
+                argv[..11],
+                [
+                    "add",
+                    "rule",
+                    "inet",
+                    "rustynet_g3",
+                    "forward",
+                    "ct",
+                    "state",
+                    "established,related",
+                    "meta",
+                    "nfproto",
+                    "ipv4"
+                ],
+                "established/related accepts must be the IPv4-scoped AQ-70 form: {argv:?}"
+            );
+            assert_eq!(argv.last().map(String::as_str), Some("accept"));
+        }
         assert_eq!(
-            cmds[2],
+            cmds[4],
             [
                 "add",
                 "rule",
@@ -492,8 +523,39 @@ table inet rustynet_g3 {
     fn builder_uses_ip6_family_for_ula_mesh() {
         let cfg = LinuxBlindExitConfig::new("rustynet0", "eth0", "fd7a::/48").unwrap();
         let cmds = build_linux_blind_exit_forward_commands(&cfg, "rustynet").unwrap();
-        assert!(cmds[2].iter().any(|tok| tok == "ip6"));
-        assert!(cmds[2].iter().all(|tok| tok != "ip"));
+        let mesh_allow = cmds
+            .last()
+            .expect("builder emits the mesh-scoped allow last");
+        assert!(mesh_allow.iter().any(|tok| tok == "ip6"));
+        assert!(mesh_allow.iter().all(|tok| tok != "ip"));
+    }
+
+    /// Emitter/allowlist drift witness. Every argv the builder emits must pass
+    /// the privileged helper's own validator, because the helper is what runs
+    /// them on a live node. When AQ-70/F2 replaced the helper's unqualified
+    /// `forward ct state established,related accept` arm, this builder kept
+    /// emitting the old shape. The helper refused it, and every Linux
+    /// blind_exit node failed closed until it restricted itself permanently
+    /// (live lab run linux-u3-blindexit-a3dfb390a, 2026-09-27). Validating
+    /// here turns that into a unit-test failure.
+    ///
+    /// Not on Windows: the helper's nft `add rule` schema check is non-Windows
+    /// (it refuses every such argv there), exactly why the helper's own tests
+    /// are gated `#[cfg(all(test, not(windows)))]`.
+    #[cfg(not(windows))]
+    #[test]
+    fn builder_argv_is_accepted_by_privileged_helper() {
+        use crate::privileged_helper::{PrivilegedCommandProgram, validate_request};
+        let ula = LinuxBlindExitConfig::new("rustynet0", "eth0", "fd7a::/48").unwrap();
+        for (cfg, table) in [(config(), "rustynet_g3"), (ula, "rustynet_g1")] {
+            let cmds = build_linux_blind_exit_forward_commands(&cfg, table).unwrap();
+            for argv in &cmds {
+                let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+                validate_request(PrivilegedCommandProgram::Nft, &args).unwrap_or_else(|err| {
+                    panic!("privileged helper refuses blind_exit argv {args:?}: {err}")
+                });
+            }
+        }
     }
 
     #[test]

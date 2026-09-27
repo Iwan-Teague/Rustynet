@@ -2160,7 +2160,11 @@ impl LinuxCommandSystem {
     /// argv entry with the trailing comma carried by the element, exactly
     /// like the egress drop sets, and the rendered spacing is pinned by the
     /// helper allowlist arms + tests on both sides (emitter and helper).
-    fn established_related_accept_tokens() -> Vec<Vec<String>> {
+    ///
+    /// `crate::linux_blind_exit` builds its `forward` chain from this same
+    /// list. It kept the unqualified form when AQ-70/F2 landed, the helper
+    /// refused it, and every Linux blind_exit node failed closed.
+    pub(crate) fn established_related_accept_tokens() -> Vec<Vec<String>> {
         let head: [&str; 6] = [
             "ct",
             "state",
