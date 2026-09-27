@@ -769,6 +769,7 @@ enum TrustCommand {
 }
 
 mod ops_ci_release_perf;
+mod self_exec;
 
 /// The `ops` subcommands that exist ONLY in `--features vm-lab` builds.
 ///
@@ -1786,6 +1787,7 @@ fn main() {
             } else {
                 println!("{output}");
             }
+            crate::self_exec::cleanup_stable_self_executable();
         }
         Err(err) => {
             let exit_code = classify_cli_error(err.as_str());
@@ -1804,6 +1806,7 @@ fn main() {
                     println!("error [{exit_code}]: {err}\n  hint: {hint}");
                 }
             }
+            crate::self_exec::cleanup_stable_self_executable();
             std::process::exit(exit_code.as_i32());
         }
     }

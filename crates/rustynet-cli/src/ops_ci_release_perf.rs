@@ -775,6 +775,9 @@ fn verify_membership_phase10_report(report_path: &Path) -> Result<String, String
 }
 
 pub fn execute_ops_run_supply_chain_integrity_gates() -> Result<String, String> {
+    // Snapshot the running image BEFORE any cargo child can relink
+    // target/debug/rustynet-cli out from under the nested self-ops.
+    crate::self_exec::pin_stable_self_executable()?;
     let root_dir = repo_root()?;
     require_commands(&["cargo", "rustup", "rustc"])?;
     require_cargo_subcommands(&["audit", "deny"])?;
@@ -942,6 +945,9 @@ pub fn execute_ops_run_supply_chain_integrity_gates() -> Result<String, String> 
 }
 
 pub fn execute_ops_run_security_regression_gates() -> Result<String, String> {
+    // Nested flows re-enter this module mid-run; the pin is an idempotent
+    // no-op then, and the first entry happened before any cargo relink.
+    crate::self_exec::pin_stable_self_executable()?;
     let root_dir = repo_root()?;
     let required_tests = [
         [
@@ -1952,8 +1958,7 @@ fn run_self_command_allow_failure(
     cwd: Option<&Path>,
     env_pairs: &[(&str, &str)],
 ) -> Result<ExitStatus, String> {
-    let current_exe =
-        env::current_exe().map_err(|err| format!("resolve current executable failed: {err}"))?;
+    let current_exe = crate::self_exec::stable_self_executable()?;
     let mut command = Command::new(current_exe);
     if let Some(dir) = cwd {
         command.current_dir(dir);
