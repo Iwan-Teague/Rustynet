@@ -441,6 +441,50 @@
       "mesh_ip": "100.64.0.5",
       "exit_capable": true,
       "relay_capable": false
+    },
+    {
+      "alias": "katana-entry-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.122.57",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.122.57",
+      "last_known_network": "192.168.122.0/24",
+      "network_group": "libvirt-nat-192.168.122.0/24",
+      "node_id": "katana-entry-1",
+      "lab_role": "linux_entry",
+      "parent_device": "katana (x86_64 KVM host, Debian 13 laptop)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "katana-entry-1",
+        "host_id": "katana"
+      },
+      "notes": "Provisioned 2026-09-28 with vm-lab-provision-guest (debian-13-generic-amd64 overlay, 2.5 GB RAM, 2 vCPU) into the lab-owned pool dir /var/lib/libvirt/images/lab, for 4-node katana topologies. NAT'd on katana's virbr0: reachable from katana itself (runs are launched ON katana), not from the Mac directly",
+      "mesh_ip": "100.64.0.15"
+    },
+    {
+      "alias": "katana-aux-1",
+      "include_in_all": false,
+      "ssh_target": "192.168.122.114",
+      "ssh_user": "debian",
+      "os": "Debian GNU/Linux 13 (trixie) (x86_64)",
+      "platform": "linux",
+      "last_known_ip": "192.168.122.114",
+      "last_known_network": "192.168.122.0/24",
+      "network_group": "libvirt-nat-192.168.122.0/24",
+      "node_id": "katana-aux-1",
+      "lab_role": "linux_aux",
+      "parent_device": "katana (x86_64 KVM host, Debian 13 laptop)",
+      "rustynet_src_dir": "/home/debian/Rustynet",
+      "controller": {
+        "type": "libvirt",
+        "domain": "katana-aux-1",
+        "host_id": "katana"
+      },
+      "notes": "Provisioned 2026-09-28 with vm-lab-provision-guest (debian-13-generic-amd64 overlay, 2.5 GB RAM, 2 vCPU) into the lab-owned pool dir /var/lib/libvirt/images/lab, for 4-node katana topologies. NAT'd on katana's virbr0: reachable from katana itself (runs are launched ON katana), not from the Mac directly",
+      "mesh_ip": "100.64.0.16"
     }
   ]
 }
