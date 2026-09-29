@@ -7476,23 +7476,170 @@ fn utc_timestamp() -> String {
     }
 }
 
+/// Waits until the daemon control socket at `socket_path` accepts a
+/// connection, within `attempts` x `sleep_secs`.
+///
+/// A socket file alone is not readiness. rustynetd never unlinks its control
+/// socket on shutdown and only removes and rebinds the path after its runtime
+/// bootstrap (1-2 s), so right after a restart the path still names the
+/// previous daemon's dead socket, and the one-shot IPC that follows this wait
+/// is refused. Only a successful connect proves the new daemon is listening.
+/// This is the contract of `ops_install_systemd::wait_for_unix_socket`, which
+/// this module cannot call: it is also built into the library crate, where
+/// that module does not exist.
 pub fn wait_for_daemon_socket_locally(
     socket_path: &str,
     attempts: usize,
     sleep_secs: u64,
 ) -> Result<(), String> {
-    for i in 1..=attempts {
-        if Path::new(socket_path).exists()
-            && let Ok(metadata) = std::fs::metadata(socket_path)
-            && metadata.file_type().is_socket()
-        {
-            return Ok(());
+    let path = Path::new(socket_path);
+    let mut last_state = "missing".to_owned();
+    for attempt in 1..=attempts {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                last_state = "symlink".to_owned();
+            }
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(_) => return Ok(()),
+                    Err(err) => last_state = format!("socket-not-accepting ({err})"),
+                }
+            }
+            Ok(_) => last_state = "not-socket".to_owned(),
+            Err(err) => last_state = err.to_string(),
         }
-        if i < attempts {
+        if attempt < attempts {
             std::thread::sleep(Duration::from_secs(sleep_secs));
         }
     }
-    Err(format!("daemon socket not ready after {attempts} attempts"))
+    Err(format!(
+        "daemon socket {socket_path} not ready after {attempts} attempts (last_state={last_state})"
+    ))
+}
+
+#[cfg(test)]
+mod daemon_socket_ready_tests {
+    use super::wait_for_daemon_socket_locally;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::net::UnixListener;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Longest socket path these tests create. macOS caps a Unix socket path
+    /// at 104 bytes (Linux at 108); keep clear of both.
+    const SOCKET_TEST_PATH_MAX: usize = 100;
+    const SOCKET_TEST_FILE: &str = "d.sock";
+
+    /// A unique socket test dir: under the temp dir, or under /tmp when a
+    /// long TMPDIR would push the socket path past SOCKET_TEST_PATH_MAX.
+    fn short_socket_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let name = format!(
+            "rn-e2e-{tag}-{}-{}",
+            std::process::id(),
+            nanos % 1_000_000_000
+        );
+        let temp_dir = std::env::temp_dir();
+        let socket_len = temp_dir.as_os_str().len() + name.len() + SOCKET_TEST_FILE.len() + 2;
+        let base = if socket_len <= SOCKET_TEST_PATH_MAX {
+            temp_dir
+        } else {
+            PathBuf::from("/tmp")
+        };
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        dir
+    }
+
+    fn socket_str(path: &Path) -> &str {
+        path.to_str().expect("socket path should be utf-8")
+    }
+
+    #[test]
+    fn rejects_a_socket_file_with_no_listener() {
+        // After a restart the previous daemon's socket file is still on disk,
+        // but nothing listens on it yet.
+        let dir = short_socket_test_dir("stale");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("listener should bind"));
+        assert!(
+            std::fs::symlink_metadata(&socket_path)
+                .expect("stale socket file should remain")
+                .file_type()
+                .is_socket(),
+            "dropping the listener must leave its socket file behind"
+        );
+
+        let err = wait_for_daemon_socket_locally(socket_str(&socket_path), 2, 0)
+            .expect_err("a socket file with no listener must not count as ready");
+        assert!(err.contains("last_state=socket-not-accepting"), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn accepts_a_listening_socket() {
+        let dir = short_socket_test_dir("live");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        let listener = UnixListener::bind(&socket_path).expect("listener should bind");
+
+        wait_for_daemon_socket_locally(socket_str(&socket_path), 1, 0)
+            .expect("a listening socket must count as ready");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn waits_through_a_stale_file_until_the_rebind() {
+        let dir = short_socket_test_dir("rebind");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("stale listener should bind"));
+
+        let rebind_started = Arc::new(AtomicBool::new(false));
+        let rebind_flag = Arc::clone(&rebind_started);
+        let rebind_path = socket_path.clone();
+        let rebinder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            rebind_flag.store(true, Ordering::SeqCst);
+            std::fs::remove_file(&rebind_path).expect("stale socket should be removable");
+            UnixListener::bind(&rebind_path).expect("new listener should bind")
+        });
+
+        let result = wait_for_daemon_socket_locally(socket_str(&socket_path), 10, 1);
+        let returned_after_rebind = rebind_started.load(Ordering::SeqCst);
+        let listener = rebinder.join().expect("rebind thread should finish");
+        result.expect("the wait must keep polling past the stale file until the rebind");
+        assert!(
+            returned_after_rebind,
+            "the wait returned while only the stale socket file existed"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_a_symlink_to_a_socket() {
+        let dir = short_socket_test_dir("link");
+        let target = dir.join(SOCKET_TEST_FILE);
+        let listener = UnixListener::bind(&target).expect("listener should bind");
+        let link = dir.join("l.sock");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+
+        let err = wait_for_daemon_socket_locally(socket_str(&link), 1, 0)
+            .expect_err("a symlinked socket path must be rejected");
+        assert!(err.contains("last_state=symlink"), "{err}");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 pub fn execute_ops_e2e_worker_refresh_trust_evidence(
