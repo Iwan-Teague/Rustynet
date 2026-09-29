@@ -40,7 +40,7 @@ The anchor enrollment listener enforces a 256-byte request line, a 2 s read budg
 - **Must hold:** the daemon survives with the same PID; its IPC `status` answers within a stated bound during and after the attack; the consumed-token ledger gains no row.
 - **Positive control:** a genuine token minted after the attack is accepted exactly once, and the ledger gains exactly that one row.
 - The listener exposes no serve counters, and journald can rate-limit its lines, so no verdict rests on a count of journal lines.
-- Because this stage uses the anchor listener host, re-run `live_anchor` (31 days stale in the audit) in the same topology.
+- Also re-run `live_anchor` (31 days stale in the audit) wherever a topology can host it; it needs an anchor node plus an `extra` enrollee. It is not a precondition of this stage: a first implementation made it a hard dependency, which would have left the stage unrunnable on every 4-node lab host, so the stage gates on its own baseline checks instead (as the replay control does).
 
 ### S4. `live_relay_preauth_flood_validation` (SecurityMinimumBar §3.3)
 
