@@ -496,39 +496,18 @@ pub fn execute_ops_e2e_bootstrap_host(
             "rustynetd key init-gossip failed during e2e bootstrap",
         )?;
 
-        // Provision the 32-byte HMAC enrollment secret. The daemon reads this at
-        // enrollment request time (not at startup), so it doesn't fail the service
-        // start if absent — but the live anchor enrollment test requires it.
-        // Mode 0600, owned by rustynetd so the daemon (User=rustynetd) can read it.
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            let enrollment_secret_path = Path::new("/var/lib/rustynet/keys/enrollment.secret");
-            let mut enrollment_secret_bytes = [0u8; 32];
-            fill_os_random_bytes(&mut enrollment_secret_bytes, "enrollment secret")?;
-            let write_result = (|| -> Result<(), String> {
-                let mut options = std::fs::OpenOptions::new();
-                options.write(true).create_new(true).mode(0o600);
-                let mut file = options
-                    .open(enrollment_secret_path)
-                    .map_err(|err| format!("create enrollment secret failed: {err}"))?;
-                file.write_all(&enrollment_secret_bytes)
-                    .map_err(|err| format!("write enrollment secret failed: {err}"))?;
-                file.sync_all()
-                    .map_err(|err| format!("sync enrollment secret failed: {err}"))?;
-                Ok(())
-            })();
-            enrollment_secret_bytes.zeroize();
-            write_result?;
-        }
-        run_status(
-            "chown",
-            &[
-                "rustynetd:rustynetd",
-                "/var/lib/rustynet/keys/enrollment.secret",
-            ],
-            &[],
-            "chown enrollment secret failed during e2e bootstrap",
-        )?;
+        // The anchor enrollment secret is deliberately NOT seeded here. The
+        // production installer (`ops install-systemd`) seeds it for
+        // `RUSTYNET_NODE_ROLE=admin` nodes only and leaves it absent on
+        // non-admin nodes so the daemon's enrollment IPC stays fail-closed —
+        // a security boundary, not an optimisation. The install-systemd run
+        // below already receives this bootstrap's role, and
+        // `EnforceBaselineRuntime` re-runs install-systemd with the assigned
+        // role, so admin-role lab nodes are seeded through the SAME hardened
+        // production path (mode 0600, rustynetd-owned). Seeding it
+        // unconditionally here gave every lab node a plaintext enrollment
+        // secret the production installer would never write, diverging the
+        // lab's custody posture from production.
 
         run_status(
             "systemd-creds",
@@ -7628,6 +7607,49 @@ mod tests {
         assert!(
             err.contains("TRAVERSAL_TTL_SECS"),
             "error must name the missing env var: {err}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_does_not_seed_the_enrollment_secret_outside_the_production_path() {
+        // AQ-68 lab/production alignment witness: e2e bootstrap used to
+        // unconditionally write a plaintext enrollment secret on EVERY node,
+        // while the production installer seeds it for admin-role nodes only
+        // ("Non-admin nodes leave it absent so the daemon's enrollment IPC
+        // stays fail-closed — a security boundary"). The lab must not be
+        // weaker than production: the bootstrap body must not touch the
+        // secret at all (admin nodes are seeded by the `ops install-systemd`
+        // run inside this same bootstrap, which receives RUSTYNET_NODE_ROLE),
+        // and the installer's admin-only gate must still exist.
+        let src = std::fs::read_to_string(format!("{}/src/ops_e2e.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("read ops_e2e.rs source for the bootstrap custody witness");
+        let bootstrap = src
+            .split("pub fn execute_ops_e2e_bootstrap_host(")
+            .nth(1)
+            .expect("bootstrap fn must be present")
+            .to_owned();
+        let bootstrap_body = bootstrap
+            .split("pub fn execute_ops_e2e_enforce_host(")
+            .next()
+            .expect("bootstrap body span (Linux enforce fn follows it)");
+        assert!(
+            !bootstrap_body.contains("enrollment.secret"),
+            "e2e bootstrap must not seed the enrollment secret itself; admin nodes are \
+             seeded by `ops install-systemd` (the production path) and non-admin nodes \
+             must stay secretless (AQ-68 lab/production alignment)"
+        );
+        let installer = std::fs::read_to_string(format!(
+            "{}/src/ops_install_systemd.rs",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("read ops_install_systemd.rs source for the custody witness");
+        assert!(
+            installer.contains("if node_role == \"admin\""),
+            "the production installer's admin-only enrollment-secret gate must stay"
+        );
+        assert!(
+            installer.contains("Non-admin nodes leave it absent"),
+            "the installer's fail-closed non-admin boundary must stay"
         );
     }
 

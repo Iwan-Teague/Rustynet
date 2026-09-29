@@ -44,7 +44,11 @@
 //! Enabling the listener is a **drop-in** (`rustynetd.service.d/…conf` adding
 //! `RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:<port>` — the daemon reads the
 //! addr from that env var alone, so the reviewed `ExecStart` argv is never
-//! rewritten). The drop-in is guarded: a pre-existing drop-in is an ambiguous
+//! rewritten). The same drop-in carries the AQ-68 plaintext-custody opt-in
+//! (`RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1`) so the daemon can resolve
+//! the lab's plaintext secret for the control's window; teardown deletes the
+//! whole drop-in, restoring the fail-closed custody posture. The drop-in is
+//! guarded: a pre-existing drop-in is an ambiguous
 //! leftover and fails the control; teardown deletes it, reloads, restarts, and
 //! VERIFIES the unit is active and the drop-in is gone. A teardown leak
 //! dominates every other verdict.
@@ -173,10 +177,18 @@ pub(crate) mod enrollment_replay {
     pub(crate) const DROPIN_PATH: &str =
         "/etc/systemd/system/rustynetd.service.d/99-nc-enrollment-replay.conf";
     pub(crate) const DROPIN_STAGE_PATH: &str = "/tmp/rustynet-nc-enrollment-replay-dropin.conf";
-    /// The drop-in body: env-only listener enablement.
+    /// The drop-in body: env-only listener enablement + the AQ-68
+    /// plaintext-custody opt-in, scoped to the control's window. The daemon
+    /// resolves `allow_plaintext_enrollment_secret` from this env at startup
+    /// (`DaemonConfig`), which covers BOTH its fail-fast bind-time resolution
+    /// and every per-consume resolution; teardown removes the drop-in, so the
+    /// restored daemon is back to refusing plaintext custody. Pinned to the
+    /// custody const by
+    /// `dropin_opts_the_daemon_into_plaintext_custody_for_the_control_window`.
     pub(crate) const DROPIN_CONTENT: &str = "# QH-89 negative_control_enrollment_token_replay\n\
          [Service]\n\
-         Environment=RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:51831\n";
+         Environment=RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:51831\n\
+         Environment=RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1\n";
     /// The handler's fixed-vocabulary refusal for every token-level rejection
     /// (`ConsumeError::Token(_)` collapses to this string — daemon.rs
     /// `handle_enrollment_consume`). A replay MUST be refused with exactly it.
@@ -344,7 +356,7 @@ printf 'nc_replay_c1_response=%s\n' "$(cat /tmp/nc-c1.$$)"
 printf 'nc_replay_c2_response=%s\n' "$(cat /tmp/nc-c2.$$)"
 rm -f /tmp/nc-c1.$$ /tmp/nc-c2.$$
 
-verify_out="$(/usr/local/bin/rustynet enrollment verify --secret "$secret" --token "$token" --ledger "$ledger" 2>&1)"
+verify_out="$(env RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1 /usr/local/bin/rustynet enrollment verify --secret "$secret" --token "$token" --ledger "$ledger" 2>&1)"
 printf 'nc_verify_output=%s\n' "$(printf '%s' "$verify_out" | tr -d '\r' | tr ' ' '\n' | grep -E '^(already_consumed|valid)=' | tr '\n' ' ')"
 
 ledger_after_rows="$(sed -n 's/^consumed_exp=//p' "$ledger" | tr ',' '\n' | grep -c .)"
@@ -656,6 +668,25 @@ exit 0
             .map_err(|err| format!("transport failure running {argv:?}: {err}"))
     }
 
+    /// The `enrollment mint` argv run on the anchor (step 3). AQ-68: `env
+    /// <opt-in>` is prefixed so the CLI's
+    /// `resolve_enrollment_secret_platform` accepts the lab's plaintext
+    /// secret for THIS command only; the argv is otherwise unchanged
+    /// (bare-token stdout contract relied on by the caller).
+    fn enrollment_mint_argv(plaintext_opt_in: &str) -> Vec<String> {
+        vec![
+            "env".to_owned(),
+            plaintext_opt_in.to_owned(),
+            REMOTE_CLI.to_owned(),
+            "enrollment".to_owned(),
+            "mint".to_owned(),
+            "--secret".to_owned(),
+            ENROLLMENT_SECRET_PATH.to_owned(),
+            "--ttl".to_owned(),
+            "300".to_owned(),
+        ]
+    }
+
     fn write_evidence(dir: &Path, name: &str, contents: &str) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         let path = dir.join(name);
@@ -856,19 +887,19 @@ exit 0
 
         // 3. Mint the token (admin CLI on the anchor itself) and derive the
         //    token id hex host-side so the ledger row can be bound to THIS
-        //    token.
-        let mint = match run_remote_argv(
-            &shell,
-            &[
-                REMOTE_CLI,
-                "enrollment",
-                "mint",
-                "--secret",
-                ENROLLMENT_SECRET_PATH,
-                "--ttl",
-                "300",
-            ],
-        ) {
+        //    token. AQ-68: the CLI resolves the secret through
+        //    `resolve_enrollment_secret_platform`, which refuses a plaintext
+        //    secret without the explicit opt-in — the lab guest cannot
+        //    migrate into a keystore, so this one command opts in via `env`
+        //    (same pattern as the secrets-not-in-logs mint). Nothing on the
+        //    guest is reconfigured.
+        let plaintext_opt_in = format!(
+            "{}=1",
+            rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+        );
+        let mint_argv = enrollment_mint_argv(plaintext_opt_in.as_str());
+        let mint_argv_refs: Vec<&str> = mint_argv.iter().map(String::as_str).collect();
+        let mint = match run_remote_argv(&shell, &mint_argv_refs) {
             Ok(out) => out,
             Err(err) => {
                 let teardown = best_effort_disable(&shell);
@@ -1454,6 +1485,68 @@ exit 0
                 StageEvidence::File(REPLAY_TRANSCRIPT_RELATIVE)
             );
             assert!(REPLAY_TRANSCRIPT_RELATIVE.ends_with(REPLAY_TRANSCRIPT_FILE));
+        }
+
+        #[test]
+        fn dropin_opts_the_daemon_into_plaintext_custody_for_the_control_window() {
+            // AQ-68: without the opt-in the daemon's fail-fast bind-time
+            // resolution refuses the lab's plaintext secret, the listener
+            // never binds, and the control can never adjudicate. The opt-in
+            // must ride the SAME drop-in as the listener addr (one staged
+            // artifact, one verified teardown) and must name the custody
+            // const verbatim so a rename upstream breaks this pin, not the
+            // live control.
+            let opt_in = format!(
+                "Environment={}=1",
+                rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+            );
+            assert!(
+                DROPIN_CONTENT.contains(&opt_in),
+                "the drop-in must carry the AQ-68 daemon-side custody opt-in: {DROPIN_CONTENT:?}"
+            );
+            assert!(
+                DROPIN_CONTENT
+                    .contains("Environment=RUSTYNET_ANCHOR_ENROLLMENT_ADDR=127.0.0.1:51831"),
+                "the listener enablement must survive alongside the opt-in"
+            );
+        }
+
+        #[test]
+        fn cli_legs_carry_the_plaintext_opt_in() {
+            // The CLI mint/verify legs are SEPARATE processes from the daemon
+            // — the drop-in env does not reach them, so each must opt in
+            // itself. Verify (inside ATTACK_SCRIPT) and mint (enrollment
+            // mint argv) both do.
+            let opt_in_prefix = format!(
+                "env {}=1",
+                rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+            );
+            let expected_verify =
+                format!("{opt_in_prefix} /usr/local/bin/rustynet enrollment verify");
+            assert!(
+                ATTACK_SCRIPT.contains(&expected_verify),
+                "the in-script `enrollment verify` must opt in or its output is a \
+                 refusal transcript, not the already_consumed/valid datum"
+            );
+            let mint = enrollment_mint_argv(&format!(
+                "{}=1",
+                rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+            ));
+            assert_eq!(mint[0].as_str(), "env");
+            assert_eq!(
+                mint[1].as_str(),
+                format!(
+                    "{}=1",
+                    rustynetd::enrollment_secret_custody::ALLOW_PLAINTEXT_ENROLLMENT_SECRET_ENV
+                )
+            );
+            assert_eq!(mint[2].as_str(), REMOTE_CLI);
+            assert_eq!(mint[3].as_str(), "enrollment");
+            assert_eq!(mint[4].as_str(), "mint");
+            assert!(
+                mint.windows(2)
+                    .any(|w| w[0] == "--secret" && w[1] == ENROLLMENT_SECRET_PATH)
+            );
         }
     }
 }
