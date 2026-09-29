@@ -294,15 +294,18 @@ pub(crate) mod enrollment_replay {
     ///
     /// Sequencing invariants (pinned by `script_binds_the_attack_sequence…`):
     /// 1. the listener is proven bound BEFORE any token byte is spent;
-    /// 2. the pre-attack ledger row count + snapshot digest are captured
-    ///    BEFORE the genuine consume (baseline);
+    /// 2. the pre-attack ledger entries (row count, and the attack token's
+    ///    rows, which must be none) + snapshot digest are captured BEFORE the
+    ///    genuine consume (baseline);
     /// 3. the genuine consume precedes the replays and the post-genuine
     ///    snapshot digest is captured (the accept-leg legitimately moves
     ///    state; only the REPLAYS must leave it fixed);
     /// 4. the two concurrent replays overlap (both started before either is
     ///    waited on);
     /// 5. `enrollment verify` (inspect-only), the on-disk ledger count, the
-    ///    token-row count, and the post-replay snapshot digest run last.
+    ///    token-row count, the ledger diff against the baseline (rows added
+    ///    besides the token; rows removed, and how many of those were still
+    ///    live), and the post-replay snapshot digest run last.
     pub(crate) const ATTACK_SCRIPT: &str = r#"set -u
 token_hex="$1"
 secret="$2"
@@ -333,8 +336,13 @@ until bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' nc-probe "$port" 2>/dev/null; do
 done
 printf 'nc_listener_bound=true\n'
 
-ledger_before_rows="$(sed -n 's/^consumed_exp=//p' "$ledger" | tr ',' '\n' | grep -c .)"
+# Ledger entries are "<token_hex>:<expiry_unix>" in one consumed_exp= line.
+ledger_entries() { sed -n 's/^consumed_exp=//p' "$ledger" 2>/dev/null | tr ',' '\n' | grep . ; }
+
+ledger_before="$(ledger_entries)"
+ledger_before_rows="$(printf '%s\n' "$ledger_before" | grep -c .)"
 printf 'nc_ledger_rows_before=%s\n' "$ledger_before_rows"
+printf 'nc_token_rows_before=%s\n' "$(printf '%s\n' "$ledger_before" | grep -c "^$token_hex:")"
 snap_before="$(sha256sum "$snapshot" | cut -d" " -f1)"
 printf 'nc_snapshot_sha_before=%s\n' "$snap_before"
 
@@ -359,10 +367,38 @@ rm -f /tmp/nc-c1.$$ /tmp/nc-c2.$$
 verify_out="$(env RUSTYNET_ALLOW_PLAINTEXT_ENROLLMENT_SECRET=1 /usr/local/bin/rustynet enrollment verify --secret "$secret" --token "$token" --ledger "$ledger" 2>&1)"
 printf 'nc_verify_output=%s\n' "$(printf '%s' "$verify_out" | tr -d '\r' | tr ' ' '\n' | grep -E '^(already_consumed|valid)=' | tr '\n' ' ')"
 
-ledger_after_rows="$(sed -n 's/^consumed_exp=//p' "$ledger" | tr ',' '\n' | grep -c .)"
+ledger_after="$(ledger_entries)"
+now_after="$(date +%s)"
+ledger_after_rows="$(printf '%s\n' "$ledger_after" | grep -c .)"
 printf 'nc_ledger_rows_after=%s\n' "$ledger_after_rows"
-token_rows="$(sed -n 's/^consumed_exp=//p' "$ledger" | tr ',' '\n' | grep -c "^$token_hex:")"
+token_rows="$(printf '%s\n' "$ledger_after" | grep -c "^$token_hex:")"
 printf 'nc_token_rows=%s\n' "$token_rows"
+
+# Rows added besides the attack token must be none. Rows removed are
+# legitimate only when expired: the daemon purges consumed entries whose
+# expiry has passed when it records a new one. Removing an entry that is
+# still live would let that token be redeemed again.
+new_foreign=0
+for entry in $ledger_after; do
+  id="${entry%%:*}"
+  [ "$id" = "$token_hex" ] && continue
+  printf '%s\n' "$ledger_before" | grep -q "^$id:" || new_foreign=$((new_foreign+1))
+done
+removed=0
+removed_live=0
+for entry in $ledger_before; do
+  id="${entry%%:*}"
+  exp="${entry#*:}"
+  printf '%s\n' "$ledger_after" | grep -q "^$id:" && continue
+  removed=$((removed+1))
+  case "$exp" in
+    ''|*[!0-9]*) removed_live=$((removed_live+1)) ;;
+    *) if [ "${#exp}" -gt 18 ] || [ "$exp" -gt "$now_after" ]; then removed_live=$((removed_live+1)); fi ;;
+  esac
+done
+printf 'nc_ledger_foreign_rows_added=%s\n' "$new_foreign"
+printf 'nc_ledger_rows_removed=%s\n' "$removed"
+printf 'nc_ledger_live_rows_removed=%s\n' "$removed_live"
 
 snap_after="$(sha256sum "$snapshot" | cut -d" " -f1)"
 printf 'nc_snapshot_sha_after=%s\n' "$snap_after"
@@ -379,7 +415,7 @@ exit 0
     /// [`ReplayObservation`] is adjudicable; every hole is fail-closed.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(crate) enum ReplayParse {
-        Observed(ReplayObservation),
+        Observed(Box<ReplayObservation>),
         NotAdjudicable { reason: String },
     }
 
@@ -399,6 +435,15 @@ exit 0
         pub(crate) verify_valid: Option<bool>,
         pub(crate) ledger_rows_after: usize,
         pub(crate) token_rows: usize,
+        /// Rows for the attack token before the genuine consume (must be 0).
+        pub(crate) token_rows_before: usize,
+        /// Rows added besides the attack token's (must be 0).
+        pub(crate) ledger_foreign_rows_added: usize,
+        /// Rows that disappeared: the daemon purges expired entries when it
+        /// records a consume, so these are legitimate when expired.
+        pub(crate) ledger_rows_removed: usize,
+        /// Removed rows whose expiry had NOT passed (must be 0).
+        pub(crate) ledger_live_rows_removed: usize,
         pub(crate) snapshot_sha_after: String,
         pub(crate) unit_after: String,
     }
@@ -462,6 +507,26 @@ exit 0
             &mut holes,
         );
         let token_rows = parse_usize(need("token_rows", &mut holes), "token_rows", &mut holes);
+        let token_rows_before = parse_usize(
+            need("token_rows_before", &mut holes),
+            "token_rows_before",
+            &mut holes,
+        );
+        let ledger_foreign_rows_added = parse_usize(
+            need("ledger_foreign_rows_added", &mut holes),
+            "ledger_foreign_rows_added",
+            &mut holes,
+        );
+        let ledger_rows_removed = parse_usize(
+            need("ledger_rows_removed", &mut holes),
+            "ledger_rows_removed",
+            &mut holes,
+        );
+        let ledger_live_rows_removed = parse_usize(
+            need("ledger_live_rows_removed", &mut holes),
+            "ledger_live_rows_removed",
+            &mut holes,
+        );
         let _genuine_required = need("genuine_response", &mut holes);
         let verify_output = need("verify_output", &mut holes);
         let flag = |prefix: &str| -> Option<bool> {
@@ -484,7 +549,7 @@ exit 0
             };
         }
         let str_field = |key: &str| map.get(key).map(|v| (*v).to_owned()).unwrap_or_default();
-        ReplayParse::Observed(ReplayObservation {
+        ReplayParse::Observed(Box::new(ReplayObservation {
             listener_bound,
             ledger_rows_before,
             snapshot_sha_before: str_field("snapshot_sha_before"),
@@ -497,12 +562,16 @@ exit 0
             verify_valid,
             ledger_rows_after,
             token_rows,
+            token_rows_before,
+            ledger_foreign_rows_added,
+            ledger_rows_removed,
+            ledger_live_rows_removed,
             snapshot_sha_after: str_field("snapshot_sha_after"),
             unit_after: map
                 .get("unit_after")
                 .map(|v| (*v).to_owned())
                 .unwrap_or_else(|| "unknown".to_owned()),
-        })
+        }))
     }
 
     // ── pure adjudication (the inversion) ────────────────────────────────
@@ -586,11 +655,34 @@ exit 0
                 valid: o.verify_valid,
             };
         }
-        if o.ledger_rows_after != o.ledger_rows_before + 1 || o.token_rows != 1 {
+        // The daemon purges consumed entries whose expiry has passed when it
+        // records a new consume, so the row count alone cannot prove "exactly
+        // one new row" (katana-u17: an earlier stage's token expired, and the
+        // ledger went 1 -> 1 across a correct consume). The content check: the
+        // attack token was absent before and is present once after, nothing
+        // else was added, nothing still live was removed, and the counts
+        // reconcile with those removals.
+        let rows_reconcile =
+            o.ledger_rows_after + o.ledger_rows_removed == o.ledger_rows_before + 1;
+        if o.token_rows_before != 0
+            || o.token_rows != 1
+            || o.ledger_foreign_rows_added != 0
+            || o.ledger_live_rows_removed != 0
+            || !rows_reconcile
+        {
             return ReplayControlOutcome::LedgerNotSingleton {
                 detail: format!(
-                    "rows {} -> {} (expected +1), token id appears {} time(s) (expected 1)",
-                    o.ledger_rows_before, o.ledger_rows_after, o.token_rows
+                    "rows {} -> {} with {} expired row(s) purged, {} still-live row(s) removed \
+                     and {} foreign row(s) added (expected before + 1 - purged, no live \
+                     removals, no foreign rows); token id appears {} time(s) before and {} \
+                     after (expected 0 and 1)",
+                    o.ledger_rows_before,
+                    o.ledger_rows_after,
+                    o.ledger_rows_removed - o.ledger_live_rows_removed.min(o.ledger_rows_removed),
+                    o.ledger_live_rows_removed,
+                    o.ledger_foreign_rows_added,
+                    o.token_rows_before,
+                    o.token_rows
                 ),
             };
         }
@@ -1004,7 +1096,7 @@ exit 0
 
         // 6. Adjudicate the attack + persist the declared witness.
         let observation = match parse_replay_transcript(script_exit, &script_stdout) {
-            ReplayParse::Observed(o) => o,
+            ReplayParse::Observed(o) => *o,
             ReplayParse::NotAdjudicable { reason } => {
                 evidence.push_str(&format!("## adjudication\nnot adjudicable: {reason}\n"));
                 let _ = write_evidence(workdir, REPLAY_TRANSCRIPT_FILE, &evidence);
@@ -1146,6 +1238,10 @@ exit 0
                 verify_valid: Some(false),
                 ledger_rows_after: 5,
                 token_rows: 1,
+                token_rows_before: 0,
+                ledger_foreign_rows_added: 0,
+                ledger_rows_removed: 0,
+                ledger_live_rows_removed: 0,
                 snapshot_sha_after: "bbb".to_owned(),
                 unit_after: "active".to_owned(),
             }
@@ -1164,6 +1260,10 @@ exit 0
                  nc_verify_output=already_consumed={} valid={}\n\
                  nc_ledger_rows_after={}\n\
                  nc_token_rows={}\n\
+                 nc_token_rows_before={}\n\
+                 nc_ledger_foreign_rows_added={}\n\
+                 nc_ledger_rows_removed={}\n\
+                 nc_ledger_live_rows_removed={}\n\
                  nc_snapshot_sha_after={}\n\
                  nc_unit_after={}\n",
                 o.listener_bound,
@@ -1178,16 +1278,186 @@ exit 0
                 o.verify_valid.unwrap(),
                 o.ledger_rows_after,
                 o.token_rows,
+                o.token_rows_before,
+                o.ledger_foreign_rows_added,
+                o.ledger_rows_removed,
+                o.ledger_live_rows_removed,
                 o.snapshot_sha_after,
                 o.unit_after,
             )
+        }
+
+        // katana-u17: an earlier stage's token expired, the daemon purged it
+        // while recording the attack token, and the ledger went 1 -> 1 across
+        // a correct consume. A purge of expired rows is not a failure.
+        #[test]
+        fn expired_rows_purged_during_the_consume_still_pass() {
+            let mut o = observation();
+            o.ledger_rows_before = 1;
+            o.ledger_rows_after = 1;
+            o.ledger_rows_removed = 1;
+            assert!(
+                adjudicate_replay(&o).is_control_pass(),
+                "{:?}",
+                adjudicate_replay(&o)
+            );
+
+            let mut o2 = observation();
+            o2.ledger_rows_after = 3;
+            o2.ledger_rows_removed = 2;
+            assert!(
+                adjudicate_replay(&o2).is_control_pass(),
+                "{:?}",
+                adjudicate_replay(&o2)
+            );
+        }
+
+        #[test]
+        fn removing_a_still_live_row_is_not_a_pass() {
+            // Dropping an unexpired entry would let that token be redeemed
+            // again, so it fails even when the counts reconcile.
+            let mut o = observation();
+            o.ledger_rows_after = 4;
+            o.ledger_rows_removed = 1;
+            o.ledger_live_rows_removed = 1;
+            assert!(matches!(
+                adjudicate_replay(&o),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+        }
+
+        #[test]
+        fn a_foreign_row_or_a_token_seen_before_is_not_a_pass() {
+            let mut o = observation();
+            o.ledger_rows_after = 6;
+            o.ledger_foreign_rows_added = 1;
+            assert!(matches!(
+                adjudicate_replay(&o),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+            let mut o2 = observation();
+            o2.token_rows_before = 1;
+            assert!(matches!(
+                adjudicate_replay(&o2),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+        }
+
+        #[test]
+        fn counts_that_do_not_reconcile_are_not_a_pass() {
+            // One row fewer with no removal reported: the counting is broken.
+            let mut o = observation();
+            o.ledger_rows_after = 3;
+            assert!(matches!(
+                adjudicate_replay(&o),
+                ReplayControlOutcome::LedgerNotSingleton { .. }
+            ));
+        }
+
+        #[test]
+        fn a_transcript_missing_the_ledger_diff_is_not_adjudicable() {
+            let text = transcript(&observation()).replace("nc_ledger_live_rows_removed=0\n", "");
+            assert!(matches!(
+                parse_replay_transcript(0, &text),
+                ReplayParse::NotAdjudicable { .. }
+            ));
+        }
+
+        /// Runs the attack script's own ledger-diff text (from `ledger_after=`
+        /// to the last `nc_ledger_live_rows_removed=` line) under bash against
+        /// fixture ledgers. Returns the `nc_*` lines it prints.
+        fn run_ledger_diff(before: &[String], after: &[String], token_hex: &str) -> String {
+            let func_start = ATTACK_SCRIPT
+                .find("ledger_entries() {")
+                .expect("ledger_entries function");
+            let func_end = func_start
+                + ATTACK_SCRIPT[func_start..]
+                    .find('\n')
+                    .expect("ledger_entries is one line");
+            let start = ATTACK_SCRIPT
+                .find("ledger_after=\"$(ledger_entries)\"")
+                .expect("after-block start");
+            let last = "printf 'nc_ledger_live_rows_removed=%s\\n' \"$removed_live\"";
+            let end = ATTACK_SCRIPT.find(last).expect("after-block end") + last.len();
+            let dir = tempfile::tempdir().expect("temp dir");
+            let ledger = dir.path().join("ledger");
+            std::fs::write(&ledger, format!("consumed_exp={}\n", after.join(",")))
+                .expect("fixture ledger");
+            let program = format!(
+                "ledger=\"$1\"; token_hex=\"$2\"; ledger_before=\"$3\"\n{}\n{}\n",
+                &ATTACK_SCRIPT[func_start..func_end],
+                &ATTACK_SCRIPT[start..end]
+            );
+            let out = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(program)
+                .arg("nc-ledger-diff")
+                .arg(&ledger)
+                .arg(token_hex)
+                .arg(before.join("\n"))
+                .output()
+                .expect("bash runs the ledger diff");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+
+        #[test]
+        fn the_script_ledger_diff_counts_purges_live_removals_and_foreign_rows() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs();
+            let tok = "aa11".to_owned();
+            let entry = |id: &str, exp: u64| format!("{id}:{exp}");
+
+            // katana-u17 shape: the earlier token expired and was purged.
+            let out = run_ledger_diff(&[entry("bb22", now - 100)], &[entry(&tok, now + 300)], &tok);
+            for want in [
+                "nc_ledger_rows_after=1",
+                "nc_token_rows=1",
+                "nc_ledger_foreign_rows_added=0",
+                "nc_ledger_rows_removed=1",
+                "nc_ledger_live_rows_removed=0",
+            ] {
+                assert!(out.lines().any(|l| l == want), "missing {want} in:\n{out}");
+            }
+
+            // A still-live entry removed, and a never-expiring (migrated v1)
+            // entry removed, both count as live removals.
+            let out = run_ledger_diff(
+                &[entry("bb22", now + 1000), format!("cc33:{}", u64::MAX)],
+                &[entry(&tok, now + 300)],
+                &tok,
+            );
+            assert!(
+                out.lines().any(|l| l == "nc_ledger_live_rows_removed=2"),
+                "{out}"
+            );
+
+            // A row that was not there before and is not the attack token.
+            let out = run_ledger_diff(
+                &[entry("bb22", now + 1000)],
+                &[
+                    entry("bb22", now + 1000),
+                    entry(&tok, now + 300),
+                    entry("dd44", now + 300),
+                ],
+                &tok,
+            );
+            assert!(
+                out.lines().any(|l| l == "nc_ledger_foreign_rows_added=1"),
+                "{out}"
+            );
+            assert!(
+                out.lines().any(|l| l == "nc_ledger_rows_removed=0"),
+                "{out}"
+            );
         }
 
         #[test]
         fn healthy_attack_is_a_control_pass() {
             let o = observation();
             let parsed = match parse_replay_transcript(0, &transcript(&o)) {
-                ReplayParse::Observed(o) => o,
+                ReplayParse::Observed(o) => *o,
                 other => panic!("healthy transcript must parse, got {other:?}"),
             };
             assert_eq!(parsed, o);
@@ -1362,6 +1632,20 @@ exit 0
             assert!(
                 token_rows > verify,
                 "the token-row count is a post-replay datum"
+            );
+            let token_before = ATTACK_SCRIPT
+                .find("nc_token_rows_before=")
+                .expect("token-rows-before marker");
+            assert!(
+                ledger_before < token_before && token_before < genuine,
+                "the attack token's absence is a pre-consume baseline datum"
+            );
+            let live_removed = ATTACK_SCRIPT
+                .find("nc_ledger_live_rows_removed=")
+                .expect("live-removal marker");
+            assert!(
+                live_removed > verify,
+                "the ledger diff is a post-replay datum"
             );
             // The two concurrent replays both START before either is waited on.
             let c1 = ATTACK_SCRIPT.find("c1=$!").expect("c1 start");
