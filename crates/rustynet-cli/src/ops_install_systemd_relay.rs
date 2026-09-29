@@ -10,8 +10,10 @@
 //!
 //! The installer is intentionally minimal:
 //!
-//! - Source unit ships in `scripts/systemd/rustynet-relay.service`.
-//! - Installer reads that unit, copies it to
+//! - The unit ships embedded at compile time from
+//!   `scripts/systemd/rustynet-relay.service` (so the installer works on
+//!   an installed node with no source checkout).
+//! - Installer writes the embedded unit to
 //!   `/etc/systemd/system/rustynet-relay.service`, runs
 //!   `systemctl daemon-reload`, then `systemctl enable --now` or
 //!   `systemctl disable --now` depending on `mode`.
@@ -30,6 +32,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The `rustynet-relay.service` unit body, embedded at compile time from
+/// `scripts/systemd/rustynet-relay.service` so the installer works on an
+/// installed node that has only the binaries and no source checkout
+/// (the same approach as `install/live_linux.rs` `SYSTEMD_UNIT_TEMPLATES`).
+const RELAY_UNIT_BODY: &str = include_str!("../../../scripts/systemd/rustynet-relay.service");
+
 /// What to do with the unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayUnitMode {
@@ -45,8 +53,6 @@ pub enum RelayUnitMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallRelayConfig {
     pub mode: RelayUnitMode,
-    /// Path to the source unit file (in-repo: `scripts/systemd/rustynet-relay.service`).
-    pub source_unit_path: PathBuf,
     /// Path to install at (default `/etc/systemd/system/rustynet-relay.service`).
     pub dest_unit_path: PathBuf,
     /// When true, drive the real `systemctl` binary (production).
@@ -60,7 +66,6 @@ impl InstallRelayConfig {
     pub fn default_install() -> Self {
         Self {
             mode: RelayUnitMode::InstallAndEnable,
-            source_unit_path: PathBuf::from("scripts/systemd/rustynet-relay.service"),
             dest_unit_path: PathBuf::from("/etc/systemd/system/rustynet-relay.service"),
             dry_run: false,
         }
@@ -69,7 +74,6 @@ impl InstallRelayConfig {
     pub fn default_uninstall() -> Self {
         Self {
             mode: RelayUnitMode::DisableAndRemove,
-            source_unit_path: PathBuf::from("scripts/systemd/rustynet-relay.service"),
             dest_unit_path: PathBuf::from("/etc/systemd/system/rustynet-relay.service"),
             dry_run: false,
         }
@@ -111,17 +115,13 @@ pub fn execute_install_relay(config: InstallRelayConfig) -> Result<InstallRelayR
 
     match config.mode {
         RelayUnitMode::InstallAndEnable => {
-            // 1. Read the source unit.
-            let unit_body = read_source_unit(&config.source_unit_path, config.dry_run)?;
-            steps.push(format!(
-                "read source unit ({} bytes) from {}",
-                unit_body.len(),
-                config.source_unit_path.display()
-            ));
+            // 1. The unit body is embedded at compile time.
+            let unit_body = RELAY_UNIT_BODY;
+            steps.push(format!("read embedded unit ({} bytes)", unit_body.len()));
 
             // 2. Write to the destination path.
             if !config.dry_run {
-                write_unit_atomic(&config.dest_unit_path, &unit_body)?;
+                write_unit_atomic(&config.dest_unit_path, unit_body)?;
             }
             steps.push(format!(
                 "{} unit file at {}",
@@ -190,16 +190,6 @@ pub fn execute_install_relay(config: InstallRelayConfig) -> Result<InstallRelayR
     })
 }
 
-fn read_source_unit(path: &Path, dry_run: bool) -> Result<String, String> {
-    if dry_run && !path.exists() {
-        // Allow dry-run without the source file (e.g., from a CI
-        // host that hasn't cloned the systemd scripts directory).
-        return Ok(String::new());
-    }
-    std::fs::read_to_string(path)
-        .map_err(|err| format!("read source unit at {} failed: {err}", path.display()))
-}
-
 fn write_unit_atomic(dest: &Path, body: &str) -> Result<(), String> {
     let parent = dest
         .parent()
@@ -260,12 +250,9 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("rustynet-relay.service");
-        std::fs::write(&source, "[Unit]\nDescription=test\n").unwrap();
         let dest = dir.join("dest").join("rustynet-relay.service");
         let cfg = InstallRelayConfig {
             mode: RelayUnitMode::InstallAndEnable,
-            source_unit_path: source.clone(),
             dest_unit_path: dest.clone(),
             dry_run: true,
         };
@@ -301,7 +288,6 @@ mod tests {
         std::fs::write(&dest, "[Unit]\nDescription=test\n").unwrap();
         let cfg = InstallRelayConfig {
             mode: RelayUnitMode::DisableAndRemove,
-            source_unit_path: PathBuf::from("unused.service"),
             dest_unit_path: dest.clone(),
             dry_run: true,
         };
@@ -360,10 +346,6 @@ mod tests {
             cfg.dest_unit_path,
             PathBuf::from("/etc/systemd/system/rustynet-relay.service")
         );
-        assert_eq!(
-            cfg.source_unit_path,
-            PathBuf::from("scripts/systemd/rustynet-relay.service")
-        );
         assert!(!cfg.dry_run);
     }
 
@@ -388,9 +370,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("rustynet-relay-write-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("rustynet-relay.service");
         let unit_body = "[Unit]\nDescription=tmp-test\n[Service]\nExecStart=/bin/true\n";
-        std::fs::write(&source, unit_body).unwrap();
         let dest = dir.join("rustynet-relay.service.installed");
 
         write_unit_atomic(&dest, unit_body).expect("write_unit_atomic");
@@ -405,6 +385,60 @@ mod tests {
             assert_eq!(meta.permissions().mode() & 0o777, 0o644);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pin: the embedded unit must stay byte-identical to the checked-in
+    /// `scripts/systemd/rustynet-relay.service` file. The read here is an
+    /// independent runtime read from `CARGO_MANIFEST_DIR`, not another
+    /// `include_str!` of the same path, so the two really can drift apart
+    /// and this test would catch it.
+    #[test]
+    fn embedded_relay_unit_is_byte_identical_to_checked_in_file() {
+        let checked_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/systemd/rustynet-relay.service");
+        let on_disk = std::fs::read(&checked_in).expect("read checked-in rustynet-relay.service");
+        assert_eq!(
+            RELAY_UNIT_BODY.as_bytes(),
+            on_disk.as_slice(),
+            "embedded rustynet-relay.service must be byte-identical to the checked-in unit"
+        );
+    }
+
+    /// Regression witness for PF-2: the default install used to read
+    /// `scripts/systemd/rustynet-relay.service` relative to the CWD, so on an
+    /// installed node outside a source checkout it failed with
+    /// "read source unit at scripts/systemd/rustynet-relay.service failed:
+    /// No such file or directory". The unit is now embedded, so the plan
+    /// must carry the real unit bytes regardless of the working directory
+    /// (the tests run from `crates/rustynet-cli`, where that relative path
+    /// does not exist).
+    #[test]
+    fn default_install_dry_run_needs_no_source_checkout() {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-relay-embed-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("rustynet-relay.service");
+        let checked_in = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../scripts/systemd/rustynet-relay.service");
+        let expected_len = std::fs::read(&checked_in)
+            .expect("read checked-in unit")
+            .len();
+        let cfg = InstallRelayConfig {
+            dest_unit_path: dest.clone(),
+            dry_run: true,
+            ..InstallRelayConfig::default_install()
+        };
+        let report = execute_install_relay(cfg).unwrap();
+        let expected_step = format!("read embedded unit ({expected_len} bytes)");
+        assert!(
+            report.steps.contains(&expected_step),
+            "dry-run plan must carry the embedded unit bytes (expected step \
+             {expected_step:?}), got {:?}",
+            report.steps
+        );
+        assert!(report.steps.iter().any(|s| s.contains("would write")));
+        assert!(!dest.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
