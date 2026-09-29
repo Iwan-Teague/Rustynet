@@ -359,7 +359,6 @@ fn run() -> Result<(), String> {
         "awk",
         "sed",
         "openssl",
-        "xxd",
         "mktemp",
         "chmod",
         "tr",
