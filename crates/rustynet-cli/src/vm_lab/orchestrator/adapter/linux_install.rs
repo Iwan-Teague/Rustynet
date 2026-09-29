@@ -351,6 +351,25 @@ fn build_enforce_script(
     )
 }
 
+/// Install script for the relay verifier public key under the product
+/// custody directory.
+///
+/// `/etc/rustynet` carries product posture `0750 root:rustynetd`
+/// (`rustynetd/src/linux_runtime_acls.rs`, enforced by
+/// `scripts/e2e/live_lab_common.sh`). The directory creation therefore pins
+/// the FULL posture — mode AND owner AND group — so that if this stage is
+/// the one to create it (first bring-up, before
+/// `distribute_verifier_key` or the live install ever ran), it is born
+/// traversable by the `rustynetd` group. A bare `install -d -m 0750` would
+/// create it `root:root`, which the daemon's custody evaluation cannot
+/// traverse. Only the key FILE is then installed (public key, `0644`).
+fn linux_relay_verifier_install_script() -> String {
+    "sudo -n sh -c 'install -d -m 0750 -o root -g rustynetd /etc/rustynet && \
+     install -m 0644 /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub && \
+     rm -f /tmp/rn-relay-verifier.pub'"
+        .to_owned()
+}
+
 /// Deploy the `rustynet-relay` sibling service onto this Relay node so the
 /// `relay_validation` stage has a live relay to prove.
 ///
@@ -405,13 +424,7 @@ pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     );
     let _ = std::fs::remove_file(&tmp);
     ship?;
-    ssh::run_remote(
-        conn,
-        "sudo -n sh -c 'install -d -m 0750 /etc/rustynet && \
-         install -m 0644 /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub && \
-         rm -f /tmp/rn-relay-verifier.pub'",
-        short_timeout,
-    )?;
+    ssh::run_remote(conn, &linux_relay_verifier_install_script(), short_timeout)?;
 
     // 4. Drop any /etc/default/rustynet-relay left by a PREVIOUS run before
     //    installing the unit. The unit sources it with
@@ -794,6 +807,27 @@ mod relay_deploy_hygiene_tests {
 mod tests {
     use super::*;
     use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+
+    /// Custody pin: the relay verifier install must create `/etc/rustynet`
+    /// (whenever this stage is the one to create it) with the FULL product
+    /// posture `0750 root:rustynetd` — a bare `install -d -m 0750` would
+    /// create it `root:root`, untraversable by the `rustynetd` group the
+    /// daemon's custody evaluation requires. Mutation caught: dropping
+    /// `-o root -g rustynetd` from the directory install goes RED here.
+    #[test]
+    fn relay_verifier_install_uses_the_full_product_custody_posture() {
+        let script = linux_relay_verifier_install_script();
+        assert!(
+            script.contains("install -d -m 0750 -o root -g rustynetd /etc/rustynet"),
+            "directory creation must carry mode AND owner AND group: {script}"
+        );
+        let file_install =
+            "install -m 0644 /tmp/rn-relay-verifier.pub /etc/rustynet/relay-verifier.pub";
+        assert!(
+            script.contains(file_install),
+            "only the key FILE is installed, 0644: {script}"
+        );
+    }
 
     /// RSA-0068 witness: the env-file argument must never be interpreted as
     /// bash. The old `source "$1"` gave any shell metacharacter in the file

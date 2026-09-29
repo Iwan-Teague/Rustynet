@@ -237,15 +237,40 @@ pub fn distribute_verifier_key(
     let dst_dir = dst.rsplit_once('/').map_or("/etc/rustynet", |(d, _)| d);
     ssh::run_remote(
         conn,
-        &format!(
-            "sudo -n install -d -m 0755 -o root -g root '{dst_dir}' && \
-             sudo -n install -m 0644 -o root -g root '{remote_tmp}' '{dst}' && \
-             sudo -n rm -f '{remote_tmp}' && \
-             test \"$(sudo -n sha256sum '{dst}' | awk '{{print $1}}')\" = '{expected_sha256}'"
-        ),
+        &linux_verifier_key_install_script(dst_dir, &dst, remote_tmp, &expected_sha256),
         SHORT_TIMEOUT,
     )?;
     Ok(())
+}
+
+/// Install script for a verifier public key under the product custody
+/// directory.
+///
+/// Custody rule (katana-u19 owner-key rotation incident): `/etc/rustynet`
+/// carries product posture `0750 root:rustynetd`
+/// (`rustynetd/src/linux_runtime_acls.rs`, enforced by
+/// `scripts/e2e/live_lab_common.sh`). The directory is therefore only
+/// CREATED when missing — and never re-chmod'd/re-chown'd when it already
+/// exists — so a lab distribute stage can never widen or re-own live
+/// product custody. (The old unconditional
+/// `install -d -m 0755 -o root -g root` flipped the existing directory from
+/// `0750 root:rustynetd` to `0755 root:root` on every distribute stage,
+/// which made the owner-key rotation stage refuse to sign.) Only the key
+/// FILE is installed: `0644 root:root`, matching the `assignment.pub`
+/// posture in `scripts/e2e/live_lab_common.sh`.
+fn linux_verifier_key_install_script(
+    dst_dir: &str,
+    dst: &str,
+    remote_tmp: &str,
+    expected_sha256: &str,
+) -> String {
+    format!(
+        "(sudo -n test -d '{dst_dir}' || \
+         sudo -n install -d -m 0750 -o root -g rustynetd '{dst_dir}') && \
+         sudo -n install -m 0644 -o root -g root '{remote_tmp}' '{dst}' && \
+         sudo -n rm -f '{remote_tmp}' && \
+         test \"$(sudo -n sha256sum '{dst}' | awk '{{print $1}}')\" = '{expected_sha256}'"
+    )
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -488,5 +513,70 @@ mod tests {
         use sha2::Digest;
         expected.update(b"signed-bundle-bytes");
         assert_eq!(digest, format!("{:x}", expected.finalize()));
+    }
+
+    /// Custody pin: the verifier-key install script must never widen or
+    /// re-own the EXISTING product custody directory. Creation of
+    /// `/etc/rustynet` is guarded by a `test -d` (create-only-if-missing)
+    /// and carries the product posture `0750 root:rustynetd`; only the key
+    /// FILE is installed, `0644 root:root`. Mutation caught: restoring the
+    /// old unconditional `install -d -m 0755 -o root -g root` (which flipped
+    /// katana-u19's live custody posture to `0755 root:root` on every
+    /// distribute stage and made owner-key rotation refuse to sign) removes
+    /// both the guard and the posture — this test goes RED.
+    #[test]
+    fn linux_verifier_key_install_never_widens_the_config_directory() {
+        for kind in [
+            BundleKind::Membership,
+            BundleKind::Assignment,
+            BundleKind::Traversal,
+            BundleKind::DnsZone,
+        ] {
+            let dst = linux_verifier_key_path(&kind);
+            let dst_dir = dst.rsplit_once('/').map_or("/etc/rustynet", |(d, _)| d);
+            let expected = "cafebabe".repeat(8);
+            let script = linux_verifier_key_install_script(
+                dst_dir,
+                &dst,
+                "/tmp/rn-verifier-key.pub",
+                &expected,
+            );
+            let guard = format!("sudo -n test -d '{dst_dir}' ||");
+            assert!(
+                script.contains(&guard),
+                "{kind:?}: directory creation must be create-only-if-missing: {script}"
+            );
+            let guard_idx = script.find(&guard).expect("guard present");
+            let dir_install_idx = script.find("install -d").expect("dir install present");
+            assert!(
+                guard_idx < dir_install_idx,
+                "{kind:?}: guard must precede the directory install: {script}"
+            );
+            assert_eq!(
+                script.matches("install -d").count(),
+                1,
+                "{kind:?}: exactly one (guarded) directory install: {script}"
+            );
+            let clause_end = script[dir_install_idx..]
+                .find(')')
+                .map_or(script.len(), |off| dir_install_idx + off);
+            let dir_clause = &script[dir_install_idx..clause_end];
+            assert!(
+                dir_clause.contains("-m 0750 -o root -g rustynetd"),
+                "{kind:?}: created directory must carry product posture 0750 root:rustynetd: {script}"
+            );
+            assert!(
+                !dir_clause.contains("0755"),
+                "{kind:?}: directory creation must never widen to 0755: {script}"
+            );
+            assert!(
+                !dir_clause.contains("-g root"),
+                "{kind:?}: directory creation must never re-own the group to root: {script}"
+            );
+            assert!(
+                script.contains("install -m 0644 -o root -g root"),
+                "{kind:?}: only the key FILE is installed, 0644 root:root: {script}"
+            );
+        }
     }
 }
