@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::sleep;
@@ -2729,6 +2730,17 @@ fn run_command_checked_with_env(
     run_command_capture_with_env(command, args, env_vars).map(|_| ())
 }
 
+/// Waits until the daemon control socket at `path` accepts a connection.
+///
+/// A socket file alone is not readiness. rustynetd never unlinks its socket
+/// on shutdown, and after a restart it only removes and rebinds the path once
+/// its runtime bootstrap is done (1-2 s on the lab guests). Straight after
+/// `systemctl restart` the path therefore still names the previous daemon's
+/// dead socket and `connect` is refused (live-lab katana-u16: the follow-up
+/// `rustynet state refresh` ran 17 ms after the unit started). Only a
+/// successful connect proves the new daemon is listening. The probe sends no
+/// command; the daemon logs the empty connection as `ipc_command_read_failed`
+/// and carries on.
 fn wait_for_unix_socket(path: &Path, attempts: usize, sleep_ms: u64) -> Result<(), String> {
     let mut last_state = "missing".to_owned();
     for attempt in 1..=attempts {
@@ -2737,7 +2749,12 @@ fn wait_for_unix_socket(path: &Path, attempts: usize, sleep_ms: u64) -> Result<(
                 if metadata.file_type().is_symlink() {
                     last_state = "symlink".to_owned();
                 } else if metadata.file_type().is_socket() {
-                    return Ok(());
+                    match UnixStream::connect(path) {
+                        Ok(_) => return Ok(()),
+                        Err(err) => {
+                            last_state = format!("socket-not-accepting ({err})");
+                        }
+                    }
                 } else {
                     last_state = "not-socket".to_owned();
                 }
@@ -2986,9 +3003,13 @@ fn validate_env_line(key: &str, value: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::os::unix::fs::FileTypeExt;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::symlink;
+    use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::{
         EGRESS_SOURCE_DERIVED, EGRESS_SOURCE_OPERATOR, EgressPinProvenance,
@@ -3587,6 +3608,133 @@ mod tests {
         let err = wait_for_unix_socket(&path, 1, 0)
             .expect_err("missing path must not validate as a socket");
         assert!(err.contains("failed to become available"));
+    }
+
+    /// Longest socket path the socket tests create. macOS caps a Unix socket
+    /// path at 104 bytes (Linux at 108); keep clear of both.
+    const SOCKET_TEST_PATH_MAX: usize = 100;
+    /// File name of the socket inside a `short_socket_test_dir`.
+    const SOCKET_TEST_FILE: &str = "d.sock";
+
+    /// Base directory for socket test dirs: the temp dir, unless a socket
+    /// under it would pass SOCKET_TEST_PATH_MAX. The default macOS temp dir is
+    /// already about 49 bytes and a build may set a much longer TMPDIR, so in
+    /// that case the tests fall back to /tmp.
+    fn socket_test_base(temp_dir: &std::path::Path, dir_name: &str) -> PathBuf {
+        let socket_len = temp_dir.as_os_str().len() + dir_name.len() + SOCKET_TEST_FILE.len() + 2;
+        if socket_len <= SOCKET_TEST_PATH_MAX {
+            temp_dir.to_path_buf()
+        } else {
+            PathBuf::from("/tmp")
+        }
+    }
+
+    /// Unique socket test directory whose socket path stays under the cap.
+    fn short_socket_test_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock should be valid")
+            .as_nanos();
+        let name = format!("rn-{tag}-{}-{}", std::process::id(), nanos % 1_000_000_000);
+        let dir = socket_test_base(&std::env::temp_dir(), &name).join(name);
+        std::fs::create_dir_all(&dir).expect("test dir should exist");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("test dir permissions should be strict");
+        dir
+    }
+
+    #[test]
+    fn socket_test_paths_fall_back_to_tmp_under_a_long_temp_dir() {
+        let name = "rn-rebind-4294967295-999999999";
+        let default_macos_tmp =
+            std::path::Path::new("/var/folders/ab/abcdefghijklmnopqrstuvwxyz0123/T/");
+        assert_eq!(
+            socket_test_base(default_macos_tmp, name),
+            default_macos_tmp.to_path_buf()
+        );
+        let long_tmp = std::path::Path::new(
+            "/Users/someone/rustysuite-fleet/builds/rustynet-a65-r-install-socket-connect-witness-v4-group/tmp",
+        );
+        let base = socket_test_base(long_tmp, name);
+        assert_eq!(base, PathBuf::from("/tmp"));
+        let socket = base.join(name).join(SOCKET_TEST_FILE);
+        assert!(
+            socket.as_os_str().len() <= SOCKET_TEST_PATH_MAX,
+            "{}",
+            socket.display()
+        );
+        let live = short_socket_test_dir("len").join(SOCKET_TEST_FILE);
+        assert!(
+            live.as_os_str().len() <= SOCKET_TEST_PATH_MAX,
+            "{}",
+            live.display()
+        );
+        let _ = std::fs::remove_dir_all(live.parent().expect("socket has a parent dir"));
+    }
+
+    #[test]
+    fn wait_for_unix_socket_rejects_socket_file_with_no_listener() {
+        // The katana-u16 failure: after a restart the previous daemon's socket
+        // file is still on disk, but nothing listens on it yet.
+        let dir = short_socket_test_dir("stale");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("listener should bind"));
+        assert!(
+            std::fs::symlink_metadata(&socket_path)
+                .expect("stale socket file should remain")
+                .file_type()
+                .is_socket(),
+            "dropping the listener must leave its socket file behind"
+        );
+
+        let err = wait_for_unix_socket(&socket_path, 2, 0)
+            .expect_err("a socket file with no listener must not count as ready");
+        assert!(err.contains("last_state=socket-not-accepting"), "{err}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_for_unix_socket_accepts_listening_socket() {
+        let dir = short_socket_test_dir("live");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        let listener = UnixListener::bind(&socket_path).expect("listener should bind");
+
+        wait_for_unix_socket(&socket_path, 1, 0).expect("a listening socket must count as ready");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn wait_for_unix_socket_waits_through_stale_file_until_rebind() {
+        // The restart sequence end to end: a stale socket file first, then the
+        // new daemon removes it and binds a listener.
+        let dir = short_socket_test_dir("rebind");
+        let socket_path = dir.join(SOCKET_TEST_FILE);
+        drop(UnixListener::bind(&socket_path).expect("stale listener should bind"));
+
+        let rebind_started = Arc::new(AtomicBool::new(false));
+        let rebind_flag = Arc::clone(&rebind_started);
+        let rebind_path = socket_path.clone();
+        let rebinder = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            rebind_flag.store(true, Ordering::SeqCst);
+            std::fs::remove_file(&rebind_path).expect("stale socket should be removable");
+            UnixListener::bind(&rebind_path).expect("new listener should bind")
+        });
+
+        let result = wait_for_unix_socket(&socket_path, 400, 25);
+        let returned_after_rebind = rebind_started.load(Ordering::SeqCst);
+        let listener = rebinder.join().expect("rebind thread should finish");
+        result.expect("the wait must keep polling past the stale file until the rebind");
+        assert!(
+            returned_after_rebind,
+            "the wait returned while only the stale socket file existed"
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
