@@ -2837,7 +2837,7 @@ impl VmInventoryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteTarget {
+pub(crate) struct RemoteTarget {
     label: String,
     ssh_target: String,
     ssh_user: Option<String>,
@@ -14381,6 +14381,13 @@ const RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS: u64 = 90;
 const RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS: u64 = 5;
 const RELAY_FORWARD_TEST_CAPTURE_SECS: u64 = 15;
 const RELAY_FORWARD_TEST_MARKER_LEN: usize = 8;
+/// Bounded wait for a peer's daemon to report a healthy post-cleanup status
+/// (no FailClosed / restricted_safe_mode, reconcile error drained, traversal
+/// peer set matching the run's assignment count). Used by
+/// `cleanup_relay_forward_test` so a failed proof can never silently leave
+/// the lab with a daemon stuck rejecting its signed traversal state.
+const RELAY_FORWARD_TEST_CLEANUP_HEALTH_TIMEOUT_SECS: u64 = 60;
+const RELAY_FORWARD_TEST_HEALTH_POLL_INTERVAL_SECS: u64 = 3;
 
 /// Which two spare Linux peers (and the relay node) this proof drives.
 /// Carries mesh IPs too, since the traffic itself must cross the mesh
@@ -14617,6 +14624,62 @@ fn parse_relay_forward_test_status_field(status_line: &str, key: &str) -> Option
         .find_map(|field| field.strip_prefix(prefix.as_str()).map(ToString::to_string))
 }
 
+/// Health gate over a live `rustynet status` output: the node must NOT be in
+/// fail-closed restricted safe mode, must have no pending reconcile error,
+/// and its signed traversal snapshot must cover exactly
+/// `expected_managed_peers` peers (the count of peers the run's assignment
+/// set says this node manages). Every unparseable/missing field fails closed
+/// — a status this function cannot read is never treated as healthy. This is
+/// the harness-side witness for the QH-04 assignment↔traversal pair
+/// invariant the daemon itself enforces (extra/missing traversal peers push
+/// the daemon to `restriction_mode=Permanent` after 5 failed reconciles —
+/// see `rustynetd/src/daemon.rs` `DEFAULT_MAX_RECONCILE_FAILURES`); the
+/// daemon's rejection must never be weakened, so the lab tooling instead
+/// verifies the pair it just installed actually took.
+pub(crate) fn rustynet_status_health(
+    status_line: &str,
+    expected_managed_peers: u64,
+) -> Result<(), String> {
+    let restricted = parse_relay_forward_test_status_field(status_line, "restricted_safe_mode")
+        .ok_or_else(|| "status line missing restricted_safe_mode field".to_owned())?;
+    match restricted.as_str() {
+        "false" => {}
+        "true" => {
+            return Err("restricted_safe_mode=true (fail-closed restriction active)".to_owned());
+        }
+        other => {
+            return Err(format!("unparseable restricted_safe_mode value: {other:?}"));
+        }
+    }
+
+    let state = parse_relay_forward_test_status_field(status_line, "state")
+        .ok_or_else(|| "status line missing state field".to_owned())?;
+    if state == "FailClosed" {
+        return Err("state=FailClosed".to_owned());
+    }
+
+    let reconcile_error =
+        parse_relay_forward_test_status_field(status_line, "last_reconcile_error")
+            .ok_or_else(|| "status line missing last_reconcile_error field".to_owned())?;
+    if reconcile_error != "none" {
+        return Err(format!("last_reconcile_error={reconcile_error}"));
+    }
+
+    let traversal_peer_count =
+        parse_relay_forward_test_status_field(status_line, "traversal_peer_count")
+            .ok_or_else(|| "status line missing traversal_peer_count field".to_owned())?;
+    let traversal_peer_count = traversal_peer_count
+        .parse::<u64>()
+        .map_err(|err| format!("unparseable traversal_peer_count value: {err}"))?;
+    if traversal_peer_count != expected_managed_peers {
+        return Err(format!(
+            "traversal_peer_count={traversal_peer_count} but run assignment set manages {expected_managed_peers} peers"
+        ));
+    }
+
+    Ok(())
+}
+
 /// True if `capture_text` (a `tcpdump -A` ASCII capture) contains the
 /// plaintext marker anywhere. Used as the ciphertext-only negative
 /// assertion: this MUST be false for the stage to pass.
@@ -14693,7 +14756,7 @@ fn build_relay_forward_test_daemon_restart_script() -> String {
         .to_owned()
 }
 
-fn build_relay_forward_test_status_script() -> String {
+pub(crate) fn build_relay_forward_test_status_script() -> String {
     format!(
         "{status} || echo HP3_STATUS_UNREACHABLE",
         status = privileged_rustynet_cli_script("status")
@@ -14749,6 +14812,70 @@ fn run_relay_forward_test_script(
         timeout_or_default(0, DEFAULT_RUN_TIMEOUT_SECS),
     )
     .map_err(|err| format!("{label} on {} failed: {err}", target.label))
+}
+
+/// pub(crate) alias for [`run_relay_forward_test_script`] so sibling vm_lab
+/// stages (e.g. the signed-bundle refresh pair swap) can run the same
+/// marker-emitting remote scripts over the same SSH control plane without
+/// each growing its own capture wrapper.
+pub(crate) fn run_vm_lab_node_script(
+    target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    script: &str,
+    label: &str,
+) -> Result<String, String> {
+    run_relay_forward_test_script(target, ssh_identity_file, known_hosts_path, script, label)
+}
+
+/// Bounded-poll health gate over one node's `rustynet status`: real sleeps,
+/// never a fixed sleep-then-assume. Every poll re-runs the status script and
+/// re-evaluates [`rustynet_status_health`]; the first healthy read wins, and
+/// the timeout fails CLOSED with the last-seen status/error so the caller
+/// never mistakes "still down" for "healthy enough". Shared by the HP-3
+/// relay-forward proof cleanup and the refresh_signed_bundles pair swap.
+pub(crate) fn wait_for_vm_lab_node_health(
+    target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+    expected_managed_peers: u64,
+    timeout_secs: u64,
+    poll_interval_secs: u64,
+) -> Result<(), String> {
+    let script = build_relay_forward_test_status_script();
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut healthy = false;
+    let mut unhealthy_reason = String::new();
+    while !healthy && Instant::now() < deadline {
+        match run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            script.as_str(),
+            "rustynet status (health poll)",
+        ) {
+            Err(err) => unhealthy_reason = err,
+            Ok(status) => {
+                if status.contains("HP3_STATUS_UNREACHABLE") {
+                    unhealthy_reason = format!("status unreachable: {status}");
+                } else {
+                    match rustynet_status_health(status.as_str(), expected_managed_peers) {
+                        Ok(()) => healthy = true,
+                        Err(err) => unhealthy_reason = err,
+                    }
+                }
+            }
+        }
+        if !healthy && Instant::now() < deadline {
+            thread::sleep(Duration::from_secs(poll_interval_secs));
+        }
+    }
+    if !healthy {
+        return Err(format!(
+            "daemon did not report a healthy {expected_managed_peers}-peer traversal within {timeout_secs}s: {unhealthy_reason}"
+        ));
+    }
+    Ok(())
 }
 
 /// Polls (bounded, real sleeps between attempts — never a single
@@ -14832,6 +14959,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     inventory_path: &Path,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
+    expected_managed_peers: u64,
 ) -> Result<String, String> {
     // The caller owns topology election: the `--node` orchestrator stage
     // elects from the run's role assignments
@@ -14866,6 +14994,37 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
                 "alias {} resolved to non-Linux platform: {}",
                 target.label,
                 target.platform_profile.platform.as_str()
+            ));
+        }
+    }
+
+    // Pre-flight: both peers must ALREADY be healthy and holding a signed
+    // traversal snapshot that covers exactly the peers this run's assignment
+    // set manages. If the earlier bundle-refresh stage left a traversal
+    // snapshot that does not match the node's own assignment (the
+    // "unmanaged peers" divergence — the daemon fail-closes after 5 failed
+    // reconciles), this proof can never form a relay-routed session and
+    // running it would only burn the run: fail HERE with the status line as
+    // the witness instead. Safe to early-return: nothing has been mutated
+    // yet (the relay provisioning below has not run).
+    for (role, target) in [("sender", sender_target), ("receiver", receiver_target)] {
+        let status = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            build_relay_forward_test_status_script().as_str(),
+            "rustynet status (pre-flight)",
+        )?;
+        if status.contains("HP3_STATUS_UNREACHABLE") {
+            return Err(format!(
+                "pre-flight: rustynet status unreachable on {role} {}: {status}",
+                target.label
+            ));
+        }
+        if let Err(err) = rustynet_status_health(status.as_str(), expected_managed_peers) {
+            return Err(format!(
+                "pre-flight: {role} {} daemon is not healthy for a {}-peer assignment set (mutual managed peers required for a relay-routed session): {err}; status: {status}",
+                target.label, expected_managed_peers
             ));
         }
     }
@@ -15103,28 +15262,58 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     // Always attempted, pass or fail, and regardless of which line inside the
     // closure above produced the result (assertion failure or SSH-transport
     // error alike) — this is what keeps a failed run from leaving the lab
-    // stuck in the artificially-relay-forced state.
-    cleanup_relay_forward_test(
+    // stuck in the artificially-relay-forced state. The fold keeps BOTH
+    // truths visible: a passed proof whose cleanup could not restore a
+    // healthy mesh is a stage failure, not a pass.
+    let cleanup = cleanup_relay_forward_test(
         sender_target,
         receiver_target,
         ssh_identity_file,
         known_hosts_path,
+        expected_managed_peers,
     );
-    result
+    fold_relay_forward_cleanup_result(result, cleanup)
 }
 
-/// Best-effort cleanup: remove the firewall block and restart both daemons
-/// so the lab returns to normal direct-path operation for subsequent
-/// stages/runs. Failures here are logged to stderr rather than propagated —
-/// they must never mask the stage's own pass/fail verdict, but silently
-/// swallowing them entirely would hide real residue, so they're still
-/// visible in the orchestrator's captured output.
+/// Combines the proof verdict with the cleanup verdict without letting
+/// cleanup residue ever turn a failed proof into a pass — or a passed proof
+/// with an unrestored mesh into a silent pass. Priority: the proof verdict
+/// leads; cleanup failure is appended, never swallowed.
+pub(crate) fn fold_relay_forward_cleanup_result(
+    proof: Result<String, String>,
+    cleanup: Result<(), String>,
+) -> Result<String, String> {
+    match (proof, cleanup) {
+        (Ok(summary), Ok(())) => Ok(summary),
+        (Ok(summary), Err(cleanup_err)) => Err(format!(
+            "proof PASSED ({summary}) but cleanup failed to restore a healthy mesh — residue must be fixed before the run is trusted: {cleanup_err}"
+        )),
+        (Err(proof_err), Ok(())) => Err(proof_err),
+        (Err(proof_err), Err(cleanup_err)) => {
+            Err(format!("{proof_err}; cleanup also failed: {cleanup_err}"))
+        }
+    }
+}
+
+/// Cleanup + restoration proof: remove the firewall block, restart both
+/// daemons, then bounded-poll each peer's `rustynet status` until it reports
+/// a HEALTHY daemon whose traversal snapshot again matches the run's
+/// assignment set (post-cleanup the full-mesh refresh env is what the
+/// daemon holds, so `expected_managed_peers` is the bar). Failures here are
+/// PROPAGATED — the caller folds them into the stage verdict via
+/// [`fold_relay_forward_cleanup_result`] — because a lab left with a daemon
+/// stuck rejecting its signed traversal state (the FailClosed residue this
+/// lane root-caused) silently poisons every later stage. Each step is still
+/// attempted for both peers before giving up, so one peer's SSH hiccup never
+/// skips the other's unblock.
 fn cleanup_relay_forward_test(
     sender_target: &RemoteTarget,
     receiver_target: &RemoteTarget,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
-) {
+    expected_managed_peers: u64,
+) -> Result<(), String> {
+    let mut failures: Vec<String> = Vec::new();
     for target in [sender_target, receiver_target] {
         if let Err(err) = run_relay_forward_test_script(
             target,
@@ -15133,7 +15322,7 @@ fn cleanup_relay_forward_test(
             build_relay_forward_test_unblock_script().as_str(),
             "nft cleanup",
         ) {
-            eprintln!("hp3 relay-forward-test cleanup: {err}");
+            failures.push(format!("{} nft cleanup: {err}", target.label));
         }
         if let Err(err) = run_relay_forward_test_script(
             target,
@@ -15142,8 +15331,61 @@ fn cleanup_relay_forward_test(
             build_relay_forward_test_daemon_restart_script().as_str(),
             "daemon restart (cleanup)",
         ) {
-            eprintln!("hp3 relay-forward-test cleanup: {err}");
+            failures.push(format!("{} daemon restart: {err}", target.label));
         }
+    }
+
+    // Bounded, real-sleep poll: each daemon must come back healthy with the
+    // expected traversal peer count. Never assume the restart was enough.
+    // Both daemons restarted together above, so they share one window, but
+    // every peer is polled at least once: a slow first peer must not leave
+    // the second unchecked with an empty reason.
+    let deadline =
+        Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_CLEANUP_HEALTH_TIMEOUT_SECS);
+    for target in [sender_target, receiver_target] {
+        let mut healthy = false;
+        let mut unhealthy_reason = String::new();
+        loop {
+            match run_relay_forward_test_script(
+                target,
+                ssh_identity_file,
+                known_hosts_path,
+                build_relay_forward_test_status_script().as_str(),
+                "rustynet status (cleanup health)",
+            ) {
+                Err(err) => unhealthy_reason = err,
+                Ok(status) => {
+                    if status.contains("HP3_STATUS_UNREACHABLE") {
+                        unhealthy_reason = format!("status unreachable: {status}");
+                    } else {
+                        match rustynet_status_health(status.as_str(), expected_managed_peers) {
+                            Ok(()) => healthy = true,
+                            Err(err) => unhealthy_reason = err,
+                        }
+                    }
+                }
+            }
+            if healthy || Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_secs(
+                RELAY_FORWARD_TEST_HEALTH_POLL_INTERVAL_SECS,
+            ));
+        }
+        if !healthy {
+            failures.push(format!(
+                "{} did not return to a healthy {}-peer-traversal state within {}s: {unhealthy_reason}",
+                target.label,
+                expected_managed_peers,
+                RELAY_FORWARD_TEST_CLEANUP_HEALTH_TIMEOUT_SECS
+            ));
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
     }
 }
 
@@ -26339,11 +26581,16 @@ fn run_linux_orchestration_stages_with_options(
         let relay_forwards_result = (|| {
             let inventory = load_inventory(inventory_path)?;
             let topology = select_relay_forward_test_topology(&inventory)?;
+            // Legacy inventory-wide chain: assignments are minted full-mesh
+            // across the whole inventory, so every node manages all others
+            // (count minus self).
+            let expected_managed_peers = inventory.len().saturating_sub(1) as u64;
             exercise_linux_relay_forwards_frame(
                 &topology,
                 inventory_path,
                 ssh_identity_file,
                 known_hosts_path,
+                expected_managed_peers,
             )
         })();
         match relay_forwards_result {
@@ -49682,6 +49929,89 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(!super::relay_forward_test_status_reports_relay_peer(
             "unrelated=field"
         ));
+    }
+
+    #[test]
+    fn rustynet_status_health_accepts_healthy_full_mesh_status() {
+        let status = "node_id=fedora-utm-1-bootstrap state=Active restricted_safe_mode=false traversal_peer_count=4 last_reconcile_error=none";
+        super::rustynet_status_health(status, 4)
+            .expect("healthy 4-peer traversal status must pass");
+    }
+
+    #[test]
+    fn rustynet_status_health_rejects_real_failclosed_residue() {
+        // Witness line shape taken verbatim from the HP-3 run residue
+        // (linux-u11b-5node-negctl-relayfwd, relay_forwards_frame_validation
+        // stage): a daemon pushed to Permanent fail-closed restriction by a
+        // traversal snapshot holding peers its assignment does not manage.
+        let status = "node_id=debian-headless-2-bootstrap state=FailClosed restricted_safe_mode=true bootstrap_error=\"reconcile failure threshold exceeded: 102\" traversal_peer_count=4 last_reconcile_error=\"traversal authority snapshot contains unmanaged peers\"";
+        let err = super::rustynet_status_health(status, 4)
+            .expect_err("FailClosed residue must never pass the health gate");
+        assert!(
+            err.contains("restricted_safe_mode") || err.contains("FailClosed"),
+            "error must name the fail-closed signal: {err}"
+        );
+    }
+
+    #[test]
+    fn rustynet_status_health_rejects_wrong_traversal_peer_count() {
+        let status = "node_id=x state=Active restricted_safe_mode=false traversal_peer_count=2 last_reconcile_error=none";
+        let err = super::rustynet_status_health(status, 4)
+            .expect_err("a traversal snapshot narrower than the assignment set must fail");
+        assert!(err.contains("traversal_peer_count"), "error: {err}");
+    }
+
+    #[test]
+    fn rustynet_status_health_rejects_missing_fields_and_reconcile_error() {
+        let err = super::rustynet_status_health("state=Active restricted_safe_mode=false", 4)
+            .expect_err("missing fields fail closed");
+        assert!(err.contains("missing"), "error: {err}");
+
+        let status = "state=Active restricted_safe_mode=false traversal_peer_count=4 last_reconcile_error=transient";
+        let err = super::rustynet_status_health(status, 4)
+            .expect_err("a pending reconcile error is not health");
+        assert!(err.contains("last_reconcile_error"), "error: {err}");
+
+        let err = super::rustynet_status_health("no status fields at all", 4)
+            .expect_err("unparseable status fails closed");
+        assert!(err.contains("restricted_safe_mode"), "error: {err}");
+    }
+
+    #[test]
+    fn fold_relay_forward_cleanup_result_keeps_both_truths_visible() {
+        let pass = Ok::<String, String>("proof passed".to_owned());
+        let clean = Ok::<(), String>(());
+        let dirty = Err::<(), String>("daemon still FailClosed".to_owned());
+        let fail = Err::<String, String>("ping marker missing".to_owned());
+
+        assert!(super::fold_relay_forward_cleanup_result(pass.clone(), clean.clone()).is_ok());
+
+        let passed_but_dirty =
+            super::fold_relay_forward_cleanup_result(pass.clone(), dirty.clone())
+                .expect_err("a passed proof with dirty cleanup is a failure");
+        assert!(
+            passed_but_dirty.contains("proof PASSED"),
+            "{passed_but_dirty}"
+        );
+        assert!(
+            passed_but_dirty.contains("daemon still FailClosed"),
+            "{passed_but_dirty}"
+        );
+
+        let failed_clean = super::fold_relay_forward_cleanup_result(fail.clone(), clean.clone())
+            .expect_err("proof failure must stay a failure");
+        assert_eq!(failed_clean, "ping marker missing");
+
+        let failed_dirty = super::fold_relay_forward_cleanup_result(fail.clone(), dirty)
+            .expect_err("both failing must stay a failure");
+        assert!(
+            failed_dirty.contains("ping marker missing"),
+            "{failed_dirty}"
+        );
+        assert!(
+            failed_dirty.contains("cleanup also failed"),
+            "{failed_dirty}"
+        );
     }
 
     #[test]

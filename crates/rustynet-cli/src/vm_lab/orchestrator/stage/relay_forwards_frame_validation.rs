@@ -175,11 +175,19 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
         // the outcome itself is a bare pass (StageOutcome::Passed carries no
         // payload by design — the summary would have nowhere to ride, so it
         // is logged where the run report's stage log captures it).
+        // The proof needs sender and receiver to be MUTUAL MANAGED PEERS
+        // (relay-routed sessions are only minted between peers each side's
+        // own signed assignment manages). The healthy-traversal bar is the
+        // run's own assignment count minus self: a node holding a traversal
+        // snapshot that disagrees (the "unmanaged peers" divergence the
+        // daemon fail-closes on) fails the pre-flight before any disruption.
+        let expected_managed_peers = ctx.assignments.len().saturating_sub(1) as u64;
         match crate::vm_lab::exercise_linux_relay_forwards_frame(
             &topology,
             Path::new(&inventory_path),
             &params.identity_file,
             Some(params.known_hosts.as_path()),
+            expected_managed_peers,
         ) {
             Ok(summary) => {
                 // Rich evidence on disk (StageOutcome::Passed carries no
