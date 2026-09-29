@@ -547,15 +547,15 @@ pub(crate) fn execute_rust_native_orchestration(
 
     // Snapshot (alias, target, role) now for the run_summary nodes.tsv (Bucket 2);
     // node_id is filled from ctx.node_ids after the run populates it. Owned
-    // strings so no borrow of `node_entries`/`inventory` lingers.
+    // strings so no borrow of `node_entries`/`inventory` lingers. Overlay-origin
+    // nodes record the redacted stand-in target: this tuple feeds nodes.tsv, the
+    // matrix parity check, and the {platform}_{role}_target columns — every one
+    // of them committed.
+    let overlay_redaction = crate::vm_lab::inventory_overlay_redaction()?;
     let node_targets: Vec<(String, String, String, String)> = node_entries
         .iter()
         .map(|(entry, assignment)| {
-            let target = entry
-                .last_known_ip
-                .as_deref()
-                .unwrap_or(entry.ssh_target.as_str())
-                .to_owned();
+            let target = crate::vm_lab::ledger_target_for_entry(entry, overlay_redaction.as_ref());
             let platform =
                 format!("{:?}", entry_platform_or_fail(entry, assignment)?).to_lowercase();
             Ok((
@@ -1513,6 +1513,7 @@ mod tests {
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: None,
         }
     }

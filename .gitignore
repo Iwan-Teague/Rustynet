@@ -93,3 +93,6 @@ __pycache__/
 
 # Lab SSH bootstrap passwords. The inventory beside this is public; these are not.
 *.secrets.json
+
+# Local inventory overlays name real lab addresses; never commit them.
+/lab-local/

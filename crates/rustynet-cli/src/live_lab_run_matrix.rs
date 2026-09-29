@@ -607,11 +607,23 @@ fn write_node_stage_result_ledgers(
         return Err("node-stage evidence requires at least one nodes.tsv row".to_owned());
     }
     let stages = read_stage_evidence(report_dir.join(STAGES_RELATIVE_PATH).as_path())?;
+    // Stage summaries carry raw adapter/SSH error text, which can embed an
+    // overlay node's real addresses; both committed sinks below
+    // (live_lab_node_stage_results.csv and the triage stubs) are built from
+    // this one map, so scrubbing here covers both. Fails closed: a ledger
+    // write that cannot prove its redaction does not happen.
+    let overlay_redaction = crate::vm_lab::inventory_overlay_redaction()?;
     let stage_summaries: BTreeMap<String, String> =
         read_tsv_rows(report_dir.join(STAGES_RELATIVE_PATH).as_path())?
             .into_iter()
             .filter(|row| row.len() >= 6)
-            .map(|row| (row[0].clone(), row[5].clone()))
+            .map(|row| {
+                let summary = match overlay_redaction.as_ref() {
+                    Some(redaction) => redaction.scrub(&row[5]),
+                    None => row[5].clone(),
+                };
+                (row[0].clone(), summary)
+            })
             .collect();
 
     let field = |name: &str| run_values.get(name).cloned().unwrap_or_default();
@@ -1148,7 +1160,9 @@ fn build_live_lab_run_matrix_values(
         .transpose()?
         .unwrap_or_default();
     let node_rows = read_node_rows(config.report_dir.join(NODES_RELATIVE_PATH).as_path())?;
-    let mut target_evidence = target_evidence_from_profile(&profile_values, &node_rows);
+    let overlay_redaction = crate::vm_lab::inventory_overlay_redaction()?;
+    let mut target_evidence =
+        target_evidence_from_profile(&profile_values, &node_rows, overlay_redaction.as_ref());
     if target_evidence.is_empty() {
         target_evidence =
             target_evidence_from_parity(config.report_dir.join("parity_input.json").as_path())?;
@@ -1757,6 +1771,7 @@ fn stage_rows_for_times(path: &Path) -> Vec<StageRow> {
 fn target_evidence_from_profile(
     profile: &BTreeMap<String, String>,
     nodes: &[NodeRow],
+    overlay_redaction: Option<&crate::vm_lab::OverlayRedaction>,
 ) -> Vec<TargetEvidence> {
     let mut targets = Vec::new();
     for label in ["exit", "client", "entry", "aux", "extra", "fifth_client"] {
@@ -1776,6 +1791,16 @@ fn target_evidence_from_profile(
             .filter(|value| !value.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| label.to_owned());
+        // A profile that names an overlay node carries the raw resolved ssh
+        // target; the committed nodes.tsv row for that node records the
+        // redacted stand-in instead. Apply the same redaction here or the
+        // parity check below rejects the whole matrix append.
+        let target = match overlay_redaction {
+            Some(redaction) if redaction.contains(alias.as_str()) => {
+                crate::vm_lab::LOCAL_OVERLAY_REDACTED_TARGET.to_owned()
+            }
+            _ => target.clone(),
+        };
         let node = nodes.iter().find(|node| node.label == label);
         targets.push(TargetEvidence {
             label: label.to_owned(),
@@ -4562,6 +4587,94 @@ mod tests {
         ] {
             assert!(validate_target_evidence(std::slice::from_ref(&invalid), &nodes).is_err());
         }
+    }
+
+    #[test]
+    /// Mutation caught: a profile naming an OVERLAY node carried the raw
+    /// resolved ssh target into target evidence, while nodes.tsv records the
+    /// redacted stand-in for that node — so validate_target_evidence rejected
+    /// the whole matrix append. The profile target must be redacted by overlay
+    /// alias (same rule as the ledger target) before validation.
+    fn profile_target_for_an_overlay_node_is_redacted_before_parity() {
+        let dir = std::env::temp_dir().join(format!("rn-matrix-ovl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let overlay = dir.join("lab-local-overlay.json");
+        std::fs::write(
+            overlay.as_path(),
+            r#"{
+              "version": 1,
+              "hosts": [
+                { "host_id": "host-overlay", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" }
+              ],
+              "entries": [
+                { "alias": "cloud-exit-1", "node_id": "cloud-exit-1",
+                  "ssh_target": "azureuser@198.51.100.8", "platform": "linux" }
+              ]
+            }"#,
+        )
+        .expect("write overlay");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o600))
+                .expect("chmod");
+        }
+        let redaction = crate::vm_lab::overlay_redaction_from_file(overlay.as_path())
+            .expect("redaction from overlay file");
+        assert!(redaction.contains("cloud-exit-1"));
+
+        let nodes = vec![
+            NodeRow {
+                label: "exit".to_owned(),
+                // nodes.tsv records the redacted stand-in for overlay nodes.
+                target: crate::vm_lab::LOCAL_OVERLAY_REDACTED_TARGET.to_owned(),
+                node_id: "cloud-exit-1".to_owned(),
+                bootstrap_role: "exit".to_owned(),
+                platform: "linux".to_owned(),
+                os_version: "Ubuntu 24.04".to_owned(),
+            },
+            NodeRow {
+                label: "client".to_owned(),
+                target: "debian@192.0.2.20".to_owned(),
+                node_id: "client-1".to_owned(),
+                bootstrap_role: "client".to_owned(),
+                platform: "linux".to_owned(),
+                os_version: "Debian GNU/Linux 13 (trixie)".to_owned(),
+            },
+        ];
+        let mut profile = BTreeMap::new();
+        profile.insert(
+            "EXIT_TARGET".to_owned(),
+            "azureuser@198.51.100.8".to_owned(),
+        );
+        profile.insert("EXIT_UTM_NAME".to_owned(), "cloud-exit-1".to_owned());
+        profile.insert("EXIT_PLATFORM".to_owned(), "linux".to_owned());
+        profile.insert("CLIENT_TARGET".to_owned(), "debian@192.0.2.20".to_owned());
+        profile.insert("CLIENT_UTM_NAME".to_owned(), "client-1".to_owned());
+
+        let targets = super::target_evidence_from_profile(&profile, &nodes, Some(&redaction));
+        assert_eq!(
+            targets[0].target,
+            crate::vm_lab::LOCAL_OVERLAY_REDACTED_TARGET,
+            "overlay node's raw ssh target must be redacted"
+        );
+        assert_eq!(targets[0].alias, "cloud-exit-1");
+        assert_eq!(
+            targets[1].target, "debian@192.0.2.20",
+            "a tracked node's target must pass through untouched"
+        );
+        validate_target_evidence(&targets, &nodes).expect("redacted parity must validate");
+
+        // Witness: without the redaction (the old behaviour) the raw target
+        // diverges from nodes.tsv and the whole append would error.
+        let raw = super::target_evidence_from_profile(&profile, &nodes, None);
+        assert_eq!(raw[0].target, "azureuser@198.51.100.8");
+        assert!(
+            validate_target_evidence(&raw, &nodes).is_err(),
+            "raw overlay target must fail parity — that is the old bug"
+        );
+        let _ = std::fs::remove_dir_all(dir.as_path());
     }
 
     #[test]

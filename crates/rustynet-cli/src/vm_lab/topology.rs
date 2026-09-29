@@ -585,6 +585,7 @@ mod tests {
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: None,
         }
     }

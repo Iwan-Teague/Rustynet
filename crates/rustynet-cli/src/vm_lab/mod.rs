@@ -2817,6 +2817,11 @@ pub(crate) struct VmInventoryEntry {
     pub(crate) guest_exec_mode: Option<VmGuestExecMode>,
     pub(crate) service_manager: Option<VmServiceManager>,
     pub(crate) controller: Option<VmController>,
+    /// Optional dataplane address override: when set, the node's WireGuard
+    /// endpoint host becomes this address while SSH/management traffic keeps
+    /// using `ssh_target`. Must parse as an IP literal (no hostnames) so it can
+    /// never smuggle option-shaped strings into a `wg` endpoint.
+    pub(crate) dataplane_endpoint: Option<std::net::IpAddr>,
 }
 
 impl VmInventoryEntry {
@@ -31729,6 +31734,48 @@ pub(crate) fn write_inventory_live_ips(
     inventory_path: &Path,
     updates: &BTreeMap<&str, &str>,
 ) -> Result<String, String> {
+    let redaction = inventory_overlay_redaction()?;
+    write_inventory_live_ips_with_redaction(inventory_path, updates, redaction.as_ref())
+}
+
+/// The live-IP writer with overlay handling made explicit (test seam for the
+/// env-var read in [`write_inventory_live_ips`]).
+///
+/// Refuses — before any byte is written — when any update targets an
+/// overlay-origin alias. The overlay is untracked precisely because its
+/// addresses are not publishable; silently rewriting the tracked inventory for
+/// such an alias would copy them into a committed file. Refusing (rather than
+/// skipping) is deliberate: readiness discovery only covers controller-side
+/// guests, so an overlay alias reaching this writer at all means a caller is
+/// trying to persist addresses for a node the tracked inventory does not own,
+/// and that is a configuration mistake worth surfacing.
+fn write_inventory_live_ips_with_redaction(
+    inventory_path: &Path,
+    updates: &BTreeMap<&str, &str>,
+    redaction: Option<&OverlayRedaction>,
+) -> Result<String, String> {
+    if let Some(redaction) = redaction {
+        let overlay_aliases: Vec<String> = updates
+            .keys()
+            .map(|alias| (*alias).to_owned())
+            .filter(|alias| redaction.contains(alias.as_str()))
+            .collect();
+        if !overlay_aliases.is_empty() {
+            return Err(format!(
+                "refusing to update vm inventory {} for inventory-overlay aliases: {}; \
+                 overlay entries live only in the untracked overlay",
+                inventory_path.display(),
+                overlay_aliases.join(", ")
+            ));
+        }
+    }
+    write_inventory_live_ips_inner(inventory_path, updates)
+}
+
+fn write_inventory_live_ips_inner(
+    inventory_path: &Path,
+    updates: &BTreeMap<&str, &str>,
+) -> Result<String, String> {
     if updates.is_empty() {
         return Ok(format!(
             "inventory not updated because no authoritative live IPs were observed in {}",
@@ -33075,6 +33122,17 @@ pub(crate) fn load_inventory(path: &Path) -> Result<Vec<VmInventoryEntry>, Strin
 /// a concrete `connect_uri` at parse time, so the runtime `VmController` shape is
 /// unchanged and every downstream call site keeps working untouched.
 fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<LabHost>), String> {
+    let overlay = inventory_overlay_path();
+    load_inventory_with_overlay(path, overlay.as_deref())
+}
+
+/// Load the tracked inventory and, when an overlay path is given, append the
+/// overlay's `hosts` and `entries` to it. `overlay == None` is exactly the
+/// tracked-inventory load.
+fn load_inventory_with_overlay(
+    path: &Path,
+    overlay: Option<&Path>,
+) -> Result<(Vec<VmInventoryEntry>, Vec<LabHost>), String> {
     let body = fs::read_to_string(path)
         .map_err(|err| format!("read vm inventory failed ({}): {err}", path.display()))?;
     let value = serde_json::from_str::<Value>(body.as_str())
@@ -33098,7 +33156,7 @@ fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<
             path.display()
         ));
     }
-    let hosts = parse_hosts(object).map_err(|err| format!("{err} ({})", path.display()))?;
+    let mut hosts = parse_hosts(object).map_err(|err| format!("{err} ({})", path.display()))?;
 
     let entries = object
         .get("entries")
@@ -33119,6 +33177,12 @@ fn load_inventory_with_hosts(path: &Path) -> Result<(Vec<VmInventoryEntry>, Vec<
             ));
         }
         parsed.push(parsed_entry);
+    }
+    if let Some(overlay_path) = overlay {
+        let (overlay_hosts, overlay_entries) =
+            load_inventory_overlay(path, overlay_path, &parsed, &hosts)?;
+        hosts.extend(overlay_hosts);
+        parsed.extend(overlay_entries);
     }
     merge_secrets_sidecar(path, &mut parsed)?;
     Ok((parsed, hosts))
@@ -33236,6 +33300,423 @@ fn ensure_secrets_file_permissions(_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Env var naming the optional untracked inventory overlay. Unset (or blank)
+/// means no overlay; a set var pointing at a missing or unreadable file fails
+/// the load closed. Like `RUSTYNET_LAB_SECRETS`, there is deliberately no
+/// default path inside the repository: an owner-owned cloud node's addresses
+/// must never be one careless commit away from the public tree.
+const INVENTORY_OVERLAY_ENV: &str = "RUSTYNET_LAB_INVENTORY_OVERLAY";
+
+/// Resolve the overlay path from the environment. Unset or blank ⇒ `None`.
+fn inventory_overlay_path() -> Option<PathBuf> {
+    std::env::var(INVENTORY_OVERLAY_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Load the untracked inventory overlay and APPEND its `hosts` and `entries`
+/// to the tracked inventory.
+///
+/// Fail-closed rules (all errors refuse the whole load, never a partial one):
+/// the file must exist, be a regular file (symlinks refused), and — on unix —
+/// not be group/world readable; it must be valid JSON with the same top-level
+/// shape as the inventory (`version == 1`, non-empty `entries`, optional
+/// `hosts[]`); every entry passes the same validation as tracked entries; and
+/// an alias or `host_id` that already exists in the tracked inventory (or
+/// twice within the overlay) is an error — an overlay never silently overrides
+/// a tracked record.
+fn load_inventory_overlay(
+    inventory: &Path,
+    overlay: &Path,
+    tracked_entries: &[VmInventoryEntry],
+    tracked_hosts: &[LabHost],
+) -> Result<(Vec<LabHost>, Vec<VmInventoryEntry>), String> {
+    ensure_overlay_file_permissions(overlay)?;
+
+    let body = fs::read_to_string(overlay).map_err(|err| {
+        format!(
+            "read vm inventory overlay failed ({}): {err}",
+            overlay.display()
+        )
+    })?;
+    let value = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+        format!(
+            "parse vm inventory overlay failed ({}): {err}",
+            overlay.display()
+        )
+    })?;
+    let object = value.as_object().ok_or_else(|| {
+        format!(
+            "vm inventory overlay must be a JSON object: {}",
+            overlay.display()
+        )
+    })?;
+    let version = object
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            format!(
+                "vm inventory overlay is missing numeric version: {}",
+                overlay.display()
+            )
+        })?;
+    if version != 1 {
+        return Err(format!(
+            "unsupported vm inventory overlay version {} in {}",
+            version,
+            overlay.display()
+        ));
+    }
+
+    let overlay_hosts =
+        parse_hosts(object).map_err(|err| format!("{err} ({})", overlay.display()))?;
+    for host in &overlay_hosts {
+        if tracked_hosts
+            .iter()
+            .any(|tracked| tracked.host_id == host.host_id)
+        {
+            return Err(format!(
+                "vm inventory overlay host_id already exists in the tracked inventory {}: {} ({})",
+                inventory.display(),
+                host.host_id,
+                overlay.display()
+            ));
+        }
+    }
+
+    let entries = object
+        .get("entries")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "vm inventory overlay is missing entries array: {}",
+                overlay.display()
+            )
+        })?;
+    if entries.is_empty() {
+        return Err(format!(
+            "vm inventory overlay has no entries: {}",
+            overlay.display()
+        ));
+    }
+
+    // Overlay entries validate against tracked + overlay hosts so an overlay
+    // controller may reference an overlay-declared host.
+    let mut combined_hosts = Vec::with_capacity(tracked_hosts.len() + overlay_hosts.len());
+    combined_hosts.extend(tracked_hosts.iter().cloned());
+    combined_hosts.extend(overlay_hosts.iter().cloned());
+
+    let mut parsed = Vec::with_capacity(entries.len());
+    let mut seen_aliases: HashSet<String> = tracked_entries
+        .iter()
+        .map(|entry| entry.alias.clone())
+        .collect();
+    for entry in entries {
+        let parsed_entry = parse_inventory_entry(entry, combined_hosts.as_slice())?;
+        if !seen_aliases.insert(parsed_entry.alias.clone()) {
+            return Err(format!(
+                "vm inventory overlay alias already exists in the tracked inventory {} or earlier in the overlay: {} ({})",
+                inventory.display(),
+                parsed_entry.alias,
+                overlay.display()
+            ));
+        }
+        parsed.push(parsed_entry);
+    }
+    Ok((overlay_hosts, parsed))
+}
+
+/// Refuse to read an inventory overlay that is not a plain, private file:
+/// symlinks are refused outright (the target could be swapped after approval)
+/// and — on unix — group/world-readable modes fail the load closed. Stricter
+/// than the secrets-sidecar check, which does not reject symlinks.
+#[cfg(unix)]
+fn ensure_overlay_file_permissions(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        format!(
+            "stat vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "vm inventory overlay {} must be a regular file; symlinks and directories are refused",
+            path.display()
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "vm inventory overlay {} is mode {:04o}; it must not be readable by group or other. \
+             Fix with: chmod 600 {}",
+            path.display(),
+            mode,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_overlay_file_permissions(path: &Path) -> Result<(), String> {
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        format!(
+            "stat vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "vm inventory overlay {} must be a regular file; symlinks and directories are refused",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The stand-in recorded in committed ledgers for an overlay-origin node's
+/// address. Chosen to be a valid non-empty `target` so target-presence and
+/// parity validation keep passing without publishing the real address.
+pub(crate) const LOCAL_OVERLAY_REDACTED_TARGET: &str = "local-overlay";
+
+/// What an overlay hides, and where its addresses must never appear.
+///
+/// `aliases` are the overlay-declared nodes: the live-IP writer refuses them
+/// outright and the run-summary records their target as
+/// [`LOCAL_OVERLAY_REDACTED_TARGET`]. `needles` are the literal address strings
+/// (ssh_target, its host part, last_known_ip, dataplane forms) scrubbed from
+/// stage summaries before they land in committed ledgers or triage stubs.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct OverlayRedaction {
+    aliases: std::collections::BTreeSet<String>,
+    needles: Vec<String>,
+}
+
+impl OverlayRedaction {
+    pub(crate) fn contains(&self, alias: &str) -> bool {
+        self.aliases.contains(alias)
+    }
+
+    /// Replace every overlay address in `detail` with
+    /// [`LOCAL_OVERLAY_REDACTED_TARGET`]. Only address substrings are replaced,
+    /// so `{alias}:` prefixes used for status attribution survive intact.
+    pub(crate) fn scrub(&self, detail: &str) -> String {
+        let mut out = detail.to_owned();
+        for needle in &self.needles {
+            if out.contains(needle.as_str()) {
+                out = out.replace(needle.as_str(), LOCAL_OVERLAY_REDACTED_TARGET);
+            }
+        }
+        out
+    }
+}
+
+/// Build the redaction set from the overlay file named by the environment.
+///
+/// `Ok(None)` when no overlay is configured. Fails closed on a configured
+/// overlay that cannot be read or parsed: a ledger write that cannot prove it
+/// is redacting correctly must not guess.
+pub(crate) fn inventory_overlay_redaction() -> Result<Option<OverlayRedaction>, String> {
+    let Some(path) = inventory_overlay_path() else {
+        return Ok(None);
+    };
+    overlay_redaction_from_file(path.as_path()).map(Some)
+}
+
+/// Parse an overlay file into its redaction set without requiring a full
+/// inventory load (the full load runs elsewhere; here we only need the
+/// addresses to hide and the aliases to refuse).
+pub(crate) fn overlay_redaction_from_file(path: &Path) -> Result<OverlayRedaction, String> {
+    let body = fs::read_to_string(path).map_err(|err| {
+        format!(
+            "read vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    let value = serde_json::from_str::<Value>(body.as_str()).map_err(|err| {
+        format!(
+            "parse vm inventory overlay failed ({}): {err}",
+            path.display()
+        )
+    })?;
+    let mut redaction = OverlayRedaction::default();
+    // Overlay hosts matter even when no entry references them: virsh/libvirt
+    // error strings embed a host's connect_uri verbatim, and those strings
+    // flow into stage summaries that land in committed ledgers.
+    if let Some(hosts) = value.get("hosts").and_then(Value::as_array) {
+        for host in hosts {
+            let Some(object) = host.as_object() else {
+                continue;
+            };
+            let Some(connect_uri) = object.get("connect_uri").and_then(Value::as_str) else {
+                continue;
+            };
+            for needle in overlay_connect_uri_needles(connect_uri) {
+                if !needle.is_empty() && !redaction.needles.contains(&needle) {
+                    redaction.needles.push(needle);
+                }
+            }
+        }
+    }
+    let Some(entries) = value.get("entries").and_then(Value::as_array) else {
+        return Ok(redaction);
+    };
+    for entry in entries {
+        let Some(object) = entry.as_object() else {
+            continue;
+        };
+        let alias = object
+            .get("alias")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if alias.is_empty() {
+            continue;
+        }
+        redaction.aliases.insert(alias.clone());
+        let mut push_needle = |needle: String| {
+            if !needle.is_empty() && !redaction.needles.contains(&needle) {
+                redaction.needles.push(needle);
+            }
+        };
+        if let Some(ssh_target) = object.get("ssh_target").and_then(Value::as_str) {
+            push_needle(ssh_target.to_owned());
+            if let Some((_user, host)) = ssh_target.rsplit_once('@') {
+                // A host that parses as an address is always specific enough;
+                // so is anything IPv6-shaped. The length guard survives only
+                // for plain hostnames, where a short token like "vm" could
+                // appear inside unrelated words in an error string.
+                let parsed = host.parse::<std::net::IpAddr>().ok();
+                if parsed.is_some() || host.contains(':') || host.len() >= 7 {
+                    push_needle(host.to_owned());
+                }
+                // The OS prints the canonical RFC 5952 spelling (wg show
+                // endpoints, daemon endpoint lines), which can differ from
+                // the raw JSON text: scrub that form too.
+                if let Some(ip) = parsed {
+                    let canonical = ip.to_string();
+                    push_needle(canonical.clone());
+                    if ip.is_ipv6() {
+                        push_needle(format!("[{canonical}]"));
+                    }
+                }
+            }
+        }
+        if let Some(last_known_ip) = object.get("last_known_ip").and_then(Value::as_str) {
+            push_needle(last_known_ip.to_owned());
+            if let Ok(ip) = last_known_ip.parse::<std::net::IpAddr>() {
+                let canonical = ip.to_string();
+                push_needle(canonical.clone());
+                if ip.is_ipv6() {
+                    push_needle(format!("[{canonical}]"));
+                }
+            }
+        }
+        if let Some(dataplane) = object
+            .get("dataplane_endpoint")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        {
+            push_needle(dataplane.to_string());
+            if dataplane.is_ipv6() {
+                push_needle(format!("[{dataplane}]"));
+            }
+        }
+    }
+    Ok(redaction)
+}
+
+/// Address needles contributed by one connect_uri. Libvirt/virsh error
+/// strings embed the URI verbatim, so every addressing form it can reveal —
+/// `user@host[:port]`, the bare host, and the canonical IP spellings the OS
+/// itself prints — must be scrubbed from anything that reaches a ledger.
+fn overlay_connect_uri_needles(connect_uri: &str) -> Vec<String> {
+    let mut needles: Vec<String> = Vec::new();
+    let Some((_scheme, authority)) = connect_uri.split_once("://") else {
+        return needles;
+    };
+    // Drop the path suffix (qemu+ssh://host/system -> host).
+    let authority = authority.split('/').next().unwrap_or_default();
+    if authority.is_empty() {
+        return needles;
+    }
+    let (user_part, host_part) = match authority.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, authority),
+    };
+    // Bracketed IPv6 literal, optionally with a port: [2001:db8::9]:2222.
+    let bracketed = host_part
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .map(|(inner, _)| inner);
+    let host = if let Some(inner) = bracketed {
+        if !inner.is_empty() {
+            needles.push(format!("[{inner}]"));
+        }
+        Some(inner.to_owned())
+    } else if host_part.contains(':') {
+        // Unbracketed colon-bearing authority: a bare IPv6 literal. A
+        // host:port split would mangle it, so keep it whole.
+        Some(host_part.to_owned())
+    } else {
+        match host_part.rsplit_once(':') {
+            Some((host, port))
+                if !host.is_empty()
+                    && !port.is_empty()
+                    && port.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                Some(host.to_owned())
+            }
+            _ => Some(host_part.to_owned()),
+        }
+    };
+    if let Some(user) = user_part {
+        needles.push(format!("{user}@{host_part}"));
+        if let Some(host) = host.as_deref() {
+            needles.push(format!("{user}@{host}"));
+        }
+    }
+    if let Some(host) = host {
+        needles.push(host.clone());
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let canonical = ip.to_string();
+            needles.push(canonical.clone());
+            if ip.is_ipv6() {
+                needles.push(format!("[{canonical}]"));
+            }
+        }
+    }
+    needles.retain(|needle| !needle.is_empty());
+    let mut unique: Vec<String> = Vec::with_capacity(needles.len());
+    for needle in needles {
+        if !unique.contains(&needle) {
+            unique.push(needle);
+        }
+    }
+    unique
+}
+
+/// The target string recorded for an entry in run ledgers: the live IP when
+/// known, else the ssh_target — or the redacted stand-in for overlay-origin
+/// entries, so committed evidence never carries the owner's real addresses.
+pub(crate) fn ledger_target_for_entry(
+    entry: &VmInventoryEntry,
+    redaction: Option<&OverlayRedaction>,
+) -> String {
+    if let Some(redaction) = redaction {
+        if redaction.contains(entry.alias.as_str()) {
+            return LOCAL_OVERLAY_REDACTED_TARGET.to_owned();
+        }
+    }
+    entry
+        .last_known_ip
+        .clone()
+        .unwrap_or_else(|| entry.ssh_target.clone())
+}
+
 fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventoryEntry, String> {
     let object = value
         .as_object()
@@ -33269,6 +33750,17 @@ fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventory
             ));
         }
     }
+    let dataplane_endpoint = match optional_string_field(object, "dataplane_endpoint")? {
+        Some(value) => match value.parse::<std::net::IpAddr>() {
+            Ok(parsed) => Some(parsed),
+            Err(_) => {
+                return Err(format!(
+                    "dataplane_endpoint must be an IP address literal (no hostnames): {value}"
+                ));
+            }
+        },
+        None => None,
+    };
     let parent_device = optional_string_field(object, "parent_device")?;
     if let Some(value) = parent_device.as_deref() {
         ensure_no_control_chars("parent_device", value)?;
@@ -33361,6 +33853,7 @@ fn parse_inventory_entry(value: &Value, hosts: &[LabHost]) -> Result<VmInventory
         guest_exec_mode,
         service_manager,
         controller,
+        dataplane_endpoint,
     })
 }
 
@@ -41931,6 +42424,7 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                 remote_shell: None,
                 guest_exec_mode: None,
                 service_manager: None,
+                dataplane_endpoint: None,
                 controller: None,
             },
             VmInventoryEntry {
@@ -41956,6 +42450,7 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
                 remote_shell: None,
                 guest_exec_mode: None,
                 service_manager: None,
+                dataplane_endpoint: None,
                 controller: None,
             },
         ];
@@ -42038,6 +42533,7 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: Some(super::VmController::LocalUtm {
                 utm_name: "debian-headless-1".to_owned(),
                 bundle_path: PathBuf::from("/tmp/debian-headless-1.utm"),
@@ -49372,6 +49868,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             remote_shell: None,
             guest_exec_mode: None,
             service_manager: None,
+            dataplane_endpoint: None,
             controller: None,
         }
     }
@@ -54856,6 +55353,572 @@ mod secrets_sidecar_tests {
             derived,
             PathBuf::from("/lab/documents/vm_lab_inventory.secrets.json")
         );
+    }
+}
+
+#[cfg(test)]
+mod inventory_overlay_tests {
+    //! The untracked inventory overlay (`RUSTYNET_LAB_INVENTORY_OVERLAY`) and
+    //! the per-entry `dataplane_endpoint` field. Every rule below fails closed:
+    //! a bad overlay refuses the WHOLE load, an alias/host_id collision is an
+    //! error (never a silent override), the live-IP writer refuses overlay
+    //! aliases outright, and ledger targets for overlay nodes are redacted.
+    //! All addresses are documentation addresses (RFC 5737 / RFC 3849) — a
+    //! real owner address must never appear here.
+
+    use super::{
+        VmInventoryEntry, ledger_target_for_entry, load_inventory_with_overlay,
+        overlay_redaction_from_file, write_inventory_live_ips_with_redaction,
+    };
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// Tracked inventory: one controller-less entry (an overlay-style node must
+    /// not collide with it) plus one declared host.
+    fn write_tracked(dir: &Path) -> PathBuf {
+        let body = r#"{
+          "version": 1,
+          "hosts": [
+            {
+              "host_id": "host-tracked",
+              "kind": "libvirt",
+              "connect_uri": "qemu+ssh://debian@192.0.2.10/system"
+            }
+          ],
+          "entries": [
+            {
+              "alias": "guest-a",
+              "ssh_target": "192.0.2.20",
+              "controller": {
+                "type": "libvirt",
+                "domain": "guest-a",
+                "host_id": "host-tracked"
+              }
+            }
+          ]
+        }"#;
+        let path = dir.join("vm_lab_inventory.json");
+        std::fs::write(&path, body).expect("write tracked inventory");
+        path
+    }
+
+    fn overlay_body(entries: &str, hosts: &str) -> String {
+        format!(
+            r#"{{
+              "version": 1,
+              {hosts}
+              "entries": [{entries}]
+            }}"#
+        )
+    }
+
+    fn cloud_entry(alias: &str, ssh_target: &str) -> String {
+        format!(
+            r#"{{
+                "alias": "{alias}",
+                "node_id": "{alias}",
+                "ssh_target": "{ssh_target}",
+                "platform": "linux"
+            }}"#
+        )
+    }
+
+    fn write_overlay(dir: &Path, body: &str, mode: u32) -> PathBuf {
+        let path = dir.join("lab-local-overlay.json");
+        std::fs::write(&path, body).expect("write overlay");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod overlay");
+        }
+        let _ = mode;
+        path
+    }
+
+    fn load_tracked_only(tracked: &Path) -> Vec<VmInventoryEntry> {
+        load_inventory_with_overlay(tracked, None)
+            .expect("tracked load")
+            .0
+    }
+
+    #[test]
+    /// Mutation caught: merging the overlay by REPLACEMENT or dropping it —
+    /// the tracked entry and the overlay entry must both be present, in order.
+    fn overlay_entries_and_hosts_are_appended_to_the_tracked_inventory() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-append-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            &cloud_entry("cloud-node-1", "100.64.15.9"),
+            r#""hosts": [
+                { "host_id": "host-overlay", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" }
+            ],"#,
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+
+        let (entries, hosts) =
+            load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+                .expect("overlay load must succeed");
+        assert_eq!(entries.len(), 2, "tracked + overlay entry");
+        assert_eq!(entries[0].alias, "guest-a");
+        assert_eq!(entries[1].alias, "cloud-node-1");
+        assert_eq!(entries[1].ssh_target, "100.64.15.9");
+        let host_ids: Vec<&str> = hosts.iter().map(|h| h.host_id.as_str()).collect();
+        assert_eq!(host_ids, vec!["host-tracked", "host-overlay"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: a silent override (Map-merge semantics). An alias that
+    /// already exists in the tracked inventory must REFUSE the load.
+    fn overlay_alias_colliding_with_tracked_alias_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-dup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("guest-a", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("duplicate alias must be refused");
+        assert!(err.contains("guest-a"), "error must name the alias: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: host_id dedup only INSIDE the overlay. A collision
+    /// against the tracked hosts[] must refuse too.
+    fn overlay_host_id_colliding_with_tracked_host_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-duphost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            &cloud_entry("cloud-node-1", "100.64.15.9"),
+            r#""hosts": [
+                { "host_id": "host-tracked", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" }
+            ],"#,
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("duplicate host_id must be refused");
+        assert!(
+            err.contains("host-tracked"),
+            "error must name the host_id: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: accepting an overlay twice-declared record, where the
+    /// second declaration silently wins.
+    fn duplicate_alias_within_the_overlay_itself_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-selfdup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let entries = format!(
+            "{},{}",
+            cloud_entry("cloud-node-1", "100.64.15.9"),
+            cloud_entry("cloud-node-1", "100.64.15.10")
+        );
+        let body = overlay_body(&entries, "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("intra-overlay duplicate must be refused");
+        assert!(err.contains("cloud-node-1"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// Mutation caught: following the symlink (fs::metadata semantics). A
+    /// symlinked overlay can be repointed after the operator approved the
+    /// file, so it must be refused BEFORE any read.
+    fn symlinked_overlay_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let real = dir.join("real-overlay.json");
+        std::fs::write(&real, body).expect("write real overlay");
+        let link = dir.join("link-overlay.json");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(link.as_path()))
+            .expect_err("symlinked overlay must be refused");
+        assert!(err.contains("regular file"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    /// Mutation caught: reusing the looser secrets-sidecar check (which does
+    /// not reject group/world readability here) or skipping the mode check.
+    fn world_readable_overlay_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-mode-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o644);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("group/world-readable overlay must be refused");
+        assert!(
+            err.contains("must not be readable by group or other"),
+            "{err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: treating a configured-but-absent overlay as "no
+    /// overlay" (fail-open). A set path that cannot be stat'd must fail.
+    fn missing_overlay_file_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-missing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let absent = dir.join("does-not-exist.json");
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(absent.as_path()))
+            .expect_err("configured-but-missing overlay must be refused");
+        assert!(err.contains("overlay"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: breaking the plain tracked load while refactoring the
+    /// loader for overlays (no overlay path = exactly the old behaviour).
+    fn no_overlay_leaves_the_tracked_load_unchanged() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let entries = load_tracked_only(tracked.as_path());
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].alias, "guest-a");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: persisting an overlay alias's live IP into the tracked
+    /// inventory (the whole point of the overlay is that its addresses never
+    /// become publishable bytes). The writer must refuse BEFORE writing, and
+    /// the tracked file must be byte-identical afterwards.
+    fn writer_refuses_overlay_alias_and_leaves_tracked_bytes_untouched() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-wrefuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).expect("redaction");
+
+        let before = std::fs::read_to_string(tracked.as_path()).unwrap();
+        let mut updates: BTreeMap<&str, &str> = BTreeMap::new();
+        updates.insert("guest-a", "192.0.2.99");
+        updates.insert("cloud-node-1", "203.0.113.99");
+        let err =
+            write_inventory_live_ips_with_redaction(tracked.as_path(), &updates, Some(&redaction))
+                .expect_err("overlay-alias update must be refused");
+        assert!(err.contains("cloud-node-1"), "{err}");
+        assert!(
+            err.contains("untracked overlay"),
+            "refusal must say why: {err}"
+        );
+        let after = std::fs::read_to_string(tracked.as_path()).unwrap();
+        assert_eq!(before, after, "refused write must not touch the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: refusing EVERYTHING once an overlay is loaded. Tracked
+    /// aliases must still be updatable in the same process.
+    fn writer_still_updates_tracked_aliases_alongside_a_loaded_overlay() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-wok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).expect("redaction");
+
+        let mut updates: BTreeMap<&str, &str> = BTreeMap::new();
+        updates.insert("guest-a", "192.0.2.99");
+        write_inventory_live_ips_with_redaction(tracked.as_path(), &updates, Some(&redaction))
+            .expect("tracked-alias update must succeed");
+        let updated = std::fs::read_to_string(tracked.as_path()).unwrap();
+        assert!(updated.contains("192.0.2.99"), "live ip must land");
+        assert!(
+            !updated.contains("100.64.15.9") && !updated.contains("cloud-node-1"),
+            "overlay data must not leak into the tracked file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: recording the overlay node's real ssh_target /
+    /// last_known_ip as the ledger target — that tuple feeds committed
+    /// evidence (nodes.tsv, parity, matrix *_target columns).
+    fn ledger_target_redacts_overlay_aliases_and_keeps_tracked_targets() {
+        let overlay_entry = VmInventoryEntry {
+            alias: "cloud-node-1".to_owned(),
+            ssh_target: "100.64.15.9".to_owned(),
+            ssh_user: None,
+            ssh_password: None,
+            include_in_all: None,
+            os: None,
+            last_known_ip: Some("203.0.113.50".to_owned()),
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: None,
+            mesh_ip: None,
+            exit_capable: None,
+            relay_capable: None,
+            remote_temp_dir: None,
+            utm_staging_dir: None,
+            rustynet_src_dir: None,
+            platform: None,
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
+            controller: None,
+            dataplane_endpoint: None,
+        };
+        let mut tracked_entry = overlay_entry.clone();
+        tracked_entry.alias = "guest-a".to_owned();
+        tracked_entry.ssh_target = "192.0.2.20".to_owned();
+        tracked_entry.last_known_ip = None;
+
+        // The struct's fields are private to the parent module; build through
+        // the file parser so the test exercises the real needle derivation.
+        let dir = std::env::temp_dir().join(format!("rn-ovl-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(&cloud_entry("cloud-node-1", "100.64.15.9"), "");
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let parsed = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        assert_eq!(
+            ledger_target_for_entry(&overlay_entry, Some(&parsed)),
+            "local-overlay",
+            "overlay-origin target must be redacted"
+        );
+        assert_eq!(
+            ledger_target_for_entry(&tracked_entry, Some(&parsed)),
+            "192.0.2.20",
+            "tracked fallback target unchanged"
+        );
+        let mut with_ip = tracked_entry.clone();
+        with_ip.last_known_ip = Some("203.0.113.77".to_owned());
+        assert_eq!(
+            ledger_target_for_entry(&with_ip, Some(&parsed)),
+            "203.0.113.77",
+            "tracked live-ip target unchanged"
+        );
+        assert_eq!(
+            ledger_target_for_entry(&overlay_entry, None),
+            "203.0.113.50",
+            "without an overlay configured the raw target is kept (same file semantics)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: a scrub that replaces nothing (or replaces the alias
+    /// prefix, breaking `{alias}:` status attribution).
+    fn overlay_redaction_scrubs_declared_addresses_but_keeps_alias_prefixes() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-scrub-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "azureuser@100.64.15.9",
+                "last_known_ip": "203.0.113.50",
+                "dataplane_endpoint": "198.51.100.7",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let detail = "cloud-node-1: ssh azureuser@100.64.15.9 failed (255); wg handshake to 198.51.100.7:51820 timed out; last seen 203.0.113.50";
+        let scrubbed = redaction.scrub(detail);
+        assert!(!scrubbed.contains("100.64.15.9"), "{scrubbed}");
+        assert!(!scrubbed.contains("198.51.100.7"), "{scrubbed}");
+        assert!(!scrubbed.contains("203.0.113.50"), "{scrubbed}");
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+        assert!(
+            scrubbed.starts_with("cloud-node-1:"),
+            "alias prefix must survive status attribution: {scrubbed}"
+        );
+        // A summary that never mentioned the overlay is returned unchanged.
+        let untouched = "guest-a: tcpdump missing";
+        assert_eq!(redaction.scrub(untouched), untouched);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: a redaction built from entries[] only. A virsh/libvirt
+    /// error embeds the overlay HOST's connect_uri verbatim, and that string
+    /// flows into stage summaries — so hosts[] alone (no entries at all) must
+    /// already contribute needles, covering user@host, bare host, and the
+    /// bracketed-IPv6 URI forms.
+    fn overlay_host_connect_uri_addresses_are_scrubbed_from_error_strings() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-uri-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            "",
+            r#""hosts": [
+                { "host_id": "host-overlay", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://debian@198.51.100.9/system" },
+                { "host_id": "host-overlay-v6", "kind": "libvirt",
+                  "connect_uri": "qemu+ssh://root@[2001:db8::9]:2222/system" }
+            ],"#,
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let virsh_error = "error: failed to get domain 'rn-demo': cannot connect to \
+qemu+ssh://debian@198.51.100.9/system: authentication failed";
+        let scrubbed = redaction.scrub(virsh_error);
+        assert!(!scrubbed.contains("198.51.100.9"), "{scrubbed}");
+        assert!(!scrubbed.contains("debian@"), "{scrubbed}");
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+
+        let virsh_error_v6 = "error: cannot connect to \
+qemu+ssh://root@[2001:db8::9]:2222/system: connection refused";
+        let scrubbed_v6 = redaction.scrub(virsh_error_v6);
+        assert!(!scrubbed_v6.contains("2001:db8::9"), "{scrubbed_v6}");
+        assert!(
+            !scrubbed_v6.contains("["),
+            "no bracketed address fragment may survive: {scrubbed_v6}"
+        );
+        assert!(scrubbed_v6.contains("local-overlay"), "{scrubbed_v6}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: needles kept as the RAW JSON text only. The OS prints
+    /// the canonical RFC 5952 spelling (wg endpoints, daemon
+    /// selected_exit_peer_endpoint=/managed_peer_endpoints= lines), which for
+    /// an uppercase/long-form JSON spelling differs — that form must be
+    /// scrubbed too.
+    fn overlay_ipv6_canonical_forms_are_scrubbed_from_status_text() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-canonical-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "azureuser@2001:0DB8:0000:0000:0000:0000:0000:0001",
+                "last_known_ip": "2001:0DB8:0000:0000:0000:0000:0000:0002",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let detail = "cloud-node-1: wg show: endpoint = [2001:db8::1]:51820; \
+managed_peer_endpoints=[2001:db8::2]:51820; raw echo 2001:0DB8:0000:0000:0000:0000:0000:0002";
+        let scrubbed = redaction.scrub(detail);
+        assert!(!scrubbed.contains("2001:db8::1"), "{scrubbed}");
+        assert!(!scrubbed.contains("2001:db8::2"), "{scrubbed}");
+        assert!(
+            !scrubbed.contains("0DB8"),
+            "raw uppercase spelling must be scrubbed too: {scrubbed}"
+        );
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: the old length guard (>= 7) dropped SHORT IPv6-shaped
+    /// hosts like db8::1, so they leaked from stage summaries. An IPv6-shaped
+    /// host is always pushed; the length guard survives only for plain
+    /// hostnames.
+    fn short_ipv6_shaped_host_is_scrubbed_despite_length_guard() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-short6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "root@db8::1",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let redaction = overlay_redaction_from_file(overlay.as_path()).unwrap();
+
+        let detail = "cloud-node-1: dial tcp [db8::1]:22: connect: connection refused";
+        let scrubbed = redaction.scrub(detail);
+        assert!(!scrubbed.contains("db8::1"), "{scrubbed}");
+        assert!(scrubbed.contains("local-overlay"), "{scrubbed}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: accepting a hostname (or any non-IP text) as
+    /// `dataplane_endpoint` — the value is spliced into a wg endpoint, so a
+    /// hostname would smuggle arbitrary resolver-dependent text into it.
+    fn hostname_dataplane_endpoint_is_refused() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-dp-host-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "100.64.15.9",
+                "dataplane_endpoint": "wg.example.com",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let err = load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path()))
+            .expect_err("hostname dataplane_endpoint must be refused");
+        assert!(err.contains("dataplane_endpoint"), "{err}");
+        assert!(err.contains("wg.example.com"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    /// Mutation caught: dropping the field in parse (silently None) or
+    /// re-parsing it as a string. IPv4 and IPv6 literals must both survive.
+    fn dataplane_endpoint_parses_as_ip_literals() {
+        let dir = std::env::temp_dir().join(format!("rn-ovl-dp-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracked = write_tracked(&dir);
+        let body = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "100.64.15.9",
+                "dataplane_endpoint": "203.0.113.7",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay = write_overlay(&dir, &body, 0o600);
+        let (entries, _) =
+            load_inventory_with_overlay(tracked.as_path(), Some(overlay.as_path())).unwrap();
+        assert_eq!(
+            entries[1].dataplane_endpoint,
+            Some("203.0.113.7".parse().unwrap())
+        );
+
+        let body_v6 = overlay_body(
+            r#"{
+                "alias": "cloud-node-1",
+                "ssh_target": "100.64.15.9",
+                "dataplane_endpoint": "2001:db8::7",
+                "platform": "linux"
+            }"#,
+            "",
+        );
+        let overlay_v6 = write_overlay(&dir, &body_v6, 0o600);
+        let (entries_v6, _) =
+            load_inventory_with_overlay(tracked.as_path(), Some(overlay_v6.as_path())).unwrap();
+        assert_eq!(
+            entries_v6[1].dataplane_endpoint,
+            Some("2001:db8::7".parse().unwrap())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
