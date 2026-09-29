@@ -250,6 +250,18 @@ impl BootTraversalEndpoint {
 /// into `--iface` on the ExecStartPre line, which arrives here verbatim as a
 /// single argument. The character class mirrors the runtime path's
 /// `validate_net_device_name` exactly so boot and runtime cannot drift.
+/// AQ-253: the established/related rule bodies the boot killswitch installs,
+/// delegated to the runtime generator's ONE shared list
+/// (`LinuxCommandSystem::established_related_accept_tokens`) so the boot-time
+/// chain and the daemon's killswitch/forward chains cannot drift apart (the
+/// bodies used to be re-spelled inline here — a byte-for-byte copy that only
+/// a comment tied to the shared list). Cross-platform on purpose: the unit
+/// test cross-pins this list, and the reviewed fragments rendered from it,
+/// on every OS, while the nft exec that consumes it is Linux-only.
+pub fn boot_established_related_rule_bodies() -> Vec<Vec<String>> {
+    crate::phase10::LinuxCommandSystem::established_related_accept_tokens()
+}
+
 pub fn install_linux_boot_killswitch(
     iface: &str,
     ssh_allow: bool,
@@ -339,71 +351,15 @@ fn install_linux_boot_killswitch_inner(
     ])?;
     // AQ-70/F2: established/related passes through THREE scoped rules so an
     // established DNS/DoT/DoQ flow is never accepted ahead of the DNS drops
-    // and established IPv6 stays on the policy-drop path. Mirrors the runtime
-    // generator's `established_related_accept_tokens` in `phase10.rs`.
-    nft(&[
-        "add",
-        "rule",
-        "inet",
-        BOOT_KILLSWITCH_TABLE,
-        "killswitch",
-        "ct",
-        "state",
-        "established,related",
-        "meta",
-        "nfproto",
-        "ipv4",
-        "tcp",
-        "dport",
-        "!=",
-        "{",
-        "53,",
-        "853",
-        "}",
-        "accept",
-    ])?;
-    nft(&[
-        "add",
-        "rule",
-        "inet",
-        BOOT_KILLSWITCH_TABLE,
-        "killswitch",
-        "ct",
-        "state",
-        "established,related",
-        "meta",
-        "nfproto",
-        "ipv4",
-        "udp",
-        "dport",
-        "!=",
-        "{",
-        "53,",
-        "853",
-        "}",
-        "accept",
-    ])?;
-    nft(&[
-        "add",
-        "rule",
-        "inet",
-        BOOT_KILLSWITCH_TABLE,
-        "killswitch",
-        "ct",
-        "state",
-        "established,related",
-        "meta",
-        "nfproto",
-        "ipv4",
-        "meta",
-        "l4proto",
-        "!=",
-        "{",
-        "tcp,",
-        "udp",
-        "}",
-        "accept",
-    ])?;
+    // and established IPv6 stays on the policy-drop path. AQ-253: the bodies
+    // ARE the runtime generator's `established_related_accept_tokens`
+    // (`boot_established_related_rule_bodies`), so this boot chain cannot
+    // drift from the daemon's killswitch/forward chains.
+    for rule_tokens in boot_established_related_rule_bodies() {
+        let mut argv: Vec<&str> = vec!["add", "rule", "inet", BOOT_KILLSWITCH_TABLE, "killswitch"];
+        argv.extend(rule_tokens.iter().map(String::as_str));
+        nft(&argv)?;
+    }
     // Allow outbound through the WireGuard interface.  The iface may not
     // exist yet at ExecStartPre time, but nftables accepts the rule and
     // will match it once the interface comes up.
@@ -1244,6 +1200,37 @@ table inet rustynetfoo {
         assert!(REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS.contains(
             &"ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept"
         ));
+    }
+
+    /// AQ-253: the boot killswitch's established/related bodies must BE the
+    /// runtime generator's shared list (no drift between the boot-time chain
+    /// and the daemon's killswitch/forward chains), and each reviewed
+    /// fragment must remain the exact `join(" ")` rendering of the
+    /// corresponding shared rule — otherwise the L8 verifier's substring
+    /// match and what the code actually installs diverge.
+    #[test]
+    fn boot_established_related_bodies_match_phase10_shared_list_and_fragments() {
+        let bodies = boot_established_related_rule_bodies();
+        assert_eq!(
+            bodies,
+            crate::phase10::LinuxCommandSystem::established_related_accept_tokens(),
+            "boot established/related bodies must be the phase10 shared list verbatim"
+        );
+        assert_eq!(
+            bodies.len(),
+            3,
+            "established/related must stay three scoped rules"
+        );
+        for (index, body) in bodies.iter().enumerate() {
+            let fragment = REVIEWED_REQUIRED_KILLSWITCH_RULE_FRAGMENTS
+                .get(index + 1)
+                .expect("reviewed fragments pin loopback + the three established/related rules");
+            assert_eq!(
+                body.join(" "),
+                *fragment,
+                "reviewed fragment #{index} drifted from the shared rule rendering"
+            );
+        }
     }
 
     #[test]

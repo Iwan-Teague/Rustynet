@@ -1725,60 +1725,55 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
+    /// AQ-253: pure argv construction for the fail-closed management SSH
+    /// allow rules, so the privileged-helper witness test can validate the
+    /// exact shape the emitter sends without a live system. `port_match` is
+    /// `"dport"` (node-initiated SSH) or `"sport"` (sshd replies).
+    fn management_ssh_allow_rule_args(
+        table: &str,
+        cidr: &ManagementCidr,
+        port_match: &str,
+    ) -> Vec<String> {
+        let cidr_text = cidr.to_string();
+        vec![
+            "add".to_owned(),
+            "rule".to_owned(),
+            "inet".to_owned(),
+            table.to_owned(),
+            "killswitch".to_owned(),
+            cidr.nft_family().to_owned(),
+            "daddr".to_owned(),
+            cidr_text,
+            "tcp".to_owned(),
+            port_match.to_owned(),
+            "22".to_owned(),
+            "accept".to_owned(),
+        ]
+    }
+
     fn apply_fail_closed_management_allow_rules(&self, table: &str) -> Result<(), SystemError> {
         if !self.fail_closed_ssh_allow {
             return Ok(());
         }
         for cidr in &self.fail_closed_ssh_allow_cidrs {
             let cidr_text = cidr.to_string();
-            self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    table,
-                    "killswitch",
-                    cidr.nft_family(),
-                    "daddr",
-                    cidr_text.as_str(),
-                    "tcp",
-                    "dport",
-                    "22",
-                    "accept",
-                ],
-            )
-            .map_err(|err| {
-                SystemError::FirewallApplyFailed(format!(
-                    "management ssh fail-closed allow rule failed for {cidr_text}: {err}"
-                ))
-            })?;
-            // The killswitch only filters outbound traffic. Allowing destination
-            // port 22 preserves node-initiated SSH, but inbound management SSH
-            // also needs sshd reply packets (source port 22) to escape the
-            // host under fail-closed policy.
-            self.run(
-                PrivilegedCommandProgram::Nft,
-                &[
-                    "add",
-                    "rule",
-                    "inet",
-                    table,
-                    "killswitch",
-                    cidr.nft_family(),
-                    "daddr",
-                    cidr_text.as_str(),
-                    "tcp",
-                    "sport",
-                    "22",
-                    "accept",
-                ],
-            )
-            .map_err(|err| {
-                SystemError::FirewallApplyFailed(format!(
-                    "management ssh reply fail-closed allow rule failed for {cidr_text}: {err}"
-                ))
-            })?;
+            for (port_match, failure_prefix) in [
+                ("dport", "management ssh fail-closed allow rule"),
+                // The killswitch only filters outbound traffic. Allowing destination
+                // port 22 preserves node-initiated SSH, but inbound management SSH
+                // also needs sshd reply packets (source port 22) to escape the
+                // host under fail-closed policy.
+                ("sport", "management ssh reply fail-closed allow rule"),
+            ] {
+                let argv = Self::management_ssh_allow_rule_args(table, cidr, port_match);
+                let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                self.run(PrivilegedCommandProgram::Nft, &arg_refs)
+                    .map_err(|err| {
+                        SystemError::FirewallApplyFailed(format!(
+                            "{failure_prefix} failed for {cidr_text}: {err}"
+                        ))
+                    })?;
+            }
         }
         Ok(())
     }
@@ -17741,6 +17736,94 @@ mod tests {
         }
     }
 
+    /// AQ-253 (review §3): the blind_exit rollback must RE-LOCK, not relax:
+    /// `rollback_nat_forwarding` with a live `blind_exit_config` drops the NAT
+    /// table and re-installs the mesh-scoped blind_exit forward chain (built
+    /// by `build_linux_blind_exit_forward_commands`) instead of restoring the
+    /// open-NAT posture. Driven against the same capture helper the emitter
+    /// agreement tests use; the only macOS-side re-lock test existed before
+    /// this. Also pins the fail-closed guard: no killswitch table in state →
+    /// the rollback refuses instead of silently skipping the re-lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn blind_exit_rollback_relocks_forward_chain_via_capture_helper() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "eth0",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+
+        let run_rollback = |firewall_table: Option<String>| {
+            let socket_path = phase10_test_socket_path("berl");
+            let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "eth0",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize");
+            system.firewall_table = firewall_table;
+            system.nat_table = Some("rustynet_nat_g0".to_owned());
+            system.blind_exit_config = Some(config.clone());
+
+            let result = DataplaneSystem::rollback_nat_forwarding(&mut system);
+
+            let command_log = commands.lock().expect("command log should lock").clone();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            (result, command_log)
+        };
+
+        // Happy path: NAT table deleted, then the re-lock argv re-applied.
+        let (result, command_log) = run_rollback(Some("rustynet_g1".to_owned()));
+        result.expect("blind_exit rollback should re-lock against the capture helper");
+        assert!(
+            command_log
+                .iter()
+                .any(|cmd| cmd.contains(" delete table ip rustynet_nat_g0")),
+            "rollback must drop the NAT table before re-locking: {command_log:?}"
+        );
+        let relock_argv = crate::linux_blind_exit::build_linux_blind_exit_forward_commands(
+            &config,
+            "rustynet_g1",
+        )
+        .expect("re-lock commands should render");
+        assert_eq!(
+            relock_argv.len(),
+            5,
+            "flush + 3 established/related + mesh allow"
+        );
+        for argv in &relock_argv {
+            let expected = format!("nft {}", argv.join(" "));
+            assert!(
+                command_log.contains(&expected),
+                "rollback must re-apply blind_exit argv {expected:?}; log={command_log:?}"
+            );
+        }
+
+        // Fail-closed guard: no killswitch table in state → refused, and
+        // nothing privileged runs at all.
+        let (result, command_log) = run_rollback(None);
+        let err = result.expect_err("rollback without a killswitch table must fail closed");
+        assert!(
+            err.to_string().contains("requires the killswitch table"),
+            "refusal must name the missing-table reason: {err}"
+        );
+        assert!(
+            command_log.is_empty(),
+            "a refused rollback must run no privileged command: {command_log:?}"
+        );
+    }
+
     /// QH-29 regression pin for the 2026-08-29 live-lab failure: a shared
     /// builder may NEVER emit a token carrying internal whitespace. The
     /// emitters splice these tokens into a real `nft add rule` argv, where
@@ -17985,6 +18068,176 @@ mod tests {
                 &[],
             );
             assert_eq!(argv, expected, "established/related argv drifted");
+        }
+    }
+
+    /// AQ-253 witness: EVERY `nft add rule` argv the LinuxCommandSystem emits
+    /// into the fail-closed killswitch and exit-forward chains must pass the
+    /// privileged helper's own validator (`validate_request`) — the helper is
+    /// what executes them on a live node, so an emitter shape the helper
+    /// refuses must fail this test instead of failing every Linux apply (or
+    /// rollback) at the privileged boundary, the AQ-70/F2 failure mode that
+    /// permanently restricted live blind_exit nodes. Rule bodies come from
+    /// the same pure token builders + `nft_add_rule_argv` the emitters use,
+    /// with the same (family, table, chain, observability) arguments; the
+    /// inline table/chain creation argv from `ensure_failclosed_table` and
+    /// `apply_firewall_killswitch` are pinned as literals. Not on Windows:
+    /// the helper's nft `add rule` schema check is non-Windows, exactly like
+    /// the helper's own tests.
+    #[cfg(not(windows))]
+    #[test]
+    fn killswitch_and_forward_emitter_argvs_pass_privileged_helper_validate_request() {
+        use crate::privileged_helper::{PrivilegedCommandProgram, validate_request};
+
+        let table = "rustynet_g1";
+        let tunnel = "rustynet0";
+        let egress = "enp0s9";
+        let wg_port: u16 = 51820;
+
+        let mut argvs: Vec<Vec<String>> = Vec::new();
+        let literal = |tokens: &[&str]| tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // Table + chain creation, verbatim from ensure_failclosed_table and
+        // apply_firewall_killswitch.
+        argvs.push(literal(&["add", "table", "inet", table]));
+        argvs.push(literal(&[
+            "add",
+            "chain",
+            "inet",
+            table,
+            "killswitch",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "output",
+            "priority",
+            "0",
+            ";",
+            "policy",
+            "drop",
+            ";",
+            "}",
+        ]));
+        argvs.push(literal(&[
+            "add", "chain", "inet", table, "forward", "{", "type", "filter", "hook", "forward",
+            "priority", "0", ";", "policy", "drop", ";", "}",
+        ]));
+
+        // Established/related accepts: into BOTH chains (apply_firewall_killswitch).
+        for chain in ["killswitch", "forward"] {
+            for rule_tokens in LinuxCommandSystem::established_related_accept_tokens() {
+                argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                    "inet",
+                    table,
+                    chain,
+                    &rule_tokens,
+                    &[],
+                ));
+            }
+        }
+        // Loopback accept (ensure_failclosed_table).
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "killswitch",
+            &LinuxCommandSystem::loopback_accept_tokens(),
+            &[],
+        ));
+        // Tunnel-interface accept (apply_firewall_killswitch).
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "killswitch",
+            &LinuxCommandSystem::tunnel_interface_accept_tokens(tunnel),
+            &[],
+        ));
+        // WireGuard listen port dport + sport (ensure_failclosed_table).
+        for port_match in ["dport", "sport"] {
+            argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                table,
+                "killswitch",
+                &LinuxCommandSystem::wg_listen_port_allow_tokens(port_match, egress, wg_port),
+                &[],
+            ));
+        }
+        // Exit egress rules, with and without the protected-DNS drops
+        // (apply_nat_forwarding sets exit_egress_dns_drop per posture).
+        for drop_dns in [true, false] {
+            for rule_tokens in LinuxCommandSystem::killswitch_egress_rule_tokens(egress, drop_dns) {
+                argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                    "inet",
+                    table,
+                    "killswitch",
+                    &rule_tokens,
+                    &[],
+                ));
+            }
+        }
+        // DNS protection: off-tunnel drop + on-tunnel accept, per protocol
+        // (apply_dns_protection).
+        for proto in ["udp", "tcp"] {
+            argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                table,
+                "killswitch",
+                &LinuxCommandSystem::dns_off_tunnel_drop_tokens(proto, tunnel),
+                &[],
+            ));
+            argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+                "inet",
+                table,
+                "killswitch",
+                &LinuxCommandSystem::dns_accept_tokens(proto),
+                &[],
+            ));
+        }
+        // Forward: tunnel→egress, plus the relay hairpin accept with the
+        // `counter` observability token the emitter passes.
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "forward",
+            &LinuxCommandSystem::forward_tunnel_to_egress_tokens(tunnel, egress),
+            &[],
+        ));
+        argvs.push(LinuxCommandSystem::nft_add_rule_argv(
+            "inet",
+            table,
+            "forward",
+            &LinuxCommandSystem::forward_hairpin_accept_tokens(tunnel),
+            &["counter"],
+        ));
+        // Fail-closed management SSH allow, dport + sport
+        // (apply_fail_closed_management_allow_rules, via the extracted pure
+        // constructor).
+        let mgmt: ManagementCidr = "192.168.18.0/24"
+            .parse()
+            .expect("witness management cidr should parse");
+        for port_match in ["dport", "sport"] {
+            argvs.push(LinuxCommandSystem::management_ssh_allow_rule_args(
+                table, &mgmt, port_match,
+            ));
+        }
+        // Traversal bootstrap allow (apply_traversal_bootstrap_allow_rules).
+        let endpoint: std::net::SocketAddr = "203.0.113.10:3478"
+            .parse()
+            .expect("witness traversal endpoint should parse");
+        argvs.push(LinuxCommandSystem::traversal_bootstrap_allow_rule_args(
+            table, egress, endpoint,
+        ));
+
+        assert!(
+            argvs.len() >= 20,
+            "witness must cover the full emitter set, got {}",
+            argvs.len()
+        );
+        for argv in &argvs {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            validate_request(PrivilegedCommandProgram::Nft, &args).unwrap_or_else(|err| {
+                panic!("privileged helper refuses emitter argv {args:?}: {err}")
+            });
         }
     }
 

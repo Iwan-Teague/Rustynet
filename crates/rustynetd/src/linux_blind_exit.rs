@@ -45,8 +45,9 @@ pub struct LinuxBlindExitConfig {
     /// Physical egress interface (e.g. `eth0`). Forwarded mesh traffic may
     /// leave only here, and only when sourced from `mesh_cidr`.
     pub egress_interface: String,
-    /// Bounded private/CGNAT/ULA mesh CIDR. Becomes the `saddr` match of the
-    /// mesh-scoped forward allow; a global/default-route range is rejected.
+    /// Bounded private/CGNAT IPv4 mesh CIDR. Becomes the `saddr` match of the
+    /// mesh-scoped forward allow; a global/default-route range is rejected,
+    /// and so is any non-IPv4 range (blind_exit on Linux is IPv4-only).
     pub mesh_cidr: String,
 }
 
@@ -99,10 +100,11 @@ fn nft_saddr_family_for_cidr(value: &str) -> Result<&'static str, String> {
 ///
 /// It deliberately emits NO masquerade rule and NO own-egress allow.
 ///
-/// The established/related accepts are IPv4-only, like the rest of the
-/// dataplane posture (IPv6 is hard-disabled system-wide). A ULA mesh CIDR
-/// still renders an `ip6 saddr` final-hop allow, but no IPv6
-/// established/related accept exists to carry its return traffic.
+/// The whole posture is IPv4-only, like the rest of the dataplane posture
+/// (IPv6 is hard-disabled system-wide): a non-IPv4 mesh CIDR is refused by
+/// [`validate_linux_blind_exit_config`], because no IPv6
+/// established/related accept exists to carry its return traffic and a
+/// non-IPv4 blind exit would report ExitActive while forwarding nothing.
 pub fn build_linux_blind_exit_forward_commands(
     config: &LinuxBlindExitConfig,
     table: &str,
@@ -268,9 +270,24 @@ fn validate_linux_blind_exit_config(config: &LinuxBlindExitConfig) -> Result<(),
     // <egress> saddr <mesh_cidr> accept` forward rule. A global/default-route
     // source there (e.g. 0.0.0.0/0) would forward arbitrary non-mesh traffic
     // out the egress, defeating the mesh-scope lockdown — so it must be a
-    // bounded private/CGNAT/ULA range, validated by the shared verifier the
+    // bounded private/CGNAT range, validated by the shared verifier the
     // macOS path uses too.
     validate_mesh_egress_source_cidr(config.mesh_cidr.as_str())?;
+    // AQ-253: the established/related accepts this posture installs are
+    // IPv4-scoped (`meta nfproto ipv4`), and the Linux apply path
+    // hard-disables IPv6 (`ipv6_parity_supported` is hard-coded false;
+    // `net.ipv6.conf.all.disable_ipv6=1`). A non-IPv4 mesh CIDR would
+    // therefore report ExitActive while forwarding nothing — fail closed
+    // instead of emitting a false-green blind exit.
+    let family = nft_saddr_family_for_cidr(config.mesh_cidr.as_str())?;
+    if family != "ip" {
+        return Err(format!(
+            "blind_exit on Linux is IPv4-only and rejects mesh CIDR {:?}: IPv6 is \
+             hard-disabled (ipv6_parity_supported=false, net.ipv6.conf.all.disable_ipv6=1), \
+             so a non-IPv4 blind exit would report ExitActive while forwarding nothing",
+            config.mesh_cidr
+        ));
+    }
     Ok(())
 }
 
@@ -519,15 +536,29 @@ table inet rustynet_g3 {
         );
     }
 
+    /// AQ-253: blind_exit on Linux is IPv4-only. IPv6 is hard-disabled at
+    /// apply (`ipv6_parity_supported=false`, `net.ipv6.conf.all.disable_ipv6=1`)
+    /// and the established/related accepts are `meta nfproto ipv4`-scoped, so
+    /// a ULA mesh CIDR used to render an `ip6 saddr` allow that could never
+    /// carry traffic — an ExitActive node forwarding nothing. Both the
+    /// constructor and the render path (which re-validates, so a struct
+    /// literal cannot bypass it) must refuse.
     #[test]
-    fn builder_uses_ip6_family_for_ula_mesh() {
-        let cfg = LinuxBlindExitConfig::new("rustynet0", "eth0", "fd7a::/48").unwrap();
-        let cmds = build_linux_blind_exit_forward_commands(&cfg, "rustynet").unwrap();
-        let mesh_allow = cmds
-            .last()
-            .expect("builder emits the mesh-scoped allow last");
-        assert!(mesh_allow.iter().any(|tok| tok == "ip6"));
-        assert!(mesh_allow.iter().all(|tok| tok != "ip"));
+    fn builder_rejects_ula_mesh_cidr_ipv6_hard_disabled() {
+        let err = LinuxBlindExitConfig::new("rustynet0", "eth0", "fd7a::/48")
+            .expect_err("ULA mesh CIDR must be refused: blind_exit on Linux is IPv4-only");
+        assert!(
+            err.contains("IPv4-only"),
+            "refusal must name the IPv4-only reason: {err}"
+        );
+        let mut cfg = config();
+        cfg.mesh_cidr = "fd7a::/48".to_owned();
+        let err = build_linux_blind_exit_forward_commands(&cfg, "rustynet")
+            .expect_err("render must also refuse a struct-literal ULA mesh CIDR");
+        assert!(
+            err.contains("IPv4-only"),
+            "render refusal must name the IPv4-only reason: {err}"
+        );
     }
 
     /// Emitter/allowlist drift witness. Every argv the builder emits must pass
@@ -546,16 +577,19 @@ table inet rustynet_g3 {
     #[test]
     fn builder_argv_is_accepted_by_privileged_helper() {
         use crate::privileged_helper::{PrivilegedCommandProgram, validate_request};
-        let ula = LinuxBlindExitConfig::new("rustynet0", "eth0", "fd7a::/48").unwrap();
-        for (cfg, table) in [(config(), "rustynet_g3"), (ula, "rustynet_g1")] {
-            let cmds = build_linux_blind_exit_forward_commands(&cfg, table).unwrap();
-            for argv in &cmds {
-                let args: Vec<&str> = argv.iter().map(String::as_str).collect();
-                validate_request(PrivilegedCommandProgram::Nft, &args).unwrap_or_else(|err| {
-                    panic!("privileged helper refuses blind_exit argv {args:?}: {err}")
-                });
-            }
+        let cmds = build_linux_blind_exit_forward_commands(&config(), "rustynet_g3").unwrap();
+        for argv in &cmds {
+            let args: Vec<&str> = argv.iter().map(String::as_str).collect();
+            validate_request(PrivilegedCommandProgram::Nft, &args).unwrap_or_else(|err| {
+                panic!("privileged helper refuses blind_exit argv {args:?}: {err}")
+            });
         }
+        // AQ-253: a ULA mesh CIDR must not even render anymore (see
+        // builder_rejects_ula_mesh_cidr_ipv6_hard_disabled).
+        let mut ula = config();
+        ula.mesh_cidr = "fd7a::/48".to_owned();
+        build_linux_blind_exit_forward_commands(&ula, "rustynet_g1")
+            .expect_err("ULA blind_exit must fail closed instead of reaching the helper");
     }
 
     #[test]
