@@ -311,6 +311,9 @@ mod tests {
         let mut file = std::fs::File::create(&path).expect("fake ps should create");
         file.write_all(script.as_bytes())
             .expect("fake ps should write");
+        // Same ETXTBSY class as the sleep copy: the script is exec'd directly
+        // (shebang) by the builtin, so flush it to disk before any exec.
+        file.sync_all().expect("fake ps should sync");
         drop(file);
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
             .expect("fake ps should chmod");
@@ -324,25 +327,94 @@ mod tests {
     /// re-signed ad hoc when codesign is available).
     fn spawn_long_lived(dir: &Path, name: &str) -> Option<(PathBuf, std::process::Child)> {
         let fake = dir.join(name);
-        std::fs::copy("/bin/sleep", &fake).expect("sleep copy should succeed");
-        let _ = Command::new("/usr/bin/codesign")
-            .args(["--force", "--sign", "-"])
-            .arg(&fake)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        let mut child = Command::new(&fake)
-            .arg("3600")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("fake wireguard-go process should spawn");
+        // Linux parallel-test race: exec'ing a freshly written binary fails
+        // with ETXTBSY ("Text file busy") while any other thread's fork still
+        // holds the file's write descriptor. Write the copy explicitly, flush
+        // and fsync it, and close it before the exec — then retry the spawn a
+        // bounded number of times on ExecutableFileBusy, the standard remedy
+        // for this well-known race.
+        let mut src = std::fs::File::open("/bin/sleep").expect("sleep should open");
+        let mut dst = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&fake)
+            .expect("sleep copy should succeed");
+        std::io::copy(&mut src, &mut dst).expect("sleep copy should succeed");
+        dst.flush().expect("sleep copy should flush");
+        dst.sync_all().expect("sleep copy should sync");
+        drop(dst);
+        drop(src);
+        // Preserve the exec bit a std::fs::copy would have carried over: a
+        // plain create_new() copy lands as 0644 and exec fails with EACCES.
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755))
+            .expect("sleep copy should chmod");
+        // The ad-hoc re-sign exists only for macOS AMFI, which refuses an
+        // unsigned copy of a system binary; on Linux the attempt is a doomed
+        // fork that merely widens the fd-inheritance window this test is
+        // hardening against.
+        if cfg!(target_os = "macos") {
+            let _ = Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&fake)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        const ETXTBSY_RETRIES: usize = 20;
+        let retry_sleep = Duration::from_millis(50);
+        let mut spawned = None;
+        for attempt in 0..ETXTBSY_RETRIES {
+            match Command::new(&fake)
+                .arg("3600")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    spawned = Some(child);
+                    break;
+                }
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy
+                        && attempt + 1 < ETXTBSY_RETRIES =>
+                {
+                    std::thread::sleep(retry_sleep);
+                }
+                Err(err) => panic!("fake wireguard-go process should spawn: {err}"),
+            }
+        }
+        let mut child = spawned.expect("retry loop exits only via child or panic");
         std::thread::sleep(Duration::from_millis(300));
         if child.try_wait().is_ok_and(|exited| exited.is_some()) {
             let _ = child.wait();
             return None;
         }
         Some((fake, child))
+    }
+
+    /// The fake `ps` is exec'd directly (shebang) by the builtin; under a
+    /// loaded 16-thread harness another test's fork can still hold this
+    /// test's just-written script open for write when the exec lands
+    /// (ETXTBSY, "Text file busy") even though this thread flushed, synced
+    /// and closed it. Retry the whole builtin call a bounded number of times
+    /// on that one error — the same remedy `spawn_long_lived` applies to the
+    /// sleep copy. Any other error is returned as-is.
+    fn run_terminate_with_etxtbsy_retry(
+        ps: &Path,
+        kill: &Path,
+        allowlist: &[&str],
+        interface: &str,
+    ) -> Result<PrivilegedCommandOutput, String> {
+        let mut out = run_terminate_wireguard_go(ps, kill, allowlist, interface);
+        for _ in 0..9 {
+            match &out {
+                Err(err) if err.contains("Text file busy") => {}
+                _ => return out,
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            out = run_terminate_wireguard_go(ps, kill, allowlist, interface);
+        }
+        out
     }
 
     fn exited_by_signal(child: &mut std::process::Child) -> bool {
@@ -402,7 +474,7 @@ mod tests {
             )],
         );
 
-        let result = run_terminate_wireguard_go(
+        let result = run_terminate_with_etxtbsy_retry(
             ps.as_path(),
             Path::new(REAL_KILL),
             &[&fake_utun71.display().to_string()],
@@ -452,7 +524,7 @@ mod tests {
             &["42 /usr/local/bin/wireguard-go utunOTHER".to_owned()],
             &[],
         );
-        let result = run_terminate_wireguard_go(
+        let result = run_terminate_with_etxtbsy_retry(
             ps.as_path(),
             Path::new(REAL_KILL),
             &["/usr/local/bin/wireguard-go"],
@@ -483,7 +555,7 @@ mod tests {
             &["not-a-pid /usr/local/bin/wireguard-go utun7".to_owned()],
             &[],
         );
-        let err = run_terminate_wireguard_go(
+        let err = run_terminate_with_etxtbsy_retry(
             ps.as_path(),
             Path::new(REAL_KILL),
             &["/usr/local/bin/wireguard-go"],
@@ -563,7 +635,7 @@ mod tests {
             )],
         );
 
-        let result = run_terminate_wireguard_go(
+        let result = run_terminate_with_etxtbsy_retry(
             ps.as_path(),
             Path::new(REAL_KILL),
             &["/usr/local/bin/wireguard-go"],
@@ -603,7 +675,7 @@ mod tests {
         std::fs::write(&kill, "#!/bin/sh\nexit 3\n").expect("fake kill should write");
         std::fs::set_permissions(&kill, std::fs::Permissions::from_mode(0o755))
             .expect("fake kill should chmod");
-        let err = run_terminate_wireguard_go(
+        let err = run_terminate_with_etxtbsy_retry(
             ps.as_path(),
             &kill,
             &["/usr/local/bin/wireguard-go"],

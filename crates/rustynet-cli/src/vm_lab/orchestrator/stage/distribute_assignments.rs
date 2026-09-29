@@ -299,6 +299,29 @@ pub(crate) fn distribute_bundle_kind_scoped(
     )
 }
 
+/// Create this issuance's private bundle staging directory under `$TMPDIR`.
+/// Unique per call: parallel issuances of one kind — lab runs re-issue a kind
+/// mid-run, and the test harness runs many issuances as threads of ONE
+/// process — used to share `$TMPDIR/rn_bundles_<pid>_<kind>` and clobber each
+/// other's in-flight verifier key (observed on a 16-thread lab host as
+/// "verifier key ... is empty"). tempfile's random suffix separates them and
+/// its dir mode is 0700 (owner-only). The caller removes the directory on
+/// every path, exactly as before.
+fn create_bundle_staging_dir(kind: &BundleKind) -> std::io::Result<std::path::PathBuf> {
+    let dir = tempfile::Builder::new()
+        .prefix(&format!("rn_bundles_{kind}_"))
+        .tempdir()?;
+    // tempfile honours the process umask (0775 under 0022), so pin the
+    // owner-only mode explicitly. TempDir::keep is infallible (unlike
+    // TempFile::keep); the caller removes the directory on every path.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir.keep())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn distribute_bundle_kind_inner(
     ctx: &mut OrchestrationContext,
@@ -320,13 +343,9 @@ fn distribute_bundle_kind_inner(
         Err(e) => return StageOutcome::Failed(format!("build env: {e}")),
     };
 
-    let tmp_dir = {
-        let mut p = std::env::temp_dir();
-        p.push(format!("rn_bundles_{}_{}", std::process::id(), kind));
-        if let Err(e) = std::fs::create_dir_all(&p) {
-            return StageOutcome::Failed(format!("create tmp bundle dir: {e}"));
-        }
-        p
+    let tmp_dir = match create_bundle_staging_dir(&kind) {
+        Ok(dir) => dir,
+        Err(e) => return StageOutcome::Failed(format!("create tmp bundle dir: {e}")),
     };
 
     // Issue bundles (exit adapter only — no ctx mutation needed after)
@@ -959,5 +978,37 @@ mod tests {
             first_bundle, 3,
             "all three verifier calls must precede bundles"
         );
+    }
+
+    /// RACE (katana, 16 threads): the staging dir used to be
+    /// `$TMPDIR/rn_bundles_<pid>_<kind>` — a pure function of (pid, kind) — so
+    /// two parallel same-kind issuances in one test binary shared it and one
+    /// thread read an empty `rn-<kind>.pub` while the other rewrote it. Every
+    /// call must now mint its own directory.
+    #[test]
+    fn bundle_staging_dir_is_unique_per_issuance() {
+        let first = create_bundle_staging_dir(&BundleKind::Traversal).expect("staging dir");
+        let second = create_bundle_staging_dir(&BundleKind::Traversal).expect("staging dir");
+        assert_ne!(
+            first, second,
+            "two same-kind issuances must not share a staging dir"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&first, &second] {
+                let mode = std::fs::metadata(dir)
+                    .expect("staging dir should exist")
+                    .permissions()
+                    .mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "staging dir must be owner-only: {dir:?} mode {mode:o}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
     }
 }
