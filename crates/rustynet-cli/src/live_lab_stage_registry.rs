@@ -894,6 +894,14 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    StageSpec {
+        name: "exit_egress_leak_witness",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        logical: Some("exit_egress_leak_witness_check"),
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     // Rust-engine exit NAT lifecycle: two-phase snapshot→stop→snapshot prove
     // NAT present during exit and gone after stop. state_machine_only — only
     // the Rust `--node` plan dispatches it; the bash orchestrate path runs the
@@ -3202,7 +3210,7 @@ mod tests {
             // +1 on 2026-09-07 (bundle freshness): refresh_signed_bundles,
             // the HP-3 prerequisite re-mint stage
             // (TraversalBundleFreshnessPlan_2026-09-07.md).
-            ("t1_role", 24),
+            ("t1_role", 25),
             // +1 on 2026-09-02 (C7): validate_macos_reboot_recovery joins
             // T2Resilience as the macOS reboot-with-protection live stage
             // (MacosDnsBackupRebootSurvivalPlan_2026-09-02.md).

@@ -18,6 +18,7 @@ pub mod blind_exit_dataplane;
 pub mod dns_failclosed;
 pub mod exit_demotion_residue;
 pub mod exit_dns_failclosed;
+pub mod exit_egress_leak_witness;
 pub mod exit_nat_lifecycle;
 pub mod gossip_convergence;
 pub mod identity_challenge;

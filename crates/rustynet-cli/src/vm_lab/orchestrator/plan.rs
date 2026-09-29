@@ -64,6 +64,7 @@ use crate::vm_lab::orchestrator::stage::dns_failclosed_validation::DnsFailclosed
 use crate::vm_lab::orchestrator::stage::enforce_runtime::EnforceBaselineRuntimeStage;
 use crate::vm_lab::orchestrator::stage::exit_demotion_residue_validation::ExitDemotionResidueValidationStage;
 use crate::vm_lab::orchestrator::stage::exit_dns_failclosed_validation::ExitDnsFailclosedValidationStage;
+use crate::vm_lab::orchestrator::stage::exit_egress_leak_witness::ExitEgressLeakWitnessStage;
 use crate::vm_lab::orchestrator::stage::exit_handoff::ExitHandoffStage;
 use crate::vm_lab::orchestrator::stage::exit_nat_lifecycle_validation::ExitNatLifecycleValidationStage;
 use crate::vm_lab::orchestrator::stage::final_cleanup::FinalCleanupStage;
@@ -477,6 +478,7 @@ impl PlanBuilder {
                     StageId::ExitDnsFailclosedValidation => {
                         Box::new(ExitDnsFailclosedValidationStage)
                     }
+                    StageId::ExitEgressLeakWitness => Box::new(ExitEgressLeakWitnessStage),
                     StageId::ExitNatLifecycleValidation => {
                         Box::new(ExitNatLifecycleValidationStage)
                     }
@@ -622,7 +624,7 @@ mod tests {
     #[test]
     fn build_returns_66_stages() {
         let stages = PlanBuilder::new().build();
-        assert_eq!(stages.len(), 66, "plan must contain exactly 66 stages");
+        assert_eq!(stages.len(), 67, "plan must contain exactly 67 stages");
     }
 
     // MAC-D3: the three macOS anchor validators must be part of the
@@ -750,7 +752,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_enable_chaos_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        assert_eq!(ids.len(), 75, "chaos-enabled plan must contain 75 stages");
+        assert_eq!(ids.len(), 76, "chaos-enabled plan must contain 76 stages");
         for chaos_id in PlanBuilder::chaos_suite_stages() {
             assert!(
                 ids.contains(&chaos_id),
@@ -773,11 +775,11 @@ mod tests {
             .with_enable_negative_control(true)
             .build();
         let ids: Vec<StageId> = stages.iter().map(|stage| stage.id()).collect();
-        // Opt-in and out of the default plan (like chaos): default 66 + 6.
+        // Opt-in and out of the default plan (like chaos): default 67 + 6.
         assert_eq!(
             ids.len(),
-            72,
-            "negative-control-enabled plan must contain 72 stages"
+            73,
+            "negative-control-enabled plan must contain 73 stages"
         );
         for control_id in PlanBuilder::negative_control_suite_stages() {
             assert!(
@@ -812,8 +814,8 @@ mod tests {
             .build();
         assert_eq!(
             stages.len(),
-            81,
-            "66 default + 9 chaos + 6 negative-control"
+            82,
+            "67 default + 9 chaos + 6 negative-control"
         );
     }
 
@@ -824,10 +826,10 @@ mod tests {
     #[test]
     fn relay_forwarding_validation_absent_from_default_plan() {
         use crate::vm_lab::orchestrator::stage::StageId;
-        // The default count MUST stay 66: a change here means the disruptive
+        // The default count MUST stay 67: a change here means the disruptive
         // stage leaked into the default plan (a wiring bug, not a test bump).
         let default_ids: Vec<StageId> = PlanBuilder::new().build().iter().map(|s| s.id()).collect();
-        assert_eq!(default_ids.len(), 66, "default plan must stay 66 stages");
+        assert_eq!(default_ids.len(), 67, "default plan must stay 67 stages");
         assert!(
             !default_ids.contains(&StageId::RelayForwardsFrameValidation),
             "the disruptive relay-forwarding stage must NOT be in the default plan"
@@ -843,8 +845,8 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            68,
-            "relay-forwarding-enabled plan must contain 68 stages (refresh + HP-3)"
+            69,
+            "relay-forwarding-enabled plan must contain 69 stages (refresh + HP-3)"
         );
         assert!(ids.contains(&StageId::RelayForwardsFrameValidation));
         // Placed after relay_validation (its lifecycle gate) and still last
@@ -897,8 +899,8 @@ mod tests {
             .build();
         assert_eq!(
             chaos_plus_hp3.len(),
-            77,
-            "66 default + 9 chaos + 1 refresh + 1 relay-forwarding"
+            78,
+            "67 default + 9 chaos + 1 refresh + 1 relay-forwarding"
         );
         let stacked = PlanBuilder::new()
             .with_enable_chaos_suite(true)
@@ -908,8 +910,8 @@ mod tests {
         let ids: Vec<StageId> = stacked.iter().map(|s| s.id()).collect();
         assert_eq!(
             stacked.len(),
-            83,
-            "66 default + 9 chaos + 6 negative-control + 1 refresh + 1 relay-forwarding"
+            84,
+            "67 default + 9 chaos + 6 negative-control + 1 refresh + 1 relay-forwarding"
         );
         assert_eq!(ids.last(), Some(&StageId::Cleanup));
     }
@@ -952,10 +954,10 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_live_suite(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        // 66 total - 35 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
+        // 67 total - 35 live-suite stages - 11 cross-network stages - 1 soak stage = 19.
         assert_eq!(
             ids.len(),
-            66 - PlanBuilder::live_suite_stages().len()
+            67 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -997,7 +999,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            66 - PlanBuilder::live_suite_stages().len()
+            67 - PlanBuilder::live_suite_stages().len()
                 - PlanBuilder::cross_network_suite_stages().len()
                 - PlanBuilder::soak_suite_stages().len()
         );
@@ -1052,6 +1054,7 @@ mod tests {
                 StageId::ExitHandoff,
                 StageId::ActiveExit,
                 StageId::ExitDnsFailclosedValidation,
+                StageId::ExitEgressLeakWitness,
                 StageId::ExitNatLifecycleValidation,
                 StageId::ExitDemotionResidueValidation,
                 StageId::BlindExitDataplaneValidation,
@@ -1095,7 +1098,7 @@ mod tests {
         use crate::vm_lab::orchestrator::stage::StageId;
         let stages = PlanBuilder::new().with_skip_soak(true).build();
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
-        assert_eq!(ids.len(), 65);
+        assert_eq!(ids.len(), 66);
         assert!(!ids.contains(&StageId::LiveExtendedSoakValidation));
         assert!(ids.contains(&StageId::LiveMixedTopologyValidation));
         assert!(ids.contains(&StageId::CrossNetworkPreflight));
@@ -1115,7 +1118,7 @@ mod tests {
         let ids: Vec<StageId> = stages.iter().map(|s| s.id()).collect();
         assert_eq!(
             ids.len(),
-            66 - PlanBuilder::cross_network_suite_stages().len()
+            67 - PlanBuilder::cross_network_suite_stages().len()
         );
         for dropped in PlanBuilder::cross_network_suite_stages() {
             assert!(

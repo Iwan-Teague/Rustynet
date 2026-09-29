@@ -40001,11 +40001,12 @@ fn kept_after() {}\n\
         // slack absorbs files losing their scan coverage silently. Measured
         // 2026-09-09: 88 stage sources; 89 after the QH-83 F1b
         // bundle_evidence.rs witness module joined the tree. Re-measured
-        // 2026-09-21 (AQ-85, wave-13 F1): 91 stage sources. Bump this
-        // number deliberately when a stage source is added or removed.
+        // 2026-09-21 (AQ-85, wave-13 F1): 91 stage sources. Re-measured
+        // 2026-09-27 (AQ-46): 92 stage sources (exit_egress_leak_witness.rs).
+        // Bump this number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 91,
-            "expected exactly 91 stage sources under the scan root; found \
+            files_scanned, 92,
+            "expected exactly 92 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );
@@ -40302,12 +40303,13 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         // runtime_acls_validation + service_hardening_validation +
         // key_custody_validation + mesh_status_validation + authenticode_validation +
         // ipv6_leak_validation + exit_demotion_residue_validation +
-        // exit_dns_failclosed_validation + exit_nat_lifecycle_validation +
+        // exit_dns_failclosed_validation + exit_egress_leak_witness (AQ-46) +
+        // exit_nat_lifecycle_validation +
         // blind_exit_dataplane_validation + gossip_convergence_validation.
         // MAC-D3 (2026-08-29): 61 + the 3 macOS anchor validator stages.
         // C6 (2026-09-02): + validate_macos_role_transition.
         // C7 (2026-09-02): + validate_macos_reboot_recovery.
-        assert_eq!(cli_ids.len(), 66);
+        assert_eq!(cli_ids.len(), 67);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

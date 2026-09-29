@@ -105,6 +105,7 @@ pub mod dns_failclosed_validation;
 pub mod enforce_runtime;
 pub mod exit_demotion_residue_validation;
 pub mod exit_dns_failclosed_validation;
+pub mod exit_egress_leak_witness;
 pub mod exit_handoff;
 pub mod exit_nat_lifecycle_validation;
 pub mod final_cleanup;
@@ -409,6 +410,7 @@ define_stage_catalog! {
     // T1 list ("exit→NAT+handoff+dns-failclosed+demotion-residue"); the
     // standalone dns_failclosed_validation above is the T4 family member.
     ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role / StageEvidence::StageLog,
+    ExitEgressLeakWitness => "exit_egress_leak_witness" @ Live / T1Role / StageEvidence::StageLog,
     ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role / StageEvidence::StageLog,
     ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role / StageEvidence::StageLog,
     BlindExitDataplaneValidation => "blind_exit_dataplane_validation" @ Live / T1Role / StageEvidence::StageLog,
