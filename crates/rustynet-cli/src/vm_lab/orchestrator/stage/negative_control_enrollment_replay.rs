@@ -773,20 +773,24 @@ exit 0
                  node carries no anchor enrollment state"
             ));
         }
-        for (label, path) in [
-            ("membership snapshot", MEMBERSHIP_SNAPSHOT_PATH),
-            ("enrollment ledger", ENROLLMENT_LEDGER_PATH),
-        ] {
-            let probe = match run_remote_argv(&shell, &["test", "-f", path]) {
+        let snapshot_probe =
+            match run_remote_argv(&shell, &["test", "-f", MEMBERSHIP_SNAPSHOT_PATH]) {
                 Ok(out) => out,
                 Err(err) => return fail(err),
             };
-            if probe.code != 0 {
-                return fail(format!(
-                    "baseline not applicable: {label} missing at {path} (fail closed)"
-                ));
-            }
+        if snapshot_probe.code != 0 {
+            return fail(format!(
+                "baseline not applicable: membership snapshot missing at \
+                 {MEMBERSHIP_SNAPSHOT_PATH} (fail closed)"
+            ));
         }
+        // The consumed-token ledger is NOT required to exist yet: the daemon
+        // creates it on its first accepted consume, so an admin node that has
+        // never enrolled anyone has none (run linux-u12b failed this control
+        // on exactly that). An absent ledger is a zero-row baseline: the
+        // attack script counts it as 0 rows (`set -u`, no errexit), and the
+        // verdict still requires exactly one consumed row for the token after
+        // the attack, so nothing here can pass vacuously.
         let leftover = match run_remote_argv(&shell, &["test", "-e", DROPIN_PATH]) {
             Ok(out) => out,
             Err(err) => return fail(err),
