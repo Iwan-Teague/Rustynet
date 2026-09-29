@@ -562,8 +562,12 @@ if [ "$recovered" = true ]; then
   # 2026-09-11: recovered in 8 s, sampled unconverged, stage failed).
   # Convergence (re-handshake + path proof) is a slower clock than socket
   # recovery: katana (nested-virt, NAT'd guests) needed longer than the 90 s
-  # recovery deadline while lenovo converged in 12 s. Two deadlines.
-  mesh_end_unix="$((start_unix + deadline * 2))"
+  # recovery deadline while lenovo converged in 12 s. Two deadlines were
+  # still short on katana: after the 12-kill loop of run katana-u13 the mesh
+  # re-proved a live handshake about 214 s after recovery, 34 s past a 180 s
+  # window, while the UTM guests (linux-u12b) converged inside it. Three
+  # deadlines (270 s at the 90 s default); the state checks are unchanged.
+  mesh_end_unix="$((start_unix + deadline * 3))"
   while :; do
     mesh_status_line="$(env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>/dev/null | tr '\n' ' ' | head -c 8192 || true)"
     case "$mesh_status_line" in
