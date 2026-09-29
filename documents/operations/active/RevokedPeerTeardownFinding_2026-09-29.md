@@ -1,6 +1,6 @@
 # PF-1: a revoked peer keeps tunnel access to client nodes (2026-09-29)
 
-**Status.** Product security finding, CONFIRMED by code reading and by an independent adversarial review. Live effect not yet observed; the new stage `live_owner_key_rotation_validation` (S1 of `LinuxSecurityStagesPlan_2026-09-29.md`) is built to witness it. Fix: option 1 below, being prepared in a fleet lane; it lands only after an independent review, the full gates, and the owner's confirmation.
+**Status.** Product security finding, CONFIRMED by code reading, by an independent adversarial review, and LIVE on katana (see Live proof). Fix: option 1 below, implemented, reviewed and proven live in a lab tree; it lands only after the owner's confirmation and the full gates.
 
 ## What happens
 
@@ -25,8 +25,18 @@ This contradicts the stated bar: Requirements ("rapid revocation/offboarding"; "
 
 Open question for the owner: accept option 1, and confirm that fail-closed's "tunnel traffic keeps flowing" behaviour must exclude revoked peers.
 
+## Live proof (katana, relay layout, stage `live_owner_key_rotation_validation`)
+
+| Run | PF-1 fix in the lab tree | Verdict V6 (every surviving peer drops the revoked node within 60 s) |
+|---|---|---|
+| katana-u20 (`livelab-1790684552-53d262d5462d`) | no | **Breach.** The authority (katana-exit-1, which applies membership through the daemon) dropped the revoked katana-client-1 by the first probe, about 5 s after apply, but the survivor katana-aux-1, which receives membership as a file, reached it over the mesh for the whole 60 s bound. It kept it until its assignment pair was re-minted. |
+| katana-u21 (`livelab-1790704024-2e7617e5c655`) | yes (lanes b47c + b47r1) | **Pass.** Every survivor's files and daemon watermark held the revocation epoch with the target revoked within 8 s; traffic from both probed survivors (katana-exit-1, katana-aux-1) to it was denied, and neither had its key on the interface. katana-entry-1 is checked for membership state only, not traffic. |
+
+The other eight verdicts passed in both runs: rotation applied everywhere, old-key and revoked-cosigned updates refused with no state change, the pre-rotation replay refused, the new-key update applied everywhere, survivors served each other, the revoked node could not rejoin on its old state, and the mesh was restored. The evidence is in the node ledgers (commit c90dd4383 for u20; u21 in the following evidence commit).
+
 ## Evidence
 
 - Found by: the S1 implementation lane (b43c), from code reading.
 - Independent review: charter/reviews/REVIEW-pf1-revoked-peer-teardown-2026-09-29.md (CONFIRMED). The manager also checked the fail-closed rule order and the append-only drop in `phase10.rs`.
-- Live proof: the S1 stage's verdict V6 ("every peer drops the revoked node within a stated bound") is expected to fail before the fix and to pass after it.
+- Live proof: see the table above; V6 failed without the fix (katana-u20) and passed with it (katana-u21).
+- The fix: lanes b47c and b47r1 (reconcile-path and signed-state-refresh teardown), reviewed SOUND (a81) and CORRECTIONS DONE (a83).
