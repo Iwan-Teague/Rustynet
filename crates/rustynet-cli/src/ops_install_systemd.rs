@@ -3923,3 +3923,251 @@ mod tests {
         assert!(err.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID"));
     }
 }
+
+#[cfg(test)]
+mod unit_exec_line_shell_syntax_tests {
+    //! PF-3 guard: systemd does NOT run `Exec*=` lines through a shell, so
+    //! shell substitution in an Exec line is either a unit-parse error
+    //! (`$(` → "Invalid environment variable name", status=2) or arrives
+    //! at the binary as literal text. Shell syntax is only legitimate
+    //! behind an explicit `/bin/sh -c` (or `/bin/bash -c`) form, where
+    //! systemd splits the argv and the shell interprets exactly the one
+    //! quoted script argument. Every unit and timer shipped under
+    //! `scripts/systemd/` is pinned below so a newly added file cannot
+    //! silently skip this check.
+
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+
+    /// Where the shipped units live, relative to this crate's manifest dir
+    /// (`crates/rustynet-cli`): the workspace repo root's `scripts/systemd`.
+    const UNIT_DIR: &str = "../../scripts/systemd";
+
+    /// (file name, contents) for every unit/timer under `scripts/systemd/`.
+    /// `install_rustynetd_service.sh` is deliberately absent: it is a shell
+    /// script run by a shell interpreter, not a systemd unit.
+    const EMBEDDED_UNITS: &[(&str, &str)] = &[
+        (
+            "rustynet-exit.service",
+            include_str!("../../../scripts/systemd/rustynet-exit.service"),
+        ),
+        (
+            "rustynet-llm-gateway.service",
+            include_str!("../../../scripts/systemd/rustynet-llm-gateway.service"),
+        ),
+        (
+            "rustynet-nas.service",
+            include_str!("../../../scripts/systemd/rustynet-nas.service"),
+        ),
+        (
+            "rustynet-relay.service",
+            include_str!("../../../scripts/systemd/rustynet-relay.service"),
+        ),
+        (
+            "rustynetd-anchor.service",
+            include_str!("../../../scripts/systemd/rustynetd-anchor.service"),
+        ),
+        (
+            "rustynetd-assignment-refresh.service",
+            include_str!("../../../scripts/systemd/rustynetd-assignment-refresh.service"),
+        ),
+        (
+            "rustynetd-assignment-refresh.timer",
+            include_str!("../../../scripts/systemd/rustynetd-assignment-refresh.timer"),
+        ),
+        (
+            "rustynetd-managed-dns.service",
+            include_str!("../../../scripts/systemd/rustynetd-managed-dns.service"),
+        ),
+        (
+            "rustynetd-privileged-helper.service",
+            include_str!("../../../scripts/systemd/rustynetd-privileged-helper.service"),
+        ),
+        (
+            "rustynetd-trust-refresh.service",
+            include_str!("../../../scripts/systemd/rustynetd-trust-refresh.service"),
+        ),
+        (
+            "rustynetd-trust-refresh.timer",
+            include_str!("../../../scripts/systemd/rustynetd-trust-refresh.timer"),
+        ),
+        (
+            "rustynetd.service",
+            include_str!("../../../scripts/systemd/rustynetd.service"),
+        ),
+    ];
+
+    /// Shell metacharacters that make an Exec line shell-dependent when
+    /// they appear outside an explicit `/bin/sh -c` script argument.
+    /// `${VAR}`/`$VAR` are systemd's own environment expansion and are
+    /// therefore not in this list.
+    const SHELL_METACHARS: &[&str] = &["$(", "`", "&&", "||", ";", "|", ">", "<"];
+
+    /// Joins systemd line continuations (`\` as the last non-blank
+    /// character of a line) so each logical Exec line is one string.
+    fn logical_lines(unit: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut pending: Option<String> = None;
+        for raw in unit.lines() {
+            let line = match pending.take() {
+                Some(mut prev) => {
+                    prev.push(' ');
+                    prev.push_str(raw.trim_start());
+                    prev
+                }
+                None => raw.to_string(),
+            };
+            if line.trim_end().ends_with('\\') {
+                let mut trimmed = line.trim_end().to_string();
+                trimmed.pop();
+                pending = Some(trimmed);
+            } else {
+                out.push(line);
+            }
+        }
+        if let Some(last) = pending {
+            out.push(last);
+        }
+        out
+    }
+
+    /// systemd's only escape relevant to shell detection is `$$` → a
+    /// literal `$` handed to the command; every other `$` form is systemd
+    /// environment expansion performed by the manager itself.
+    fn systemd_unescape_dollar(line: &str) -> String {
+        line.replace("$$", "$")
+    }
+
+    /// Fails (Err) if the Exec line depends on shell syntax outside an
+    /// explicit `/bin/sh -c` / `/bin/bash -c` form.
+    fn check_exec_line(file: &str, line: &str) -> Result<(), String> {
+        let eq = line
+            .find('=')
+            .ok_or_else(|| format!("{file}: Exec line without '=': {line}"))?;
+        let mut body = line[eq + 1..].trim();
+        // systemd's special executable prefixes (`-`, `+`, `!`, `!!` —
+        // combinable in any order, systemd.service(5)) select error and
+        // privilege behaviour, not which program runs, so strip them all
+        // before identifying the shell form. Only stripping `-` makes a
+        // legitimate `+/bin/sh -c ...` look like a non-shell program.
+        body = body.trim_start_matches(['-', '+', '!']).trim_start();
+        let mut tokens = body.split_whitespace();
+        let program = tokens.next().unwrap_or_default();
+        if (program == "/bin/sh" || program == "/bin/bash")
+            && tokens.next().is_some_and(|flag| flag.starts_with("-c"))
+        {
+            // Explicit shell form: systemd passes the quoted script as one
+            // argument and the shell interprets it. Allowed by design.
+            return Ok(());
+        }
+        let unescaped = systemd_unescape_dollar(line);
+        for meta in SHELL_METACHARS {
+            if unescaped.contains(meta) {
+                return Err(format!(
+                    "{file}: Exec line uses shell syntax ({meta:?}) outside an explicit \
+                     /bin/sh -c form; systemd will not run it through a shell: {line}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Directory-scan filter for the pin test below: a scanned entry is a
+    /// real (non-hidden) `.service`/`.timer` name. Dotfiles are excluded —
+    /// macOS tar/rsync drop AppleDouble `._foo.service` shadows next to
+    /// real units, and counting them fails the gate on a clean tree.
+    fn is_scanned_unit_file(name: &str) -> bool {
+        !name.starts_with('.') && (name.ends_with(".service") || name.ends_with(".timer"))
+    }
+
+    #[test]
+    fn every_repo_unit_and_timer_is_embedded_in_this_test() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(UNIT_DIR);
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()));
+        let mut on_disk = BTreeSet::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_scanned_unit_file(&name) {
+                on_disk.insert(name);
+            }
+        }
+        let embedded: BTreeSet<String> = EMBEDDED_UNITS
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect();
+        assert_eq!(
+            on_disk, embedded,
+            "scripts/systemd/ units and the embedded pin list have drifted; add the new \
+             unit to EMBEDDED_UNITS so the Exec-line shell-syntax guard covers it"
+        );
+    }
+
+    #[test]
+    fn embedded_exec_lines_use_no_shell_syntax_outside_explicit_shell() {
+        for (name, body) in EMBEDDED_UNITS {
+            for line in logical_lines(body) {
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with("Exec") {
+                    continue;
+                }
+                if let Err(err) = check_exec_line(name, &line) {
+                    panic!("{err}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn detector_rejects_the_pf3_command_substitution_form() {
+        // The exact ExecStartPost that shipped broken (PF-3, seen live in
+        // the katana-u20 guest journal as status=2/INVALIDARGUMENT).
+        let broken =
+            "ExecStartPost=/usr/bin/test \"$(/usr/sbin/sysctl -n net.ipv4.ip_forward)\" = \"1\"";
+        assert!(
+            check_exec_line("rustynet-exit.service", broken).is_err(),
+            "the broken PF-3 form must be rejected"
+        );
+        // The fixed form: explicit /bin/sh -c with systemd's $$ escape.
+        let fixed = "ExecStartPost=/bin/sh -c 'test \"$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)\" = \"1\"'";
+        assert!(
+            check_exec_line("rustynet-exit.service", fixed).is_ok(),
+            "the fixed /bin/sh -c form must be allowed"
+        );
+    }
+
+    #[test]
+    fn unit_scan_ignores_appledouble_and_other_dotfiles() {
+        assert!(!is_scanned_unit_file("._rustynet-exit.service"));
+        assert!(!is_scanned_unit_file(".gitignore"));
+        assert!(!is_scanned_unit_file("."));
+        assert!(is_scanned_unit_file("rustynet-exit.service"));
+        assert!(is_scanned_unit_file("rustynetd-assignment-refresh.timer"));
+        assert!(!is_scanned_unit_file("install_rustynetd_service.sh"));
+        assert!(!is_scanned_unit_file("README.md"));
+    }
+
+    #[test]
+    fn detector_accepts_shell_form_behind_systemd_exec_prefixes() {
+        // systemd.service(5) special executable prefixes combine freely and
+        // never change which program runs, so a prefixed `/bin/sh -c` is
+        // still an explicit shell form the guard must allow.
+        for prefix in ["", "-", "+", "!", "!!", "-+", "!-"] {
+            let line = format!(
+                "ExecStartPost={prefix}/bin/sh -c \
+                 'test \"$$(/usr/sbin/sysctl -n net.ipv4.ip_forward)\" = \"1\"'"
+            );
+            assert!(
+                check_exec_line("rustynet-exit.service", &line).is_ok(),
+                "prefixed explicit shell form must be accepted: {line}"
+            );
+        }
+        // Prefixes must not bypass the metachar scan on non-shell programs.
+        let broken_script = r#"test "$(/usr/sbin/sysctl -n net.ipv4.ip_forward)" = "1""#;
+        let privileged_broken = format!("ExecStartPost=+/usr/bin/test {broken_script}");
+        assert!(
+            check_exec_line("rustynet-exit.service", &privileged_broken).is_err(),
+            "a prefix on a non-shell program must still reject shell syntax"
+        );
+    }
+}
