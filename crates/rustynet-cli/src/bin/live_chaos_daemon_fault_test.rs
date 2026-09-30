@@ -336,7 +336,7 @@ impl<'a> ClientTrafficGuard<'a> {
         known_hosts: &'a Path,
         client: &'a str,
     ) -> Result<Self, String> {
-        let duration = config.recovery_deadline_secs + 20;
+        let duration = config.recovery_deadline_secs + 60;
         let script = render_client_traffic_start_script(duration);
         run_root(identity, known_hosts, client, &script)?;
         Ok(Self {
@@ -398,6 +398,13 @@ if [ -n "${reason_var}" ]; then
   printf '{lines_var}=0\n'
   printf '{check_var}=error\n'
   printf '{reason_var}=%s\n' "${reason_var}"
+  # 2026-09-30 katana-u26: the work_dir (holding tcpdump.err) is rm -rf'ed by
+  # the cleanup trap, so an error verdict used to leave NO evidence of why the
+  # capture failed. Surface a bounded single-line excerpt of tcpdump's stderr
+  # in the k=v stream (the observation parser ignores unknown keys) before the
+  # fail-closed exit.
+  tcpdump_error_snippet="$(tr '\n' ' ' 2>/dev/null < {error_path} | cut -c1-240)"
+  printf 'tcpdump_error_snippet=%s\n' "$tcpdump_error_snippet"
   exit 3
 fi
 if [ "${lines_var}" = "0" ]; then
@@ -405,6 +412,123 @@ if [ "${lines_var}" = "0" ]; then
 else
   {check_var}=fail
 fi
+"#
+    )
+}
+
+/// Bounded readiness wait for a backgrounded tcpdump: a real readiness signal
+/// (`listening on ` in tcpdump's stderr file) instead of a blind `sleep 2`.
+/// 2026-09-30 katana-u26: the daemon-fault kill path declared recovery on the
+/// first recovery-poll iteration, tore tcpdump down ~1.5s after spawning it,
+/// and the kernel log proves the device was never opened (no `promiscuous
+/// mode` line), so the stderr file never received the banner and the leak
+/// tally failed closed with `tcpdump_did_not_start`. Waiting for the banner
+/// (bounded, 1s polls) makes the fault window start from a PROVEN capture and
+/// still fails closed: on timeout this prints `tcpdump_ready=false` plus a
+/// bounded excerpt of tcpdump's stderr for diagnosability, then emits
+/// `plaintext_leak_check=error` / `plaintext_error=tcpdump_not_ready` (verdict
+/// keys first, the stderr excerpt LAST, because the orchestrator keeps only
+/// the first 500 chars of stderr) and exits 3 BEFORE any fault is injected (the caller's EXIT trap restores the
+/// service), so no pass is possible without a proven working capture.
+/// `error_path_expr` is inserted verbatim (callers pass a quoted runtime path
+/// such as `"$work_dir/tcpdump.err"`), mirroring [`render_capture_leak_tally_sh`].
+fn render_tcpdump_readiness_wait_sh(error_path_expr: &str, timeout_secs: u64) -> String {
+    format!(
+        r#"tcpdump_ready=false
+readiness_i=0
+while [ "$readiness_i" -lt {timeout_secs} ]; do
+  if grep -q '^listening on ' {error_path_expr} 2>/dev/null; then
+    tcpdump_ready=true
+    break
+  fi
+  readiness_i=$((readiness_i + 1))
+  sleep 1
+done
+printf 'tcpdump_ready=%s\n' "$tcpdump_ready"
+if [ "$tcpdump_ready" = "false" ]; then
+  # Fail closed BEFORE the fault is injected: a fault window without a proven
+  # capture proves nothing. The caller's EXIT trap tears down and restores.
+  # The verdict keys print FIRST and the free-text stderr excerpt LAST: the
+  # orchestrator keeps only the first 500 chars of stderr/output, so the
+  # excerpt must never be able to push the verdict out of the kept window.
+  printf 'tcpdump_lines=0\n'
+  printf 'plaintext_leak_check=error\n'
+  printf 'plaintext_error=tcpdump_not_ready\n'
+  tcpdump_error_snippet="$(tr '\n' ' ' 2>/dev/null < {error_path_expr} | cut -c1-240)"
+  printf 'tcpdump_error_snippet=%s\n' "$tcpdump_error_snippet"
+  exit 3
+fi
+"#
+    )
+}
+
+/// The kill-mode fault window: inject the KILL fault, PROVE the fault landed,
+/// then poll for recovery. 2026-09-30 katana-u26 root cause: the old inline
+/// block polled `systemctl is-active && [ -S socket ]` immediately after
+/// `systemctl kill -s KILL`, and the first iteration raced systemd's SIGKILL
+/// reaping (the guest journal shows the kill at 08:00:42 and the exit
+/// processed at 08:00:44) while the SIGKILLed daemon could not unlink its
+/// socket file — so `recovered=true` fired instantly, the fault window
+/// collapsed from 90s to ~1s, and tcpdump was killed before it ever opened
+/// the device. Now the fault must be OBSERVED first (`is-active` flipping
+/// false, or the socket inode changing — a restart faster than one poll is
+/// still caught by the inode), and recovery requires a FRESH socket inode,
+/// so a stale pre-fault socket can never stand in for a restarted daemon.
+/// `stat` absence or an unchanged inode fail closed (`recovered=false` →
+/// `.passed()` refuses the stage), never fail open. The pre-fault inode is a
+/// precondition: if it is empty or non-numeric (unreadable socket, `stat`
+/// failure) the fragment prints `fault_precondition=socket_inode_unreadable`
+/// and exits 1 BEFORE `systemctl kill` — with an empty baseline ANY later
+/// readable inode, including the unchanged stale one, would read as a "fresh"
+/// socket and fake both the fault observation and the recovery. `service` and
+/// `socket_path` are shell-quoted literals; both are parameters so tests can
+/// run this fragment under `sh` with fake `systemctl`/`stat` binaries on
+/// PATH, replaying the exact katana-u26 race.
+fn render_kill_fault_window_sh(
+    service: &str,
+    socket_path: &str,
+    deadline_secs: u64,
+    observe_timeout_secs: u64,
+) -> String {
+    let service = shell_quote(service);
+    let socket_path = shell_quote(socket_path);
+    format!(
+        r#"start_unix="$(date +%s)"
+socket_ino_before="$(stat -c %i {socket_path} 2>/dev/null || true)"
+case "$socket_ino_before" in
+  ''|*[!0-9]*) printf 'fault_precondition=socket_inode_unreadable\n'; exit 1 ;;
+esac
+printf 'fault_signal=KILL\n'
+systemctl kill -s KILL {service}
+fault_observed=false
+observe_i=0
+while [ "$observe_i" -lt {observe_timeout_secs} ]; do
+  if ! systemctl is-active --quiet {service} 2>/dev/null; then
+    fault_observed=true
+    break
+  fi
+  socket_ino_now="$(stat -c %i {socket_path} 2>/dev/null || true)"
+  if [ -n "$socket_ino_now" ] && [ "$socket_ino_now" != "$socket_ino_before" ]; then
+    fault_observed=true
+    break
+  fi
+  observe_i=$((observe_i + 1))
+  sleep 1
+done
+printf 'fault_observed=%s\n' "$fault_observed"
+recovered=false
+if [ "$fault_observed" = "true" ]; then
+  end_unix="$((start_unix + {deadline_secs}))"
+  while [ "$(date +%s)" -le "$end_unix" ]; do
+    socket_ino_now="$(stat -c %i {socket_path} 2>/dev/null || true)"
+    if systemctl is-active --quiet {service} && [ -S {socket_path} ] && [ -n "$socket_ino_now" ] && [ "$socket_ino_now" != "$socket_ino_before" ]; then
+      recovered=true
+      break
+    fi
+    sleep 1
+  done
+fi
+measured_recovery_secs="$(( $(date +%s) - start_unix ))"
 "#
     )
 }
@@ -506,6 +630,9 @@ fn render_remote_kill_script(config: &Config) -> String {
         "plaintext_leak_check",
         "plaintext_error",
     );
+    let readiness = render_tcpdump_readiness_wait_sh("\"$work_dir/tcpdump.err\"", 15);
+    let fault_window =
+        render_kill_fault_window_sh(&config.service_name, &config.socket_path, deadline, 15);
 
     format!(
         r#"set -eu
@@ -553,22 +680,10 @@ filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
 # Provenance marker + append: a missing or empty capture downstream fails
 # closed (audit I2 finding 2) instead of tallying as zero plaintext.
 printf 'capture_provenance=started_unix=%s\n' "$(date +%s)" > "$work_dir/tcpdump.txt"
-timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" >> "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
+timeout "$((deadline + 45))" tcpdump -i "$capture_interface" -nn -l "$filter" >> "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
 tcpdump_pid="$!"
-sleep 2
-start_unix="$(date +%s)"
-printf 'fault_signal=KILL\n'
-systemctl kill -s KILL "$service"
-recovered=false
-end_unix="$((start_unix + deadline))"
-while [ "$(date +%s)" -le "$end_unix" ]; do
-  if systemctl is-active --quiet "$service" && [ -S "$socket_path" ]; then
-    recovered=true
-    break
-  fi
-  sleep 1
-done
-measured_recovery_secs="$(( $(date +%s) - start_unix ))"
+{readiness}
+{fault_window}
 kill "$tcpdump_pid" >/dev/null 2>&1 || true
 wait "$tcpdump_pid" >/dev/null 2>&1 || true
 tcpdump_pid=""
@@ -607,6 +722,7 @@ fn render_remote_sigstop_script(config: &Config) -> String {
         "plaintext_leak_check",
         "plaintext_error",
     );
+    let readiness = render_tcpdump_readiness_wait_sh("\"$work_dir/tcpdump.err\"", 15);
 
     format!(
         r#"set -eu
@@ -655,9 +771,9 @@ filter="ip and src net $mesh_cidr and not dst net $mesh_cidr"
 # Provenance marker + append: a missing or empty capture downstream fails
 # closed (audit I2 finding 2) instead of tallying as zero plaintext.
 printf 'capture_provenance=started_unix=%s\n' "$(date +%s)" > "$work_dir/tcpdump.txt"
-timeout "$((deadline + 15))" tcpdump -i "$capture_interface" -nn -l "$filter" >> "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
+timeout "$((deadline + 45))" tcpdump -i "$capture_interface" -nn -l "$filter" >> "$work_dir/tcpdump.txt" 2> "$work_dir/tcpdump.err" &
 tcpdump_pid="$!"
-sleep 2
+{readiness}
 start_unix="$(date +%s)"
 printf 'fault_signal=STOP\n'
 systemctl kill -s STOP "$service"
@@ -709,6 +825,12 @@ struct KillStageObservation {
     /// the stopped state. `None` for kill-mode output (the key is never emitted
     /// there), so it never affects the existing `.passed()` kill check.
     observed_stopped_state: Option<String>,
+    /// Kill-mode proof that the fault actually landed (`is-active` flipped
+    /// false or the socket inode changed) before recovery was measured.
+    /// `None` when the key is absent (SIGSTOP output never emits it, and an
+    /// old/broken guest script would not either); `.passed()` requires
+    /// `Some(true)` so a missing or false observation can never pass kill mode.
+    fault_observed: Option<bool>,
 }
 
 impl KillStageObservation {
@@ -762,6 +884,12 @@ impl KillStageObservation {
                 .parse::<u64>()
                 .map_err(|err| format!("invalid integer for {key}: {err}"))
         };
+        let fault_observed = match exit_value("fault_observed") {
+            None => None,
+            Some("true") => Some(true),
+            Some("false") => Some(false),
+            Some(other) => return Err(format!("invalid boolean for fault_observed: {other}")),
+        };
         Ok(Self {
             teardown_registered_before_fault: parse_exit_bool("teardown_registered_before_fault")?,
             recovered: parse_exit_bool("recovered")?,
@@ -776,11 +904,13 @@ impl KillStageObservation {
                 .to_owned(),
             capture_interface: exit_value("capture_interface").map(str::to_owned),
             observed_stopped_state: exit_value("observed_stopped_state").map(str::to_owned),
+            fault_observed,
         })
     }
 
     fn passed(&self, deadline_secs: u64) -> bool {
         self.teardown_registered_before_fault
+            && self.fault_observed == Some(true)
             && self.recovered
             && self.measured_recovery_secs <= deadline_secs
             && self.tcpdump_lines == 0
@@ -852,6 +982,10 @@ fn render_live_report(config: &Config, observation: &KillStageObservation) -> Va
                     "teardown_registered_before_fault": observation.teardown_registered_before_fault,
                     "recovered": observation.recovered,
                 });
+                if config.fault_mode == FaultMode::Kill {
+                    // Surface the proof that the KILL fault actually landed.
+                    implemented["fault_observed"] = json!(observation.fault_observed);
+                }
                 if config.fault_mode == FaultMode::StopCont {
                     // Surface the proof that the daemon was actually frozen.
                     implemented["observed_stopped_state"] =
@@ -993,7 +1127,7 @@ mod tests {
     #[test]
     fn kill_observation_parses_passing_output() {
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\ncapture_interface=eth0\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nfault_observed=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
@@ -1004,7 +1138,7 @@ mod tests {
     #[test]
     fn kill_observation_fails_on_plaintext_lines() {
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=1\nplaintext_leak_check=fail\n",
+            "teardown_registered_before_fault=true\nfault_observed=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=1\nplaintext_leak_check=fail\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
@@ -1014,18 +1148,46 @@ mod tests {
     #[test]
     fn kill_observation_fails_on_client_plaintext_lines() {
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "teardown_registered_before_fault=true\nfault_observed=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
             "client_plaintext_lines=1\nclient_plaintext_leak_check=fail\n",
         )
         .expect("observation should parse");
         assert!(!observation.passed(90));
     }
 
+    // The fault-landed proof is mandatory in kill mode: a guest that reports
+    // recovered=true without ever proving the fault landed (key missing, or
+    // fault_observed=false) must not pass, and the stage report must be fail.
+    #[test]
+    fn kill_observation_requires_fault_observed() {
+        let client = "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n";
+        let base = "teardown_registered_before_fault=true\ncapture_interface=eth0\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n";
+        let missing = KillStageObservation::parse(base, client).expect("missing key parses");
+        assert_eq!(missing.fault_observed, None);
+        assert!(!missing.passed(90), "missing fault_observed must not pass");
+        let denied = KillStageObservation::parse(&format!("fault_observed=false\n{base}"), client)
+            .expect("false parses");
+        assert_eq!(denied.fault_observed, Some(false));
+        assert!(!denied.passed(90), "fault_observed=false must not pass");
+        let proven = KillStageObservation::parse(&format!("fault_observed=true\n{base}"), client)
+            .expect("true parses");
+        assert_eq!(proven.fault_observed, Some(true));
+        assert!(proven.passed(90));
+        let err = KillStageObservation::parse(&format!("fault_observed=maybe\n{base}"), client)
+            .expect_err("garbage boolean must reject");
+        assert!(err.contains("fault_observed"), "{err}");
+        // The report must say fail, not pass, for the unproven observation.
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let report = render_live_report(&config, &missing);
+        assert_eq!(report["overall_status"], "fail");
+        assert_eq!(report["stages"][0]["status"], "fail");
+    }
+
     #[test]
     fn live_report_marks_first_stage_pass_and_remaining_skipped() {
         let config = parse(&["--dry-run"]).expect("dry-run config should parse");
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\ncapture_interface=eth0\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nfault_observed=true\nrecovered=true\nmeasured_recovery_secs=7\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
@@ -1036,6 +1198,7 @@ mod tests {
         let stages = report["stages"].as_array().expect("stages array");
         assert_eq!(stages[0]["name"], "chaos_daemon_kill_during_reconcile");
         assert_eq!(stages[0]["status"], "pass");
+        assert_eq!(stages[0]["fault_observed"], true);
         assert_eq!(stages[1]["status"], "skipped");
         assert_eq!(stages[2]["status"], "skipped");
         assert_eq!(stages[3]["status"], "skipped");
@@ -1428,5 +1591,384 @@ mod tests {
         .expect_err("a missing capture must fail the stage, not pass");
         assert!(err.contains("capture_missing"), "{err}");
         assert!(err.contains("target tcpdump leak check"), "{err}");
+    }
+
+    // 2026-09-30 katana-u26: on the error path the work_dir (holding
+    // tcpdump.err) is deleted by the cleanup trap, so the failure output named
+    // `tcpdump_did_not_start` with zero evidence of WHY. The error branch must
+    // carry a bounded single-line excerpt of tcpdump's stderr. Old behaviour:
+    // no snippet line — this test fails against it.
+    #[test]
+    fn tally_error_carries_tcpdump_stderr_snippet_for_diagnosis() {
+        let body = "tcpdump: boom: permission denied\n";
+        let (out, exited_3) = run_tally(body);
+        assert!(exited_3, "a bannerless capture must fail closed: {out}");
+        assert!(out.contains("reason=tcpdump_did_not_start"), "{out}");
+        assert!(
+            out.contains("tcpdump_error_snippet=tcpdump: boom: permission denied"),
+            "the stderr excerpt must reach the failure output: {out}"
+        );
+
+        // A healthy capture path must NOT grow a snippet line.
+        let healthy = "listening on ens3, link-type EN10MB (Ethernet)\n0 packets captured\n";
+        let (out, exited_3) = run_tally(healthy);
+        assert!(!exited_3, "healthy stderr must pass: {out}");
+        assert!(!out.contains("tcpdump_error_snippet="), "{out}");
+    }
+
+    /// Run the readiness fragment against a temp stderr file, optionally with
+    /// a backgrounded late writer, and return its stdout.
+    fn run_readiness(prelude: &str, timeout_secs: u64) -> (String, Option<i32>) {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rn-ready-{}-{}-{}-{}",
+            std::process::id(),
+            timeout_secs,
+            prelude.len(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let error = dir.join("tcpdump.err");
+        std::fs::write(&error, "").expect("empty stderr file");
+        let frag = render_tcpdump_readiness_wait_sh(
+            &shell_quote(error.to_str().expect("utf8")),
+            timeout_secs,
+        );
+        let script = format!(
+            "RDY_ERR={}\n{prelude}\n{frag}\nprintf 'READY_DONE\\n'\nprintf 'FAULT_INJECTED\\n'\n",
+            shell_quote(error.to_str().expect("utf8")),
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run sh");
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            out.status.code(),
+        )
+    }
+
+    // The banner may arrive AFTER the blind `sleep 2` the old scripts used:
+    // katana-u26's kernel log proves tcpdump was killed ~1.5s after spawn
+    // without ever opening ens3. The readiness wait must accept a banner that
+    // lands late (1s), and still time out bounded with `tcpdump_ready=false`
+    // plus a stderr excerpt when it never lands.
+    #[test]
+    fn readiness_wait_accepts_late_banner() {
+        // Banner at 3s: later than the old blind `sleep 2`, inside a 6s wait.
+        let (out, code) = run_readiness(
+            "( sleep 3; printf 'listening on ens3, link-type EN10MB (Ethernet)\\n' >> \"$RDY_ERR\" ) &",
+            6,
+        );
+        assert_eq!(code, Some(0), "{out}");
+        assert!(out.contains("tcpdump_ready=true"), "{out}");
+        assert!(out.contains("FAULT_INJECTED"), "{out}");
+        assert!(out.contains("READY_DONE"), "{out}");
+        assert!(!out.contains("tcpdump_ready=false"), "{out}");
+    }
+
+    #[test]
+    fn readiness_wait_times_out_bounded_with_stderr_snippet() {
+        let started = std::time::Instant::now();
+        let (out, code) = run_readiness("RDY_ERR_UNUSED=0", 1);
+        let elapsed = started.elapsed();
+        assert!(out.contains("tcpdump_ready=false"), "{out}");
+        assert!(out.contains("tcpdump_error_snippet="), "{out}");
+        // The orchestrator keeps only the first 500 chars of stderr/output:
+        // the verdict keys must precede the free-text excerpt, which is LAST.
+        let pos = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("{needle}: {out}"))
+        };
+        let snippet_at = pos("tcpdump_error_snippet=");
+        assert!(pos("tcpdump_lines=0") < snippet_at, "{out}");
+        assert!(pos("plaintext_leak_check=error") < snippet_at, "{out}");
+        assert!(
+            pos("plaintext_error=tcpdump_not_ready") < snippet_at,
+            "{out}"
+        );
+        assert_eq!(
+            out.trim_end()
+                .lines()
+                .last()
+                .map(|l| l.starts_with("tcpdump_error_snippet=")),
+            Some(true),
+            "the snippet must be the LAST line: {out}"
+        );
+        // Fail closed: exit 3 with the not-ready verdict, and the code after
+        // the fragment (standing in for the fault injection) never runs.
+        assert_eq!(code, Some(3), "{out}");
+        assert!(out.contains("tcpdump_lines=0"), "{out}");
+        assert!(out.contains("plaintext_leak_check=error"), "{out}");
+        assert!(out.contains("plaintext_error=tcpdump_not_ready"), "{out}");
+        assert!(
+            !out.contains("FAULT_INJECTED"),
+            "fault must not be injected: {out}"
+        );
+        assert!(!out.contains("READY_DONE"), "{out}");
+        // Bounded: one poll + margin, never the old unbounded wait.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "readiness wait must be bounded, took {elapsed:?}"
+        );
+    }
+
+    /// Run the kill fault-window fragment with fake `systemctl`/`stat`
+    /// binaries on PATH. `systemctl_body`/`stat_body` are full fake scripts;
+    /// `prelude` runs before the fragment (for background simulators).
+    fn run_kill_fault_window(
+        systemctl_body: &str,
+        stat_body: &str,
+        prelude: &str,
+        deadline: u64,
+        observe_timeout: u64,
+    ) -> (String, std::path::PathBuf) {
+        let (out, dir, _code) = run_kill_fault_window_status(
+            systemctl_body,
+            stat_body,
+            prelude,
+            deadline,
+            observe_timeout,
+        );
+        (out, dir)
+    }
+
+    /// As [`run_kill_fault_window`], also returning the script's exit code.
+    fn run_kill_fault_window_status(
+        systemctl_body: &str,
+        stat_body: &str,
+        prelude: &str,
+        deadline: u64,
+        observe_timeout: u64,
+    ) -> (String, std::path::PathBuf, Option<i32>) {
+        // Unique per call: parallel tests may share (deadline, observe) pairs
+        // and each call now wipes its own dir first.
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rn-killfw-{}-{}-{}-{}",
+            std::process::id(),
+            deadline,
+            observe_timeout,
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let bin = dir.join("bin");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&bin).expect("bin dir");
+        let sock = dir.join("rustynetd.sock");
+        let _ = std::os::unix::net::UnixListener::bind(&sock).expect("bind fake socket");
+        let ino_state = dir.join("ino");
+        std::fs::write(&ino_state, "424242\n").expect("ino");
+        let systemctl = bin.join("systemctl");
+        std::fs::write(&systemctl, systemctl_body).expect("systemctl");
+        let stat = bin.join("stat");
+        std::fs::write(&stat, stat_body).expect("stat");
+        for tool in [&systemctl, &stat] {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(tool).expect("stat tool").permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(tool, perms).expect("chmod");
+        }
+        let frag = render_kill_fault_window_sh(
+            "rustynetd.service",
+            sock.to_str().expect("utf8"),
+            deadline,
+            observe_timeout,
+        );
+        let script = format!(
+            "RDY_KILLFW_DIR={}\nRDY_INO={}\nPATH={}:\"$PATH\"\nexport PATH RDY_KILLFW_DIR RDY_INO\n{prelude}\n{frag}\nprintf 'recovered=%s\\n' \"$recovered\"\nprintf 'KILLFW_DONE\\n'\n",
+            shell_quote(dir.to_str().expect("utf8")),
+            shell_quote(ino_state.to_str().expect("utf8")),
+            shell_quote(bin.to_str().expect("utf8")),
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .output()
+            .expect("run sh");
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            dir,
+            out.status.code(),
+        )
+    }
+
+    // THE katana-u26 witness: `systemctl kill -s KILL` raced systemd's
+    // reaping — the guest journal shows the kill at 08:00:42 and the exit
+    // processed at 08:00:44 — while the SIGKILLed daemon could not unlink its
+    // socket file. The old inline recovery poll treated `is-active` (still
+    // active) + the stale socket as instant recovery, collapsing the 90s
+    // fault window to ~1s and killing tcpdump before it opened the device.
+    // Replay: is-active NEVER flips, inode NEVER changes. The old logic
+    // printed `recovered=true` here; the new fragment must print
+    // `fault_observed=false` / `recovered=false` (fail closed), bounded.
+    #[test]
+    fn kill_fault_window_stale_active_and_stale_socket_never_recovers() {
+        let systemctl = "#!/bin/sh\ncase \"$1\" in\n  is-active) exit 0 ;;\n  kill) exit 0 ;;\n  *) exit 0 ;;\nesac\n";
+        let stat = "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    %i) shift; cat \"$RDY_INO\"; exit 0 ;;\n    *) shift ;;\n  esac\ndone\nexit 1\n";
+        let started = std::time::Instant::now();
+        let (out, dir) = run_kill_fault_window(systemctl, stat, "", 1, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.contains("fault_observed=false"), "{out}");
+        assert!(out.contains("recovered=false"), "{out}");
+        assert!(
+            !out.contains("recovered=true"),
+            "a never-reaped daemon with a stale socket must NOT read as recovered: {out}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "observation must be bounded"
+        );
+    }
+
+    // The healthy path: the fault lands (is-active flips false), the daemon
+    // restarts (active again) and binds a FRESH socket (inode changes).
+    // Recovery must be observed as true within the deadline.
+    #[test]
+    fn kill_fault_window_observes_fault_and_recovers_on_fresh_socket() {
+        // Fake systemctl: `kill -s KILL <svc>` deactivates, a background
+        // restart reactivates after 1s. Fake stat returns the CURRENT inode
+        // from a state file the restart bumps.
+        let systemctl = "#!/bin/sh\nif [ \"$1\" = \"kill\" ]; then\n  printf '0\\n' > \"$RDY_KILLFW_DIR/active\"\n  printf '777777\\n' > \"$RDY_INO\"\n  ( sleep 1; printf '1\\n' > \"$RDY_KILLFW_DIR/active\" ) &\n  exit 0\nfi\nif [ \"$1\" = \"is-active\" ]; then\n  if [ -f \"$RDY_KILLFW_DIR/active\" ] && [ \"$(cat \"$RDY_KILLFW_DIR/active\")\" = \"1\" ]; then exit 0; fi\n  exit 1\nfi\nexit 0\n";
+        let stat = "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    %i) shift; cat \"$RDY_INO\"; exit 0 ;;\n    *) shift ;;\n  esac\ndone\nexit 1\n";
+        let (out, dir) = run_kill_fault_window(
+            systemctl,
+            stat,
+            "printf '1\\n' > \"$RDY_KILLFW_DIR/active\"",
+            5,
+            3,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.contains("fault_observed=true"), "{out}");
+        assert!(out.contains("recovered=true"), "{out}");
+        assert!(out.contains("KILLFW_DONE"), "{out}");
+    }
+
+    const FAKE_STAT: &str = "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    %i) shift; cat \"$RDY_INO\"; exit 0 ;;\n    *) shift ;;\n  esac\ndone\nexit 1\n";
+
+    // Fault observed via is-active flipping, daemon comes back active, but the
+    // socket inode NEVER changes (stale socket). Recovery requires a fresh
+    // inode, so this must read fault_observed=true, recovered=false. A weaker
+    // recovery condition (active + socket present) would print recovered=true.
+    #[test]
+    fn kill_fault_window_active_again_but_stale_inode_not_recovered() {
+        let systemctl = "#!/bin/sh\nif [ \"$1\" = \"kill\" ]; then\n  printf '0\\n' > \"$RDY_KILLFW_DIR/active\"\n  ( sleep 1; printf '1\\n' > \"$RDY_KILLFW_DIR/active\" ) &\n  exit 0\nfi\nif [ \"$1\" = \"is-active\" ]; then\n  if [ -f \"$RDY_KILLFW_DIR/active\" ] && [ \"$(cat \"$RDY_KILLFW_DIR/active\")\" = \"1\" ]; then exit 0; fi\n  exit 1\nfi\nexit 0\n";
+        let (out, dir) = run_kill_fault_window(
+            systemctl,
+            FAKE_STAT,
+            "printf '1\\n' > \"$RDY_KILLFW_DIR/active\"",
+            3,
+            3,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.contains("fault_observed=true"), "{out}");
+        assert!(out.contains("recovered=false"), "{out}");
+        assert!(!out.contains("recovered=true"), "{out}");
+    }
+
+    // A restart faster than one poll: `kill` bumps the inode while is-active
+    // exits 0 throughout. The inode alone must prove the fault landed
+    // (fault_observed=true) and the fresh inode proves recovery. An
+    // is-active-only observation would print fault_observed=false here.
+    #[test]
+    fn kill_fault_window_fast_restart_observed_by_inode_only() {
+        let systemctl = "#!/bin/sh\nif [ \"$1\" = \"kill\" ]; then\n  printf '777777\\n' > \"$RDY_INO\"\n  exit 0\nfi\nexit 0\n";
+        let (out, dir) = run_kill_fault_window(systemctl, FAKE_STAT, "", 5, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(out.contains("fault_observed=true"), "{out}");
+        assert!(out.contains("recovered=true"), "{out}");
+    }
+
+    // Review MUST-fix: if the pre-fault `stat` fails, socket_ino_before is
+    // empty and ANY later readable inode -- including the unchanged stale one --
+    // differs from "", so the fragment used to declare fault_observed=true and
+    // then recovered=true against a daemon that was never verified to restart.
+    // Replay: the FIRST stat fails, every later stat returns the same stale
+    // inode, systemctl always reports active. The precondition guard must abort
+    // BEFORE the kill: no fault_signal, no recovered=true, nonzero exit.
+    #[test]
+    fn kill_fault_window_unreadable_pre_fault_inode_aborts_before_kill() {
+        let systemctl = "#!/bin/sh\ncase \"$1\" in\n  kill) printf 'KILLED\\n' >> \"$RDY_KILLFW_DIR/killed\"; exit 0 ;;\n  *) exit 0 ;;\nesac\n";
+        let stat = "#!/bin/sh\nn=0\n[ -f \"$RDY_KILLFW_DIR/statn\" ] && n=\"$(cat \"$RDY_KILLFW_DIR/statn\")\"\nn=$((n + 1))\nprintf '%s\\n' \"$n\" > \"$RDY_KILLFW_DIR/statn\"\nif [ \"$n\" -eq 1 ]; then exit 1; fi\ncat \"$RDY_INO\"\nexit 0\n";
+        let (out, dir, code) = run_kill_fault_window_status(systemctl, stat, "", 3, 2);
+        let killed = dir.join("killed").exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            out.contains("fault_precondition=socket_inode_unreadable"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("fault_signal="),
+            "no fault may be signalled: {out}"
+        );
+        assert!(!killed, "systemctl kill must never run: {out}");
+        assert!(!out.contains("recovered=true"), "{out}");
+        assert!(!out.contains("KILLFW_DONE"), "{out}");
+        assert!(
+            matches!(code, Some(c) if c != 0),
+            "the precondition failure must exit nonzero: {code:?} {out}"
+        );
+    }
+
+    // The redirect order matters under dash: `< file 2>/dev/null` opens the
+    // file BEFORE stderr is silenced, so a missing file printed an open error.
+    #[test]
+    fn snippet_pipelines_silence_stderr_before_opening_the_file() {
+        for frag in [
+            render_tcpdump_readiness_wait_sh("\"$E\"", 1),
+            render_capture_leak_tally_sh("\"$C\"", "\"$E\"", "L", "K", "R"),
+        ] {
+            assert!(frag.contains("2>/dev/null < "), "{frag}");
+            assert!(!frag.contains("< \"$E\" 2>/dev/null"), "{frag}");
+        }
+    }
+
+    // Both live fault scripts must wire the fragments in: the readiness wait
+    // replaces the blind `sleep 2` after the tcpdump spawn, and the kill
+    // script must carry the observation guard + socket-inode freshness.
+    #[test]
+    fn fault_scripts_use_readiness_wait_and_kill_observation_guard() {
+        let kill = kill_script();
+        let sigstop = sigstop_script();
+        for (name, script) in [("kill", &kill), ("sigstop", &sigstop)] {
+            assert!(
+                script.contains("tcpdump_ready="),
+                "{name}: readiness wait must be wired in:\n{script}"
+            );
+            assert!(
+                !script.contains("\nsleep 2\nstart_unix="),
+                "{name}: blind sleep 2 must be gone:\n{script}"
+            );
+        }
+        // Readiness must precede fault injection in both scripts.
+        for (name, script, fault) in [
+            ("kill", &kill, "fault_signal=KILL"),
+            ("sigstop", &sigstop, "fault_signal=STOP"),
+        ] {
+            let ready = script.find("tcpdump_ready=").expect("readiness present");
+            let fault_at = script.find(fault).expect("fault signal present");
+            assert!(
+                ready < fault_at,
+                "{name}: tcpdump_ready= must appear before {fault}"
+            );
+            assert!(
+                script.contains("timeout \"$((deadline + 45))\" tcpdump"),
+                "{name}: target tcpdump timeout must be deadline + 45"
+            );
+        }
+        assert!(
+            kill.contains("fault_observed=false") && kill.contains("socket_ino_before"),
+            "kill script must observe the fault and pin the pre-fault socket inode:\n{kill}"
+        );
+        let guard = kill
+            .find("fault_precondition=socket_inode_unreadable")
+            .expect("precondition guard present");
+        let kill_at = kill.find("systemctl kill").expect("kill present");
+        assert!(
+            guard < kill_at,
+            "guard must precede systemctl kill:\n{kill}"
+        );
     }
 }
