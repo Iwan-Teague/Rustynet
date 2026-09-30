@@ -46,3 +46,10 @@ The VM is too small to compile Rustynet; the lab normally builds on each guest. 
 - **Credit and quota.** The subscription runs on student credit, and a deallocated VM ends a run badly. Stop the VM between runs only if the owner wants to save credit. A deallocated VM can lose its dynamic public address, which silently breaks the dataplane endpoint in the overlay until it is updated. The tailnet address survives.
 - **Exposure.** The public address answers only on the Rustynet UDP ports, and only to katana's address. Lab keys placed on the VM are lab-only material.
 - **Terms.** It is a university subscription; use it within its terms. Testing one's own software is the intended use.
+
+## Update 2026-09-30 (state and host changes)
+
+- **VM running again.** `az vm start` succeeded on 2026-09-30 (~12:40Z; the 2026-09-29 `ZonalAllocationFailed` was transient). Tailnet address unchanged (100.109.160.10); reachable from the Mac and from katana with the katana-lab key. The public IP (68.221.26.30, static, zone 2) is unchanged, so the overlay `dataplane_endpoint` stays valid.
+- **Tailscale netfilter off (owner decision, 2026-09-30).** The VM's `ts-input` chain dropped `100.64.0.0/10` arriving on any non-`tailscale0` interface, which is exactly the Rustynet mesh range. Applied `tailscale set --netfilter-mode=off` on the VM (reversible with `--netfilter-mode=on`); the `ts-input`/`ts-forward` chains are gone and management SSH is unaffected. The VM's only inbound exposure remains the NSG (UDP from katana, no public SSH).
+- **Binaries.** katana's glibc (2.41) is newer than the VM's (2.39), so a katana-native build may not load on the VM. Owner chose (2026-09-30) to cross-build on the Mac (zig + zigbuild present) rather than install zig on katana, so the first run waits for Mac AC power (owner battery rule).
+- **Landed since the record was written:** the overlay loader and `dataplane_endpoint` (b52r1, commit 900f82d59).

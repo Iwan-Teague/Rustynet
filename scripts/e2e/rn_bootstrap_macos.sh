@@ -79,7 +79,7 @@ RELEASE_MANIFEST_PATH=""
 # --verifier-key-hex / --verifier-key-file always overrides it. The matching
 # PRIVATE signing seed is held by the owner only and never appears in this
 # tree.
-readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723"
+readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe"
 
 usage() {
   cat >&2 <<'USAGE'

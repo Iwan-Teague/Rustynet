@@ -152,7 +152,7 @@ readonly BUILD_DIR="/private/var/tmp/rustynet-build-$$"
 # verification path below. An explicit RUSTYNET_RELEASE_PINNED_KEY_HEX /
 # RUSTYNET_RELEASE_PINNED_KEY_FILE always overrides it. The matching PRIVATE
 # signing seed is held by the owner only and never appears in this tree.
-readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723"
+readonly RUSTYNET_DEFAULT_RELEASE_VERIFIER_KEY_HEX="7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe"
 
 # On Apple Silicon brew lives at /opt/homebrew; on Intel at /usr/local.
 BREW_PREFIX=""

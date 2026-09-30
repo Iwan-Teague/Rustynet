@@ -2800,7 +2800,7 @@ mod tests {
     /// these scripts may embed; the matching private seed is owner-held and
     /// never enters this tree.
     const AQ247_OWNER_RELEASE_VERIFIER_KEY_HEX: &str =
-        "720d723f9452e7f0a4a150f3c96811b19c98b4b8179d62e9a238c9e5c7ad8723";
+        "7bb5f1629b7b9eb48bdb94633d092e796a2a8ba69903cc3e432e1a33c05016fe";
 
     #[test]
     fn aq247_bootstrap_pins_owner_release_verifier_key_as_embedded_default() {

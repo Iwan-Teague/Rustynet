@@ -203,6 +203,7 @@ jobs:
         env:
           TARGETS: "x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc"
           NAMES: "rustynetd rustynet rustynet-relay"
+          SEED_MODE: ${{ steps.seed.outputs.mode }}
         run: |
           set -euo pipefail
           args=()
@@ -226,6 +227,16 @@ jobs:
             --output dist/release-manifest.json
           VKEY="$(python3 -c "import json;print(json.load(open('dist/release-manifest.json'))['verifier_key_hex'])")"
           printf '%s\n' "$VKEY" > dist/release-manifest.verifier-key.hex
+          # Gate: the key the seed produces must equal the key pinned in the
+          # macOS bootstrap scripts. The verify below trusts the manifest's OWN
+          # key, so without this a seed/pin mismatch passes CI and the first
+          # failure is a Mac bootstrap refusing the release. Real seed => fail
+          # closed; throwaway DEMO seed can never match => warn only.
+          if [ "$SEED_MODE" = "release" ]; then
+            bash scripts/ci/check_release_verifier_key_pin.sh "$VKEY"
+          else
+            echo "::warning::demo seed — skipping the bootstrap verifier-key pin check (a throwaway key cannot match the pin)."
+          fi
           # Gate: the manifest signature + every artifact digest must verify.
           "$CLI" ops verify-release-manifest \
             --manifest dist/release-manifest.json \
