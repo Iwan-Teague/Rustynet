@@ -640,6 +640,27 @@ fn run() -> Result<(), String> {
     ensure_daemon_services_ready(&ctx, &client_host)?;
     ensure_daemon_services_ready(&ctx, &blind_exit_host)?;
 
+    // Fence the node-local assignment-refresh units out of the swap window.
+    // Every guest runs rustynetd-assignment-refresh.timer (60s cadence) whose
+    // ExecStart self-issues and installs a fresh signed assignment/traversal
+    // pair from the node-local env. Left running, it races the exit-signed
+    // pairs this test distributes: in katana-u23 an aux-node timer run
+    // installed its self-signed verifier (pub mtime 01:22:45.596) between
+    // this test's cycle-B bundle installs, so the daemon read a verifier and
+    // a bundle signed by DIFFERENT keys, failed signature verification, hit
+    // "traversal state missing while peers are managed" (rustynetd
+    // refresh_signed_state_with_reason), escalated to restrict_permanent
+    // within ~6 seconds, and the stage failed. enforce_host re-arms the timer
+    // (it reinstalls and starts the units), so the fence must engage here —
+    // after the ensure_daemon_services_ready loop, before the FIRST artifact
+    // distribution — and hold until the whole toggle sequence is done. This
+    // is the same hazard live_linux_two_hop_test fenced at swap time; the
+    // LAN-toggle test never got the fence. Unlike two_hop the daemon STAYS
+    // up: every subsequent step drives it through the IPC socket.
+    logger.line("Quiescing node-local assignment-refresh units for the bundle swap")?;
+    let bundle_swap_fence =
+        BundleSwapFence::quiesce(&ctx, &[&exit_host, &client_host, &blind_exit_host])?;
+
     logger
         .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")?;
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
@@ -952,6 +973,9 @@ fn run() -> Result<(), String> {
     if overall != "pass" {
         return Err("LAN toggle test overall status: fail".to_owned());
     }
+    // Released only after the full toggle sequence has succeeded; on any
+    // earlier error path the armed guard's Drop restores every host instead.
+    bundle_swap_fence.release()?;
     Ok(())
 }
 
@@ -2085,6 +2109,114 @@ fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<()
     Ok(())
 }
 
+/// Stop the node-local assignment-refresh timer and its service unit on
+/// `target` so the multi-artifact signed-bundle swap is the only writer of
+/// the node's signed state for the duration of the swap.
+///
+/// The timer's ExecStart (`ops refresh-assignment`) self-issues and installs
+/// a verifier + bundle pair signed with the NODE's own key back-to-back; this
+/// test installs a pair signed with the EXIT's key. A timer run landing
+/// between this test's installs leaves the two files signed by different
+/// keys, which the daemon fail-closes on (traversal signature verification
+/// failure -> "traversal state missing while peers are managed" ->
+/// restrict_permanent). The timer is stopped BEFORE its service so the timer
+/// cannot immediately re-trigger the run being stopped.
+///
+/// Deliberately a fence rather than a re-ordering, mirroring
+/// live_linux_two_hop_test: staging would only SHRINK the inconsistent
+/// window, quiescing ELIMINATES it. Unlike two_hop the daemon itself is NOT
+/// stopped: the LAN-toggle assertions drive the daemon through the IPC
+/// socket continuously, and enforce_host re-arms the units afterwards, so
+/// the fence engages after the ensure_daemon_services_ready loop.
+///
+/// Idempotent: `systemctl stop` on an inactive unit succeeds as a no-op.
+/// Every unit name is a fixed literal — no untrusted interpolation.
+fn quiesce_node_for_bundle_swap(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    for unit in [
+        "rustynetd-assignment-refresh.timer",
+        "rustynetd-assignment-refresh.service",
+    ] {
+        ctx.run_root(target, &["systemctl", "stop", unit])?;
+    }
+    Ok(())
+}
+
+/// Restart the periodic assignment-refresh timer after the swap sequence has
+/// completed, restoring the node to the state the stage found it in.
+///
+/// `systemctl start` on a running unit succeeds as a no-op, so both the
+/// success path and the Drop path are safe to repeat.
+fn resume_assignment_refresh_timer(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    ctx.run_root(
+        target,
+        &["systemctl", "start", "rustynetd-assignment-refresh.timer"],
+    )
+}
+
+/// RAII guard making the quiesce/resume pair exception-safe (mirrors
+/// live_linux_two_hop_test's BundleSwapFence, minus the daemon restart:
+/// this test never stops the daemon).
+///
+/// The swap between quiesce and resume spans a long sequence of fallible SSH
+/// steps, every one of which propagates with `?`. Without this guard any of
+/// them would abort the stage leaving the guests' refresh timers stopped BY
+/// THE TEST — confounding exactly the root-causing this fence exists to make
+/// possible, and failing a later stage on
+/// "rustynetd-assignment-refresh.timer is inactive" for an unrelated reason.
+/// So restoration is unconditional on the error path (`drop` without
+/// `release`).
+struct BundleSwapFence {
+    ctx: LiveLabContext,
+    hosts: Vec<String>,
+    released: bool,
+}
+
+impl BundleSwapFence {
+    /// Stop the refresh timer + service on every host, returning the guard
+    /// that will restore them. Constructed before the loop so a failure
+    /// part-way through still restores the hosts already quiesced when the
+    /// guard drops.
+    fn quiesce(ctx: &LiveLabContext, hosts: &[&str]) -> Result<Self, String> {
+        let guard = Self {
+            ctx: ctx.clone(),
+            hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+            released: false,
+        };
+        for host in &guard.hosts {
+            quiesce_node_for_bundle_swap(&guard.ctx, host)?;
+        }
+        Ok(guard)
+    }
+
+    /// Success-path release. `released` is set only AFTER every host is
+    /// resumed; setting it first would disarm the guard before doing the
+    /// work, so a failure on host 2 of 3 would leave host 3 quiesced while
+    /// Drop no-ops. On an early error the guard stays armed and Drop
+    /// restores every host (idempotent starts make re-resume harmless).
+    fn release(mut self) -> Result<(), String> {
+        for host in &self.hosts {
+            resume_assignment_refresh_timer(&self.ctx, host)?;
+        }
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for BundleSwapFence {
+    fn drop(&mut self) {
+        if self.released {
+            return;
+        }
+        for host in &self.hosts {
+            if let Err(err) = resume_assignment_refresh_timer(&self.ctx, host) {
+                eprintln!(
+                    "warning: could not restart rustynetd-assignment-refresh.timer on {host} after an aborted bundle swap: {err}"
+                );
+            }
+        }
+    }
+}
+
 fn managed_dns_base_records(
     exit_node_id: &str,
     client_node_id: &str,
@@ -2240,6 +2372,120 @@ mod tests {
         assert!(super::validate_ssh_allow_cidrs(super::LAN_TEST_CIDR).is_err());
         assert!(super::validate_ssh_allow_cidrs("192.168.64.0/24").is_ok());
         assert!(super::validate_ssh_allow_cidrs("192.168.64.0/24, 10.0.7.0/24").is_ok());
+    }
+
+    #[test]
+    fn lan_toggle_bundle_swap_fence_engages_before_first_artifact_refresh() {
+        // katana-u23 root cause: this test distributed exit-signed
+        // assignment/traversal pairs while every guest's 60s
+        // rustynetd-assignment-refresh.timer kept self-issuing replacement
+        // pairs, so the daemon read a torn (mismatched-signer) pair,
+        // fail-closed with "traversal state missing while peers are managed",
+        // and escalated to restrict_permanent. The fence must therefore be
+        // ENGAGED before the first refresh_signed_state_artifacts call and
+        // RELEASED after the last one; parsing this file's own source makes
+        // the ordering claim fail loudly on any regression that reverts the
+        // fence or reorders it after the first swap.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        // Bound the scan to run()'s body: the refresh helper functions below
+        // run() also contain call-site text and would defeat the ordering
+        // assertions.
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let fence_engage = run_body
+            .find("BundleSwapFence::quiesce(")
+            .expect("run() must engage the BundleSwapFence before the signed-state swap");
+        let release = run_body
+            .find("bundle_swap_fence.release()")
+            .expect("run() must release the BundleSwapFence on the success path");
+        let first_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger")
+            .expect("run() must drive refresh_signed_state_artifacts");
+        let last_refresh = run_body
+            .rfind("refresh_signed_state_artifacts(&ctx, &logger")
+            .expect("run() must drive refresh_signed_state_artifacts");
+        assert!(
+            fence_engage < first_refresh,
+            "the bundle-swap fence must be engaged BEFORE the first \
+             refresh_signed_state_artifacts call; a timer self-issue landing \
+             inside the swap window tears the signed pair (katana-u23)"
+        );
+        assert!(
+            release > last_refresh,
+            "the bundle-swap fence must stay armed across the LAST \
+             refresh_signed_state_artifacts call"
+        );
+        // The wait helpers drive refresh_signed_state_artifacts at runtime
+        // (via maybe_refresh_signed_state_artifacts inside them), so every
+        // wait call site in run() is an artifact refresh too and must sit
+        // inside the armed window. The direct-call scan above cannot see
+        // these: they live in helpers defined after run().
+        for helper in ["wait_for_lan_access_state(", "wait_for_lan_probe_state("] {
+            let first_wait = run_body
+                .find(helper)
+                .expect("run() must drive the LAN-state wait helper");
+            let last_wait = run_body
+                .rfind(helper)
+                .expect("run() must drive the LAN-state wait helper");
+            assert!(
+                fence_engage < first_wait && release > last_wait,
+                "every {helper} call site in run() must lie inside the \
+                 armed bundle-swap window; its runtime artifact refreshes \
+                 would otherwise run un-fenced (katana-u23)"
+            );
+        }
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        assert!(fence_engage < impl_end && release < impl_end);
+    }
+
+    #[test]
+    fn lan_toggle_fence_stops_timer_before_service_and_restores_it() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
+        let impl_text = &source[..impl_end];
+        // The timer is stopped BEFORE its service so the timer cannot
+        // immediately re-trigger the run being stopped.
+        let timer_needle = "\"rustynetd-assignment-refresh.timer\"";
+        let service_needle = "\"rustynetd-assignment-refresh.service\"";
+        let timer_pos = impl_text
+            .find(timer_needle)
+            .expect("quiesce must name the assignment-refresh timer unit");
+        let service_pos = impl_text
+            .find(service_needle)
+            .expect("quiesce must also stop the assignment-refresh service unit");
+        assert!(
+            timer_pos < service_pos,
+            "the timer must be stopped before the service unit"
+        );
+        // Both quiesce (systemctl stop) and restore (systemctl start) paths
+        // exist, and the Drop guard is armed via `released`.
+        assert!(impl_text.contains("\"systemctl\", \"stop\", unit"));
+        assert!(
+            impl_text
+                .contains("&[\"systemctl\", \"start\", \"rustynetd-assignment-refresh.timer\"]")
+        );
+        assert!(
+            impl_text.contains("fn drop(&mut self)") && impl_text.contains("if self.released"),
+            "the fence must restore the timer unconditionally via an armed Drop guard"
+        );
+        // The daemon itself is deliberately NOT stopped here (unlike two_hop):
+        // banning the daemon stop keeps the fence from breaking the IPC-driven
+        // toggle assertions.
+        let quiesce_start = impl_text
+            .find("fn quiesce_node_for_bundle_swap(")
+            .expect("quiesce helper must exist");
+        let quiesce_end = impl_text[quiesce_start..]
+            .find("\n}\n")
+            .map(|offset| quiesce_start + offset)
+            .expect("quiesce helper must terminate");
+        assert!(
+            !impl_text[quiesce_start..quiesce_end].contains("rustynetd.service"),
+            "the lan-toggle fence must NOT stop rustynetd.service; the toggle \
+             assertions drive the daemon through its IPC socket"
+        );
     }
 
     #[test]
