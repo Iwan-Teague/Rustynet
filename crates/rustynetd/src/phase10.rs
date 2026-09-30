@@ -4118,6 +4118,13 @@ pub struct MacosCommandSystem {
     /// applies and tests, where the serve loop is already live or the
     /// failure is the expected result).
     dns_probe_servicer: Option<std::sync::Arc<crate::daemon::DnsProbeServicer>>,
+    /// Loopback endpoint the apply-path DNS liveness probe dials. Production
+    /// default is the scoped-resolver port (`127.0.0.1:53535`, unchanged);
+    /// tests inject a guaranteed-dead endpoint so a negative probe cannot be
+    /// answered by a DIFFERENT process that happens to own :53535 at that
+    /// moment (nextest runs every test in its own process, so the in-process
+    /// `dns_probe_port_lock` cannot serialise them).
+    dns_probe_endpoint: SocketAddr,
 }
 
 impl MacosCommandSystem {
@@ -4166,6 +4173,10 @@ impl MacosCommandSystem {
                 std::path::Path::new(crate::daemon::default_state_path()),
             ),
             dns_probe_servicer: None,
+            dns_probe_endpoint: SocketAddr::from((
+                [127, 0, 0, 1],
+                crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT,
+            )),
         })
     }
 
@@ -4994,7 +5005,11 @@ impl MacosCommandSystem {
             // QNAME "rustynet." (length-prefixed labels), QTYPE=A, QCLASS=IN.
             0x07, b'r', b'u', b's', b't', b'y', b'n', b'e', b't', 0x00, 0x00, 0x01, 0x00, 0x01,
         ];
-        let port = crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT;
+        // The dial target is the injectable endpoint field; for the
+        // production default this is exactly `127.0.0.1:53535`, so the
+        // rendered error strings are byte-identical to the pre-injection
+        // ones (they interpolate `{endpoint}`).
+        let endpoint = self.dns_probe_endpoint;
         let socket = UdpSocket::bind("127.0.0.1:0").map_err(|err| {
             SystemError::DnsApplyFailed(format!(
                 "loopback DNS resolver probe socket bind failed: {err}"
@@ -5005,14 +5020,14 @@ impl MacosCommandSystem {
             .map_err(|err| {
                 SystemError::DnsApplyFailed(format!("loopback DNS resolver probe timeout: {err}"))
             })?;
-        socket.connect(("127.0.0.1", port)).map_err(|err| {
+        socket.connect(endpoint).map_err(|err| {
             SystemError::DnsApplyFailed(format!(
-                "no loopback DNS resolver is listening on 127.0.0.1:{port}: {err}"
+                "no loopback DNS resolver is listening on {endpoint}: {err}"
             ))
         })?;
         socket.send(&PROBE_QUERY).map_err(|err| {
             SystemError::DnsApplyFailed(format!(
-                "loopback DNS resolver probe send to 127.0.0.1:{port} failed: {err}"
+                "loopback DNS resolver probe send to {endpoint} failed: {err}"
             ))
         })?;
         // M1: during bootstrap the main serve loop cannot be running (the
@@ -5042,7 +5057,7 @@ impl MacosCommandSystem {
                 Ok(len) => {
                     if len < 12 || reply[0] != PROBE_QUERY[0] || reply[1] != PROBE_QUERY[1] {
                         return Err(SystemError::DnsApplyFailed(format!(
-                            "127.0.0.1:{port} answered with a malformed DNS reply ({len} bytes)"
+                            "{endpoint} answered with a malformed DNS reply ({len} bytes)"
                         )));
                     }
                     return Ok(());
@@ -5053,13 +5068,13 @@ impl MacosCommandSystem {
                 {
                     if std::time::Instant::now() >= deadline {
                         return Err(SystemError::DnsApplyFailed(format!(
-                            "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
+                            "the loopback DNS resolver on {endpoint} did not answer: {err}"
                         )));
                     }
                 }
                 Err(err) => {
                     return Err(SystemError::DnsApplyFailed(format!(
-                        "the loopback DNS resolver on 127.0.0.1:{port} did not answer: {err}"
+                        "the loopback DNS resolver on {endpoint} did not answer: {err}"
                     )));
                 }
             }
@@ -19628,13 +19643,33 @@ mod tests {
         assert!(err.to_string().contains("DNS protection is not active"));
     }
 
-    /// The probe targets the fixed loopback port 53535. Tests that BIND that
-    /// port and tests that require it to be FREE must not race each other
-    /// inside one test binary, so they share this lock.
+    /// The production probe targets the fixed loopback port 53535. Only the
+    /// test that BINDS that port (`macos_probe_answered_via_bootstrap_servicer`)
+    /// still takes this lock: it serialises the bind against other tests in
+    /// the SAME process. Cross-process serialisation is nextest's job —
+    /// `.config/nextest.toml` pins every `macos_(probe|scoped_posture)` test
+    /// of this package into the single-threaded `dns-probe-port` test group.
     #[cfg(target_os = "macos")]
     fn dns_probe_port_lock() -> &'static std::sync::Mutex<()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    /// Bind an ephemeral UDP socket that nothing ever reads, and return it
+    /// with its address: a probe target that cannot be answered by anyone
+    /// (the probe datagram is buffered by the kernel and never drained, and
+    /// no other process can steal the port while this test holds the socket).
+    /// Retries if the OS hands back the production probe port itself — 53535
+    /// sits inside the macOS ephemeral range.
+    #[cfg(target_os = "macos")]
+    fn bind_dead_probe_endpoint() -> (std::net::UdpSocket, SocketAddr) {
+        loop {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("ephemeral bind");
+            let endpoint = socket.local_addr().expect("ephemeral local addr");
+            if endpoint.port() != crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT {
+                return (socket, endpoint);
+            }
+        }
     }
 
     /// M1 (MacosClientResolverNotServingDiagnosisReview_2026-09-02 §3.3): a
@@ -19671,13 +19706,14 @@ mod tests {
     /// M1 negative control: a servicer whose socket does NOT own the probe
     /// port answers nothing, so the probe still fails closed under its
     /// existing 2 s bound — the servicer adds servicing, never success by
-    /// fiat.
+    /// fiat. The probe dials an INJECTED dead endpoint (a bound-but-never-
+    /// read socket this test holds): under nextest every test is its own
+    /// process, so probing the production :53535 would let any concurrent
+    /// process that owns that port answer this probe and defeat the control.
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_probe_servicer_cannot_answer_without_the_port() {
-        let _guard = dns_probe_port_lock()
-            .lock()
-            .expect("dns probe port lock poisoned");
+        let (_dead_socket, dead_endpoint) = bind_dead_probe_endpoint();
         // Bound to an EPHEMERAL port, never :53535: the servicer drains a
         // socket no probe can reach.
         let socket =
@@ -19687,6 +19723,7 @@ mod tests {
             .expect("nonblocking should succeed");
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
             .expect("macos system should construct");
+        system.dns_probe_endpoint = dead_endpoint;
         system.dns_probe_servicer =
             Some(std::sync::Arc::new(crate::daemon::DnsProbeServicer::new(
                 socket,
@@ -19696,31 +19733,63 @@ mod tests {
             .verify_loopback_resolver_live()
             .expect_err("a servicer that owns no listener must not answer the probe");
         assert!(
-            err.to_string().contains("127.0.0.1:53535"),
-            "the error must name the unanswerable resolver endpoint: {err}"
+            err.to_string().contains(dead_endpoint.to_string().as_str()),
+            "the error must name the injected unanswerable endpoint: {err}"
+        );
+        assert!(
+            !err.to_string().contains("127.0.0.1:53535"),
+            "the injected endpoint, not the production default, must be named: {err}"
+        );
+    }
+
+    /// The injected-dead-endpoint tests assert the INJECTED address, so this
+    /// pure test is what pins the production default (and with it the exact
+    /// production error text, e.g. daemon.rs's
+    /// "the loopback DNS resolver on 127.0.0.1:53535 did not answer" matchers):
+    /// `new()` must keep dialling the scoped-resolver loopback port.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_dns_probe_endpoint_defaults_to_production_loopback_port() {
+        let system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
+            .expect("macos system should construct");
+        assert_eq!(
+            system.dns_probe_endpoint.to_string(),
+            "127.0.0.1:53535",
+            "the production probe endpoint must stay the loopback resolver default"
+        );
+        assert_eq!(
+            system.dns_probe_endpoint.port(),
+            crate::linux_dns_protect::MACOS_SCOPED_RESOLVER_LOOPBACK_PORT,
+            "the production probe endpoint must track the scoped-resolver port const"
         );
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_scoped_posture_fails_closed_without_live_resolver() {
-        let _guard = dns_probe_port_lock()
-            .lock()
-            .expect("dns probe port lock poisoned");
+        // The apply-time probe dials an INJECTED dead endpoint (see
+        // `bind_dead_probe_endpoint`): under nextest the production :53535
+        // can be owned by a concurrent process, and a positive answer there
+        // would defeat this negative control too.
+        let (_dead_socket, dead_endpoint) = bind_dead_probe_endpoint();
         let mut system = MacosCommandSystem::new("utun9", "en0", None, false, Vec::new())
             .expect("macos system should construct");
-        // No daemon is bound on 127.0.0.1:53535 in the test process, so the
-        // apply-time probe must fail BEFORE any mutation (review A6): the
-        // scoped resolver file must not be written to point at a dead
-        // listener, and the posture must stay untouched.
+        system.dns_probe_endpoint = dead_endpoint;
+        // The probe must fail BEFORE any mutation (review A6): the scoped
+        // resolver file must not be written to point at a dead listener, and
+        // the posture must stay untouched.
         let err = DataplaneSystem::apply_dns_protection_for_posture(
             &mut system,
             DnsPosture::ScopedResolverOnly,
         )
         .expect_err("scoped posture without a live loopback resolver must fail closed");
         assert!(
-            err.to_string().contains("127.0.0.1:53535"),
-            "the error must name the unanswerable resolver endpoint: {err}"
+            err.to_string().contains(dead_endpoint.to_string().as_str()),
+            "the error must name the injected unanswerable endpoint: {err}"
+        );
+        assert!(
+            !err.to_string().contains("127.0.0.1:53535"),
+            "the injected endpoint, not the production default, must be named: {err}"
         );
         assert_eq!(system.dns_posture, DnsPosture::Untouched);
         assert!(!system.dns_protected);
