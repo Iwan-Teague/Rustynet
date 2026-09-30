@@ -2021,11 +2021,23 @@ impl CrossNetworkSubstrateSetupStage {
         }
         match provider.setup(topology, runners) {
             Ok(handle) => {
+                // The witness must describe the handle ACTUALLY returned, not
+                // the requested topology: a vxlan setup whose participants
+                // all share one underlay /24 provisions no overlay, and
+                // witnessing that as provisioned=true would lie (a102
+                // CORRECTION 2).
+                let provisioned = handle.record.provisioned;
+                let overlay_nodes = handle.record.participants.len();
                 ctx.substrate_record = Some(handle.record.clone());
                 ctx.substrate = Some(handle);
                 // QH-83: the witness is written on EVERY pass path and a
                 // write failure fails the stage.
-                match Self::write_provision_witness(&ctx.report_dir, provider.id(), runners.len()) {
+                match Self::write_provision_witness(
+                    &ctx.report_dir,
+                    provider.id(),
+                    provisioned,
+                    overlay_nodes,
+                ) {
                     Ok(()) => StageOutcome::Passed,
                     Err(err) => {
                         StageOutcome::Failed(format!("substrate witness write failed: {err}"))
@@ -2062,18 +2074,30 @@ impl CrossNetworkSubstrateSetupStage {
         )
     }
 
-    /// QH-83 witness for the overlay-provisioning pass path.
+    /// QH-83 witness for the overlay-provisioning pass path. It reports the
+    /// setup that was ACTUALLY performed, taken from the returned handle: a
+    /// no-overlay pass (every participant inside one underlay /24) is still
+    /// a pass, but the witness must say `provisioned=false overlay_nodes=0`
+    /// and name the reason instead of claiming nodes that were never
+    /// provisioned.
     fn write_provision_witness(
         report_dir: &std::path::Path,
         provider_id: &str,
+        provisioned: bool,
         overlay_nodes: usize,
     ) -> Result<(), String> {
+        let line = if provisioned {
+            format!("substrate_setup={provider_id} provisioned=true overlay_nodes={overlay_nodes}")
+        } else {
+            format!(
+                "substrate_setup={provider_id} provisioned=false overlay_nodes={overlay_nodes} \
+                 no-overlay: all participants share one underlay /24"
+            )
+        };
         crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(
             report_dir,
             StageId::CrossNetworkSubstrateSetup.as_str(),
-            &format!(
-                "substrate_setup={provider_id} provisioned=true overlay_nodes={overlay_nodes}"
-            ),
+            &line,
         )
     }
 }
@@ -2206,7 +2230,20 @@ impl CrossNetworkSubstrateTeardownStage {
             return StageOutcome::Failed(err);
         }
         if !record.provisioned {
-            return StageOutcome::Passed;
+            // QH-83: this pass removes nothing, and the evidence line must
+            // say so — a bare pass over a record that provisioned no overlay
+            // would read as a removal. A witness write failure fails the
+            // stage, like every other pass path.
+            return match crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(
+                &ctx.report_dir,
+                StageId::CrossNetworkSubstrateTeardown.as_str(),
+                "substrate_teardown=nothing-to-remove (not provisioned)",
+            ) {
+                Ok(()) => StageOutcome::Passed,
+                Err(err) => {
+                    StageOutcome::Failed(format!("substrate teardown witness write failed: {err}"))
+                }
+            };
         }
         // Dispatch on what the RECORD says was provisioned, not on what this
         // run selected: an unknown id means we cannot remove it correctly, and
@@ -3753,8 +3790,10 @@ mod tests {
 
         CrossNetworkSubstrateSetupStage::write_no_overlay_witness(&dir, 4)
             .expect("no-overlay witness write");
-        CrossNetworkSubstrateSetupStage::write_provision_witness(&dir, "vxlan", 3)
+        CrossNetworkSubstrateSetupStage::write_provision_witness(&dir, "vxlan", true, 3)
             .expect("provision witness write");
+        CrossNetworkSubstrateSetupStage::write_provision_witness(&dir, "vxlan", false, 0)
+            .expect("no-overlay provision witness write");
 
         let log = std::fs::read_to_string(
             crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
@@ -3771,6 +3810,13 @@ mod tests {
         );
         assert!(
             log.contains("substrate_setup=vxlan provisioned=true overlay_nodes=3"),
+            "{log}"
+        );
+        assert!(
+            log.contains(
+                "substrate_setup=vxlan provisioned=false overlay_nodes=0 \
+                 no-overlay: all participants share one underlay /24"
+            ),
             "{log}"
         );
 
@@ -3791,5 +3837,103 @@ mod tests {
         assert!(!err.is_empty());
 
         let _ = std::fs::remove_file(&blocker);
+    }
+
+    /// A vxlan topology whose participants all share one underlay /24
+    /// provisions NO overlay. The stage still passes (later scenario stages
+    /// skip on that), but the witness must say `provisioned=false
+    /// overlay_nodes=0` — not claim nodes that were never provisioned
+    /// (a102 CORRECTION 2: the old code witnessed `provisioned=true
+    /// overlay_nodes=<runner count>` on every pass path).
+    #[test]
+    fn no_overlay_vxlan_provision_witnesses_an_honest_no_op() {
+        use mock::MockLeafRunner;
+        let dir = std::env::temp_dir().join(format!(
+            "substrate_no_overlay_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ctx = OrchestrationContext::new(Vec::new(), dir.clone(), "net".to_owned());
+        let a = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a)]);
+        // One /24 group: plan_overlay returns no plan, so setup provisions
+        // nothing and must not touch any leaf runner.
+        let topo = topology(&[("a", "192.168.64.10"), ("b", "192.168.64.11")]);
+        assert_eq!(
+            CrossNetworkSubstrateSetupStage::provision(
+                &mut ctx,
+                &VxlanSubstrateProvider,
+                &topo,
+                &runners
+            ),
+            StageOutcome::Passed,
+            "a no-overlay vxlan setup is still a pass"
+        );
+        assert!(a.recorded().is_empty(), "no overlay, no leaf commands");
+        let handle = ctx.substrate.as_ref().expect("handle stored");
+        assert!(!handle.record.provisioned);
+        assert!(handle.record.participants.is_empty());
+
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::CrossNetworkSubstrateSetup.as_str(),
+            ),
+        )
+        .unwrap_or_default();
+        assert!(
+            log.contains(
+                "substrate_setup=vxlan provisioned=false overlay_nodes=0 \
+                 no-overlay: all participants share one underlay /24"
+            ),
+            "witness must report the no-overlay honestly: {log}"
+        );
+        assert!(!log.contains("provisioned=true"), "{log}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A teardown over a record that provisioned no overlay must PASS while
+    /// its evidence line says nothing was removed — a bare pass there would
+    /// read as a removal (a102 CORRECTION 2).
+    #[test]
+    fn teardown_of_an_unprovisioned_record_witnesses_nothing_to_remove() {
+        use mock::MockLeafRunner;
+        let dir = std::env::temp_dir().join(format!(
+            "substrate_teardown_witness_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ctx = OrchestrationContext::new(Vec::new(), dir.clone(), "net".to_owned());
+        ctx.substrate_record = Some(vxlan_record(false));
+        let td_a = MockLeafRunner::default();
+        let td_runners = runner_map(&[("a", &td_a)]);
+        assert_eq!(
+            CrossNetworkSubstrateTeardownStage::teardown_with(&mut ctx, &td_runners, Some("vxlan")),
+            StageOutcome::Passed
+        );
+        assert!(
+            td_a.recorded().is_empty(),
+            "nothing was provisioned, so nothing may be removed"
+        );
+        let log = std::fs::read_to_string(
+            crate::vm_lab::orchestrator::evidence::rust_native_stage_log_path(
+                &dir,
+                StageId::CrossNetworkSubstrateTeardown.as_str(),
+            ),
+        )
+        .unwrap_or_default();
+        assert!(
+            log.contains("substrate_teardown=nothing-to-remove (not provisioned)"),
+            "teardown witness must state there was nothing to remove: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
