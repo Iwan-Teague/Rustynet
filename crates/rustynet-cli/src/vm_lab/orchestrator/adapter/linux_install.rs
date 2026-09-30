@@ -67,23 +67,6 @@ pub fn install_daemon(
         // sanctioned bootstrap mint applies (adapter::mint_bootstrap_node_id).
         .unwrap_or_else(|| super::mint_bootstrap_node_id(alias));
 
-    // Write bootstrap script to a temp file.
-    let script_tmp = write_temp_file("rn_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
-
-    // host-cross-binary: if the orchestrator wrote a prebuilt-binary manifest
-    // for this node (host_cross_build increment 3c/4), ship those binaries and
-    // tell the bootstrap to install them instead of building. Absent manifest =
-    // normal build-on-guest run, unchanged.
-    let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
-        .map_err(|message| AdapterError::Protocol { message })?;
-
-    // Write env file (append the host-cross flags when shipping prebuilts).
-    let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
-    if prebuilt_binaries.is_some() {
-        env_content.push_str("\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR=/tmp/rn_prebuilt\n");
-    }
-    let env_tmp = write_temp_file("rn_bootstrap_env_", ".env", env_content.as_bytes())?;
-
     let short_timeout = Duration::from_secs(30);
     // The source archive is tens of MB and, on a cross-LAN topology, crosses
     // two physical networks — 30s (sized for the tiny script/env files) timed
@@ -92,6 +75,59 @@ pub fn install_daemon(
     let archive_timeout = Duration::from_secs(300);
     let build_timeout = Duration::from_secs(900); // cargo build can take a while
     let socket_timeout = Duration::from_secs(300);
+
+    // host-cross-binary / --prebuilt-node-binaries: if the orchestrator wrote a
+    // prebuilt-binary manifest for this node (host_cross_build increment 3c/4),
+    // ship those binaries and tell the bootstrap to install them instead of
+    // building. Absent manifest = normal build-on-guest run, unchanged. Shipped
+    // FIRST so a failed transfer/verification stops before anything else is
+    // copied, and so the (per-install) remote dir can go into the env file.
+    let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
+        .map_err(|message| AdapterError::Protocol { message })?;
+    let remote = SshPrebuiltRemote {
+        conn,
+        run_timeout: short_timeout,
+        scp_timeout: archive_timeout,
+    };
+    // `shipped` owns the cleanup guard: it is a NAMED binding so the
+    // per-install remote dir is removed when this function returns by ANY path
+    // (every `?` below, a failed bootstrap, success) — and the guard exists from
+    // the instant the ship succeeds, before anything else can fail.
+    let shipped = match &prebuilt_binaries {
+        Some(binaries) => {
+            // `--prebuilt-node-binaries` records the sha256 of each binary in the
+            // run's provenance (read errors if provenance exists but lacks this
+            // alias); re-check the copies on the node against it.
+            let expected = host_cross_build::read_prebuilt_sha256(&ctx.report_dir, alias)
+                .map_err(|message| AdapterError::Protocol { message })?;
+            let shipped = ship_and_guard(&remote, alias, binaries, expected.as_ref())?;
+            eprintln!(
+                "[host-cross] {alias}: shipped {} prebuilt binaries to {}{}",
+                binaries.len(),
+                shipped.dir,
+                if expected.is_some() {
+                    " (sha256 verified)"
+                } else {
+                    ""
+                }
+            );
+            Some(shipped)
+        }
+        None => None,
+    };
+    let prebuilt_dir: Option<String> = shipped.as_ref().map(|s| s.dir.clone());
+
+    // Write bootstrap script to a temp file.
+    let script_tmp = write_temp_file("rn_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())?;
+
+    // Write env file (append the host-cross flags when shipping prebuilts).
+    let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
+    if let Some(dir) = &prebuilt_dir {
+        env_content.push_str(&format!(
+            "\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR={dir}\n"
+        ));
+    }
+    let env_tmp = write_temp_file("rn_bootstrap_env_", ".env", env_content.as_bytes())?;
 
     // SCP the three artefacts.
     ssh::scp_to(
@@ -112,44 +148,6 @@ pub fn install_daemon(
         "/tmp/rn_source.tar.gz",
         archive_timeout,
     )?;
-
-    // host-cross: ship the host-built binaries so the bootstrap installs them and
-    // skips the guest build. Names are preserved (rustynetd / rustynet-cli /
-    // rustynet-relay), matching the bootstrap's RN_PREBUILT_DIR install loop.
-    if let Some(binaries) = &prebuilt_binaries {
-        // Route the mkdir through the validated seam (RemoteCommand + ValidatedArg)
-        // rather than a raw interpolated string at the remote sink.
-        let mkdir = ssh::RemoteCommand::from_args(
-            "host-cross prebuilt dir",
-            &[
-                ValidatedArg::cli_token("mkdir")?,
-                ValidatedArg::cli_token("-p")?,
-                ValidatedArg::path("/tmp/rn_prebuilt")?,
-            ],
-        )?;
-        ssh::run_remote(conn, mkdir.as_str(), short_timeout)?;
-        for bin in binaries {
-            let name =
-                bin.file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or_else(|| AdapterError::Protocol {
-                        message: format!(
-                            "host-cross: prebuilt binary path has no filename: {}",
-                            bin.display()
-                        ),
-                    })?;
-            ssh::scp_to(
-                conn,
-                bin.as_path(),
-                &format!("/tmp/rn_prebuilt/{name}"),
-                archive_timeout,
-            )?;
-        }
-        eprintln!(
-            "[host-cross] {alias}: shipped {} prebuilt binaries to /tmp/rn_prebuilt",
-            binaries.len()
-        );
-    }
 
     // Cleanup temp files (best-effort; ignore errors).
     let _ = std::fs::remove_file(&script_tmp);
@@ -187,6 +185,240 @@ pub fn install_daemon(
         daemon_path: LINUX_RUSTYNETD_PATH.into(),
         service_name: LINUX_SERVICE_NAME.to_owned(),
     })
+}
+
+/// Template for the per-install remote dir the prebuilt binaries are shipped
+/// into (`mktemp -d` fills the `X`s).
+const PREBUILT_REMOTE_DIR_TEMPLATE: &str = "/tmp/rn_prebuilt.XXXXXXXX";
+const PREBUILT_REMOTE_DIR_PREFIX: &str = "/tmp/rn_prebuilt.";
+
+/// The two node operations the prebuilt ship sequence needs, injected so the
+/// command ORDER and the fail-closed stops are unit-testable without ssh.
+trait PrebuiltRemote {
+    fn run(&self, command: &ssh::RemoteCommand) -> Result<String, AdapterError>;
+    fn scp(&self, local: &std::path::Path, remote_path: &str) -> Result<(), AdapterError>;
+}
+
+struct SshPrebuiltRemote<'a> {
+    conn: &'a NodeConnection,
+    run_timeout: Duration,
+    scp_timeout: Duration,
+}
+
+impl PrebuiltRemote for SshPrebuiltRemote<'_> {
+    fn run(&self, command: &ssh::RemoteCommand) -> Result<String, AdapterError> {
+        ssh::run_remote(self.conn, command.as_str(), self.run_timeout)
+    }
+    fn scp(&self, local: &std::path::Path, remote_path: &str) -> Result<(), AdapterError> {
+        ssh::scp_to(self.conn, local, remote_path, self.scp_timeout)
+    }
+}
+
+fn remote_command(
+    label: &str,
+    tokens: &[&str],
+    path_args: &[String],
+) -> Result<ssh::RemoteCommand, AdapterError> {
+    let mut args = Vec::with_capacity(tokens.len() + path_args.len());
+    for token in tokens {
+        args.push(ValidatedArg::cli_token(token)?);
+    }
+    for path in path_args {
+        args.push(ValidatedArg::path(path)?);
+    }
+    ssh::RemoteCommand::from_args(label, &args)
+}
+
+/// `rm -rf <dir>` for a per-install prebuilt dir; refuses anything that is not
+/// under the `/tmp/rn_prebuilt.` prefix.
+fn remove_dir_command(dir: &str) -> Result<ssh::RemoteCommand, AdapterError> {
+    check_prebuilt_remote_dir(dir)?;
+    remote_command("prebuilt dir cleanup", &["rm", "-rf"], &[dir.to_owned()])
+}
+
+/// The remote dir is interpolated into the bootstrap env file and later into
+/// commands, so accept only `/tmp/rn_prebuilt.` + alphanumerics.
+fn check_prebuilt_remote_dir(dir: &str) -> Result<(), AdapterError> {
+    let ok = dir
+        .strip_prefix(PREBUILT_REMOTE_DIR_PREFIX)
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()));
+    if ok {
+        Ok(())
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!("mktemp returned an unexpected prebuilt dir '{dir}'"),
+        })
+    }
+}
+
+/// Removes the per-install remote dir (best-effort) when dropped, unless
+/// disarmed. Held from the moment `mktemp` succeeds until the install function
+/// returns, so EVERY exit path — a failed scp or hash check, a failed later
+/// copy, a failed bootstrap, success — leaves no copies of the binaries behind
+/// on a small node's /tmp. (A failed bootstrap deliberately does not keep the
+/// dir for diagnosis: it only holds copies of orchestrator-side files, and the
+/// bootstrap log is written locally.)
+struct RemoteDirCleanup<'a> {
+    remote: &'a dyn PrebuiltRemote,
+    dir: String,
+    armed: bool,
+}
+
+impl<'a> RemoteDirCleanup<'a> {
+    fn new(remote: &'a dyn PrebuiltRemote, dir: String) -> Self {
+        Self {
+            remote,
+            dir,
+            armed: true,
+        }
+    }
+
+    /// Hand the dir back without removing it (ownership moves to the caller,
+    /// which installs its own guard).
+    fn disarm(mut self) -> String {
+        self.armed = false;
+        std::mem::take(&mut self.dir)
+    }
+}
+
+impl Drop for RemoteDirCleanup<'_> {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(rm) = remove_dir_command(&self.dir)
+        {
+            if let Err(err) = self.remote.run(&rm) {
+                eprintln!(
+                    "[host-cross] warning: could not remove {} on the node: {err}",
+                    self.dir
+                );
+            }
+        }
+    }
+}
+
+/// A shipped per-install dir together with the guard that removes it when this
+/// value is dropped.
+struct ShippedPrebuilt<'a> {
+    dir: String,
+    _cleanup: RemoteDirCleanup<'a>,
+}
+
+/// [`ship_prebuilt_binaries`], then hand the dir over to a guard that lives as
+/// long as the returned value (see `install_daemon`).
+fn ship_and_guard<'a>(
+    remote: &'a dyn PrebuiltRemote,
+    alias: &str,
+    binaries: &[std::path::PathBuf],
+    expected: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<ShippedPrebuilt<'a>, AdapterError> {
+    let dir = ship_prebuilt_binaries(remote, alias, binaries, expected)?;
+    Ok(ShippedPrebuilt {
+        dir: dir.clone(),
+        _cleanup: RemoteDirCleanup::new(remote, dir),
+    })
+}
+
+/// Ship the host-built binaries to a fresh, owner-only per-install dir on the
+/// node and return that dir. Sequence (each step fail-closed, in this order):
+/// `mktemp -d` (atomic, unpredictable name, mode 700, owned by the ssh user —
+/// so another user cannot pre-create or swap the dir) -> `chmod 700` -> scp
+/// each binary -> `sha256sum` -> compare with the orchestrator-verified hashes
+/// (when `expected` is `Some`) -> `chmod 0555` the binaries. Any failure stops
+/// before the chmod 0555 and, because the caller ships before scp'ing the
+/// bootstrap env/archive, before the bootstrap runs. A failure after the dir
+/// exists removes it again (best-effort) before returning the error.
+fn ship_prebuilt_binaries(
+    remote: &dyn PrebuiltRemote,
+    alias: &str,
+    binaries: &[std::path::PathBuf],
+    expected: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<String, AdapterError> {
+    let mktemp = remote_command(
+        "prebuilt dir",
+        &["mktemp", "-d"],
+        &[PREBUILT_REMOTE_DIR_TEMPLATE.to_owned()],
+    )?;
+    let dir = remote.run(&mktemp)?.trim().to_owned();
+    check_prebuilt_remote_dir(&dir)?;
+    // Dropped (=> rm -rf) by any `?` below; disarmed only on success.
+    let cleanup = RemoteDirCleanup::new(remote, dir.clone());
+    remote.run(&remote_command(
+        "prebuilt dir mode",
+        &["chmod", "700"],
+        &[dir.clone()],
+    )?)?;
+    let mut shipped: Vec<String> = Vec::with_capacity(binaries.len());
+    for bin in binaries {
+        let name =
+            bin.file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| AdapterError::Protocol {
+                    message: format!(
+                        "host-cross: prebuilt binary path has no filename: {}",
+                        bin.display()
+                    ),
+                })?;
+        remote.scp(bin.as_path(), &format!("{dir}/{name}"))?;
+        shipped.push(name.to_owned());
+    }
+    let remote_paths: Vec<String> = shipped.iter().map(|n| format!("{dir}/{n}")).collect();
+    if let Some(expected) = expected {
+        let output = remote.run(&remote_command(
+            "prebuilt sha256 check",
+            &["sha256sum"],
+            &remote_paths,
+        )?)?;
+        verify_remote_sha256(&output, &dir, expected, &shipped).map_err(|message| {
+            AdapterError::Protocol {
+                message: format!("{alias}: {message}"),
+            }
+        })?;
+    }
+    remote.run(&remote_command(
+        "prebuilt binary mode",
+        &["chmod", "0555"],
+        &remote_paths,
+    )?)?;
+    Ok(cleanup.disarm())
+}
+
+/// Compare `sha256sum <dir>/<name>...` output from the node with the
+/// hashes verified on the orchestrator. Fail closed: every shipped binary must
+/// have an expected hash AND appear in the output with exactly that hash, so a
+/// short or garbled output can never pass.
+fn verify_remote_sha256(
+    output: &str,
+    dir: &str,
+    expected: &std::collections::BTreeMap<String, String>,
+    shipped: &[String],
+) -> Result<(), String> {
+    let mut remote: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for line in output.lines().filter(|l| !l.trim().is_empty()) {
+        let mut parts = line.split_whitespace();
+        let (Some(hash), Some(path), None) = (parts.next(), parts.next(), parts.next()) else {
+            return Err(format!("unparseable sha256sum output line '{line}'"));
+        };
+        if let Some(name) = path
+            .strip_prefix(dir)
+            .and_then(|rest| rest.strip_prefix('/'))
+        {
+            remote.insert(name, hash);
+        }
+    }
+    for name in shipped {
+        let want = expected
+            .get(name)
+            .ok_or_else(|| format!("no verified sha256 recorded for prebuilt '{name}'"))?;
+        let got = remote
+            .get(name.as_str())
+            .ok_or_else(|| format!("node sha256sum output has no entry for prebuilt '{name}'"))?;
+        if !got.eq_ignore_ascii_case(want) {
+            return Err(format!(
+                "prebuilt '{name}' on the node has sha256 {got}, expected {want} (fail closed)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Enforce baseline runtime: re-run `install-systemd` with
@@ -1625,6 +1857,332 @@ echo OK
     fn run_systemctl_rejects_a_metacharacter_action_at_the_seam() {
         let err = ValidatedArg::cli_token("start; reboot").expect_err("must reject");
         assert!(err.to_string().contains("not safe for shell embedding"));
+    }
+
+    fn sha_map(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    const H1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const H2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const DIR: &str = "/tmp/rn_prebuilt.AbC12345";
+
+    #[test]
+    fn remote_sha256_check_accepts_matching_hashes() {
+        let expected = sha_map(&[("rustynetd", H1), ("rustynet-cli", H2)]);
+        let shipped = vec!["rustynetd".to_owned(), "rustynet-cli".to_owned()];
+        let out = format!("{H1}  {DIR}/rustynetd\n{H2}  {DIR}/rustynet-cli\n");
+        verify_remote_sha256(&out, DIR, &expected, &shipped).expect("matching hashes verify");
+    }
+
+    /// Mutation caught: dropping the comparison, or treating a missing /
+    /// short / garbled `sha256sum` output as success.
+    #[test]
+    fn remote_sha256_check_fails_closed() {
+        let expected = sha_map(&[("rustynetd", H1)]);
+        let shipped = vec!["rustynetd".to_owned()];
+        let check = |out: &str, exp: &std::collections::BTreeMap<String, String>| {
+            verify_remote_sha256(out, DIR, exp, &shipped)
+        };
+        // Wrong hash.
+        let err =
+            check(&format!("{H2}  {DIR}/rustynetd\n"), &expected).expect_err("mismatch must fail");
+        assert!(
+            err.contains("rustynetd") && err.contains("expected"),
+            "{err}"
+        );
+        // Empty output (sha256sum produced nothing).
+        assert!(check("", &expected).is_err());
+        // Output for a different file only.
+        assert!(check(&format!("{H1}  {DIR}/rustynet-cli\n"), &expected).is_err());
+        // Right hash but in a different directory.
+        assert!(check(&format!("{H1}  /tmp/other/rustynetd\n"), &expected).is_err());
+        // Garbled line.
+        assert!(check("sha256sum: no such file\n", &expected).is_err());
+        // A shipped binary with no verified hash on record.
+        let err = check(&format!("{H1}  {DIR}/rustynetd\n"), &sha_map(&[]))
+            .expect_err("no recorded hash must fail");
+        assert!(err.contains("no verified sha256"), "{err}");
+    }
+
+    /// Records every remote command / scp in order and answers `mktemp` and
+    /// `sha256sum` from canned data, so the ship sequence runs without ssh.
+    struct FakeRemote {
+        log: std::cell::RefCell<Vec<String>>,
+        mktemp_output: String,
+        sha256sum_output: Result<String, ()>,
+        fail_scp: bool,
+        fail_chmod_dir: bool,
+    }
+
+    impl FakeRemote {
+        fn new(sha256sum_output: Result<String, ()>) -> Self {
+            Self {
+                log: std::cell::RefCell::new(Vec::new()),
+                mktemp_output: format!("{DIR}\n"),
+                sha256sum_output,
+                fail_scp: false,
+                fail_chmod_dir: false,
+            }
+        }
+        fn log(&self) -> Vec<String> {
+            self.log.borrow().clone()
+        }
+    }
+
+    impl PrebuiltRemote for FakeRemote {
+        fn run(&self, command: &ssh::RemoteCommand) -> Result<String, AdapterError> {
+            let text = command.as_str().replace('\'', "");
+            self.log.borrow_mut().push(text.clone());
+            if text.starts_with("mktemp") {
+                return Ok(self.mktemp_output.clone());
+            }
+            if self.fail_chmod_dir && text.starts_with("chmod 700") {
+                return Err(AdapterError::Protocol {
+                    message: "chmod: operation not permitted".to_owned(),
+                });
+            }
+            if text.starts_with("sha256sum") {
+                return self
+                    .sha256sum_output
+                    .clone()
+                    .map_err(|()| AdapterError::Protocol {
+                        message: "sha256sum: command not found".to_owned(),
+                    });
+            }
+            Ok(String::new())
+        }
+        fn scp(&self, _local: &std::path::Path, remote_path: &str) -> Result<(), AdapterError> {
+            self.log.borrow_mut().push(format!("scp {remote_path}"));
+            if self.fail_scp {
+                return Err(AdapterError::Protocol {
+                    message: "scp: connection lost".to_owned(),
+                });
+            }
+            Ok(())
+        }
+    }
+
+    fn three_binaries() -> Vec<std::path::PathBuf> {
+        ["rustynetd", "rustynet-cli", "rustynet-relay"]
+            .iter()
+            .map(|n| std::path::PathBuf::from(format!("/host/{n}")))
+            .collect()
+    }
+
+    fn expected_all() -> std::collections::BTreeMap<String, String> {
+        sha_map(&[
+            ("rustynetd", H1),
+            ("rustynet-cli", H2),
+            ("rustynet-relay", H1),
+        ])
+    }
+
+    fn good_sha_output() -> String {
+        format!("{H1}  {DIR}/rustynetd\n{H2}  {DIR}/rustynet-cli\n{H1}  {DIR}/rustynet-relay\n")
+    }
+
+    /// The exact command order: a fresh private dir first, locked down BEFORE any
+    /// binary lands in it, hashes verified BEFORE the binaries are made
+    /// executable-read-only. Mutations caught: removing the dir chmod, the
+    /// sha256sum, or reordering the 0555 chmod ahead of the verification.
+    #[test]
+    fn ship_prebuilt_runs_the_sequence_in_order() {
+        let remote = FakeRemote::new(Ok(good_sha_output()));
+        let dir = ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect("a matching ship succeeds");
+        assert_eq!(dir, DIR);
+        assert_eq!(
+            remote.log(),
+            vec![
+                "mktemp -d /tmp/rn_prebuilt.XXXXXXXX".to_owned(),
+                format!("chmod 700 {DIR}"),
+                format!("scp {DIR}/rustynetd"),
+                format!("scp {DIR}/rustynet-cli"),
+                format!("scp {DIR}/rustynet-relay"),
+                format!("sha256sum {DIR}/rustynetd {DIR}/rustynet-cli {DIR}/rustynet-relay"),
+                format!("chmod 0555 {DIR}/rustynetd {DIR}/rustynet-cli {DIR}/rustynet-relay"),
+            ]
+        );
+    }
+
+    /// A hash mismatch stops the ship: Err, and the 0555 chmod never ran (the
+    /// caller propagates the Err before the bootstrap is even copied).
+    #[test]
+    fn ship_prebuilt_stops_on_a_mismatching_sha256sum() {
+        let bad = good_sha_output().replace(H2, H1);
+        let remote = FakeRemote::new(Ok(bad));
+        let err = ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("a mismatch must fail");
+        assert!(err.to_string().contains("n1") && err.to_string().contains("rustynet-cli"));
+        assert!(
+            !remote.log().iter().any(|c| c.starts_with("chmod 0555")),
+            "no chmod 0555 after a failed verification: {:?}",
+            remote.log()
+        );
+    }
+
+    #[test]
+    fn ship_prebuilt_fails_when_sha256sum_itself_fails() {
+        let remote = FakeRemote::new(Err(()));
+        let err = ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("a missing sha256sum must fail");
+        assert!(err.to_string().contains("sha256sum"));
+        assert!(!remote.log().iter().any(|c| c.starts_with("chmod 0555")));
+    }
+
+    /// Every failure after the dir exists removes it again, so a failed ship
+    /// does not strand copies of the binaries on the node. Mutation caught:
+    /// disarming the guard early / dropping the cleanup.
+    #[test]
+    fn ship_prebuilt_removes_the_remote_dir_on_failure_only() {
+        let rm = format!("rm -rf {DIR}");
+        // Hash mismatch.
+        let remote = FakeRemote::new(Ok(good_sha_output().replace(H2, H1)));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("mismatch fails");
+        assert_eq!(remote.log().last(), Some(&rm), "{:?}", remote.log());
+        // scp failure.
+        let mut remote = FakeRemote::new(Ok(good_sha_output()));
+        remote.fail_scp = true;
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("scp failure fails");
+        assert_eq!(remote.log().last(), Some(&rm), "{:?}", remote.log());
+        // sha256sum command failure.
+        let remote = FakeRemote::new(Err(()));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("sha256sum failure fails");
+        assert_eq!(remote.log().last(), Some(&rm));
+        // The dir lock-down step itself failing.
+        let mut remote = FakeRemote::new(Ok(good_sha_output()));
+        remote.fail_chmod_dir = true;
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect_err("chmod 700 failure fails");
+        assert_eq!(remote.log().last(), Some(&rm), "{:?}", remote.log());
+        assert!(!remote.log().iter().any(|c| c.starts_with("scp")));
+        // Success: the dir is handed back intact (the caller's guard owns it).
+        let remote = FakeRemote::new(Ok(good_sha_output()));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), Some(&expected_all()))
+            .expect("ships");
+        assert!(!remote.log().iter().any(|c| c.starts_with("rm ")));
+    }
+
+    /// What `install_daemon` holds: a successful ship yields a value whose
+    /// drop removes the dir (and that does not remove it earlier); a failed
+    /// ship yields no value and has already cleaned up. Mutations caught:
+    /// returning a disarmed guard, or dropping the guard inside the helper.
+    #[test]
+    fn ship_and_guard_holds_the_dir_until_dropped() {
+        let remote = FakeRemote::new(Ok(good_sha_output()));
+        let shipped =
+            ship_and_guard(&remote, "n1", &three_binaries(), Some(&expected_all())).expect("ships");
+        assert_eq!(shipped.dir, DIR);
+        assert!(
+            !remote.log().iter().any(|c| c.starts_with("rm ")),
+            "the dir must still exist while the install runs"
+        );
+        drop(shipped);
+        assert_eq!(remote.log().last(), Some(&format!("rm -rf {DIR}")));
+        let remote = FakeRemote::new(Ok(good_sha_output().replace(H1, H2)));
+        assert!(ship_and_guard(&remote, "n1", &three_binaries(), Some(&expected_all())).is_err());
+        assert_eq!(remote.log().last(), Some(&format!("rm -rf {DIR}")));
+    }
+
+    #[test]
+    fn remote_dir_cleanup_guard_removes_on_drop_unless_disarmed() {
+        let remote = FakeRemote::new(Ok(String::new()));
+        drop(RemoteDirCleanup::new(&remote, DIR.to_owned()));
+        assert_eq!(remote.log(), vec![format!("rm -rf {DIR}")]);
+        let remote = FakeRemote::new(Ok(String::new()));
+        let dir = RemoteDirCleanup::new(&remote, DIR.to_owned()).disarm();
+        assert_eq!(dir, DIR);
+        assert!(remote.log().is_empty());
+        // A path outside the per-install prefix is never removed.
+        let remote = FakeRemote::new(Ok(String::new()));
+        drop(RemoteDirCleanup::new(&remote, "/tmp".to_owned()));
+        assert!(remote.log().is_empty());
+    }
+
+    /// Without recorded hashes (plain host-cross-binary) there is nothing to
+    /// compare, so no sha256sum is run — but the dir is still private + fresh.
+    #[test]
+    fn ship_prebuilt_without_expected_hashes_skips_only_the_verification() {
+        let remote = FakeRemote::new(Err(()));
+        ship_prebuilt_binaries(&remote, "n1", &three_binaries(), None).expect("ships");
+        let log = remote.log();
+        assert!(!log.iter().any(|c| c.starts_with("sha256sum")));
+        assert!(log[0].starts_with("mktemp -d") && log[1] == format!("chmod 700 {DIR}"));
+    }
+
+    /// The dir name comes back from the node and lands in the bootstrap env
+    /// file, so anything but `/tmp/rn_prebuilt.<alnum>` is refused.
+    #[test]
+    fn ship_prebuilt_rejects_an_unexpected_mktemp_result() {
+        for bad in [
+            "/tmp/other.abc",
+            "/tmp/rn_prebuilt.",
+            "/tmp/rn_prebuilt.a/b",
+            "/tmp/rn_prebuilt.a$b",
+            "/tmp/rn_prebuilt.a b",
+            "",
+        ] {
+            let mut remote = FakeRemote::new(Ok(good_sha_output()));
+            remote.mktemp_output = bad.to_owned();
+            assert!(
+                ship_prebuilt_binaries(&remote, "n1", &three_binaries(), None).is_err(),
+                "{bad}"
+            );
+            assert_eq!(remote.log().len(), 1, "nothing runs after a bad dir: {bad}");
+        }
+    }
+
+    /// Pin: install_daemon ships (and so verifies) BEFORE it copies the
+    /// bootstrap env/archive or runs the bootstrap, and points the bootstrap at
+    /// the per-install dir rather than a fixed /tmp path. Mutation caught:
+    /// dropping the verification arm at runtime is caught by the behavioural
+    /// tests above; this pins the call site's placement and wiring.
+    #[test]
+    fn install_daemon_ships_prebuilts_before_bootstrap_and_uses_the_private_dir() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
+        let start = source
+            .find("pub fn install_daemon(")
+            .expect("install_daemon must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        let ship = body.find("ship_and_guard(").expect("ship call");
+        let read_sums = body.find("read_prebuilt_sha256(").expect("hash read");
+        let env_scp = body.find("\"/tmp/rn_bootstrap.env\"").expect("env scp");
+        let bootstrap = body
+            .find("bash /tmp/rn_bootstrap.sh")
+            .expect("bootstrap run");
+        assert!(read_sums < ship && ship < env_scp && env_scp < bootstrap);
+        // The cleanup guard is created by ship_and_guard and held in a NAMED
+        // binding (`shipped`) across every later step, in scope until return.
+        assert!(
+            body.contains("let shipped = match &prebuilt_binaries {")
+                && body.contains("ship_and_guard(&remote, alias, binaries, expected.as_ref())?")
+                && body.contains("Some(shipped)"),
+            "install_daemon must keep the guard-owning value alive"
+        );
+        // The dir is read out BY REFERENCE: consuming `shipped` would drop the
+        // guard (and rm -rf the dir) before the bootstrap runs.
+        assert!(
+            body.contains("shipped.as_ref().map(|s| s.dir.clone())"),
+            "the guard-owning value must outlive the env/bootstrap steps"
+        );
+        assert!(
+            body.contains("RN_PREBUILT_DIR={dir}")
+                && !body.contains("RN_PREBUILT_DIR=/tmp/rn_prebuilt"),
+            "the env must carry the per-install dir"
+        );
     }
 }
 

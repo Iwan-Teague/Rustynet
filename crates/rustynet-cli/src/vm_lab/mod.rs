@@ -1744,6 +1744,17 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// Allow-listed by [`parse_linux_backend`]; macOS/Windows guests are
     /// unaffected. `None` (the default) leaves the env byte-identical.
     pub linux_backend: Option<String>,
+    /// `--prebuilt-node-binaries <alias>=<dir>` (repeatable): ship Mac-built
+    /// x86_64 Linux binaries to those `--node` aliases instead of building on
+    /// the guest (for nodes that cannot compile, and orchestrator hosts with no
+    /// zig for `--source-mode host-cross-binary`, which it excludes). Each dir
+    /// is validated fail-closed before deploy (ELF/arch/glibc floor/sha256/
+    /// commit, see `host_cross_build::validate_prebuilt_dir`); aliases NOT
+    /// listed still build on the guest. Empty (the default) changes nothing.
+    pub prebuilt_node_binaries: Vec<(String, PathBuf)>,
+    /// `--prebuilt-glibc-floor <ver>`: glibc ceiling for the prebuilt
+    /// binaries; `None` means `host_cross_build::DEFAULT_PREBUILT_GLIBC_FLOOR`.
+    pub prebuilt_glibc_floor: Option<String>,
 }
 
 /// The Linux daemon backends `--linux-backend` may pin: the daemon's own
@@ -54049,6 +54060,8 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             allow_dirty: false,
             lab_stun_servers: Vec::new(),
             linux_backend: None,
+            prebuilt_node_binaries: Vec::new(),
+            prebuilt_glibc_floor: None,
         }
     }
 

@@ -410,6 +410,14 @@ pub(crate) fn execute_rust_native_orchestration(
         }
         None => None,
     };
+    // --prebuilt-node-binaries: flag-level checks first (cheap, before any plan
+    // or evidence work); the directory validation follows once the plan is known.
+    orchestrator::stage::host_cross_build::check_prebuilt_flags(
+        config.source_mode.as_deref(),
+        &config.prebuilt_node_binaries,
+        config.prebuilt_glibc_floor.as_deref(),
+        config.allow_dirty,
+    )?;
     let stages = filter_rust_native_stages_for_mode(
         build_rust_native_orchestration_stages(
             rebuild_only.clone(),
@@ -529,6 +537,75 @@ pub(crate) fn execute_rust_native_orchestration(
         Some((reused_ids, digest))
     } else {
         None
+    };
+    // --prebuilt-node-binaries: fail closed BEFORE readiness can restart a
+    // guest or anything deploys — target aliases/platforms and every prebuilt
+    // directory (owner/ELF/arch/glibc/sha256/commit). The manifest itself is
+    // written (and the dirs re-validated) after readiness below.
+    //
+    // NB the binding this establishes is only as strong as PREBUILT.json:
+    // `source_commit` and the hashes are SELF-DECLARED by whoever wrote the dir.
+    // Passing proves internal consistency, label == this run's HEAD, and (via
+    // the remote re-hash at install) host->node transfer integrity — not that
+    // the build really came from that commit. The provenance file says so
+    // ("attestation":"self-declared").
+    //
+    // Resume/rerun/run-only: everything here only matters when bootstrap_hosts
+    // will actually execute in THIS invocation (a reused bootstrap installs
+    // nothing). If it will, provenance left by an earlier invocation must be at
+    // the same HEAD (with or without the flag), and with the flag must record
+    // the same binaries (`prepare_prebuilt_node_binaries`).
+    let bootstrap_executes = bootstrap_hosts_executes(
+        &plan_stage_ids,
+        reuse_binding.as_ref().map(|(reused, _)| reused.as_slice()),
+    );
+    let prebuilt_run: Option<(String, String)> = if !bootstrap_executes {
+        if !config.prebuilt_node_binaries.is_empty() {
+            eprintln!(
+                "[prebuilt] bootstrap_hosts does not run in this invocation; \
+                 --prebuilt-node-binaries is ignored"
+            );
+        }
+        None
+    } else {
+        use orchestrator::stage::host_cross_build;
+        let provenance_exists = report_dir
+            .join(host_cross_build::PREBUILT_PROVENANCE_RELATIVE_PATH)
+            .is_file();
+        if config.prebuilt_node_binaries.is_empty() && !provenance_exists {
+            None
+        } else {
+            let repo_dir = std::env::current_dir()
+                .map_err(|e| format!("prebuilt-node-binaries: cannot resolve repo dir: {e}"))?;
+            let commit = orchestrator::stage::source_archive::git_head_commit(&repo_dir)?;
+            host_cross_build::check_prebuilt_provenance_commit(
+                &report_dir,
+                &commit,
+                config.allow_dirty,
+            )?;
+            if config.prebuilt_node_binaries.is_empty() {
+                None
+            } else {
+                let targets = node_entries
+                    .iter()
+                    .map(|(entry, assignment)| {
+                        Ok((
+                            assignment.alias.clone(),
+                            entry_platform_or_fail(entry, assignment)?,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                host_cross_build::check_prebuilt_targets(&config.prebuilt_node_binaries, &targets)?;
+                let floor = host_cross_build::resolve_prebuilt_glibc_floor(
+                    config.prebuilt_glibc_floor.as_deref(),
+                )?;
+                for (alias, dir) in &config.prebuilt_node_binaries {
+                    host_cross_build::validate_prebuilt_dir(dir, &commit, &floor)
+                        .map_err(|e| format!("prebuilt binaries for '{alias}': {e}"))?;
+                }
+                Some((commit, floor))
+            }
+        }
     };
     let selected_aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
     // Evidence state must be writable before readiness can mutate inventory or
@@ -736,6 +813,57 @@ pub(crate) fn execute_rust_native_orchestration(
             "[host-cross] wrote prebuilt-binary manifest for {} node(s): {}",
             alias_to_binaries.len(),
             manifest.display()
+        );
+    }
+
+    // --prebuilt-node-binaries: probe each listed node's arch, re-validate the
+    // directories and write the same manifest the host-cross build writes, but
+    // ONLY for the listed aliases (the others still build on their guest), plus
+    // `state/prebuilt_binaries_provenance.json`. Any failure aborts before
+    // deploy. A strict no-op unless the flag is present.
+    if let Some((commit, floor)) = &prebuilt_run {
+        use orchestrator::adapter::ssh;
+        use orchestrator::stage::host_cross_build;
+
+        for (alias, _) in &config.prebuilt_node_binaries {
+            let (entry, _) = node_entries
+                .iter()
+                .find(|(_, assignment)| &assignment.alias == alias)
+                .ok_or_else(|| {
+                    format!("prebuilt-node-binaries: '{alias}' is not a --node alias")
+                })?;
+            let host = entry
+                .last_known_ip
+                .as_deref()
+                .unwrap_or(entry.ssh_target.as_str())
+                .to_owned();
+            let conn = NodeConnection::ssh(
+                host.clone(),
+                config.ssh_port,
+                entry.ssh_user.clone(),
+                config.ssh_identity_file.clone(),
+                known_hosts.clone(),
+                entry.ssh_password.clone(),
+            )
+            .map_err(|err| {
+                format!(
+                    "prebuilt-node-binaries: build SSH connection for '{alias}' ({host}): {err}"
+                )
+            })?;
+            let arch = ssh::run_remote(&conn, "uname -m", std::time::Duration::from_secs(30))
+                .map_err(|err| {
+                    format!("prebuilt-node-binaries: arch probe (uname -m) for '{alias}' ({host}): {err}")
+                })?;
+            host_cross_build::require_prebuilt_arch(alias, &arch)?;
+        }
+        let count = host_cross_build::prepare_prebuilt_node_binaries(
+            &report_dir,
+            &config.prebuilt_node_binaries,
+            commit,
+            floor,
+        )?;
+        eprintln!(
+            "[prebuilt] {count} node(s) will install prebuilt binaries (commit {commit}, glibc floor {floor}); other nodes build on their guest"
         );
     }
 
@@ -1293,6 +1421,18 @@ pub(crate) fn reboot_platform_macos_elected(reboot_platform: Option<&str>) -> bo
     reboot_platform == Some("macos")
 }
 
+/// Whether `bootstrap_hosts` will actually execute in this invocation: it must
+/// be in the (mode-filtered) plan and not be among the stages reused as
+/// already-passed by `--run-only` / `--resume-from` / `--rerun-stage`.
+fn bootstrap_hosts_executes(
+    plan_stage_ids: &[orchestrator::stage::StageId],
+    reused_stage_ids: Option<&[orchestrator::stage::StageId]>,
+) -> bool {
+    plan_stage_ids.contains(&orchestrator::stage::StageId::BootstrapHosts)
+        && reused_stage_ids
+            .is_none_or(|reused| !reused.contains(&orchestrator::stage::StageId::BootstrapHosts))
+}
+
 fn filter_rust_native_stages_for_mode(
     mut stages: Vec<Box<dyn orchestrator::stage::OrchestrationStage>>,
     setup_only: bool,
@@ -1589,5 +1729,83 @@ mod tests {
             &[],
             &|_: &str| None
         ));
+    }
+
+    /// Pin the ordering `--prebuilt-node-binaries` depends on: the flag
+    /// combination and every prebuilt dir are checked BEFORE readiness can
+    /// restart a guest, and the manifest is only written after that (and after
+    /// the arch probe) but before any stage deploys. Mutation caught: deleting
+    /// the early validation, or moving the manifest write ahead of readiness.
+    #[test]
+    fn prebuilt_node_binaries_are_validated_before_readiness_and_written_before_stages() {
+        // native.rs has `#[cfg(test)]` fns, which `implementation_source_slice`
+        // does not support, so read the file (not `include_str!`, which the
+        // self-include scanner would reject) and keep everything before the
+        // first test region: that is the production code.
+        let full = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ))
+        .expect("native.rs must read");
+        let source = &full[..full
+            .find("\n#[cfg(test)]")
+            .expect("test region marker present")];
+        let at = |needle: &str| {
+            source
+                .find(needle)
+                .unwrap_or_else(|| panic!("native.rs must contain {needle}"))
+        };
+        let flags = at("host_cross_build::check_prebuilt_flags(");
+        let targets = at("host_cross_build::check_prebuilt_targets(");
+        let validate = at("host_cross_build::validate_prebuilt_dir(");
+        let readiness = at("orchestrator::readiness::run(");
+        let arch = at("host_cross_build::require_prebuilt_arch(");
+        let manifest = at("host_cross_build::prepare_prebuilt_node_binaries(");
+        let os_versions = at("let mut os_versions");
+        // The resume branch (no flag, leftover provenance) must refuse a dirty
+        // tree: the check is handed the real --allow-dirty setting.
+        let commit_check = at("host_cross_build::check_prebuilt_provenance_commit(");
+        assert!(
+            source[commit_check..commit_check + 160].contains("config.allow_dirty"),
+            "check_prebuilt_provenance_commit must receive config.allow_dirty"
+        );
+        assert!(flags < targets && targets < validate && validate < readiness);
+        assert!(readiness < arch && arch < manifest && manifest < os_versions);
+    }
+
+    /// `bootstrap_hosts_executes` gates all prebuilt work on resume/rerun paths.
+    /// Mutation caught: `true ||` (always executes) or dropping the reuse test.
+    #[test]
+    fn bootstrap_hosts_executes_only_when_planned_and_not_reused() {
+        use orchestrator::stage::StageId;
+        let plan = rust_native_orchestration_stage_ids();
+        let pos = plan
+            .iter()
+            .position(|id| *id == StageId::BootstrapHosts)
+            .expect("bootstrap_hosts is in the full plan");
+        // Fresh run: nothing reused.
+        assert!(bootstrap_hosts_executes(&plan, None));
+        // --run-only: the setup stages (bootstrap included) are reused.
+        let setup = rust_native_setup_stage_ids();
+        assert!(setup.contains(&StageId::BootstrapHosts));
+        assert!(!bootstrap_hosts_executes(&plan, Some(&setup)));
+        // The run-only plan keeps the setup stages (as injected Passed
+        // dependencies), so it is the reuse set that stops bootstrap; and a plan
+        // that lacks the stage altogether never executes it.
+        let run_only_plan = rust_native_orchestration_stage_ids_for_mode(false, true);
+        assert!(!bootstrap_hosts_executes(&run_only_plan, Some(&setup)));
+        let without: Vec<StageId> = plan
+            .iter()
+            .filter(|id| **id != StageId::BootstrapHosts)
+            .cloned()
+            .collect();
+        assert!(!bootstrap_hosts_executes(&without, None));
+        // --resume-from / --rerun-stage at the stage AFTER bootstrap: bootstrap
+        // is among the reused ids, so it does not run.
+        assert!(!bootstrap_hosts_executes(&plan, Some(&plan[..=pos])));
+        // ...AT bootstrap_hosts: reused = everything before it, so it runs.
+        assert!(bootstrap_hosts_executes(&plan, Some(&plan[..pos])));
+        // An empty reuse set (resume at the very first stage) runs it.
+        assert!(bootstrap_hosts_executes(&plan, Some(&[])));
     }
 }

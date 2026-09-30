@@ -388,7 +388,7 @@ fn write_source_archive_provenance(
     Ok(path)
 }
 
-fn git_head_commit(repo_dir: &Path) -> Result<String, String> {
+pub(crate) fn git_head_commit(repo_dir: &Path) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_dir)

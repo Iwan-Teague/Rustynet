@@ -4540,6 +4540,24 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     },
                     resume_from: parser.value("--resume-from"),
                     rerun_stage: parser.value("--rerun-stage"),
+                    prebuilt_node_binaries: {
+                        let raw =
+                            collect_repeated_option_values(&args[1..], "--prebuilt-node-binaries");
+                        let mut out = Vec::with_capacity(raw.len());
+                        for s in raw {
+                            out.push(
+                                vm_lab::orchestrator::stage::host_cross_build::parse_prebuilt_node_binaries_arg(&s)?,
+                            );
+                        }
+                        vm_lab::orchestrator::stage::host_cross_build::check_prebuilt_flags(
+                            parser.value("--source-mode").as_deref(),
+                            &out,
+                            parser.value("--prebuilt-glibc-floor").as_deref(),
+                            parser.has_flag("--allow-dirty"),
+                        )?;
+                        out
+                    },
+                    prebuilt_glibc_floor: parser.value("--prebuilt-glibc-floor"),
                 }),
             })
         }
@@ -20666,7 +20684,8 @@ fn help_text() -> String {
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>] [--lab-stun-servers <ip:port[,ip:port...]>] [--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>] [--lab-stun-servers <ip:port[,ip:port...]>] [--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>] [--prebuilt-node-binaries <alias>=<abs-dir>]... [--prebuilt-glibc-floor <ver>]",
+        "      --prebuilt-node-binaries: <abs-dir> holds rustynetd, rustynet-cli, rustynet-relay (flat, x86_64 Linux, owned by you and not group/world-writable) and PREBUILT.json (scripts/lab/make_prebuilt_manifest.sh); PREBUILT.json's commit and sha256 are SELF-DECLARED by whoever wrote it (checked for consistency, label == HEAD and host->node transfer integrity, not that the build came from that commit); only the listed --node aliases skip the guest build, every other node still builds on its guest; excludes --source-mode host-cross-binary and --allow-dirty; --prebuilt-glibc-floor defaults to 2.39.",
         "  ops vm-lab-overnight --ssh-identity-file <path> [--inventory <path>] [--known-hosts-file <path>] [--branch-prefix <name>] [--backlog <path>] [--max-duration-secs <secs>] [--max-attempts-per-cell <n>] [--rotation <breadth-first|deep-first>] [--auto-merge-safe-cells] [--agent-cmd <path>] [--agent-timeout-secs <secs>] [--seed-status <os:role=status,...>] [--dry-run]",
         "  ops vm-lab-validate-windows-security --inventory <path> --windows-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] [--ssh-port <port>] [--utm-documents-root <path>] [--utmctl-path <path>] --report-dir <path> [--dry-run] [--skip-access-bootstrap] [--skip-install] [--no-fail-on-authenticode] [--distribute-windows-membership-bundle <path>] [--distribute-windows-assignment-bundle <path>] [--distribute-windows-traversal-bundle <path>] [--distribute-windows-dns-zone-bundle <path>]",
         "  ops vm-lab-validate-linux-security [--inventory <path>] --linux-vm <alias> --ssh-identity-file <path> [--known-hosts-file <path>] --report-dir <path> [--dry-run] [--mesh-status-state-path <path>] [--mesh-status-expected-peer-ids <id[,id...]>] [--mesh-status-max-age-seconds <secs>]",
@@ -26787,6 +26806,111 @@ mod tests {
         assert!(help.contains("ops vm-lab-orchestrate-live-lab"));
         assert!(help.contains("ops vm-lab-run-live-lab --profile <path>"));
         assert!(help.contains("[--skip-setup]"));
+    }
+
+    #[cfg(feature = "vm-lab")]
+    fn orchestrate_args_with(extra: &[&str]) -> Vec<String> {
+        let mut args: Vec<String> = [
+            "ops",
+            "vm-lab-orchestrate-live-lab",
+            "--report-dir",
+            "artifacts/live_lab/prebuilt",
+            "--ssh-identity-file",
+            "/tmp/id",
+            "--node",
+            "azure-vm-1:client",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+        args.extend(extra.iter().map(|s| (*s).to_owned()));
+        args
+    }
+
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn parse_orchestrate_prebuilt_node_binaries_is_repeatable_and_opt_in() {
+        let none = format!("{:?}", parse_command(&orchestrate_args_with(&[])));
+        assert!(none.contains("prebuilt_node_binaries: []"), "{none}");
+        assert!(none.contains("prebuilt_glibc_floor: None"), "{none}");
+
+        let two = format!(
+            "{:?}",
+            parse_command(&orchestrate_args_with(&[
+                "--prebuilt-node-binaries",
+                "azure-vm-1=/opt/pb/azure",
+                "--prebuilt-node-binaries",
+                "lab-2=/opt/pb/lab2",
+                "--prebuilt-glibc-floor",
+                "2.35",
+            ]))
+        );
+        assert!(two.contains("\"azure-vm-1\", \"/opt/pb/azure\""), "{two}");
+        assert!(two.contains("\"lab-2\", \"/opt/pb/lab2\""), "{two}");
+        assert!(
+            two.contains("prebuilt_glibc_floor: Some(\"2.35\")"),
+            "{two}"
+        );
+    }
+
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn parse_orchestrate_prebuilt_node_binaries_fails_closed() {
+        let usage_error = |extra: &[&str]| match parse_command(&orchestrate_args_with(extra)) {
+            CliCommand::UsageError(message) => message,
+            other => panic!("expected a usage error, got {other:?}"),
+        };
+        // Mutually exclusive with the host cross-build.
+        let msg = usage_error(&[
+            "--source-mode",
+            "host-cross-binary",
+            "--prebuilt-node-binaries",
+            "azure-vm-1=/opt/pb/azure",
+        ]);
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+        // The exclusion is on the PARSED mode: padding cannot bypass it.
+        let msg = usage_error(&[
+            "--source-mode",
+            " host-cross-binary",
+            "--prebuilt-node-binaries",
+            "azure-vm-1=/opt/pb/azure",
+        ]);
+        assert!(msg.contains("mutually exclusive"), "{msg}");
+        // A dirty tree does not match the HEAD label the binaries carry.
+        let msg = usage_error(&[
+            "--allow-dirty",
+            "--prebuilt-node-binaries",
+            "azure-vm-1=/opt/pb/azure",
+        ]);
+        assert!(msg.contains("--allow-dirty"), "{msg}");
+        // Malformed / relative values.
+        assert!(usage_error(&["--prebuilt-node-binaries", "azure-vm-1"]).contains("<alias>=<dir>"));
+        assert!(
+            usage_error(&["--prebuilt-node-binaries", "azure-vm-1=rel/dir"]).contains("absolute")
+        );
+        // Floor alone, or a duplicate alias, is refused rather than ignored.
+        assert!(usage_error(&["--prebuilt-glibc-floor", "2.35"]).contains("requires"));
+        assert!(
+            usage_error(&[
+                "--prebuilt-node-binaries",
+                "a=/x",
+                "--prebuilt-node-binaries",
+                "a=/y",
+            ])
+            .contains("more than once")
+        );
+    }
+
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn help_text_documents_prebuilt_node_binaries() {
+        let help = help_text();
+        assert!(help.contains("[--prebuilt-node-binaries <alias>=<abs-dir>]..."));
+        assert!(help.contains("[--prebuilt-glibc-floor <ver>]"));
+        // The "only listed aliases skip the guest build" contract is stated.
+        assert!(help.contains("every other node still builds on its guest"));
+        // ...and so is the honest limit of the commit/hash binding.
+        assert!(help.contains("SELF-DECLARED"));
     }
 
     #[test]

@@ -423,6 +423,10 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         skip_linux_live_suite: _,
         lab_stun_servers: _,
         linux_backend: _,
+        // Aliases here must already be `--node` aliases (checked at run start),
+        // so they add no guest beyond `node_assignments`.
+        prebuilt_node_binaries: _,
+        prebuilt_glibc_floor: _,
     } = config;
 
     if *dry_run {
