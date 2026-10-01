@@ -327,9 +327,9 @@ current-state picture from the actual files. Do these in parallel:
 
 **a) Repo + branch state:**
 ```bash
-git -C /Users/iwan/Desktop/Rustynet log --oneline -5
-git -C /Users/iwan/Desktop/Rustynet branch --show-current
-git -C /Users/iwan/Desktop/Rustynet status --short
+git -C /Users/iwan/Desktop/rustysuite/projects/rustynet log --oneline -5
+git -C /Users/iwan/Desktop/rustysuite/projects/rustynet branch --show-current
+git -C /Users/iwan/Desktop/rustysuite/projects/rustynet status --short
 git -C .claude/worktrees/lab-main log --oneline -1
 ```
 If the main repo is not fast-forwarded to `origin/main`, fix it now (§4).
@@ -624,12 +624,12 @@ gate-runner for `run_gates`/`run_security_gates` before every commit (§7 below)
 ═══════════════════════════════════════════
 All development on `main`. The lab-main worktree at `.claude/worktrees/lab-main` is always
 on `main` and is the correct place to develop. The main repo root
-(`/Users/iwan/Desktop/Rustynet`) may be on a feature branch — before every live-lab run,
+(`/Users/iwan/Desktop/rustysuite/projects/rustynet`) may be on a feature branch — before every live-lab run,
 fast-forward it to `origin/main`:
 
 ```bash
-git -C /Users/iwan/Desktop/Rustynet fetch origin main
-git -C /Users/iwan/Desktop/Rustynet merge --ff-only origin/main
+git -C /Users/iwan/Desktop/rustysuite/projects/rustynet fetch origin main
+git -C /Users/iwan/Desktop/rustysuite/projects/rustynet merge --ff-only origin/main
 ```
 
 If a dirty tracked file blocks the fast-forward, STOP and inspect it. Do not `checkout --`
@@ -642,8 +642,8 @@ for the next action. Never erase run evidence just to make `git merge --ff-only`
 The main repo can't `checkout main` when the `lab-main` worktree exists (worktree conflict)
 — ff the feature branch instead. Verify both point at the same commit:
 ```bash
-git -C /Users/iwan/Desktop/Rustynet log --oneline -1
-git -C /Users/iwan/Desktop/Rustynet/.claude/worktrees/lab-main log --oneline -1
+git -C /Users/iwan/Desktop/rustysuite/projects/rustynet log --oneline -1
+git -C /Users/iwan/Desktop/rustysuite/projects/rustynet/.claude/worktrees/lab-main log --oneline -1
 # These must match before you launch a run.
 ```
 

@@ -977,3 +977,28 @@ Optional output override:
 
 The repo also seeds `artifacts/perf/phase1/source/performance_samples.ndjson`
 for first-run CI/bootstrap; refresh this with current measured samples before release evidence sign-off.
+
+## Working in the suite
+
+Rustynet is developed **in the rustysuite checkout**, at `projects/rustynet`
+(an in-tree project, not a submodule). The old standalone checkout at
+`~/Desktop/Rustynet` was retired on 2026-10-01; its GitHub copy is an outdated
+mirror.
+
+- **Toolchain.** `rust-toolchain.toml` pins 1.88.0. Put the pinned toolchain's
+  `bin` first on `PATH` when running clippy (`rustup run` alone can still pick a
+  newer Homebrew clippy), and check `cargo clippy --version`.
+- **Gates.** Landings run the full gate set (fmt, clippy, windows clippy,
+  nextest `--workspace --all-targets --all-features`, the fuzz, boundary and
+  drift gates, and the Linux secrets leg) before a gated commit from the suite
+  root (`tooling/run-gates.sh`).
+- **MCP servers** (repo context, gate runner, lab state, AI sub-agent): build
+  and install with `scripts/mcp/install.sh --release`; the binaries go to the
+  gitignored `./bin` and bake this checkout's path in. Register them for this
+  project only (Claude Code local scope), pointing at `projects/rustynet/bin/`;
+  reconnect after every reinstall. A `-dirty` suffix in the reported server
+  version means it was built from a modified tree.
+- **Live labs** run from the suite root through the `--node` orchestrator
+  (`rustynet-cli ops vm-lab-orchestrate-live-lab`). The Mac host's ledgers are
+  written under `projects/rustynet/documents/operations/` (inventory
+  `repo_dir`).
