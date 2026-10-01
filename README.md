@@ -998,6 +998,13 @@ mirror.
   project only (Claude Code local scope), pointing at `projects/rustynet/bin/`;
   reconnect after every reinstall. A `-dirty` suffix in the reported server
   version means it was built from a modified tree.
+- **The Azure lab VM is off unless it is doing rustysuite work** (owner rule,
+  2026-10-01; it runs on student credit). `scripts/lab/azure_vm_up.sh [hours]`
+  starts it under a lease, `scripts/lab/azure_vm_down.sh` deallocates it
+  (deallocated is the state that stops billing), and an hourly LaunchAgent
+  (`scripts/lab/install_azure_vm_guard.sh`) deallocates it whenever it is running
+  with no lease and no live-lab run naming `azure-vm-1` on the lab host. Witness
+  tests: `scripts/lab/test_azure_vm_guard.sh`. Log: `~/rustysuite-fleet/state/azure-guard.log`.
 - **Live labs** run from the suite root through the `--node` orchestrator
   (`rustynet-cli ops vm-lab-orchestrate-live-lab`). The Mac host's ledgers are
   written under `projects/rustynet/documents/operations/` (inventory
