@@ -241,11 +241,23 @@ pub fn compute_entry_hash(index: u64, previous_hash: &str, event_payload: &str) 
     sha256_hex(format!("{index}|{previous_hash}|{event_hex}").as_bytes())
 }
 
-/// Append a single event to the audit log at `path`. Atomic
-/// per-line append: opens with `OPEN_APPEND` and writes the whole
-/// log line in one `write_all` call so a concurrent reader sees
-/// either the full prior log or the full prior log plus this
-/// entry — never a torn line.
+/// Append a single event to the audit log at `path`.
+///
+/// RSA-0012: the previous shape read the chain by path and then
+/// re-opened the file to append, so two concurrent writers could both
+/// observe the same last entry, both compute the same next index, and
+/// both append (CWE-362 / duplicated or broken chain). This append now
+/// opens the file ONCE and holds an exclusive advisory lock across the
+/// whole read-modify-append, reading the prior chain back through the
+/// SAME locked descriptor. Contention is bounded (see
+/// [`APPEND_LOCK_MAX_WAIT`]); on timeout the write is REFUSED with
+/// [`RoleAuditError::Locked`] — fail closed, never written unlocked.
+///
+/// Non-unix (e.g. Windows) uses a create-new `<log>.lock` sidecar
+/// instead of `flock`. A crash while holding it leaves the sidecar on
+/// disk, so appends keep failing closed with [`RoleAuditError::Locked`]
+/// (permanent denial): recovery is for an operator to delete the
+/// sidecar file — only when no rustynet process is running — and retry.
 pub fn append_role_audit_entry(
     path: &Path,
     timestamp_unix: u64,
@@ -258,8 +270,21 @@ pub fn append_role_audit_entry(
             .map_err(|err| RoleAuditError::Io(format!("create_dir_all: {err}")))?;
     }
 
-    let existing = read_role_audit_log(path)?;
-    let (next_index, previous_hash) = match existing.last() {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|err| RoleAuditError::Io(format!("open append: {err}")))?;
+    let mut lock = acquire_role_audit_append_lock(path, file)?;
+
+    // Read the existing chain back through the SAME locked descriptor
+    // (no path re-open) so no writer can interleave between our read
+    // and our append.
+    let existing = read_capped_role_audit_body(lock.file_mut())?;
+    let entries = parse_role_audit_body(&existing)?;
+    let (next_index, previous_hash) = match entries.last() {
         Some(last) => (last.index + 1, last.entry_hash.clone()),
         None => (0_u64, GENESIS_PREVIOUS_HASH.to_owned()),
     };
@@ -271,12 +296,6 @@ pub fn append_role_audit_entry(
         "index={next_index} previous_hash={previous_hash} entry_hash={entry_hash} event_hex={event_hex}\n"
     );
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|err| RoleAuditError::Io(format!("open append: {err}")))?;
-
     // Pin restrictive perms when the file is newly created. We
     // don't downgrade existing perms (operator might have widened
     // intentionally) but we tighten on create.
@@ -284,13 +303,17 @@ pub fn append_role_audit_entry(
     {
         use std::os::unix::fs::PermissionsExt;
         if existing.is_empty() {
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o640));
+            let _ = lock
+                .file_mut()
+                .set_permissions(fs::Permissions::from_mode(0o640));
         }
     }
 
-    file.write_all(line.as_bytes())
+    lock.file_mut()
+        .write_all(line.as_bytes())
         .map_err(|err| RoleAuditError::Io(format!("write: {err}")))?;
-    file.flush()
+    lock.file_mut()
+        .flush()
         .map_err(|err| RoleAuditError::Io(format!("flush: {err}")))?;
     Ok(RoleAuditEntry {
         index: next_index,
@@ -298,6 +321,180 @@ pub fn append_role_audit_entry(
         entry_hash,
         event_hex,
     })
+}
+
+/// Contention bound for the role audit append lock. Mirrors the
+/// enrollment ledger lock posture in
+/// `rustynetd/src/enrollment_token.rs`: bounded retry, then fail
+/// closed with [`RoleAuditError::Locked`] rather than writing unlocked.
+const APPEND_LOCK_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const APPEND_LOCK_WAIT_MS: u64 = 10;
+
+/// Sidecar lock path for the non-unix append lock. Only used on
+/// platforms without `flock(2)`; unix builds never touch it.
+#[cfg(not(unix))]
+fn append_lock_path(path: &Path) -> std::path::PathBuf {
+    let mut raw = path.as_os_str().to_owned();
+    raw.push(".lock");
+    std::path::PathBuf::from(raw)
+}
+
+/// Guard holding the exclusive append lock for the audit log.
+///
+/// Unix: an `flock(LOCK_EX)`-held descriptor (nix `Flock`; unlocking
+/// happens on drop). Non-unix (e.g. Windows): a create-new sidecar
+/// `.lock` file removed on drop.
+///
+/// Non-unix stale sidecar: a crash while holding the lock leaves
+/// `<log>.lock` behind (it is NOT auto-recovered); appends then fail
+/// closed until an operator deletes the sidecar file when no rustynet
+/// process is running, then retries.
+struct RoleAuditAppendLock {
+    #[cfg(unix)]
+    flock: nix::fcntl::Flock<fs::File>,
+    #[cfg(not(unix))]
+    data: fs::File,
+    #[cfg(not(unix))]
+    lock_path: std::path::PathBuf,
+    #[cfg(not(unix))]
+    _lock_handle: Option<fs::File>,
+}
+
+impl RoleAuditAppendLock {
+    #[cfg(unix)]
+    fn file_mut(&mut self) -> &mut fs::File {
+        // Deref coercion through Flock<T>: hand out the locked descriptor.
+        &mut self.flock
+    }
+
+    #[cfg(not(unix))]
+    fn file_mut(&mut self) -> &mut fs::File {
+        &mut self.data
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for RoleAuditAppendLock {
+    fn drop(&mut self) {
+        // Release the lock handle (close the descriptor) BEFORE
+        // removing the sidecar: on Windows, unlinking while the handle
+        // is still open leaves the name delete-pending, which turns an
+        // ordinary contention window into a spurious access-denied for
+        // the next `create_new` (mirrors resilience.rs / enrollment_token.rs).
+        drop(self._lock_handle.take());
+        let _ = fs::remove_file(&self.lock_path);
+    }
+}
+
+#[cfg(unix)]
+fn acquire_role_audit_append_lock(
+    _path: &Path,
+    file: fs::File,
+) -> Result<RoleAuditAppendLock, RoleAuditError> {
+    let deadline = std::time::Instant::now() + APPEND_LOCK_MAX_WAIT;
+    let mut file = file;
+    loop {
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(RoleAuditAppendLock { flock }),
+            // Flock::lock hands the file back on failure, so the
+            // descriptor is never dropped mid-retry.
+            Err((retry_file, errno)) => {
+                file = retry_file;
+                match errno {
+                    // Only these mean "held elsewhere" (contention):
+                    // EWOULDBLOCK/EAGAIN on a non-blocking flock, EINTR
+                    // if a signal interrupted the call. Anything else
+                    // (ENOLCK, EINVAL/EOPNOTSUPP, EBADF, ...) is not
+                    // contention — report the errno immediately instead
+                    // of sleeping and reporting a misleading `Locked`.
+                    nix::errno::Errno::EWOULDBLOCK | nix::errno::Errno::EINTR => {
+                        if std::time::Instant::now() >= deadline {
+                            return Err(RoleAuditError::Locked(
+                                "role audit log is locked by another writer (contention timeout)"
+                                    .to_owned(),
+                            ));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(APPEND_LOCK_WAIT_MS));
+                    }
+                    other => {
+                        return Err(RoleAuditError::Io(format!("flock role audit log: {other}")));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn acquire_role_audit_append_lock(
+    path: &Path,
+    data: fs::File,
+) -> Result<RoleAuditAppendLock, RoleAuditError> {
+    let lock_path = append_lock_path(path);
+    let deadline = std::time::Instant::now() + APPEND_LOCK_MAX_WAIT;
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut lock_handle) => {
+                // Stamp owner + age into the sidecar so a stale lock
+                // left by a crashed writer is diagnosable (mirrors
+                // resilience.rs / enrollment_token.rs).
+                let stamp = format!(
+                    "pid={} ts={}\n",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|age| age.as_secs())
+                        .unwrap_or(0),
+                );
+                lock_handle.write_all(stamp.as_bytes()).map_err(|err| {
+                    RoleAuditError::Io(format!(
+                        "stamp role audit lock {}: {err}",
+                        lock_path.display()
+                    ))
+                })?;
+                return Ok(RoleAuditAppendLock {
+                    data,
+                    lock_path,
+                    _lock_handle: Some(lock_handle),
+                });
+            }
+            Err(err)
+                if err.kind() == std::io::ErrorKind::AlreadyExists
+                    || err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                // PermissionDenied is contention here, exactly like
+                // AlreadyExists: the releasing guard unlinks the sidecar
+                // while its own handle is still open, and on Windows that
+                // leaves the name delete-pending so a concurrent
+                // `create_new` gets ERROR_ACCESS_DENIED (mirrors
+                // resilience.rs / enrollment_token.rs).
+                if std::time::Instant::now() >= deadline {
+                    return Err(match err.kind() {
+                        std::io::ErrorKind::PermissionDenied => RoleAuditError::Io(format!(
+                            "create role audit lock {} (delete-pending contention): {err}",
+                            lock_path.display()
+                        )),
+                        _ => RoleAuditError::Locked(format!(
+                            "role audit lock {} held (timeout); if no rustynet process is \
+                             running, delete that file and retry",
+                            lock_path.display()
+                        )),
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(APPEND_LOCK_WAIT_MS));
+            }
+            Err(err) => {
+                return Err(RoleAuditError::Io(format!(
+                    "create role audit lock {}: {err}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
 }
 
 /// Read all entries from the log at `path`. Returns an empty vec if
@@ -319,10 +516,20 @@ pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAudit
     }
     let mut file =
         fs::File::open(path).map_err(|err| RoleAuditError::Io(format!("open: {err}")))?;
-    // Read at most cap+1 bytes so a file grown between the metadata
-    // check and this read cannot bypass the cap via TOCTOU. Reading
-    // cap+1 lets us distinguish exactly-at-cap (accepted) from
-    // over-cap (refused) without a second stat.
+    let body = read_capped_role_audit_body(&mut file)?;
+    parse_role_audit_body(&body)
+}
+
+/// Capped read of the whole log from an already-open descriptor.
+/// Split out of [`read_role_audit_log`] so [`append_role_audit_entry`]
+/// can read the prior chain back through the SAME locked descriptor
+/// (RSA-0012) without re-opening by path.
+///
+/// Reads at most cap+1 bytes so a file grown between the metadata
+/// check and this read cannot bypass the cap via TOCTOU. Reading
+/// cap+1 lets us distinguish exactly-at-cap (accepted) from
+/// over-cap (refused) without a second stat.
+fn read_capped_role_audit_body(file: &mut fs::File) -> Result<String, RoleAuditError> {
     let mut capped = vec![0u8; MAX_ROLE_AUDIT_LOG_BYTES + 1];
     let mut filled = 0usize;
     loop {
@@ -349,8 +556,14 @@ pub fn read_role_audit_log(path: &Path) -> Result<Vec<RoleAuditEntry>, RoleAudit
             "role audit log exceeds {MAX_ROLE_AUDIT_LOG_BYTES} byte cap; refusing to parse"
         )));
     }
-    let body = String::from_utf8(capped)
-        .map_err(|_| RoleAuditError::Io("utf8: invalid encoding in role audit log".to_string()))?;
+    String::from_utf8(capped)
+        .map_err(|_| RoleAuditError::Io("utf8: invalid encoding in role audit log".to_string()))
+}
+
+/// Parse the capped log body into entries. Split out of
+/// [`read_role_audit_log`] for the same reason as
+/// [`read_capped_role_audit_body`].
+fn parse_role_audit_body(body: &str) -> Result<Vec<RoleAuditEntry>, RoleAuditError> {
     let mut out = Vec::new();
     for (line_no, line) in body.lines().enumerate() {
         if line.trim().is_empty() {
@@ -470,6 +683,9 @@ pub enum RoleAuditError {
     Io(String),
     Malformed(String),
     ChainBroken(String),
+    /// RSA-0012: the append lock was contended beyond the bounded wait;
+    /// the write was refused (fail-closed) rather than performed unlocked.
+    Locked(String),
 }
 
 impl fmt::Display for RoleAuditError {
@@ -478,6 +694,7 @@ impl fmt::Display for RoleAuditError {
             RoleAuditError::Io(msg) => write!(f, "audit log io error: {msg}"),
             RoleAuditError::Malformed(msg) => write!(f, "audit log malformed: {msg}"),
             RoleAuditError::ChainBroken(msg) => write!(f, "audit log chain broken: {msg}"),
+            RoleAuditError::Locked(msg) => write!(f, "audit log locked: {msg}"),
         }
     }
 }
@@ -500,6 +717,128 @@ mod tests {
 
     fn cleanup(path: &Path) {
         let _ = fs::remove_file(path);
+    }
+
+    fn preset_event() -> RoleTransitionEvent {
+        RoleTransitionEvent::PresetTransition {
+            from: RolePreset::Admin,
+            to: RolePreset::Exit,
+            outcome: RoleTransitionOutcome::Succeeded,
+            error_category: None,
+        }
+    }
+
+    // RSA-0012 witness: with another live descriptor holding the exclusive
+    // advisory lock on the log, append must FAIL CLOSED (refuse) rather
+    // than write unlocked and race the other writer's read-modify-append.
+    #[test]
+    fn append_refuses_while_log_is_locked_elsewhere() {
+        let path = tmp_path("locked_append");
+        let event = preset_event();
+        append_role_audit_entry(&path, 1_700_000_000, &event)
+            .unwrap_or_else(|err| panic!("baseline unlocked append must succeed: {err}"));
+        #[cfg(unix)]
+        {
+            let held = fs::OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .unwrap_or_else(|err| panic!("open for external lock: {err}"));
+            let guard = nix::fcntl::Flock::lock(held, nix::fcntl::FlockArg::LockExclusiveNonblock)
+                .unwrap_or_else(|(_, errno)| panic!("acquire external lock: {errno}"));
+            let result = append_role_audit_entry(&path, 1_700_000_001, &event);
+            assert!(
+                result.is_err(),
+                "append must refuse while another descriptor locks the log, got {result:?}"
+            );
+            if let Err(err) = result {
+                assert!(
+                    matches!(err, RoleAuditError::Locked(_)),
+                    "expected RoleAuditError::Locked, got {err:?}"
+                );
+            }
+            drop(guard);
+        }
+        cleanup(&path);
+    }
+
+    // RSA-0012 supporting test: with the append lock held across each
+    // read-modify-append, N concurrent writers must serialise into one
+    // contiguous, verifiable chain with no lost or duplicated entries.
+    #[test]
+    fn concurrent_appenders_produce_contiguous_chain() {
+        let path = tmp_path("concurrent_append");
+        let event = preset_event();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    for offset in 0..25_u64 {
+                        append_role_audit_entry(&path, 1_700_000_000 + offset, &event)
+                            .unwrap_or_else(|err| {
+                                panic!("contended append must eventually succeed: {err}")
+                            });
+                    }
+                });
+            }
+        });
+        let entries = read_role_audit_log(&path)
+            .unwrap_or_else(|err| panic!("read after concurrent appends: {err}"));
+        assert_eq!(entries.len(), 100, "every append must land exactly once");
+        verify_role_audit_chain(&entries)
+            .unwrap_or_else(|err| panic!("chain must stay contiguous: {err}"));
+        cleanup(&path);
+    }
+
+    // RSA-0012 witness (non-unix): a pre-existing sidecar `.lock`
+    // (e.g. left behind by a crashed writer) must make the append fail
+    // CLOSED with `Locked`, and removing the sidecar must let the next
+    // append succeed with a verifiable chain.
+    #[cfg(not(unix))]
+    #[test]
+    fn stale_sidecar_lock_refuses_then_recovers_once_removed() {
+        let path = tmp_path("stale_sidecar_lock");
+        let event = preset_event();
+        let lock_path = append_lock_path(&path);
+        fs::write(&lock_path, b"pid=0 ts=0\n")
+            .unwrap_or_else(|err| panic!("create stale sidecar: {err}"));
+        let refused = append_role_audit_entry(&path, 1_700_000_000, &event);
+        assert!(
+            matches!(&refused, Err(RoleAuditError::Locked(_))),
+            "pre-existing sidecar must refuse with Locked, got {refused:?}"
+        );
+        fs::remove_file(&lock_path).unwrap_or_else(|err| panic!("remove stale sidecar: {err}"));
+        append_role_audit_entry(&path, 1_700_000_001, &event)
+            .unwrap_or_else(|err| panic!("append after sidecar removal must succeed: {err}"));
+        let entries =
+            read_role_audit_log(&path).unwrap_or_else(|err| panic!("read after recovery: {err}"));
+        assert_eq!(entries.len(), 1, "exactly the recovered append landed");
+        verify_role_audit_chain(&entries)
+            .unwrap_or_else(|err| panic!("chain must verify after recovery: {err}"));
+        cleanup(&path);
+    }
+
+    // RSA-0012 supporting witness (unix): a failed append (malformed
+    // log body) must RELEASE the append lock — the next append must
+    // re-acquire it (re-failing with Malformed on the still-broken
+    // body) rather than spin to the 3 s deadline and return Locked.
+    #[cfg(unix)]
+    #[test]
+    fn failed_append_releases_lock() {
+        let path = tmp_path("failed_append_releases_lock");
+        let event = preset_event();
+        fs::write(&path, b"garbage that is not an audit entry\n")
+            .unwrap_or_else(|err| panic!("seed malformed log: {err}"));
+        let first = append_role_audit_entry(&path, 1_700_000_000, &event);
+        assert!(
+            matches!(&first, Err(RoleAuditError::Malformed(_))),
+            "malformed body must fail the append with Malformed, got {first:?}"
+        );
+        let second = append_role_audit_entry(&path, 1_700_000_001, &event);
+        assert!(
+            matches!(&second, Err(RoleAuditError::Malformed(_))),
+            "lock must be released after the failed append (second attempt must re-acquire \
+             and hit Malformed, not Locked), got {second:?}"
+        );
+        cleanup(&path);
     }
 
     #[test]
