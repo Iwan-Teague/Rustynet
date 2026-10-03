@@ -335,6 +335,11 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         "/var/lib/rustynet/rustynetd.traversal.watermark",
         &existing_env,
     )?;
+    let coordination_replay_store_path = env_path_or_existing_default(
+        "RUSTYNET_COORDINATION_REPLAY_STORE",
+        "/var/lib/rustynet/rustynetd.coordination-replay",
+        &existing_env,
+    )?;
     let traversal_max_age_secs =
         env_string_or_existing_default("RUSTYNET_TRAVERSAL_MAX_AGE_SECS", "120", &existing_env)?;
     let traversal_stun_servers_raw =
@@ -563,6 +568,7 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         dns_zone_bundle_path.as_path(),
         dns_zone_watermark_path.as_path(),
         traversal_watermark_path.as_path(),
+        coordination_replay_store_path.as_path(),
         wireguard_private_key_path.as_path(),
     ] {
         ensure_parent_dir_if_missing(mutable_target, daemon_uid, daemon_gid, 0o750)?;
@@ -728,6 +734,12 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
     )?;
     set_owner_mode_if_exists(
         traversal_watermark_path.as_path(),
+        daemon_uid,
+        daemon_gid,
+        0o600,
+    )?;
+    set_owner_mode_if_exists(
+        coordination_replay_store_path.as_path(),
         daemon_uid,
         daemon_gid,
         0o600,
@@ -1041,6 +1053,10 @@ pub(crate) fn execute_ops_install_systemd() -> Result<String, String> {
         (
             "RUSTYNET_TRAVERSAL_WATERMARK".to_owned(),
             display_path(traversal_watermark_path.as_path()),
+        ),
+        (
+            "RUSTYNET_COORDINATION_REPLAY_STORE".to_owned(),
+            display_path(coordination_replay_store_path.as_path()),
         ),
         (
             "RUSTYNET_TRAVERSAL_MAX_AGE_SECS".to_owned(),
@@ -3317,6 +3333,25 @@ mod tests {
                 "--traversal-stun-gather-timeout-ms ${RUSTYNET_TRAVERSAL_STUN_GATHER_TIMEOUT_MS}"
             ),
             "rustynetd service template must pass traversal stun gather timeout to the daemon"
+        );
+    }
+
+    #[test]
+    fn rustynetd_service_template_persists_coordination_replay_store() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let service_template =
+            std::fs::read_to_string(repo_root.join("scripts/systemd/rustynetd.service"))
+                .expect("rustynetd service template should be readable");
+        assert!(
+            service_template.contains(
+                "Environment=RUSTYNET_COORDINATION_REPLAY_STORE=/var/lib/rustynet/rustynetd.coordination-replay"
+            ),
+            "rustynetd service template must default the coordination replay store path (RSA-0029)"
+        );
+        assert!(
+            service_template
+                .contains("--coordination-replay-store ${RUSTYNET_COORDINATION_REPLAY_STORE}"),
+            "rustynetd service template must pass the coordination replay store to the daemon"
         );
     }
 

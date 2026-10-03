@@ -150,14 +150,14 @@ use rustynet_operator::menu::{MenuAction, menu_tree};
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use rustynetd::daemon::{
     DEFAULT_ANCHOR_BUNDLE_PULL_ADDR, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS,
-    DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME, DEFAULT_MEMBERSHIP_LOG_PATH,
-    DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH, DEFAULT_TRAVERSAL_BUNDLE_PATH,
-    DEFAULT_TRAVERSAL_MAX_AGE_SECS, DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH,
-    DEFAULT_TRAVERSAL_WATERMARK_PATH, DEFAULT_TRUST_VERIFIER_KEY_PATH,
-    DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE, DEFAULT_WG_KEY_PASSPHRASE_PATH,
-    DEFAULT_WG_PUBLIC_KEY_PATH, DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH,
-    verify_signed_assignment_state_artifact, verify_signed_traversal_state_artifact,
-    verify_signed_trust_state_artifact,
+    DEFAULT_COORDINATION_REPLAY_STORE_PATH, DEFAULT_DNS_RESOLVER_BIND_ADDR, DEFAULT_DNS_ZONE_NAME,
+    DEFAULT_MEMBERSHIP_LOG_PATH, DEFAULT_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_SOCKET_PATH,
+    DEFAULT_TRAVERSAL_BUNDLE_PATH, DEFAULT_TRAVERSAL_MAX_AGE_SECS,
+    DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_TRAVERSAL_WATERMARK_PATH,
+    DEFAULT_TRUST_VERIFIER_KEY_PATH, DEFAULT_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WG_INTERFACE,
+    DEFAULT_WG_KEY_PASSPHRASE_PATH, DEFAULT_WG_PUBLIC_KEY_PATH,
+    DEFAULT_WG_RUNTIME_PRIVATE_KEY_PATH, verify_signed_assignment_state_artifact,
+    verify_signed_traversal_state_artifact, verify_signed_trust_state_artifact,
 };
 use rustynetd::ipc::{IpcCommand, IpcResponse, validate_cidr};
 use rustynetd::key_material::{
@@ -12059,6 +12059,16 @@ fn macos_launchd_restart_config_from_env() -> Result<MacosLaunchdRestartConfig, 
         env_required_path("RUSTYNET_TRAVERSAL_WATERMARK")?
             .display()
             .to_string(),
+        // RSA-0029: env-optional with the daemon default so a restart against
+        // a pre-existing env file (written before this store existed) keeps
+        // working instead of failing the launchd restart.
+        "--coordination-replay-store".to_owned(),
+        env_path_or_default(
+            "RUSTYNET_COORDINATION_REPLAY_STORE",
+            DEFAULT_COORDINATION_REPLAY_STORE_PATH,
+        )?
+        .display()
+        .to_string(),
         "--traversal-max-age-secs".to_owned(),
         parse_env_u64_with_default(
             "RUSTYNET_TRAVERSAL_MAX_AGE_SECS",
@@ -13722,6 +13732,7 @@ fn execute_ops_prepare_system_dirs() -> Result<String, String> {
         "RUSTYNET_TRAVERSAL_BUNDLE",
         "RUSTYNET_TRAVERSAL_VERIFIER_KEY",
         "RUSTYNET_TRAVERSAL_WATERMARK",
+        "RUSTYNET_COORDINATION_REPLAY_STORE",
         "RUSTYNET_WG_PRIVATE_KEY",
         "RUSTYNET_WG_ENCRYPTED_PRIVATE_KEY",
         "RUSTYNET_WG_KEY_PASSPHRASE",

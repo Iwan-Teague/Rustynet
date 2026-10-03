@@ -96,18 +96,19 @@ use crate::windows_ipc::{
 #[cfg(windows)]
 use crate::windows_paths::{
     DEFAULT_WINDOWS_AUTO_TUNNEL_BUNDLE_PATH, DEFAULT_WINDOWS_AUTO_TUNNEL_VERIFIER_KEY_PATH,
-    DEFAULT_WINDOWS_AUTO_TUNNEL_WATERMARK_PATH, DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH,
-    DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH,
-    DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH, DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
-    DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH, DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH,
-    DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH, DEFAULT_WINDOWS_RELAY_FLEET_WATERMARK_PATH,
-    DEFAULT_WINDOWS_STATE_PATH, DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH,
-    DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH,
-    DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH, DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH,
-    DEFAULT_WINDOWS_TRUST_WATERMARK_PATH, DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH,
-    DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH, DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH,
-    DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH, default_windows_tunnel_service_config_path,
-    validate_windows_local_secret_acl, validate_windows_runtime_file_path,
+    DEFAULT_WINDOWS_AUTO_TUNNEL_WATERMARK_PATH, DEFAULT_WINDOWS_COORDINATION_REPLAY_STORE_PATH,
+    DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH, DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH,
+    DEFAULT_WINDOWS_DNS_ZONE_WATERMARK_PATH, DEFAULT_WINDOWS_MEMBERSHIP_LOG_PATH,
+    DEFAULT_WINDOWS_MEMBERSHIP_OWNER_SIGNING_KEY_PATH, DEFAULT_WINDOWS_MEMBERSHIP_SNAPSHOT_PATH,
+    DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH, DEFAULT_WINDOWS_RELAY_FLEET_BUNDLE_PATH,
+    DEFAULT_WINDOWS_RELAY_FLEET_WATERMARK_PATH, DEFAULT_WINDOWS_STATE_PATH,
+    DEFAULT_WINDOWS_TRAVERSAL_BUNDLE_PATH, DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH,
+    DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH, DEFAULT_WINDOWS_TRUST_EVIDENCE_PATH,
+    DEFAULT_WINDOWS_TRUST_VERIFIER_KEY_PATH, DEFAULT_WINDOWS_TRUST_WATERMARK_PATH,
+    DEFAULT_WINDOWS_WG_ENCRYPTED_PRIVATE_KEY_PATH, DEFAULT_WINDOWS_WG_KEY_PASSPHRASE_PATH,
+    DEFAULT_WINDOWS_WG_PUBLIC_KEY_PATH, DEFAULT_WINDOWS_WG_RUNTIME_PRIVATE_KEY_PATH,
+    default_windows_tunnel_service_config_path, validate_windows_local_secret_acl,
+    validate_windows_runtime_file_path,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -386,6 +387,18 @@ pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str =
     "/var/lib/rustynet/rustynetd.traversal.watermark";
 #[cfg(windows)]
 pub const DEFAULT_TRAVERSAL_WATERMARK_PATH: &str = DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH;
+/// RSA-0029: durable home of the traversal coordination replay window. Lives
+/// beside the traversal watermark in the trust-state directory so the daemon's
+/// own 0700 parent-dir handling covers it on every platform.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_COORDINATION_REPLAY_STORE_PATH: &str =
+    "/usr/local/var/rustynet/trust/rustynetd.coordination-replay";
+#[cfg(all(not(windows), not(target_os = "macos")))]
+pub const DEFAULT_COORDINATION_REPLAY_STORE_PATH: &str =
+    "/var/lib/rustynet/rustynetd.coordination-replay";
+#[cfg(windows)]
+pub const DEFAULT_COORDINATION_REPLAY_STORE_PATH: &str =
+    DEFAULT_WINDOWS_COORDINATION_REPLAY_STORE_PATH;
 #[cfg(target_os = "macos")]
 pub const DEFAULT_RELAY_FLEET_WATERMARK_PATH: &str =
     "/usr/local/var/rustynet/rustynetd.relay-fleet.watermark";
@@ -2607,6 +2620,11 @@ pub struct DaemonConfig {
     pub traversal_bundle_path: PathBuf,
     pub traversal_verifier_key_path: PathBuf,
     pub traversal_watermark_path: PathBuf,
+    /// RSA-0029: durable store for the traversal coordination replay window
+    /// (`crate::coordination_replay_store`). Without it the window is
+    /// in-memory only and every daemon restart re-accepts a captured,
+    /// still-valid signed coordination record within its (up to 24 h) TTL.
+    pub coordination_replay_store_path: PathBuf,
     /// FIS-0009: enable the cross-session prior re-rank of candidate
     /// pairs. Default OFF — recording always runs (observability first);
     /// only the re-rank consumption is gated.
@@ -2758,6 +2776,7 @@ impl Default for DaemonConfig {
             traversal_bundle_path: PathBuf::from(DEFAULT_TRAVERSAL_BUNDLE_PATH),
             traversal_verifier_key_path: PathBuf::from(DEFAULT_TRAVERSAL_VERIFIER_KEY_PATH),
             traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
+            coordination_replay_store_path: PathBuf::from(DEFAULT_COORDINATION_REPLAY_STORE_PATH),
             traversal_prior_rerank: false,
             traversal_flap_breaker: false,
             advertise_cgnat_host_candidates: false,
@@ -4962,6 +4981,16 @@ struct DaemonRuntime {
     verified_traversal_coordination_index:
         BTreeMap<(String, String), SignedTraversalCoordinationRecord>,
     traversal_coordination_replay_window: CoordinationReplayWindow,
+    /// RSA-0029: path of the durable coordination replay window store, copied
+    /// from [`DaemonConfig::coordination_replay_store_path`].
+    coordination_replay_store_path: PathBuf,
+    /// RSA-0029: whether the durable replay store has been loaded into
+    /// `traversal_coordination_replay_window` at least once this process.
+    /// Only set to `true` after a SUCCESSFUL load, so a corrupt store keeps
+    /// failing validation closed (and keeps being retried) until an operator
+    /// repairs or removes the file; reset paths flip it back to `false` when
+    /// they cannot confirm the on-disk window matches the in-memory one.
+    coordination_replay_store_loaded: bool,
     traversal_hint_error: Option<String>,
     traversal_probe_statuses: BTreeMap<NodeId, TraversalProbeStatus>,
     /// FIS-0015: per-peer adaptive keepalive intervals. Persists across
@@ -5493,6 +5522,8 @@ impl DaemonRuntime {
             verified_traversal_index: VerifiedTraversalIndex::new(),
             verified_traversal_coordination_index: BTreeMap::new(),
             traversal_coordination_replay_window: CoordinationReplayWindow::default(),
+            coordination_replay_store_path: config.coordination_replay_store_path.clone(),
+            coordination_replay_store_loaded: false,
             traversal_hint_error: None,
             traversal_probe_statuses: BTreeMap::new(),
             keepalive_estimators: BTreeMap::new(),
@@ -6057,6 +6088,39 @@ impl DaemonRuntime {
         message
     }
 
+    /// RSA-0029: generation rotation of the coordination replay window. The
+    /// freshly-verified bundle set invalidates every previously recorded
+    /// nonce, so the durable store must be emptied too — otherwise a restart
+    /// would restore nonces whose records no longer belong to the live
+    /// authority. Best-effort: if the persist fails, the loaded flag is
+    /// dropped so the next validation attempt reloads whatever is on disk —
+    /// stale entries can only over-reject until their TTL passes, never
+    /// accept (fail closed).
+    fn rotate_traversal_coordination_replay_window(&mut self) {
+        self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        let entries: BTreeMap<[u8; 16], u64> = self
+            .traversal_coordination_replay_window
+            .seen_entries()
+            .collect();
+        match crate::coordination_replay_store::persist_coordination_replay_store(
+            &self.coordination_replay_store_path,
+            &entries,
+            now_unix,
+        ) {
+            Ok(()) => self.coordination_replay_store_loaded = true,
+            Err(err) => {
+                self.coordination_replay_store_loaded = false;
+                log::warn!(
+                    "coordination replay store reset persist failed (will reload from disk): {err}"
+                );
+            }
+        }
+    }
+
     fn update_verified_traversal_index(&mut self, envelope: &TraversalBundleSetEnvelope) {
         let now_unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -6065,7 +6129,7 @@ impl DaemonRuntime {
 
         self.verified_traversal_index = VerifiedTraversalIndex::new();
         self.verified_traversal_coordination_index = BTreeMap::new();
-        self.traversal_coordination_replay_window = CoordinationReplayWindow::default();
+        self.rotate_traversal_coordination_replay_window();
 
         for bundle_envelope in &envelope.bundles {
             let bundle = &bundle_envelope.bundle;
@@ -8426,7 +8490,34 @@ impl DaemonRuntime {
         })?;
         let engine = TraversalEngine::new(self.traversal_probe_config.clone())
             .map_err(|err| format!("invalid traversal engine config: {err}"))?;
-        engine
+        // RSA-0029: hydrate the replay window from the durable store exactly
+        // once per process, before the first record is validated. A load
+        // error fails the coordination attempt closed: replaying a captured
+        // record into an accidentally-empty window is the exact hole the
+        // store exists to close, so corrupt/unreadable disk state must never
+        // degrade to "start empty". The flag is only set on success, so a
+        // later attempt retries (and can recover) after an operator repairs
+        // or removes the file.
+        if !self.coordination_replay_store_loaded {
+            match crate::coordination_replay_store::load_coordination_replay_store(
+                &self.coordination_replay_store_path,
+                now_unix,
+            ) {
+                Ok(entries) => {
+                    let restored = entries.unwrap_or_default();
+                    self.traversal_coordination_replay_window
+                        .restore_entries(restored, now_unix);
+                    self.coordination_replay_store_loaded = true;
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "validated traversal coordination for peer {} is unavailable: coordination replay store failed closed: {err}",
+                        remote_node_id.as_str()
+                    ));
+                }
+            }
+        }
+        let schedule = engine
             .validate_signed_coordination_record(
                 &record,
                 &local_node_id,
@@ -8435,13 +8526,32 @@ impl DaemonRuntime {
                 &mut self.traversal_coordination_replay_window,
                 now_unix,
             )
-            .map(Some)
             .map_err(|err| {
                 format!(
                     "validated traversal coordination for peer {} is unavailable: {err}",
                     remote_node_id.as_str()
                 )
-            })
+            })?;
+        // RSA-0029: the record above has just been recorded into the replay
+        // window; its replay-protection row is only real once it is durable.
+        // A persist failure therefore refuses the schedule (fail closed) —
+        // the caller surfaces it as a per-peer coordination error and the
+        // probe round falls back to the non-coordinated path.
+        let entries: BTreeMap<[u8; 16], u64> = self
+            .traversal_coordination_replay_window
+            .seen_entries()
+            .collect();
+        if let Err(err) = crate::coordination_replay_store::persist_coordination_replay_store(
+            &self.coordination_replay_store_path,
+            &entries,
+            now_unix,
+        ) {
+            return Err(format!(
+                "validated traversal coordination for peer {} is unavailable: coordination replay store persist failed closed: {err}",
+                remote_node_id.as_str()
+            ));
+        }
+        Ok(Some(schedule))
     }
 
     fn build_verified_traversal_index(
@@ -14845,7 +14955,7 @@ fn trust_evidence_payload(record: &TrustEvidenceRecord) -> String {
 /// generous; the bound is enforced inside the read loop via
 /// `read_text_artifact_bounded` so tampered disk state cannot drive an
 /// unbounded allocation before the parser sees a single byte.
-const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 16 * 1024;
 
 /// Read a text artifact from disk with a hard upper bound enforced inside the
 /// read loop, eliminating the TOCTOU window between a separate `fs::metadata`
@@ -14865,7 +14975,7 @@ const MAX_BOOTSTRAP_ARTIFACT_BYTES: usize = 16 * 1024;
 /// (i.e. the file is bigger than the cap), we surface the same
 /// "exceeds maximum size" error shape callers already log. The buffer is
 /// bounded BEFORE memory is committed, closing the TOCTOU window.
-fn read_text_artifact_bounded(
+pub(crate) fn read_text_artifact_bounded(
     path: &Path,
     artifact_name: &str,
     max_bytes: usize,
@@ -28875,6 +28985,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_max_candidates: NonZeroUsize::new(4)
                 .expect("test traversal probe max candidates should be non-zero"),
@@ -30745,6 +30856,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path),
             traversal_bundle_path: traversal_path,
             traversal_verifier_key_path: traversal_verifier_path,
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path,
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()
@@ -30852,6 +30964,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_reprobe_interval_secs: NonZeroU64::new(60)
                 .expect("test traversal reprobe interval should be non-zero"),
@@ -31187,6 +31300,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_handshake_freshness_secs: NonZeroU64::new(60)
                 .expect("test traversal handshake freshness should be non-zero"),
@@ -31345,6 +31459,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             traversal_probe_handshake_freshness_secs: NonZeroU64::new(60)
                 .expect("test traversal handshake freshness should be non-zero"),
@@ -31498,6 +31613,7 @@ mod tests {
             auto_tunnel_watermark_path: Some(assignment_watermark_path.clone()),
             traversal_bundle_path: traversal_path.clone(),
             traversal_verifier_key_path: traversal_verifier_path.clone(),
+            coordination_replay_store_path: test_dir.join("coordination-replay"),
             traversal_watermark_path: traversal_watermark_path.clone(),
             backend_mode: DaemonBackendMode::InMemory,
             ..DaemonConfig::default()

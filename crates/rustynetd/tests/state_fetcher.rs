@@ -49,6 +49,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         traversal_bundle_path: dir.join("traversal.bundle"),
         traversal_verifier_key_path: dir.join("traversal.pub"),
         traversal_watermark_path: dir.join("traversal.watermark"),
+        coordination_replay_store_path: dir.join("coordination-replay"),
         traversal_prior_rerank: false,
         traversal_flap_breaker: false,
         advertise_cgnat_host_candidates: false,

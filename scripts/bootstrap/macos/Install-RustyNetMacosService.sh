@@ -455,6 +455,8 @@ ${AUTO_TUNNEL_MAX_AGE_PLIST_FRAGMENT}
         <string>${STATE_ROOT}/trust/traversal.pub</string>
         <string>--traversal-watermark</string>
         <string>${STATE_ROOT}/trust/rustynetd.traversal.watermark</string>
+        <string>--coordination-replay-store</string>
+        <string>${STATE_ROOT}/trust/rustynetd.coordination-replay</string>
 ${TRAVERSAL_MAX_AGE_PLIST_FRAGMENT}
 ${TRAVERSAL_STUN_PLIST_FRAGMENT}
         <string>--dns-zone-bundle</string>

@@ -15,6 +15,7 @@
 pub mod anchor_port_mapping_status;
 pub mod anchor_tls;
 pub mod blind_exit_reversal_audit;
+pub mod coordination_replay_store;
 pub mod core_hardening;
 pub mod daemon;
 pub mod dataplane_candidates;

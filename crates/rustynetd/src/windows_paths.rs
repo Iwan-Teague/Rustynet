@@ -60,6 +60,8 @@ pub const DEFAULT_WINDOWS_TRAVERSAL_VERIFIER_KEY_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\traversal.pub";
 pub const DEFAULT_WINDOWS_TRAVERSAL_WATERMARK_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\rustynetd.traversal.watermark";
+pub const DEFAULT_WINDOWS_COORDINATION_REPLAY_STORE_PATH: &str =
+    r"C:\ProgramData\RustyNet\trust\rustynetd.coordination-replay";
 pub const DEFAULT_WINDOWS_DNS_ZONE_BUNDLE_PATH: &str =
     r"C:\ProgramData\RustyNet\trust\rustynetd.dns-zone";
 pub const DEFAULT_WINDOWS_DNS_ZONE_VERIFIER_KEY_PATH: &str =

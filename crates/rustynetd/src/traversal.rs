@@ -735,6 +735,31 @@ impl CoordinationReplayWindow {
         self.seen_nonces.insert(nonce, expires_at_unix);
         Ok(())
     }
+
+    /// Snapshot of the live (nonce, expires_at_unix) pairs, for durable
+    /// persistence across daemon restarts (RSA-0029).
+    pub fn seen_entries(&self) -> impl Iterator<Item = ([u8; 16], u64)> + '_ {
+        self.seen_nonces
+            .iter()
+            .map(|(nonce, expires)| (*nonce, *expires))
+    }
+
+    /// Restore persisted entries recorded before a restart. Expired entries
+    /// are dropped, mirroring the `retain` in `verify_and_record`; surviving
+    /// entries restore replay protection for records that are still within
+    /// their coordination TTL.
+    pub fn restore_entries<I: IntoIterator<Item = ([u8; 16], u64)>>(
+        &mut self,
+        entries: I,
+        now_unix: u64,
+    ) {
+        self.seen_nonces.retain(|_, expires| *expires >= now_unix);
+        for (nonce, expires) in entries {
+            if expires >= now_unix {
+                self.seen_nonces.insert(nonce, expires);
+            }
+        }
+    }
 }
 
 pub trait SimultaneousOpenRuntime {
