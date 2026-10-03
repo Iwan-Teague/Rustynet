@@ -263,6 +263,37 @@ pub fn append_role_audit_entry(
     timestamp_unix: u64,
     event: &RoleTransitionEvent,
 ) -> Result<RoleAuditEntry, RoleAuditError> {
+    #[cfg(unix)]
+    {
+        append_role_audit_entry_inner(path, timestamp_unix, event, |file| {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o640))
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        // No POSIX mode to pin on non-unix platforms (RSA-0013 is a
+        // unix-mode concern); the injected step is a no-op that can
+        // never fail there.
+        append_role_audit_entry_inner(path, timestamp_unix, event, |_| Ok(()))
+    }
+}
+
+/// RSA-0013: the permission-pinning step is injected as a closure so
+/// tests can exercise the chmod-failure path portably (a real
+/// `set_permissions` failure needs e.g. a non-owned or immutable file,
+/// which cannot be reproduced reliably in a unit test). The production
+/// step is the real `set_permissions(0o640)` in
+/// [`append_role_audit_entry`].
+fn append_role_audit_entry_inner<F>(
+    path: &Path,
+    timestamp_unix: u64,
+    event: &RoleTransitionEvent,
+    pin_new_log_mode: F,
+) -> Result<RoleAuditEntry, RoleAuditError>
+where
+    F: FnOnce(&mut fs::File) -> std::io::Result<()>,
+{
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -299,14 +330,22 @@ pub fn append_role_audit_entry(
     // Pin restrictive perms when the file is newly created. We
     // don't downgrade existing perms (operator might have widened
     // intentionally) but we tighten on create.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if existing.is_empty() {
-            let _ = lock
-                .file_mut()
-                .set_permissions(fs::Permissions::from_mode(0o640));
-        }
+    //
+    // RSA-0013: the pin previously discarded its `set_permissions`
+    // result (`let _ = ...`), so a failed chmod left the fresh log
+    // with a umask-derived (possibly group/world-readable) mode and
+    // the entry was written anyway (CWE-732). Now the failure is
+    // propagated BEFORE the write: the append is refused with
+    // [`RoleAuditError::Io`] and nothing is removed — the still-empty
+    // file stays on disk (no data was written; unlinking by path
+    // under a held lock invites TOCTOU and an operator-visible empty
+    // log is the honest failure state).
+    if existing.is_empty() {
+        pin_new_log_mode(lock.file_mut()).map_err(|err| {
+            RoleAuditError::Io(format!(
+                "pin newly created role audit log to 0o640; refusing to write: {err}"
+            ))
+        })?;
     }
 
     lock.file_mut()
@@ -1554,6 +1593,106 @@ mod tests {
         fs::write(&path, "this is not a valid line\n").unwrap();
         let err = read_role_audit_log(&path).unwrap_err();
         assert!(matches!(err, RoleAuditError::Malformed(_)));
+        cleanup(&path);
+    }
+
+    // RSA-0013 witness: on a NEWLY created (empty) log, a failing
+    // permission pin must FAIL CLOSED — the append is refused with a
+    // `RoleAuditError::Io` naming the 0o640 pin, NOTHING is written,
+    // and nothing is removed (the still-empty file stays on disk).
+    // The old code discarded the `set_permissions` result with
+    // `let _ =` and wrote the entry anyway. This test drives the
+    // injected pin step, which did not exist before the fix, so on
+    // the pre-fix tree the RED is a compile failure (cannot find
+    // function `append_role_audit_entry_inner`).
+    #[cfg(unix)]
+    #[test]
+    fn pin_failure_on_new_log_refuses_write_and_removes_nothing() {
+        let path = tmp_path("pin-failure-new");
+        let result =
+            append_role_audit_entry_inner(&path, 1_700_000_000, &preset_event(), |_file| {
+                Err(std::io::Error::other("injected chmod failure"))
+            });
+        let err = result.expect_err("failing pin must refuse the append");
+        assert!(
+            matches!(&err, RoleAuditError::Io(msg) if msg.contains("0o640")),
+            "expected Io error naming the 0o640 pin, got {err:?}"
+        );
+        let body = fs::read(&path).unwrap_or_else(|err| panic!("file must not be removed: {err}"));
+        assert!(
+            body.is_empty(),
+            "refused append must write nothing, got {} bytes",
+            body.len()
+        );
+        cleanup(&path);
+    }
+
+    // RSA-0013 companion: the pin step is attempted ONLY for a newly
+    // created (empty) log. An existing log is never chmod'ed, so an
+    // operator's mode is preserved and an injected failing pin step
+    // must never fire for it (never downgrade; never block an append
+    // to an existing log over permissions).
+    #[cfg(unix)]
+    #[test]
+    fn pin_step_not_attempted_for_existing_log() {
+        let path = tmp_path("pin-existing");
+        let event = preset_event();
+        append_role_audit_entry(&path, 1_700_000_000, &event)
+            .unwrap_or_else(|err| panic!("baseline append must succeed: {err}"));
+        let second = append_role_audit_entry_inner(&path, 1_700_000_001, &event, |_file| {
+            Err(std::io::Error::other("injected chmod failure"))
+        });
+        assert!(
+            second.is_ok(),
+            "existing log must not be pinned; injected failure must not fire, got {second:?}"
+        );
+        let entries = read_role_audit_log(&path).unwrap_or_else(|err| panic!("read back: {err}"));
+        assert_eq!(entries.len(), 2, "second append must have landed");
+        verify_role_audit_chain(&entries).unwrap_or_else(|err| panic!("chain must verify: {err}"));
+        cleanup(&path);
+    }
+
+    // RSA-0013 supporting (unix): the happy path still pins a newly
+    // created log to 0o640 through the injected-step refactor.
+    #[cfg(unix)]
+    #[test]
+    fn new_log_pinned_to_0640() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("pin-new-0640");
+        append_role_audit_entry(&path, 1_700_000_000, &preset_event())
+            .unwrap_or_else(|err| panic!("append must succeed: {err}"));
+        let mode = fs::metadata(&path)
+            .unwrap_or_else(|err| panic!("metadata: {err}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o640, "newly created log must be pinned to 0o640");
+        cleanup(&path);
+    }
+
+    // RSA-0013 supporting (unix): an EXISTING log with a STRICTER
+    // mode than 0o640 must never be widened by an append.
+    #[cfg(unix)]
+    #[test]
+    fn existing_log_stricter_mode_is_never_widened() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = tmp_path("pin-existing-stricter");
+        let event = preset_event();
+        append_role_audit_entry(&path, 1_700_000_000, &event)
+            .unwrap_or_else(|err| panic!("baseline append must succeed: {err}"));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| panic!("chmod 600: {err}"));
+        append_role_audit_entry(&path, 1_700_000_001, &event)
+            .unwrap_or_else(|err| panic!("second append must succeed: {err}"));
+        let mode = fs::metadata(&path)
+            .unwrap_or_else(|err| panic!("metadata: {err}"))
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "existing stricter mode must be preserved verbatim"
+        );
         cleanup(&path);
     }
 }
