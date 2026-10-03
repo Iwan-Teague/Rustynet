@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -616,13 +627,18 @@ fn write_node_stage_result_ledgers(
     let stage_summaries: BTreeMap<String, String> =
         read_tsv_rows(report_dir.join(STAGES_RELATIVE_PATH).as_path())?
             .into_iter()
-            .filter(|row| row.len() >= 6)
-            .map(|row| {
-                let summary = match overlay_redaction.as_ref() {
-                    Some(redaction) => redaction.scrub(&row[5]),
-                    None => row[5].clone(),
-                };
-                (row[0].clone(), summary)
+            // AQ-08: the `row.len() >= 6` filter made the old `row[0]` /
+            // `row[5]` accesses panic-free; the slice match keeps behaviour
+            // identical without indexing.
+            .filter_map(|row| match row.as_slice() {
+                [stage, _, _, _, _, summary, ..] => Some((
+                    stage.clone(),
+                    match overlay_redaction.as_ref() {
+                        Some(redaction) => redaction.scrub(summary),
+                        None => summary.clone(),
+                    },
+                )),
+                _ => None,
             })
             .collect();
 
@@ -1680,14 +1696,19 @@ fn read_tsv_rows(path: &Path) -> Result<Vec<Vec<String>>, String> {
 fn read_node_rows(path: &Path) -> Result<Vec<NodeRow>, String> {
     Ok(read_tsv_rows(path)?
         .into_iter()
-        .filter(|row| row.len() >= 4)
-        .map(|row| NodeRow {
-            label: row[0].clone(),
-            target: row[1].clone(),
-            node_id: row[2].clone(),
-            bootstrap_role: row[3].clone(),
-            platform: row.get(4).cloned().unwrap_or_default(),
-            os_version: row.get(5).cloned().unwrap_or_default(),
+        // AQ-08: the `row.len() >= 4` filter guarded the old `row[0..=3]`
+        // accesses and made the `row.get(4)`/`row.get(5)` lookups equivalent
+        // to `rest.first()`/`rest.get(1)` below; behaviour identical.
+        .filter_map(|row| match row.as_slice() {
+            [label, target, node_id, bootstrap_role, rest @ ..] => Some(NodeRow {
+                label: label.clone(),
+                target: target.clone(),
+                node_id: node_id.clone(),
+                bootstrap_role: bootstrap_role.clone(),
+                platform: rest.first().cloned().unwrap_or_default(),
+                os_version: rest.get(1).cloned().unwrap_or_default(),
+            }),
+            _ => None,
         })
         .collect())
 }
@@ -1695,14 +1716,19 @@ fn read_node_rows(path: &Path) -> Result<Vec<NodeRow>, String> {
 fn read_stage_evidence(path: &Path) -> Result<Vec<StageEvidence>, String> {
     Ok(read_tsv_rows(path)?
         .into_iter()
-        .filter(|row| row.len() >= 8)
-        .map(|row| StageEvidence {
-            stage: row[0].clone(),
-            status: normalize_status(row[2].as_str()).to_owned(),
-            artifacts: vec![row[4].clone()],
-            // Column 6 is `started_at` (`live_lab_stage_recorder::to_tsv`);
-            // the `len() >= 8` filter above guarantees it is present.
-            started_at: row[6].clone(),
+        // AQ-08: the `row.len() >= 8` filter made the old `row[0]/[2]/[4]/[6]`
+        // accesses panic-free; the eight-slot pattern pins the same minimum
+        // length without indexing.
+        .filter_map(|row| match row.as_slice() {
+            [stage, _, status, _, artifact, _, started_at, _, ..] => Some(StageEvidence {
+                stage: stage.clone(),
+                status: normalize_status(status.as_str()).to_owned(),
+                artifacts: vec![artifact.clone()],
+                // Column 6 is `started_at` (`live_lab_stage_recorder::to_tsv`);
+                // the pattern above guarantees it is present.
+                started_at: started_at.clone(),
+            }),
+            _ => None,
         })
         .collect())
 }
@@ -1760,10 +1786,15 @@ fn stage_rows_for_times(path: &Path) -> Vec<StageRow> {
     read_tsv_rows(path)
         .unwrap_or_default()
         .into_iter()
-        .filter(|row| row.len() >= 8)
-        .map(|row| StageRow {
-            started_at: row[6].clone(),
-            finished_at: row[7].clone(),
+        // AQ-08: the `row.len() >= 8` filter made the old `row[6]/[7]`
+        // accesses panic-free; the eight-slot pattern pins the same minimum
+        // length without indexing.
+        .filter_map(|row| match row.as_slice() {
+            [_, _, _, _, _, _, started_at, finished_at, ..] => Some(StageRow {
+                started_at: started_at.clone(),
+                finished_at: finished_at.clone(),
+            }),
+            _ => None,
         })
         .collect()
 }
@@ -7227,4 +7258,143 @@ fn node_and_legacy_run_matrices_are_distinct_ledgers() {
         "--node ledger path moved: {}",
         node.display()
     );
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for the TSV row mappers in this
+    //! module (`stage_summaries` overlay-absent path, `read_node_rows`,
+    //! `read_stage_evidence`, `stage_rows_for_times`).
+    //!
+    //! `old_*` helpers are verbatim copies of the pre-AQ-08 index-based
+    //! mapping bodies. The old code could not panic: every mapper filtered
+    //! rows by a minimum length before indexing. Tests pin output equality
+    //! across seeded and mutated rows.
+
+    use super::*;
+
+    fn old_node_row(row: &[String]) -> Option<NodeRow> {
+        if row.len() < 4 {
+            return None;
+        }
+        Some(NodeRow {
+            label: row[0].clone(),
+            target: row[1].clone(),
+            node_id: row[2].clone(),
+            bootstrap_role: row[3].clone(),
+            platform: row.get(4).cloned().unwrap_or_default(),
+            os_version: row.get(5).cloned().unwrap_or_default(),
+        })
+    }
+
+    fn new_node_row(row: &[String]) -> Option<NodeRow> {
+        match row {
+            [label, target, node_id, bootstrap_role, rest @ ..] => Some(NodeRow {
+                label: label.clone(),
+                target: target.clone(),
+                node_id: node_id.clone(),
+                bootstrap_role: bootstrap_role.clone(),
+                platform: rest.first().cloned().unwrap_or_default(),
+                os_version: rest.get(1).cloned().unwrap_or_default(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn old_stage_evidence_row(row: &[String]) -> Option<StageEvidence> {
+        if row.len() < 8 {
+            return None;
+        }
+        Some(StageEvidence {
+            stage: row[0].clone(),
+            status: normalize_status(row[2].as_str()).to_owned(),
+            artifacts: vec![row[4].clone()],
+            started_at: row[6].clone(),
+        })
+    }
+
+    fn new_stage_evidence_row(row: &[String]) -> Option<StageEvidence> {
+        match row {
+            [stage, _, status, _, artifact, _, started_at, _, ..] => Some(StageEvidence {
+                stage: stage.clone(),
+                status: normalize_status(status.as_str()).to_owned(),
+                artifacts: vec![artifact.clone()],
+                started_at: started_at.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn old_stage_row(row: &[String]) -> Option<StageRow> {
+        if row.len() < 8 {
+            return None;
+        }
+        Some(StageRow {
+            started_at: row[6].clone(),
+            finished_at: row[7].clone(),
+        })
+    }
+
+    fn new_stage_row(row: &[String]) -> Option<StageRow> {
+        match row {
+            [_, _, _, _, _, _, started_at, finished_at, ..] => Some(StageRow {
+                started_at: started_at.clone(),
+                finished_at: finished_at.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn old_stage_summary(row: &[String]) -> Option<(String, String)> {
+        if row.len() < 6 {
+            return None;
+        }
+        Some((row[0].clone(), row[5].clone()))
+    }
+
+    fn new_stage_summary(row: &[String]) -> Option<(String, String)> {
+        match row {
+            [stage, _, _, _, _, summary, ..] => Some((stage.clone(), summary.clone())),
+            _ => None,
+        }
+    }
+
+    fn matrices() -> Vec<Vec<String>> {
+        vec![
+            vec![],
+            (1..=1).map(|i| format!("c{i}")).collect(),
+            (1..=4).map(|i| format!("c{i}")).collect(),
+            (1..=5).map(|i| format!("c{i}")).collect(),
+            (1..=6).map(|i| format!("c{i}")).collect(),
+            (1..=7).map(|i| format!("c{i}")).collect(),
+            (1..=8).map(|i| format!("c{i}")).collect(),
+            (1..=10).map(|i| format!("c{i}")).collect(),
+        ]
+    }
+
+    #[test]
+    fn differential_row_mappers() {
+        for row in &matrices() {
+            let row = row.as_slice();
+            assert_eq!(new_node_row(row), old_node_row(row), "node {row:?}");
+            assert_eq!(
+                new_stage_evidence_row(row),
+                old_stage_evidence_row(row),
+                "evidence {row:?}"
+            );
+            assert_eq!(new_stage_row(row), old_stage_row(row), "stage {row:?}");
+            assert_eq!(
+                new_stage_summary(row),
+                old_stage_summary(row),
+                "summary {row:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_stage_evidence_status_normalization_matches() {
+        let mut row: Vec<String> = (1..=8).map(|i| format!("c{i}")).collect();
+        row[2] = "PASS".to_owned();
+        assert_eq!(new_stage_evidence_row(&row), old_stage_evidence_row(&row));
+    }
 }

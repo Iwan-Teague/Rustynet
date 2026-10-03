@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -2682,10 +2693,12 @@ pub fn execute_ops_generate_cross_network_remote_exit_report(
         config.path_status_line,
         config.path_evidence_report,
     )? {
-        payload
-            .as_object_mut()
-            .expect("payload object")
-            .insert("path_evidence".to_owned(), path_evidence);
+        // AQ-08: `payload` is built as `Value::Object` above, so the old
+        // `.expect("payload object")` could not panic. The `if let` mirrors
+        // the adjacent CHECK_FAIL insert below; behaviour identical.
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("path_evidence".to_owned(), path_evidence);
+        }
     }
     if status == CHECK_FAIL {
         let failure_summary = if config.failure_summary.trim().is_empty() {
@@ -4450,5 +4463,49 @@ mod tests {
             Some("ride-through"),
             "scalar extras must be preserved verbatim"
         );
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for the `path_evidence` payload
+    //! insert in the check-report builder.
+    //!
+    //! `payload` is constructed as `Value::Object` immediately before the
+    //! insert, so the old `.expect("payload object")` could not panic. The
+    //! helpers below mirror the old and new insert shapes; tests pin equality
+    //! for object payloads (the only shape reachable at the call site).
+
+    use super::*;
+    use serde_json::json;
+
+    fn old_insert_path_evidence(payload: &mut Value, path_evidence: Value) {
+        payload
+            .as_object_mut()
+            .expect("payload object")
+            .insert("path_evidence".to_owned(), path_evidence);
+    }
+
+    fn new_insert_path_evidence(payload: &mut Value, path_evidence: Value) {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("path_evidence".to_owned(), path_evidence);
+        }
+    }
+
+    #[test]
+    fn differential_path_evidence_insert() {
+        for extra in [
+            json!({}),
+            json!({"participants": {}, "checks": {"reachability": "pass"}}),
+            json!({"source_artifacts": [], "log_artifacts": [], "implementation_state": "not_implemented"}),
+        ] {
+            let evidence = json!({"probe": "icmp", "rtt_ms": 12});
+            let mut old_payload = extra.clone();
+            let mut new_payload = extra.clone();
+            old_insert_path_evidence(&mut old_payload, evidence.clone());
+            new_insert_path_evidence(&mut new_payload, evidence);
+            assert_eq!(old_payload, new_payload, "divergence for base {extra}");
+            assert!(old_payload.get("path_evidence").is_some());
+        }
     }
 }

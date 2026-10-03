@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
@@ -4023,13 +4034,13 @@ fn issue_traversal_bundle_artifacts(
 
         let signed_coordination = core
             .signed_traversal_coordination_record(TraversalCoordinationRecord {
-                session_id: random_nonzero_coordination_bytes(),
+                session_id: random_nonzero_coordination_bytes()?,
                 probe_start_unix: generated_at_unix,
                 node_a: pair.source_node_id.clone(),
                 node_b: pair.target_node_id.clone(),
                 issued_at_unix: generated_at_unix,
                 expires_at_unix: generated_at_unix.saturating_add(coordination_ttl_secs),
-                nonce: random_nonzero_coordination_bytes(),
+                nonce: random_nonzero_coordination_bytes()?,
             })
             .map_err(|err| format!("issue traversal coordination failed: {err}"))?;
         if !core.verify_signed_traversal_coordination_record(&signed_coordination) {
@@ -4154,14 +4165,14 @@ fn traversal_coordination_pair_key(left: &str, right: &str) -> (String, String) 
     }
 }
 
-fn random_nonzero_coordination_bytes() -> [u8; 16] {
+fn random_nonzero_coordination_bytes() -> Result<[u8; 16], String> {
     let mut bytes = [0u8; 16];
     while bytes.iter().all(|value| *value == 0) {
-        OsRng
-            .try_fill_bytes(&mut bytes)
-            .expect("os randomness unavailable for traversal coordination bytes");
+        OsRng.try_fill_bytes(&mut bytes).map_err(|err| {
+            format!("os randomness unavailable for traversal coordination bytes: {err}")
+        })?;
     }
-    bytes
+    Ok(bytes)
 }
 
 fn signed_traversal_coordination_record_to_wire(
@@ -5439,28 +5450,31 @@ fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, S
             continue;
         }
         let parts = trimmed.split('|').collect::<Vec<_>>();
-        if parts.len() < 3 {
+        // AQ-08: the `parts.len() < 3` guard made the old `parts[0..=2]`
+        // accesses panic-free; the refutable let-else returns the identical
+        // error without indexing.
+        let [node_id, endpoint, public_key_hex, rest @ ..] = parts.as_slice() else {
             return Err(format!(
                 "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|public_key_hex[|...]"
             ));
-        }
-        let node_id = parts[0].trim();
-        let endpoint = parts[1].trim();
-        let public_key_hex = parts[2].trim();
+        };
+        // The old code trimmed each of the three fields before validating them;
+        // keep that (an independent review caught the dropped trim).
+        let node_id = node_id.trim();
+        let endpoint = endpoint.trim();
+        let public_key_hex = public_key_hex.trim();
         ensure_safe_token("node-id", node_id)?;
         ensure_safe_token("endpoint", endpoint)?;
         ensure_hex_32("node-public-key-hex", public_key_hex)?;
         // Optional 4th field: comma-separated capabilities (e.g. "anchor,exit_server").
         // When absent the caller defaults to [Client].
-        let capabilities = if parts.len() >= 4 && !parts[3].trim().is_empty() {
-            let csv = parts[3].trim();
-            let parsed =
-                rustynet_control::roles::parse_role_capability_csv(csv).map_err(|err| {
+        let capabilities = match rest.first() {
+            Some(csv) if !csv.trim().is_empty() => Some(
+                rustynet_control::roles::parse_role_capability_csv(csv.trim()).map_err(|err| {
                     format!("invalid capabilities in NODES_SPEC entry {trimmed:?}: {err}")
-                })?;
-            Some(parsed)
-        } else {
-            None
+                })?,
+            ),
+            _ => None,
         };
         nodes.push(GenericTraversalNodeSpec {
             node_id: node_id.to_owned(),
@@ -5613,10 +5627,15 @@ fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
 fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
     ensure_hex_32("hex", value)?;
     let mut out = [0u8; 32];
-    for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
-        let hi = decode_hex_nibble(chunk[0]).ok_or_else(|| "invalid hex".to_owned())?;
-        let lo = decode_hex_nibble(chunk[1]).ok_or_else(|| "invalid hex".to_owned())?;
-        out[index] = (hi << 4) | lo;
+    // AQ-08: `ensure_hex_32` guarantees exactly 64 chars, so `chunks_exact(2)`
+    // yields exactly 32 pairs and the old `chunk[0]`/`chunk[1]`/`out[index]`
+    // accesses could not panic. The zip + slice-pattern pair keeps behaviour
+    // identical without indexing.
+    for (pair, slot) in value.as_bytes().chunks_exact(2).zip(out.iter_mut()) {
+        let [hi_byte, lo_byte] = pair else { continue };
+        let hi = decode_hex_nibble(*hi_byte).ok_or_else(|| "invalid hex".to_owned())?;
+        let lo = decode_hex_nibble(*lo_byte).ok_or_else(|| "invalid hex".to_owned())?;
+        *slot = (hi << 4) | lo;
     }
     Ok(out)
 }
@@ -6298,9 +6317,15 @@ fn clear_rustynet_nftables_state() -> Result<(), String> {
         let table_listing = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
         for line in table_listing.lines() {
             let tokens = line.split_whitespace().collect::<Vec<_>>();
-            if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
-                run_allow_failure("nft", &["flush", "table", tokens[1], tokens[2]], &[]);
-                run_allow_failure("nft", &["delete", "table", tokens[1], tokens[2]], &[]);
+            // AQ-08: the `tokens.len() == 3` condition made the old
+            // `tokens[0..=2]` accesses panic-free; the irrefutable-in-branch
+            // slice pattern keeps behaviour identical without indexing.
+            if let [first_token, table_id, table_name] = tokens.as_slice()
+                && *first_token == "table"
+                && table_name.starts_with("rustynet")
+            {
+                run_allow_failure("nft", &["flush", "table", *table_id, *table_name], &[]);
+                run_allow_failure("nft", &["delete", "table", *table_id, *table_name], &[]);
             }
         }
         let residual = capture_stdout("nft", &["list", "tables"], &[]).unwrap_or_default();
@@ -7292,22 +7317,27 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         return Err("invalid base64 wireguard public key".to_owned());
     }
     let mut output = Vec::with_capacity(clean.len() / 4 * 3);
-    for chunk in clean.chunks(4) {
+    // AQ-08: the `clean.len() % 4 != 0` guard above makes every chunk exactly
+    // 4 chars, so the old `sextets[index]` writes and `sextets[0..=3]` reads
+    // could not panic. `zip` + an irrefutable array pattern keep behaviour
+    // identical without slice indexing.
+    for chunk in clean.chunks_exact(4) {
         let mut sextets = [0u8; 4];
         let mut padding = 0usize;
-        for (index, ch) in chunk.iter().enumerate() {
+        for (slot, ch) in sextets.iter_mut().zip(chunk) {
             if *ch == '=' {
-                sextets[index] = 0;
+                *slot = 0;
                 padding += 1;
             } else if let Some(value) = reverse.get(ch) {
-                sextets[index] = *value;
+                *slot = *value;
             } else {
                 return Err("invalid base64 wireguard public key".to_owned());
             }
         }
-        let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
-        let b1 = ((sextets[1] & 0x0f) << 4) | (sextets[2] >> 2);
-        let b2 = ((sextets[2] & 0x03) << 6) | sextets[3];
+        let [s0, s1, s2, s3] = sextets;
+        let b0 = (s0 << 2) | (s1 >> 4);
+        let b1 = ((s1 & 0x0f) << 4) | (s2 >> 2);
+        let b2 = ((s2 & 0x03) << 6) | s3;
         output.push(b0);
         if padding < 2 {
             output.push(b1);
@@ -10015,6 +10045,285 @@ mod macos_enforce_tests {
         #[cfg(not(target_os = "macos"))]
         {
             assert_eq!(owner_group, "root:root");
+        }
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for the rewritten `ops_e2e`
+    //! helpers (`parse_generic_nodes` field extraction, `decode_hex_32`,
+    //! `decode_base64`, the nftables token matcher, and the node-row fields).
+    //!
+    //! `old_*` helpers are verbatim copies of the pre-AQ-08 index-based
+    //! logic. The old code could not panic on the covered input space: every
+    //! indexed access was guarded by a length check (or `chunks_exact`) in
+    //! the same function. `random_nonzero_coordination_bytes` changed its
+    //! failure surface from panic to `Err` on OS-RNG failure (fail-closed);
+    //! that path cannot be triggered deterministically in-process and is
+    //! disclosed as UNVERIFIED in the lane report.
+
+    use super::*;
+
+    fn old_decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+        ensure_hex_32("hex", value)?;
+        let mut out = [0u8; 32];
+        for (index, chunk) in value.as_bytes().chunks_exact(2).enumerate() {
+            let hi = decode_hex_nibble(chunk[0]).ok_or_else(|| "invalid hex".to_owned())?;
+            let lo = decode_hex_nibble(chunk[1]).ok_or_else(|| "invalid hex".to_owned())?;
+            out[index] = (hi << 4) | lo;
+        }
+        Ok(out)
+    }
+
+    fn old_decode_base64(value: &str) -> Result<Vec<u8>, String> {
+        const TABLE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut reverse = BTreeMap::new();
+        for (index, ch) in TABLE.chars().enumerate() {
+            reverse.insert(ch, index as u8);
+        }
+        let clean = value
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        if clean.is_empty() || clean.len() % 4 != 0 {
+            return Err("invalid base64 wireguard public key".to_owned());
+        }
+        let mut output = Vec::with_capacity(clean.len() / 4 * 3);
+        for chunk in clean.chunks(4) {
+            let mut sextets = [0u8; 4];
+            let mut padding = 0usize;
+            for (index, ch) in chunk.iter().enumerate() {
+                if *ch == '=' {
+                    sextets[index] = 0;
+                    padding += 1;
+                } else if let Some(value) = reverse.get(ch) {
+                    sextets[index] = *value;
+                } else {
+                    return Err("invalid base64 wireguard public key".to_owned());
+                }
+            }
+            let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
+            let b1 = ((sextets[1] & 0x0f) << 4) | (sextets[2] >> 2);
+            let b2 = ((sextets[2] & 0x03) << 6) | sextets[3];
+            output.push(b0);
+            if padding < 2 {
+                output.push(b1);
+            }
+            if padding < 1 {
+                output.push(b2);
+            }
+        }
+        Ok(output)
+    }
+
+    /// Old NODES_SPEC field extraction: returns the trimmed first three
+    /// fields plus the optional fourth (verbatim guard + indexing).
+    fn old_nodes_spec_fields(
+        trimmed: &str,
+    ) -> Result<(String, String, String, Option<String>), String> {
+        let parts = trimmed.split('|').collect::<Vec<_>>();
+        if parts.len() < 3 {
+            return Err(format!(
+                "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|public_key_hex[|...]"
+            ));
+        }
+        let node_id = parts[0].trim();
+        let endpoint = parts[1].trim();
+        let public_key_hex = parts[2].trim();
+        ensure_safe_token("node-id", node_id)?;
+        ensure_safe_token("endpoint", endpoint)?;
+        ensure_hex_32("node-public-key-hex", public_key_hex)?;
+        let capabilities = if parts.len() >= 4 && !parts[3].trim().is_empty() {
+            let csv = parts[3].trim();
+            let parsed =
+                rustynet_control::roles::parse_role_capability_csv(csv).map_err(|err| {
+                    format!("invalid capabilities in NODES_SPEC entry {trimmed:?}: {err}")
+                })?;
+            Some(parsed)
+        } else {
+            None
+        };
+        Ok((
+            node_id.to_owned(),
+            endpoint.to_owned(),
+            public_key_hex.to_owned(),
+            capabilities.map(|caps| caps.iter().map(|cap| cap.as_str().to_owned()).collect()),
+        ))
+    }
+
+    /// New NODES_SPEC field extraction mirroring the rewritten
+    /// `parse_generic_nodes` body.
+    fn new_nodes_spec_fields(
+        trimmed: &str,
+    ) -> Result<(String, String, String, Option<String>), String> {
+        let parts = trimmed.split('|').collect::<Vec<_>>();
+        let [node_id, endpoint, public_key_hex, rest @ ..] = parts.as_slice() else {
+            return Err(format!(
+                "invalid NODES_SPEC entry {trimmed:?}; expected node_id|endpoint|public_key_hex[|...]"
+            ));
+        };
+        let node_id = node_id.trim();
+        let endpoint = endpoint.trim();
+        let public_key_hex = public_key_hex.trim();
+        ensure_safe_token("node-id", node_id)?;
+        ensure_safe_token("endpoint", endpoint)?;
+        ensure_hex_32("node-public-key-hex", public_key_hex)?;
+        let capabilities = match rest.first() {
+            Some(csv) if !csv.trim().is_empty() => {
+                let csv = csv.trim();
+                Some(
+                    rustynet_control::roles::parse_role_capability_csv(csv).map_err(|err| {
+                        format!("invalid capabilities in NODES_SPEC entry {trimmed:?}: {err}")
+                    })?,
+                )
+            }
+            _ => None,
+        };
+        Ok((
+            node_id.to_owned(),
+            endpoint.to_owned(),
+            public_key_hex.to_owned(),
+            capabilities.map(|caps| caps.iter().map(|cap| cap.as_str().to_owned()).collect()),
+        ))
+    }
+
+    fn old_nft_matches(line: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for line in line.lines() {
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            if tokens.len() == 3 && tokens[0] == "table" && tokens[2].starts_with("rustynet") {
+                found.push((tokens[1].to_owned(), tokens[2].to_owned()));
+            }
+        }
+        found
+    }
+
+    fn new_nft_matches(line: &str) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for line in line.lines() {
+            let tokens = line.split_whitespace().collect::<Vec<_>>();
+            if let [first_token, table_id, table_name] = tokens.as_slice()
+                && *first_token == "table"
+                && table_name.starts_with("rustynet")
+            {
+                found.push(((*table_id).to_owned(), (*table_name).to_owned()));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn differential_decode_hex_32_matrix() {
+        let inputs: Vec<String> = vec![
+            "".to_owned(),
+            "00".to_owned(),
+            "0011".to_owned(),
+            "0g".to_owned(),
+            "00".repeat(31) + "0g",
+            "00".repeat(31) + "1f",
+            format!("  {}  ", "00".repeat(32)),
+        ];
+        for input in inputs {
+            assert_eq!(
+                decode_hex_32(&input),
+                old_decode_hex_32(&input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_decode_base64_matrix() {
+        let inputs = [
+            "",
+            "QQ==",
+            "QUI=",
+            "QUJD",
+            "QUJDRA==",
+            "AU JD",
+            "\tQUJD\n",
+            "====",
+            "A===",
+            "AA==AA==",
+            "QUJ",
+            "QUJD!",
+            "aaaa",
+            "++++////",
+            "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=",
+        ];
+        for input in inputs {
+            assert_eq!(
+                decode_base64(input),
+                old_decode_base64(input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_nodes_spec_fields() {
+        let inputs = [
+            "",
+            "only",
+            "a|b",
+            "a|b|c",
+            "node-1|10.0.0.1:51820|<64-hex>",
+            &format!("node-1|10.0.0.1:51820|{}", "0".repeat(64)),
+            &format!(
+                "node-1|10.0.0.1:51820|{}|anchor,exit_server",
+                "0".repeat(64)
+            ),
+            &format!("node-1|10.0.0.1:51820|{}|", "0".repeat(64)),
+            &format!("node-1|10.0.0.1:51820|{}|bogus_capability", "0".repeat(64)),
+            &format!("node id|10.0.0.1:51820|{}", "0".repeat(64)),
+            &format!("node-1|bad endpoint|{}", "0".repeat(64)),
+            &format!("node-1|10.0.0.1:51820|{}", "0".repeat(63)),
+            // Whitespace-padded fields: the old code trimmed each field before
+            // validating it (an independent review caught the dropped trim).
+            &format!(" node-1 | 10.0.0.1:51820 | {} ", "0".repeat(64)),
+            &format!(" |10.0.0.1:51820|{}", "0".repeat(64)),
+            &format!("node-1|10.0.0.1:51820| {} |anchor", "0".repeat(64)),
+            &format!("\tnode-1\t|10.0.0.1:51820|{}", "0".repeat(64)),
+        ];
+        for input in inputs {
+            assert_eq!(
+                new_nodes_spec_fields(input),
+                old_nodes_spec_fields(input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_nft_token_matcher() {
+        let inputs = [
+            "",
+            "table",
+            "table inet",
+            "table inet rustynet_main",
+            "table inet rustynet_main extra",
+            "table ip rustynet_fw",
+            "table ip other",
+            "flush table inet rustynet_main",
+            "table inet rustynet_a\ntable inet rustynet_b",
+        ];
+        for input in inputs {
+            assert_eq!(
+                new_nft_matches(input),
+                old_nft_matches(input),
+                "divergence for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn differential_random_coordination_bytes_shape() {
+        // The rewrite propagates OS-RNG failure as `Err` instead of panicking;
+        // on success the value must be non-zero exactly like the old loop.
+        for _ in 0..8 {
+            let bytes = random_nonzero_coordination_bytes().expect("os randomness available");
+            assert!(bytes.iter().any(|value| *value != 0));
         }
     }
 }

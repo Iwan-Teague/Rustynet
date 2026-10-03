@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -69,22 +80,27 @@ fn decode_base64(value: &str) -> Result<Vec<u8>, String> {
         return Err("invalid base64".to_owned());
     }
     let mut output = Vec::with_capacity(clean.len() / 4 * 3);
-    for chunk in clean.chunks(4) {
+    // AQ-08: the `clean.len() % 4 != 0` guard above makes every chunk exactly
+    // 4 chars, so the old `sextets[index]` writes and `sextets[0..=3]` reads
+    // could not panic. `zip` + an irrefutable array pattern keep behaviour
+    // identical without slice indexing.
+    for chunk in clean.chunks_exact(4) {
         let mut sextets = [0u8; 4];
         let mut padding = 0usize;
-        for (index, ch) in chunk.iter().enumerate() {
+        for (slot, ch) in sextets.iter_mut().zip(chunk) {
             if *ch == '=' {
-                sextets[index] = 0;
+                *slot = 0;
                 padding += 1;
             } else if let Some(value) = reverse.get(ch) {
-                sextets[index] = *value;
+                *slot = *value;
             } else {
                 return Err("invalid base64".to_owned());
             }
         }
-        let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
-        let b1 = ((sextets[1] & 0x0f) << 4) | (sextets[2] >> 2);
-        let b2 = ((sextets[2] & 0x03) << 6) | sextets[3];
+        let [s0, s1, s2, s3] = sextets;
+        let b0 = (s0 << 2) | (s1 >> 4);
+        let b1 = ((s1 & 0x0f) << 4) | (s2 >> 2);
+        let b2 = ((s2 & 0x03) << 6) | s3;
         output.push(b0);
         if padding < 2 {
             output.push(b1);
@@ -1370,5 +1386,73 @@ mod tests {
             message.contains("public_key") || message.contains("string"),
             "error must point to the offending field or type: {message}"
         );
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for `decode_base64`.
+    //!
+    //! `old_decode_base64` is a verbatim copy of the pre-AQ-08 function (with
+    //! its `sextets[index]` accesses). The old code could not panic: the
+    //! `clean.len() % 4 != 0` guard makes every chunk exactly 4 chars. Tests
+    //! pin byte equality across seeded and mutated inputs.
+
+    use super::*;
+
+    fn old_decode_base64(value: &str) -> Result<Vec<u8>, String> {
+        const TABLE: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut reverse = BTreeMap::new();
+        for (index, ch) in TABLE.chars().enumerate() {
+            reverse.insert(ch, index as u8);
+        }
+        let clean = value
+            .chars()
+            .filter(|ch| !ch.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        if clean.is_empty() || clean.len() % 4 != 0 {
+            return Err("invalid base64".to_owned());
+        }
+        let mut output = Vec::with_capacity(clean.len() / 4 * 3);
+        for chunk in clean.chunks(4) {
+            let mut sextets = [0u8; 4];
+            let mut padding = 0usize;
+            for (index, ch) in chunk.iter().enumerate() {
+                if *ch == '=' {
+                    sextets[index] = 0;
+                    padding += 1;
+                } else if let Some(value) = reverse.get(ch) {
+                    sextets[index] = *value;
+                } else {
+                    return Err("invalid base64".to_owned());
+                }
+            }
+            let b0 = (sextets[0] << 2) | (sextets[1] >> 4);
+            let b1 = ((sextets[1] & 0x0f) << 4) | (sextets[2] >> 2);
+            let b2 = ((sextets[2] & 0x03) << 6) | sextets[3];
+            output.push(b0);
+            if padding < 2 {
+                output.push(b1);
+            }
+            if padding < 1 {
+                output.push(b2);
+            }
+        }
+        Ok(output)
+    }
+
+    #[test]
+    fn differential_decode_base64_matrix() {
+        let inputs = [
+            "", "QQ==", "QUI=", "QUJD", "QUJDRA==", "AU JD", "\tQUJD\n", "====", "A===",
+            "AA==AA==", "QUJ", "QUJD!", "aaaa", "++++////",
+        ];
+        for input in inputs {
+            assert_eq!(
+                decode_base64(input),
+                old_decode_base64(input),
+                "divergence for {input:?}"
+            );
+        }
     }
 }

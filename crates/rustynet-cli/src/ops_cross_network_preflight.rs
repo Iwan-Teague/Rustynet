@@ -1,3 +1,15 @@
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 //! D5.5 / cross-network preflight diagnostic.
 //!
 //! `rustynet ops cross-network-preflight` is an operator-runnable
@@ -369,7 +381,12 @@ fn classify_nat(observations: &[StunServerObservation]) -> NatClassHeuristic {
     if addrs.len() < 2 {
         return NatClassHeuristic::InsufficientData;
     }
-    let first = addrs[0];
+    // AQ-08: the old `addrs[0]` could not panic — the `len() < 2` guard above
+    // guarantees a non-empty vector. `first()` + fail-closed dead branch keeps
+    // behaviour identical without slice indexing.
+    let Some(&first) = addrs.first() else {
+        return NatClassHeuristic::InsufficientData;
+    };
     let all_same_ip = addrs.iter().all(|a| a.ip() == first.ip());
     let all_same_port = addrs.iter().all(|a| a.port() == first.port());
     match (all_same_ip, all_same_port) {
@@ -816,5 +833,84 @@ mod tests {
         let config = CrossNetworkPreflightConfig::default();
         let report = run_cross_network_preflight(&config);
         assert_eq!(report.schema_version, 1);
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for `classify_nat`.
+    //!
+    //! `old_classify_nat` is a verbatim copy of the pre-AQ-08 function (with
+    //! its `addrs[0]` index). The old code could not panic: the `len() < 2`
+    //! guard already rejected empty vectors. Tests pin classification equality
+    //! across seeded observation matrices.
+
+    use super::*;
+
+    fn old_classify_nat(observations: &[StunServerObservation]) -> NatClassHeuristic {
+        let mut by_family: BTreeMap<&'static str, Vec<SocketAddr>> = BTreeMap::new();
+        for obs in observations {
+            if let Some(addr) = obs.mapped_endpoint {
+                by_family.entry(obs.family).or_default().push(addr);
+            }
+        }
+        let Some((_, addrs)) = by_family.iter().max_by_key(|(_, v)| v.len()) else {
+            return NatClassHeuristic::InsufficientData;
+        };
+        if addrs.len() < 2 {
+            return NatClassHeuristic::InsufficientData;
+        }
+        let first = addrs[0];
+        let all_same_ip = addrs.iter().all(|a| a.ip() == first.ip());
+        let all_same_port = addrs.iter().all(|a| a.port() == first.port());
+        match (all_same_ip, all_same_port) {
+            (true, true) => NatClassHeuristic::ConeNatLikely,
+            (true, false) => NatClassHeuristic::PortRestrictedLikely,
+            (false, _) => NatClassHeuristic::SymmetricLikely,
+        }
+    }
+
+    fn obs(family: &'static str, mapped: Option<u32>) -> StunServerObservation {
+        StunServerObservation {
+            server: "stun.example:3478".to_owned(),
+            family,
+            mapped_endpoint: mapped
+                .map(|last_octet| format!("10.0.0.{last_octet}:51820").parse().unwrap()),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn differential_classify_nat_matrix() {
+        let matrices: Vec<Vec<StunServerObservation>> = vec![
+            vec![],
+            vec![obs("ipv4", None)],
+            vec![obs("ipv4", Some(1))],
+            vec![obs("ipv4", Some(1)), obs("ipv4", Some(1))],
+            vec![obs("ipv4", Some(1)), obs("ipv4", Some(2))],
+            vec![
+                obs("ipv4", Some(1)),
+                obs("ipv4", Some(1)),
+                obs("ipv6", Some(7)),
+            ],
+            vec![
+                obs("ipv4", Some(1)),
+                obs("ipv6", Some(7)),
+                obs("ipv6", Some(8)),
+            ],
+            vec![
+                obs("ipv4", Some(1)),
+                obs("ipv4", Some(2)),
+                obs("ipv6", Some(7)),
+                obs("ipv6", Some(8)),
+            ],
+        ];
+        for matrix in &matrices {
+            assert_eq!(
+                classify_nat(matrix),
+                old_classify_nat(matrix),
+                "divergence for {matrix:?}"
+            );
+        }
     }
 }

@@ -1,3 +1,16 @@
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
+use std::collections::HashMap;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -18,35 +31,7 @@ pub fn execute_ops_write_daemon_env(
     })?;
 
     // 2. Apply policy logic (defaults and enforcement)
-
-    // Default: NODE_ROLE
-    let setup_complete = config
-        .get("SETUP_COMPLETE")
-        .map_or("0", std::string::String::as_str);
-    if !config.contains_key("NODE_ROLE") {
-        let default_role = if setup_complete == "1" {
-            "admin"
-        } else {
-            "client"
-        };
-        config.insert("NODE_ROLE".to_owned(), default_role.to_owned());
-    }
-
-    // Validate NODE_ROLE
-    let node_role = {
-        let role = config.get("NODE_ROLE").unwrap(); // Safe because inserted above
-        match role.as_str() {
-            "admin" | "client" | "blind_exit" => role.clone(),
-            _ => {
-                eprintln!("[warn] Invalid NODE_ROLE='{role}', defaulting to 'client'.");
-                "client".to_owned()
-            }
-        }
-    };
-    // Re-insert normalized role if it was invalid
-    if config.get("NODE_ROLE").unwrap() != &node_role {
-        config.insert("NODE_ROLE".to_owned(), node_role.clone());
-    }
+    let node_role = validate_node_role(&mut config);
 
     // enforce_role_policy_defaults logic
     if node_role == "client" {
@@ -212,5 +197,126 @@ pub fn execute_ops_write_daemon_env(
             format!("child exited with status {}", output.status)
         };
         Err(format!("rustynet ops install-systemd failed: {detail}"))
+    }
+}
+
+/// Applies the NODE_ROLE default/validation policy and returns the normalized
+/// role. Extracted verbatim from `execute_ops_write_daemon_env` for the AQ-08
+/// differential harness.
+///
+/// AQ-08: the two old `config.get("NODE_ROLE").unwrap()` calls could not panic
+/// — `NODE_ROLE` is unconditionally inserted above when absent. Rewritten with
+/// `match`/`Some(..)` comparison, behaviour identical.
+fn validate_node_role(config: &mut HashMap<String, String>) -> String {
+    // Default: NODE_ROLE
+    let setup_complete = config
+        .get("SETUP_COMPLETE")
+        .map_or("0", std::string::String::as_str);
+    if !config.contains_key("NODE_ROLE") {
+        let default_role = if setup_complete == "1" {
+            "admin"
+        } else {
+            "client"
+        };
+        config.insert("NODE_ROLE".to_owned(), default_role.to_owned());
+    }
+
+    // Validate NODE_ROLE
+    let node_role = match config.get("NODE_ROLE") {
+        Some(role) => match role.as_str() {
+            "admin" | "client" | "blind_exit" => role.clone(),
+            _ => {
+                eprintln!("[warn] Invalid NODE_ROLE='{role}', defaulting to 'client'.");
+                "client".to_owned()
+            }
+        },
+        // Fail-closed dead branch: unreachable because NODE_ROLE is inserted
+        // above when absent; the old `.unwrap()` could not panic either.
+        None => "client".to_owned(),
+    };
+    // Re-insert normalized role if it was invalid
+    if config.get("NODE_ROLE") != Some(&node_role) {
+        config.insert("NODE_ROLE".to_owned(), node_role.clone());
+    }
+    node_role
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for `validate_node_role`.
+    //!
+    //! `old_validate_node_role` is a verbatim copy of the pre-AQ-08 inline
+    //! block (with its two `unwrap()` calls). The old code could not panic:
+    //! `NODE_ROLE` is inserted above whenever absent. Tests pin equality of
+    //! the returned role and the mutated config across seeded inputs.
+
+    use super::*;
+
+    fn old_validate_node_role(config: &mut HashMap<String, String>) -> String {
+        // Default: NODE_ROLE
+        let setup_complete = config
+            .get("SETUP_COMPLETE")
+            .map_or("0", std::string::String::as_str);
+        if !config.contains_key("NODE_ROLE") {
+            let default_role = if setup_complete == "1" {
+                "admin"
+            } else {
+                "client"
+            };
+            config.insert("NODE_ROLE".to_owned(), default_role.to_owned());
+        }
+
+        // Validate NODE_ROLE
+        let node_role = {
+            let role = config.get("NODE_ROLE").unwrap(); // Safe because inserted above
+            match role.as_str() {
+                "admin" | "client" | "blind_exit" => role.clone(),
+                _ => {
+                    eprintln!("[warn] Invalid NODE_ROLE='{role}', defaulting to 'client'.");
+                    "client".to_owned()
+                }
+            }
+        };
+        // Re-insert normalized role if it was invalid
+        if config.get("NODE_ROLE").unwrap() != &node_role {
+            config.insert("NODE_ROLE".to_owned(), node_role.clone());
+        }
+        node_role
+    }
+
+    fn seeded(role: Option<&str>, setup: Option<&str>) -> HashMap<String, String> {
+        let mut config = HashMap::new();
+        if let Some(role) = role {
+            config.insert("NODE_ROLE".to_owned(), role.to_owned());
+        }
+        if let Some(setup) = setup {
+            config.insert("SETUP_COMPLETE".to_owned(), setup.to_owned());
+        }
+        config
+    }
+
+    fn assert_same(role: Option<&str>, setup: Option<&str>) {
+        let mut new_config = seeded(role, setup);
+        let mut old_config = seeded(role, setup);
+        let new_role = validate_node_role(&mut new_config);
+        let old_role = old_validate_node_role(&mut old_config);
+        assert_eq!(new_role, old_role, "role divergence for {role:?}/{setup:?}");
+        assert_eq!(
+            new_config, old_config,
+            "config divergence for {role:?}/{setup:?}"
+        );
+    }
+
+    #[test]
+    fn differential_node_role_matrix() {
+        assert_same(None, None);
+        assert_same(None, Some("1"));
+        assert_same(None, Some("0"));
+        assert_same(Some("admin"), None);
+        assert_same(Some("client"), None);
+        assert_same(Some("blind_exit"), None);
+        assert_same(Some("root"), None);
+        assert_same(Some(""), Some("1"));
+        assert_same(Some("Admin"), None);
     }
 }

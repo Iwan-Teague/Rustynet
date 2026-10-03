@@ -1,4 +1,15 @@
 #![forbid(unsafe_code)]
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -611,30 +622,41 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
 
     let nodes: Vec<DigestNodeView> = read_tsv(nodes_tsv.as_path())
         .into_iter()
-        .filter(|row| row.len() == 4)
-        .map(|row| DigestNodeView {
-            label: row[0].clone(),
-            target: row[1].clone(),
-            node_id: row[2].clone(),
-            bootstrap_role: row[3].clone(),
-            extra: Map::new(),
+        // AQ-08: the old `row.len() == 4` filter made every `row[0..=3]`
+        // access panic-free; the slice match keeps behaviour identical
+        // without indexing.
+        .filter_map(|row| match row.as_slice() {
+            [label, target, node_id, bootstrap_role] => Some(DigestNodeView {
+                label: label.clone(),
+                target: target.clone(),
+                node_id: node_id.clone(),
+                bootstrap_role: bootstrap_role.clone(),
+                extra: Map::new(),
+            }),
+            _ => None,
         })
         .collect();
 
     let mut stages: Vec<DigestStageEntryView> = Vec::new();
     let mut failed_stages: Vec<DigestStageEntryView> = Vec::new();
     for row in read_tsv(stages_tsv.as_path()) {
-        if row.len() != 8 {
+        // AQ-08: the `row.len() != 8` skip above guarded the old `row[0..=7]`
+        // accesses, so they could not panic. The refutable let-else keeps the
+        // same skip semantics without indexing.
+        let [
+            stage_name,
+            severity,
+            status,
+            rc_raw,
+            log_path,
+            message,
+            started_at,
+            finished_at,
+        ] = row.as_slice()
+        else {
             continue;
-        }
-        let stage_name = row[0].clone();
-        let severity = row[1].clone();
-        let status = row[2].clone();
-        let rc = row[3].parse::<i64>().unwrap_or(1);
-        let log_path = row[4].clone();
-        let message = row[5].clone();
-        let started_at = row[6].clone();
-        let finished_at = row[7].clone();
+        };
+        let rc = rc_raw.parse::<i64>().unwrap_or(1);
         let worker_results = read_parallel_stage_results(report_dir.as_path(), stage_name.as_str());
         let failed_workers: Vec<DigestFailedWorkerView> = worker_results
             .iter()
@@ -667,14 +689,14 @@ pub fn execute_ops_generate_live_linux_lab_failure_digest(
         let condensed_result =
             stage_sentence(stage_name.as_str(), status.as_str(), &worker_results);
         let stage_entry = DigestStageEntryView {
-            stage: stage_name,
-            severity,
+            stage: stage_name.clone(),
+            severity: severity.clone(),
             status: status.clone(),
             rc,
-            description: message,
-            started_at,
-            finished_at,
-            log_path,
+            description: message.clone(),
+            started_at: started_at.clone(),
+            finished_at: finished_at.clone(),
+            log_path: log_path.clone(),
             condensed_result,
             primary_failure_reason: likely_reason.clone(),
             likely_reason,
@@ -1344,5 +1366,160 @@ mod typed_parser_tests {
         // than underflowing or slicing mid-character.
         assert_eq!(shorten("\u{1F600}\u{1F600}", 2), "...");
         assert_eq!(shorten("\u{1F600}", 0), "...");
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for the TSV row mappers in
+    //! `execute_ops_generate_live_linux_lab_failure_digest`.
+    //!
+    //! `old_node_views` / `old_stage_fields` are verbatim copies of the
+    //! pre-AQ-08 mapping logic (slice-index based). The old code could not
+    //! panic: node rows were filtered to `len() == 4` and stage rows with
+    //! `len() != 8` were skipped. Tests pin equality of the mapped output
+    //! across seeded and mutated TSV rows.
+
+    use super::*;
+
+    fn old_node_views(rows: Vec<Vec<String>>) -> Vec<DigestNodeView> {
+        rows.into_iter()
+            .filter(|row| row.len() == 4)
+            .map(|row| DigestNodeView {
+                label: row[0].clone(),
+                target: row[1].clone(),
+                node_id: row[2].clone(),
+                bootstrap_role: row[3].clone(),
+                extra: Map::new(),
+            })
+            .collect()
+    }
+
+    fn new_node_views(rows: Vec<Vec<String>>) -> Vec<DigestNodeView> {
+        rows.into_iter()
+            .filter_map(|row| match row.as_slice() {
+                [label, target, node_id, bootstrap_role] => Some(DigestNodeView {
+                    label: label.clone(),
+                    target: target.clone(),
+                    node_id: node_id.clone(),
+                    bootstrap_role: bootstrap_role.clone(),
+                    extra: Map::new(),
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    type StageFields = (String, String, String, i64, String, String, String, String);
+
+    fn old_stage_fields(row: &[String]) -> Option<StageFields> {
+        if row.len() != 8 {
+            return None;
+        }
+        Some((
+            row[0].clone(),
+            row[1].clone(),
+            row[2].clone(),
+            row[3].parse::<i64>().unwrap_or(1),
+            row[4].clone(),
+            row[5].clone(),
+            row[6].clone(),
+            row[7].clone(),
+        ))
+    }
+
+    fn new_stage_fields(row: &[String]) -> Option<StageFields> {
+        let [
+            stage_name,
+            severity,
+            status,
+            rc_raw,
+            log_path,
+            message,
+            started_at,
+            finished_at,
+        ] = row
+        else {
+            return None;
+        };
+        Some((
+            stage_name.clone(),
+            severity.clone(),
+            status.clone(),
+            rc_raw.parse::<i64>().unwrap_or(1),
+            log_path.clone(),
+            message.clone(),
+            started_at.clone(),
+            finished_at.clone(),
+        ))
+    }
+
+    fn node_rows() -> Vec<Vec<String>> {
+        vec![
+            vec![],
+            vec!["exit-a".to_owned()],
+            vec!["exit-a".to_owned(), "hostA".to_owned()],
+            vec!["exit-a".to_owned(), "hostA".to_owned(), "node-1".to_owned()],
+            vec![
+                "exit-a".to_owned(),
+                "hostA".to_owned(),
+                "node-1".to_owned(),
+                "bootstrap".to_owned(),
+            ],
+            vec![
+                "exit-a".to_owned(),
+                "hostA".to_owned(),
+                "node-1".to_owned(),
+                "bootstrap".to_owned(),
+                "extra".to_owned(),
+            ],
+        ]
+    }
+
+    fn node_keys(views: Vec<DigestNodeView>) -> Vec<(String, String, String, String)> {
+        views
+            .into_iter()
+            .map(|view| (view.label, view.target, view.node_id, view.bootstrap_role))
+            .collect()
+    }
+
+    #[test]
+    fn differential_node_view_mapping() {
+        let rows = node_rows();
+        // `DigestNodeView` does not derive `PartialEq`, so compare the four
+        // mapped fields.
+        assert_eq!(
+            node_keys(new_node_views(rows.clone())),
+            node_keys(old_node_views(rows))
+        );
+    }
+
+    #[test]
+    fn differential_stage_field_mapping() {
+        let rows: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["s1".to_owned()],
+            vec!["s1".to_owned(), "warn".to_owned()],
+            (1..=8).map(|i| i.to_string()).collect(),
+            (1..=9).map(|i| i.to_string()).collect(),
+            [
+                "stage-x".to_owned(),
+                "fail".to_owned(),
+                "timeout".to_owned(),
+                "not-a-number".to_owned(),
+                "/tmp/log".to_owned(),
+                "boom".to_owned(),
+                "t0".to_owned(),
+                "t1".to_owned(),
+            ]
+            .to_vec(),
+        ];
+        for row in &rows {
+            assert_eq!(
+                new_stage_fields(row),
+                old_stage_fields(row),
+                "divergence for {row:?}"
+            );
+        }
     }
 }

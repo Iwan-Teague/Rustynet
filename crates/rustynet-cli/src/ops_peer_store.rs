@@ -1,3 +1,15 @@
+// AQ-08 (6b part 2): panic-family lock. Test code is exempt so the verbatim
+// `old_*` copies in `mod aq08_6b_differential` still compile.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -268,25 +280,30 @@ fn load_peer_records(peers_file: &Path) -> Result<Vec<PeerRecord>, String> {
             ));
         }
 
-        let mut fields = vec![String::new(); 6];
-        for (field_index, field_value) in parts.into_iter().enumerate() {
-            fields[field_index] = field_value.to_owned();
+        // AQ-08: the guard above rejects lines with more than 6 fields, so the
+        // old `fields[field_index]` write and the `fields[0..=5]` reads below
+        // could not panic. The fixed-size array + `zip` keeps that behaviour
+        // without slice indexing.
+        let mut fields = std::array::from_fn(|_| String::new());
+        for (slot, field_value) in fields.iter_mut().zip(parts) {
+            *slot = field_value.to_owned();
         }
 
-        ensure_peer_field_safe("name", fields[0].as_str(), Some(line_no))?;
-        ensure_peer_field_safe("node_id", fields[1].as_str(), Some(line_no))?;
-        ensure_peer_field_safe("public_key", fields[2].as_str(), Some(line_no))?;
-        ensure_peer_field_safe("endpoint", fields[3].as_str(), Some(line_no))?;
-        ensure_peer_field_safe("cidr", fields[4].as_str(), Some(line_no))?;
-        ensure_peer_field_safe("role", fields[5].as_str(), Some(line_no))?;
+        let [name, node_id, public_key, endpoint, cidr, role] = fields;
+        ensure_peer_field_safe("name", name.as_str(), Some(line_no))?;
+        ensure_peer_field_safe("node_id", node_id.as_str(), Some(line_no))?;
+        ensure_peer_field_safe("public_key", public_key.as_str(), Some(line_no))?;
+        ensure_peer_field_safe("endpoint", endpoint.as_str(), Some(line_no))?;
+        ensure_peer_field_safe("cidr", cidr.as_str(), Some(line_no))?;
+        ensure_peer_field_safe("role", role.as_str(), Some(line_no))?;
 
         records.push(PeerRecord {
-            name: fields[0].clone(),
-            node_id: fields[1].clone(),
-            public_key: fields[2].clone(),
-            endpoint: fields[3].clone(),
-            cidr: fields[4].clone(),
-            role: fields[5].clone(),
+            name,
+            node_id,
+            public_key,
+            endpoint,
+            cidr,
+            role,
         });
     }
 
@@ -425,5 +442,95 @@ mod tests {
         assert!(!client.contains("exit-a|exit-1"));
 
         cleanup(root.as_path());
+    }
+}
+
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 6b part 2 differential harness for `load_peer_records`.
+    //!
+    //! `old_load_peer_records` is a verbatim copy of the pre-AQ-08 function
+    //! (slice-index based). The rewrite could not have panicked: the
+    //! `parts.len() > 6` guard already constrained every `fields[...]` access
+    //! to a 6-element vector. These tests pin output equality between old and
+    //! new implementations across seeded inputs and mutations.
+
+    use super::*;
+
+    fn old_load_peer_records(peers_file: &Path) -> Result<Vec<PeerRecord>, String> {
+        let file = File::open(peers_file)
+            .map_err(|err| format!("failed reading peer store {}: {err}", peers_file.display()))?;
+        let reader = BufReader::new(file);
+
+        let mut records = Vec::new();
+        for (index, line_result) in reader.lines().enumerate() {
+            let line_no = index + 1;
+            let line = line_result.map_err(|err| {
+                format!(
+                    "failed reading peer store line {line_no} ({}): {err}",
+                    peers_file.display()
+                )
+            })?;
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let parts = line.split('|').collect::<Vec<_>>();
+            if parts.len() > 6 {
+                return Err(format!(
+                    "peer store line {line_no} is malformed (too many fields)"
+                ));
+            }
+
+            let mut fields = vec![String::new(); 6];
+            for (field_index, field_value) in parts.into_iter().enumerate() {
+                fields[field_index] = field_value.to_owned();
+            }
+
+            ensure_peer_field_safe("name", fields[0].as_str(), Some(line_no))?;
+            ensure_peer_field_safe("node_id", fields[1].as_str(), Some(line_no))?;
+            ensure_peer_field_safe("public_key", fields[2].as_str(), Some(line_no))?;
+            ensure_peer_field_safe("endpoint", fields[3].as_str(), Some(line_no))?;
+            ensure_peer_field_safe("cidr", fields[4].as_str(), Some(line_no))?;
+            ensure_peer_field_safe("role", fields[5].as_str(), Some(line_no))?;
+
+            records.push(PeerRecord {
+                name: fields[0].clone(),
+                node_id: fields[1].clone(),
+                public_key: fields[2].clone(),
+                endpoint: fields[3].clone(),
+                cidr: fields[4].clone(),
+                role: fields[5].clone(),
+            });
+        }
+
+        Ok(records)
+    }
+
+    fn assert_same(contents: &str) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("peers.db");
+        std::fs::write(&path, contents).expect("write peers.db");
+        let new_result = load_peer_records(&path);
+        let old_result = old_load_peer_records(&path);
+        assert_eq!(new_result, old_result, "divergence for input {contents:?}");
+    }
+
+    #[test]
+    fn differential_full_and_partial_fields() {
+        assert_same("# header\nexit-a|exit-1|pub1|10.0.0.1:51820|100.64.0.1/32|admin\n");
+        assert_same("only-name\n");
+        assert_same("a|b|c\n");
+        assert_same("a|b|c|d|e\n");
+        assert_same("a|b|c|d|e|f\n");
+        assert_same("\n\n# comment\n");
+    }
+
+    #[test]
+    fn differential_error_mutations() {
+        assert_same("a|b|c|d|e|f|g\n");
+        assert_same("a|b|c|d|e|f\ng|h|i|j|k|l|m\n");
+        assert_same("na|me|pub|1.2.3.4:53|10.0.0.0/24|admin\r\n");
+        assert_same("na|me|pub|1.2.3.4:53|10.0.0.0/24|adm\x07in\n");
     }
 }
