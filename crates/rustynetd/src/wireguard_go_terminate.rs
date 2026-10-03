@@ -1,3 +1,18 @@
+// AQ-08 step 3 finish: this file landed after step 3c (RSA-0033
+// wireguard-go terminator) and was the last rustynetd module carrying
+// panic-family sites. The lints are denied in non-test code here, the same
+// per-file lock steps 3a-3c gave their modules; the crate-wide Cargo.toml
+// [lints] table now carries the identical deny for every module.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 //! Purpose-built privileged termination of wireguard-go processes (RSA-0033).
 //!
 //! # Why this builtin exists
@@ -240,21 +255,37 @@ fn recheck_process_still_matches(
         return Ok(false);
     }
     match parse_wireguard_go_process_entries(&output.stdout) {
-        Ok(entries) => {
-            if entries.len() == 1
-                && entries[0].pid_raw == pid
-                && entry_matches_allowlisted_interface(
-                    &entries[0],
-                    wireguard_go_allowlist,
-                    interface,
-                )
-            {
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        }
+        Ok(entries) => Ok(recheck_listing_selects(
+            &entries,
+            pid,
+            wireguard_go_allowlist,
+            interface,
+        )),
         Err(err) => Err(err),
+    }
+}
+
+/// Selection core of [`recheck_process_still_matches`]: a re-check listing
+/// selects the pid for signalling only when it shows EXACTLY one entry, that
+/// entry re-reports the same pid, and that entry still matches the
+/// allowlisted executable + interface. Written as a slice pattern so the
+/// exact-one-entry requirement is structural (a listing of two entries that
+/// both re-report the pid does NOT select); every other shape does not
+/// select. Replaces the former `entries.len() == 1 && entries[0]..`
+/// condition with identical behaviour; the differential witness test in the
+/// tests module pins the two against each other.
+#[cfg(not(windows))]
+fn recheck_listing_selects(
+    entries: &[WireguardGoProcessEntry],
+    pid: &str,
+    wireguard_go_allowlist: &[&str],
+    interface: &str,
+) -> bool {
+    match entries {
+        [entry] if entry.pid_raw == pid => {
+            entry_matches_allowlisted_interface(entry, wireguard_go_allowlist, interface)
+        }
+        _ => false,
     }
 }
 
@@ -723,5 +754,91 @@ mod tests {
         assert!(validate_terminate_wireguard_go_args(&["utun7; rm -rf /"]).is_err());
         assert!(validate_terminate_wireguard_go_args(&["utun7 utun8"]).is_err());
         assert!(validate_terminate_wireguard_go_args(&["x".repeat(16).as_str()]).is_err());
+    }
+
+    /// The pre-AQ-08-step-3 selection expression, verbatim: `entries.len()
+    /// == 1` short-circuits before `entries[0]` is evaluated, so the
+    /// indexing was unreachable for any other length. Kept as the oracle of
+    /// the differential test below; test-only code is exempt from the
+    /// indexing deny, so the literal expression still compiles here.
+    fn legacy_len_guarded_head_selection(
+        entries: &[WireguardGoProcessEntry],
+        pid: &str,
+        wireguard_go_allowlist: &[&str],
+        interface: &str,
+    ) -> bool {
+        entries.len() == 1
+            && entries[0].pid_raw == pid
+            && entry_matches_allowlisted_interface(&entries[0], wireguard_go_allowlist, interface)
+    }
+
+    fn ps_entry(pid_raw: &str, executable: &str, interface: &str) -> WireguardGoProcessEntry {
+        WireguardGoProcessEntry {
+            pid_raw: pid_raw.to_string(),
+            executable: executable.to_string(),
+            interface: interface.to_string(),
+        }
+    }
+
+    /// Differential witness (AQ-08 step 3 finish): the slice-pattern rewrite
+    /// in [`recheck_listing_selects`] must decide every listing exactly as
+    /// the legacy len-guarded `entries[0]` expression did, over listings of
+    /// length 0, 1, 2 and 3 with varying pids. The expected decision is
+    /// stated explicitly per case, so the test pins the behaviour, not mere
+    /// agreement between the two functions. The length-2 both-same-pid case
+    /// is the trap a naive `first()` rewrite would get wrong (it must NOT
+    /// select, exactly one entry means exactly one).
+    #[test]
+    fn recheck_selection_matches_legacy_len_guarded_indexing() {
+        const ALLOWLIST: &[&str] = &["/usr/local/bin/wireguard-go"];
+        const PID: &str = "101";
+        const IFACE: &str = "utun9";
+        const WG: &str = "/usr/local/bin/wireguard-go";
+        const OTHER_EXE: &str = "/bin/sh";
+
+        let empty: Vec<WireguardGoProcessEntry> = Vec::new();
+        let one_full_match = vec![ps_entry(PID, WG, IFACE)];
+        let one_pid_mismatch = vec![ps_entry("202", WG, IFACE)];
+        let one_executable_mismatch = vec![ps_entry(PID, OTHER_EXE, IFACE)];
+        let one_interface_mismatch = vec![ps_entry(PID, WG, "utun11")];
+        let two_both_same_pid = vec![ps_entry(PID, WG, IFACE), ps_entry(PID, WG, IFACE)];
+        let two_head_matches = vec![ps_entry(PID, WG, IFACE), ps_entry("303", WG, IFACE)];
+        let three_head_matches_varying = vec![
+            ps_entry(PID, WG, IFACE),
+            ps_entry("303", OTHER_EXE, IFACE),
+            ps_entry("404", WG, "utun11"),
+        ];
+        let three_head_mismatches = vec![
+            ps_entry("202", WG, IFACE),
+            ps_entry(PID, WG, IFACE),
+            ps_entry("303", WG, IFACE),
+        ];
+
+        let cases: &[(&[WireguardGoProcessEntry], bool)] = &[
+            (&empty, false),
+            (&one_full_match, true),
+            (&one_pid_mismatch, false),
+            (&one_executable_mismatch, false),
+            (&one_interface_mismatch, false),
+            (&two_both_same_pid, false),
+            (&two_head_matches, false),
+            (&three_head_matches_varying, false),
+            (&three_head_mismatches, false),
+        ];
+
+        for (entries, expected) in cases {
+            assert_eq!(
+                recheck_listing_selects(entries, PID, ALLOWLIST, IFACE),
+                legacy_len_guarded_head_selection(entries, PID, ALLOWLIST, IFACE),
+                "rewrite disagrees with the legacy expression on {} entries",
+                entries.len(),
+            );
+            assert_eq!(
+                recheck_listing_selects(entries, PID, ALLOWLIST, IFACE),
+                *expected,
+                "wrong selection decision on {} entries",
+                entries.len(),
+            );
+        }
     }
 }

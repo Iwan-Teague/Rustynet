@@ -67,3 +67,18 @@ fuzzing = []
 # privileged-helper path. All other modules in the crate still individually
 # pin `#![forbid(unsafe_code)]` at the top of their files.
 unsafe_code = "deny"
+
+# AQ-08 step 3 finish: the last two panic-family sites (the len-guarded
+# `entries[0]` indexing in wireguard_go_terminate.rs, landed after step 3c
+# by the RSA-0033 terminator) are rewritten, so the whole crate now carries
+# the panic-family denies at the crate level. Test code is exempt by the
+# #![cfg_attr(test, allow(...))] block at each crate root and integration
+# target, the steps 1-2 pattern. The per-file deny blocks from steps 3a-3c
+# stay as belt-and-braces. All other crates still use `[lints] workspace =
+# true`; once [workspace.lints.clippy] is adopted at the workspace root
+# (plan §7.1), replace this table with it.
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
