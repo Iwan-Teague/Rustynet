@@ -38,6 +38,7 @@ fn make_test_config(dir: &std::path::Path) -> DaemonConfig {
         traversal_watermark_path: dir.join("traversal.watermark"),
         traversal_prior_rerank: false,
         traversal_flap_breaker: false,
+        advertise_cgnat_host_candidates: false,
         relay_fleet_bundle_path: None,
         relay_fleet_watermark_path: None,
         traversal_max_age_secs: std::num::NonZeroU64::new(300).unwrap(),

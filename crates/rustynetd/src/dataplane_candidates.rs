@@ -68,7 +68,15 @@ pub enum AddressScope {
     /// or IPv6 ULA `fc00::/7`. Useful only on the same admin domain.
     /// We surface these as "host candidates" because they ARE useful
     /// for same-LAN peer reachability; a peer on a different LAN can
-    /// ignore them.
+    /// ignore them. AQ-254(a): scope classification is deliberately
+    /// separate from advertisement policy — CGNAT (`100.64/10`)
+    /// addresses and tailscale's IPv6 ULA `fd7a:115c:a1e0::/48` are
+    /// classified `Private` here, but they are only advertised as host
+    /// candidates when the operator opts in via
+    /// `advertise_cgnat_host_candidates` (default off; see
+    /// [`overlay_host_advertisable`]), because on a node that also
+    /// runs a third-party overlay such as tailscale such an interface
+    /// address belongs to that overlay, not to this mesh's underlay.
     Private,
     /// Globally routable IPv4 (anything not in the above) or IPv6
     /// (`2000::/3` global unicast). The highest-value host candidate
@@ -125,11 +133,14 @@ pub fn classify_ipv4(addr: Ipv4Addr) -> AddressScope {
     // RFC 6598 Shared Address Space (CGNAT): 100.64.0.0/10.
     // `Ipv4Addr::is_private` doesn't include CGNAT; treat it as
     // Private because peers behind the same carrier-grade NAT can
-    // reach each other directly.
-    let oct = addr.octets();
-    if oct[0] == 100 && (64..=127).contains(&oct[1]) {
+    // reach each other directly. Scope is classification only: the
+    // decision to ADVERTISE such an interface address as a host
+    // candidate is made by `overlay_host_advertisable` (default off,
+    // AQ-254(a)).
+    if is_rfc6598_cgnat_v4(addr) {
         return AddressScope::Private;
     }
+    let oct = addr.octets();
     // Remaining IPv4 special-use ranges are never legitimate mesh
     // endpoints, so they fold into Unspecified the same way the IPv6
     // documentation prefix does below; both candidate filters then
@@ -257,6 +268,70 @@ pub fn classify_ip(addr: IpAddr) -> AddressScope {
         IpAddr::V4(v4) => classify_ipv4(v4),
         IpAddr::V6(v6) => classify_ipv6(v6),
     }
+}
+
+/// True for the RFC 6598 Shared Address Space block `100.64.0.0/10`
+/// (carrier-grade NAT). Single source of truth shared by
+/// [`classify_ipv4`] and the host-candidate advertisement policy.
+pub fn is_rfc6598_cgnat_v4(addr: Ipv4Addr) -> bool {
+    let oct = addr.octets();
+    oct[0] == 100 && (64..=127).contains(&oct[1])
+}
+
+/// True for tailscale's allocated IPv6 ULA prefix
+/// `fd7a:115c:a1e0::/48` — the IPv6 half of the same third-party
+/// overlay concern as [`is_rfc6598_cgnat_v4`] (tailscale assigns both
+/// families from its own space; `classify_ipv6` maps this prefix to
+/// `Private` via the fc00::/7 rule, so without the AQ-254(a)
+/// advertisement gate it would still be advertised as a v6 host
+/// candidate). The rustynet mesh's own documented ULA `fd7a::/48` and
+/// `fd7a:115c::/32`-style test addresses are different prefixes and do
+/// not match.
+pub fn is_tailscale_ula_v6(addr: Ipv6Addr) -> bool {
+    let seg = addr.segments();
+    seg[0] == 0xfd7a && seg[1] == 0x115c && seg[2] == 0xa1e0
+}
+
+/// [`is_rfc6598_cgnat_v4`] + [`is_tailscale_ula_v6`] for either
+/// address family; IPv4-mapped IPv6 addresses classify as their
+/// embedded IPv4 address. These are the third-party overlay address
+/// ranges covered by the AQ-254(a) advertisement gate.
+pub fn is_overlay_assigned_addr(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => is_rfc6598_cgnat_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_rfc6598_cgnat_v4(v4),
+            None => is_tailscale_ula_v6(v6),
+        },
+    }
+}
+
+/// AQ-254(a) host-candidate advertisement policy for third-party
+/// overlay interface addresses: RFC 6598 CGNAT (`100.64.0.0/10`, the
+/// tailscale v4 range, or a genuine carrier-grade NAT) and tailscale's
+/// IPv6 ULA `fd7a:115c:a1e0::/48` (classified `Private` by
+/// `classify_ipv6`'s fc00::/7 rule, so without this gate it would be
+/// advertised as a v6 host candidate just like the v4 range). Such an
+/// address must NOT be advertised to peers by default: it is
+/// overlay/NAT-scoped, is not reachable through the mesh underlay in
+/// general, and on a tailscale node it otherwise wins the dataplane
+/// over the public srflx candidate (verified live by lane b72,
+/// katana-u31-azure-1). Advertising it requires the explicit operator
+/// opt-in `advertise_cgnat_host_candidates` (default `false`), which
+/// also covers the rustynet mesh's own `100.64/10` interface
+/// addresses — those are already excluded from the traversal plane as
+/// own addresses (traversal.rs `is_candidate_endpoint_allowed`,
+/// daemon.rs interface-name rules), so the default filter only ever
+/// removes addresses that could not be dialled back through the
+/// underlay anyway. The mesh's own documented ULA `fd7a::/48` and test
+/// addresses such as `fd7a:115c::7` are outside tailscale's /48 and
+/// unaffected.
+///
+/// ADR-027 (no third-party service in the runtime or trust path):
+/// default-off keeps third-party overlay addresses out of the
+/// candidate plane unless the operator explicitly declares them.
+pub fn overlay_host_advertisable(addr: IpAddr, advertise_cgnat_host_candidates: bool) -> bool {
+    advertise_cgnat_host_candidates || !is_overlay_assigned_addr(addr)
 }
 
 /// Per-platform interface enumeration. On Linux/macOS uses
@@ -471,6 +546,12 @@ fn stun_server_resolves_in_family(url: &str, family: AddressFamily) -> bool {
 /// `getifaddrs(2)` + srflx candidates from both v4 and v6 STUN
 /// servers.
 ///
+/// `advertise_cgnat_host_candidates` gates AQ-254(a): RFC 6598
+/// CGNAT (`100.64.0.0/10`) interface addresses and tailscale's IPv6
+/// ULA `fd7a:115c:a1e0::/48` are excluded from the
+/// host lanes unless the operator opted in (see
+/// [`overlay_host_advertisable`]). Srflx lanes are not affected.
+///
 /// **Security**: the STUN-returned mapped endpoint is filtered to
 /// gossip-worthy scope (Global or Private) before being added to the
 /// set. This is the OUTBOUND mirror of the inbound
@@ -483,10 +564,14 @@ pub fn gather_candidate_set(
     v4_stun_servers: &[String],
     v6_stun_servers: &[String],
     stun_timeout: Duration,
+    advertise_cgnat_host_candidates: bool,
 ) -> CandidateSet {
     let hosts = gather_gossip_worthy_host_candidates();
     let mut set = CandidateSet::default();
     for h in &hosts {
+        if !overlay_host_advertisable(h.addr, advertise_cgnat_host_candidates) {
+            continue;
+        }
         match h.addr {
             IpAddr::V4(_) => set.v4_host.push(h.addr),
             IpAddr::V6(_) => set.v6_host.push(h.addr),
@@ -1060,6 +1145,88 @@ mod tests {
     }
 
     #[test]
+    fn is_overlay_assigned_addr_boundaries() {
+        // In-range endpoints of 100.64.0.0/10.
+        assert!(is_rfc6598_cgnat_v4(Ipv4Addr::new(100, 64, 0, 0)));
+        assert!(is_rfc6598_cgnat_v4(Ipv4Addr::new(100, 127, 255, 255)));
+        assert!(is_overlay_assigned_addr(IpAddr::V4(Ipv4Addr::new(
+            100, 109, 160, 10
+        ))));
+        // Just outside both ends.
+        assert!(!is_rfc6598_cgnat_v4(Ipv4Addr::new(100, 63, 255, 255)));
+        assert!(!is_rfc6598_cgnat_v4(Ipv4Addr::new(100, 128, 0, 0)));
+        // IPv4-mapped IPv6 form classifies as the embedded v4 address.
+        assert!(is_overlay_assigned_addr(IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0xffff, 0x6440, 0x0001
+        ))));
+        assert!(!is_overlay_assigned_addr(IpAddr::V6(Ipv6Addr::new(
+            0, 0, 0, 0, 0, 0xffff, 0x63ff, 0xffff
+        ))));
+        // Tailscale's IPv6 ULA fd7a:115c:a1e0::/48 (both /48 endpoints
+        // and the realistic sysinfo fixture fd7a:115c:a1e0::5).
+        assert!(is_tailscale_ula_v6(Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 0
+        )));
+        assert!(is_tailscale_ula_v6(Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e0, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff
+        )));
+        assert!(is_overlay_assigned_addr(IpAddr::V6(
+            "fd7a:115c:a1e0::5".parse().expect("ip should parse")
+        )));
+        // Just outside the tailscale /48 on every varying segment.
+        assert!(!is_tailscale_ula_v6(Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1df, 0, 0, 0, 0, 1
+        )));
+        assert!(!is_tailscale_ula_v6(Ipv6Addr::new(
+            0xfd7a, 0x115c, 0xa1e1, 0, 0, 0, 0, 1
+        )));
+        // The rustynet mesh's own ULA shapes: fd7a::/48 and the
+        // fd7a:115c::7 test peer — different prefixes, NOT tailscale's.
+        assert!(!is_overlay_assigned_addr(IpAddr::V6(Ipv6Addr::new(
+            0xfd7a, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        assert!(!is_overlay_assigned_addr(IpAddr::V6(
+            "fd7a:115c::7".parse().expect("ip should parse")
+        )));
+        // Non-mapped ordinary ULA (Private scope, but NOT overlay).
+        assert!(!is_overlay_assigned_addr(IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn overlay_host_advertisable_gates_by_default_and_flag_reenables() {
+        let tailscale_style = IpAddr::V4(Ipv4Addr::new(100, 109, 160, 10));
+        // Default OFF: the tailscale-style v4 address must not be advertised.
+        assert!(!overlay_host_advertisable(tailscale_style, false));
+        // Explicit opt-in re-enables it.
+        assert!(overlay_host_advertisable(tailscale_style, true));
+        // Same policy for tailscale's IPv6 ULA /48.
+        let tailscale_v6 = IpAddr::V6("fd7a:115c:a1e0::5".parse().expect("ip should parse"));
+        assert!(
+            !overlay_host_advertisable(tailscale_v6, false),
+            "tailscale fd7a:115c:a1e0::/48 must not be advertised by default"
+        );
+        assert!(overlay_host_advertisable(tailscale_v6, true));
+        // Non-overlay addresses are unaffected either way (no regression
+        // surface for ordinary networks).
+        let lan = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 10));
+        let global = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+        let ula = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        let global_v6 = IpAddr::V6("2001:4860:4860::8888".parse().expect("ip should parse"));
+        assert!(overlay_host_advertisable(lan, false));
+        assert!(overlay_host_advertisable(global, false));
+        assert!(overlay_host_advertisable(ula, false));
+        assert!(overlay_host_advertisable(global_v6, false));
+        // The mesh's own WG interface address (also 100.64/10) follows
+        // the same policy: excluded by default, so it can never be
+        // gossiped as a dial-back host candidate.
+        let mesh_own = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 7));
+        assert!(!overlay_host_advertisable(mesh_own, false));
+        assert!(overlay_host_advertisable(mesh_own, true));
+    }
+
+    #[test]
     fn gather_candidate_set_drops_loopback_srflx_from_hijacked_stun() {
         // Security pin: a loopback-only STUN echo (which our test
         // infrastructure must use — there's no public Internet in
@@ -1075,6 +1242,7 @@ mod tests {
             &[v4_stun.to_string()],
             &[v6_stun.to_string()],
             Duration::from_secs(2),
+            false,
         );
         assert_eq!(set.v4_srflx.len(), 0, "loopback srflx must be filtered out");
         assert_eq!(

@@ -2615,6 +2615,23 @@ pub struct DaemonConfig {
     /// Default OFF — intensity tracking always runs (observability first);
     /// only the stay-on-relay consult is gated.
     pub traversal_flap_breaker: bool,
+    /// AQ-254(a): advertise third-party overlay interface addresses —
+    /// RFC 6598 CGNAT (`100.64.0.0/10`, e.g. tailscale's v4 range, or
+    /// a genuine carrier-grade NAT) and tailscale's IPv6 ULA
+    /// `fd7a:115c:a1e0::/48` — as peer host candidates.
+    /// Default `false`, the strictest practical default: such addresses
+    /// are overlay/NAT-scoped and not reachable through the mesh
+    /// underlay in general, and on a tailscale node the tailnet address
+    /// otherwise wins the dataplane over the public srflx candidate
+    /// (verified live by lane b72, katana-u31-azure-1). Also see
+    /// ADR-027 (no third-party service in the runtime or trust path).
+    /// Opt in only when peers genuinely share the same CGNAT or
+    /// tailnet: `--advertise-cgnat-host-candidates true`. The rustynet
+    /// mesh's own `100.64/10` interface addresses and its own ULA
+    /// (`fd7a::/48`, a different /48) are unaffected — they are already
+    /// excluded as own addresses on the traversal side and are useless
+    /// as advertised host candidates either way.
+    pub advertise_cgnat_host_candidates: bool,
     pub relay_fleet_bundle_path: Option<PathBuf>,
     pub relay_fleet_watermark_path: Option<PathBuf>,
     pub traversal_max_age_secs: NonZeroU64,
@@ -2743,6 +2760,7 @@ impl Default for DaemonConfig {
             traversal_watermark_path: PathBuf::from(DEFAULT_TRAVERSAL_WATERMARK_PATH),
             traversal_prior_rerank: false,
             traversal_flap_breaker: false,
+            advertise_cgnat_host_candidates: false,
             relay_fleet_bundle_path: Some(relay_fleet_default_path_from_env(
                 RELAY_FLEET_BUNDLE_PATH_ENV,
                 DEFAULT_RELAY_FLEET_BUNDLE_PATH,
@@ -4848,6 +4866,12 @@ struct DaemonRuntime {
     /// only — a restart starts every breaker closed.
     flap_breakers: BTreeMap<NodeId, crate::traversal::FlapBreaker>,
     traversal_flap_breaker: bool,
+    /// AQ-254(a): advertise third-party overlay interface addresses
+    /// (CGNAT `100.64.0.0/10`, tailscale ULA
+    /// `fd7a:115c:a1e0::/48`) as host candidates. Copied from
+    /// [`DaemonConfig::advertise_cgnat_host_candidates`]; default
+    /// `false` (see that field for the rationale).
+    advertise_cgnat_host_candidates: bool,
     /// FIS-0013: per-peer path-quality trackers (sustained-degradation
     /// detector over backend samples). Persists across sync passes.
     quality_tracker: crate::traversal::PathQualityTracker,
@@ -5396,6 +5420,7 @@ impl DaemonRuntime {
             traversal_prior_rerank: config.traversal_prior_rerank,
             flap_breakers: BTreeMap::new(),
             traversal_flap_breaker: config.traversal_flap_breaker,
+            advertise_cgnat_host_candidates: config.advertise_cgnat_host_candidates,
             quality_tracker: crate::traversal::PathQualityTracker::default(),
             pending_quality_reprobe: BTreeSet::new(),
             quality_demoted_endpoints: BTreeMap::new(),
@@ -6624,6 +6649,17 @@ impl DaemonRuntime {
                 if !matches!(scope, AddressScope::Global | AddressScope::Private) {
                     continue;
                 }
+                // AQ-254(a): third-party overlay interface addresses
+                // (tailscale's CGNAT `100.64/10` and IPv6 ULA
+                // `fd7a:115c:a1e0::/48`, or a genuine carrier-grade
+                // NAT) are not advertised as host candidates unless the
+                // operator opted in.
+                if !crate::dataplane_candidates::overlay_host_advertisable(
+                    *ip,
+                    self.advertise_cgnat_host_candidates,
+                ) {
+                    continue;
+                }
                 match ip {
                     IpAddr::V4(_) => set.v4_host.push(*ip),
                     IpAddr::V6(_) => set.v6_host.push(*ip),
@@ -7513,6 +7549,18 @@ impl DaemonRuntime {
             }
             for ip in addrs {
                 if !ip_is_usable_for_traversal_host_candidate(*ip) {
+                    continue;
+                }
+                // AQ-254(a): keep third-party overlay addresses
+                // (tailscale0's CGNAT `100.64/10` and IPv6 ULA
+                // `fd7a:115c:a1e0::/48`, carrier-grade NAT) out
+                // of the advertised probe host candidates unless the
+                // operator opted in. The mesh's own WG interfaces are
+                // already excluded by the name rules above.
+                if !crate::dataplane_candidates::overlay_host_advertisable(
+                    *ip,
+                    self.advertise_cgnat_host_candidates,
+                ) {
                     continue;
                 }
 
@@ -24149,6 +24197,124 @@ mod tests {
                     .parse()
                     .expect("probe candidate ip should parse"),
             ],
+        );
+    }
+
+    /// AQ-254(a) witness seed: an interface list shaped like a node
+    /// that also runs tailscale — tailscale-style `100.64/10` and
+    /// `fd7a:115c:a1e0::/48` addresses (the v6 fixture shape matches
+    /// rustynet-sysinfo's tailscale snapshot), an ordinary LAN address
+    /// (v4 + ordinary ULA + global v6), and the rustynet mesh's own WG
+    /// interface address (which also lives in `100.64/10`).
+    fn seed_overlay_style_host_candidates(runtime: &mut DaemonRuntime) {
+        runtime.local_host_candidates.insert(
+            "tailscale0".to_owned(),
+            vec![
+                "100.109.160.10"
+                    .parse()
+                    .expect("tailscale candidate ip should parse"),
+                "fd7a:115c:a1e0::5"
+                    .parse()
+                    .expect("tailscale v6 candidate ip should parse"),
+            ],
+        );
+        runtime.local_host_candidates.insert(
+            "eth0".to_owned(),
+            vec![
+                "192.168.1.10"
+                    .parse()
+                    .expect("lan candidate ip should parse"),
+                "fd00::1".parse().expect("ula candidate ip should parse"),
+                "2001:4860:4860::8888"
+                    .parse()
+                    .expect("global v6 candidate ip should parse"),
+            ],
+        );
+        runtime.local_host_candidates.insert(
+            "rustynet0".to_owned(),
+            vec![
+                "100.64.0.7"
+                    .parse()
+                    .expect("mesh candidate ip should parse"),
+            ],
+        );
+    }
+
+    /// AQ-254(a) witness: a candidate set built from an interface list
+    /// containing tailscale-style `100.x` and `fd7a:115c:a1e0::x`
+    /// addresses must NOT contain them by default. Fails against the
+    /// pre-fix behaviour, where every CGNAT v4 interface address was
+    /// advertised as a top-priority host candidate (lane b72,
+    /// katana-u31-azure-1) — and, pre-R1, where the tailscale IPv6 ULA
+    /// still was (classify_ipv6 maps fc00::/7 to Private).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn build_candidate_set_excludes_overlay_addresses_by_default() {
+        let (mut runtime, _guard) =
+            build_runtime_with_blocked_production_backend("overlay_default_excluded");
+        seed_overlay_style_host_candidates(&mut runtime);
+        let set = runtime.build_candidate_set_from_cache();
+        let tailscale = IpAddr::V4("100.109.160.10".parse().expect("ip should parse"));
+        let tailscale_v6 = IpAddr::V6("fd7a:115c:a1e0::5".parse().expect("ip should parse"));
+        let mesh_own = IpAddr::V4("100.64.0.7".parse().expect("ip should parse"));
+        let lan = IpAddr::V4("192.168.1.10".parse().expect("ip should parse"));
+        let ula = IpAddr::V6("fd00::1".parse().expect("ip should parse"));
+        let global_v6 = IpAddr::V6("2001:4860:4860::8888".parse().expect("ip should parse"));
+        assert!(
+            !set.v4_host.contains(&tailscale),
+            "tailscale-style 100.64/10 host candidate must not be advertised by default (AQ-254a); got {:?}",
+            set.v4_host
+        );
+        assert!(
+            !set.v6_host.contains(&tailscale_v6),
+            "tailscale fd7a:115c:a1e0::/48 host candidate must not be advertised by default (AQ-254a R1); got {:?}",
+            set.v6_host
+        );
+        assert!(
+            !set.v4_host.contains(&mesh_own),
+            "the mesh's own WG interface address is never a useful advertised host candidate"
+        );
+        assert!(
+            set.v4_host.contains(&lan),
+            "ordinary RFC1918 host candidates are unaffected by the overlay filter"
+        );
+        assert!(
+            set.v6_host.contains(&ula),
+            "ordinary ULA (outside tailscale's fd7a:115c:a1e0::/48) host candidates are unaffected"
+        );
+        assert!(
+            set.v6_host.contains(&global_v6),
+            "global v6 host candidates are unaffected by the overlay filter"
+        );
+    }
+
+    /// AQ-254(a) opt-in: the same interface list WITH the explicit
+    /// `advertise_cgnat_host_candidates` flag set keeps the tailscale-
+    /// style candidates (v4 CGNAT and v6 ULA alike), so operators whose
+    /// peers genuinely share one CGNAT/tailnet can restore the
+    /// co-location path.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn build_candidate_set_keeps_overlay_addresses_when_flag_set() {
+        let (mut runtime, _guard) =
+            build_runtime_with_blocked_production_backend("overlay_flag_enabled");
+        // Same-module override standing in for
+        // `--advertise-cgnat-host-candidates true` (the DaemonConfig
+        // field is copied into this runtime field at construction).
+        runtime.advertise_cgnat_host_candidates = true;
+        seed_overlay_style_host_candidates(&mut runtime);
+        let set = runtime.build_candidate_set_from_cache();
+        let tailscale = IpAddr::V4("100.109.160.10".parse().expect("ip should parse"));
+        let tailscale_v6 = IpAddr::V6("fd7a:115c:a1e0::5".parse().expect("ip should parse"));
+        assert!(
+            set.v4_host.contains(&tailscale),
+            "flag must re-enable CGNAT host candidate advertisement; got {:?}",
+            set.v4_host
+        );
+        assert!(
+            set.v6_host.contains(&tailscale_v6),
+            "flag must re-enable tailscale ULA v6 host candidate advertisement (AQ-254a R1); got {:?}",
+            set.v6_host
         );
     }
 
