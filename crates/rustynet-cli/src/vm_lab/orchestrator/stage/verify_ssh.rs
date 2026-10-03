@@ -3,6 +3,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::cloud_node_safety::guard_dataplane_nodes;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 /// Writes the QH-83 witness line for a verify_ssh_reachability PASS: the
@@ -24,7 +25,23 @@ fn write_ssh_reachability_witness(
     )
 }
 
-pub struct VerifySshReachabilityStage;
+/// Besides proving reachability, this is the earliest stage that touches the
+/// nodes, so it is where the cloud-node safety guard (direct-path precondition
+/// and node-side dead-man) is armed: the daemon is first started by the
+/// bootstrap stage (`ops install-systemd` restarts rustynetd, whose
+/// `ExecStartPre` installs the `rustynet_boot` killswitch), long before
+/// `enforce_baseline_runtime`. Nodes that are not cloud nodes are untouched.
+#[derive(Debug, Default)]
+pub struct VerifySshReachabilityStage {
+    /// Stage ids the plan elected (for the cloud-node reboot refusal).
+    planned_stage_ids: Vec<StageId>,
+}
+
+impl VerifySshReachabilityStage {
+    pub fn new(planned_stage_ids: Vec<StageId>) -> Self {
+        Self { planned_stage_ids }
+    }
+}
 
 impl OrchestrationStage for VerifySshReachabilityStage {
     fn id(&self) -> StageId {
@@ -60,6 +77,17 @@ impl OrchestrationStage for VerifySshReachabilityStage {
             .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
             .collect();
         if errors.is_empty() {
+            // Reachability is proven; arm the cloud-node safety net before any
+            // later stage can start a daemon on those nodes.
+            if let Err(e) = guard_dataplane_nodes(
+                ctx,
+                &StageId::VerifySshReachability,
+                &self.planned_stage_ids,
+            ) {
+                return StageOutcome::Failed(format!(
+                    "cloud-node safety guard refused the run: {e}"
+                ));
+            }
             // QH-83: the witness is written on EVERY pass path and a write
             // failure fails the stage — an unwitnessed reachability pass
             // must not stand.
@@ -111,7 +139,7 @@ mod tests {
             relay_forwarding_validation_elected: false,
         };
         assert_eq!(
-            VerifySshReachabilityStage.execute(&mut ctx),
+            VerifySshReachabilityStage::default().execute(&mut ctx),
             StageOutcome::Passed
         );
     }
@@ -148,7 +176,7 @@ mod tests {
             relay_forwarding_validation_elected: false,
         };
         assert!(matches!(
-            VerifySshReachabilityStage.execute(&mut ctx),
+            VerifySshReachabilityStage::default().execute(&mut ctx),
             StageOutcome::Failed(_)
         ));
     }

@@ -2,6 +2,9 @@
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::cloud_node_safety::{
+    CleanupState, disarm_dataplane_nodes_after_cleanup,
+};
 use crate::vm_lab::orchestrator::stage::install::node_in_rebuild_set;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -73,6 +76,22 @@ impl OrchestrationStage for FinalCleanupStage {
                 Some((alias.clone(), r))
             })
             .collect();
+        // Cloud nodes (inventory `dataplane_endpoint`) carry a node-side
+        // dead-man armed before enforce. Disarm it only now, AFTER each node's
+        // own cleanup: a node whose cleanup failed keeps its safety net. Runs
+        // on pipeline pass and fail alike (this stage is always-run).
+        let cleanup_states: Vec<(String, CleanupState)> = aliases
+            .iter()
+            .map(|alias| {
+                let state = match results.iter().find(|(a, _)| a == alias) {
+                    None => CleanupState::SkippedForReuse,
+                    Some((_, Ok(()))) => CleanupState::Clean,
+                    Some((_, Err(_))) => CleanupState::Failed,
+                };
+                (alias.clone(), state)
+            })
+            .collect();
+        disarm_dataplane_nodes_after_cleanup(ctx, &cleanup_states);
         let errors: Vec<String> = results
             .into_iter()
             .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))

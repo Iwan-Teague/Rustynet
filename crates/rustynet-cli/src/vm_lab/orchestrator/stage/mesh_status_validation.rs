@@ -9,6 +9,9 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::mesh_status::{
     LiveHandshakeObservation, evaluate_live_handshake_status, parse_guest_now_unix,
 };
+use crate::vm_lab::orchestrator::stage::node_diagnostics::{
+    PHASE_MESH_STATUS_FAILURE, capture_all_nodes_diagnostics,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const REPORTED_SKIPS_FILENAME: &str = "mesh_status_validation.reported_skips.json";
@@ -138,6 +141,11 @@ impl OrchestrationStage for MeshStatusValidationStage {
 
         if !reported_skips.is_empty() {
             write_reported_skips_note(ctx, &reported_skips);
+        }
+        if !failures.is_empty() {
+            // Best-effort network snapshot of every node at failure time; it
+            // can never change the verdict.
+            capture_all_nodes_diagnostics(ctx, PHASE_MESH_STATUS_FAILURE);
         }
         outcome_for(&failures, &reported_skips)
     }
@@ -487,6 +495,45 @@ mod tests {
             log.contains("\"alias\":\"deb-1\"") && log.contains("\"expected_live_peers\":0"),
             "stage log must carry the observation row; got: {log}"
         );
+        // A passing stage captures no failure diagnostics.
+        assert!(
+            !report_dir
+                .join("logs/diag_mesh-status-failure_deb-1.txt")
+                .exists()
+        );
+    }
+
+    /// A failing stage snapshots every node's network state (best effort) and
+    /// the verdict stays Failed. Mutation caught: dropping the capture call or
+    /// letting capture change the outcome.
+    #[test]
+    fn failure_captures_node_diagnostics_for_every_node() {
+        use crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::{
+            EventLog, Responder, ShellAdapter, ctx_with_adapters, ok,
+        };
+        let report_dir = temp_report_dir("diag-on-failure");
+        let log: EventLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let responder: std::sync::Arc<Responder> = std::sync::Arc::new(|_: &[String]| ok("x\n"));
+        // ShellAdapter has no live identity, so the mesh-status validator
+        // fails closed at the node-identity challenge.
+        let mut ctx = ctx_with_adapters(
+            &report_dir,
+            vec![
+                ShellAdapter::new("deb-1", &log, responder.clone()),
+                ShellAdapter::new("deb-2", &log, responder),
+            ],
+        );
+        assert!(matches!(
+            MeshStatusValidationStage.execute(&mut ctx),
+            StageOutcome::Failed(_)
+        ));
+        for alias in ["deb-1", "deb-2"] {
+            let body = std::fs::read_to_string(
+                report_dir.join(format!("logs/diag_mesh-status-failure_{alias}.txt")),
+            )
+            .expect("diag file per node");
+            assert!(body.contains("== nft list ruleset =="), "{body}");
+        }
     }
 
     /// The empty-assignments guard must SKIP, never PASS: with zero nodes the

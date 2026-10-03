@@ -448,7 +448,9 @@ impl PlanBuilder {
                     StageId::PrepareSourceArchive => {
                         Box::new(PrepareSourceArchiveStage::new(source_mode, allow_dirty))
                     }
-                    StageId::VerifySshReachability => Box::new(VerifySshReachabilityStage),
+                    StageId::VerifySshReachability => {
+                        Box::new(VerifySshReachabilityStage::new(planned.clone()))
+                    }
                     // cleanup + bootstrap must share the same rebuild set: a
                     // node we refuse to clean must also be refused a rebuild
                     // (and vice versa).
@@ -484,10 +486,13 @@ impl PlanBuilder {
                         max_parallel_node_workers,
                         std::sync::Arc::clone(&shutdown_flag),
                     )),
-                    StageId::EnforceBaselineRuntime => Box::new(EnforceBaselineRuntimeStage::new(
-                        max_parallel_node_workers,
-                        std::sync::Arc::clone(&shutdown_flag),
-                    )),
+                    StageId::EnforceBaselineRuntime => Box::new(
+                        EnforceBaselineRuntimeStage::new(
+                            max_parallel_node_workers,
+                            std::sync::Arc::clone(&shutdown_flag),
+                        )
+                        .with_planned_stage_ids(planned.clone()),
+                    ),
                     StageId::ValidateBaselineRuntime => {
                         Box::new(ValidateBaselineRuntimeStage::new(
                             max_parallel_node_workers,

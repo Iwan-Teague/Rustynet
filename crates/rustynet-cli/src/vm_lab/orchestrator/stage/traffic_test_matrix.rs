@@ -5,6 +5,9 @@ use std::path::Path;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{StageOutcome, TrafficTestResult};
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::node_diagnostics::{
+    PHASE_TRAFFIC_MATRIX_FAILURE, capture_all_nodes_diagnostics,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 pub struct TrafficTestMatrixStage;
@@ -379,6 +382,9 @@ impl OrchestrationStage for TrafficTestMatrixStage {
                 message.push_str("; ");
                 message.push_str(&summary);
             }
+            // Best-effort kernel/daemon network snapshot of every node; never
+            // changes the verdict.
+            capture_all_nodes_diagnostics(ctx, PHASE_TRAFFIC_MATRIX_FAILURE);
             if let Err(write_err) = write_pair_results(&ctx.report_dir, &evidence) {
                 message.push_str("; ");
                 message.push_str(&format!("pair-results witness write failed: {write_err}"));
@@ -766,6 +772,15 @@ mod tests {
         assert!(content.contains("mesh_ip: 100.64.0.1"));
         assert!(content.contains("tunnel: wg0\tpeer-a\tlatest-handshake=1234"));
         assert!(content.contains("daemon_failure_reason: daemon exited: killswitch active"));
+        // The best-effort node diagnostics run at failure time too; this stub
+        // adapter has no remote shell, which is recorded rather than silent.
+        let diag =
+            std::fs::read_to_string(report_dir.join("logs/diag_traffic-matrix-failure_node-a.txt"))
+                .expect("node diagnostics file written on failure");
+        assert!(
+            diag.contains("capture error: remote shell unavailable"),
+            "{diag}"
+        );
         let _ = std::fs::remove_dir_all(&report_dir);
     }
 

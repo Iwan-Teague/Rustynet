@@ -40782,10 +40782,12 @@ fn kept_after() {}\n\
         // bundle_evidence.rs witness module joined the tree. Re-measured
         // 2026-09-21 (AQ-85, wave-13 F1): 91 stage sources. Re-measured
         // 2026-09-27 (AQ-46): 92 stage sources (exit_egress_leak_witness.rs).
+        // Re-measured 2026-09-30: 94 stage sources (cloud_node_safety.rs and
+        // node_diagnostics.rs, the cloud-node dead-man + diagnostics modules).
         // Bump this number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 92,
-            "expected exactly 92 stage sources under the scan root; found \
+            files_scanned, 94,
+            "expected exactly 94 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );

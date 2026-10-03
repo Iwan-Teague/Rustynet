@@ -3,6 +3,10 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::cloud_node_safety::guard_dataplane_nodes;
+use crate::vm_lab::orchestrator::stage::node_diagnostics::{
+    PHASE_POST_ENFORCE, capture_all_nodes_diagnostics,
+};
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 /// Writes the QH-83 witness line for an enforce_baseline_runtime PASS: the
@@ -23,6 +27,9 @@ fn write_enforce_witness(report_dir: &std::path::Path, aliases: &[String]) -> Re
 pub struct EnforceBaselineRuntimeStage {
     max_parallel_node_workers: usize,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Stage ids the plan elected; lets the cloud-node guard refuse plans that
+    /// reboot a guarded node. Empty (the default) means nothing is planned.
+    planned_stage_ids: Vec<StageId>,
 }
 
 impl EnforceBaselineRuntimeStage {
@@ -33,7 +40,15 @@ impl EnforceBaselineRuntimeStage {
         Self {
             max_parallel_node_workers: max_parallel_node_workers.max(1),
             shutdown_flag,
+            planned_stage_ids: Vec::new(),
         }
+    }
+
+    /// Supply the plan's stage ids (used by the cloud-node reboot refusal).
+    #[must_use]
+    pub fn with_planned_stage_ids(mut self, planned_stage_ids: Vec<StageId>) -> Self {
+        self.planned_stage_ids = planned_stage_ids;
+        self
     }
 }
 
@@ -61,6 +76,21 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
         // planning. Fail loudly instead.
         if ctx.assignments.is_empty() {
             return StageOutcome::Failed("no assignments in scope".to_owned());
+        }
+        // Cloud-node safety (dataplane_endpoint / tailnet-managed nodes only):
+        // the tailscale path to the orchestrator must be direct and a node-side
+        // dead-man must be armed BEFORE the killswitch engages (this re-arms
+        // what verify_ssh_reachability armed, restarting the budget clock). Any
+        // refusal aborts before any node is enforced. Other nodes are never
+        // touched.
+        if let Err(e) = guard_dataplane_nodes(
+            ctx,
+            &StageId::EnforceBaselineRuntime,
+            &self.planned_stage_ids,
+        ) {
+            return StageOutcome::Failed(format!(
+                "cloud-node safety guard refused to enforce: {e}"
+            ));
         }
         let aliases: Vec<String> = ctx.assignments.iter().map(|a| a.alias.clone()).collect();
         let results = crate::vm_lab::orchestrator::parallel::bounded_parallel_map_cancellable(
@@ -95,6 +125,9 @@ impl OrchestrationStage for EnforceBaselineRuntimeStage {
             .into_iter()
             .filter_map(|(alias, r)| r.err().map(|e| format!("{alias}: {e}")))
             .collect();
+        // Best-effort post-enforce network snapshot of every node (pass or
+        // fail): it can never change the verdict below.
+        capture_all_nodes_diagnostics(ctx, PHASE_POST_ENFORCE);
         if errors.is_empty() {
             // QH-83: the witness is written on EVERY pass path and a write
             // failure fails the stage — an unwitnessed enforce pass must
