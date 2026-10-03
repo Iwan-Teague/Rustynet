@@ -705,8 +705,18 @@ printf 'plaintext_leak_check=%s\n' "$plaintext_leak_check"
 /// filter. Divergences vs the kill path:
 ///   * the cleanup trap issues `systemctl kill -s CONT` BEFORE `systemctl start`
 ///     so the daemon is never left frozen on any abort path,
-///   * the fault block STOPs the daemon, proves the `T` (stopped) kernel state
-///     from `/proc/$pid/stat`, holds past the reconcile interval, then CONTs.
+///   * the fault block STOPs the daemon, then POLLS `/proc/$pid/stat` for the
+///     `T` (stopped, or `t` tracing-stop) kernel state within a bounded window
+///     ([`STOP_POLL_WINDOW_SECS`]) instead of sampling one instant, records the
+///     distinct state sequence, holds past the reconcile interval, CONTs, and
+///     polls for a schedulable (`S`/`R`) state within [`RESUME_POLL_WINDOW_SECS`].
+///
+/// Why poll instead of one sample: a task in uninterruptible sleep (`D`) holds
+/// SIGSTOP pending until it returns from the wait, so a single first-instant
+/// sample can legitimately read `D` on a healthy freeze (live
+/// katana-u37-anchor-b78, 2026-10-03: observed_stopped_state=D with
+/// recovered=true and all leak checks passing). An empty stop sequence or a
+/// resume sequence that never reaches `S`/`R` still fails the stage closed.
 ///
 /// The bounded recovery poll and leak tally tail are identical to the kill path.
 fn render_remote_sigstop_script(config: &Config) -> String {
@@ -780,14 +790,55 @@ systemctl kill -s STOP "$service"
 main_pid="$(systemctl show -p MainPID --value "$service" 2>/dev/null || true)"
 case "$main_pid" in ""|*[!0-9]*|0) main_pid="" ;; esac
 observed_stopped_state=unknown
-if [ -n "$main_pid" ] && [ -r "/proc/$main_pid/stat" ]; then
-  observed_stopped_state="$(awk '{{ print $3 }}' "/proc/$main_pid/stat" 2>/dev/null || true)"
-  case "$observed_stopped_state" in ""|*[!A-Za-z]*) observed_stopped_state=unknown ;; esac
+observed_stopped_states=
+if [ -n "$main_pid" ]; then
+  stop_poll_deadline=$(( $(date +%s) + {STOP_POLL_WINDOW_SECS} ))
+  while :; do
+    state="$(awk '{{ print $3 }}' "/proc/$main_pid/stat" 2>/dev/null || true)"
+    case "$state" in ""|*[!A-Za-z]*) state=unknown ;; esac
+    if [ "$observed_stopped_state" = unknown ]; then
+      observed_stopped_state="$state"
+    fi
+    case "$observed_stopped_states" in
+      "$state"|*",$state") : ;;
+      *) observed_stopped_states="${{observed_stopped_states:+$observed_stopped_states,}}$state" ;;
+    esac
+    case "$state" in
+      T|t) break ;;
+    esac
+    if [ "$(date +%s)" -ge "$stop_poll_deadline" ]; then break; fi
+    sleep 0.2
+  done
 fi
 printf 'observed_stopped_state=%s\n' "$observed_stopped_state"
+printf 'observed_stopped_states=%s\n' "$observed_stopped_states"
 sleep 3
 printf 'fault_signal_resume=CONT\n'
 systemctl kill -s CONT "$service"
+# Fail closed on an unfinished resume too: poll for a schedulable state
+# (S sleeping or R running) within a bounded window right after CONT, and
+# record every distinct state seen so the report shows the whole sequence.
+observed_resumed_states=
+resumed_state=unknown
+if [ -n "$main_pid" ]; then
+  resume_poll_deadline=$(( $(date +%s) + {RESUME_POLL_WINDOW_SECS} ))
+  while :; do
+    state="$(awk '{{ print $3 }}' "/proc/$main_pid/stat" 2>/dev/null || true)"
+    case "$state" in ""|*[!A-Za-z]*) state=unknown ;; esac
+    resumed_state="$state"
+    case "$observed_resumed_states" in
+      "$state"|*",$state") : ;;
+      *) observed_resumed_states="${{observed_resumed_states:+$observed_resumed_states,}}$state" ;;
+    esac
+    case "$state" in
+      S|R) break ;;
+    esac
+    if [ "$(date +%s)" -ge "$resume_poll_deadline" ]; then break; fi
+    sleep 0.2
+  done
+fi
+printf 'resumed_state=%s\n' "$resumed_state"
+printf 'observed_resumed_states=%s\n' "$observed_resumed_states"
 recovered=false
 end_unix="$((start_unix + deadline))"
 while [ "$(date +%s)" -le "$end_unix" ]; do
@@ -810,6 +861,35 @@ printf 'plaintext_leak_check=%s\n' "$plaintext_leak_check"
     )
 }
 
+/// Bounded window (seconds) the guest script polls `/proc/<MainPID>/stat` for
+/// a stopped state after SIGSTOP before giving up. A task in uninterruptible
+/// sleep (`D`) holds SIGSTOP pending until it returns from the wait, so the
+/// stop can land later than the first instant sample (live
+/// katana-u37-anchor-b78, 2026-10-03).
+const STOP_POLL_WINDOW_SECS: u64 = 10;
+
+/// Bounded window (seconds) the guest script polls for a schedulable state
+/// (`S`/`R`) right after SIGCONT, so a still-stopped (`T`) sample cannot pass.
+const RESUME_POLL_WINDOW_SECS: u64 = 2;
+
+/// Pass input for the SIGSTOP/SIGCONT stage: true when the bounded stop-poll
+/// sequence proves the kernel actually parked the task — it contains `T`
+/// (job-control stop) or `t` (tracing stop). Decided purely from the contents:
+/// `["D","D","T"]` is true (the u37 race — `D` before the stop landed, `T`
+/// once it did), `["T"]` alone is true, while `["D","D","D"]`, `["R"]`, `["S"]`
+/// and `[]` are false (never stopped).
+fn stop_sequence_proves_stopped(states: &[String]) -> bool {
+    states.iter().any(|state| state == "T" || state == "t")
+}
+
+/// Pass input for the SIGSTOP/SIGCONT stage: true when the bounded post-SIGCONT
+/// sequence proves the task left the stopped state and is schedulable again —
+/// it contains `S` (interruptible sleep) or `R` (running). A sequence that
+/// stays `T` (SIGCONT never took), reads only `D`, or is empty is false.
+fn resume_sequence_proves_resumed(states: &[String]) -> bool {
+    states.iter().any(|state| state == "S" || state == "R")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct KillStageObservation {
     teardown_registered_before_fault: bool,
@@ -820,11 +900,29 @@ struct KillStageObservation {
     client_plaintext_lines: u64,
     client_plaintext_leak_check: String,
     capture_interface: Option<String>,
-    /// Field-3 (`state`) read from `/proc/<MainPID>/stat` while the daemon was
-    /// held under SIGSTOP. `Some("T")` proves the kernel parked the process in
-    /// the stopped state. `None` for kill-mode output (the key is never emitted
-    /// there), so it never affects the existing `.passed()` kill check.
+    /// Field-3 (`state`) read from `/proc/<MainPID>/stat` at the FIRST sample
+    /// instant after SIGSTOP (the legacy single-instant key, kept for the
+    /// report; the pass decision no longer rests on it). `None` for kill-mode
+    /// output (the key is never emitted there), so it never affects the
+    /// existing `.passed()` kill check.
     observed_stopped_state: Option<String>,
+    /// Every distinct consecutive `/proc/<MainPID>/stat` state sampled while
+    /// polling for the stop within [`STOP_POLL_WINDOW_SECS`] after SIGSTOP, in
+    /// order. Containing `T`/`t` — not any single instant — is what
+    /// `passed_stopcont` requires: a task in uninterruptible sleep (`D`) holds
+    /// SIGSTOP pending until it leaves the wait, so a first-instant sample
+    /// alone can read `D` (live katana-u37-anchor-b78, 2026-10-03). Empty
+    /// fails the stage closed.
+    observed_stopped_states: Vec<String>,
+    /// Every distinct consecutive state sampled while polling right after
+    /// SIGCONT for a schedulable (`S`/`R`) state within
+    /// [`RESUME_POLL_WINDOW_SECS`]. Empty, or a sequence that never reaches
+    /// `S`/`R` (e.g. the task still reads `T`), fails the stage closed.
+    observed_resumed_states: Vec<String>,
+    /// Last state observed in the post-SIGCONT resume window (`unknown` when
+    /// `/proc` was unreadable). Informational; the pass criterion is
+    /// [`KillStageObservation::observed_resumed_states`].
+    resumed_state: Option<String>,
     /// Kill-mode proof that the fault actually landed (`is-active` flipped
     /// false or the socket inode changed) before recovery was measured.
     /// `None` when the key is absent (SIGSTOP output never emits it, and an
@@ -890,6 +988,22 @@ impl KillStageObservation {
             Some("false") => Some(false),
             Some(other) => return Err(format!("invalid boolean for fault_observed: {other}")),
         };
+        // Bounded poll sequences are comma-joined lists of `/proc` states as
+        // the guest script emitted them ("D,D,T"). An absent key parses to an
+        // empty sequence, which `passed_stopcont` treats as fail-closed.
+        let parse_state_list = |key: &str| -> Vec<String> {
+            exit_value(key)
+                .map(|raw| {
+                    raw.split(',')
+                        .map(|state| state.trim().to_owned())
+                        .filter(|state| !state.is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let observed_stopped_states = parse_state_list("observed_stopped_states");
+        let observed_resumed_states = parse_state_list("observed_resumed_states");
+        let resumed_state = observed_resumed_states.last().cloned();
         Ok(Self {
             teardown_registered_before_fault: parse_exit_bool("teardown_registered_before_fault")?,
             recovered: parse_exit_bool("recovered")?,
@@ -904,6 +1018,9 @@ impl KillStageObservation {
                 .to_owned(),
             capture_interface: exit_value("capture_interface").map(str::to_owned),
             observed_stopped_state: exit_value("observed_stopped_state").map(str::to_owned),
+            observed_stopped_states,
+            observed_resumed_states,
+            resumed_state,
             fault_observed,
         })
     }
@@ -919,15 +1036,19 @@ impl KillStageObservation {
             && self.client_plaintext_leak_check == "pass"
     }
 
-    /// Pass-check for the SIGSTOP/SIGCONT sub-stage. Mirrors `.passed()` but
-    /// additionally requires proof that the kernel actually parked the daemon in
-    /// the `T` (stopped) state during the freeze window. ANDs: teardown was
-    /// registered before the fault, the daemon was observed stopped (`T`), it
-    /// recovered within the deadline, and ALL FOUR zero-plaintext leak checks
-    /// (target tcpdump + client tcpdump) held during the fault window.
+    /// Pass-check for the SIGSTOP/SIGCONT sub-stage. ANDs: teardown was
+    /// registered before the fault, the bounded stop-poll sequence proves the
+    /// daemon actually reached the stopped (`T`/`t`) state, the bounded
+    /// resume-poll sequence proves it left the stopped state (`S`/`R`) after
+    /// SIGCONT, it recovered within the deadline, and ALL FOUR zero-plaintext
+    /// leak checks (target tcpdump + client tcpdump) held during the fault
+    /// window. Fails closed when either sequence is absent (an old guest
+    /// script sampling one instant proves nothing about the stop or the
+    /// resume) or never reaches the required states.
     fn passed_stopcont(&self, deadline_secs: u64) -> bool {
         self.teardown_registered_before_fault
-            && self.observed_stopped_state.as_deref() == Some("T")
+            && stop_sequence_proves_stopped(&self.observed_stopped_states)
+            && resume_sequence_proves_resumed(&self.observed_resumed_states)
             && self.recovered
             && self.measured_recovery_secs <= deadline_secs
             && self.tcpdump_lines == 0
@@ -987,9 +1108,19 @@ fn render_live_report(config: &Config, observation: &KillStageObservation) -> Va
                     implemented["fault_observed"] = json!(observation.fault_observed);
                 }
                 if config.fault_mode == FaultMode::StopCont {
-                    // Surface the proof that the daemon was actually frozen.
+                    // Surface the proof that the daemon was actually frozen:
+                    // the first-instant sample (legacy key, often `D` during
+                    // the u37 race) plus the bounded stop/resume poll
+                    // sequences that actually decide the stage.
                     implemented["observed_stopped_state"] =
                         json!(observation.observed_stopped_state);
+                    implemented["observed_stopped_states"] =
+                        json!(observation.observed_stopped_states);
+                    implemented["stop_poll_window_secs"] = json!(STOP_POLL_WINDOW_SECS);
+                    implemented["resumed_state"] = json!(observation.resumed_state);
+                    implemented["observed_resumed_states"] =
+                        json!(observation.observed_resumed_states);
+                    implemented["resume_poll_window_secs"] = json!(RESUME_POLL_WINDOW_SECS);
                 }
                 implemented
             } else {
@@ -1226,18 +1357,21 @@ mod tests {
     #[test]
     fn sigstop_observation_parses_passing_output() {
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nobserved_stopped_states=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\nresumed_state=S\nobserved_resumed_states=S\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
         assert_eq!(observation.observed_stopped_state.as_deref(), Some("T"));
+        assert_eq!(observation.observed_stopped_states, ["T"]);
+        assert_eq!(observation.resumed_state.as_deref(), Some("S"));
+        assert_eq!(observation.observed_resumed_states, ["S"]);
         assert!(observation.passed_stopcont(90));
     }
 
     #[test]
     fn sigstop_observation_fails_when_not_stopped() {
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=R\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=R\nobserved_stopped_states=R\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\nresumed_state=R\nobserved_resumed_states=R\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
@@ -1247,7 +1381,7 @@ mod tests {
     #[test]
     fn sigstop_observation_fails_on_plaintext_lines() {
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=1\nplaintext_leak_check=fail\n",
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nobserved_stopped_states=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=1\nplaintext_leak_check=fail\nresumed_state=S\nobserved_resumed_states=S\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
@@ -1257,8 +1391,59 @@ mod tests {
     #[test]
     fn sigstop_observation_fails_on_client_plaintext_lines() {
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nobserved_stopped_states=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\nresumed_state=S\nobserved_resumed_states=S\n",
             "client_plaintext_lines=1\nclient_plaintext_leak_check=fail\n",
+        )
+        .expect("observation should parse");
+        assert!(!observation.passed_stopcont(90));
+    }
+
+    // The daemon ran the whole bounded stop window without ever reaching the
+    // stopped state (D forever): fail closed even though it recovered.
+    #[test]
+    fn sigstop_fails_closed_when_daemon_never_reaches_stopped_state() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=D\nobserved_stopped_states=D,D,D,D,D\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\nresumed_state=R\nobserved_resumed_states=R\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect("observation should parse");
+        assert!(!observation.passed_stopcont(90));
+    }
+
+    // Witness for the live katana-u37-anchor-b78 D-state flake (2026-10-03):
+    // the first-instant sample read `D` because the daemon sat in
+    // uninterruptible sleep when SIGSTOP landed, every substantive check
+    // passed, and the stage still failed. The bounded poll sequence is the
+    // proof of the stop, not any single instant.
+    #[test]
+    fn sigstop_ddt_sequence_passes_where_first_instant_sample_read_d() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=ens3\nfault_signal=STOP\nobserved_stopped_state=D\nobserved_stopped_states=D,D,T\nfault_signal_resume=CONT\nresumed_state=R\nobserved_resumed_states=T,R\nrecovered=true\nmeasured_recovery_secs=3\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect("observation should parse");
+        assert!(observation.passed_stopcont(90));
+    }
+
+    // Fail closed on an unfinished resume: the stop was proven, but the
+    // bounded post-SIGCONT poll still reads `T`, so SIGCONT never took.
+    #[test]
+    fn sigstop_fails_when_daemon_still_stopped_after_sigcont() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nobserved_stopped_states=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\nresumed_state=T\nobserved_resumed_states=T,T\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
+        )
+        .expect("observation should parse");
+        assert!(!observation.passed_stopcont(90));
+    }
+
+    // Fail closed when the guest emitted no poll sequences at all (an old
+    // single-instant script proves nothing about the stop or the resume).
+    #[test]
+    fn sigstop_fails_closed_when_state_sequences_absent() {
+        let observation = KillStageObservation::parse(
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
         assert!(!observation.passed_stopcont(90));
@@ -1269,7 +1454,7 @@ mod tests {
         let config = parse(&["--dry-run", "--fault-mode", "sigstop-cont"])
             .expect("sigstop dry-run config should parse");
         let observation = KillStageObservation::parse(
-            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\n",
+            "teardown_registered_before_fault=true\ncapture_interface=eth0\nobserved_stopped_state=T\nobserved_stopped_states=T\nrecovered=true\nmeasured_recovery_secs=9\ntcpdump_lines=0\nplaintext_leak_check=pass\nresumed_state=S\nobserved_resumed_states=S\n",
             "client_plaintext_lines=0\nclient_plaintext_leak_check=pass\n",
         )
         .expect("observation should parse");
@@ -1281,9 +1466,101 @@ mod tests {
         assert_eq!(stages[2]["name"], "chaos_daemon_sigstop_sigcont");
         assert_eq!(stages[2]["status"], "pass");
         assert_eq!(stages[2]["observed_stopped_state"], "T");
+        assert_eq!(stages[2]["observed_stopped_states"], json!(["T"]));
+        assert_eq!(stages[2]["stop_poll_window_secs"], STOP_POLL_WINDOW_SECS);
+        assert_eq!(stages[2]["resumed_state"], "S");
+        assert_eq!(stages[2]["observed_resumed_states"], json!(["S"]));
+        assert_eq!(
+            stages[2]["resume_poll_window_secs"],
+            RESUME_POLL_WINDOW_SECS
+        );
         assert_eq!(stages[0]["status"], "skipped");
         assert_eq!(stages[1]["status"], "skipped");
         assert_eq!(stages[3]["status"], "skipped");
+    }
+
+    #[test]
+    fn stop_sequence_proves_stopped_decides_purely_on_contents() {
+        // D,D,T: the u37 race — D at the first instant, T once the stop landed.
+        assert!(stop_sequence_proves_stopped(&[
+            "D".to_owned(),
+            "D".to_owned(),
+            "T".to_owned()
+        ]));
+        // T immediately.
+        assert!(stop_sequence_proves_stopped(&["T".to_owned()]));
+        // t: tracing stop counts too.
+        assert!(stop_sequence_proves_stopped(&[
+            "D".to_owned(),
+            "t".to_owned()
+        ]));
+        // D forever never proves the stop.
+        assert!(!stop_sequence_proves_stopped(&[
+            "D".to_owned(),
+            "D".to_owned(),
+            "D".to_owned()
+        ]));
+        // R: running is not stopped.
+        assert!(!stop_sequence_proves_stopped(&["R".to_owned()]));
+        // S: sleeping is not stopped.
+        assert!(!stop_sequence_proves_stopped(&["S".to_owned()]));
+        // Empty (sequence key absent): fail closed.
+        assert!(!stop_sequence_proves_stopped(&[]));
+    }
+
+    #[test]
+    fn resume_sequence_proves_resumed_requires_s_or_r() {
+        assert!(resume_sequence_proves_resumed(&["S".to_owned()]));
+        assert!(resume_sequence_proves_resumed(&["R".to_owned()]));
+        // T then R: the first sample raced the CONT, it did resume.
+        assert!(resume_sequence_proves_resumed(&[
+            "T".to_owned(),
+            "R".to_owned()
+        ]));
+        // Still stopped after SIGCONT.
+        assert!(!resume_sequence_proves_resumed(&[
+            "T".to_owned(),
+            "T".to_owned()
+        ]));
+        // Only uninterruptible I/O in the window.
+        assert!(!resume_sequence_proves_resumed(&[
+            "D".to_owned(),
+            "D".to_owned()
+        ]));
+        // Empty (sequence key absent): fail closed.
+        assert!(!resume_sequence_proves_resumed(&[]));
+    }
+
+    #[test]
+    fn sigstop_script_polls_for_stopped_state_within_bounded_window() {
+        let script = sigstop_script();
+        assert!(script.contains(&format!(
+            "stop_poll_deadline=$(( $(date +%s) + {STOP_POLL_WINDOW_SECS} ))"
+        )));
+        assert!(script.contains("T|t) break ;;"));
+        assert!(script.contains("printf 'observed_stopped_state=%s\\n'"));
+        assert!(script.contains("printf 'observed_stopped_states=%s\\n'"));
+    }
+
+    #[test]
+    fn sigstop_script_polls_for_resume_and_records_state_sequence() {
+        let script = sigstop_script();
+        assert!(script.contains(&format!(
+            "resume_poll_deadline=$(( $(date +%s) + {RESUME_POLL_WINDOW_SECS} ))"
+        )));
+        assert!(script.contains("S|R) break ;;"));
+        assert!(script.contains("printf 'resumed_state=%s\\n'"));
+        assert!(script.contains("printf 'observed_resumed_states=%s\\n'"));
+    }
+
+    // The kill stage (fixed in cef3ecde2) must keep its fault_observed proof
+    // and must gain none of the SIGSTOP poll keys.
+    #[test]
+    fn kill_script_keeps_fault_observed_and_gains_no_sigstop_poll_keys() {
+        let script = kill_script();
+        assert!(script.contains("fault_observed"));
+        assert!(!script.contains("observed_stopped_states"));
+        assert!(!script.contains("observed_resumed_states"));
     }
 
     fn kill_script() -> String {
