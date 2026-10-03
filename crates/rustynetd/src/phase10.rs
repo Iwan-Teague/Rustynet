@@ -1701,11 +1701,45 @@ impl LinuxCommandSystem {
         })
     }
 
+    /// Rendered rule lines of the generation's dns_redirect chain, or an
+    /// empty list when the redirect table does not exist yet.
+    ///
+    /// Probes via `nft list table inet <owned table>`: the helper allowlist
+    /// admits `list chain` only for the fixed killswitch/forward/… chain
+    /// names, and `dns_redirect` is deliberately not one of them — a table
+    /// listing needs NO allowlist change (`is_owned_nft_table_token` already
+    /// admits every `rustynet_g*` table). Fail-closed: any probe error other
+    /// than the missing-table case is propagated, never swallowed.
+    fn dns_redirect_rule_lines(&self, table: &str) -> Result<Vec<String>, SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Nft,
+            &["list", "table", "inet", table],
+        )?;
+        if !output.success() {
+            if Self::is_nft_missing_object_error(output.stderr.as_str()) {
+                return Ok(Vec::new());
+            }
+            return Err(SystemError::DnsApplyFailed(format!(
+                "nft list table exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        Ok(Self::nft_chain_lines(&output.stdout, "dns_redirect").unwrap_or_default())
+    }
+
     /// Install the loopback `:53` -> resolver redirect, point
     /// `/etc/resolv.conf` at the loopback resolver (backing up the original),
     /// and — when NetworkManager is present — drop in `dns=none` so NM cannot
     /// reintroduce off-loopback nameservers on a link change. Every file write
     /// goes through the privileged helper's fixed-path/fixed-content builtin.
+    ///
+    /// The redirect TABLE is generation-named and torn down by
+    /// `rollback_dns_protection`, but on a failed generation apply the table
+    /// name stays the same across reconcile retries while the table itself
+    /// survives — so the two `add rule` argvs below are guarded by the SAME
+    /// exact-rule idempotence probe as every other retry-path emitter
+    /// (`nft add rule` appends; an unguarded loop re-appends both redirect
+    /// rules every ~1.5s retry).
     fn apply_loopback_dns_ownership(&mut self) -> Result<(), SystemError> {
         if self.dns_resolver_port == 0 {
             return Err(SystemError::DnsApplyFailed(
@@ -1714,9 +1748,17 @@ impl LinuxCommandSystem {
             ));
         }
         let table = crate::linux_dns_protect::dns_redirect_table_name(self.generation);
+        let existing_redirect_rules = self.dns_redirect_rule_lines(table.as_str())?;
         for argv in
             crate::linux_dns_protect::dns_redirect_nft_apply_argvs(&table, self.dns_resolver_port)
         {
+            if let Some(rule_tokens) = argv.get(5..)
+                && argv.first().map(String::as_str) == Some("add")
+                && argv.get(1).map(String::as_str) == Some("rule")
+                && Self::chain_holds_exact_rule(&existing_redirect_rules, rule_tokens, &[])
+            {
+                continue;
+            }
             let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
             self.run(PrivilegedCommandProgram::Nft, &refs)
                 .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
@@ -2215,36 +2257,188 @@ impl LinuxCommandSystem {
         None
     }
 
+    /// b97 (a120 RF1/RF2): real-nft folding canonicalization — see the doc on
+    /// `fold_implied_l4proto_dependency` below. Kept verbatim-token matching
+    /// for the emitted-argv agreement tests in `mod tests`, the only remaining
+    /// consumers after the a120 RF3 rework moved every LIVE-ruleset assertion
+    /// onto the exact folding-aware matcher.
+    // Test-support only: those tests are `#[cfg(target_os = "linux")]`, so on
+    // non-linux `--all-targets` builds this compiles unreferenced.
+    #[cfg(test)]
+    #[allow(dead_code)]
     fn chain_contains_all_tokens(lines: &[String], tokens: &[&str]) -> bool {
         lines
             .iter()
             .any(|line| tokens.iter().all(|token| line.contains(token)))
     }
 
-    fn assert_chain_contains(
-        &self,
+    /// Tokens of a RENDERED nft rule line, normalized to the argv vocabulary:
+    /// nft quotes string match args (`oifname "lo"`), splices live counter
+    /// statistics after an explicit `counter` token (`counter packets 7 bytes
+    /// 588`), and (only under `-a`) appends a `# handle N` comment. Strip all
+    /// three so a rendered line tokenizes to exactly the `nft add rule` body
+    /// argv that produced it.
+    fn rendered_rule_tokens(line: &str) -> Vec<String> {
+        let raws: Vec<&str> = line.split_whitespace().collect();
+        let mut tokens = Vec::new();
+        let mut index = 0usize;
+        while index < raws.len() {
+            let Some(raw) = raws.get(index) else {
+                break;
+            };
+            if raw.starts_with('#') {
+                break;
+            }
+            let unquoted = raw.trim_matches('"');
+            if unquoted == "counter"
+                && raws.get(index + 1).is_some_and(|token| *token == "packets")
+                && raws
+                    .get(index + 2)
+                    .is_some_and(|token| token.parse::<u64>().is_ok())
+                && raws.get(index + 3).is_some_and(|token| *token == "bytes")
+                && raws
+                    .get(index + 4)
+                    .is_some_and(|token| token.parse::<u64>().is_ok())
+            {
+                tokens.push("counter".to_owned());
+                index += 5;
+                continue;
+            }
+            tokens.push(unquoted.to_owned());
+            index += 1;
+        }
+        tokens
+    }
+
+    /// Real nftables (1.0.9, kernel 6.8 — live-probed on the b97 review box,
+    /// throwaway tables `rn_test_*`) FOLDS the explicit transport-protocol
+    /// dependency `meta l4proto <p>` out of `list` output when the rule later
+    /// carries the implied `<p> dport`/`<p> sport` payload expression:
+    /// `add rule … meta l4proto udp ip daddr 127.0.0.1 udp dport 53 redirect
+    /// to :53535` lists back as `ip daddr 127.0.0.1 udp dport 53 redirect to
+    /// :53535` — with `ip daddr` (and `iifname`, and counters) between the
+    /// dependency and the port expression, the fold still happens. Live probe
+    /// results that bound this rule exactly:
+    /// - `ip protocol <p>` is NOT folded (stays verbatim in the listing);
+    /// - a SECOND `meta l4proto <p>` AFTER the port expression is kept;
+    /// - the negated set `meta l4proto != { tcp, udp }` (no port expression)
+    ///   round-trips byte-identically.
+    ///
+    /// Canonicalizing BOTH sides this way is what lets the exact matcher
+    /// accept the real folded rendering AND the unfolded rendering of the
+    /// same rule while every other token difference still fails. Without it,
+    /// `chain_holds_exact_rule` never matches the dns_redirect rules against
+    /// live state and `apply_loopback_dns_ownership` re-appends both redirect
+    /// rules on every dns-stage retry — unbounded `dns_redirect` growth, the
+    /// exact incident class the idempotence guard exists to prevent.
+    fn fold_implied_l4proto_dependency(tokens: &[String]) -> Vec<String> {
+        // First `<p> dport` / `<p> sport` payload expression, in evaluation
+        // order — this is the expression whose protocol dependency is
+        // already established once `meta l4proto <p>` ran earlier.
+        let mut port: Option<(usize, &str)> = None;
+        for (index, window) in tokens.windows(2).enumerate() {
+            let Some(next) = window.get(1) else {
+                continue;
+            };
+            if next == "dport" || next == "sport" {
+                port = window.first().map(|proto| (index, proto.as_str()));
+                break;
+            }
+        }
+        let Some((port_at, proto)) = port else {
+            return tokens.to_vec();
+        };
+        let mut folded = Vec::with_capacity(tokens.len());
+        let mut index = 0usize;
+        while index < tokens.len() {
+            let explicit_dependency = tokens.get(index).map(String::as_str) == Some("meta")
+                && tokens.get(index + 1).map(String::as_str) == Some("l4proto")
+                && tokens.get(index + 2).map(String::as_str) == Some(proto);
+            // Fold ONLY an explicit dependency that sits before the port
+            // expression, and only while nothing between them re-establishes
+            // a transport-protocol context (another `l4proto`/`protocol`/
+            // `nexthdr` keyword, or another port expression). This keeps the
+            // negated `meta l4proto != { … }` builder (no port expression ⇒
+            // `port_at` find fails above) and any post-port `meta l4proto`
+            // (probe p7) verbatim.
+            if explicit_dependency && index + 3 <= port_at {
+                let neutral = tokens.get(index + 3..port_at).is_some_and(|between| {
+                    between.iter().all(|token| {
+                        token != "l4proto"
+                            && token != "protocol"
+                            && token != "nexthdr"
+                            && token != "dport"
+                            && token != "sport"
+                    })
+                });
+                if neutral {
+                    index += 3;
+                    continue;
+                }
+            }
+            if let Some(token) = tokens.get(index) {
+                folded.push(token.clone());
+            }
+            index += 1;
+        }
+        folded
+    }
+
+    /// Does `lines` (rendered chain content) already hold EXACTLY this rule —
+    /// the given builder tokens with `observability_tokens` spliced at the
+    /// same position `nft_add_rule_argv` puts them (before the final verdict)?
+    ///
+    /// This is the per-RULE decision the u38c idempotence guard needs. The
+    /// substring matcher above (`chain_contains_all_tokens`) is the WRONG tool
+    /// for skip decisions: token sets overlap between rules, most visibly
+    /// `forward_hairpin_accept_tokens` (`iifname <t> oifname <t> accept`)
+    /// versus `forward_tunnel_to_egress_tokens` (`iifname <t> oifname <e>
+    /// accept`) — every hairpin token is a substring of the tunnel→egress
+    /// line, so a tunnel→egress rule installed just before the hairpin check
+    /// made the matcher report the hairpin as present and the rule was never
+    /// installed. Exact equality cannot cross-match: normalized line tokens
+    /// must equal this rule's own argv body, token for token, in order —
+    /// AFTER both sides are canonicalized the way real nft renders them
+    /// (`rendered_rule_tokens` + `fold_implied_l4proto_dependency`).
+    fn chain_holds_exact_rule(
+        lines: &[String],
+        rule_tokens: &[String],
+        observability_tokens: &[&str],
+    ) -> bool {
+        let expected = Self::nft_add_rule_argv("inet", "t", "c", rule_tokens, observability_tokens);
+        let expected = expected.get(5..).unwrap_or_default();
+        let expected = Self::fold_implied_l4proto_dependency(expected);
+        lines.iter().any(|line| {
+            Self::fold_implied_l4proto_dependency(&Self::rendered_rule_tokens(line)).as_slice()
+                == expected.as_slice()
+        })
+    }
+
+    /// Exact folding-aware PRESENCE assertion for the live-ruleset checks:
+    /// the chain must hold EXACTLY this builder rule — the same decision
+    /// `chain_holds_exact_rule` makes for the idempotence skip — tolerating
+    /// only the observability-only `counter` token an emitter may have
+    /// spliced before the verdict. The historical substring matcher
+    /// (`chain_contains_all_tokens`) passed vacuously whenever every builder
+    /// token happened to be an independent substring of one longer live rule
+    /// (every hairpin token sits inside the tunnel→egress line), so a missing
+    /// hairpin forward-accept rule was reported as present by the runtime
+    /// self-assertion that exists to catch exactly that.
+    fn assert_chain_holds_exact_rule(
         chain_lines: &[String],
-        tokens: &[&str],
+        rule_tokens: &[String],
         message: &str,
     ) -> Result<(), SystemError> {
-        if Self::chain_contains_all_tokens(chain_lines, tokens) {
+        if Self::chain_holds_exact_rule(chain_lines, rule_tokens, &[])
+            || Self::chain_holds_exact_rule(chain_lines, rule_tokens, &["counter"])
+        {
             return Ok(());
         }
         Err(SystemError::KillSwitchAssertionFailed(format!(
             "{message}: missing tokens={} chain_lines={}",
-            tokens.join(" "),
+            rule_tokens.join(" "),
             chain_lines.join(" | ")
         )))
-    }
-
-    fn assert_chain_contains_strings(
-        &self,
-        chain_lines: &[String],
-        tokens: &[String],
-        message: &str,
-    ) -> Result<(), SystemError> {
-        let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
-        self.assert_chain_contains(chain_lines, &borrowed, message)
     }
 
     // ── QH-29: shared rule-token builders ────────────────────────────────────
@@ -2265,11 +2459,12 @@ impl LinuxCommandSystem {
     //
     // Note on `counter`: it is an OBSERVABILITY-ONLY argv token (packet
     // counters for live debugging) deliberately OMITTED from every builder —
-    // `chain_contains_all_tokens` matches each token as an independent
-    // substring of the rendered line, so the extra `counter packets N bytes N`
-    // text nft renders between match terms and the verdict never breaks the
-    // match. Keep it that way: adding `counter` to a builder would couple the
-    // assertion to nft's counter rendering.
+    // the exact-rule matcher (`chain_holds_exact_rule`) strips the
+    // `counter packets N bytes M` statistics nft renders after the keyword,
+    // and the live-ruleset assertions accept the rule with or without the
+    // spliced `counter`, so the extra text never breaks either consumer. Keep
+    // it that way: adding `counter` to a builder would couple the assertion to
+    // nft's counter rendering.
 
     /// Killswitch: allow loopback (managed DNS resolver on 127.0.0.1 must
     /// survive the default-deny OUTPUT policy).
@@ -2737,13 +2932,13 @@ impl LinuxCommandSystem {
         let postrouting = Self::nft_chain_lines(&ruleset, "postrouting").ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("nat postrouting chain missing".to_owned())
         })?;
-        self.assert_chain_contains_strings(
+        Self::assert_chain_holds_exact_rule(
             &postrouting,
             &Self::nat_egress_masquerade_tokens(self.egress_interface.as_str()),
             "egress masquerade rule missing",
         )?;
         if self.allow_tunnel_relay_forward {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &postrouting,
                 &Self::nat_hairpin_masquerade_tokens(self.interface_name.as_str()),
                 "relay-with-upstream masquerade rule missing",
@@ -2810,9 +3005,14 @@ impl LinuxCommandSystem {
     /// / `apply_nat_forwarding` / `apply_dns_protection` emit their rules
     /// from — the pairing is pinned by
     /// `killswitch_and_dns_rule_tokens_agree_with_emitted_nft_argv` in
-    /// `mod tests`. FAIL-CLOSED: every missing allow rule below is an error;
-    /// the shared builders exist to keep these checks honest across rule
-    /// format changes, never to weaken them.
+    /// `mod tests`. b97 rework (a120 finding F2): every check below goes
+    /// through the EXACT folding-aware matcher (`assert_chain_holds_exact_rule`),
+    /// the same decision the idempotence skip makes — the historical substring
+    /// matcher passed vacuously whenever all of a rule's tokens were
+    /// independent substrings of one longer live rule (the hairpin tokens all
+    /// sit inside the tunnel→egress line). FAIL-CLOSED: every missing allow
+    /// rule below is an error; the shared builders exist to keep these checks
+    /// honest across rule format changes, never to weaken them.
     fn assert_firewall_ruleset(&self) -> Result<(), SystemError> {
         let table = self.firewall_table.clone().ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("killswitch table missing".to_owned())
@@ -2824,7 +3024,7 @@ impl LinuxCommandSystem {
         let forward = Self::nft_chain_lines(&ruleset, "forward").ok_or_else(|| {
             SystemError::KillSwitchAssertionFailed("forward chain missing".to_owned())
         })?;
-        self.assert_chain_contains_strings(
+        Self::assert_chain_holds_exact_rule(
             &killswitch,
             &Self::loopback_accept_tokens(),
             "loopback killswitch allow rule missing",
@@ -2832,19 +3032,19 @@ impl LinuxCommandSystem {
         // AQ-70/F2: one scoped established/related rule per iteration; each
         // is asserted/installed individually so none can be silently omitted.
         for rule_tokens in Self::established_related_accept_tokens() {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &killswitch,
                 &rule_tokens,
                 "established/related killswitch allow rule missing",
             )?;
         }
-        self.assert_chain_contains_strings(
+        Self::assert_chain_holds_exact_rule(
             &killswitch,
             &Self::tunnel_interface_accept_tokens(self.interface_name.as_str()),
             "tunnel-interface killswitch allow rule missing",
         )?;
         if self.wg_listen_port != 0 {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &killswitch,
                 &Self::wg_listen_port_allow_tokens(
                     "dport",
@@ -2853,7 +3053,7 @@ impl LinuxCommandSystem {
                 ),
                 "wireguard listen port killswitch allow rule missing",
             )?;
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &killswitch,
                 &Self::wg_listen_port_allow_tokens(
                     "sport",
@@ -2864,13 +3064,13 @@ impl LinuxCommandSystem {
             )?;
         }
         for rule_tokens in Self::established_related_accept_tokens() {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &forward,
                 &rule_tokens,
                 "forward established/related allow rule missing",
             )?;
         }
-        self.assert_chain_contains_strings(
+        Self::assert_chain_holds_exact_rule(
             &forward,
             &Self::forward_tunnel_to_egress_tokens(
                 self.interface_name.as_str(),
@@ -2879,7 +3079,7 @@ impl LinuxCommandSystem {
             "forwarding allow rule to underlay egress missing",
         )?;
         if self.allow_tunnel_relay_forward {
-            self.assert_chain_contains_strings(
+            Self::assert_chain_holds_exact_rule(
                 &forward,
                 &Self::forward_hairpin_accept_tokens(self.interface_name.as_str()),
                 "relay-with-upstream forwarding allow rule missing",
@@ -2893,7 +3093,7 @@ impl LinuxCommandSystem {
                 self.egress_interface.as_str(),
                 self.exit_egress_dns_drop,
             ) {
-                self.assert_chain_contains_strings(
+                Self::assert_chain_holds_exact_rule(
                     &killswitch,
                     &rule_tokens,
                     "scoped egress killswitch rule missing while nat forwarding is active",
@@ -2902,12 +3102,12 @@ impl LinuxCommandSystem {
         }
         if self.dns_protected {
             for proto in ["udp", "tcp"] {
-                self.assert_chain_contains_strings(
+                Self::assert_chain_holds_exact_rule(
                     &killswitch,
                     &Self::dns_off_tunnel_drop_tokens(proto, self.interface_name.as_str()),
                     &format!("dns {proto} fail-closed rule missing"),
                 )?;
-                self.assert_chain_contains_strings(
+                Self::assert_chain_holds_exact_rule(
                     &killswitch,
                     &Self::dns_accept_tokens(proto),
                     &format!("dns {proto} allow rule missing"),
@@ -3428,6 +3628,89 @@ impl LinuxCommandSystem {
             .to_ascii_lowercase()
             .contains("no such file or directory")
     }
+
+    /// Rendered lines of an owned nft chain, or an empty list when the chain
+    /// does not exist yet (`nft list chain` misses with "no such file or
+    /// directory" the same way `killswitch_chain_exists` interprets).
+    ///
+    /// Deliberately uses the SAME `list chain` argv shape the allowlist already
+    /// admits (`has_fail_closed_drop_rule`, `killswitch_chain_exists`) — the
+    /// idempotence probe introduces no new privileged surface. Takes the
+    /// family so the ip-family NAT chains (postrouting) probe through the
+    /// same path (`is_nft_family_token` already admits `ip`).
+    fn chain_lines(
+        &self,
+        family: &str,
+        table: &str,
+        chain: &str,
+    ) -> Result<Vec<String>, SystemError> {
+        let output = self.run_capture(
+            PrivilegedCommandProgram::Nft,
+            &["list", "chain", family, table, chain],
+        )?;
+        if !output.success() {
+            if Self::is_nft_missing_object_error(output.stderr.as_str()) {
+                return Ok(Vec::new());
+            }
+            return Err(SystemError::FirewallApplyFailed(format!(
+                "nft list chain exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        Ok(output
+            .stdout
+            .lines()
+            .map(|line| line.trim().to_owned())
+            .collect())
+    }
+
+    /// Append a rule to an nft chain ONLY when that EXACT rule (builder
+    /// tokens with the observability tokens spliced exactly where
+    /// `nft_add_rule_argv` puts them) is not already installed.
+    ///
+    /// This is the defect-u38c fix, reworked per the b91 review (finding F1):
+    /// the skip decision is PER-RULE EXACT, never a token-set substring match.
+    /// The chain is probed with `nft list chain` (allowlist-admitted argv,
+    /// same surface as `killswitch_chain_exists`), each rendered line is
+    /// normalized to the argv vocabulary (`rendered_rule_tokens`: quotes
+    /// stripped, `counter packets N bytes M` statistics collapsed to
+    /// `counter`, `# handle N` comments dropped) and compared for EXACT
+    /// equality against this rule's own argv body. The historical substring
+    /// matcher wrongly cross-matched rules whose token sets nest — most
+    /// visibly the hairpin forward-accept (`iifname t oifname t accept`)
+    /// hiding inside the tunnel→egress forward rule (`iifname t oifname e
+    /// accept`) installed just before it, so the hairpin was never added.
+    ///
+    /// Fail-closed: a probe error (timeout, non-zero exit other than the
+    /// missing-chain case) PROPAGATES — the add is never attempted on a blind
+    /// probe, and nothing is ever skipped or double-added on uncertainty.
+    /// `apply_firewall_killswitch` runs on every reconcile pass, and on a
+    /// failed generation apply the rollback keeps the table+chain alive
+    /// (FirewallApplied is a no-op under RollbackIntent::FailClosed) while
+    /// the generation number is NOT bumped — so the table name stays
+    /// `rustynet_g1` across retries. With exact per-rule idempotence each
+    /// emitter's chain stays bounded regardless of how many retries run.
+    ///
+    /// Fail-closed posture is untouched: this only ever SKIPS an add that is
+    /// byte-identical to an installed rule; the base-chain `policy drop`
+    /// holds throughout, and the fail-closed drop rule written by
+    /// `block_all_egress` is guarded by its own `has_fail_closed_drop_rule`
+    /// check.
+    fn add_nft_rule_if_absent(
+        &self,
+        family: &str,
+        table: &str,
+        chain: &str,
+        rule_tokens: &[String],
+        observability_tokens: &[&str],
+    ) -> Result<(), SystemError> {
+        let lines = self.chain_lines(family, table, chain)?;
+        if Self::chain_holds_exact_rule(&lines, rule_tokens, observability_tokens) {
+            return Ok(());
+        }
+        self.run_nft_rule_argv(family, table, chain, rule_tokens, observability_tokens)
+            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))
+    }
 }
 
 impl DataplaneSystem for LinuxCommandSystem {
@@ -3601,23 +3884,32 @@ impl DataplaneSystem for LinuxCommandSystem {
         // AQ-70/F2: install every scoped established/related rule in order;
         // nft first-match-wins, and all three must precede nothing that would
         // shadow them (they ARE the shadowing fix).
+        // Defect-u38c (reworked per the b91 review, finding F1): every scoped
+        // add below is conditional on THAT EXACT RULE already being present —
+        // per-rule exact equality over normalized rendered lines
+        // (`chain_holds_exact_rule`), never a token-set substring match. `add
+        // rule` APPENDS, this method re-runs on every reconcile pass, and a
+        // failed generation apply keeps the same table across retries —
+        // unconditional adds grow the killswitch chain without bound (live
+        // run lenovo-u38c-xnet-quiet: ~898 lines, `nft list chain` over its
+        // 2s timeout, restrict_permanent). The old substring skip was itself
+        // broken: every hairpin token is a substring of the tunnel→egress
+        // rule added immediately before, so the hairpin was reported present
+        // and never installed.
         for rule_tokens in Self::established_related_accept_tokens() {
-            self.run_nft_rule_argv("inet", table.as_str(), "killswitch", &rule_tokens, &[])
-                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            self.add_nft_rule_if_absent("inet", table.as_str(), "killswitch", &rule_tokens, &[])?;
         }
-        self.run_nft_rule_argv(
+        self.add_nft_rule_if_absent(
             "inet",
             table.as_str(),
             "killswitch",
             &Self::tunnel_interface_accept_tokens(self.interface_name.as_str()),
             &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        )?;
         for rule_tokens in Self::established_related_accept_tokens() {
-            self.run_nft_rule_argv("inet", table.as_str(), "forward", &rule_tokens, &[])
-                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            self.add_nft_rule_if_absent("inet", table.as_str(), "forward", &rule_tokens, &[])?;
         }
-        self.run_nft_rule_argv(
+        self.add_nft_rule_if_absent(
             "inet",
             table.as_str(),
             "forward",
@@ -3626,8 +3918,7 @@ impl DataplaneSystem for LinuxCommandSystem {
                 self.egress_interface.as_str(),
             ),
             &[],
-        )
-        .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        )?;
         if self.allow_tunnel_relay_forward {
             // OBSERVABILITY, not behaviour: `counter` turns "the hairpin
             // forward-accept rule exists" into "it matched N packets". Whether
@@ -3638,18 +3929,17 @@ impl DataplaneSystem for LinuxCommandSystem {
             //
             // Safe for the runtime self-assertion: `counter` is inserted as an
             // observability token BEFORE the verdict and never enters the
-            // shared builder, and `chain_contains_all_tokens` matches each
-            // builder token as an independent substring of the rendered line,
-            // so the extra `counter packets N bytes N` nft prints between the
-            // match terms and the verdict does not break the match.
-            self.run_nft_rule_argv(
+            // shared builder, and the exact-rule idempotence matcher strips
+            // the `counter packets N bytes M` statistics nft prints after the
+            // keyword before comparing, so neither the matcher nor the
+            // substring assertion is confused by it.
+            self.add_nft_rule_if_absent(
                 "inet",
                 table.as_str(),
                 "forward",
                 &Self::forward_hairpin_accept_tokens(self.interface_name.as_str()),
                 &["counter"],
-            )
-            .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            )?;
         }
         if let Some(previous) = previous_table
             && previous != table
@@ -3863,21 +4153,26 @@ impl DataplaneSystem for LinuxCommandSystem {
         }
         // QH-29: rule bodies come from the shared token builders that
         // assert_nat_forwarding / assert_firewall_ruleset match against.
-        self.run_nft_rule_argv(
+        // b91-review finding F2: the postrouting adds are exact-rule
+        // idempotent too. The table is freshly recreated above, so on real
+        // nft these rules cannot actually accumulate — but the guard costs
+        // one allowlist-admitted probe and makes the emitter idempotent on
+        // its own terms (and under any helper that answers `list chain`
+        // honestly), instead of relying on the surrounding delete/recreate.
+        if let Err(err) = self.add_nft_rule_if_absent(
             "ip",
             nat_table.as_str(),
             "postrouting",
             &Self::nat_egress_masquerade_tokens(self.egress_interface.as_str()),
             &[],
-        )
-        .map_err(|err| {
+        ) {
             self.run_allow_failure(
                 PrivilegedCommandProgram::Nft,
                 &["delete", "table", "ip", nat_table.as_str()],
             );
             let _ = self.restore_ipv4_forwarding();
-            SystemError::NatApplyFailed(err.to_string())
-        })?;
+            return Err(SystemError::NatApplyFailed(err.to_string()));
+        }
         if self.allow_tunnel_relay_forward {
             // OBSERVABILITY, not behaviour — see the matching `counter` on the
             // hairpin forward-accept rule. This one matters even more: the
@@ -3886,10 +4181,10 @@ impl DataplaneSystem for LinuxCommandSystem {
             // routing, whose AllowedIPs for this node is a single /32), and
             // whether it MATCHED was previously unobservable — only that the rule
             // existed. `counter` is inserted before the verdict and never enters
-            // the shared builder, and `chain_contains_all_tokens` matches each
-            // builder token as an independent substring of the rendered line, so
-            // it is safe for `assert_nat_forwarding`.
-            if let Err(err) = self.run_nft_rule_argv(
+            // the shared builder, and the exact-rule idempotence matcher strips
+            // the counter statistics nft renders, so it is safe for
+            // `assert_nat_forwarding`.
+            if let Err(err) = self.add_nft_rule_if_absent(
                 "ip",
                 nat_table.as_str(),
                 "postrouting",
@@ -3925,7 +4220,13 @@ impl DataplaneSystem for LinuxCommandSystem {
                 egress_iface.as_str(),
                 self.exit_egress_dns_drop,
             ) {
-                if let Err(err) = self.run_nft_rule_argv(
+                // b91-review finding F2: this inet killswitch chain SURVIVES
+                // retries (only the ip NAT table is deleted/recreated), so
+                // the unguarded add re-appended the egress accept (and the
+                // DNS drops, when enabled) on every retry — the dominant
+                // growth term in the reviewer's witness. Exact-rule probe,
+                // same failure semantics as before.
+                if let Err(err) = self.add_nft_rule_if_absent(
                     "inet",
                     fw_table.as_str(),
                     "killswitch",
@@ -4024,8 +4325,13 @@ impl DataplaneSystem for LinuxCommandSystem {
             .ok_or_else(|| SystemError::DnsApplyFailed("killswitch table missing".to_owned()))?;
         // QH-29: rule bodies come from the shared token builders that
         // assert_firewall_ruleset matches against.
+        // b91-review finding F2: these four adds run on EVERY dns stage and
+        // the inet killswitch chain survives retries, so each unguarded add
+        // re-appended its rule every retry. Exact-rule idempotence probe;
+        // probe failure fails closed (DnsApplyFailed), never skips on a
+        // blind probe.
         for proto in ["udp", "tcp"] {
-            self.run_nft_rule_argv(
+            self.add_nft_rule_if_absent(
                 "inet",
                 table.as_str(),
                 "killswitch",
@@ -4033,7 +4339,7 @@ impl DataplaneSystem for LinuxCommandSystem {
                 &[],
             )
             .map_err(|err| SystemError::DnsApplyFailed(err.to_string()))?;
-            self.run_nft_rule_argv(
+            self.add_nft_rule_if_absent(
                 "inet",
                 table.as_str(),
                 "killswitch",
@@ -18990,6 +19296,257 @@ Persistent Routes:
         );
     }
 
+    /// Defect-u38c witness: when the killswitch/forward chains ALREADY hold
+    /// the scoped accept rules, `apply_firewall_killswitch` must not append
+    /// them again.
+    ///
+    /// The live failure (run lenovo-u38c-xnet-quiet): a failed generation
+    /// apply keeps table `rustynet_g1` alive across reconcile retries (the
+    /// generation number is not bumped on failure and the FirewallApplied
+    /// rollback stage is a no-op under RollbackIntent::FailClosed), and the
+    /// historical unconditional `nft add rule` re-appended the scoped rules
+    /// on every ~1.5s retry — ~898 rendered chain lines in total, until
+    /// `nft list chain` overran its timeout and the node went
+    /// restrict_permanent. This test fails on the old unconditional emitter
+    /// and passes only when the conditional probe (`add_nft_rule_if_absent`)
+    /// reads the chain before writing.
+    ///
+    /// The scripted helper answers every `nft list chain inet rustynet_g0
+    /// ...` with a chain rendering built from the REAL token builders, so the
+    /// rules read as already present; the firewall table is pre-marked active
+    /// (private field, same module) so `ensure_failclosed_table` takes its
+    /// idempotent early-return and no creation-path adds muddy the log.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killswitch_apply_skips_scoped_rules_already_present_in_chain() {
+        fn rendered_chain_lines(chain: &str, rules: &[Vec<String>]) -> String {
+            let mut stdout = format!(
+                "table inet rustynet_g0 {{\n\tchain {chain} {{\n\t\ttype filter hook {chain} \
+                 priority 0; policy drop;\n"
+            );
+            for rule in rules {
+                stdout.push_str("\t\t");
+                stdout.push_str(&rule.join(" "));
+                stdout.push('\n');
+            }
+            stdout.push_str("\t}\n}\n");
+            stdout
+        }
+
+        let killswitch_rules: Vec<Vec<String>> =
+            LinuxCommandSystem::established_related_accept_tokens()
+                .into_iter()
+                .chain([LinuxCommandSystem::tunnel_interface_accept_tokens(
+                    "rustynet0",
+                )])
+                .collect();
+        let forward_rules: Vec<Vec<String>> =
+            LinuxCommandSystem::established_related_accept_tokens()
+                .into_iter()
+                .chain([LinuxCommandSystem::forward_tunnel_to_egress_tokens(
+                    "rustynet0",
+                    "enp0s9",
+                )])
+                .collect();
+
+        let socket_path = phase10_test_socket_path("killskip");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "list chain inet rustynet_g0 killswitch".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: rendered_chain_lines("killswitch", &killswitch_rules),
+                        stderr: String::new(),
+                    },
+                ),
+                (
+                    "list chain inet rustynet_g0 forward".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: rendered_chain_lines("forward", &forward_rules),
+                        stderr: String::new(),
+                    },
+                ),
+            ],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the scripted helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let appended: Vec<&String> = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0"))
+            .collect();
+        assert!(
+            appended.is_empty(),
+            "scoped rules already present in the chain must not be re-appended: {appended:?}"
+        );
+    }
+
+    /// Defect-u38c guard: with EMPTY chain listings (fresh table), the
+    /// conditional emitter must still install every scoped accept rule — the
+    /// skip path above must never suppress a first install.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killswitch_apply_installs_scoped_rules_when_chains_are_fresh() {
+        let socket_path = phase10_test_socket_path("killadd");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the capture helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let killswitch_adds: Vec<String> = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0 killswitch"))
+            .cloned()
+            .collect();
+        let forward_adds: Vec<String> = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0 forward"))
+            .cloned()
+            .collect();
+        let expectations: [(&str, Vec<String>, bool); 8] = [
+            (
+                "established/related killswitch 0",
+                LinuxCommandSystem::established_related_accept_tokens()[0].clone(),
+                true,
+            ),
+            (
+                "established/related killswitch 1",
+                LinuxCommandSystem::established_related_accept_tokens()[1].clone(),
+                true,
+            ),
+            (
+                "established/related killswitch 2",
+                LinuxCommandSystem::established_related_accept_tokens()[2].clone(),
+                true,
+            ),
+            (
+                "tunnel interface accept",
+                LinuxCommandSystem::tunnel_interface_accept_tokens("rustynet0"),
+                true,
+            ),
+            (
+                "established/related forward 0",
+                LinuxCommandSystem::established_related_accept_tokens()[0].clone(),
+                false,
+            ),
+            (
+                "established/related forward 1",
+                LinuxCommandSystem::established_related_accept_tokens()[1].clone(),
+                false,
+            ),
+            (
+                "established/related forward 2",
+                LinuxCommandSystem::established_related_accept_tokens()[2].clone(),
+                false,
+            ),
+            (
+                "tunnel→egress forward",
+                LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9"),
+                false,
+            ),
+        ];
+        for (name, tokens, killswitch) in expectations {
+            let lines: &[String] = if killswitch {
+                &killswitch_adds
+            } else {
+                &forward_adds
+            };
+            let borrowed: Vec<&str> = tokens.iter().map(String::as_str).collect();
+            assert!(
+                LinuxCommandSystem::chain_contains_all_tokens(lines, &borrowed),
+                "fresh-chain apply must install the {name} rule: tokens={borrowed:?} \
+                 lines={lines:?}"
+            );
+        }
+    }
+
+    /// Companion to `killswitch_apply_installs_scoped_rules_when_chains_are_
+    /// fresh`: the hairpin forward-accept only emits when relay forwarding is
+    /// enabled, and it must ride the same conditional path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn killswitch_apply_installs_hairpin_rule_when_relay_enabled() {
+        let socket_path = phase10_test_socket_path("killhairpin");
+        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("killswitch apply should succeed against the capture helper");
+        let command_log = commands.lock().expect("command log should lock").clone();
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let hairpin = LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0");
+        let borrowed: Vec<&str> = hairpin.iter().map(String::as_str).collect();
+        assert!(
+            LinuxCommandSystem::chain_contains_all_tokens(
+                &command_log
+                    .iter()
+                    .filter(|cmd| cmd.contains("add rule inet rustynet_g0 forward"))
+                    .cloned()
+                    .collect::<Vec<String>>(),
+                &borrowed
+            ),
+            "relay-enabled fresh-chain apply must install the hairpin forward rule"
+        );
+    }
+
     /// QH-29: generator↔matcher agreement for the inet fail-closed table.
     /// Drives the REAL `apply_firewall_killswitch` → `apply_nat_forwarding` →
     /// `apply_dns_protection` emitter chain through the privileged-capture
@@ -19120,6 +19677,1097 @@ Persistent Routes:
                  tokens={borrowed:?} chain_argv={chain_argv:?}"
             );
         }
+    }
+
+    // ── b91-review findings F1/F2/F3: stateful-renderer witnesses ────────────
+    //
+    // The reviewer's fake (`u38c_witness_block.rs`) RECORDS `add rule` argvs
+    // per family/table/chain and answers `list chain` with nft-style
+    // renderings of what it recorded — that is what exposed the substring
+    // matcher (F1) and the nat+dns growth (F2), and what b91's canned-output
+    // tests could not see (F3). These tests productize that fake, with two
+    // fixes over the reviewer's version: it also honours `delete table` (the
+    // NAT table is deleted + recreated on every nat apply, so its fake
+    // over-counted postrouting growth), and it renders the way nft really
+    // renders (quotes around string args, `counter packets N bytes M`
+    // statistics after an explicit `counter`, so the matcher's normalization
+    // is exercised for real).
+    //
+    // b97 rework (a120 RF2): the fake must render the way real nftables 1.0.9
+    // renders, INCLUDING the `meta l4proto` dependency folding — a fake that
+    // renders verbatim is kinder than nft and hid the dns_redirect growth bug
+    // from b94. The fake now folds through the same
+    // `fold_implied_l4proto_dependency` the matcher normalizes with, and
+    // `stateful_fake_and_exact_matcher_agree_with_live_nft_golden_text` pins
+    // its output to REAL `nft list` text recorded live, so this fidelity is
+    // enforced, not assumed.
+
+    /// Shared state type of the stateful nft fake: recorded rule bodies per
+    /// `family table chain` key.
+    #[cfg(target_os = "linux")]
+    type StatefulNftRules = std::collections::BTreeMap<String, Vec<Vec<String>>>;
+
+    #[cfg(target_os = "linux")]
+    type StatefulNftShared = Arc<Mutex<StatefulNftRules>>;
+
+    #[cfg(target_os = "linux")]
+    type StatefulNftHelperHandle = (
+        Arc<Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+        std::thread::JoinHandle<()>,
+        StatefulNftShared,
+    );
+
+    /// Render ONE recorded rule body the way `nft list chain` would print it:
+    /// string match args quoted, live counter statistics spliced after an
+    /// explicit `counter` token (the counter ticks per rule position, as real
+    /// counters do), and the explicit `meta l4proto <p>` dependency FOLDED
+    /// when the rule implies it via a later `<p> dport`/`<p> sport` — which
+    /// is what real nftables 1.0.9 does (live-probed: the dns_redirect rules
+    /// list back WITHOUT `meta l4proto`, while `ip protocol` folds NOT and
+    /// `ip daddr` renders UNQUOTED). The golden fixture test
+    /// (`stateful_fake_and_exact_matcher_agree_with_live_nft_golden_text`)
+    /// pins this rendering against REAL `nft list` text so the fake can never
+    /// silently drift back to verbatim rendering (the a118+b120 fake-fidelity
+    /// failure class: a fake that is kinder than nft hides real matcher bugs).
+    #[cfg(target_os = "linux")]
+    fn stateful_fake_render_rule(tokens: &[String], position: usize) -> String {
+        let tokens = LinuxCommandSystem::fold_implied_l4proto_dependency(tokens);
+        let mut parts: Vec<String> = Vec::new();
+        for (index, token) in tokens.iter().enumerate() {
+            if token == "counter" {
+                let packets = (position * 7 + 3) as u64;
+                parts.push(format!("counter packets {packets} bytes {}", packets * 97));
+                continue;
+            }
+            let prev = if index >= 1 {
+                tokens[index - 1].as_str()
+            } else {
+                ""
+            };
+            let prev2 = if index >= 2 {
+                tokens[index - 2].as_str()
+            } else {
+                ""
+            };
+            // Real nft quotes STRING-typed match args (interface names,
+            // comments) and does NOT quote address/protocol/port atoms or
+            // operators — live-probed: `ip daddr 127.0.0.1` renders bare and
+            // `oifname != "rustynet0"` quotes only the name.
+            let is_operator = token == "!=" || token == "=";
+            let is_quoted_string = !is_operator
+                && (prev == "iifname"
+                    || prev == "oifname"
+                    || prev == "comment"
+                    || ((prev == "!=") && (prev2 == "iifname" || prev2 == "oifname")));
+            if is_quoted_string {
+                parts.push(format!("\"{token}\""));
+            } else {
+                parts.push(token.clone());
+            }
+        }
+        parts.join(" ")
+    }
+
+    /// A recording nft fake that keeps STATE: `add rule` argvs are stored per
+    /// `family table chain` and `list chain` / `list table` are answered with
+    /// nft-style renderings of the stored rules. `add table`, `add chain` and
+    /// `delete table` are honoured (delete purges the table's rules — the
+    /// NAT stage deletes + recreates its table on every apply). Commands are
+    /// logged in the same `program args…` format the capture helper uses.
+    #[cfg(target_os = "linux")]
+    fn spawn_privileged_stateful_nft_helper(socket_path: &Path) -> StatefulNftHelperHandle {
+        use crate::privileged_helper::{HelperResponse, read_request, write_response};
+
+        if socket_path.exists() {
+            let _ = std::fs::remove_file(socket_path);
+        }
+        let listener = UnixListener::bind(socket_path).unwrap_or_else(|err| {
+            panic!(
+                "test helper socket should bind at {}: {err}",
+                socket_path.display()
+            )
+        });
+        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap_or_else(|err| {
+                panic!(
+                    "test helper socket permissions should be settable at {}: {err}",
+                    socket_path.display()
+                )
+            });
+        listener
+            .set_nonblocking(true)
+            .expect("test helper socket should be non-blocking");
+
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let rules: StatefulNftShared = Arc::new(Mutex::new(StatefulNftRules::new()));
+        let commands_clone = Arc::clone(&commands);
+        let stop_clone = Arc::clone(&stop);
+        let rules_clone = Arc::clone(&rules);
+
+        let handle = thread::spawn(move || {
+            while !stop_clone.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _addr)) => {
+                        if stream.set_nonblocking(false).is_err() {
+                            continue;
+                        }
+                        let request = match read_request(&mut stream) {
+                            Ok(request) => request,
+                            Err(err) => {
+                                let _ = write_response(&mut stream, HelperResponse::error(err));
+                                continue;
+                            }
+                        };
+                        let args = request.args.clone();
+                        commands_clone
+                            .lock()
+                            .expect("test helper command log should lock")
+                            .push(format!("{} {}", request.program, args.join(" ")));
+
+                        let mut stdout = String::new();
+                        {
+                            let mut state = rules_clone
+                                .lock()
+                                .expect("test helper nft state should lock");
+                            match (args.first().map(String::as_str), args.get(1)) {
+                                (Some("add"), Some(second))
+                                    if second == "rule" && args.len() >= 6 =>
+                                {
+                                    let key = format!("{} {} {}", args[2], args[3], args[4]);
+                                    state.entry(key).or_default().push(args[5..].to_vec());
+                                }
+                                (Some("add"), Some(second))
+                                    if second == "chain" && args.len() >= 5 =>
+                                {
+                                    let key = format!("{} {} {}", args[2], args[3], args[4]);
+                                    state.entry(key).or_default();
+                                }
+                                (Some("add"), Some(second))
+                                    if second == "table" && args.len() >= 4 =>
+                                {
+                                    // Table creation carries no rules; existence is
+                                    // implied by chain keys.
+                                }
+                                (Some("delete"), Some(second))
+                                    if second == "table" && args.len() >= 4 =>
+                                {
+                                    let prefix = format!("{} {} ", args[2], args[3]);
+                                    let keys: Vec<String> = state
+                                        .keys()
+                                        .filter(|key| key.starts_with(&prefix))
+                                        .cloned()
+                                        .collect();
+                                    for key in keys {
+                                        state.remove(&key);
+                                    }
+                                }
+                                (Some("list"), Some(second))
+                                    if second == "chain" && args.len() >= 5 =>
+                                {
+                                    let key = format!("{} {} {}", args[2], args[3], args[4]);
+                                    if let Some(chain_rules) = state.get(&key) {
+                                        stdout.push_str(&format!(
+                                            "table {} {} {{\n",
+                                            args[2], args[3]
+                                        ));
+                                        stdout.push_str(&format!("\tchain {} {{\n", args[4]));
+                                        stdout.push_str(&format!(
+                                            "\t\ttype filter hook {} priority 0; policy drop;\n",
+                                            args[4]
+                                        ));
+                                        for (position, rule) in chain_rules.iter().enumerate() {
+                                            stdout.push_str("\t\t");
+                                            stdout.push_str(&stateful_fake_render_rule(
+                                                rule, position,
+                                            ));
+                                            stdout.push('\n');
+                                        }
+                                        stdout.push_str("\t}\n}\n");
+                                    }
+                                }
+                                (Some("list"), Some(second))
+                                    if second == "table" && args.len() >= 4 =>
+                                {
+                                    let prefix = format!("{} {} ", args[2], args[3]);
+                                    let mut chains: Vec<String> = state
+                                        .keys()
+                                        .filter(|key| key.starts_with(&prefix))
+                                        .cloned()
+                                        .collect();
+                                    chains.sort();
+                                    if !chains.is_empty() {
+                                        stdout.push_str(&format!(
+                                            "table {} {} {{\n",
+                                            args[2], args[3]
+                                        ));
+                                        for key in chains {
+                                            let chain_name = key
+                                                .split_whitespace()
+                                                .nth(2)
+                                                .unwrap_or_default()
+                                                .to_owned();
+                                            stdout.push_str(&format!("\tchain {chain_name} {{\n"));
+                                            if let Some(chain_rules) = state.get(&key) {
+                                                for (position, rule) in
+                                                    chain_rules.iter().enumerate()
+                                                {
+                                                    stdout.push_str("\t\t");
+                                                    stdout.push_str(&stateful_fake_render_rule(
+                                                        rule, position,
+                                                    ));
+                                                    stdout.push('\n');
+                                                }
+                                            }
+                                            stdout.push_str("\t}\n");
+                                        }
+                                        stdout.push_str("}\n");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        let _ = write_response(
+                            &mut stream,
+                            HelperResponse::success(0, stdout, String::new()),
+                        );
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        (commands, stop, handle, rules)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn stateful_fake_chain_rules(rules: &StatefulNftShared, key: &str) -> Vec<Vec<String>> {
+        rules
+            .lock()
+            .expect("test helper nft state should lock")
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Reviewer witness W3, productized (b91 review findings F2+F3): 50 full
+    /// generation reapplies — firewall + NAT + DNS stages, relay enabled —
+    /// against the stateful fake, where `list chain` renders the recorded
+    /// rules the way nft would. Every retry-path chain must stay BOUNDED:
+    /// the inet killswitch (which survives retries), the forward chain, the
+    /// postrouting chain (deleted + recreated per nat apply) and the
+    /// dns_redirect chain all hold exactly their steady-state rule count, and
+    /// the hairpin rules are present.
+    ///
+    /// RED on plain HEAD: the nat-stage egress accept and the four DNS rules
+    /// re-append unconditionally every pass (~600 killswitch rules after 50
+    /// passes). RED on the b91 patch: same growth (only the 8 firewall-stage
+    /// adds were made conditional). GREEN only when every retry-path emitter
+    /// probes before writing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_rendered_ruleset_bounded_across_50_failed_generation_reapplies() {
+        let socket_path = phase10_test_socket_path("b94bound");
+        let (commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.dns_resolver_port = 53535;
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        for pass in 0..50u32 {
+            DataplaneSystem::apply_firewall_killswitch(&mut system)
+                .unwrap_or_else(|err| panic!("firewall stage should apply (pass {pass}): {err}"));
+            DataplaneSystem::apply_nat_forwarding(
+                &mut system,
+                true,
+                ExitMode::FullTunnel,
+                false,
+                "10.66.0.0/16",
+            )
+            .unwrap_or_else(|err| panic!("nat stage should apply (pass {pass}): {err}"));
+            DataplaneSystem::apply_dns_protection(&mut system)
+                .unwrap_or_else(|err| panic!("dns stage should apply (pass {pass}): {err}"));
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Steady state: loopback + 3 scoped established/related + tunnel
+        // accept + 1 nat egress accept + 4 DNS rules (2 off-tunnel drops + 2
+        // accepts) = 10.
+        let killswitch = stateful_fake_chain_rules(&rules, "inet rustynet_g0 killswitch");
+        assert_eq!(
+            killswitch.len(),
+            10,
+            "killswitch chain must stay bounded across 50 reapplies: {killswitch:?}"
+        );
+        // 3 scoped established/related + tunnel→egress + hairpin = 5.
+        let forward = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward.len(),
+            5,
+            "forward chain must stay bounded across 50 reapplies: {forward:?}"
+        );
+        assert!(
+            forward.iter().any(|rule| {
+                rule.first().map(String::as_str) == Some("iifname")
+                    && rule
+                        .windows(2)
+                        .any(|window| window == ["oifname", "rustynet0"])
+            }),
+            "hairpin forward-accept rule must be installed: {forward:?}"
+        );
+        // Masquerade + hairpin SNAT (the whole ip table is deleted + recreated
+        // on every nat apply, so two rules is the steady state, not growth).
+        let postrouting = stateful_fake_chain_rules(&rules, "ip rustynet_nat_g0 postrouting");
+        assert_eq!(
+            postrouting.len(),
+            2,
+            "postrouting chain must stay bounded across 50 reapplies: {postrouting:?}"
+        );
+        // udp + tcp loopback redirect rules.
+        let dns_redirect = stateful_fake_chain_rules(&rules, "inet rustynet_g0_dns dns_redirect");
+        assert_eq!(
+            dns_redirect.len(),
+            2,
+            "dns_redirect chain must stay bounded across 50 reapplies: {dns_redirect:?}"
+        );
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let killswitch_adds = command_log
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0 killswitch"))
+            .count();
+        assert_eq!(
+            killswitch_adds, 10,
+            "exactly the 10 steady-state killswitch rules may ever be added: \
+             got {killswitch_adds}"
+        );
+    }
+
+    /// Reviewer witness W1, productized (b91 review finding F1): the chain
+    /// already holds the tunnel→egress forward rule; a relay-enabled re-apply
+    /// must still install the hairpin forward-accept rule. The old token-set
+    /// substring matcher treated the hairpin as present because every one of
+    /// its tokens is a substring of the tunnel→egress line installed just
+    /// before — so the hairpin was NEVER added on any relay node whose first
+    /// apply ran with relay disabled.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_hairpin_installed_when_tunnel_egress_already_present() {
+        let socket_path = phase10_test_socket_path("b94hairpin");
+        let (_commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        // Skip table creation so the forward chain holds ONLY what the
+        // firewall stage itself adds.
+        system.firewall_table = Some("rustynet_g0".to_owned());
+
+        // First apply: relay OFF — tunnel→egress lands, no hairpin.
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("first firewall apply should succeed");
+        let forward_before = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward_before.len(),
+            4,
+            "relay-off apply installs 3 established/related + tunnel→egress: {forward_before:?}"
+        );
+
+        // Relay flips ON (the reviewer's scenario: role promotion between
+        // reconcile passes), then the SAME generation re-applies.
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("relay-enabled re-apply should succeed");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let forward_after = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward_after.len(),
+            5,
+            "relay-enabled re-apply must ADD the hairpin rule: {forward_after:?}"
+        );
+        assert!(
+            forward_after
+                .iter()
+                .any(|rule| rule.first().map(String::as_str) == Some("iifname")
+                    && rule
+                        .windows(2)
+                        .any(|window| window == ["oifname", "rustynet0"])),
+            "hairpin forward-accept rule must be present: {forward_after:?}"
+        );
+    }
+
+    /// Guard for the witnesses above (reviewer witness W2 shape): on a FRESH
+    /// fake, ONE full apply with relay enabled installs EVERYTHING — the
+    /// idempotence probes must never suppress a first install. GREEN on old
+    /// and new code alike; the two witnesses above carry the red.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_first_install_installs_every_rule() {
+        let socket_path = phase10_test_socket_path("b94fresh");
+        let (_commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.dns_resolver_port = 53535;
+        DataplaneSystem::set_relay_forwarding(&mut system, true);
+
+        DataplaneSystem::apply_firewall_killswitch(&mut system)
+            .expect("firewall stage should apply on a fresh system");
+        DataplaneSystem::apply_nat_forwarding(
+            &mut system,
+            true,
+            ExitMode::FullTunnel,
+            false,
+            "10.66.0.0/16",
+        )
+        .expect("nat stage should apply on a fresh system");
+        DataplaneSystem::apply_dns_protection(&mut system)
+            .expect("dns stage should apply on a fresh system");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        // Creation path skipped: 3 established/related + tunnel accept + 1
+        // egress accept + 4 DNS rules = 9.
+        let killswitch = stateful_fake_chain_rules(&rules, "inet rustynet_g0 killswitch");
+        assert_eq!(
+            killswitch.len(),
+            9,
+            "first install must populate the killswitch chain: {killswitch:?}"
+        );
+        let forward = stateful_fake_chain_rules(&rules, "inet rustynet_g0 forward");
+        assert_eq!(
+            forward.len(),
+            5,
+            "first install must populate the forward chain incl hairpin: {forward:?}"
+        );
+        let postrouting = stateful_fake_chain_rules(&rules, "ip rustynet_nat_g0 postrouting");
+        assert_eq!(
+            postrouting.len(),
+            2,
+            "first install must populate postrouting incl hairpin SNAT: {postrouting:?}"
+        );
+        let dns_redirect = stateful_fake_chain_rules(&rules, "inet rustynet_g0_dns dns_redirect");
+        assert_eq!(
+            dns_redirect.len(),
+            2,
+            "first install must populate the dns_redirect chain: {dns_redirect:?}"
+        );
+    }
+
+    // ── b97 rework (a120 RF1/RF2): live-nft golden text ─────────────────────
+    //
+    // Every entry is the EXACT line real nftables 1.0.9 (kernel 6.8,
+    // ubuntu@100.83.218.21) renders for one emitter's `nft add rule` argv,
+    // recorded this session by adding each rule into throwaway tables
+    // (`rn_test_*`, deleted afterwards) with the SAME chain types the daemon
+    // creates, then running `nft list chain`. Format:
+    // (name, builder body tokens, observability tokens, REAL `nft list` line,
+    //  the stateful fake's position-0 rendering of the same rule).
+    //
+    // The dns_redirect entries are the a120 finding: the add argv carries
+    // `meta l4proto <proto>` and real nft FOLDS it out of the listing —
+    // `ip daddr 127.0.0.1 tcp dport 53 redirect to :53535` has no
+    // `meta l4proto`. The counter entries carry live statistics
+    // (`counter packets 0 bytes 0`) the matcher must collapse.
+    /// One golden entry: (name, builder body tokens, observability tokens,
+    /// REAL `nft list` line, the stateful fake's position-0 rendering).
+    #[cfg(target_os = "linux")]
+    type LiveNftGoldenRule = (
+        &'static str,
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static str,
+        &'static str,
+    );
+
+    #[cfg(target_os = "linux")]
+    const LIVE_NFT_GOLDEN_RULES: &[LiveNftGoldenRule] = &[
+        (
+            "loopback accept",
+            &["oifname", "lo", "accept"],
+            &[],
+            "oifname \"lo\" accept",
+            "oifname \"lo\" accept",
+        ),
+        (
+            "established/related tcp",
+            &[
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "tcp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            &[],
+            "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+            "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        ),
+        (
+            "established/related udp",
+            &[
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "udp",
+                "dport",
+                "!=",
+                "{",
+                "53,",
+                "853",
+                "}",
+                "accept",
+            ],
+            &[],
+            "ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+            "ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        ),
+        (
+            "established/related non-tcp/udp",
+            &[
+                "ct",
+                "state",
+                "established,related",
+                "meta",
+                "nfproto",
+                "ipv4",
+                "meta",
+                "l4proto",
+                "!=",
+                "{",
+                "tcp,",
+                "udp",
+                "}",
+                "accept",
+            ],
+            &[],
+            "ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+            "ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        ),
+        (
+            "tunnel interface accept",
+            &["oifname", "rustynet0", "meta", "nfproto", "ipv4", "accept"],
+            &[],
+            "oifname \"rustynet0\" meta nfproto ipv4 accept",
+            "oifname \"rustynet0\" meta nfproto ipv4 accept",
+        ),
+        (
+            "wireguard listen port (dport)",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "51820", "accept",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport 51820 accept",
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport 51820 accept",
+        ),
+        (
+            "wireguard listen port (sport)",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "sport", "51820", "accept",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 udp sport 51820 accept",
+            "oifname \"enp0s9\" meta nfproto ipv4 udp sport 51820 accept",
+        ),
+        (
+            "scoped egress udp drop",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "udp", "dport", "{", "53,", "853",
+                "}", "drop",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport { 53, 853 } drop",
+            "oifname \"enp0s9\" meta nfproto ipv4 udp dport { 53, 853 } drop",
+        ),
+        (
+            "scoped egress tcp drop",
+            &[
+                "oifname", "enp0s9", "meta", "nfproto", "ipv4", "tcp", "dport", "{", "53,", "853",
+                "}", "drop",
+            ],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 tcp dport { 53, 853 } drop",
+            "oifname \"enp0s9\" meta nfproto ipv4 tcp dport { 53, 853 } drop",
+        ),
+        (
+            "scoped egress v4 catch-all accept",
+            &["oifname", "enp0s9", "meta", "nfproto", "ipv4", "accept"],
+            &[],
+            "oifname \"enp0s9\" meta nfproto ipv4 accept",
+            "oifname \"enp0s9\" meta nfproto ipv4 accept",
+        ),
+        (
+            "dns off-tunnel drop udp",
+            &["udp", "dport", "53", "oifname", "!=", "rustynet0", "drop"],
+            &[],
+            "udp dport 53 oifname != \"rustynet0\" drop",
+            "udp dport 53 oifname != \"rustynet0\" drop",
+        ),
+        (
+            "dns off-tunnel drop tcp",
+            &["tcp", "dport", "53", "oifname", "!=", "rustynet0", "drop"],
+            &[],
+            "tcp dport 53 oifname != \"rustynet0\" drop",
+            "tcp dport 53 oifname != \"rustynet0\" drop",
+        ),
+        (
+            "dns on-tunnel accept udp",
+            &["udp", "dport", "53", "accept"],
+            &[],
+            "udp dport 53 accept",
+            "udp dport 53 accept",
+        ),
+        (
+            "dns on-tunnel accept tcp",
+            &["tcp", "dport", "53", "accept"],
+            &[],
+            "tcp dport 53 accept",
+            "tcp dport 53 accept",
+        ),
+        (
+            "forward tunnel→egress",
+            &["iifname", "rustynet0", "oifname", "enp0s9", "accept"],
+            &[],
+            "iifname \"rustynet0\" oifname \"enp0s9\" accept",
+            "iifname \"rustynet0\" oifname \"enp0s9\" accept",
+        ),
+        (
+            "forward hairpin (counter)",
+            &["iifname", "rustynet0", "oifname", "rustynet0", "accept"],
+            &["counter"],
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 accept",
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 3 bytes 291 accept",
+        ),
+        (
+            "nat egress masquerade",
+            &["oifname", "enp0s9", "masquerade"],
+            &[],
+            "oifname \"enp0s9\" masquerade",
+            "oifname \"enp0s9\" masquerade",
+        ),
+        (
+            "nat hairpin masquerade (counter)",
+            &["iifname", "rustynet0", "oifname", "rustynet0", "masquerade"],
+            &["counter"],
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 masquerade",
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 3 bytes 291 masquerade",
+        ),
+        (
+            "dns_redirect udp (folded dependency)",
+            &[
+                "meta",
+                "l4proto",
+                "udp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "udp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                ":53535",
+            ],
+            &[],
+            "ip daddr 127.0.0.1 udp dport 53 redirect to :53535",
+            "ip daddr 127.0.0.1 udp dport 53 redirect to :53535",
+        ),
+        (
+            "dns_redirect tcp (folded dependency)",
+            &[
+                "meta",
+                "l4proto",
+                "tcp",
+                "ip",
+                "daddr",
+                "127.0.0.1",
+                "tcp",
+                "dport",
+                "53",
+                "redirect",
+                "to",
+                ":53535",
+            ],
+            &[],
+            "ip daddr 127.0.0.1 tcp dport 53 redirect to :53535",
+            "ip daddr 127.0.0.1 tcp dport 53 redirect to :53535",
+        ),
+    ];
+
+    /// b97 (a120 RF1+RF2): pin BOTH consumers of rendered rule text to the
+    /// REAL nft renderings recorded live on nftables 1.0.9.
+    ///
+    /// (1) the exact matcher must accept the real line for its builder tokens
+    /// — this is the productized folding witness: on the b94 patch the two
+    /// dns_redirect entries FAIL here, because their add argv carries `meta
+    /// l4proto <p>` and real nft lists the rule back with that dependency
+    /// folded away; (2) the stateful fake must RENDER the rule exactly the
+    /// way real nft does — a fake that renders verbatim (kinder than nft) is
+    /// what hid the folding from two consecutive lanes; (3) fake and real
+    /// lines normalize to the identical token vector, so the fake is
+    /// matcher-equivalent, not merely similar; (4) a mutated body never
+    /// matches, so none of the above is vacuous.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stateful_fake_and_exact_matcher_agree_with_live_nft_golden_text() {
+        for (name, body, observability, real_line, fake_line) in LIVE_NFT_GOLDEN_RULES {
+            let body: Vec<String> = body.iter().map(|token| token.to_string()).collect();
+            // (1) matcher ↔ REAL rendering.
+            assert!(
+                LinuxCommandSystem::chain_holds_exact_rule(
+                    &[(*real_line).to_owned()],
+                    &body,
+                    observability
+                ),
+                "matcher must accept the LIVE nft rendering of the {name} rule: \
+                 real={real_line:?} body={body:?}"
+            );
+            // (2) fake ↔ REAL rendering (the fake's counter statistics are its
+            // own deterministic position-0 values, hence a separate string).
+            let mut spliced =
+                LinuxCommandSystem::nft_add_rule_argv("inet", "t", "c", &body, observability);
+            let spliced = spliced.split_off(5);
+            assert_eq!(
+                stateful_fake_render_rule(&spliced, 0),
+                *fake_line,
+                "stateful fake rendering drifted from live nft for the {name} rule"
+            );
+            // (3) fake ≡ real after normalization.
+            assert_eq!(
+                LinuxCommandSystem::rendered_rule_tokens(fake_line),
+                LinuxCommandSystem::rendered_rule_tokens(real_line),
+                "fake and live renderings must normalize to identical tokens for {name}"
+            );
+            // (4) negative control: a mutated body must NOT match.
+            let mut mutated = body.clone();
+            let last = mutated.len() - 1;
+            mutated[last] = "reject".to_owned();
+            assert!(
+                !LinuxCommandSystem::chain_holds_exact_rule(
+                    &[(*real_line).to_owned()],
+                    &mutated,
+                    observability
+                ),
+                "mutated body must not match the live rendering of {name}"
+            );
+        }
+    }
+
+    /// a120 productized witness (review artifact
+    /// `a120_matcher_block.rs`): REAL nft rendering of the redirect rule
+    /// FOLDS AWAY the explicit `meta l4proto <proto>` (its dependency is
+    /// implied by the following `<proto> dport` expression), so the exact
+    /// matcher MUST recognize the folded rendering — otherwise
+    /// `apply_loopback_dns_ownership` re-appends both redirect rules on
+    /// every dns-stage retry on real nft (unbounded `dns_redirect` growth).
+    /// RED on the b94 patch; GREEN only with dependency-folding-aware
+    /// matching on BOTH sides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a120_matcher_redirect_l4proto_dependency_folding_is_normalized() {
+        let argvs = crate::linux_dns_protect::dns_redirect_nft_apply_argvs("t", 53535);
+        for proto in ["udp", "tcp"] {
+            let argv = argvs
+                .iter()
+                .find(|argv| {
+                    argv.first().map(String::as_str) == Some("add")
+                        && argv.get(1).map(String::as_str) == Some("rule")
+                        && argv.iter().any(|token| token == proto)
+                })
+                .unwrap_or_else(|| panic!("no {proto} redirect add argv"));
+            let rule_tokens: Vec<String> = argv[5..].to_vec();
+            // Exactly what nftables 1.0.9 renders for this add argv.
+            let folded = format!("ip daddr 127.0.0.1 {proto} dport 53 redirect to :53535");
+            let matched_folded =
+                LinuxCommandSystem::chain_holds_exact_rule(&[folded.clone()], &rule_tokens, &[]);
+            assert!(
+                matched_folded,
+                "matcher must skip the real-nft FOLDED rendering of the {proto} redirect rule: \
+                 expected={rule_tokens:?} folded={folded}"
+            );
+            // The unfolded form (what a verbatim fake renders) must match too.
+            let unfolded = format!(
+                "meta l4proto {proto} ip daddr 127.0.0.1 {proto} dport 53 \
+                 redirect to :53535"
+            );
+            assert!(
+                LinuxCommandSystem::chain_holds_exact_rule(&[unfolded], &rule_tokens, &[]),
+                "matcher must keep matching the unfolded rendering ({proto})"
+            );
+        }
+    }
+
+    /// a120 productized counter-examples (review artifact
+    /// `a120_matcher_block.rs`): the exact matcher must keep REJECTING rules
+    /// that differ in any token — different verdict, different interface,
+    /// negation, comments carrying the same tokens, counter-statistic and
+    /// whitespace variants, handle comments, the hairpin↔tunnel→egress
+    /// cross-match in BOTH directions, the dns-accept landmine, and
+    /// empty/extra-token lines. The folding normalization must not loosen
+    /// any of this.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a120_matcher_counter_examples() {
+        let hairpin = LinuxCommandSystem::forward_hairpin_accept_tokens("rustynet0");
+        let t2e = LinuxCommandSystem::forward_tunnel_to_egress_tokens("rustynet0", "enp0s9");
+        let dns_accept = LinuxCommandSystem::dns_accept_tokens("tcp");
+        let line = |text: &str| vec![text.to_owned()];
+
+        let h = |text: &str| {
+            LinuxCommandSystem::chain_holds_exact_rule(&line(text), &hairpin, &["counter"])
+        };
+        // The a118 F1 shape: tunnel→egress is NOT the hairpin rule.
+        assert!(!h("iifname \"rustynet0\" oifname \"enp0s9\" accept"));
+        // Different verdict must never be skipped.
+        assert!(!h("iifname \"rustynet0\" oifname \"rustynet0\" drop"));
+        assert!(!h("iifname \"rustynet0\" oifname \"rustynet0\" reject"));
+        // Different interface must never be skipped.
+        assert!(!h(
+            "iifname \"rustynet0\" oifname \"rustynet1\" counter packets 3 bytes 291 accept"
+        ));
+        // A comment carrying the exact same tokens is NOT the rule.
+        assert!(!h(
+            "iifname \"rustynet0\" oifname \"rustynet0\" accept comment \"iifname rustynet0 \
+             oifname rustynet0 accept\""
+        ));
+        // Genuinely the same rule under nft rendering variance.
+        assert!(h(
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 999999 bytes 0 accept"
+        ));
+        assert!(h(
+            "iifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 accept # \
+             handle 21"
+        ));
+        assert!(h(
+            "iifname \"rustynet0\"\toifname \"rustynet0\"   counter packets 7 bytes 588 accept"
+        ));
+        assert!(h("iifname rustynet0 oifname rustynet0 counter accept"));
+
+        // Reverse direction: tunnel→egress expected is not satisfied by the
+        // hairpin line, and bare-token (no observability) matching stays exact.
+        let t = |text: &str| LinuxCommandSystem::chain_holds_exact_rule(&line(text), &t2e, &[]);
+        assert!(!t("iifname \"rustynet0\" oifname \"rustynet0\" accept"));
+        assert!(t("iifname \"rustynet0\" oifname \"enp0s9\" accept"));
+        assert!(!t(
+            "iifname \"rustynet0\" oifname \"enp0s9\" counter accept"
+        ));
+        assert!(!t("iifname \"rustynet1\" oifname \"enp0s9\" accept"));
+
+        // The dns-accept landmine from the a118 review: the established/related
+        // rendering (and the udp variant) must NOT satisfy the tcp accept.
+        let d =
+            |text: &str| LinuxCommandSystem::chain_holds_exact_rule(&line(text), &dns_accept, &[]);
+        assert!(d("tcp dport 53 accept"));
+        assert!(!d(
+            "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept"
+        ));
+        assert!(!d("udp dport 53 accept"));
+        assert!(!d("tcp dport != 53 accept"));
+        assert!(!d("tcp dport 53 drop"));
+        // Extra trailing tokens (comment payload etc.) block the skip.
+        assert!(!d("tcp dport 53 accept comment \"x\""));
+        assert!(!LinuxCommandSystem::chain_holds_exact_rule(
+            &[],
+            &dns_accept,
+            &[]
+        ));
+    }
+
+    /// b97 (a120 RF1+RF2) end-to-end discriminator: with the stateful fake
+    /// rendering the way REAL nft renders (the `meta l4proto` dependency
+    /// folded out of the redirect rules), a SECOND dns-stage apply must not
+    /// re-append the redirect rules. RED on the b94 patch (its matcher
+    /// compares verbatim tokens, so the folded rendering never matches and
+    /// both rules re-append on every dns retry — the unbounded
+    /// `dns_redirect` growth a120 proved on live nft) and RED on plain HEAD
+    /// (unconditional adds). GREEN only when the matcher folds both sides.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nft_idempotence_dns_redirect_folded_render_is_not_readded() {
+        let socket_path = phase10_test_socket_path("b97fold");
+        let (commands, stop, helper_thread, rules) =
+            spawn_privileged_stateful_nft_helper(&socket_path);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.dns_resolver_port = 53535;
+
+        DataplaneSystem::apply_dns_protection(&mut system).expect("first dns apply should succeed");
+        DataplaneSystem::apply_dns_protection(&mut system)
+            .expect("second dns apply should succeed");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+
+        let stored = stateful_fake_chain_rules(&rules, "inet rustynet_g0_dns dns_redirect");
+        assert_eq!(
+            stored.len(),
+            2,
+            "dns_redirect must hold exactly the two redirect rules across re-applies: {stored:?}"
+        );
+        let redirect_adds = commands
+            .lock()
+            .expect("command log should lock")
+            .iter()
+            .filter(|cmd| cmd.contains("add rule inet rustynet_g0_dns dns_redirect"))
+            .count();
+        assert_eq!(
+            redirect_adds, 2,
+            "each redirect rule may be added exactly once; a re-add means the matcher \
+             missed the real-nft FOLDED rendering"
+        );
+    }
+
+    /// b97 (a120 RF3) discriminator: the forward chain holds ONLY the
+    /// tunnel→egress rule; with relay enabled the runtime self-assertion
+    /// must FAIL the hairpin expectation instead of passing vacuously —
+    /// every hairpin token is an independent substring of the tunnel→egress
+    /// line, which is exactly what the historical
+    /// `chain_contains_all_tokens` matcher (a118 F1's shape surviving in the
+    /// assertion layer) did. RED on the b94 patch and on plain HEAD; GREEN
+    /// only with the exact folding-aware assertion. The positive control
+    /// proves the assertion fails for the RIGHT reason: with the hairpin
+    /// line present (real-nft rendering, live counter statistics) it passes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_firewall_ruleset_rejects_hairpin_hidden_in_tunnel_egress_rule() {
+        let ruleset_without_hairpin = "table inet rustynet_g0 {\n\
+            \tchain killswitch {\n\
+            \t\ttype filter hook output priority filter; policy drop;\n\
+            \t\toifname \"lo\" accept\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\toifname \"rustynet0\" meta nfproto ipv4 accept\n\
+            \t}\n\
+            \tchain forward {\n\
+            \t\ttype filter hook forward priority filter; policy drop;\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\
+            \t}\n\
+            }\n";
+        let run = |stdout: &str, tag: &str| {
+            let socket_path = phase10_test_socket_path(tag);
+            let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![(
+                    "list table inet rustynet_g0".to_string(),
+                    PrivilegedCommandOutput {
+                        status: 0,
+                        stdout: stdout.to_owned(),
+                        stderr: String::new(),
+                    },
+                )],
+            );
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize");
+            system.firewall_table = Some("rustynet_g0".to_owned());
+            DataplaneSystem::set_relay_forwarding(&mut system, true);
+            let result = system.assert_firewall_ruleset();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            result
+        };
+
+        let missing = run(ruleset_without_hairpin, "b97hairpin0");
+        let err = missing
+            .expect_err("hairpin expectation must FAIL when forward holds only tunnel→egress");
+        assert!(
+            err.to_string()
+                .contains("relay-with-upstream forwarding allow rule missing"),
+            "failure must name the hairpin expectation: {err}"
+        );
+
+        let with_hairpin = ruleset_without_hairpin.replace(
+            "\t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n",
+            "\t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\
+             \t\tiifname \"rustynet0\" oifname \"rustynet0\" counter packets 0 bytes 0 accept\n",
+        );
+        run(&with_hairpin, "b97hairpin1")
+            .expect("hairpin expectation must PASS once the hairpin rule is installed");
     }
 
     /// AQ-253 (review §3): the blind_exit rollback must RE-LOCK, not relax:
