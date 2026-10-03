@@ -60,7 +60,7 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
             Err(e) => return StageOutcome::Failed(e),
         };
         // The LAN-toggle scenario drives THREE nodes: exit, client, and a
-        // Linux aux/extra/entry node it promotes to the blind_exit posture
+        // Linux aux/extra node it promotes to the blind_exit posture
         // (the test binary requires --blind-exit-host). A 2-node topology
         // cannot exercise it — skip rather than fail-closed, matching the
         // two_hop / enrollment-restart / soak / mixed-topology
@@ -228,8 +228,18 @@ fn ssh_params_for_role(ctx: &OrchestrationContext, label: &str) -> Result<Resolv
     alias_matching_label(ctx, label)
 }
 
+/// LAN-toggle promotes its third node to the `blind_exit` daemon role. An
+/// `entry`-role node must never be picked: entry memberships are minted from
+/// the admin-owner capability set (which carries `anchor`), and rustynetd
+/// hard-rejects a `blind_exit` role whose membership carries `anchor`,
+/// permanently fail-closing the node mid-run. That silently removes the
+/// exit's entry peer and fails every later handshake-liveness stage
+/// (katana-u37-anchor-b78). Aux/extra nodes carry client-only memberships
+/// and promote cleanly via the blind_exit warn-and-continue path.
+const BLIND_EXIT_CANDIDATE_LABELS: &[&str] = &["aux", "extra"];
+
 fn find_blind_exit(ctx: &OrchestrationContext) -> Result<ResolvedParams, String> {
-    for label in &["aux", "extra", "entry"] {
+    for label in BLIND_EXIT_CANDIDATE_LABELS {
         let assignment = ctx.assignments.iter().find(|a| a.role.as_str() == *label);
         if let Some(assignment) = assignment {
             let adapter = ctx
@@ -249,7 +259,7 @@ fn find_blind_exit(ctx: &OrchestrationContext) -> Result<ResolvedParams, String>
             }
         }
     }
-    Err("no Linux node found for blind_exit role among aux/extra/entry".to_owned())
+    Err("no Linux node found for blind_exit role among aux/extra".to_owned())
 }
 
 /// The platform label fed to the validation binary's `--platform` argv
@@ -396,5 +406,13 @@ mod tests {
             "the failure must name the missing witness artifact"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression guard for katana-u37-anchor-b78: the entry lab role carries
+    /// an admin-owner (anchor-capable) membership, which blind_exit can never
+    /// lawfully hold, so the entry node must not be a promotion candidate.
+    #[test]
+    fn blind_exit_candidates_exclude_entry_role_nodes() {
+        assert!(!super::BLIND_EXIT_CANDIDATE_LABELS.contains(&"entry"));
     }
 }
