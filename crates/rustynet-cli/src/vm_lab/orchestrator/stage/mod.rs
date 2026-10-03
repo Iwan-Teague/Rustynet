@@ -152,6 +152,7 @@ pub mod security_audit_validation;
 pub mod service_hardening_validation;
 pub mod source_archive;
 pub mod traffic_test_matrix;
+pub mod underlay_attestation;
 pub mod validate_runtime;
 pub mod verify_ssh;
 

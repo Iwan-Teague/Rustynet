@@ -196,6 +196,39 @@ impl OrchestrationStage for TrafficTestMatrixStage {
         let mesh_ips = ctx.mesh_ips.clone();
         let mut errors = Vec::new();
 
+        // AQ-254 (c): underlay attestation. For every node whose inventory
+        // entry declares a `dataplane_endpoint`, capture the LIVE WireGuard
+        // peer endpoints and fail the stage when any announced endpoint sits
+        // on a non-public underlay (tailnet/CGNAT 100.64.0.0/10, RFC1918,
+        // loopback, …) — the exact fail-open b72 exposed. The mesh IPs above
+        // are INSIDE 100.64.0.0/10, so attestation keys on the WireGuard
+        // ENDPOINT address only. An unloadable inventory fails closed with
+        // the witness written (every failure path writes it first);
+        // violations join `errors`; a clean node leaves an evidence line.
+        // Nodes WITHOUT a declared override are out of scope.
+        match super::underlay_attestation::attest_inventory_dataplane_nodes(ctx, self.name()) {
+            Ok(report) => {
+                for line in &report.evidence_lines {
+                    evidence.push(line.clone());
+                }
+                errors.extend(report.violations);
+            }
+            Err(e) => {
+                evidence.push(format!(
+                    "underlay_attestation: inventory load failed: {}",
+                    single_line(&e)
+                ));
+                let message =
+                    format!("traffic_test_matrix: underlay attestation failed closed: {e}");
+                return match write_pair_results(&ctx.report_dir, &evidence) {
+                    Ok(()) => StageOutcome::Failed(message),
+                    Err(write_err) => StageOutcome::Failed(format!(
+                        "{message}; ALSO failed to write the pair-results witness: {write_err}"
+                    )),
+                };
+            }
+        }
+
         // WireGuard handshakes complete asynchronously after the daemon applies the
         // assignment bundle.  The IP collection loop above exits as soon as IPs are
         // stable, which may be before the first handshake completes.  Retry each
@@ -562,6 +595,10 @@ mod tests {
         /// Factory for `ping_mesh_peer`'s result; `None` keeps the historical
         /// unimplemented!() (single-node tests never ping).
         ping: Option<fn() -> Result<TrafficTestResult, AdapterError>>,
+        /// AQ-254 fixture: canned `wg show all endpoints` output served
+        /// through the scripted-shell seam; `None` keeps the historical
+        /// unimplemented remote shell.
+        wg_output: Option<&'static str>,
     }
 
     impl FakeCaptureAdapter {
@@ -573,6 +610,7 @@ mod tests {
                 alias: "node-a",
                 mesh_ip: "100.64.0.1",
                 ping: None,
+                wg_output: None,
             }
         }
     }
@@ -583,6 +621,26 @@ mod tests {
         }
         fn alias(&self) -> &str {
             self.alias
+        }
+        fn shell_host(
+            &self,
+        ) -> Result<
+            std::sync::Arc<dyn crate::vm_lab::orchestrator::remote_shell::RemoteShellHost>,
+            AdapterError,
+        > {
+            use crate::vm_lab::orchestrator::stage::node_diagnostics::test_support::{
+                ScriptedShell, ok,
+            };
+            match self.wg_output {
+                Some(output) => Ok(std::sync::Arc::new(ScriptedShell {
+                    log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+                    responder: std::sync::Arc::new(move |_: &[String]| ok(output)),
+                })),
+                None => Err(AdapterError::UnsupportedPlatform {
+                    platform: self.platform(),
+                    message: "fake adapter: remote shell not implemented".to_owned(),
+                }),
+            }
         }
         fn ssh_connection_params(
             &self,
@@ -848,6 +906,7 @@ mod tests {
                 alias: "node-a",
                 mesh_ip: "100.64.0.9",
                 ping: None,
+                wg_output: None,
             }),
         );
         adapters.insert(
@@ -857,6 +916,7 @@ mod tests {
                 alias: "node-b",
                 mesh_ip: "100.64.0.9",
                 ping: None,
+                wg_output: None,
             }),
         );
         let ctx = matrix_ctx_from_adapters(
@@ -913,6 +973,7 @@ mod tests {
                 alias: "node-a",
                 mesh_ip: "100.64.0.1",
                 ping: Some(|| Ok(TrafficTestResult::Reachable)),
+                wg_output: None,
             }),
         );
         adapters.insert(
@@ -922,6 +983,7 @@ mod tests {
                 alias: "node-b",
                 mesh_ip: "100.64.0.2",
                 ping: Some(|| Ok(TrafficTestResult::Reachable)),
+                wg_output: None,
             }),
         );
         let ctx = matrix_ctx_from_adapters(
@@ -952,5 +1014,224 @@ mod tests {
         assert!(witness.contains("deny_probe: src=node-a ip=198.51.100.1 result=blocked"));
         assert!(witness.contains("deny_probe: src=node-b ip=198.51.100.1 result=blocked"));
         let _ = std::fs::remove_dir_all(&report_dir);
+    }
+
+    // ── AQ-254 (c): underlay attestation of declared dataplane nodes ──────────
+
+    /// Inventory declaring `dataplane_endpoint` for exactly `alias`.
+    fn inventory_declaring(dir: &Path, alias: &str, dataplane: &str) -> std::path::PathBuf {
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            format!(
+                r#"{{
+                  "version": 1,
+                  "entries": [
+                    {{
+                      "alias": "{alias}",
+                      "ssh_target": "100.64.15.9",
+                      "dataplane_endpoint": "{dataplane}",
+                      "platform": "linux"
+                    }}
+                  ]
+                }}"#
+            ),
+        )
+        .expect("write inventory");
+        inventory
+    }
+
+    fn two_node_adapters(
+        wg_a: &'static str,
+        wg_b: &'static str,
+    ) -> HashMap<String, Box<dyn NodeAdapter>> {
+        let mut adapters: HashMap<String, Box<dyn NodeAdapter>> = HashMap::new();
+        adapters.insert(
+            "node-a".to_owned(),
+            Box::new(FakeCaptureAdapter {
+                fail_collectors: false,
+                alias: "node-a",
+                mesh_ip: "100.64.0.1",
+                ping: Some(|| Ok(TrafficTestResult::Reachable)),
+                wg_output: Some(wg_a),
+            }),
+        );
+        adapters.insert(
+            "node-b".to_owned(),
+            Box::new(FakeCaptureAdapter {
+                fail_collectors: false,
+                alias: "node-b",
+                mesh_ip: "100.64.0.2",
+                ping: Some(|| Ok(TrafficTestResult::Reachable)),
+                wg_output: Some(wg_b),
+            }),
+        );
+        adapters
+    }
+
+    /// AQ-254 (c), enforcement: a declared node whose LIVE WireGuard
+    /// endpoints announce a tailnet/CGNAT underlay fails the stage, naming
+    /// node, peer and endpoint. On the pre-AQ-254 stage this topology
+    /// PASSED (the mesh IPs are healthy) — the before/after evidence.
+    #[test]
+    fn live_tailnet_endpoint_fails_traffic_test_matrix() {
+        let report_dir =
+            std::env::temp_dir().join(format!("ttm-attest-tailnet-{}", std::process::id()));
+        let inv_dir =
+            std::env::temp_dir().join(format!("ttm-attest-tailnet-inv-{}", std::process::id()));
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        let mut ctx = matrix_ctx_from_adapters(
+            vec![NodeRoleAssignment {
+                alias: "node-a".to_owned(),
+                role: NodeRole::Client,
+            }],
+            two_node_adapters("wg0\tPEERKEYAAAA\t100.100.5.5:51820\n", ""),
+            &report_dir,
+        );
+        ctx.inventory_path = Some(inventory_declaring(&inv_dir, "node-a", "203.0.113.7"));
+
+        match TrafficTestMatrixStage.execute(&mut ctx) {
+            StageOutcome::Failed(message) => {
+                for needle in [
+                    "node-a",
+                    "PEERKEYAAAA",
+                    "100.100.5.5:51820",
+                    "not the public internet",
+                ] {
+                    assert!(message.contains(needle), "must name {needle}: {message}");
+                }
+            }
+            other => panic!("expected Failed (tailnet underlay), got {other:?}"),
+        }
+        // Every failure path writes the witness first (violations travel in
+        // the verdict message; the witness stays the pair-results record).
+        let witness = std::fs::read_to_string(report_dir.join(PAIR_RESULTS_RELATIVE))
+            .expect("pair-results witness written on the attestation-failure path");
+        assert!(
+            witness.contains("# traffic_test_matrix pair results"),
+            "{witness}"
+        );
+        let _ = std::fs::remove_dir_all(&report_dir);
+        let _ = std::fs::remove_dir_all(&inv_dir);
+    }
+
+    /// Declared nodes with all-public live endpoints attest clean: the
+    /// matrix still passes and the witness carries the per-node attestation
+    /// evidence lines.
+    #[test]
+    fn live_public_endpoints_pass_and_leave_attestation_evidence() {
+        let report_dir =
+            std::env::temp_dir().join(format!("ttm-attest-public-{}", std::process::id()));
+        let inv_dir =
+            std::env::temp_dir().join(format!("ttm-attest-public-inv-{}", std::process::id()));
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        let mut ctx = matrix_ctx_from_adapters(
+            vec![
+                NodeRoleAssignment {
+                    alias: "node-a".to_owned(),
+                    role: NodeRole::Client,
+                },
+                NodeRoleAssignment {
+                    alias: "node-b".to_owned(),
+                    role: NodeRole::Client,
+                },
+            ],
+            two_node_adapters(
+                "wg0\tPEERKEYAAAA\t203.0.113.7:51820\n",
+                "wg0\tPEERKEYBBBB\t198.51.100.9:443\n",
+            ),
+            &report_dir,
+        );
+        ctx.inventory_path = Some(inventory_declaring(&inv_dir, "node-a", "203.0.113.7"));
+        // Both nodes declared; node-b's inventory entry lives in the same file.
+        std::fs::write(
+            std::path::PathBuf::from(&inv_dir).join("vm_lab_inventory.json"),
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "node-a",
+                  "ssh_target": "100.64.15.9",
+                  "dataplane_endpoint": "203.0.113.7",
+                  "platform": "linux"
+                },
+                {
+                  "alias": "node-b",
+                  "ssh_target": "100.64.15.10",
+                  "dataplane_endpoint": "198.51.100.9",
+                  "platform": "linux"
+                }
+              ]
+            }"#,
+        )
+        .expect("write inventory");
+
+        match TrafficTestMatrixStage.execute(&mut ctx) {
+            StageOutcome::Passed => {}
+            other => panic!("expected Passed for public endpoints, got {other:?}"),
+        }
+        let witness = std::fs::read_to_string(report_dir.join(PAIR_RESULTS_RELATIVE))
+            .expect("pair-results witness on the pass path");
+        assert!(
+            witness.contains("underlay_attestation: node=node-a")
+                && witness.contains("verdict=all_public"),
+            "{witness}"
+        );
+        assert!(
+            witness.contains("underlay_attestation: node=node-b"),
+            "{witness}"
+        );
+        let _ = std::fs::remove_dir_all(&report_dir);
+        let _ = std::fs::remove_dir_all(&inv_dir);
+    }
+
+    /// Out-of-scope discipline: an UNDECLARED node's live endpoints are
+    /// never attested — even a tailnet answer cannot flip the verdict, and
+    /// the witness carries no attestation line for it.
+    #[test]
+    fn undeclared_node_is_not_attested_in_traffic_matrix() {
+        let report_dir =
+            std::env::temp_dir().join(format!("ttm-attest-undecl-{}", std::process::id()));
+        let inv_dir =
+            std::env::temp_dir().join(format!("ttm-attest-undecl-inv-{}", std::process::id()));
+        std::fs::create_dir_all(&inv_dir).unwrap();
+        let mut ctx = matrix_ctx_from_adapters(
+            vec![
+                NodeRoleAssignment {
+                    alias: "node-a".to_owned(),
+                    role: NodeRole::Client,
+                },
+                NodeRoleAssignment {
+                    alias: "node-b".to_owned(),
+                    role: NodeRole::Client,
+                },
+            ],
+            // node-b is NOT declared in the inventory yet answers wg with a
+            // tailnet endpoint: attestation must ignore it.
+            two_node_adapters(
+                "wg0\tPEERKEYAAAA\t203.0.113.7:51820\n",
+                "wg0\tPEERKEYBBBB\t100.100.5.5:51820\n",
+            ),
+            &report_dir,
+        );
+        ctx.inventory_path = Some(inventory_declaring(&inv_dir, "node-a", "203.0.113.7"));
+
+        match TrafficTestMatrixStage.execute(&mut ctx) {
+            StageOutcome::Passed => {}
+            other => panic!("expected Passed (undeclared node out of scope), got {other:?}"),
+        }
+        let witness = std::fs::read_to_string(report_dir.join(PAIR_RESULTS_RELATIVE))
+            .expect("pair-results witness on the pass path");
+        assert!(
+            witness.contains("underlay_attestation: node=node-a"),
+            "{witness}"
+        );
+        assert!(
+            !witness.contains("underlay_attestation: node=node-b"),
+            "an undeclared node must not be attested: {witness}"
+        );
+        assert!(!witness.contains("100.100.5.5"), "{witness}");
+        let _ = std::fs::remove_dir_all(&report_dir);
+        let _ = std::fs::remove_dir_all(&inv_dir);
     }
 }

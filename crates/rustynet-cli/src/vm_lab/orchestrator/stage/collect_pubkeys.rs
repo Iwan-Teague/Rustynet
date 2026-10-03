@@ -331,6 +331,22 @@ fn resolve_collected_endpoint(
         )),
         (Some(overlay_ip), None) => override_endpoint_host(discovered, overlay_ip),
         (None, Some(dataplane)) => {
+            // AQ-254 (b): a dataplane_endpoint override exists to publish an
+            // owner cloud node's PUBLIC WireGuard address. An override that
+            // itself names a CGNAT/tailnet (100.64.0.0/10), RFC1918,
+            // loopback, link-local, or similar non-public address hands every
+            // peer an unroutable "public" endpoint — the exact fail-open b72
+            // exposed. Refuse to record it. (The substrate-overlay arm above
+            // is NOT range-checked: a provisioned overlay address is by
+            // definition not the public internet and is gated by the
+            // substrate seam instead.)
+            if super::underlay_attestation::is_non_public_dataplane_ip(dataplane) {
+                return Err(format!(
+                    "dataplane_endpoint {dataplane} is not a public internet address; \
+                     refusing to record it as this node's WireGuard endpoint (the mesh \
+                     would degrade to a non-public underlay)"
+                ));
+            }
             override_endpoint_host(discovered, dataplane_endpoint_host(dataplane).as_str())
         }
         (None, None) => Ok(discovered.to_owned()),
@@ -862,6 +878,100 @@ mod tests {
             .expect_err("substrate + dataplane must conflict");
         assert!(err.contains("100.64.0.9"), "{err}");
         assert!(err.contains("203.0.113.7"), "{err}");
+    }
+
+    /// AQ-254 (b): a dataplane_endpoint override that names a NON-public
+    /// address is refused — the exact fail-open b72 exposed (a tailscale/
+    /// CGNAT 100.x address recorded as a node's "public" endpoint). Every
+    /// non-public class is rejected; the public classes still record.
+    #[test]
+    fn non_public_dataplane_endpoint_is_refused_and_public_still_records() {
+        let discovered = "10.0.0.1:51820";
+        for bad in [
+            "100.64.0.1",    // CGNAT low edge
+            "100.100.5.5",   // tailnet (b72's live endpoint class)
+            "100.127.255.9", // CGNAT high edge
+            "10.0.0.5",
+            "172.16.5.5",
+            "192.168.1.5",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "224.0.0.1",
+            "240.0.0.1",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            let addr: std::net::IpAddr = bad.parse().expect("test ip");
+            let err = resolve_collected_endpoint(discovered, None, Some(addr))
+                .expect_err("non-public dataplane_endpoint must be refused");
+            assert!(err.contains(bad), "refusal must name {bad}: {err}");
+            assert!(
+                err.contains("not a public internet address"),
+                "refusal must state the reason: {err}"
+            );
+        }
+        for good in ["203.0.113.7", "198.51.100.5", "2001:db8::7"] {
+            let addr: std::net::IpAddr = good.parse().expect("test ip");
+            assert!(
+                resolve_collected_endpoint(discovered, None, Some(addr)).is_ok(),
+                "{good} is a public-class address and must still record"
+            );
+        }
+        // The substrate-overlay arm is deliberately NOT range-checked: a
+        // provisioned overlay address (100.64.0.9 above) is not the public
+        // internet by design and stays gated by the substrate seam.
+        assert!(
+            resolve_collected_endpoint(discovered, Some("100.64.0.9"), None).is_ok(),
+            "overlay override must remain out of scope of the range check"
+        );
+    }
+
+    /// AQ-254 (b), stage level: an inventory whose dataplane_endpoint is a
+    /// tailnet/CGNAT address fails the stage and records NO endpoint for the
+    /// alias — the mesh must never receive a non-public "public" endpoint.
+    #[test]
+    fn stage_rejects_tailnet_dataplane_endpoint_without_recording_an_endpoint() {
+        let dir =
+            std::env::temp_dir().join(format!("collect_pubkeys_dp_tailnet_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            inventory.as_path(),
+            r#"{
+              "version": 1,
+              "entries": [
+                {
+                  "alias": "cloud-node-1",
+                  "ssh_target": "100.64.15.9",
+                  "dataplane_endpoint": "100.100.5.5",
+                  "platform": "linux"
+                }
+              ]
+            }"#,
+        )
+        .expect("write inventory");
+
+        let mut ctx = ctx_with_nodes(&[("cloud-node-1", "10.0.0.1:51820")]);
+        ctx.inventory_path = Some(inventory);
+        match CollectPubkeysStage.execute(&mut ctx) {
+            StageOutcome::Failed(message) => {
+                assert!(message.contains("cloud-node-1"), "{message}");
+                assert!(message.contains("100.100.5.5"), "{message}");
+                assert!(
+                    message.contains("not a public internet address"),
+                    "must state the reason: {message}"
+                );
+            }
+            other => panic!("expected Failed (non-public dataplane_endpoint), got {other:?}"),
+        }
+        assert!(
+            !ctx.endpoints.contains_key("cloud-node-1"),
+            "a refused dataplane_endpoint must not record an endpoint"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// An inventory `dataplane_endpoint` reaches ctx.endpoints through the

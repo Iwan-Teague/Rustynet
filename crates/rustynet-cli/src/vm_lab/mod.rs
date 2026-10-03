@@ -40784,10 +40784,14 @@ fn kept_after() {}\n\
         // 2026-09-27 (AQ-46): 92 stage sources (exit_egress_leak_witness.rs).
         // Re-measured 2026-09-30: 94 stage sources (cloud_node_safety.rs and
         // node_diagnostics.rs, the cloud-node dead-man + diagnostics modules).
+        // Re-measured 2026-10-03 (AQ-254 b+c): 95 stage sources
+        // (underlay_attestation.rs, the dataplane underlay attestation
+        // helpers shared by collect_pubkeys, mesh_status_validation and
+        // traffic_test_matrix).
         // Bump this number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 94,
-            "expected exactly 94 stage sources under the scan root; found \
+            files_scanned, 95,
+            "expected exactly 95 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );
