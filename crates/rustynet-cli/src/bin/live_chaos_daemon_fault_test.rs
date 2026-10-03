@@ -709,7 +709,7 @@ printf 'plaintext_leak_check=%s\n' "$plaintext_leak_check"
 ///     `T` (stopped, or `t` tracing-stop) kernel state within a bounded window
 ///     ([`STOP_POLL_WINDOW_SECS`]) instead of sampling one instant, records the
 ///     distinct state sequence, holds past the reconcile interval, CONTs, and
-///     polls for a schedulable (`S`/`R`) state within [`RESUME_POLL_WINDOW_SECS`].
+///     polls for a resumed (`S`/`R`/`D`) state within [`RESUME_POLL_WINDOW_SECS`].
 ///
 /// Why poll instead of one sample: a task in uninterruptible sleep (`D`) holds
 /// SIGSTOP pending until it returns from the wait, so a single first-instant
@@ -815,8 +815,10 @@ printf 'observed_stopped_states=%s\n' "$observed_stopped_states"
 sleep 3
 printf 'fault_signal_resume=CONT\n'
 systemctl kill -s CONT "$service"
-# Fail closed on an unfinished resume too: poll for a schedulable state
-# (S sleeping or R running) within a bounded window right after CONT, and
+# Fail closed on an unfinished resume too: poll for a state that proves the
+# task left the stopped state (S sleeping, R running or D waiting on I/O; a
+# daemon that just resumed commonly writes and fsyncs state, which reads D)
+# within a bounded window right after CONT, and
 # record every distinct state seen so the report shows the whole sequence.
 observed_resumed_states=
 resumed_state=unknown
@@ -831,7 +833,7 @@ if [ -n "$main_pid" ]; then
       *) observed_resumed_states="${{observed_resumed_states:+$observed_resumed_states,}}$state" ;;
     esac
     case "$state" in
-      S|R) break ;;
+      S|R|D) break ;;
     esac
     if [ "$(date +%s)" -ge "$resume_poll_deadline" ]; then break; fi
     sleep 0.2
@@ -868,8 +870,9 @@ printf 'plaintext_leak_check=%s\n' "$plaintext_leak_check"
 /// katana-u37-anchor-b78, 2026-10-03).
 const STOP_POLL_WINDOW_SECS: u64 = 10;
 
-/// Bounded window (seconds) the guest script polls for a schedulable state
-/// (`S`/`R`) right after SIGCONT, so a still-stopped (`T`) sample cannot pass.
+/// Bounded window (seconds) the guest script polls for a state that proves the
+/// task left the stopped state (`S`/`R`/`D`) right after SIGCONT, so a
+/// still-stopped (`T`) sample cannot pass.
 const RESUME_POLL_WINDOW_SECS: u64 = 2;
 
 /// Pass input for the SIGSTOP/SIGCONT stage: true when the bounded stop-poll
@@ -883,11 +886,15 @@ fn stop_sequence_proves_stopped(states: &[String]) -> bool {
 }
 
 /// Pass input for the SIGSTOP/SIGCONT stage: true when the bounded post-SIGCONT
-/// sequence proves the task left the stopped state and is schedulable again —
-/// it contains `S` (interruptible sleep) or `R` (running). A sequence that
-/// stays `T` (SIGCONT never took), reads only `D`, or is empty is false.
+/// sequence proves the task left the stopped state — it contains `S`
+/// (interruptible sleep), `R` (running) or `D` (uninterruptible sleep: a
+/// freshly resumed daemon writing and fsyncing state reads `D`, as in
+/// katana-u39; a task that is still stopped reads `T`, never `D`). A sequence
+/// that stays `T` (SIGCONT never took), is `unknown` or is empty is false.
 fn resume_sequence_proves_resumed(states: &[String]) -> bool {
-    states.iter().any(|state| state == "S" || state == "R")
+    states
+        .iter()
+        .any(|state| state == "S" || state == "R" || state == "D")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -915,7 +922,7 @@ struct KillStageObservation {
     /// fails the stage closed.
     observed_stopped_states: Vec<String>,
     /// Every distinct consecutive state sampled while polling right after
-    /// SIGCONT for a schedulable (`S`/`R`) state within
+    /// SIGCONT for a resumed (`S`/`R`/`D`) state within
     /// [`RESUME_POLL_WINDOW_SECS`]. Empty, or a sequence that never reaches
     /// `S`/`R` (e.g. the task still reads `T`), fails the stage closed.
     observed_resumed_states: Vec<String>,
@@ -1509,7 +1516,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_sequence_proves_resumed_requires_s_or_r() {
+    fn resume_sequence_proves_resumed_accepts_s_r_and_d() {
         assert!(resume_sequence_proves_resumed(&["S".to_owned()]));
         assert!(resume_sequence_proves_resumed(&["R".to_owned()]));
         // T then R: the first sample raced the CONT, it did resume.
@@ -1522,11 +1529,15 @@ mod tests {
             "T".to_owned(),
             "T".to_owned()
         ]));
-        // Only uninterruptible I/O in the window.
-        assert!(!resume_sequence_proves_resumed(&[
+        // Uninterruptible I/O right after CONT (katana-u39: the resumed daemon
+        // fsyncing state): the task left the stopped state, so it resumed.
+        assert!(resume_sequence_proves_resumed(&[
             "D".to_owned(),
             "D".to_owned()
         ]));
+        assert!(resume_sequence_proves_resumed(&["D".to_owned()]));
+        // Unreadable state (process gone or malformed): fail closed.
+        assert!(!resume_sequence_proves_resumed(&["unknown".to_owned()]));
         // Empty (sequence key absent): fail closed.
         assert!(!resume_sequence_proves_resumed(&[]));
     }
@@ -1548,7 +1559,7 @@ mod tests {
         assert!(script.contains(&format!(
             "resume_poll_deadline=$(( $(date +%s) + {RESUME_POLL_WINDOW_SECS} ))"
         )));
-        assert!(script.contains("S|R) break ;;"));
+        assert!(script.contains("S|R|D) break ;;"));
         assert!(script.contains("printf 'resumed_state=%s\\n'"));
         assert!(script.contains("printf 'observed_resumed_states=%s\\n'"));
     }
