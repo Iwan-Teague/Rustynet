@@ -4,6 +4,7 @@ use std::time::Duration;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::collect_pubkeys::load_dataplane_overrides;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 const MAX_LAB_CLOCK_SKEW_SECS: u64 = 90;
@@ -305,6 +306,32 @@ pub struct PreflightStage {
     /// control-plane-only plans but a hard failure when any
     /// cross-bridge dataplane stage is planned.
     pub planned_stage_ids: Vec<StageId>,
+    /// The subset of `planned_stage_ids` this invocation will actually
+    /// execute: the plan after the `--setup-only` / `--run-only` mode filter
+    /// (`native::stage_id_retained_for_mode`). Read ONLY by the
+    /// dataplane-addressed PassWithNote-versus-Warn decision; the Fail
+    /// severity keeps reading `planned_stage_ids`.
+    ///
+    /// Why two views of the plan:
+    /// - `--setup-only` drops every non-Setup stage, so a setup-only run
+    ///   "plans" `mesh_status_validation` / `traffic_test_matrix` yet never
+    ///   runs them. A note claiming they prove a dataplane-addressed node's
+    ///   handshake would claim proof this invocation never produces, so this
+    ///   view yields a Warn there.
+    /// - The Fail decision must NOT read this narrowed view: a later
+    ///   `--run-only` reuses this stage's pass as an injected Passed
+    ///   dependency without re-running it, then executes the dataplane
+    ///   stages. Narrowing Fail to what a setup-only run executes would let
+    ///   those stages run with no cross-bridge gate at all, so Fail keeps the
+    ///   full (unfiltered) plan and stays over-broad in the safe direction.
+    /// - `--run-only`: preflight is retained in the mode filter but reused as
+    ///   an injected pass, so it does not execute there; whenever it does
+    ///   execute, both handshake stages are retained too.
+    /// - `--resume-from` / `--rerun-stage`: reused stages are always a prefix
+    ///   of the plan and `preflight` precedes `mesh_status_validation` and
+    ///   `traffic_test_matrix` in canonical order, so whenever preflight
+    ///   executes both later stages execute with it.
+    pub invocation_stage_ids: Vec<StageId>,
 }
 
 impl OrchestrationStage for PreflightStage {
@@ -638,6 +665,10 @@ fn sanitize_probe_text(s: &str) -> String {
 enum CrossBridgeOutcome {
     NoSplit,
     Pass,
+    /// Passed, but dataplane-addressed nodes were excluded from the L2 probe
+    /// and their reachability is left to the planned handshake-proving
+    /// stages. Never reads as a clean "no subnet split".
+    PassWithNote(String),
     Warn(String),
     Fail(String),
 }
@@ -702,6 +733,120 @@ fn decide_cross_bridge(
     }
 }
 
+/// Whether THIS invocation genuinely proves a dataplane-addressed node's
+/// reachability elsewhere, so the cross-bridge preflight may pass with a note
+/// instead of warning that it is unproven. Requires all of: both stages that
+/// fail closed on a missing WireGuard handshake (`mesh_status_validation`,
+/// `traffic_test_matrix`) are in `invocation` (the mode-filtered plan, not
+/// the full plan); at least two assigned nodes (a handshake needs a peer);
+/// and at least one Linux node (those stages exercise Linux nodes only).
+fn plan_proves_dataplane_handshakes(
+    invocation: &[StageId],
+    assigned_node_count: usize,
+    any_linux_node: bool,
+) -> bool {
+    invocation.contains(&StageId::MeshStatusValidation)
+        && invocation.contains(&StageId::TrafficTestMatrix)
+        && assigned_node_count >= 2
+        && any_linux_node
+}
+
+/// Whether `host` (an ssh host string, optional `:port`) is an RFC1918 or
+/// link-local IPv4 address — a lab-private management network, as opposed to
+/// a tailnet (100.64/10) / public address or a non-IPv4 name.
+fn ssh_host_is_private_lab_address(host: &str) -> bool {
+    strip_ssh_port(host)
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|ip| ip.is_private() || ip.is_link_local())
+}
+
+/// Result of [`partition_dataplane_addressed`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DataplanePartition {
+    /// Targets that stay in subnet classification and the probes.
+    probed: Vec<(String, String)>,
+    /// Aliases removed from every probe (sorted).
+    excluded: Vec<String>,
+    /// Aliases that declare a `dataplane_endpoint` but whose ssh host is on a
+    /// private lab network, so the declaration was NOT honoured (sorted).
+    ignored_override: Vec<String>,
+}
+
+/// Split the live ssh targets into those that sit on the management L2 and
+/// the aliases that declare an inventory `dataplane_endpoint` (a node reached
+/// for management over a different path than its dataplane, e.g. a cloud VM
+/// over the tailnet). The latter are by definition not on the management L2,
+/// so guest-to-guest TCP/22 toward or from them is meaningless: they are
+/// removed from subnet classification and from every probe.
+///
+/// An alias is excluded ONLY when its ssh host is NOT an RFC1918 / link-local
+/// lab address (i.e. tailnet 100.64/10, public, or a non-IPv4 name). A
+/// declaration on an alias whose ssh host sits on a private lab network is
+/// treated as a misdeclaration: the alias stays in the probe set, so a typo
+/// in the inventory can never drop a real lab guest from the CP-1 gate, and it
+/// is reported in `ignored_override`. Only aliases that are actual targets
+/// can be excluded or ignored; overrides for other inventory entries are
+/// dropped.
+fn partition_dataplane_addressed(
+    targets: Vec<(String, String)>,
+    overrides: &std::collections::BTreeMap<String, std::net::IpAddr>,
+) -> DataplanePartition {
+    let mut out = DataplanePartition::default();
+    for (alias, host) in targets {
+        if !overrides.contains_key(&alias) {
+            out.probed.push((alias, host));
+        } else if ssh_host_is_private_lab_address(&host) {
+            out.ignored_override.push(alias.clone());
+            out.probed.push((alias, host));
+        } else {
+            out.excluded.push(alias);
+        }
+    }
+    out.excluded.sort();
+    out.ignored_override.sort();
+    out
+}
+
+/// `decide_cross_bridge` plus the dataplane-addressed exclusion. With no
+/// excluded aliases this IS `decide_cross_bridge`. With some, a Fail stays a
+/// Fail (a real split among the probed nodes, decided on the full plan), a
+/// Warn gains the unproven note, and an otherwise clean NoSplit/Pass can no
+/// longer read as clean: it is Pass-with-note only when `handshakes_proven`
+/// (see [`plan_proves_dataplane_handshakes`]), else a Warn.
+fn decide_cross_bridge_with_dataplane(
+    groups: &[CrossBridgeSubnetGroup],
+    excluded: &[String],
+    dataplane_addressed: &[String],
+    probe_failures: &[String],
+    planned: &[StageId],
+    handshakes_proven: bool,
+) -> CrossBridgeOutcome {
+    let base = decide_cross_bridge(groups, excluded, probe_failures, planned);
+    if dataplane_addressed.is_empty() {
+        return base;
+    }
+    let names = dataplane_addressed.join(", ");
+    let unproven = format!("dataplane reachability for {names} unproven by this stage");
+    match base {
+        CrossBridgeOutcome::Fail(msg) => CrossBridgeOutcome::Fail(msg),
+        CrossBridgeOutcome::Warn(msg) => CrossBridgeOutcome::Warn(format!("{msg}; {unproven}")),
+        CrossBridgeOutcome::NoSplit
+        | CrossBridgeOutcome::Pass
+        | CrossBridgeOutcome::PassWithNote(_) => {
+            if handshakes_proven {
+                CrossBridgeOutcome::PassWithNote(format!(
+                    "dataplane-addressed node(s) {names} excluded from the L2 TCP/22 probe \
+                     (not on the management L2); their dataplane reachability is left to \
+                     mesh_status_validation and traffic_test_matrix, both executed by this \
+                     invocation and fail-closed on missing handshakes"
+                ))
+            } else {
+                CrossBridgeOutcome::Warn(unproven)
+            }
+        }
+    }
+}
+
 impl PreflightStage {
     /// Probe guest-to-guest TCP/22 across every derived /24 pair and gate
     /// the run on the result. WARN-only for control-plane plans; hard fail
@@ -715,6 +860,24 @@ impl PreflightStage {
                 targets.push((alias.clone(), params.host));
             }
         }
+        // Nodes declaring a dataplane_endpoint are not on the management L2:
+        // drop them from classification and every probe (source or
+        // destination). A load failure fails closed; no inventory path
+        // (unit-test contexts) means no overrides.
+        let overrides = match load_dataplane_overrides(ctx.inventory_path.as_deref()) {
+            Ok(overrides) => overrides,
+            Err(e) => {
+                return StageOutcome::Failed(format!(
+                    "cross-bridge preflight: load inventory for dataplane_endpoint overrides \
+                     failed: {e}"
+                ));
+            }
+        };
+        let DataplanePartition {
+            probed: targets,
+            excluded: dataplane_addressed,
+            ignored_override,
+        } = partition_dataplane_addressed(targets, &overrides);
         let (groups, excluded) = classify_subnet_split(&targets);
 
         let mut report = String::new();
@@ -734,6 +897,17 @@ impl PreflightStage {
         }
         for alias in &excluded {
             let _ = writeln!(report, "excluded (non-IPv4 ssh host): {alias}");
+        }
+        // Alias only: the dataplane address itself is never written out.
+        for alias in &dataplane_addressed {
+            let _ = writeln!(report, "dataplane-addressed (not L2-probed): {alias}");
+        }
+        for alias in &ignored_override {
+            let _ = writeln!(
+                report,
+                "dataplane_endpoint override ignored for preflight (ssh host is on a private \
+                 lab network): {alias}"
+            );
         }
         let _ = writeln!(
             report,
@@ -816,13 +990,26 @@ impl PreflightStage {
             }
         }
 
-        let outcome =
-            decide_cross_bridge(&groups, &excluded, &probe_failures, &self.planned_stage_ids);
+        let outcome = decide_cross_bridge_with_dataplane(
+            &groups,
+            &excluded,
+            &dataplane_addressed,
+            &probe_failures,
+            &self.planned_stage_ids,
+            plan_proves_dataplane_handshakes(
+                &self.invocation_stage_ids,
+                ctx.assignments.len(),
+                ctx.adapters
+                    .values()
+                    .any(|a| a.platform() == crate::vm_lab::VmGuestPlatform::Linux),
+            ),
+        );
         let decision_line = match &outcome {
             CrossBridgeOutcome::NoSplit => "decision: no subnet split (single /24)".to_owned(),
             CrossBridgeOutcome::Pass => {
                 "decision: split present, all cross-bridge probes reachable".to_owned()
             }
+            CrossBridgeOutcome::PassWithNote(msg) => format!("decision: PASS (note) — {msg}"),
             CrossBridgeOutcome::Warn(msg) => format!("decision: WARN — {msg}"),
             CrossBridgeOutcome::Fail(msg) => format!("decision: FAIL — {msg}"),
         };
@@ -849,6 +1036,10 @@ impl PreflightStage {
 
         match outcome {
             CrossBridgeOutcome::NoSplit | CrossBridgeOutcome::Pass => StageOutcome::Passed,
+            CrossBridgeOutcome::PassWithNote(msg) => {
+                eprintln!("preflight note: {msg}");
+                StageOutcome::Passed
+            }
             CrossBridgeOutcome::Warn(msg) => {
                 eprintln!("preflight warning: {msg}");
                 StageOutcome::Passed
@@ -903,6 +1094,7 @@ mod tests {
         let outcome = PreflightStage {
             clock_remediation_enabled: false,
             planned_stage_ids: Vec::new(),
+            invocation_stage_ids: Vec::new(),
         }
         .execute(&mut ctx);
         assert!(
@@ -946,6 +1138,7 @@ mod tests {
         let outcome = PreflightStage {
             clock_remediation_enabled: false,
             planned_stage_ids: Vec::new(),
+            invocation_stage_ids: Vec::new(),
         }
         .execute(&mut ctx);
         assert!(
@@ -1569,5 +1762,671 @@ mod tests {
                 aliases: vec!["linux-node".to_owned()],
             },
         ]
+    }
+
+    // ── dataplane-addressed (dataplane_endpoint) exclusion ─────────────────
+
+    fn overrides_for(aliases: &[&str]) -> std::collections::BTreeMap<String, std::net::IpAddr> {
+        aliases
+            .iter()
+            .map(|a| ((*a).to_owned(), "203.0.113.7".parse().unwrap()))
+            .collect()
+    }
+
+    fn both_handshake_stages() -> Vec<StageId> {
+        vec![
+            StageId::Preflight,
+            StageId::MeshStatusValidation,
+            StageId::TrafficTestMatrix,
+        ]
+    }
+
+    /// The excluded alias never reaches subnet classification: no group holds
+    /// it and it is not in the non-IPv4 `excluded` list either. The excluded
+    /// node's ssh host is a tailnet address (not a private lab network).
+    /// Mutation caught: dropping the partition (classifying every target).
+    #[test]
+    fn dataplane_addressed_alias_is_excluded_from_classification() {
+        let targets = vec![
+            ("a".to_owned(), "192.168.64.10:22".to_owned()),
+            ("b".to_owned(), "192.168.64.11:22".to_owned()),
+            ("azure-vm-1".to_owned(), "100.109.160.10:22".to_owned()),
+        ];
+        // `unrelated` is an override for an inventory entry that is not a
+        // target of this run: ignored.
+        let part =
+            partition_dataplane_addressed(targets, &overrides_for(&["azure-vm-1", "unrelated"]));
+        assert_eq!(part.excluded, vec!["azure-vm-1".to_owned()]);
+        assert!(part.ignored_override.is_empty());
+        assert_eq!(part.probed.len(), 2);
+        let (groups, non_ipv4) = classify_subnet_split(&part.probed);
+        assert!(non_ipv4.is_empty());
+        assert_eq!(groups.len(), 1, "remaining fleet is one /24");
+        assert!(
+            groups
+                .iter()
+                .all(|g| !g.aliases.contains(&"azure-vm-1".to_owned())),
+            "no group may hold the dataplane-addressed alias"
+        );
+    }
+
+    /// Only a host that is NOT a private lab address may be excluded: tailnet
+    /// CGNAT, public and non-IPv4 names are; RFC1918 and link-local are a
+    /// misdeclaration and stay probed, reported in `ignored_override`.
+    /// Mutation caught: dropping the private-address check, or narrowing it
+    /// to only one RFC1918 block / dropping link-local.
+    #[test]
+    fn dataplane_override_on_private_lab_host_is_ignored_and_stays_probed() {
+        for private in [
+            "10.1.2.3",
+            "172.16.0.9",
+            "172.31.255.1:22",
+            "192.168.122.45",
+            "169.254.3.4",
+        ] {
+            let part = partition_dataplane_addressed(
+                vec![("vm".to_owned(), private.to_owned())],
+                &overrides_for(&["vm"]),
+            );
+            assert!(part.excluded.is_empty(), "{private} must not be excluded");
+            assert_eq!(part.ignored_override, vec!["vm".to_owned()], "{private}");
+            assert_eq!(part.probed.len(), 1, "{private} stays probed");
+        }
+        for foreign in [
+            "100.64.0.1",
+            "100.109.160.10",
+            "100.127.255.254:22",
+            "203.0.113.7",
+            "8.8.8.8",
+            "azure-vm.tailnet.example",
+            "fd7a:115c:a1e0::1",
+        ] {
+            let part = partition_dataplane_addressed(
+                vec![("vm".to_owned(), foreign.to_owned())],
+                &overrides_for(&["vm"]),
+            );
+            assert_eq!(part.excluded, vec!["vm".to_owned()], "{foreign}");
+            assert!(part.ignored_override.is_empty(), "{foreign}");
+            assert!(part.probed.is_empty(), "{foreign}");
+        }
+    }
+
+    #[test]
+    fn partition_without_overrides_is_identity() {
+        let targets = vec![
+            ("a".to_owned(), "192.168.64.10:22".to_owned()),
+            ("b".to_owned(), "192.168.65.10:22".to_owned()),
+        ];
+        let part =
+            partition_dataplane_addressed(targets.clone(), &std::collections::BTreeMap::new());
+        assert_eq!(
+            part,
+            DataplanePartition {
+                probed: targets,
+                excluded: Vec::new(),
+                ignored_override: Vec::new(),
+            }
+        );
+    }
+
+    /// Pass-with-note ONLY when the caller says the handshakes are proven by
+    /// this invocation; never a clean NoSplit/Pass. Mutation caught: returning
+    /// NoSplit/Pass unchanged, or ignoring `handshakes_proven`.
+    #[test]
+    fn dataplane_addressed_is_pass_with_note_only_when_handshakes_proven() {
+        let dp = vec!["azure-vm-1".to_owned()];
+        let one = vec![CrossBridgeSubnetGroup {
+            subnet: [192, 168, 64, 0],
+            aliases: vec!["a".to_owned()],
+        }];
+        for groups in [&one, &two_groups()] {
+            match decide_cross_bridge_with_dataplane(
+                groups,
+                &[],
+                &dp,
+                &[],
+                &both_handshake_stages(),
+                true,
+            ) {
+                CrossBridgeOutcome::PassWithNote(msg) => {
+                    assert!(msg.contains("azure-vm-1"), "{msg}");
+                    assert!(msg.contains("mesh_status_validation"), "{msg}");
+                    assert!(msg.contains("traffic_test_matrix"), "{msg}");
+                }
+                other => panic!("expected PassWithNote, got {other:?}"),
+            }
+            // Not proven by this invocation => Warn naming the alias, even
+            // though the FULL plan carries both stages.
+            assert_eq!(
+                decide_cross_bridge_with_dataplane(
+                    groups,
+                    &[],
+                    &dp,
+                    &[],
+                    &both_handshake_stages(),
+                    false
+                ),
+                CrossBridgeOutcome::Warn(
+                    "dataplane reachability for azure-vm-1 unproven by this stage".to_owned()
+                )
+            );
+        }
+    }
+
+    /// Every condition of the handshake-proof predicate is load-bearing: both
+    /// stages in the INVOCATION plan, at least two nodes, at least one Linux
+    /// node. Mutation caught: dropping any one conjunct.
+    #[test]
+    fn plan_proves_dataplane_handshakes_needs_stages_two_nodes_and_linux() {
+        let both = both_handshake_stages();
+        assert!(plan_proves_dataplane_handshakes(&both, 2, true));
+        assert!(plan_proves_dataplane_handshakes(&both, 5, true));
+        // A missing stage (either, or both).
+        let without_mesh = [StageId::Preflight, StageId::TrafficTestMatrix];
+        let without_matrix = [StageId::Preflight, StageId::MeshStatusValidation];
+        for planned in [&without_mesh[..], &without_matrix[..], &[][..]] {
+            assert!(!plan_proves_dataplane_handshakes(planned, 2, true));
+        }
+        // A single node never proves a handshake.
+        assert!(!plan_proves_dataplane_handshakes(&both, 1, true));
+        assert!(!plan_proves_dataplane_handshakes(&both, 0, true));
+        // No Linux node: the stages do not exercise it.
+        assert!(!plan_proves_dataplane_handshakes(&both, 2, false));
+    }
+
+    /// With nothing excluded the wrapper IS `decide_cross_bridge`; a real
+    /// split among the probed nodes still fails (CP-1 text) and a Warn gains
+    /// the unproven note.
+    #[test]
+    fn dataplane_wrapper_preserves_existing_decisions() {
+        let failure = vec!["a → b (192.168.65.9):22 cross-bridge unreachable (exit 1)".to_owned()];
+        let planned = [StageId::TrafficTestMatrix];
+        assert_eq!(
+            decide_cross_bridge_with_dataplane(&two_groups(), &[], &[], &failure, &planned, true),
+            decide_cross_bridge(&two_groups(), &[], &failure, &planned)
+        );
+        // Fail survives the exclusion untouched, whatever the invocation view
+        // says about handshake proof.
+        let dp = vec!["azure-vm-1".to_owned()];
+        let full = [StageId::TrafficTestMatrix, StageId::MeshStatusValidation];
+        for proven in [true, false] {
+            let with = decide_cross_bridge_with_dataplane(
+                &two_groups(),
+                &[],
+                &dp,
+                &failure,
+                &full,
+                proven,
+            );
+            assert_eq!(
+                with,
+                decide_cross_bridge(&two_groups(), &[], &failure, &full)
+            );
+            assert!(matches!(with, CrossBridgeOutcome::Fail(ref m) if m.contains("CP-1")));
+        }
+        // Warn keeps its text and gains the note.
+        match decide_cross_bridge_with_dataplane(&two_groups(), &[], &dp, &failure, &[], true) {
+            CrossBridgeOutcome::Warn(m) => {
+                assert!(m.contains("CP-1"), "{m}");
+                assert!(
+                    m.contains("dataplane reachability for azure-vm-1 unproven by this stage"),
+                    "{m}"
+                );
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+    }
+
+    use crate::vm_lab::orchestrator::adapter::node_adapter::{NodeAdapter, SshConnectionParams};
+    use crate::vm_lab::orchestrator::error::{
+        AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+        MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+        ValidatorReport, WireguardPublicKey,
+    };
+    use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+
+    /// Adapter double for the cross-bridge preflight: answers only the ssh
+    /// host and the platform. `shell_host` (the probe source) panics when
+    /// `forbid_probe` is set, so a probe issued FROM that alias fails the
+    /// test loudly; otherwise it keeps the trait default (an error), which the
+    /// preflight records as an unreachable probe.
+    #[derive(Debug)]
+    struct ProbeAdapter {
+        alias: String,
+        host: String,
+        forbid_probe: bool,
+        platform: crate::vm_lab::VmGuestPlatform,
+    }
+
+    impl NodeAdapter for ProbeAdapter {
+        fn platform(&self) -> crate::vm_lab::VmGuestPlatform {
+            self.platform
+        }
+        fn alias(&self) -> &str {
+            &self.alias
+        }
+        fn ssh_connection_params(&self) -> Option<SshConnectionParams> {
+            Some(SshConnectionParams::new(
+                self.host.clone(),
+                22,
+                Some("debian".to_owned()),
+                std::path::PathBuf::from("/dev/null"),
+                std::path::PathBuf::from("/dev/null"),
+            ))
+        }
+        fn shell_host(
+            &self,
+        ) -> Result<
+            std::sync::Arc<dyn crate::vm_lab::orchestrator::remote_shell::RemoteShellHost>,
+            AdapterError,
+        > {
+            assert!(
+                !self.forbid_probe,
+                "a probe was issued from dataplane-addressed alias {}",
+                self.alias
+            );
+            Err(AdapterError::UnsupportedPlatform {
+                platform: self.platform(),
+                message: "probe double has no shell".to_owned(),
+            })
+        }
+        fn install_daemon(
+            &self,
+            _source: &SourceArchive,
+            _ctx: &OrchestrationContext,
+        ) -> Result<InstallReport, AdapterError> {
+            unimplemented!()
+        }
+        fn start_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn stop_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn restart_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+            unimplemented!()
+        }
+        fn init_membership_snapshot(
+            &self,
+            _owner_key: &MembershipOwnerKey,
+            _peers: &[NodeMembershipPeer],
+        ) -> Result<MembershipSnapshot, AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_signed_bundle(
+            &self,
+            _kind: BundleKind,
+            _bundle_path: &std::path::Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_verifier_key(
+            &self,
+            _kind: BundleKind,
+            _pub_key_path: &std::path::Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_bundles_to_dir(
+            &self,
+            _kind: BundleKind,
+            _env_content: &str,
+            _local_out_dir: &std::path::Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn collect_wireguard_public_key(&self) -> Result<WireguardPublicKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+            unimplemented!()
+        }
+        fn run_validator(
+            &self,
+            _op: crate::vm_lab::DaemonProbeOp,
+            _extra_args: &[String],
+        ) -> Result<ValidatorReport, AdapterError> {
+            unimplemented!()
+        }
+        fn ping_mesh_peer(&self, _peer: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn probe_denied_peer(&self, _denied: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+            unimplemented!()
+        }
+        fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn endpoint(&self) -> String {
+            unimplemented!()
+        }
+        fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_artifacts(&self, _dst: &std::path::Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+    }
+
+    const DP_NODE: &str = "azure-vm-1";
+    const DP_NODE_SSH_HOST: &str = "100.109.160.10";
+    const DP_PUBLIC_IP: &str = "203.0.113.7";
+
+    /// A context over `(alias, ssh host, is dataplane-addressed)` nodes whose
+    /// inventory declares `dataplane_endpoint` for the flagged ones. All
+    /// nodes are Linux and a probe issued FROM a flagged node panics.
+    fn dataplane_ctx(tag: &str, nodes: &[(&str, &str, bool)]) -> OrchestrationContext {
+        dataplane_ctx_on(tag, nodes, crate::vm_lab::VmGuestPlatform::Linux, true)
+    }
+
+    fn dataplane_ctx_on(
+        tag: &str,
+        nodes: &[(&str, &str, bool)],
+        platform: crate::vm_lab::VmGuestPlatform,
+        forbid_probe_from_dataplane_nodes: bool,
+    ) -> OrchestrationContext {
+        let dir = std::env::temp_dir().join(format!(
+            "preflight_dp_{tag}_{}_{}",
+            std::process::id(),
+            nodes.len()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let entries: Vec<String> = nodes
+            .iter()
+            .map(|(alias, host, dp)| {
+                let dpe = if *dp {
+                    format!(r#""dataplane_endpoint": "{DP_PUBLIC_IP}","#)
+                } else {
+                    String::new()
+                };
+                format!(
+                    r#"{{ "alias": "{alias}", "ssh_target": "{host}", {dpe} "platform": "linux" }}"#
+                )
+            })
+            .collect();
+        let inventory = dir.join("vm_lab_inventory.json");
+        std::fs::write(
+            &inventory,
+            format!(r#"{{ "version": 1, "entries": [{}] }}"#, entries.join(",")),
+        )
+        .unwrap();
+        let assignments = nodes
+            .iter()
+            .map(|(alias, _, _)| NodeRoleAssignment {
+                alias: (*alias).to_owned(),
+                role: NodeRole::Client,
+            })
+            .collect();
+        let mut ctx = OrchestrationContext::new(assignments, dir, "dpnet".to_owned());
+        ctx.inventory_path = Some(inventory);
+        for (alias, host, dp) in nodes {
+            ctx.adapters.insert(
+                (*alias).to_owned(),
+                Box::new(ProbeAdapter {
+                    alias: (*alias).to_owned(),
+                    host: (*host).to_owned(),
+                    forbid_probe: *dp && forbid_probe_from_dataplane_nodes,
+                    platform,
+                }),
+            );
+        }
+        ctx
+    }
+
+    fn read_witness(ctx: &OrchestrationContext) -> String {
+        std::fs::read_to_string(ctx.report_dir.join("logs/cross_bridge_preflight.txt"))
+            .expect("witness report written")
+    }
+
+    fn azure_fleet() -> [(&'static str, &'static str, bool); 3] {
+        [
+            ("guest-1", "192.168.122.45", false),
+            ("guest-2", "192.168.122.46", false),
+            (DP_NODE, DP_NODE_SSH_HOST, true),
+        ]
+    }
+
+    fn stage_with(planned: Vec<StageId>, invocation: Vec<StageId>) -> PreflightStage {
+        PreflightStage {
+            clock_remediation_enabled: false,
+            planned_stage_ids: planned,
+            invocation_stage_ids: invocation,
+        }
+    }
+
+    /// The Azure shape: a tailnet-managed node on a foreign /24 next to a
+    /// one-/24 NAT fleet. No probe toward or from it, the report names the
+    /// alias (never an IP), and the decision is Pass-with-note when this
+    /// invocation executes both handshake stages, Warn without.
+    #[test]
+    fn stage_excludes_dataplane_addressed_node_from_every_probe() {
+        let nodes = azure_fleet();
+        let stage = stage_with(both_handshake_stages(), both_handshake_stages());
+        let ctx = dataplane_ctx("pass", &nodes);
+        assert_eq!(stage.cross_bridge_preflight(&ctx), StageOutcome::Passed);
+        let report = read_witness(&ctx);
+        assert!(
+            report.contains(&format!("dataplane-addressed (not L2-probed): {DP_NODE}")),
+            "{report}"
+        );
+        assert!(
+            !report.contains("probe:"),
+            "no probe may be issued: {report}"
+        );
+        assert!(!report.contains(DP_PUBLIC_IP), "public IP leaked: {report}");
+        assert!(
+            !report.contains(DP_NODE_SSH_HOST),
+            "excluded node's host leaked: {report}"
+        );
+        assert!(report.contains("decision: PASS (note)"), "{report}");
+        assert!(
+            !report.contains("no subnet split"),
+            "must not read as a clean single /24: {report}"
+        );
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+
+        // Without mesh_status_validation: Warn, still Passed (non-fatal),
+        // still no probe.
+        let stage = stage_with(
+            vec![StageId::TrafficTestMatrix],
+            vec![StageId::TrafficTestMatrix],
+        );
+        let ctx = dataplane_ctx("warn", &nodes);
+        assert_eq!(stage.cross_bridge_preflight(&ctx), StageOutcome::Passed);
+        let report = read_witness(&ctx);
+        assert!(
+            report.contains(&format!(
+                "decision: WARN — dataplane reachability for {DP_NODE} unproven by this stage"
+            )),
+            "{report}"
+        );
+        assert!(!report.contains("probe:"), "{report}");
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    /// `--setup-only`: the plan still carries both handshake stages but the
+    /// mode filter drops them, so this invocation proves nothing about the
+    /// dataplane node and the note must NOT claim it does: Warn, not
+    /// Pass-with-note. The invocation view comes from the real mode filter.
+    /// Mutation caught: preflight reading the full plan for the note.
+    #[test]
+    fn setup_only_invocation_warns_instead_of_claiming_handshake_proof() {
+        let planned: Vec<StageId> = StageId::ALL.to_vec();
+        let invocation: Vec<StageId> = planned
+            .iter()
+            .filter(|id| {
+                crate::vm_lab::orchestrator::native::stage_id_retained_for_mode(id, true, false)
+            })
+            .cloned()
+            .collect();
+        assert!(invocation.contains(&StageId::Preflight));
+        assert!(!invocation.contains(&StageId::MeshStatusValidation));
+        assert!(!invocation.contains(&StageId::TrafficTestMatrix));
+        let stage = stage_with(planned.clone(), invocation);
+        let ctx = dataplane_ctx("setuponly", &azure_fleet());
+        assert_eq!(stage.cross_bridge_preflight(&ctx), StageOutcome::Passed);
+        let report = read_witness(&ctx);
+        assert!(
+            report.contains(&format!(
+                "decision: WARN — dataplane reachability for {DP_NODE} unproven by this stage"
+            )),
+            "{report}"
+        );
+        assert!(!report.contains("PASS (note)"), "{report}");
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+
+        // The Fail decision keeps the FULL plan: a real split still fails a
+        // setup-only invocation, because a later --run-only reuses this
+        // stage's pass as an injected dependency and would otherwise run the
+        // dataplane stages with no cross-bridge gate.
+        let split = [
+            ("guest-1", "192.168.64.10", false),
+            ("guest-2", "192.168.65.10", false),
+            (DP_NODE, DP_NODE_SSH_HOST, true),
+        ];
+        let stage = stage_with(planned, vec![StageId::Preflight]);
+        let ctx = dataplane_ctx("setuponly_split", &split);
+        match stage.cross_bridge_preflight(&ctx) {
+            StageOutcome::Failed(msg) => assert!(msg.contains("CP-1"), "{msg}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    /// A handshake needs two nodes and the proving stages exercise Linux
+    /// nodes: a lone dataplane node, or an all-macOS fleet, never reads as
+    /// proven even with both stages executed. Mutation caught: dropping the
+    /// node-count or Linux conjunct from the stage's call.
+    #[test]
+    fn single_node_or_non_linux_fleet_warns_even_with_handshake_stages_executed() {
+        let stage = stage_with(both_handshake_stages(), both_handshake_stages());
+        let warn =
+            format!("decision: WARN — dataplane reachability for {DP_NODE} unproven by this stage");
+
+        // One node only (the dataplane-addressed one).
+        let ctx = dataplane_ctx("solo", &[(DP_NODE, DP_NODE_SSH_HOST, true)]);
+        assert_eq!(stage.cross_bridge_preflight(&ctx), StageOutcome::Passed);
+        let report = read_witness(&ctx);
+        assert!(report.contains(&warn), "{report}");
+        assert!(!report.contains("PASS (note)"), "{report}");
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+
+        // Two nodes, none Linux.
+        let ctx = dataplane_ctx_on(
+            "macos",
+            &[
+                ("mac-1", "192.168.64.10", false),
+                (DP_NODE, DP_NODE_SSH_HOST, true),
+            ],
+            crate::vm_lab::VmGuestPlatform::Macos,
+            true,
+        );
+        assert_eq!(stage.cross_bridge_preflight(&ctx), StageOutcome::Passed);
+        let report = read_witness(&ctx);
+        assert!(report.contains(&warn), "{report}");
+        assert!(!report.contains("PASS (note)"), "{report}");
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    /// The Azure misdeclaration shape end to end: a `dataplane_endpoint` on an
+    /// alias whose ssh host is on a private lab /24 must not hide it from the
+    /// CP-1 gate. It stays probed (so the split it causes still fails), the
+    /// report names only the alias in an "ignored" line, never the declared
+    /// endpoint, and there is no dataplane-addressed exclusion note.
+    #[test]
+    fn stage_keeps_misdeclared_private_node_in_probes_and_reports_override_ignored() {
+        let nodes = [
+            ("guest-1", "192.168.64.10", false),
+            ("guest-2", "192.168.65.10", true),
+        ];
+        let stage = stage_with(both_handshake_stages(), both_handshake_stages());
+        // The misdeclared node is NOT excluded, so it is probed: the double
+        // has no shell, so each direction records an unreachable probe.
+        let ctx = dataplane_ctx_on(
+            "misdecl",
+            &nodes,
+            crate::vm_lab::VmGuestPlatform::Linux,
+            false,
+        );
+        match stage.cross_bridge_preflight(&ctx) {
+            StageOutcome::Failed(msg) => {
+                assert!(msg.contains("CP-1"), "{msg}");
+                assert!(msg.contains("guest-2"), "{msg}");
+            }
+            other => panic!("expected Failed (split among probed nodes), got {other:?}"),
+        }
+        let report = read_witness(&ctx);
+        assert!(
+            report.contains(
+                "dataplane_endpoint override ignored for preflight (ssh host is on a private \
+                 lab network): guest-2"
+            ),
+            "{report}"
+        );
+        assert!(
+            !report.contains("dataplane-addressed (not L2-probed)"),
+            "{report}"
+        );
+        assert!(!report.contains(DP_PUBLIC_IP), "public IP leaked: {report}");
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    /// Regression: excluding the dataplane node does not weaken the gate for
+    /// the rest of the fleet — a split among the remaining nodes under a
+    /// dataplane plan still fails with the CP-1 text, and the excluded node
+    /// is still not probed (its adapter panics on `shell_host`).
+    #[test]
+    fn unexcluded_split_still_fails_with_cp1_text_alongside_a_dataplane_node() {
+        let nodes = [
+            ("guest-1", "192.168.64.10", false),
+            ("guest-2", "192.168.65.10", false),
+            (DP_NODE, DP_NODE_SSH_HOST, true),
+        ];
+        let stage = stage_with(both_handshake_stages(), both_handshake_stages());
+        let ctx = dataplane_ctx("split", &nodes);
+        match stage.cross_bridge_preflight(&ctx) {
+            StageOutcome::Failed(msg) => {
+                assert!(msg.contains("CP-1"), "{msg}");
+                assert!(msg.contains("guest-1") && msg.contains("guest-2"), "{msg}");
+                assert!(!msg.contains(DP_NODE), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
+    }
+
+    /// Fail closed: an inventory that cannot be loaded fails the stage rather
+    /// than silently probing a node that may be dataplane-addressed.
+    #[test]
+    fn unloadable_inventory_fails_the_cross_bridge_preflight() {
+        let stage = stage_with(both_handshake_stages(), both_handshake_stages());
+        let mut ctx = dataplane_ctx("badinv", &[("guest-1", "192.168.122.45", false)]);
+        std::fs::write(ctx.inventory_path.as_ref().unwrap(), "{ not json").unwrap();
+        match stage.cross_bridge_preflight(&ctx) {
+            StageOutcome::Failed(msg) => {
+                assert!(msg.contains("dataplane_endpoint"), "{msg}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        // No inventory path (unit-test contexts) => no overrides, no failure.
+        ctx.inventory_path = None;
+        assert_eq!(stage.cross_bridge_preflight(&ctx), StageOutcome::Passed);
+        let _ = std::fs::remove_dir_all(&ctx.report_dir);
     }
 }

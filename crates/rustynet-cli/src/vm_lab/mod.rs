@@ -9367,18 +9367,28 @@ fn selected_local_utm_readiness_from_report(
     })
 }
 
+/// Reason code for a controller-less (SSH-only) selected alias: the UTM
+/// discovery cannot see it, so its readiness is unknown, never assumed ready.
+const NOT_REPORTED_BY_DISCOVERY_REASON_CODE: &str = "not-reported-by-discovery";
+
 /// Controller-aware readiness for the selected orchestrate aliases.
 ///
 /// The UTM bundle-scan discovery (`execute_ops_vm_lab_discover_local_utm`) does
 /// not enumerate libvirt guests, so a Rust `--node` run selecting libvirt-backed
 /// aliases used to abort at `selected_local_utm_readiness_from_report` with
 /// "local UTM discovery did not report the selected aliases". This splits the
-/// selected aliases by inventory controller kind: UTM-backed (and controller-less
-/// SSH-only) aliases are read from the discovery `report_text` exactly as before
-/// (still fail-closed on a genuinely missing UTM alias), while libvirt-backed
-/// aliases are probed live through the same `observe_local_utm_target_ready`
-/// observer + `local_utm_ready_state_is_ready` predicate the standalone lifecycle
-/// commands use.
+/// selected aliases by inventory controller kind:
+/// - UTM-backed aliases are read from the discovery `report_text` exactly as
+///   before (still fail-closed on a genuinely missing UTM alias);
+/// - libvirt-backed aliases are probed live through the same
+///   `observe_local_utm_target_ready` observer + `local_utm_ready_state_is_ready`
+///   predicate the standalone lifecycle commands use;
+/// - controller-less SSH-only aliases (e.g. a cloud node) are NEVER looked up in
+///   the discovery report: it cannot see them, and an unmatched UTM bundle is
+///   reported under its VM display name, so a same-named alias could otherwise
+///   inherit an unrelated VM's verdict. They come back UNREADY with reason
+///   `not-reported-by-discovery` instead of aborting the run, so the
+///   `--trust-inventory-ready` gate can apply.
 ///
 /// Readiness-bar scope (verified against the two paths, not assumed):
 /// - **Linux/macOS libvirt guests are held to an equal-or-STRICTER bar** than the
@@ -9401,6 +9411,7 @@ pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
 ) -> Result<LocalUtmSelectedReadinessSummary, String> {
     let inventory = load_inventory(inventory_path)?;
     let mut utm_aliases = Vec::new();
+    let mut controllerless_aliases = Vec::new();
     let mut libvirt_aliases = Vec::new();
     for alias in selected_aliases {
         let entry = inventory
@@ -9409,10 +9420,8 @@ pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
             .ok_or_else(|| format!("selected alias {alias} is not in the inventory"))?;
         match entry.controller.as_ref() {
             Some(VmController::Libvirt { .. }) => libvirt_aliases.push(alias.clone()),
-            // LocalUtm, or a controller-less SSH-only entry: read from the UTM
-            // discovery report exactly as before. A controller-less entry that the
-            // UTM scan did not match still fails closed here (unchanged behaviour).
-            _ => utm_aliases.push(alias.clone()),
+            Some(VmController::LocalUtm { .. }) => utm_aliases.push(alias.clone()),
+            None => controllerless_aliases.push(alias.clone()),
         }
     }
 
@@ -9420,6 +9429,25 @@ pub(in crate::vm_lab) fn selected_nodes_readiness_with_libvirt(
     let utm_summary = selected_local_utm_readiness_from_report(report_text, &utm_aliases)?;
     let mut ready_aliases = utm_summary.ready_aliases;
     let mut unready_entries = utm_summary.unready_entries;
+
+    // Controller-less (SSH-only) aliases: the discovery report is never
+    // consulted (see the function docs), so such an alias is UNREADY with an
+    // explicit reason, never ready and never a hard error — aborting here would
+    // run before the `--trust-inventory-ready` gate could apply.
+    //
+    // Consequence (fail-closed, verified): with no `--trust-inventory-ready`, an
+    // unready controller-less alias goes down the Restart path, where
+    // `execute_ops_vm_lab_restart` (wait_ready) calls `resolve_start_targets`,
+    // which rejects a controller-less alias ("does not declare a local start
+    // controller") BEFORE anything is stopped -> the run fails loudly, it never
+    // silently proceeds. With the flag, the restart is skipped with a warning and
+    // bootstrap/live SSH is the arbiter. No alias is ever claimed ready here.
+    for alias in controllerless_aliases {
+        unready_entries.push(LocalUtmSelectedReadinessEntry {
+            alias,
+            reason_codes: vec![NOT_REPORTED_BY_DISCOVERY_REASON_CODE.to_owned()],
+        });
+    }
 
     // Libvirt-backed aliases: probe live via the shared observer, same bar.
     if !libvirt_aliases.is_empty() {
@@ -42112,6 +42140,214 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         assert!(
             accounted,
             "libvirt alias must appear in the readiness summary, not error out"
+        );
+    }
+
+    fn controllerless_readiness_fixture_inventory() -> PathBuf {
+        write_temp_inventory(
+            r#"{
+  "version": 1,
+  "entries": [
+    {
+      "alias": "cloud-node-1",
+      "ssh_target": "azureuser@100.64.15.9",
+      "os": "Ubuntu 24.04 LTS (x86_64)",
+      "platform": "linux"
+    },
+    {
+      "alias": "utm-node-1",
+      "ssh_target": "debian@192.168.64.20",
+      "platform": "linux",
+      "controller": {
+        "type": "local_utm",
+        "utm_name": "utm node 1",
+        "bundle_path": "/Users/example/Library/Containers/com.utmapp.UTM/Data/Documents/utm node 1.utm"
+      }
+    }
+  ]
+}"#,
+        )
+    }
+
+    fn controllerless_readiness_discover_config(path: &Path) -> VmLabDiscoverLocalUtmConfig {
+        VmLabDiscoverLocalUtmConfig {
+            inventory_path: Some(path.to_path_buf()),
+            utm_documents_root: None,
+            utmctl_path: None,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            ssh_port: 22,
+            timeout_secs: 1,
+            update_inventory_live_ips: false,
+            report_dir: None,
+        }
+    }
+
+    fn controllerless_readiness_report_entry(alias: &str, ready: bool) -> serde_json::Value {
+        json!({
+            "alias": alias,
+            "readiness": {
+                "powered": ready,
+                "networked": ready,
+                "tcp_ready": ready,
+                "auth_ready": ready,
+                "execution_ready": ready,
+                "reason_codes": if ready { Vec::<&str>::new() } else { vec!["ssh-auth-rejected"] }
+            }
+        })
+    }
+
+    /// A controller-less (SSH-only cloud) alias the UTM discovery report never
+    /// mentions must be UNREADY with an explicit reason, not a hard error, so the
+    /// `--trust-inventory-ready` gate can apply. It must never be claimed ready.
+    #[test]
+    fn selected_nodes_readiness_controllerless_alias_absent_from_report_is_unready() {
+        let path = controllerless_readiness_fixture_inventory();
+        let config = controllerless_readiness_discover_config(path.as_path());
+        let summary = selected_nodes_readiness_with_libvirt(
+            r#"{"entries":[]}"#,
+            &["cloud-node-1".to_owned()],
+            path.as_path(),
+            &config,
+        )
+        .expect("controller-less alias absent from discovery must not error");
+        assert!(summary.ready_aliases.is_empty());
+        assert_eq!(summary.unready_entries.len(), 1);
+        assert_eq!(summary.unready_entries[0].alias, "cloud-node-1");
+        assert_eq!(
+            summary.unready_entries[0].reason_codes,
+            vec!["not-reported-by-discovery".to_owned()]
+        );
+        // The trust flag then covers it (skip, no restart); without it -> Restart.
+        assert_eq!(
+            decide_restart_unready(summary.unready_entries.is_empty(), false, true),
+            RestartUnreadyDecision::TrustInventorySkip
+        );
+        assert_eq!(
+            decide_restart_unready(summary.unready_entries.is_empty(), false, false),
+            RestartUnreadyDecision::Restart
+        );
+    }
+
+    /// A LocalUtm alias absent from the report keeps the original hard error,
+    /// even when a controller-less alias is selected alongside it.
+    #[test]
+    fn selected_nodes_readiness_local_utm_alias_absent_from_report_still_errors() {
+        let path = controllerless_readiness_fixture_inventory();
+        let config = controllerless_readiness_discover_config(path.as_path());
+        let err = selected_nodes_readiness_with_libvirt(
+            r#"{"entries":[]}"#,
+            &["cloud-node-1".to_owned(), "utm-node-1".to_owned()],
+            path.as_path(),
+            &config,
+        )
+        .expect_err("LocalUtm alias absent from discovery must stay a hard error");
+        assert_eq!(
+            err,
+            "local UTM discovery did not report the selected aliases: utm-node-1"
+        );
+    }
+
+    /// The discovery report is NEVER consulted for a controller-less alias: an
+    /// unmatched UTM bundle is reported under its VM display name, so a
+    /// same-named controller-less alias could otherwise inherit that
+    /// unrelated VM's ready verdict. Even a report entry carrying the alias
+    /// with a fully-ready readiness leaves it UNREADY, with the explicit
+    /// reason. Mutation caught: looking controller-less aliases up in the
+    /// report again.
+    #[test]
+    fn selected_nodes_readiness_never_consults_report_for_controllerless_alias() {
+        let path = controllerless_readiness_fixture_inventory();
+        let config = controllerless_readiness_discover_config(path.as_path());
+        for ready in [true, false] {
+            let report = json!({
+                "entries": [controllerless_readiness_report_entry("cloud-node-1", ready)]
+            })
+            .to_string();
+            let summary = selected_nodes_readiness_with_libvirt(
+                report.as_str(),
+                &["cloud-node-1".to_owned()],
+                path.as_path(),
+                &config,
+            )
+            .expect("controller-less alias must not error");
+            assert!(
+                summary.ready_aliases.is_empty(),
+                "report entry (ready={ready}) must not make a controller-less alias ready"
+            );
+            assert_eq!(summary.unready_entries.len(), 1);
+            assert_eq!(summary.unready_entries[0].alias, "cloud-node-1");
+            assert_eq!(
+                summary.unready_entries[0].reason_codes,
+                vec!["not-reported-by-discovery".to_owned()],
+                "report verdict (ready={ready}) must not leak into the reason codes"
+            );
+        }
+    }
+
+    /// Fail-closed backstop for the restart path: without `--trust-inventory-ready`
+    /// an unready controller-less alias goes to restart, and restart resolves its
+    /// targets first — which rejects a controller-less alias before any stop.
+    #[test]
+    fn restart_target_resolution_rejects_controllerless_alias() {
+        let path = controllerless_readiness_fixture_inventory();
+        let err = resolve_start_targets(path.as_path(), &["cloud-node-1".to_owned()], false)
+            .expect_err("controller-less alias must not resolve to a start target");
+        assert!(
+            err.contains("does not declare a local start controller"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// End to end through `execute_ops_vm_lab_restart` (wait_ready, as the
+    /// orchestrator readiness gate calls it): a controller-less alias in the
+    /// selection fails the restart loudly, and BEFORE anything is stopped. The
+    /// selection also carries a LocalUtm alias with a bogus utmctl path: had the
+    /// stop path been reached it would have failed with "utmctl binary is not
+    /// present" (and left stop artifacts in the report dir); instead the error
+    /// is the start-target resolution one and the report dir stays empty.
+    /// Mutation caught: start-target resolution skipping (instead of
+    /// rejecting) a controller-less alias, which would let the LocalUtm alias
+    /// proceed to the stop.
+    #[test]
+    fn restart_with_wait_ready_rejects_controllerless_alias_before_any_stop() {
+        let path = controllerless_readiness_fixture_inventory();
+        let report_dir = path
+            .parent()
+            .expect("inventory parent")
+            .join("restart-report");
+        fs::create_dir_all(&report_dir).expect("report dir");
+        let err = super::execute_ops_vm_lab_restart(super::VmLabRestartConfig {
+            inventory_path: path.clone(),
+            vm_aliases: vec!["utm-node-1".to_owned(), "cloud-node-1".to_owned()],
+            raw_targets: Vec::new(),
+            select_all: false,
+            utmctl_path: PathBuf::from("/nonexistent/bogus-utmctl"),
+            service: None,
+            wait_ready: true,
+            ssh_port: 22,
+            ready_timeout_secs: 1,
+            ssh_user: None,
+            ssh_identity_file: None,
+            known_hosts_path: None,
+            timeout_secs: 1,
+            json_output: false,
+            report_dir: Some(report_dir.clone()),
+        })
+        .expect_err("controller-less alias must fail the restart");
+        assert!(
+            err.contains("does not declare a local start controller"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("cloud-node-1"), "{err}");
+        assert!(
+            !err.contains("utmctl binary is not present"),
+            "stop path must not have been reached: {err}"
+        );
+        assert_eq!(
+            fs::read_dir(&report_dir).expect("report dir").count(),
+            0,
+            "nothing may be stopped or recorded"
         );
     }
 

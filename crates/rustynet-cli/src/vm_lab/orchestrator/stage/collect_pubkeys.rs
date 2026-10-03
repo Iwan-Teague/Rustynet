@@ -340,7 +340,7 @@ fn resolve_collected_endpoint(
 /// Load `dataplane_endpoint` overrides for the run's aliases from the
 /// inventory the run was planned from. Empty (not an error) when the context
 /// carries no inventory path, which is how unit-test contexts are built.
-fn load_dataplane_overrides(
+pub(crate) fn load_dataplane_overrides(
     inventory_path: Option<&std::path::Path>,
 ) -> Result<std::collections::BTreeMap<String, std::net::IpAddr>, String> {
     let Some(path) = inventory_path else {

@@ -374,6 +374,23 @@ pub(crate) fn execute_rust_native_orchestration(
                 })
         })
         .collect::<Result<Vec<_>, String>>()?;
+    // A dataplane-addressed node is not on the management L2, so the /24
+    // auto-derive below would allow the wrong network. Refuse before any
+    // stage (and before readiness can touch a guest).
+    //
+    // Resume caveat: the check is "an explicit, non-empty ssh_allow_cidrs is
+    // present", not "it was passed on THIS command line". A resumed /
+    // `--run-only` run loads its saved context, and a saved context that
+    // already carries ssh_allow_cidrs passes this guard — including one
+    // persisted by a run that predates this guard, whose value may be an
+    // auto-derived /24. The guard only stops NEW runs from auto-deriving.
+    require_explicit_ssh_allow_cidrs_for_dataplane_nodes(
+        ctx.ssh_allow_cidrs.as_str(),
+        &node_entries
+            .iter()
+            .map(|(entry, _)| *entry)
+            .collect::<Vec<_>>(),
+    )?;
     for (entry, assignment) in &node_entries {
         let platform = entry_platform_or_fail(entry, assignment)?;
         if !assignment.role.is_lab_assignable_for_platform(&platform) {
@@ -444,6 +461,10 @@ pub(crate) fn execute_rust_native_orchestration(
             cross_network_options,
             config.max_parallel_node_workers.unwrap_or(1),
             std::sync::Arc::clone(&shutdown_flag),
+            // The same mode flags the filter below applies, so the preflight
+            // stage can tell which planned stages this invocation executes.
+            setup_only,
+            run_only,
         ),
         setup_only,
         run_only,
@@ -1299,6 +1320,8 @@ fn build_rust_native_orchestration_stages(
     cross_network: orchestrator::stage::cross_network::CrossNetworkOptions,
     max_parallel_node_workers: usize,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    setup_only: bool,
+    run_only: bool,
 ) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
     orchestrator::plan::PlanBuilder::new()
         .with_rebuild_only(rebuild_only)
@@ -1316,6 +1339,7 @@ fn build_rust_native_orchestration_stages(
         .with_cross_network_options(cross_network)
         .with_max_parallel_node_workers(max_parallel_node_workers)
         .with_shutdown_flag(shutdown_flag)
+        .with_invocation_mode(setup_only, run_only)
         .build()
 }
 
@@ -1438,21 +1462,34 @@ fn filter_rust_native_stages_for_mode(
     setup_only: bool,
     run_only: bool,
 ) -> Vec<Box<dyn orchestrator::stage::OrchestrationStage>> {
+    stages.retain(|stage| stage_id_retained_for_mode(&stage.id(), setup_only, run_only));
+    stages
+}
+
+/// Whether the `--setup-only` / `--run-only` mode keeps `id` in the plan. The
+/// single authority for the mode filter: [`filter_rust_native_stages_for_mode`]
+/// applies it to the built stages and `PlanBuilder` applies it to the planned
+/// ids it hands the preflight stage.
+pub(crate) fn stage_id_retained_for_mode(
+    id: &orchestrator::stage::StageId,
+    setup_only: bool,
+    run_only: bool,
+) -> bool {
     use orchestrator::stage::StageSuite;
     if setup_only {
         // Setup-only stops after the last Setup-suite stage (leaves the mesh
         // up on success; the runner still cleans up on failure).
-        let setup = rust_native_setup_stage_ids();
-        stages.retain(|stage| setup.contains(&stage.id()));
+        rust_native_setup_stage_ids().contains(id)
     } else if run_only {
         // Run-only reloads persisted setup state and runs the live suites
         // against the existing mesh — every suite EXCEPT the final teardown
         // (the mesh stays up). Setup stages are retained so the runner can
         // inject them as Passed dependencies. Suite tags are the RNQ-16
         // authority; this can no longer drift from the catalog.
-        stages.retain(|stage| stage.id().suite() != StageSuite::Cleanup);
+        id.suite() != StageSuite::Cleanup
+    } else {
+        true
     }
-    stages
 }
 
 #[cfg(test)]
@@ -1473,6 +1510,8 @@ pub(crate) fn rust_native_orchestration_stage_ids() -> Vec<orchestrator::stage::
         orchestrator::stage::cross_network::CrossNetworkOptions::default(),
         1,
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        false,
+        false,
     )
     .iter()
     .map(|stage| stage.id())
@@ -1501,6 +1540,8 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
             orchestrator::stage::cross_network::CrossNetworkOptions::default(),
             1,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            setup_only,
+            run_only,
         ),
         setup_only,
         run_only,
@@ -1614,6 +1655,37 @@ pub(crate) fn ensure_orchestration_network_profile_record(
         .map_err(|err| format!("serialize network profile record failed: {err}"))?;
     write_orchestration_artifact(&record_path, &serialized)?;
     Ok(record)
+}
+
+/// Fail-closed guard for nodes that declare an inventory `dataplane_endpoint`
+/// (a cloud node reached over the tailnet for management, its public address
+/// for dataplane). Such a node is by definition not on the management L2, so
+/// deriving `ssh_allow_cidrs` from its ssh address's /24 would open the wrong
+/// network. When any selected node has the override and no explicit
+/// `--ssh-allow-cidrs` was given, the run is refused instead of auto-deriving.
+fn require_explicit_ssh_allow_cidrs_for_dataplane_nodes(
+    ssh_allow_cidrs: &str,
+    selected: &[&VmInventoryEntry],
+) -> Result<(), String> {
+    if !ssh_allow_cidrs.trim().is_empty() {
+        return Ok(());
+    }
+    let aliases: Vec<&str> = selected
+        .iter()
+        .filter(|entry| entry.dataplane_endpoint.is_some())
+        .map(|entry| entry.alias.as_str())
+        .collect();
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "node(s) {} declare a dataplane_endpoint, so they are not on the management L2 and \
+         ssh_allow_cidrs cannot be auto-derived from their ssh address; pass --ssh-allow-cidrs \
+         covering the orchestrator's management source as the node sees it (for a \
+         tailnet-managed node, the orchestrator host's tailnet /32) plus the guests' \
+         management CIDR",
+        aliases.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -1807,5 +1879,69 @@ mod tests {
         assert!(bootstrap_hosts_executes(&plan, Some(&plan[..pos])));
         // An empty reuse set (resume at the very first stage) runs it.
         assert!(bootstrap_hosts_executes(&plan, Some(&[])));
+    }
+
+    /// Guard for dataplane-addressed nodes: refuses without an explicit
+    /// `--ssh-allow-cidrs`, passes with one, and is a no-op when no selected
+    /// node declares a `dataplane_endpoint`. Mutation caught: dropping the
+    /// `dataplane_endpoint` filter or the explicit-flag early return.
+    #[test]
+    fn dataplane_endpoint_node_requires_explicit_ssh_allow_cidrs() {
+        let plain = inventory_entry("guest-1", Some(VmGuestPlatform::Linux));
+        let mut cloud = inventory_entry("azure-vm-1", Some(VmGuestPlatform::Linux));
+        cloud.dataplane_endpoint = Some("203.0.113.7".parse().unwrap());
+
+        // Endpoint node selected, flag absent => refused, alias named, the
+        // address never echoed, the operator told what to pass.
+        let err = require_explicit_ssh_allow_cidrs_for_dataplane_nodes("", &[&plain, &cloud])
+            .expect_err("must refuse");
+        assert!(err.contains("azure-vm-1"), "{err}");
+        assert!(!err.contains("guest-1"), "{err}");
+        assert!(!err.contains("203.0.113.7"), "{err}");
+        assert!(err.contains("--ssh-allow-cidrs"), "{err}");
+        assert!(err.contains("tailnet /32"), "{err}");
+        // Whitespace-only is not explicit.
+        assert!(require_explicit_ssh_allow_cidrs_for_dataplane_nodes("  ", &[&cloud]).is_err());
+        // Flag present => passes.
+        assert!(
+            require_explicit_ssh_allow_cidrs_for_dataplane_nodes(
+                "100.64.0.5/32,192.168.122.0/24",
+                &[&plain, &cloud]
+            )
+            .is_ok()
+        );
+        // No selected node has an endpoint => unchanged (auto-derive path).
+        assert!(require_explicit_ssh_allow_cidrs_for_dataplane_nodes("", &[&plain]).is_ok());
+        assert!(require_explicit_ssh_allow_cidrs_for_dataplane_nodes("", &[]).is_ok());
+    }
+
+    /// The guard must actually be wired into the run path, and ahead of
+    /// anything that touches a guest or derives the allow-list. Whitespace is
+    /// stripped before searching so a rustfmt re-layout of the call cannot
+    /// break the match. Mutation caught: deleting the call, or moving it after
+    /// readiness / the /24 auto-derive.
+    #[test]
+    fn dataplane_ssh_allow_cidrs_guard_runs_before_readiness_and_auto_derive() {
+        let full = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ))
+        .expect("native.rs must read");
+        let production = &full[..full
+            .find("\n#[cfg(test)]")
+            .expect("test region marker present")];
+        let compact: String = production.split_whitespace().collect();
+        let at = |needle: &str| {
+            let needle: String = needle.split_whitespace().collect();
+            compact
+                .find(needle.as_str())
+                .unwrap_or_else(|| panic!("native.rs must contain {needle}"))
+        };
+        let guard = at(
+            "require_explicit_ssh_allow_cidrs_for_dataplane_nodes(ctx.ssh_allow_cidrs.as_str(),",
+        );
+        let readiness = at("orchestrator::readiness::run(");
+        let derive = at("if ctx.ssh_allow_cidrs.is_empty() {");
+        assert!(guard < readiness && guard < derive);
     }
 }

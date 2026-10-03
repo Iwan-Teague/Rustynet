@@ -112,6 +112,33 @@ use crate::vm_lab::orchestrator::stage::traffic_test_matrix::TrafficTestMatrixSt
 use crate::vm_lab::orchestrator::stage::validate_runtime::ValidateBaselineRuntimeStage;
 use crate::vm_lab::orchestrator::stage::verify_ssh::VerifySshReachabilityStage;
 
+/// Construct the preflight stage with both views of the plan: the full
+/// `planned` set (drives the Fail severity) and the same set narrowed by the
+/// caller's `--setup-only` / `--run-only` mode filter (drives only the
+/// dataplane-addressed PassWithNote/Warn decision, so a setup-only run cannot
+/// claim handshake proof from stages it will never run). The mode filter's
+/// single authority is `native::stage_id_retained_for_mode`.
+fn preflight_stage_for_plan(
+    enable_clock_remediation: bool,
+    planned: &[crate::vm_lab::orchestrator::stage::StageId],
+    setup_only: bool,
+    run_only: bool,
+) -> PreflightStage {
+    PreflightStage {
+        clock_remediation_enabled: enable_clock_remediation,
+        planned_stage_ids: planned.to_vec(),
+        invocation_stage_ids: planned
+            .iter()
+            .filter(|id| {
+                crate::vm_lab::orchestrator::native::stage_id_retained_for_mode(
+                    id, setup_only, run_only,
+                )
+            })
+            .cloned()
+            .collect(),
+    }
+}
+
 /// Builds the ordered list of stages for a lab run.
 #[derive(Default)]
 pub struct PlanBuilder {
@@ -177,6 +204,14 @@ pub struct PlanBuilder {
     /// Maximum concurrent per-node adapter operations.
     max_parallel_node_workers: usize,
     shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// `--setup-only`: the invocation keeps only the setup stages (the caller
+    /// filters the built plan accordingly). Recorded here so the preflight
+    /// stage can tell which of the planned stages this invocation will
+    /// actually execute.
+    setup_only: bool,
+    /// `--run-only`: the invocation drops the teardown (the caller filters
+    /// the built plan accordingly). Same purpose as `setup_only`.
+    run_only: bool,
 }
 
 impl PlanBuilder {
@@ -308,6 +343,16 @@ impl PlanBuilder {
         self
     }
 
+    /// Tell the builder which invocation mode (`--setup-only` / `--run-only`)
+    /// the caller will filter the built plan with, so the preflight stage can
+    /// distinguish the stages this invocation really executes from the full
+    /// plan. The plan itself is NOT filtered here.
+    pub fn with_invocation_mode(mut self, setup_only: bool, run_only: bool) -> Self {
+        self.setup_only = setup_only;
+        self.run_only = run_only;
+        self
+    }
+
     pub fn with_shutdown_flag(
         mut self,
         shutdown_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -334,6 +379,8 @@ impl PlanBuilder {
             cross_network,
             max_parallel_node_workers,
             shutdown_flag,
+            setup_only,
+            run_only,
         } = self;
 
         // Suite-inclusion authority (RNQ-16): the plan is StageId::ALL in
@@ -392,10 +439,12 @@ impl PlanBuilder {
             .iter()
             .map(|id| -> Box<dyn OrchestrationStage> {
                 match id {
-                    StageId::Preflight => Box::new(PreflightStage {
-                        clock_remediation_enabled: enable_clock_remediation,
-                        planned_stage_ids: planned.clone(),
-                    }),
+                    StageId::Preflight => Box::new(preflight_stage_for_plan(
+                        enable_clock_remediation,
+                        &planned,
+                        setup_only,
+                        run_only,
+                    )),
                     StageId::PrepareSourceArchive => {
                         Box::new(PrepareSourceArchiveStage::new(source_mode, allow_dirty))
                     }
@@ -1187,5 +1236,43 @@ mod tests {
             stages.len(),
             "all chaos-enabled stage IDs must be unique"
         );
+    }
+
+    /// The preflight stage gets BOTH views of the plan: `planned_stage_ids`
+    /// stays the full plan (Fail severity), `invocation_stage_ids` is the
+    /// plan after the `--setup-only` / `--run-only` mode filter. A setup-only
+    /// invocation "plans" the handshake-proving stages but does not execute
+    /// them, so they must be absent from the invocation view. Mutation
+    /// caught: handing preflight the unfiltered plan as its invocation view,
+    /// or filtering `planned_stage_ids` too.
+    #[test]
+    fn preflight_stage_carries_full_plan_and_mode_filtered_invocation() {
+        use crate::vm_lab::orchestrator::stage::StageId;
+        let planned: Vec<StageId> = StageId::ALL.to_vec();
+        let handshake = [StageId::MeshStatusValidation, StageId::TrafficTestMatrix];
+
+        // Default invocation: both views are the full plan.
+        let normal = preflight_stage_for_plan(false, &planned, false, false);
+        assert_eq!(normal.planned_stage_ids, planned);
+        assert_eq!(normal.invocation_stage_ids, planned);
+
+        // --setup-only: full plan untouched (Fail keeps reading it), but the
+        // invocation view drops the dataplane stages and keeps preflight.
+        let setup = preflight_stage_for_plan(false, &planned, true, false);
+        assert_eq!(setup.planned_stage_ids, planned);
+        for id in &handshake {
+            assert!(setup.planned_stage_ids.contains(id), "{id:?}");
+            assert!(!setup.invocation_stage_ids.contains(id), "{id:?}");
+        }
+        assert!(setup.invocation_stage_ids.contains(&StageId::Preflight));
+        assert!(setup.invocation_stage_ids.len() < planned.len());
+
+        // --run-only: the dataplane stages are still executed.
+        let run = preflight_stage_for_plan(false, &planned, false, true);
+        assert_eq!(run.planned_stage_ids, planned);
+        for id in &handshake {
+            assert!(run.invocation_stage_ids.contains(id), "{id:?}");
+        }
+        assert!(!run.invocation_stage_ids.contains(&StageId::Cleanup));
     }
 }
