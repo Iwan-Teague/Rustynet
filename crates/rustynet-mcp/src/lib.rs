@@ -3,6 +3,15 @@
 //! Implements JSON-RPC 2.0 over stdio per the MCP specification.
 //! Each binary server registers tools and runs the main loop via `run_server`.
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
@@ -503,7 +512,7 @@ pub fn truncate_tail(text: &str, max_lines: usize, max_bytes: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let total = lines.len();
     let mut out = if total > max_lines {
-        let tail = lines[total - max_lines..].join("\n");
+        let tail = lines.split_at(total - max_lines).1.join("\n");
         format!("... (truncated: showing last {max_lines} of {total} lines)\n{tail}")
     } else {
         text.to_string()
@@ -753,7 +762,7 @@ pub fn tail_file(path: &Path, lines: usize) -> Result<String, String> {
     };
     let all: Vec<&str> = text.lines().collect();
     let from = all.len().saturating_sub(lines);
-    Ok(all[from..].join("\n"))
+    Ok(all.split_at(from).1.join("\n"))
 }
 
 /// Read at most `max_bytes` of a file as UTF-8 (lossy), appending a note if the
@@ -856,7 +865,8 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> BoundedLin
                 reader.consume(newline_pos + 1);
                 return BoundedLine::TooLong;
             }
-            buf.extend_from_slice(&available[..newline_pos]);
+            let (before_newline, _) = available.split_at(newline_pos);
+            buf.extend_from_slice(before_newline);
             reader.consume(newline_pos + 1);
             return BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned());
         }
@@ -1644,5 +1654,213 @@ mod tests {
         assert!(out.contains("truncated"));
         assert!(out.len() < 700);
         let _ = std::fs::remove_file(&p);
+    }
+
+    // ── AQ-08 step 5 differential harness ────────────────────────────────
+    // The verbatim pre-rewrite logic runs against the post-rewrite logic over
+    // seeded mutations, so the equivalence is tested, not only read.
+
+    /// Seeded xorshift64* (same PRNG family the step-4 review harness used).
+    struct Xs(u64);
+    impl Xs {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// `truncate_tail` as it was before the AQ-08 step-5 rewrite (verbatim).
+    fn truncate_tail_old(text: &str, max_lines: usize, max_bytes: usize) -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len();
+        let mut out = if total > max_lines {
+            let tail = lines[total - max_lines..].join("\n");
+            format!("... (truncated: showing last {max_lines} of {total} lines)\n{tail}")
+        } else {
+            text.to_string()
+        };
+        if out.len() > max_bytes {
+            // Keep the tail: drop from the front, on a UTF-8 char boundary.
+            let mut start = out.len() - max_bytes;
+            while start < out.len() && !out.is_char_boundary(start) {
+                start += 1;
+            }
+            out = format!(
+                "... (truncated: output exceeded byte limit)\n{}",
+                &out[start..]
+            );
+        }
+        out
+    }
+
+    /// The `tail_file` tail-join, old indexing vs new `split_at`, isolated as
+    /// pure expressions (the surrounding file IO is unchanged).
+    fn tail_join_old(text: &str, n: usize) -> String {
+        let all: Vec<&str> = text.lines().collect();
+        let from = all.len().saturating_sub(n);
+        all[from..].join("\n")
+    }
+
+    fn tail_join_new(text: &str, n: usize) -> String {
+        let all: Vec<&str> = text.lines().collect();
+        let from = all.len().saturating_sub(n);
+        all.split_at(from).1.join("\n")
+    }
+
+    #[test]
+    fn aq08_step5_truncate_tail_differential_matches_old() {
+        let mut rng = Xs(0xA0805EED5EEDBEEF);
+        // Seed pool: line counts, byte limits, and multibyte/empty-line content
+        // so both the line path and the byte-boundary path are exercised.
+        let pieces = [
+            "Compiling crate-7\n",
+            "error[E0599]: no method `foo`\n",
+            "test result: FAILED\n",
+            "",
+            "héllo — multibyte\n",
+            "\tTabbed\tcolumns\t\n",
+            "…ellipsis…\n",
+        ];
+        for case in 0..20_000u64 {
+            let line_count = (rng.next() % 40) as usize;
+            let mut s = String::new();
+            for _ in 0..line_count {
+                s.push_str(pieces[(rng.next() as usize) % pieces.len()]);
+            }
+            if rng.next() % 8 == 0 {
+                s.push_str("unterminated tail");
+            }
+            let max_lines = (rng.next() % 45) as usize;
+            let max_bytes = match rng.next() % 4 {
+                0 => 0,
+                1 => 1,
+                2 => (rng.next() % 300) as usize,
+                _ => 1_000_000,
+            };
+            let old = truncate_tail_old(&s, max_lines, max_bytes);
+            let new = truncate_tail(&s, max_lines, max_bytes);
+            assert_eq!(
+                old, new,
+                "case {case}: text={s:?} max_lines={max_lines} max_bytes={max_bytes}"
+            );
+        }
+    }
+
+    #[test]
+    fn aq08_step5_tail_join_differential_matches_old() {
+        let mut rng = Xs(0xB0805EED5EEDCAFE);
+        for case in 0..20_000u64 {
+            let line_count = (rng.next() % 30) as usize;
+            let mut s = String::new();
+            for i in 0..line_count {
+                s.push_str(&format!(
+                    "L{i}{}",
+                    if rng.next() % 4 == 0 { "é" } else { "" }
+                ));
+                s.push('\n');
+            }
+            let n = (rng.next() % 35) as usize;
+            assert_eq!(
+                tail_join_old(&s, n),
+                tail_join_new(&s, n),
+                "case {case}: text={s:?} n={n}"
+            );
+        }
+    }
+
+    /// `read_bounded_line` as it was before the AQ-08 step-5 rewrite
+    /// (verbatim; only the name differs). The single rewrite site is the
+    /// `available[..newline_pos]` extend, now a `split_at`.
+    fn read_bounded_line_old<R: BufRead>(reader: &mut R, max_bytes: usize) -> BoundedLine {
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let available = match reader.fill_buf() {
+                Ok(chunk) => chunk,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return BoundedLine::Io(e),
+            };
+            if available.is_empty() {
+                // EOF: emit a trailing unterminated line if any was buffered.
+                return if buf.is_empty() {
+                    BoundedLine::Eof
+                } else {
+                    BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned())
+                };
+            }
+            if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+                if buf.len() + newline_pos > max_bytes {
+                    reader.consume(newline_pos + 1);
+                    return BoundedLine::TooLong;
+                }
+                buf.extend_from_slice(&available[..newline_pos]);
+                reader.consume(newline_pos + 1);
+                return BoundedLine::Line(String::from_utf8_lossy(&buf).into_owned());
+            }
+            // No newline in this chunk yet.
+            if buf.len() + available.len() > max_bytes {
+                let consume_len = available.len();
+                reader.consume(consume_len);
+                drain_to_newline(reader);
+                return BoundedLine::TooLong;
+            }
+            buf.extend_from_slice(available);
+            let consume_len = available.len();
+            reader.consume(consume_len);
+        }
+    }
+
+    fn describe_bounded(b: BoundedLine) -> String {
+        match b {
+            BoundedLine::Line(l) => format!("Line({l:?})"),
+            BoundedLine::TooLong => "TooLong".to_string(),
+            BoundedLine::Eof => "Eof".to_string(),
+            BoundedLine::Io(e) => format!("Io({e})"),
+        }
+    }
+
+    #[test]
+    fn aq08_step5_read_bounded_line_differential_matches_old() {
+        let mut rng = Xs(0xC0805EED5EEDABCD);
+        for case in 0..2_000u64 {
+            // Seeded stream: random bytes, biased to newlines, split at random
+            // chunk boundaries so fill_buf() hands out varying slices. Small
+            // caps force the TooLong path.
+            let stream_len = (rng.next() % 200) as usize;
+            let mut stream: Vec<u8> = (0..stream_len)
+                .map(|_| {
+                    if rng.next() % 3 == 0 {
+                        b'\n'
+                    } else {
+                        b'a' + (rng.next() % 26) as u8
+                    }
+                })
+                .collect();
+            if rng.next() % 4 == 0 {
+                stream.push(b'\n');
+            }
+            let max_bytes = match rng.next() % 3 {
+                0 => 0,
+                1 => 1 + (rng.next() % 8) as usize,
+                _ => 1_000_000,
+            };
+            let chunk_size = 1 + (rng.next() % 30) as usize;
+            let mut r_old = BufReader::with_capacity(chunk_size, std::io::Cursor::new(&stream));
+            let mut r_new = BufReader::with_capacity(chunk_size, std::io::Cursor::new(&stream));
+            loop {
+                let old = describe_bounded(read_bounded_line_old(&mut r_old, max_bytes));
+                let new = describe_bounded(read_bounded_line(&mut r_new, max_bytes));
+                assert_eq!(
+                    old, new,
+                    "case {case}: stream={stream:?} max_bytes={max_bytes} chunk={chunk_size}"
+                );
+                if old == "Eof" {
+                    break;
+                }
+            }
+        }
     }
 }

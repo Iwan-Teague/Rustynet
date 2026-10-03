@@ -10,6 +10,15 @@
 //! every MCP call short, so a single call never blocks past a client's request
 //! timeout.
 
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 #![forbid(unsafe_code)]
 
 use rustynet_mcp::{
@@ -618,16 +627,16 @@ impl LabStateServer {
                     .filter(|l| !l.trim().is_empty())
                     .filter_map(|line| {
                         let cols: Vec<&str> = line.split('\t').collect();
-                        if cols.len() < 5 {
+                        let [stage, _, status_raw, rc, log, ..] = cols.as_slice() else {
                             return None;
-                        }
-                        let status = cols[2].to_lowercase();
+                        };
+                        let status = status_raw.to_lowercase();
                         (status == "fail" || status == "error").then(|| {
                             (
-                                cols[0].to_string(),
-                                cols[2].to_string(),
-                                cols[3].to_string(),
-                                cols[4].to_string(),
+                                stage.to_string(),
+                                status_raw.to_string(),
+                                rc.to_string(),
+                                log.to_string(),
                             )
                         })
                     })
@@ -636,9 +645,8 @@ impl LabStateServer {
                 Vec::new()
             };
 
-        if !tsv_failures.is_empty() {
+        if let Some(first) = tsv_failures.first() {
             if first_failure_info.is_none() {
-                let first = &tsv_failures[0];
                 out.push_str("## First failed stage (from stages.tsv)\n\n");
                 out.push_str(&format!(
                     "- **Stage:** `{}` (rc={})\n- **Log:** `{}`\n\n",
@@ -679,14 +687,14 @@ impl LabStateServer {
             if let Ok(body) = std::fs::read_to_string(&tsv_path) {
                 for line in body.lines().filter(|l| !l.trim().is_empty()) {
                     let cols: Vec<&str> = line.split('\t').collect();
-                    if cols.len() < 5 {
+                    let [name, _, _, _, log_col, ..] = cols.as_slice() else {
                         continue;
-                    }
-                    let name_l = cols[0].to_lowercase();
+                    };
+                    let name_l = name.to_lowercase();
                     if !name_l.contains(norm) && !norm.contains(name_l.as_str()) {
                         continue;
                     }
-                    let raw = cols[4];
+                    let raw = *log_col;
                     for cand in [
                         PathBuf::from(raw),
                         report_dir.join(raw),
@@ -2623,24 +2631,21 @@ impl LabStateServer {
                 );
                 for line in body.lines().filter(|l| !l.trim().is_empty()) {
                     let cols: Vec<&str> = line.split('\t').collect();
-                    if cols.len() < 6 {
+                    let [name, _, status, rc, log_col, description, ..] = cols.as_slice() else {
                         continue;
-                    }
-                    let name_l = cols[0].to_lowercase();
+                    };
+                    let name_l = name.to_lowercase();
                     if !name_l.contains(norm) && !norm.contains(name_l.as_str()) {
                         continue;
                     }
                     hits += 1;
-                    out.push_str(&format!(
-                        "| {} | {} | {} | {} |\n",
-                        cols[0], cols[2], cols[3], cols[5]
-                    ));
+                    out.push_str(&format!("| {name} | {status} | {rc} | {description} |\n"));
                     // Resolve the log path (col 4): absolute, report-relative, or
                     // ./-prefixed. A planted TSV row must not turn this tool into
                     // an arbitrary-file read, so every candidate is confined to
                     // the repo root first (mirrors ai_agent's lab_stage_log,
                     // which re-confines this exact surface).
-                    let raw = cols[4];
+                    let raw = *log_col;
                     for cand in [
                         PathBuf::from(raw),
                         report_dir.join(raw),
@@ -3168,7 +3173,7 @@ impl LabStateServer {
             "# Loop journal ({total} notes, showing last {})\n\n",
             total - start
         );
-        for (i, line) in lines[start..].iter().enumerate() {
+        for (i, line) in lines.split_at(start).1.iter().enumerate() {
             let n = start + i + 1;
             if let Ok(v) = serde_json::from_str::<Value>(line) {
                 let ts = v.get("ts_unix").and_then(|x| x.as_u64()).unwrap_or(0);
@@ -3409,7 +3414,7 @@ impl LabStateServer {
                     let lines: Vec<&str> = body.lines().filter(|l| !l.trim().is_empty()).collect();
                     let start = lines.len().saturating_sub(12);
                     out.push_str("\n## Latest log lines\n```\n");
-                    for l in &lines[start..] {
+                    for l in lines.split_at(start).1 {
                         out.push_str(l);
                         out.push('\n');
                     }
@@ -3496,8 +3501,11 @@ fn read_rust_native_running_stage_from_tsv(path: &Path) -> Option<String> {
     let body = std::fs::read_to_string(path).ok()?;
     for line in body.lines() {
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() >= 3 && cols[2].trim() == "running" && !cols[0].trim().is_empty() {
-            return Some(cols[0].trim().to_owned());
+        if let [stage, _, status, ..] = cols.as_slice()
+            && status.trim() == "running"
+            && !stage.trim().is_empty()
+        {
+            return Some(stage.trim().to_owned());
         }
     }
     None
@@ -3999,9 +4007,12 @@ fn trend_verdict(rows: &[(String, String)]) -> String {
     if runs.is_empty() {
         return "NO DATA".to_string();
     }
-    let (last_res, _) = runs[runs.len() - 1];
+    let Some(&(last_res, _)) = runs.last() else {
+        return "NO DATA".to_string(); // unreachable: `runs` is non-empty here
+    };
     if is_pass(last_res) {
-        let prev_pass = runs.len() >= 2 && is_pass(runs[runs.len() - 2].0);
+        let prev_pass =
+            runs.len() >= 2 && runs.get(runs.len() - 2).is_some_and(|(r, _)| is_pass(r));
         return if prev_pass {
             "GREEN — stable (last 2+ runs pass)".to_string()
         } else {
@@ -5648,7 +5659,9 @@ impl McpServer for LabStateServer {
                 let ssh_key = default_ssh_identity();
                 let kh = default_known_hosts();
                 let mut extra: Vec<&str> = Vec::new();
-                if aliases.len() == 1 && aliases[0] == "--all" {
+                if let [only] = aliases.as_slice()
+                    && only == "--all"
+                {
                     extra.push("--all");
                 } else {
                     for alias in &aliases {
@@ -5674,7 +5687,9 @@ impl McpServer for LabStateServer {
                     return tool_error("At least one alias (or ['--all']) is required");
                 }
                 let mut extra: Vec<&str> = Vec::new();
-                if aliases.len() == 1 && aliases[0] == "--all" {
+                if let [only] = aliases.as_slice()
+                    && only == "--all"
+                {
                     extra.push("--all");
                 } else {
                     for a in &aliases {
@@ -5691,7 +5706,9 @@ impl McpServer for LabStateServer {
                     return tool_error("At least one alias (or ['--all']) is required");
                 }
                 let mut extra: Vec<&str> = Vec::new();
-                if aliases.len() == 1 && aliases[0] == "--all" {
+                if let [only] = aliases.as_slice()
+                    && only == "--all"
+                {
                     extra.push("--all");
                 } else {
                     for a in &aliases {
@@ -6211,14 +6228,15 @@ impl McpServer for LabStateServer {
                         if lines.is_empty() {
                             result.push_str("Matrix is empty.\n");
                         } else {
-                            result.push_str(&format!("```\n{}\n```\n\n", lines[0]));
+                            let header = lines.first().copied().unwrap_or(""); // unreachable: non-empty above
+                            result.push_str(&format!("```\n{header}\n```\n\n"));
                             let start = if lines.len() > limit + 1 {
                                 lines.len() - limit
                             } else {
                                 1
                             };
                             result.push_str(&format!("## Last {limit} runs\n\n```\n"));
-                            for line in &lines[start..] {
+                            for line in lines.split_at(start).1 {
                                 result.push_str(line);
                                 result.push('\n');
                             }
@@ -8241,6 +8259,17 @@ impl LabStateServer {
             .collect()
     }
 
+    /// Insert `key: value` into a JSON object. A top-level `v["key"] = ..`
+    /// panics only when `v` is neither an object nor null; the reports this
+    /// module writes always start as `json!({..})` objects, so the non-object
+    /// arm is unreachable from the callers below and the helper is
+    /// behaviour-preserving at every call site.
+    fn json_object_insert(v: &mut Value, key: &str, value: Value) {
+        if let Value::Object(map) = v {
+            map.insert(key.to_string(), value);
+        }
+    }
+
     /// Seed one node. Returns a structured per-node report (always; failures are
     /// reported via `ok=false` + `error`, never a panic).
     fn seed_node(
@@ -8263,7 +8292,7 @@ impl LabStateServer {
             "ok": false,
         });
         let set_err = |mut v: Value, msg: String| -> Value {
-            v["error"] = Value::String(msg);
+            Self::json_object_insert(&mut v, "error", Value::String(msg));
             v
         };
 
@@ -8280,7 +8309,7 @@ impl LabStateServer {
         } else {
             "linux"
         };
-        base["os"] = Value::String(os.to_string());
+        Self::json_object_insert(&mut base, "os", Value::String(os.to_string()));
         let is_windows = os == "windows";
 
         // Guest registry root + hash.
@@ -8294,7 +8323,11 @@ impl LabStateServer {
             Ok(None) => host_hash.to_string(), // empty guest registry → use host hash
             Err(e) => return set_err(base, format!("hash detection failed: {e}")),
         };
-        base["registry_hash"] = Value::String(guest_hash.clone());
+        Self::json_object_insert(
+            &mut base,
+            "registry_hash",
+            Value::String(guest_hash.clone()),
+        );
 
         // Probe which lock crates are missing on the guest.
         let probe = match self.probe_guest_missing(&target, &user, is_windows, &guest_hash, crates)
@@ -8303,17 +8336,17 @@ impl LabStateServer {
             Err(e) => return set_err(base, format!("missing-probe failed: {e}")),
         };
         let missing_before = missing_crates_from_presence(&guest_hash, crates, &probe);
-        base["missing_before"] = json!(missing_before.len());
+        Self::json_object_insert(&mut base, "missing_before", json!(missing_before.len()));
 
         if dry_run {
-            base["ok"] = json!(true);
+            Self::json_object_insert(&mut base, "ok", json!(true));
             if !missing_before.is_empty() {
                 let sample: Vec<String> = missing_before
                     .iter()
                     .take(8)
                     .map(|c| format!("{}-{}", c.name, c.version))
                     .collect();
-                base["sample_missing"] = json!(sample);
+                Self::json_object_insert(&mut base, "sample_missing", json!(sample));
             }
             return base;
         }
@@ -8342,7 +8375,7 @@ impl LabStateServer {
         {
             return set_err(base, format!("ship failed: {e}"));
         }
-        base["seeded"] = json!(to_ship.len());
+        Self::json_object_insert(&mut base, "seeded", json!(to_ship.len()));
 
         // Re-probe to verify.
         let probe2 = match self.probe_guest_missing(&target, &user, is_windows, &guest_hash, crates)
@@ -8351,8 +8384,8 @@ impl LabStateServer {
             Err(e) => return set_err(base, format!("verify-probe failed: {e}")),
         };
         let missing_after = missing_crates_from_presence(&guest_hash, crates, &probe2);
-        base["missing_after"] = json!(missing_after.len());
-        base["ok"] = json!(missing_after.is_empty());
+        Self::json_object_insert(&mut base, "missing_after", json!(missing_after.len()));
+        Self::json_object_insert(&mut base, "ok", json!(missing_after.is_empty()));
         if !missing_after.is_empty() {
             let still: Vec<String> = missing_after
                 .iter()
@@ -8364,11 +8397,15 @@ impl LabStateServer {
                 .iter()
                 .filter(|c| host_missing_set.contains(&(c.name.clone(), c.version.clone())))
                 .count();
-            base["error"] = Value::String(format!(
-                "{} still missing after seeding ({host_blocked} of them missing on host, unseedable); sample: {}",
-                missing_after.len(),
-                still.join(", ")
-            ));
+            Self::json_object_insert(
+                &mut base,
+                "error",
+                Value::String(format!(
+                    "{} still missing after seeding ({host_blocked} of them missing on host, unseedable); sample: {}",
+                    missing_after.len(),
+                    still.join(", ")
+                )),
+            );
         }
         base
     }
@@ -11599,5 +11636,274 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
             text.contains("no --node topology could be synthesized"),
             "error must explain the synthesis failure; got: {text}"
         );
+    }
+
+    // ── AQ-08 step 5 differential harness ────────────────────────────────
+    // The verbatim pre-rewrite logic runs against the post-rewrite logic over
+    // seeded mutations, so the equivalence is tested, not only read.
+
+    /// Seeded xorshift64*.
+    struct Aq08Xs(u64);
+    impl Aq08Xs {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+    }
+
+    /// The stages.tsv failure-row extraction as it was before the AQ-08
+    /// step-5 rewrite (the `filter_map` closure from lab_diagnostics,
+    /// verbatim, hoisted into a test-local fn).
+    fn stage_failures_from_body_old(body: &str) -> Vec<(String, String, String, String)> {
+        body.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|line| {
+                let cols: Vec<&str> = line.split('\t').collect();
+                if cols.len() < 5 {
+                    return None;
+                }
+                let status = cols[2].to_lowercase();
+                (status == "fail" || status == "error").then(|| {
+                    (
+                        cols[0].to_string(),
+                        cols[2].to_string(),
+                        cols[3].to_string(),
+                        cols[4].to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// The post-rewrite extraction, mirroring the patched `filter_map`.
+    fn stage_failures_from_body_new(body: &str) -> Vec<(String, String, String, String)> {
+        body.lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|line| {
+                let cols: Vec<&str> = line.split('\t').collect();
+                let [stage, _, status_raw, rc, log, ..] = cols.as_slice() else {
+                    return None;
+                };
+                let status = status_raw.to_lowercase();
+                (status == "fail" || status == "error").then(|| {
+                    (
+                        stage.to_string(),
+                        status_raw.to_string(),
+                        rc.to_string(),
+                        log.to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn aq08_step5_stage_failures_differential_matches_old() {
+        let mut rng = Aq08Xs(0xE0805EED5EED0001);
+        let atoms = [
+            "build", "BUILD", "fail", "FAIL", "Fail", "error", "ERROR", "pass", "running", "",
+            "skipped", "fa il",
+        ];
+        for case in 0..20_000u64 {
+            let line_count = (rng.next() % 8) as usize;
+            let mut body = String::new();
+            for _ in 0..line_count {
+                let cols = (rng.next() % 8) as usize; // 0..=7 tab-separated cols
+                let mut row = String::new();
+                for col in 0..cols {
+                    if col > 0 {
+                        row.push('\t');
+                    }
+                    let cell = match col {
+                        0 => format!("stage_{}", rng.next() % 4),
+                        2 => atoms[(rng.next() as usize) % atoms.len()].to_string(),
+                        4 => format!("./logs/{}.log", rng.next() % 3),
+                        _ => format!("c{}", rng.next() % 100),
+                    };
+                    row.push_str(&cell);
+                }
+                if rng.next() % 10 == 0 {
+                    row = format!("   {row}   "); // whitespace-padded line
+                }
+                body.push_str(&row);
+                body.push('\n');
+            }
+            assert_eq!(
+                stage_failures_from_body_old(&body),
+                stage_failures_from_body_new(&body),
+                "case {case}: body={body:?}"
+            );
+        }
+    }
+
+    /// `read_rust_native_running_stage_from_tsv` as it was before the AQ-08
+    /// step-5 rewrite (verbatim; only the name differs).
+    fn read_rust_native_running_stage_from_tsv_old(path: &Path) -> Option<String> {
+        let body = std::fs::read_to_string(path).ok()?;
+        for line in body.lines() {
+            let cols: Vec<&str> = line.split('\t').collect();
+            if cols.len() >= 3 && cols[2].trim() == "running" && !cols[0].trim().is_empty() {
+                return Some(cols[0].trim().to_owned());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn aq08_step5_running_stage_tsv_differential_matches_old() {
+        let mut rng = Aq08Xs(0xE0805EED5EED0002);
+        let statuses = ["running", " running ", "RUNNING", "fail", "pass", "", "ok "];
+        let stages = ["build", "  ", "", "test", " relays "];
+        let p = std::env::temp_dir().join(format!("aq08s5-tsv-{}.tsv", std::process::id()));
+        for case in 0..3_000u64 {
+            let line_count = (rng.next() % 6) as usize;
+            let mut body = String::new();
+            for _ in 0..line_count {
+                let cols = (rng.next() % 6) as usize;
+                let mut row = String::new();
+                for col in 0..cols {
+                    if col > 0 {
+                        row.push('\t');
+                    }
+                    let cell = match col {
+                        0 => stages[(rng.next() as usize) % stages.len()].to_string(),
+                        2 => statuses[(rng.next() as usize) % statuses.len()].to_string(),
+                        _ => format!("x{}", rng.next() % 9),
+                    };
+                    row.push_str(&cell);
+                }
+                body.push_str(&row);
+                body.push('\n');
+            }
+            std::fs::write(&p, &body).unwrap();
+            assert_eq!(
+                read_rust_native_running_stage_from_tsv_old(&p),
+                read_rust_native_running_stage_from_tsv(&p),
+                "case {case}: body={body:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `trend_verdict` as it was before the AQ-08 step-5 rewrite (verbatim;
+    /// only the name differs).
+    fn trend_verdict_old(rows: &[(String, String)]) -> String {
+        let is_pass = |r: &str| r.eq_ignore_ascii_case("pass") || r.eq_ignore_ascii_case("passed");
+        // Drop rows with no recorded result: empty (malformed) and the run-start
+        // marker's `in_progress` (in-flight) — a killed run's stale marker must
+        // not count as a failure in the streak (review D, 2026-09-11).
+        let runs: Vec<(&str, &str)> = rows
+            .iter()
+            .filter(|(r, _)| !r.trim().is_empty() && !r.trim().eq_ignore_ascii_case("in_progress"))
+            .map(|(r, s)| (r.as_str(), s.as_str()))
+            .collect();
+        if runs.is_empty() {
+            return "NO DATA".to_string();
+        }
+        let (last_res, _) = runs[runs.len() - 1];
+        if is_pass(last_res) {
+            let prev_pass = runs.len() >= 2 && is_pass(runs[runs.len() - 2].0);
+            return if prev_pass {
+                "GREEN — stable (last 2+ runs pass)".to_string()
+            } else {
+                "JUST GREEN (latest run passed; confirm with one more run)".to_string()
+            };
+        }
+        // Latest run failed — measure the trailing run of consecutive failures.
+        let mut streak: Vec<&str> = Vec::new();
+        for pair in runs.iter().rev() {
+            if is_pass(pair.0) {
+                break;
+            }
+            streak.push(pair.1);
+        }
+        let latest_stage = streak.first().copied().unwrap_or("");
+        let stage_label = if latest_stage.is_empty() {
+            "(unknown stage)"
+        } else {
+            latest_stage
+        };
+        if streak.len() >= 2 && streak.iter().all(|s| *s == latest_stage) {
+            format!(
+                "STUCK at {stage_label} ({} consecutive fails at the same stage)",
+                streak.len()
+            )
+        } else if streak.len() >= 2 {
+            format!("MOVING (failing, but the stage is changing — latest: {stage_label})")
+        } else {
+            format!("FAILING at {stage_label} (only 1 run; need history to judge a trend)")
+        }
+    }
+
+    #[test]
+    fn aq08_step5_trend_verdict_differential_matches_old() {
+        let mut rng = Aq08Xs(0xE0805EED5EED0003);
+        let results = [
+            "pass",
+            "PASS",
+            "passed",
+            "fail",
+            "FAIL",
+            "in_progress",
+            "",
+            " ",
+            "error",
+        ];
+        let stages = ["build", "", "  ", "test", "relay_svc"];
+        for case in 0..20_000u64 {
+            let row_count = (rng.next() % 10) as usize;
+            let rows: Vec<(String, String)> = (0..row_count)
+                .map(|_| {
+                    (
+                        results[(rng.next() as usize) % results.len()].to_string(),
+                        stages[(rng.next() as usize) % stages.len()].to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                trend_verdict_old(&rows),
+                trend_verdict(&rows),
+                "case {case}: rows={rows:?}"
+            );
+        }
+    }
+
+    /// The pre-rewrite `v["key"] = value` write, restricted to the object case
+    /// (the only case `seed_node`'s reports can reach: `base` starts as a
+    /// `json!({..})` object literal and is never reassigned).
+    fn json_obj_insert_old(v: &mut Value, key: &str, value: Value) {
+        v[key] = value;
+    }
+
+    #[test]
+    fn aq08_step5_json_object_insert_differential_matches_old_on_objects() {
+        let mut rng = Aq08Xs(0xE0805EED5EED0004);
+        let keys = ["error", "os", "ok", "seeded", "sample_missing"];
+        let values = [
+            json!(true),
+            json!(0),
+            json!("text"),
+            json!(["a", "b"]),
+            json!({"nested": 1}),
+            Value::Null,
+        ];
+        for case in 0..20_000u64 {
+            let key = keys[(rng.next() as usize) % keys.len()];
+            let value = values[(rng.next() as usize) % values.len()].clone();
+            // Object with or without the key pre-existing (overwrite vs insert).
+            let mut old = json!({ "alias": "vm-a", "ok": false });
+            let mut new = json!({ "alias": "vm-a", "ok": false });
+            if rng.next() % 2 == 0 {
+                old[key] = json!("pre");
+                new[key] = json!("pre");
+            }
+            json_obj_insert_old(&mut old, key, value.clone());
+            LabStateServer::json_object_insert(&mut new, key, value);
+            assert_eq!(old, new, "case {case}: key={key:?}");
+        }
     }
 }
