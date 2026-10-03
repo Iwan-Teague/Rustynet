@@ -1,4 +1,13 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
 use std::fs;
 use std::io::{self, Read, Write};
@@ -445,39 +454,56 @@ fn redact_first_keyword_value(line: &str, keyword: &str) -> Option<String> {
     let keyword_len = keyword.len();
     let mut search_from = 0usize;
     while search_from + keyword_len <= lowered.len() {
-        let offset = lowered[search_from..].find(keyword)?;
+        let offset = lowered.get(search_from..)?.find(keyword)?;
         let start = search_from + offset;
         let end = start + keyword_len;
-        let before = line[..start].chars().next_back();
-        let after = line[end..].chars().next();
+        let before = line
+            .get(..start)
+            .and_then(|prefix| prefix.chars().next_back());
+        let after = line.get(end..).and_then(|suffix| suffix.chars().next());
         if !is_word_boundary(before) || !is_word_boundary(after) {
             search_from = end;
             continue;
         }
         let bytes = line.as_bytes();
         let mut sep_index = end;
-        while sep_index < bytes.len() && bytes[sep_index].is_ascii_whitespace() {
+        while sep_index < bytes.len()
+            && bytes
+                .get(sep_index)
+                .copied()
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             sep_index += 1;
         }
-        if sep_index >= bytes.len() || !matches!(bytes[sep_index], b':' | b'=') {
+        if sep_index >= bytes.len() || !matches!(bytes.get(sep_index).copied(), Some(b':' | b'=')) {
             search_from = end;
             continue;
         }
         let mut value_start = sep_index + 1;
-        while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+        while value_start < bytes.len()
+            && bytes
+                .get(value_start)
+                .copied()
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             value_start += 1;
         }
         if value_start >= bytes.len() {
             return None;
         }
         let mut value_end = value_start;
-        while value_end < bytes.len() && !bytes[value_end].is_ascii_whitespace() {
+        while value_end < bytes.len()
+            && !bytes
+                .get(value_end)
+                .copied()
+                .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
             value_end += 1;
         }
         let mut out = String::with_capacity(line.len());
-        out.push_str(&line[..value_start]);
+        out.push_str(line.get(..value_start)?);
         out.push_str("<redacted>");
-        out.push_str(&line[value_end..]);
+        out.push_str(line.get(value_end..)?);
         return Some(out);
     }
     None
@@ -523,8 +549,8 @@ fn parse_network_prefix(prefix: &str) -> Result<[u8; 3], String> {
         ));
     }
     let mut octets = [0u8; 3];
-    for (index, part) in parts.iter().enumerate() {
-        octets[index] = part
+    for (slot, part) in octets.iter_mut().zip(parts.iter()) {
+        *slot = part
             .parse::<u8>()
             .map_err(|err| format!("invalid --network-prefix {prefix:?}: {err}"))?;
     }
@@ -772,10 +798,9 @@ fn build_dns_query_packet(qname: &str) -> Vec<u8> {
 fn skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize, String> {
     let mut labels_seen = 0usize;
     loop {
-        if offset >= packet.len() {
+        let Some(&len) = packet.get(offset) else {
             return Err("dns response truncated while reading name".to_owned());
-        }
-        let len = packet[offset];
+        };
         if len & 0b1100_0000 == 0b1100_0000 {
             if offset + 1 >= packet.len() {
                 return Err("dns response truncated while reading compression pointer".to_owned());
@@ -826,26 +851,40 @@ fn decode_first_dns_answer(
         if offset + 10 > response.len() {
             return Err("dns response truncated in answer header".to_owned());
         }
-        let rr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
-        let rr_class = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
-        let ttl = u32::from_be_bytes([
-            response[offset + 4],
-            response[offset + 5],
-            response[offset + 6],
-            response[offset + 7],
-        ]);
-        let rdlen = u16::from_be_bytes([response[offset + 8], response[offset + 9]]) as usize;
+        let Some(answer_tail) = response.get(offset..offset + 10) else {
+            return Err("dns response truncated in answer header".to_owned());
+        };
+        let &[
+            type_high,
+            type_low,
+            class_high,
+            class_low,
+            ttl_a,
+            ttl_b,
+            ttl_c,
+            ttl_d,
+            rdlen_high,
+            rdlen_low,
+        ] = answer_tail
+        else {
+            return Err("dns response truncated in answer header".to_owned());
+        };
+        let rr_type = u16::from_be_bytes([type_high, type_low]);
+        let rr_class = u16::from_be_bytes([class_high, class_low]);
+        let ttl = u32::from_be_bytes([ttl_a, ttl_b, ttl_c, ttl_d]);
+        let rdlen = u16::from_be_bytes([rdlen_high, rdlen_low]) as usize;
         offset += 10;
         if offset + rdlen > response.len() {
             return Err("dns response truncated in answer payload".to_owned());
         }
         if rr_type == 1 && rr_class == 1 && rdlen == 4 {
-            let addr = Ipv4Addr::new(
-                response[offset],
-                response[offset + 1],
-                response[offset + 2],
-                response[offset + 3],
-            );
+            let Some(answer_payload) = response.get(offset..offset + 4) else {
+                return Err("dns response truncated in answer payload".to_owned());
+            };
+            let &[octet_a, octet_b, octet_c, octet_d] = answer_payload else {
+                return Err("dns response truncated in answer payload".to_owned());
+            };
+            let addr = Ipv4Addr::new(octet_a, octet_b, octet_c, octet_d);
             answer_ip = addr.to_string();
             answer_ttl = u64::from(ttl);
         }
@@ -1744,10 +1783,16 @@ pub fn execute_ops_validate_cross_network_forensics_bundle(
             ));
         }
 
-        let label = row[0].clone();
-        let target = row[1].clone();
-        let node_id = row[2].clone();
-        let role = row[3].clone();
+        let [label, target, node_id, role] = row.as_slice() else {
+            return Err(format!(
+                "nodes-tsv rows must contain 4 columns: {}",
+                nodes_tsv.display()
+            ));
+        };
+        let label = (*label).to_owned();
+        let target = (*target).to_owned();
+        let node_id = (*node_id).to_owned();
+        let role = (*role).to_owned();
         let node_dir = stage_dir.join(label.as_str());
         let mut node_missing_files = Vec::new();
         let mut node_empty_files = Vec::new();
@@ -1837,16 +1882,16 @@ pub fn execute_ops_write_cross_network_preflight_report(
 
     let mut nodes = Vec::new();
     for row in rows {
-        if row.len() != 4 {
+        let [label, target, node_id, role] = row.as_slice() else {
             continue;
-        }
-        let label = row[0].clone();
+        };
+        let label = (*label).to_owned();
         let capability_file = stage_dir.join(format!("capabilities-{label}.txt"));
         nodes.push(json!({
-            "label": row[0],
-            "target": row[1],
-            "node_id": row[2],
-            "role": row[3],
+            "label": label,
+            "target": (*target).to_owned(),
+            "node_id": (*node_id).to_owned(),
+            "role": (*role).to_owned(),
             "capability_file": absolute_path_string(capability_file.as_path())?,
             "capability_file_exists": capability_file.exists(),
         }));
@@ -1998,31 +2043,48 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
 
     let nodes: Vec<RunSummaryNodeView> = node_rows
         .into_iter()
-        .filter(|row| row.len() >= 4)
-        .map(|row| {
+        .filter_map(|row| {
+            let [label, target, node_id, bootstrap_role, ..] = row.as_slice() else {
+                return None;
+            };
             let mut extra = Map::new();
-            if row.len() >= 5 {
-                extra.insert("platform".to_owned(), Value::String(row[4].clone()));
+            if let Some(platform) = row.get(4) {
+                extra.insert("platform".to_owned(), Value::String((*platform).to_owned()));
             }
-            if row.len() >= 6 {
-                extra.insert("os_version".to_owned(), Value::String(row[5].clone()));
+            if let Some(os_version) = row.get(5) {
+                extra.insert(
+                    "os_version".to_owned(),
+                    Value::String((*os_version).to_owned()),
+                );
             }
-            RunSummaryNodeView {
-                label: row[0].clone(),
-                target: row[1].clone(),
-                node_id: row[2].clone(),
-                bootstrap_role: row[3].clone(),
+            Some(RunSummaryNodeView {
+                label: (*label).to_owned(),
+                target: (*target).to_owned(),
+                node_id: (*node_id).to_owned(),
+                bootstrap_role: (*bootstrap_role).to_owned(),
                 extra,
-            }
+            })
         })
         .collect();
 
     let stages: Vec<RunSummaryStageView> = stage_rows
         .into_iter()
-        .filter(|row| row.len() == 8)
-        .map(|row| {
-            let stage_name = row[0].clone();
-            let rc = row[3].parse::<i64>().unwrap_or(1);
+        .filter_map(|row| {
+            let [
+                stage_cell,
+                severity_cell,
+                status_cell,
+                rc_cell,
+                log_path_cell,
+                message_cell,
+                started_at_cell,
+                finished_at_cell,
+            ] = row.as_slice()
+            else {
+                return None;
+            };
+            let stage_name = (*stage_cell).to_owned();
+            let rc = rc_cell.parse::<i64>().unwrap_or(1);
             let worker_results =
                 read_parallel_stage_results(report_dir.as_path(), stage_name.as_str());
             let failed_worker_count = worker_results
@@ -2052,20 +2114,20 @@ pub fn execute_ops_write_live_linux_lab_run_summary(
                     extra: Map::new(),
                 })
                 .collect();
-            RunSummaryStageView {
+            Some(RunSummaryStageView {
                 stage: stage_name,
-                severity: row[1].clone(),
-                status: row[2].clone(),
+                severity: (*severity_cell).to_owned(),
+                status: (*status_cell).to_owned(),
                 rc,
-                log_path: row[4].clone(),
-                message: row[5].clone(),
-                started_at: row[6].clone(),
-                finished_at: row[7].clone(),
+                log_path: (*log_path_cell).to_owned(),
+                message: (*message_cell).to_owned(),
+                started_at: (*started_at_cell).to_owned(),
+                finished_at: (*finished_at_cell).to_owned(),
                 failed_worker_count,
                 primary_failure_reason,
                 worker_results: worker_views,
                 extra: Map::new(),
-            }
+            })
         })
         .collect();
 
@@ -2617,18 +2679,12 @@ pub fn execute_ops_write_live_linux_control_surface_report(
         let helper_meta_trimmed = helper_meta.trim().to_owned();
         let daemon_parts = daemon_meta_trimmed.split('|').collect::<Vec<_>>();
         let helper_parts = helper_meta_trimmed.split('|').collect::<Vec<_>>();
-        let daemon_owner = daemon_parts.get(2).copied().unwrap_or_default();
-        let daemon_group = daemon_parts.get(3).copied().unwrap_or_default();
-        let daemon_owner_ok = daemon_owner == "root" || daemon_owner == "rustynetd";
-        let daemon_ok = daemon_parts.len() == 4
-            && daemon_parts[0] == "socket"
-            && daemon_parts[1] == "600"
-            && daemon_owner_ok
-            && daemon_group == daemon_owner;
-        let helper_ok = helper_parts.len() == 4
-            && helper_parts[0] == "socket"
-            && helper_parts[1] == "660"
-            && helper_parts[2] == "root";
+        let daemon_ok = matches!(
+            daemon_parts.as_slice(),
+            ["socket", "600", owner, group]
+                if (*owner == "root" || *owner == "rustynetd") && group == owner
+        );
+        let helper_ok = matches!(helper_parts.as_slice(), ["socket", "660", "root", _]);
 
         let mut tcp_listener_ok = true;
         let mut udp_listener_ok = true;
@@ -2643,17 +2699,15 @@ pub fn execute_ops_write_live_linux_control_surface_report(
             }
             rustynet_listener_lines.push(line.to_owned());
             let parts = line.split_whitespace().collect::<Vec<_>>();
-            if parts.len() < 5 {
+            let [proto, _, _, _, local_addr, ..] = parts.as_slice() else {
                 tcp_listener_ok = false;
                 udp_listener_ok = false;
                 continue;
-            }
-            let proto = parts[0];
-            let local_addr = parts[4];
+            };
             if proto.starts_with("tcp") {
                 tcp_listener_ok = false;
             } else if proto.starts_with("udp") {
-                if local_addr != allowed_udp {
+                if *local_addr != allowed_udp {
                     udp_listener_ok = false;
                 }
             } else {
@@ -3649,8 +3703,11 @@ pub fn execute_ops_e2e_dns_query(config: E2eDnsQueryConfig) -> Result<String, St
         let flags = u16::from_be_bytes([response[2], response[3]]);
         let rcode = i64::from(flags & 0x000F);
         let answer_count = u64::from(u16::from_be_bytes([response[6], response[7]]));
+        let Some(response_prefix) = response.get(..size) else {
+            return Err("dns response too short".to_owned());
+        };
         let (rcode, answer_count, answer_ip, answer_ttl) =
-            decode_first_dns_answer(&response[..size], rcode, answer_count)?;
+            decode_first_dns_answer(response_prefix, rcode, answer_count)?;
         result.rcode = rcode;
         result.answer_count = answer_count;
         result.answer_ip = answer_ip;
@@ -3750,7 +3807,8 @@ pub fn execute_ops_e2e_http_probe_client(
     let read_size = stream
         .read(response.as_mut_slice())
         .map_err(|err| format!("TCP probe read failed: {err}"))?;
-    let response_text = String::from_utf8_lossy(&response[..read_size]).to_string();
+    let response_text =
+        String::from_utf8_lossy(response.get(..read_size).unwrap_or_default()).to_string();
     if !response_text.contains(config.expect_marker.as_str()) {
         return Err("probe marker missing from response".to_owned());
     }
@@ -6918,5 +6976,1434 @@ mod typed_parser_tests {
             map.get("tooling_hint").and_then(Value::as_str),
             Some("future-field")
         );
+    }
+}
+#[cfg(test)]
+mod aq08_6b_differential {
+    //! AQ-08 bucket 6b part 1 (rustynet-cli/ops_live_lab_orchestrator.rs):
+    //! seeded-mutation differential harness. Every `old_*` function is a
+    //! verbatim copy of the corresponding pre-patch function body from the
+    //! pre-patch tree (HEAD 53ba50956), renamed only; verbatim identity is
+    //! checked by the lane's harness (brace-span extract + rename-normalized
+    //! compare against `git show HEAD`). Pure text/byte parsers get a golden
+    //! fixture plus 2000 deterministic mutations each; the TSV/report
+    //! assembly entry points get golden old-vs-new comparisons over generated
+    //! row fixtures (written to temp dirs, output files compared by bytes).
+    //! Any divergence fails the test and names the parser and the input.
+
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    const ALPHABET: &[char] = &[
+        'a', 'Z', '_', '"', '\'', ':', '=', '/', '\\', '*', '+', '-', '.', '0', '1', '9', ' ',
+        '\t', '\n', 'т', 'é', '|', '<', '>',
+    ];
+
+    const BYTE_ALPHABET: &[u8] = &[
+        b'a', b'Z', b'0', b'9', b'\x00', b'\t', b'\n', b':', b'.', 0xC0, 0x16, 0x81, 0x01, 0x04,
+        0xFF,
+    ];
+
+    fn check(
+        parser: &str,
+        old: impl std::fmt::Debug,
+        new: impl std::fmt::Debug,
+        input: &str,
+    ) -> bool {
+        let old_repr = format!("{old:?}");
+        let new_repr = format!("{new:?}");
+        if old_repr == new_repr {
+            true
+        } else {
+            panic!("DIVERGENCE in {parser} on input {input:?}: old {old_repr} new {new_repr}");
+        }
+    }
+
+    fn mutate_string(input: &str, rng: &mut Rng) -> String {
+        let mut chars: Vec<char> = input.chars().collect();
+        match rng.below(8) {
+            0 => {
+                let keep = rng.below(chars.len() + 2);
+                chars.truncate(keep);
+            }
+            1 => {
+                if !chars.is_empty() {
+                    let at = rng.below(chars.len());
+                    chars.remove(at);
+                }
+            }
+            2 => {
+                if !chars.is_empty() {
+                    let at = rng.below(chars.len());
+                    let taken = chars[at];
+                    chars.insert(at, taken);
+                }
+            }
+            3 => {
+                if chars.len() >= 2 {
+                    let at = rng.below(chars.len() - 1);
+                    chars.swap(at, at + 1);
+                }
+            }
+            4 => {
+                let at = rng.below(chars.len() + 1);
+                let letter = ALPHABET[rng.below(ALPHABET.len())];
+                chars.insert(at, letter);
+            }
+            5 => {
+                for _ in 0..(1 + rng.below(8)) {
+                    let at = rng.below(chars.len() + 1);
+                    let letter = ALPHABET[rng.below(ALPHABET.len())];
+                    chars.insert(at, letter);
+                }
+            }
+            6 => {
+                if !chars.is_empty() {
+                    let at = rng.below(chars.len());
+                    let letter = ALPHABET[rng.below(ALPHABET.len())];
+                    chars[at] = letter;
+                }
+            }
+            _ => {
+                let letter = ALPHABET[rng.below(ALPHABET.len())];
+                chars.push(letter);
+            }
+        }
+        chars.into_iter().collect()
+    }
+
+    fn mutate_bytes(input: &[u8], rng: &mut Rng) -> Vec<u8> {
+        let mut bytes = input.to_vec();
+        match rng.below(7) {
+            0 => {
+                let keep = rng.below(bytes.len() + 2);
+                bytes.truncate(keep);
+            }
+            1 => {
+                if !bytes.is_empty() {
+                    let at = rng.below(bytes.len());
+                    bytes.remove(at);
+                }
+            }
+            2 => {
+                if !bytes.is_empty() {
+                    let at = rng.below(bytes.len());
+                    let byte = BYTE_ALPHABET[rng.below(BYTE_ALPHABET.len())];
+                    bytes[at] = byte;
+                }
+            }
+            3 => {
+                let at = rng.below(bytes.len() + 1);
+                let byte = BYTE_ALPHABET[rng.below(BYTE_ALPHABET.len())];
+                bytes.insert(at, byte);
+            }
+            4 => {
+                if bytes.len() >= 2 {
+                    let at = rng.below(bytes.len() - 1);
+                    bytes.swap(at, at + 1);
+                }
+            }
+            5 => {
+                for _ in 0..(1 + rng.below(6)) {
+                    let at = rng.below(bytes.len() + 1);
+                    let byte = BYTE_ALPHABET[rng.below(BYTE_ALPHABET.len())];
+                    bytes.insert(at, byte);
+                }
+            }
+            _ => {
+                let byte = BYTE_ALPHABET[rng.below(BYTE_ALPHABET.len())];
+                bytes.push(byte);
+            }
+        }
+        bytes
+    }
+
+    const MUTATIONS: usize = 2000;
+
+    fn old_redact_first_keyword_value(line: &str, keyword: &str) -> Option<String> {
+        let lowered = line.to_ascii_lowercase();
+        let keyword_len = keyword.len();
+        let mut search_from = 0usize;
+        while search_from + keyword_len <= lowered.len() {
+            let offset = lowered[search_from..].find(keyword)?;
+            let start = search_from + offset;
+            let end = start + keyword_len;
+            let before = line[..start].chars().next_back();
+            let after = line[end..].chars().next();
+            if !is_word_boundary(before) || !is_word_boundary(after) {
+                search_from = end;
+                continue;
+            }
+            let bytes = line.as_bytes();
+            let mut sep_index = end;
+            while sep_index < bytes.len() && bytes[sep_index].is_ascii_whitespace() {
+                sep_index += 1;
+            }
+            if sep_index >= bytes.len() || !matches!(bytes[sep_index], b':' | b'=') {
+                search_from = end;
+                continue;
+            }
+            let mut value_start = sep_index + 1;
+            while value_start < bytes.len() && bytes[value_start].is_ascii_whitespace() {
+                value_start += 1;
+            }
+            if value_start >= bytes.len() {
+                return None;
+            }
+            let mut value_end = value_start;
+            while value_end < bytes.len() && !bytes[value_end].is_ascii_whitespace() {
+                value_end += 1;
+            }
+            let mut out = String::with_capacity(line.len());
+            out.push_str(&line[..value_start]);
+            out.push_str("<redacted>");
+            out.push_str(&line[value_end..]);
+            return Some(out);
+        }
+        None
+    }
+    fn old_redact_forensics_line(line: &str) -> String {
+        let upper = line.to_ascii_uppercase();
+        if upper.contains("PRIVATE KEY-----")
+            || (upper.contains("BEGIN ") && upper.contains("PRIVATE KEY"))
+        {
+            return "[REDACTED sensitive key material]".to_owned();
+        }
+        let mut out = line.to_owned();
+        for keyword in ["passphrase", "password", "secret", "token"] {
+            if let Some(updated) = old_redact_first_keyword_value(out.as_str(), keyword) {
+                out = updated;
+            }
+        }
+        out
+    }
+    fn old_parse_network_prefix(prefix: &str) -> Result<[u8; 3], String> {
+        let parts = prefix.trim().split('.').map(str::trim).collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err(format!(
+                "invalid --network-prefix {prefix:?}; expected a.b.c"
+            ));
+        }
+        let mut octets = [0u8; 3];
+        for (index, part) in parts.iter().enumerate() {
+            octets[index] = part
+                .parse::<u8>()
+                .map_err(|err| format!("invalid --network-prefix {prefix:?}: {err}"))?;
+        }
+        Ok(octets)
+    }
+    fn old_skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize, String> {
+        let mut labels_seen = 0usize;
+        loop {
+            if offset >= packet.len() {
+                return Err("dns response truncated while reading name".to_owned());
+            }
+            let len = packet[offset];
+            if len & 0b1100_0000 == 0b1100_0000 {
+                if offset + 1 >= packet.len() {
+                    return Err(
+                        "dns response truncated while reading compression pointer".to_owned()
+                    );
+                }
+                return Ok(offset + 2);
+            }
+            if len == 0 {
+                return Ok(offset + 1);
+            }
+            if len & 0b1100_0000 != 0 {
+                return Err("dns response contains invalid label encoding".to_owned());
+            }
+            let label_len = len as usize;
+            if label_len > 63 {
+                return Err("dns response contains oversized label".to_owned());
+            }
+            offset += 1;
+            if offset + label_len > packet.len() {
+                return Err("dns response truncated while reading label bytes".to_owned());
+            }
+            offset += label_len;
+            labels_seen += 1;
+            if labels_seen > 128 {
+                return Err("dns response name parse exceeded label limit".to_owned());
+            }
+        }
+    }
+    fn old_decode_first_dns_answer(
+        response: &[u8],
+        rcode: i64,
+        answer_count: u64,
+    ) -> Result<(i64, u64, String, u64), String> {
+        if response.len() < 12 {
+            return Err("dns response header is too short".to_owned());
+        }
+        let mut offset = 12usize;
+        offset = old_skip_dns_name(response, offset)?;
+        if offset + 4 > response.len() {
+            return Err("dns response truncated in question tail".to_owned());
+        }
+        offset += 4;
+
+        let mut answer_ip = String::new();
+        let mut answer_ttl = 0u64;
+        if answer_count > 0 {
+            offset = old_skip_dns_name(response, offset)?;
+            if offset + 10 > response.len() {
+                return Err("dns response truncated in answer header".to_owned());
+            }
+            let rr_type = u16::from_be_bytes([response[offset], response[offset + 1]]);
+            let rr_class = u16::from_be_bytes([response[offset + 2], response[offset + 3]]);
+            let ttl = u32::from_be_bytes([
+                response[offset + 4],
+                response[offset + 5],
+                response[offset + 6],
+                response[offset + 7],
+            ]);
+            let rdlen = u16::from_be_bytes([response[offset + 8], response[offset + 9]]) as usize;
+            offset += 10;
+            if offset + rdlen > response.len() {
+                return Err("dns response truncated in answer payload".to_owned());
+            }
+            if rr_type == 1 && rr_class == 1 && rdlen == 4 {
+                let addr = Ipv4Addr::new(
+                    response[offset],
+                    response[offset + 1],
+                    response[offset + 2],
+                    response[offset + 3],
+                );
+                answer_ip = addr.to_string();
+                answer_ttl = u64::from(ttl);
+            }
+        }
+        Ok((rcode, answer_count, answer_ip, answer_ttl))
+    }
+    fn old_execute_ops_validate_cross_network_forensics_bundle(
+        config: ValidateCrossNetworkForensicsBundleConfig,
+    ) -> Result<String, String> {
+        let stage_name = config.stage_name.trim();
+        if stage_name.is_empty() {
+            return Err("stage-name is required".to_owned());
+        }
+
+        let nodes_tsv = resolve_path(config.nodes_tsv.as_path())?;
+        let stage_dir = resolve_path(config.stage_dir.as_path())?;
+        let output = resolve_path(config.output.as_path())?;
+        if !stage_dir.is_dir() {
+            return Err(format!(
+                "stage-dir must be an existing directory: {}",
+                stage_dir.display()
+            ));
+        }
+
+        let rows = read_tsv_rows(nodes_tsv.as_path())?;
+        if rows.is_empty() {
+            return Err(format!(
+                "nodes-tsv must contain at least one row: {}",
+                nodes_tsv.display()
+            ));
+        }
+
+        let required_stage_files = ["manifest.json", "route_matrix.txt", "cluster_snapshot.txt"];
+        let mut missing_files = Vec::new();
+        let mut empty_files = Vec::new();
+        let mut invalid_files = Vec::new();
+        let mut nodes = Vec::new();
+
+        for file_name in required_stage_files {
+            let path = stage_dir.join(file_name);
+            if !path.exists() {
+                missing_files.push(path.display().to_string());
+                continue;
+            }
+            let metadata = fs::metadata(path.as_path())
+                .map_err(|err| format!("stat failed ({}): {err}", path.display()))?;
+            if metadata.len() == 0 {
+                empty_files.push(path.display().to_string());
+            }
+        }
+
+        let manifest_path = stage_dir.join("manifest.json");
+        if manifest_path.exists() {
+            let body = fs::read_to_string(manifest_path.as_path())
+                .map_err(|err| format!("read JSON failed ({}): {err}", manifest_path.display()))?;
+            if body.trim().is_empty() {
+                empty_files.push(manifest_path.display().to_string());
+            } else {
+                match serde_json::from_str::<CrossNetworkForensicsManifestView>(body.as_str()) {
+                    Ok(manifest) => {
+                        let manifest_nodes = manifest.nodes.len();
+                        if manifest.mode != "cross_network_failure_forensics" {
+                            invalid_files.push(format!(
+                                "{}: unexpected mode {:?}",
+                                manifest_path.display(),
+                                manifest.mode
+                            ));
+                        }
+                        if manifest.stage != stage_name {
+                            invalid_files.push(format!(
+                                "{}: unexpected stage {:?}",
+                                manifest_path.display(),
+                                manifest.stage
+                            ));
+                        }
+                        if manifest.bundle_dir != stage_dir.display().to_string() {
+                            invalid_files.push(format!(
+                                "{}: unexpected bundle_dir {:?}",
+                                manifest_path.display(),
+                                manifest.bundle_dir
+                            ));
+                        }
+                        if manifest_nodes != rows.len() {
+                            invalid_files.push(format!(
+                                "{}: manifest node count {manifest_nodes} does not match topology node count {}",
+                                manifest_path.display(),
+                                rows.len()
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        invalid_files.push(format!(
+                            "{}: parse JSON failed: {err}",
+                            manifest_path.display()
+                        ));
+                    }
+                }
+            }
+        }
+
+        for row in rows {
+            if row.len() != 4 {
+                return Err(format!(
+                    "nodes-tsv rows must contain 4 columns: {}",
+                    nodes_tsv.display()
+                ));
+            }
+
+            let label = row[0].clone();
+            let target = row[1].clone();
+            let node_id = row[2].clone();
+            let role = row[3].clone();
+            let node_dir = stage_dir.join(label.as_str());
+            let mut node_missing_files = Vec::new();
+            let mut node_empty_files = Vec::new();
+
+            for file_name in expected_forensics_node_files() {
+                let path = node_dir.join(file_name);
+                let relative_path = path
+                    .strip_prefix(stage_dir.as_path())
+                    .unwrap_or(path.as_path())
+                    .display()
+                    .to_string();
+                if !path.exists() {
+                    node_missing_files.push(relative_path.clone());
+                    missing_files.push(relative_path);
+                    continue;
+                }
+                let metadata = fs::metadata(path.as_path())
+                    .map_err(|err| format!("stat failed ({}): {err}", path.display()))?;
+                if metadata.len() == 0 {
+                    node_empty_files.push(relative_path.clone());
+                    empty_files.push(relative_path);
+                }
+            }
+
+            nodes.push(CrossNetworkForensicsNodeReportView {
+                label,
+                target,
+                node_id,
+                role,
+                node_dir: node_dir.display().to_string(),
+                missing_files: node_missing_files,
+                empty_files: node_empty_files,
+                extra: Map::new(),
+            });
+        }
+
+        let bundle_status =
+            if missing_files.is_empty() && empty_files.is_empty() && invalid_files.is_empty() {
+                CHECK_PASS
+            } else {
+                CHECK_FAIL
+            };
+        let node_count = nodes.len() as u64;
+        let missing_file_count = missing_files.len() as u64;
+        let empty_file_count = empty_files.len() as u64;
+        let invalid_file_count = invalid_files.len() as u64;
+        let payload_view = CrossNetworkForensicsBundleValidationView {
+            schema_version: 1,
+            mode: "cross_network_forensics_bundle_validation".to_owned(),
+            stage_name: stage_name.to_owned(),
+            stage_dir: stage_dir.display().to_string(),
+            collected_at_utc: collected_at_utc_now(),
+            bundle_status: bundle_status.to_owned(),
+            node_count,
+            required_stage_files: required_stage_files
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            required_node_files: expected_forensics_node_files()
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect(),
+            missing_file_count,
+            empty_file_count,
+            invalid_file_count,
+            missing_files,
+            empty_files,
+            invalid_files,
+            nodes,
+            extra: Map::new(),
+        };
+        let payload = Value::Object(payload_view.into_value_map());
+        write_json_pretty(output.as_path(), &payload)?;
+        if bundle_status != CHECK_PASS {
+            return Err("cross-network forensics bundle validation failed".to_owned());
+        }
+        Ok(output.display().to_string())
+    }
+    fn old_execute_ops_write_cross_network_preflight_report(
+        config: WriteCrossNetworkPreflightReportConfig,
+    ) -> Result<String, String> {
+        let nodes_tsv = resolve_path(config.nodes_tsv.as_path())?;
+        let stage_dir = resolve_path(config.stage_dir.as_path())?;
+        let output = resolve_path(config.output.as_path())?;
+        let rows = read_tsv_rows(nodes_tsv.as_path())?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            if row.len() != 4 {
+                continue;
+            }
+            let label = row[0].clone();
+            let capability_file = stage_dir.join(format!("capabilities-{label}.txt"));
+            nodes.push(json!({
+                "label": row[0],
+                "target": row[1],
+                "node_id": row[2],
+                "role": row[3],
+                "capability_file": absolute_path_string(capability_file.as_path())?,
+                "capability_file_exists": capability_file.exists(),
+            }));
+        }
+
+        let payload = json!({
+            "schema_version": 1,
+            "mode": "cross_network_preflight",
+            "reference_unix": config.reference_unix,
+            "max_clock_skew_secs": config.max_clock_skew_secs,
+            "discovery_max_age_secs": config.discovery_max_age_secs,
+            "signed_artifact_max_age_secs": config.signed_artifact_max_age_secs,
+            "nodes": nodes,
+        });
+        write_json_pretty(output.as_path(), &payload)?;
+        Ok(output.display().to_string())
+    }
+    fn old_execute_ops_write_live_linux_lab_run_summary(
+        config: WriteLiveLinuxLabRunSummaryConfig,
+    ) -> Result<String, String> {
+        let nodes_tsv = resolve_path(config.nodes_tsv.as_path())?;
+        let stages_tsv = resolve_path(config.stages_tsv.as_path())?;
+        let summary_json = resolve_path(config.summary_json.as_path())?;
+        let summary_md = resolve_path(config.summary_md.as_path())?;
+        let report_dir = resolve_path(Path::new(config.report_dir.as_str()))?;
+
+        let node_rows = read_tsv_rows(nodes_tsv.as_path())?;
+        let stage_rows = read_tsv_rows(stages_tsv.as_path())?;
+
+        let nodes: Vec<RunSummaryNodeView> = node_rows
+            .into_iter()
+            .filter(|row| row.len() >= 4)
+            .map(|row| {
+                let mut extra = Map::new();
+                if row.len() >= 5 {
+                    extra.insert("platform".to_owned(), Value::String(row[4].clone()));
+                }
+                if row.len() >= 6 {
+                    extra.insert("os_version".to_owned(), Value::String(row[5].clone()));
+                }
+                RunSummaryNodeView {
+                    label: row[0].clone(),
+                    target: row[1].clone(),
+                    node_id: row[2].clone(),
+                    bootstrap_role: row[3].clone(),
+                    extra,
+                }
+            })
+            .collect();
+
+        let stages: Vec<RunSummaryStageView> = stage_rows
+            .into_iter()
+            .filter(|row| row.len() == 8)
+            .map(|row| {
+                let stage_name = row[0].clone();
+                let rc = row[3].parse::<i64>().unwrap_or(1);
+                let worker_results =
+                    read_parallel_stage_results(report_dir.as_path(), stage_name.as_str());
+                let failed_worker_count = worker_results
+                    .iter()
+                    .filter(|worker| worker.rc != 0)
+                    .count() as u64;
+                let primary_failure_reason = worker_results
+                    .iter()
+                    .find(|worker| worker.rc != 0)
+                    .map(|worker| worker.primary_failure_reason.clone())
+                    .unwrap_or_default();
+                let worker_views: Vec<RunSummaryWorkerView> = worker_results
+                    .into_iter()
+                    .map(|worker: LiveLabWorkerResult| RunSummaryWorkerView {
+                        label: worker.label,
+                        target: worker.target,
+                        node_id: worker.node_id,
+                        role: worker.role,
+                        rc: worker.rc,
+                        started_at: worker.started_at,
+                        finished_at: worker.finished_at,
+                        log_path: worker.log_path,
+                        snapshot_path: worker.snapshot_path,
+                        route_policy_path: worker.route_policy_path,
+                        dns_state_path: worker.dns_state_path,
+                        primary_failure_reason: worker.primary_failure_reason,
+                        extra: Map::new(),
+                    })
+                    .collect();
+                RunSummaryStageView {
+                    stage: stage_name,
+                    severity: row[1].clone(),
+                    status: row[2].clone(),
+                    rc,
+                    log_path: row[4].clone(),
+                    message: row[5].clone(),
+                    started_at: row[6].clone(),
+                    finished_at: row[7].clone(),
+                    failed_worker_count,
+                    primary_failure_reason,
+                    worker_results: worker_views,
+                    extra: Map::new(),
+                }
+            })
+            .collect();
+
+        let mut extra = Map::new();
+        if let Some(ref commit) = config.git_commit {
+            extra.insert("git_commit".to_owned(), Value::String(commit.clone()));
+        }
+        if let Some(clean) = config.git_tree_clean {
+            extra.insert("git_tree_clean".to_owned(), Value::Bool(clean));
+        }
+        if let Some(ref mode) = config.source_mode {
+            extra.insert("source_mode".to_owned(), Value::String(mode.clone()));
+        }
+        if let Some(ref repo_ref) = config.repo_ref {
+            extra.insert("repo_ref".to_owned(), Value::String(repo_ref.clone()));
+        }
+
+        let summary = LiveLabRunSummaryView {
+            schema_version: 1,
+            run_id: config.run_id.clone(),
+            network_id: config.network_id.clone(),
+            report_dir: report_dir.display().to_string(),
+            overall_status: config.overall_status.clone(),
+            started_at_local: config.started_at_local.clone(),
+            started_at_utc: config.started_at_utc.clone(),
+            started_at_unix: config.started_at_unix,
+            finished_at_local: config.finished_at_local.clone(),
+            finished_at_utc: config.finished_at_utc.clone(),
+            finished_at_unix: config.finished_at_unix,
+            elapsed_secs: config.elapsed_secs,
+            elapsed_human: config.elapsed_human.clone(),
+            run_note: config.run_note.clone(),
+            nodes,
+            stages,
+            extra,
+        };
+
+        ensure_parent_dir(summary_json.as_path())?;
+        let summary_body = serde_json::to_string_pretty(&summary)
+            .map_err(|err| format!("serialize JSON failed: {err}"))?;
+        fs::write(summary_json.as_path(), format!("{summary_body}\n"))
+            .map_err(|err| format!("write JSON failed ({}): {err}", summary_json.display()))?;
+
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "# Live Linux Lab Orchestrator Summary ({})",
+            summary.run_id
+        ));
+        lines.push(String::new());
+        lines.push(format!("- overall_status: `{}`", summary.overall_status));
+        lines.push(format!("- network_id: `{}`", summary.network_id));
+        lines.push(format!("- report_dir: `{}`", summary.report_dir));
+        lines.push(format!(
+            "- started_at_local: `{}`",
+            summary.started_at_local
+        ));
+        lines.push(format!("- started_at_utc: `{}`", summary.started_at_utc));
+        lines.push(format!(
+            "- finished_at_local: `{}`",
+            summary.finished_at_local
+        ));
+        lines.push(format!("- finished_at_utc: `{}`", summary.finished_at_utc));
+        lines.push(format!("- elapsed: `{}`", summary.elapsed_human));
+        if !summary.run_note.is_empty() {
+            lines.push(format!("- run_note: {}", summary.run_note));
+        }
+        lines.push(String::new());
+        lines.push("## Nodes".to_owned());
+        lines.push(String::new());
+        for node in &summary.nodes {
+            lines.push(format!(
+                "- `{}`: `{}` (`{}`, bootstrap role `{}`)",
+                node.label, node.target, node.node_id, node.bootstrap_role,
+            ));
+        }
+        lines.push(String::new());
+        lines.push("## Stages".to_owned());
+        lines.push(String::new());
+        for stage in &summary.stages {
+            lines.push(format!(
+                "- `{}` [{}] -> `{}` (rc={})",
+                stage.stage, stage.severity, stage.status, stage.rc,
+            ));
+            lines.push(format!("  log: `{}`", stage.log_path));
+            let detail = if stage.message.is_empty() {
+                "stage detail unavailable"
+            } else {
+                stage.message.as_str()
+            };
+            lines.push(format!("  detail: {detail}"));
+            if !stage.worker_results.is_empty() {
+                lines.push(format!(
+                    "  workers: {}/{} failed",
+                    stage.failed_worker_count,
+                    stage.worker_results.len()
+                ));
+                if let Some(first_failed) =
+                    stage.worker_results.iter().find(|worker| worker.rc != 0)
+                {
+                    let reason = if first_failed.primary_failure_reason.is_empty() {
+                        "see worker log"
+                    } else {
+                        first_failed.primary_failure_reason.as_str()
+                    };
+                    lines.push(format!(
+                        "  first_failed_node: `{}` reason={}",
+                        first_failed.label, reason
+                    ));
+                    if !first_failed.snapshot_path.is_empty() {
+                        lines.push(format!("  snapshot: `{}`", first_failed.snapshot_path));
+                    }
+                }
+            }
+        }
+        ensure_parent_dir(summary_md.as_path())?;
+        fs::write(summary_md.as_path(), lines.join("\n") + "\n").map_err(|err| {
+            format!(
+                "write markdown summary failed ({}): {err}",
+                summary_md.display()
+            )
+        })?;
+
+        Ok(format!(
+            "live lab run summary generated: json={} md={}",
+            summary_json.display(),
+            summary_md.display()
+        ))
+    }
+    fn old_execute_ops_write_live_linux_control_surface_report(
+        config: WriteLiveLinuxControlSurfaceReportConfig,
+    ) -> Result<String, String> {
+        let report_path = resolve_path(config.report_path.as_path())?;
+        let work_dir = resolve_path(config.work_dir.as_path())?;
+        if !work_dir.is_dir() {
+            return Err(format!(
+                "work-dir must be an existing directory: {}",
+                work_dir.display()
+            ));
+        }
+        if config.host_labels.is_empty() {
+            return Err("at least one --host-label is required".to_owned());
+        }
+
+        let Some((dns_host, dns_port)) = config.dns_bind_addr.rsplit_once(':') else {
+            return Err(format!(
+                "invalid --dns-bind-addr {:?}; expected host:port",
+                config.dns_bind_addr
+            ));
+        };
+        let dns_port_num = dns_port
+            .parse::<u16>()
+            .map_err(|err| format!("invalid dns bind port {dns_port:?}: {err}"))?;
+        if dns_host.trim().is_empty() {
+            return Err("dns bind host must not be empty".to_owned());
+        }
+        let allowed_udp = format!("{}:{}", dns_host.trim(), dns_port_num);
+        let remote_dns_probe_status = parse_pass_fail_skip(
+            config.remote_dns_probe_status.as_str(),
+            "remote-dns-probe-status",
+        )?;
+        let captured_at_unix = if config.captured_at_unix == 0 {
+            unix_now()
+        } else {
+            config.captured_at_unix
+        };
+        let captured_at = if config.captured_at_utc.trim().is_empty() {
+            format!("{captured_at_unix}")
+        } else {
+            config.captured_at_utc.trim().to_owned()
+        };
+
+        let mut typed_hosts: Vec<(String, LiveLinuxControlSurfaceHostResultView)> = Vec::new();
+        let mut overall = CHECK_PASS.to_owned();
+        for label in &config.host_labels {
+            let daemon_meta =
+                fs::read_to_string(work_dir.join(format!("{label}.daemon_socket.txt")))
+                    .map_err(|err| format!("read {label} daemon metadata failed: {err}"))?;
+            let helper_meta =
+                fs::read_to_string(work_dir.join(format!("{label}.helper_socket.txt")))
+                    .map_err(|err| format!("read {label} helper metadata failed: {err}"))?;
+            let listeners_raw =
+                fs::read_to_string(work_dir.join(format!("{label}.inet_listeners.txt")))
+                    .map_err(|err| format!("read {label} listener capture failed: {err}"))?;
+            let dns_service_state =
+                fs::read_to_string(work_dir.join(format!("{label}.managed_dns_state.txt")))
+                    .map_err(|err| format!("read {label} DNS service state failed: {err}"))?;
+
+            let daemon_meta_trimmed = daemon_meta.trim().to_owned();
+            let helper_meta_trimmed = helper_meta.trim().to_owned();
+            let daemon_parts = daemon_meta_trimmed.split('|').collect::<Vec<_>>();
+            let helper_parts = helper_meta_trimmed.split('|').collect::<Vec<_>>();
+            let daemon_owner = daemon_parts.get(2).copied().unwrap_or_default();
+            let daemon_group = daemon_parts.get(3).copied().unwrap_or_default();
+            let daemon_owner_ok = daemon_owner == "root" || daemon_owner == "rustynetd";
+            let daemon_ok = daemon_parts.len() == 4
+                && daemon_parts[0] == "socket"
+                && daemon_parts[1] == "600"
+                && daemon_owner_ok
+                && daemon_group == daemon_owner;
+            let helper_ok = helper_parts.len() == 4
+                && helper_parts[0] == "socket"
+                && helper_parts[1] == "660"
+                && helper_parts[2] == "root";
+
+            let mut tcp_listener_ok = true;
+            let mut udp_listener_ok = true;
+            let mut rustynet_listener_lines = Vec::new();
+            for line in listeners_raw
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                if !line.contains("rustynetd") {
+                    continue;
+                }
+                rustynet_listener_lines.push(line.to_owned());
+                let parts = line.split_whitespace().collect::<Vec<_>>();
+                if parts.len() < 5 {
+                    tcp_listener_ok = false;
+                    udp_listener_ok = false;
+                    continue;
+                }
+                let proto = parts[0];
+                let local_addr = parts[4];
+                if proto.starts_with("tcp") {
+                    tcp_listener_ok = false;
+                } else if proto.starts_with("udp") {
+                    if local_addr != allowed_udp {
+                        udp_listener_ok = false;
+                    }
+                } else {
+                    udp_listener_ok = false;
+                }
+            }
+
+            if !daemon_ok || !helper_ok || !tcp_listener_ok || !udp_listener_ok {
+                overall = CHECK_FAIL.to_owned();
+            }
+
+            typed_hosts.push((
+                label.clone(),
+                LiveLinuxControlSurfaceHostResultView {
+                    checks: LiveLinuxControlSurfaceHostChecksView {
+                        daemon_socket_secure: pass_or_fail(daemon_ok),
+                        helper_socket_secure: pass_or_fail(helper_ok),
+                        no_rustynet_tcp_listener: pass_or_fail(tcp_listener_ok),
+                        rustynet_udp_loopback_only: pass_or_fail(udp_listener_ok),
+                    },
+                    evidence: LiveLinuxControlSurfaceHostEvidenceView {
+                        daemon_socket_meta: daemon_meta_trimmed,
+                        helper_socket_meta: helper_meta_trimmed,
+                        managed_dns_service_state: dns_service_state.trim().to_owned(),
+                        rustynet_listener_lines,
+                    },
+                },
+            ));
+        }
+
+        if remote_dns_probe_status == CHECK_FAIL {
+            overall = CHECK_FAIL.to_owned();
+        }
+
+        let all_daemon_ok = typed_hosts
+            .iter()
+            .all(|(_, host)| host.checks.daemon_socket_secure == CHECK_PASS);
+        let all_helper_ok = typed_hosts
+            .iter()
+            .all(|(_, host)| host.checks.helper_socket_secure == CHECK_PASS);
+        let all_no_tcp = typed_hosts
+            .iter()
+            .all(|(_, host)| host.checks.no_rustynet_tcp_listener == CHECK_PASS);
+        let all_udp_loopback = typed_hosts
+            .iter()
+            .all(|(_, host)| host.checks.rustynet_udp_loopback_only == CHECK_PASS);
+
+        let mut hosts_map: Map<String, Value> = Map::new();
+        for (label, host_view) in &typed_hosts {
+            let host_value = serde_json::to_value(host_view).map_err(|err| {
+                format!("serialize control-surface host view ({label}) failed: {err}")
+            })?;
+            hosts_map.insert(label.clone(), host_value);
+        }
+
+        let report = LiveLinuxControlSurfaceReportView {
+            phase: "phase10".to_owned(),
+            mode: "live_linux_control_surface_exposure".to_owned(),
+            evidence_mode: "measured".to_owned(),
+            captured_at,
+            captured_at_unix,
+            status: overall.clone(),
+            dns_bind_addr: config.dns_bind_addr,
+            checks: LiveLinuxControlSurfaceAggregateChecksView {
+                all_daemon_sockets_secure: pass_or_fail(all_daemon_ok),
+                all_helper_sockets_secure: pass_or_fail(all_helper_ok),
+                no_rustynet_tcp_listeners: pass_or_fail(all_no_tcp),
+                rustynet_udp_loopback_only: pass_or_fail(all_udp_loopback),
+                remote_underlay_dns_probe_blocked: remote_dns_probe_status,
+            },
+            hosts: hosts_map,
+            evidence: LiveLinuxControlSurfaceEvidenceView {
+                remote_underlay_dns_probe_output: config.remote_dns_probe_output,
+            },
+        };
+
+        let payload = serde_json::to_value(&report)
+            .map_err(|err| format!("serialize control-surface report failed: {err}"))?;
+        write_json_pretty(report_path.as_path(), &payload)?;
+        Ok(report.status)
+    }
+    fn redact_golden_lines() -> Vec<&'static str> {
+        vec![
+            "password = hunter2",
+            "API_KEY: abc123",
+            "let secret = \"value\";",
+            "my pass phrase here",
+            "token=abc def",
+            "Password\t hunter2\t extra",
+            "no keyword line",
+            "",
+            "password",
+            "password:",
+            "password:   ",
+            "значение password: токе#н",
+            "password=<keep the rest here>",
+            "xpassword=xpassword xpassword=xpassword",
+        ]
+    }
+
+    #[test]
+    fn redact_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B10_0000_0000_0011);
+        let mut checked = 0usize;
+        let keywords = ["passphrase", "password", "secret", "token", "api_key"];
+        for base in redact_golden_lines() {
+            for keyword in keywords {
+                check(
+                    "redact_first_keyword_value GOLDEN",
+                    old_redact_first_keyword_value(base, keyword),
+                    redact_first_keyword_value(base, keyword),
+                    &format!("{keyword} in {base:?}"),
+                );
+                checked += 1;
+            }
+            check(
+                "redact_forensics_line GOLDEN",
+                old_redact_forensics_line(base),
+                redact_forensics_line(base),
+                base,
+            );
+            checked += 1;
+            for _ in 0..MUTATIONS {
+                let candidate = mutate_string(base, &mut rng);
+                for keyword in keywords {
+                    let old = old_redact_first_keyword_value(candidate.as_str(), keyword);
+                    let new = redact_first_keyword_value(candidate.as_str(), keyword);
+                    assert_eq!(
+                        old, new,
+                        "DIVERGENCE in redact_first_keyword_value keyword {keyword} on {candidate:?}"
+                    );
+                    checked += 1;
+                }
+                let old = old_redact_forensics_line(candidate.as_str());
+                let new = redact_forensics_line(candidate.as_str());
+                assert_eq!(
+                    old, new,
+                    "DIVERGENCE in redact_forensics_line on {candidate:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 100_000, "mutation floor: only {checked}");
+    }
+
+    #[test]
+    fn parse_network_prefix_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B11_0000_0000_0012);
+        let bases = [
+            "10.0.0",
+            " 10.1.2 ",
+            "0.0.0",
+            "255.255.255",
+            "10.0",
+            "10.0.0.1",
+            "a.b.c",
+            "1.2.300",
+            "",
+            "1..2",
+            "1.2.3.4.5",
+            "300.1.2",
+        ];
+        let mut checked = 0usize;
+        for base in bases {
+            check(
+                "parse_network_prefix GOLDEN",
+                old_parse_network_prefix(base),
+                parse_network_prefix(base),
+                base,
+            );
+            checked += 1;
+            for _ in 0..MUTATIONS {
+                let candidate = mutate_string(base, &mut rng);
+                let old = old_parse_network_prefix(candidate.as_str());
+                let new = parse_network_prefix(candidate.as_str());
+                check("parse_network_prefix", old, new, candidate.as_str());
+                checked += 1;
+            }
+        }
+        assert!(checked >= 15_000, "mutation floor: only {checked}");
+    }
+
+    fn golden_dns_response() -> Vec<u8> {
+        let mut response = Vec::new();
+        response.extend_from_slice(&[
+            0x12, 0x34, // id
+            0x81, 0x80, // flags: qr, rd, ra, rcode 0
+            0x00, 0x01, // qdcount
+            0x00, 0x01, // ancount
+            0x00, 0x00, 0x00, 0x00, // nscount, arcount
+        ]);
+        for label in ["host", "foo", "com"] {
+            response.push(label.len() as u8);
+            response.extend_from_slice(label.as_bytes());
+        }
+        response.push(0);
+        response.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // type A, class IN
+        response.extend_from_slice(&[0xC0, 0x0C]); // answer name pointer
+        response.extend_from_slice(&[
+            0x00, 0x01, 0x00, 0x01, // type A, class IN
+            0x00, 0x00, 0x00, 0x3C, // ttl 60
+            0x00, 0x04, // rdlen 4
+            10, 1, 2, 3, // 10.1.2.3
+        ]);
+        response
+    }
+
+    #[test]
+    fn dns_parsers_old_equals_new_over_mutations() {
+        let mut rng = Rng(0x6B12_0000_0000_0013);
+        let golden = golden_dns_response();
+        let mut checked = 0usize;
+        for offset in [0usize, 12, 31, golden.len(), golden.len() + 7] {
+            check(
+                "skip_dns_name GOLDEN",
+                old_skip_dns_name(golden.as_slice(), offset),
+                skip_dns_name(golden.as_slice(), offset),
+                &format!("offset {offset}"),
+            );
+            check(
+                "decode_first_dns_answer GOLDEN",
+                old_decode_first_dns_answer(golden.as_slice(), 0, 1),
+                decode_first_dns_answer(golden.as_slice(), 0, 1),
+                "golden response",
+            );
+            checked += 2;
+        }
+        check(
+            "decode_first_dns_answer GOLDEN no-answers",
+            old_decode_first_dns_answer(golden.as_slice(), 3, 0),
+            decode_first_dns_answer(golden.as_slice(), 3, 0),
+            "golden response, ancount 0",
+        );
+        checked += 1;
+        for _ in 0..MUTATIONS {
+            let candidate = mutate_bytes(golden.as_slice(), &mut rng);
+            let old = old_decode_first_dns_answer(candidate.as_slice(), 0, 1);
+            let new = decode_first_dns_answer(candidate.as_slice(), 0, 1);
+            check("decode_first_dns_answer", old, new, "mutated response");
+            for offset in [0usize, 1, 12, candidate.len(), candidate.len() + 3] {
+                let old = old_skip_dns_name(candidate.as_slice(), offset);
+                let new = skip_dns_name(candidate.as_slice(), offset);
+                check(
+                    "skip_dns_name",
+                    old,
+                    new,
+                    &format!("mutated response offset {offset}"),
+                );
+                checked += 1;
+            }
+            checked += 1;
+        }
+        assert!(checked >= 12_000, "mutation floor: only {checked}");
+    }
+    struct Sandbox {
+        root: PathBuf,
+    }
+
+    impl Sandbox {
+        fn new(name: &str) -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "rustynet-aq08-6b-{name}-{stamp}-{}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&root).expect("sandbox root");
+            Sandbox { root }
+        }
+    }
+
+    impl Drop for Sandbox {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn write_file(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("fixture parent dir");
+        }
+        fs::write(path, body).expect("fixture write");
+    }
+
+    fn compare_reports(
+        label: &str,
+        old: Result<String, String>,
+        new: Result<String, String>,
+        old_output: &Path,
+        new_output: &Path,
+    ) {
+        match (old, new) {
+            (Ok(_), Ok(_)) => {
+                let old_body = fs::read(old_output).expect("old output readable");
+                let new_body = fs::read(new_output).expect("new output readable");
+                assert_eq!(old_body, new_body, "DIVERGENCE in {label}: output bytes");
+            }
+            (Err(old_error), Err(new_error)) => {
+                assert_eq!(old_error, new_error, "DIVERGENCE in {label}: error text");
+            }
+            (old, new) => {
+                panic!("DIVERGENCE in {label}: {old:?} vs {new:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn preflight_report_old_equals_new_over_generated_rows() {
+        let sandbox = Sandbox::new("preflight");
+        let nodes_tsv = sandbox.root.join("nodes.tsv");
+        let stage_dir = sandbox.root.join("stage");
+        fs::create_dir_all(&stage_dir).expect("stage dir");
+        let base = [
+            "node-a\troot@10.0.0.1\tid-a\tcontrol",
+            "node-b\troot@10.0.0.2\tid-b\tworker",
+            "node-c\troot@10.0.0.3\tid-c\tworker\tlinux\t6.8.0",
+        ]
+        .join("\n");
+        write_file(&nodes_tsv, &format!("{base}\n"));
+        let mut rng = Rng(0x6B13_0000_0000_0014);
+        let mut checked = 0usize;
+        for iteration in 0..=(MUTATIONS / 10) {
+            let body = if iteration == 0 {
+                format!("{base}\n")
+            } else {
+                mutate_string(base.as_str(), &mut rng)
+            };
+            write_file(&nodes_tsv, &body);
+            let old_output = sandbox.root.join(format!("preflight-old-{iteration}.json"));
+            let new_output = sandbox.root.join(format!("preflight-new-{iteration}.json"));
+            let config = |output: PathBuf| WriteCrossNetworkPreflightReportConfig {
+                nodes_tsv: nodes_tsv.clone(),
+                stage_dir: stage_dir.clone(),
+                output,
+                reference_unix: 1_700_000_000,
+                max_clock_skew_secs: 60,
+                discovery_max_age_secs: 600,
+                signed_artifact_max_age_secs: 600,
+            };
+            let old =
+                old_execute_ops_write_cross_network_preflight_report(config(old_output.clone()));
+            let new = execute_ops_write_cross_network_preflight_report(config(new_output.clone()));
+            compare_reports("preflight_report", old, new, &old_output, &new_output);
+            checked += 1;
+        }
+        assert!(checked >= 200, "fixture floor: only {checked}");
+    }
+
+    #[test]
+    fn run_summary_old_equals_new_over_generated_rows() {
+        let sandbox = Sandbox::new("run-summary");
+        let nodes_tsv = sandbox.root.join("nodes.tsv");
+        let stages_tsv = sandbox.root.join("stages.tsv");
+        let report_dir = sandbox.root.join("report");
+        let state_dir = report_dir.join("state").join("parallel-nightly");
+        fs::create_dir_all(&state_dir).expect("state dir");
+        write_file(
+            state_dir.join("results.tsv").as_path(),
+            "nightly\tworker-a\troot@10.0.0.2\tid-b\tworker\t1\tt0\tt1\tlog\tsnap\troute\tdns\tdns zone missing\nnode-x\troot@10.0.0.9\tid-x\tworker\t0\textra.log\n",
+        );
+        let nodes_base = "node-a\troot@10.0.0.1\tid-a\tcontrol\nnode-b\troot@10.0.0.2\tid-b\tworker\tlinux\nnode-c\troot@10.0.0.3\tid-c\tworker\tlinux\t6.8.0\n";
+        let stages_base = "nightly\tmajor\tfail\t2\t/var/log/nightly.log\tdns zone missing\t2026-04-08T10:00:00Z\t2026-04-08T10:05:00Z\nbootstrap\tminor\tpass\t0\t/var/log/boot.log\tok\t2026-04-08T09:55:00Z\t2026-04-08T09:56:00Z\nshort\tminor\tpass";
+        write_file(&nodes_tsv, nodes_base);
+        write_file(&stages_tsv, stages_base);
+        let mut rng = Rng(0x6B14_0000_0000_0015);
+        let mut checked = 0usize;
+        for iteration in 0..=(MUTATIONS / 10) {
+            let stages_body = if iteration == 0 {
+                stages_base.to_owned()
+            } else {
+                mutate_string(stages_base, &mut rng)
+            };
+            let nodes_body = if iteration == 0 {
+                nodes_base.to_owned()
+            } else {
+                mutate_string(nodes_base, &mut rng)
+            };
+            write_file(&stages_tsv, &stages_body);
+            write_file(&nodes_tsv, &nodes_body);
+            let old_json = sandbox.root.join(format!("summary-old-{iteration}.json"));
+            let new_json = sandbox.root.join(format!("summary-new-{iteration}.json"));
+            let old_md = sandbox.root.join(format!("summary-old-{iteration}.md"));
+            let new_md = sandbox.root.join(format!("summary-new-{iteration}.md"));
+            let config =
+                |summary_json: PathBuf, summary_md: PathBuf| WriteLiveLinuxLabRunSummaryConfig {
+                    nodes_tsv: nodes_tsv.clone(),
+                    stages_tsv: stages_tsv.clone(),
+                    summary_json,
+                    summary_md,
+                    run_id: "run-1".to_owned(),
+                    network_id: "net-1".to_owned(),
+                    report_dir: report_dir.display().to_string(),
+                    overall_status: "fail".to_owned(),
+                    started_at_local: "2026-04-08 10:00:00".to_owned(),
+                    started_at_utc: "2026-04-08T10:00:00Z".to_owned(),
+                    started_at_unix: 1_700_000_000,
+                    finished_at_local: "2026-04-08 10:05:00".to_owned(),
+                    finished_at_utc: "2026-04-08T10:05:00Z".to_owned(),
+                    finished_at_unix: 1_700_000_300,
+                    elapsed_secs: 300,
+                    elapsed_human: "5m".to_owned(),
+                    run_note: "note".to_owned(),
+                    git_commit: Some("deadbeef".to_owned()),
+                    git_tree_clean: Some(true),
+                    source_mode: Some("worktree".to_owned()),
+                    repo_ref: Some("wt/submodule-migration".to_owned()),
+                };
+            let old = old_execute_ops_write_live_linux_lab_run_summary(config(
+                old_json.clone(),
+                old_md.clone(),
+            ));
+            let new = execute_ops_write_live_linux_lab_run_summary(config(
+                new_json.clone(),
+                new_md.clone(),
+            ));
+            match (&old, &new) {
+                (Ok(_), Ok(_)) => {
+                    for (old_path, new_path) in [(&old_json, &new_json), (&old_md, &new_md)] {
+                        let old_body = fs::read(old_path).expect("old summary readable");
+                        let new_body = fs::read(new_path).expect("new summary readable");
+                        assert_eq!(
+                            old_body, new_body,
+                            "DIVERGENCE in run_summary output {old_path:?}"
+                        );
+                    }
+                }
+                (Err(old_error), Err(new_error)) => {
+                    assert_eq!(old_error, new_error, "DIVERGENCE in run_summary error");
+                }
+                (old, new) => panic!("DIVERGENCE in run_summary: {old:?} vs {new:?}"),
+            }
+            checked += 1;
+        }
+        assert!(checked >= 200, "fixture floor: only {checked}");
+    }
+
+    #[test]
+    fn forensics_bundle_old_equals_new_over_generated_rows() {
+        let sandbox = Sandbox::new("forensics");
+        let nodes_tsv = sandbox.root.join("nodes.tsv");
+        let stage_dir = sandbox.root.join("stage");
+        fs::create_dir_all(&stage_dir).expect("stage dir");
+        write_file(stage_dir.join("route_matrix.txt").as_path(), "route\n");
+        write_file(
+            stage_dir.join("cluster_snapshot.txt").as_path(),
+            "cluster\n",
+        );
+        let manifest = format!(
+            "{{\"mode\":\"cross_network_failure_forensics\",\"stage\":\"nightly\",\"bundle_dir\":{:?},\"nodes\":[{{\"label\":\"node-a\"}},{{\"label\":\"node-b\"}}]}}",
+            stage_dir.display().to_string()
+        );
+        write_file(stage_dir.join("manifest.json").as_path(), &manifest);
+        let base = "node-a\troot@10.0.0.1\tid-a\tcontrol\nnode-b\troot@10.0.0.2\tid-b\tworker\n";
+        write_file(&nodes_tsv, base);
+        let mut rng = Rng(0x6B15_0000_0000_0016);
+        let mut checked = 0usize;
+        for iteration in 0..=(MUTATIONS / 10) {
+            let body = if iteration == 0 {
+                base.to_owned()
+            } else {
+                mutate_string(base, &mut rng)
+            };
+            write_file(&nodes_tsv, &body);
+            let old_output = sandbox.root.join(format!("bundle-old-{iteration}.json"));
+            let new_output = sandbox.root.join(format!("bundle-new-{iteration}.json"));
+            let config = |output: PathBuf| ValidateCrossNetworkForensicsBundleConfig {
+                nodes_tsv: nodes_tsv.clone(),
+                stage_name: "nightly".to_owned(),
+                stage_dir: stage_dir.clone(),
+                output,
+            };
+            let old =
+                old_execute_ops_validate_cross_network_forensics_bundle(config(old_output.clone()));
+            let new =
+                execute_ops_validate_cross_network_forensics_bundle(config(new_output.clone()));
+            compare_reports("forensics_bundle", old, new, &old_output, &new_output);
+            checked += 1;
+        }
+        // missing stage dir: error parity
+        let config = |output: PathBuf| ValidateCrossNetworkForensicsBundleConfig {
+            nodes_tsv: nodes_tsv.clone(),
+            stage_name: "nightly".to_owned(),
+            stage_dir: sandbox.root.join("does-not-exist"),
+            output,
+        };
+        let old = old_execute_ops_validate_cross_network_forensics_bundle(config(
+            sandbox.root.join("missing-old.json"),
+        ));
+        let new = execute_ops_validate_cross_network_forensics_bundle(config(
+            sandbox.root.join("missing-new.json"),
+        ));
+        compare_reports(
+            "forensics_bundle missing stage dir",
+            old,
+            new,
+            &sandbox.root.join("missing-old.json"),
+            &sandbox.root.join("missing-new.json"),
+        );
+        assert!(checked >= 200, "fixture floor: only {checked}");
+    }
+
+    #[test]
+    fn control_surface_old_equals_new_over_generated_evidence() {
+        let sandbox = Sandbox::new("control-surface");
+        let work_dir = sandbox.root.join("work");
+        fs::create_dir_all(&work_dir).expect("work dir");
+        let daemon_base = "socket|600|root|root";
+        let helper_base = "socket|660|root|root";
+        let listeners_base =
+            "udp 1 2 3 127.0.0.1:5353 rustynetd\ntcp 1 2 3 127.0.0.1:99 rustynetd\n";
+        let dns_base = "active\n";
+        let mut rng = Rng(0x6B16_0000_0000_0017);
+        let mut checked = 0usize;
+        for iteration in 0..=(MUTATIONS / 10) {
+            let daemon = if iteration == 0 {
+                daemon_base.to_owned()
+            } else {
+                mutate_string(daemon_base, &mut rng)
+            };
+            let helper = if iteration == 0 {
+                helper_base.to_owned()
+            } else {
+                mutate_string(helper_base, &mut rng)
+            };
+            let listeners = if iteration == 0 {
+                listeners_base.to_owned()
+            } else {
+                mutate_string(listeners_base, &mut rng)
+            };
+            write_file(work_dir.join("alpha.daemon_socket.txt").as_path(), &daemon);
+            write_file(work_dir.join("alpha.helper_socket.txt").as_path(), &helper);
+            write_file(
+                work_dir.join("alpha.inet_listeners.txt").as_path(),
+                &listeners,
+            );
+            write_file(
+                work_dir.join("alpha.managed_dns_state.txt").as_path(),
+                dns_base,
+            );
+            let old_report = sandbox.root.join(format!("control-old-{iteration}.json"));
+            let new_report = sandbox.root.join(format!("control-new-{iteration}.json"));
+            let config = |report_path: PathBuf| WriteLiveLinuxControlSurfaceReportConfig {
+                report_path,
+                dns_bind_addr: "127.0.0.1:5353".to_owned(),
+                remote_dns_probe_status: "pass".to_owned(),
+                remote_dns_probe_output: "blocked by policy".to_owned(),
+                work_dir: work_dir.clone(),
+                host_labels: vec!["alpha".to_owned()],
+                captured_at_utc: "2026-04-08T10:00:00Z".to_owned(),
+                captured_at_unix: 1_700_000_000,
+            };
+            let old =
+                old_execute_ops_write_live_linux_control_surface_report(config(old_report.clone()));
+            let new =
+                execute_ops_write_live_linux_control_surface_report(config(new_report.clone()));
+            match (&old, &new) {
+                (Ok(old_status), Ok(new_status)) => {
+                    assert_eq!(
+                        old_status, new_status,
+                        "DIVERGENCE in control_surface status on {iteration}"
+                    );
+                    let old_body = fs::read(&old_report).expect("old report readable");
+                    let new_body = fs::read(&new_report).expect("new report readable");
+                    assert_eq!(
+                        old_body, new_body,
+                        "DIVERGENCE in control_surface bytes on {iteration}"
+                    );
+                }
+                (Err(old_error), Err(new_error)) => {
+                    assert_eq!(
+                        old_error, new_error,
+                        "DIVERGENCE in control_surface error on {iteration}"
+                    );
+                }
+                (old, new) => {
+                    panic!("DIVERGENCE in control_surface on {iteration}: {old:?} vs {new:?}")
+                }
+            }
+            checked += 1;
+        }
+        assert!(checked >= 200, "fixture floor: only {checked}");
     }
 }
