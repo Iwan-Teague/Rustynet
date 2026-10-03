@@ -1461,7 +1461,20 @@ enum RouteTableFamily {
 struct ExpectedBypassRoute {
     destination: String,
     interface_name: String,
+    /// Next-hop gateway the route must carry (`via <gw>`); `None` means the
+    /// route must be on-link, i.e. carry no `via` at all.
+    via: Option<String>,
     family: RouteTableFamily,
+}
+
+/// Kernel resolution of one destination, as reported by `ip route get`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRoute {
+    interface_name: String,
+    via: Option<IpAddr>,
+    /// The kernel answered from our own table 51820 (`... table 51820`), i.e.
+    /// from a bypass pin already installed, not from the underlay's routing.
+    from_bypass_table: bool,
 }
 
 impl LinuxCommandSystem {
@@ -1796,15 +1809,20 @@ impl LinuxCommandSystem {
         Ok(())
     }
 
-    /// QH-60: the management bypass is structurally on-link — the route is
-    /// `ip route replace <cidr> dev <egress> table 51820` with no `via` — so
-    /// a CIDR set overlapping no connected prefix on the egress interface
-    /// describes a carve-out that cannot deliver replies. Engaging
-    /// full-tunnel policy routing with a provably dead carve-out black-holes
-    /// management (the QH-57 wedge). Refuse the apply instead, BEFORE the
-    /// `ip rule … table 51820` engagement: the node stays reachable and the
-    /// reconcile loop retries, so a DHCP race self-heals and the transient
-    /// restricted state clears on the first successful apply.
+    /// QH-60: a management CIDR overlapping a connected prefix on the egress
+    /// interface is installed on-link — `ip route replace <cidr> dev <egress>
+    /// table 51820`, no `via`. A CIDR overlapping no connected prefix is
+    /// off-link: an on-link route for it cannot deliver replies (ARP for a
+    /// host that is not on the segment), so a host route is resolved through
+    /// the main table and installed with the kernel's next hop (`via <gw>
+    /// dev <egress>`). A CIDR with no provable deliverable route (wider than
+    /// a host route, unresolvable, or resolving off the egress interface)
+    /// counts as unanchored and keeps the on-link form. Engaging full-tunnel
+    /// policy routing with no deliverable carve-out black-holes management
+    /// (the QH-57 wedge). Refuse the apply instead, BEFORE the `ip rule …
+    /// table 51820` engagement: the node stays reachable and the reconcile
+    /// loop retries, so a DHCP race self-heals and the transient restricted
+    /// state clears on the first successful apply.
     ///
     /// The quorum is IPv4-only while IPv6 parity is unsupported: each
     /// generation hard-disables IPv6 AFTER the routes stage, so a v6 quorum
@@ -1812,7 +1830,7 @@ impl LinuxCommandSystem {
     /// exit mode other than FullTunnel the rule-51820 lookup is never
     /// installed, a wrong list is inert, and refusal would brick mesh-join
     /// for exit-less nodes — warn and install instead.
-    fn ensure_management_bypass_anchored(&mut self) -> Result<(), SystemError> {
+    fn ensure_management_bypass_anchored(&mut self) -> Result<Vec<Option<IpAddr>>, SystemError> {
         let output = self
             .run_capture(
                 PrivilegedCommandProgram::Ip,
@@ -1844,6 +1862,7 @@ impl LinuxCommandSystem {
         let connected = parse_connected_v4_prefixes(output.stdout.as_str());
         let mut anchored_any = false;
         let mut unanchored: Vec<String> = Vec::new();
+        let mut plan = Vec::with_capacity(self.fail_closed_ssh_allow_cidrs.len());
         for cidr in &self.fail_closed_ssh_allow_cidrs {
             match cidr.address {
                 IpAddr::V4(v4) => {
@@ -1852,8 +1871,13 @@ impl LinuxCommandSystem {
                         .any(|(net, prefix)| v4_cidrs_overlap(v4, cidr.prefix, *net, *prefix));
                     if hit {
                         anchored_any = true;
+                        plan.push(None);
+                    } else if let Some(gateway) = self.resolve_management_bypass_gateway(cidr) {
+                        anchored_any = true;
+                        plan.push(Some(gateway));
                     } else {
                         unanchored.push(cidr.to_string());
+                        plan.push(None);
                     }
                 }
                 IpAddr::V6(_) => {
@@ -1861,18 +1885,20 @@ impl LinuxCommandSystem {
                         "rustynetd: management CIDR {cidr} is IPv6 and excluded from the \
                          bypass anchoring quorum while IPv6 parity is unsupported"
                     );
+                    plan.push(None);
                 }
             }
         }
         if anchored_any {
             for cidr in &unanchored {
                 eprintln!(
-                    "rustynetd: management CIDR {cidr} overlaps no connected prefix on {} — \
-                     its on-link bypass route cannot deliver to that range",
+                    "rustynetd: management CIDR {cidr} overlaps no connected prefix on {} and \
+                     resolves to no deliverable next hop — its on-link bypass route cannot \
+                     deliver to that range",
                     self.egress_interface
                 );
             }
-            return Ok(());
+            return Ok(plan);
         }
         if !self.full_tunnel_engaged {
             eprintln!(
@@ -1883,7 +1909,7 @@ impl LinuxCommandSystem {
                 join_management_cidrs(&self.fail_closed_ssh_allow_cidrs),
                 join_connected_prefixes(&connected),
             );
-            return Ok(());
+            return Ok(plan);
         }
         Err(SystemError::RouteApplyFailed(format!(
             "no management CIDR overlaps a connected prefix on {} (configured: [{}]; \
@@ -1896,17 +1922,72 @@ impl LinuxCommandSystem {
         )))
     }
 
+    /// Next hop for an off-link management CIDR, resolved through the main
+    /// table. Only a host route has a single provable next hop; a wider CIDR
+    /// may span several main-table routes, so it stays undeliverable. The
+    /// resolved interface must be the egress interface: management must never
+    /// be pinned to another link, and a lookup that lands on the tunnel means
+    /// policy routing is already engaged and the answer is not the underlay's.
+    fn resolve_management_bypass_gateway(&self, cidr: &ManagementCidr) -> Option<IpAddr> {
+        if cidr.is_ipv6() || cidr.prefix != 32 {
+            return None;
+        }
+        match self.lookup_route_for_ip(cidr.address) {
+            Ok(route) if route.interface_name == self.egress_interface => {
+                if route.from_bypass_table {
+                    // Only our own fresh endpoint pin for this very host may
+                    // answer from table 51820; reuse its recorded next hop.
+                    // Anything else is a stale pin, never a resolution.
+                    return self.recorded_endpoint_gateway(cidr.address, &route);
+                }
+                route.via
+            }
+            Ok(route) => {
+                eprintln!(
+                    "rustynetd: management CIDR {cidr} resolves via {} instead of the egress \
+                     interface {}",
+                    route.interface_name, self.egress_interface
+                );
+                None
+            }
+            Err(err) => {
+                eprintln!("rustynetd: management CIDR {cidr} next hop resolution failed: {err}");
+                None
+            }
+        }
+    }
+
+    /// Next hop recorded for the peer-endpoint pin of exactly `address`, when
+    /// the table-51820 answer agrees with it and the pin is on the egress
+    /// interface.
+    fn recorded_endpoint_gateway(&self, address: IpAddr, route: &ResolvedRoute) -> Option<IpAddr> {
+        let destination = format!("{address}/32");
+        let recorded = self
+            .expected_peer_endpoint_bypass_routes
+            .iter()
+            .find(|expected| {
+                expected.destination == destination
+                    && expected.interface_name == self.egress_interface
+            })?
+            .via
+            .as_deref()?
+            .parse::<IpAddr>()
+            .ok()?;
+        (route.via == Some(recorded)).then_some(recorded)
+    }
+
     fn apply_fail_closed_management_bypass_routes(&mut self) -> Result<(), SystemError> {
         self.expected_management_bypass_routes.clear();
         if !self.fail_closed_ssh_allow {
             return Ok(());
         }
-        self.ensure_management_bypass_anchored()?;
-        for cidr in &self.fail_closed_ssh_allow_cidrs {
+        let plan = self.ensure_management_bypass_anchored()?;
+        for (cidr, via) in self.fail_closed_ssh_allow_cidrs.iter().zip(plan) {
             // Management SSH must stay on the underlay interface. Resolving the
             // current FIB here can return the tunnel once exit-mode policy
             // routing is already active, which black-holes the control plane.
-            let args = Self::management_bypass_route_args(cidr, self.egress_interface.as_str());
+            let args =
+                Self::management_bypass_route_args(cidr, self.egress_interface.as_str(), via);
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             let result = self.run(PrivilegedCommandProgram::Ip, &arg_refs);
             result.map_err(|err| {
@@ -1918,12 +1999,93 @@ impl LinuxCommandSystem {
                 .insert(Self::expected_bypass_route(
                     cidr.to_string(),
                     self.egress_interface.clone(),
+                    via,
                 ));
         }
         Ok(())
     }
 
-    fn resolve_route_interface_for_ip(&self, target_ip: IpAddr) -> Result<String, SystemError> {
+    /// Parse `ip route get <target>` output into the interface and next hop the
+    /// kernel would use. Fails closed on anything that is not a plain unicast
+    /// answer: a kernel error, a non-unicast route type, a missing or invalid
+    /// `dev`, or a `via` that is not an address of the target's family.
+    fn parse_route_get(target_ip: IpAddr, stdout: &str) -> Result<ResolvedRoute, String> {
+        if stdout.contains("RTNETLINK") {
+            return Err(format!("kernel reported an error: {}", stdout.trim()));
+        }
+        let tokens = stdout.split_whitespace().collect::<Vec<_>>();
+        if matches!(
+            tokens.first().copied(),
+            Some(
+                "blackhole"
+                    | "unreachable"
+                    | "prohibit"
+                    | "throw"
+                    | "local"
+                    | "broadcast"
+                    | "multicast"
+                    | "anycast"
+            )
+        ) {
+            return Err(format!("non-unicast route: {}", stdout.trim()));
+        }
+        let token_after = |keyword: &str| {
+            tokens
+                .iter()
+                .position(|token| *token == keyword)
+                .map(|index| tokens.get(index + 1).copied())
+        };
+        let Some(Some(interface)) = token_after("dev") else {
+            return Err(format!("missing dev in output={}", stdout.trim()));
+        };
+        validate_net_device_name(interface)
+            .map_err(|message| format!("invalid interface: {message}"))?;
+        let via = match token_after("via") {
+            None => None,
+            Some(None) => return Err("via without a gateway address".to_owned()),
+            Some(Some(gateway)) => {
+                let gateway = gateway
+                    .parse::<IpAddr>()
+                    .map_err(|_| format!("unparseable via gateway {gateway:?}"))?;
+                if gateway.is_ipv4() != target_ip.is_ipv4() {
+                    return Err(format!(
+                        "via gateway {gateway} is not the address family of {target_ip}"
+                    ));
+                }
+                let mapped_v4 = matches!(gateway, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some());
+                if gateway.is_unspecified()
+                    || gateway.is_multicast()
+                    || gateway.is_loopback()
+                    || mapped_v4
+                {
+                    return Err(format!("via gateway {gateway} is not a unicast address"));
+                }
+                Some(gateway)
+            }
+        };
+        Ok(ResolvedRoute {
+            interface_name: interface.to_owned(),
+            via,
+            from_bypass_table: tokens.windows(2).any(|window| window == ["table", "51820"]),
+        })
+    }
+
+    /// Resolve the underlay route for a peer endpoint. An answer served from our
+    /// own table 51820 is refused: the rollback flush is best-effort, so after a
+    /// failed flush the lookup would echo a stale pin back and re-pin it as if
+    /// it were the kernel's current next hop.
+    fn resolve_route_for_ip(&self, target_ip: IpAddr) -> Result<ResolvedRoute, SystemError> {
+        let route = self.lookup_route_for_ip(target_ip)?;
+        if route.from_bypass_table {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "route interface resolution for {target_ip} was answered from table 51820 \
+                 (stale bypass pin; the rollback flush did not take effect)"
+            )));
+        }
+        Ok(route)
+    }
+
+    fn lookup_route_for_ip(&self, target_ip: IpAddr) -> Result<ResolvedRoute, SystemError> {
         let mut args = Vec::with_capacity(4);
         if matches!(target_ip, IpAddr::V6(_)) {
             args.push("-6".to_owned());
@@ -1940,24 +2102,21 @@ impl LinuxCommandSystem {
                 output.stderr.trim()
             )));
         }
-        let tokens = output.stdout.split_whitespace().collect::<Vec<_>>();
-        for (index, token) in tokens.iter().enumerate() {
-            if *token == "dev" {
-                let Some(interface) = tokens.get(index + 1) else {
-                    break;
-                };
-                validate_net_device_name(interface).map_err(|message| {
-                    SystemError::RouteApplyFailed(format!(
-                        "route interface resolution returned invalid interface for {target_ip}: {message}"
-                    ))
-                })?;
-                return Ok((*interface).to_owned());
-            }
+        let route =
+            Self::parse_route_get(target_ip, output.stdout.as_str()).map_err(|message| {
+                SystemError::RouteApplyFailed(format!(
+                    "route interface resolution failed for {target_ip}: {message}"
+                ))
+            })?;
+        // A lookup answered by the tunnel means policy routing already covers
+        // the target; pinning its bypass to the tunnel would loop it.
+        if route.interface_name == self.interface_name {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "route interface resolution for {target_ip} returned the tunnel interface {}",
+                self.interface_name
+            )));
         }
-        Err(SystemError::RouteApplyFailed(format!(
-            "route interface resolution failed for {target_ip}: missing dev in output={}",
-            output.stdout.trim()
-        )))
+        Ok(route)
     }
 
     fn route_table_output(&self, family: RouteTableFamily) -> Result<String, SystemError> {
@@ -2421,7 +2580,11 @@ impl LinuxCommandSystem {
         self.run(PrivilegedCommandProgram::Nft, &borrowed)
     }
 
-    fn expected_bypass_route(addr_or_cidr: String, interface_name: String) -> ExpectedBypassRoute {
+    fn expected_bypass_route(
+        addr_or_cidr: String,
+        interface_name: String,
+        via: Option<IpAddr>,
+    ) -> ExpectedBypassRoute {
         let family = if addr_or_cidr.contains(':') {
             RouteTableFamily::V6
         } else {
@@ -2430,6 +2593,7 @@ impl LinuxCommandSystem {
         ExpectedBypassRoute {
             destination: addr_or_cidr,
             interface_name,
+            via: via.map(|gateway| gateway.to_string()),
             family,
         }
     }
@@ -2476,9 +2640,20 @@ impl LinuxCommandSystem {
             return false;
         }
         let token_vec: Vec<_> = line.split_whitespace().collect();
-        token_vec.windows(2).any(|window| {
-            window.first() == Some(&"dev") && window.get(1) == Some(&route.interface_name.as_str())
-        })
+        // An off-link pin must carry its exact gateway; an on-link pin must not
+        // carry any, so a via-less route never satisfies a via expectation (it
+        // is the black-holing form) and a stray via never satisfies an on-link one.
+        let via_matches = match route.via.as_deref() {
+            Some(gateway) => token_vec
+                .windows(2)
+                .any(|window| window.first() == Some(&"via") && window.get(1) == Some(&gateway)),
+            None => !token_vec.contains(&"via"),
+        };
+        via_matches
+            && token_vec.windows(2).any(|window| {
+                window.first() == Some(&"dev")
+                    && window.get(1) == Some(&route.interface_name.as_str())
+            })
     }
 
     fn assert_expected_bypass_routes(&self) -> Result<(), SystemError> {
@@ -2517,7 +2692,13 @@ impl LinuxCommandSystem {
             {
                 continue;
             }
-            let expected = format!("{} dev {}", route.destination, route.interface_name);
+            let expected = match route.via.as_deref() {
+                Some(gateway) => format!(
+                    "{} via {gateway} dev {}",
+                    route.destination, route.interface_name
+                ),
+                None => format!("{} dev {}", route.destination, route.interface_name),
+            };
             return Err(SystemError::KillSwitchAssertionFailed(format!(
                 "missing owned bypass route in table 51820: expected={} output={}",
                 expected,
@@ -2850,14 +3031,22 @@ impl LinuxCommandSystem {
         )))
     }
 
-    fn management_bypass_route_args(cidr: &ManagementCidr, route_interface: &str) -> Vec<String> {
-        let mut args = Vec::with_capacity(9);
+    fn management_bypass_route_args(
+        cidr: &ManagementCidr,
+        route_interface: &str,
+        via: Option<IpAddr>,
+    ) -> Vec<String> {
+        let mut args = Vec::with_capacity(11);
         if cidr.is_ipv6() {
             args.push("-6".to_owned());
         }
         args.push("route".to_owned());
         args.push("replace".to_owned());
         args.push(cidr.to_string());
+        if let Some(gateway) = via {
+            args.push("via".to_owned());
+            args.push(gateway.to_string());
+        }
         args.push("dev".to_owned());
         args.push(route_interface.to_owned());
         args.push("table".to_owned());
@@ -2865,18 +3054,26 @@ impl LinuxCommandSystem {
         args
     }
 
-    fn peer_endpoint_bypass_route_args(addr: IpAddr, route_interface: &str) -> Vec<String> {
+    fn peer_endpoint_bypass_route_args(
+        addr: IpAddr,
+        route_interface: &str,
+        via: Option<IpAddr>,
+    ) -> Vec<String> {
         let endpoint_cidr = match addr {
             IpAddr::V4(value) => format!("{value}/32"),
             IpAddr::V6(value) => format!("{value}/128"),
         };
-        let mut args = Vec::with_capacity(9);
+        let mut args = Vec::with_capacity(11);
         if matches!(addr, IpAddr::V6(_)) {
             args.push("-6".to_owned());
         }
         args.push("route".to_owned());
         args.push("replace".to_owned());
         args.push(endpoint_cidr);
+        if let Some(gateway) = via {
+            args.push("via".to_owned());
+            args.push(gateway.to_string());
+        }
         args.push("dev".to_owned());
         args.push(route_interface.to_owned());
         args.push("table".to_owned());
@@ -3309,8 +3506,12 @@ impl DataplaneSystem for LinuxCommandSystem {
             endpoints.insert(peer.endpoint.addr);
         }
         for endpoint in endpoints {
-            let route_interface = self.resolve_route_interface_for_ip(endpoint)?;
-            let args = Self::peer_endpoint_bypass_route_args(endpoint, route_interface.as_str());
+            let route = self.resolve_route_for_ip(endpoint)?;
+            let args = Self::peer_endpoint_bypass_route_args(
+                endpoint,
+                route.interface_name.as_str(),
+                route.via,
+            );
             let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
             self.run(PrivilegedCommandProgram::Ip, &arg_refs)
                 .map_err(|err| {
@@ -3324,7 +3525,8 @@ impl DataplaneSystem for LinuxCommandSystem {
                         IpAddr::V4(value) => format!("{value}/32"),
                         IpAddr::V6(value) => format!("{value}/128"),
                     },
-                    route_interface,
+                    route.interface_name,
+                    route.via,
                 ));
         }
         Ok(())
@@ -17391,8 +17593,11 @@ mod tests {
     /// `ip route replace 0.0.0.0/0 dev enp0s1 table 51820`.
     #[test]
     fn expected_bypass_route_matches_the_default_route_iproute2_actually_renders() {
-        let route =
-            LinuxCommandSystem::expected_bypass_route("0.0.0.0/0".to_owned(), "enp0s1".to_owned());
+        let route = LinuxCommandSystem::expected_bypass_route(
+            "0.0.0.0/0".to_owned(),
+            "enp0s1".to_owned(),
+            None,
+        );
         assert!(
             LinuxCommandSystem::line_matches_expected_bypass_route(
                 "default dev enp0s1 scope link ",
@@ -17401,7 +17606,8 @@ mod tests {
             "we install 0.0.0.0/0 and the kernel renders it back as `default`"
         );
         // The v6 default renders the same way.
-        let v6 = LinuxCommandSystem::expected_bypass_route("::/0".to_owned(), "enp0s1".to_owned());
+        let v6 =
+            LinuxCommandSystem::expected_bypass_route("::/0".to_owned(), "enp0s1".to_owned(), None);
         assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
             "default dev enp0s1 metric 1024 pref medium",
             &v6
@@ -17420,6 +17626,7 @@ mod tests {
         let lan = LinuxCommandSystem::expected_bypass_route(
             "192.168.64.0/24".to_owned(),
             "enp0s1".to_owned(),
+            None,
         );
         assert!(!LinuxCommandSystem::line_matches_expected_bypass_route(
             "default dev enp0s1 scope link",
@@ -17437,6 +17644,7 @@ mod tests {
         let route = LinuxCommandSystem::expected_bypass_route(
             "10.0.0.7/32".to_owned(),
             "enp0s1".to_owned(),
+            None,
         );
         assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
             "10.0.0.7 dev enp0s1 scope link",
@@ -17453,7 +17661,7 @@ mod tests {
         let cidr = "192.168.18.0/24"
             .parse::<ManagementCidr>()
             .expect("valid cidr");
-        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8");
+        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8", None);
         assert_eq!(
             args,
             vec![
@@ -17471,7 +17679,7 @@ mod tests {
     #[test]
     fn management_bypass_route_args_use_ipv6_routing_for_ipv6_cidr() {
         let cidr = "fd00::/64".parse::<ManagementCidr>().expect("valid cidr");
-        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8");
+        let args = LinuxCommandSystem::management_bypass_route_args(&cidr, "enp0s8", None);
         assert_eq!(
             args,
             vec![
@@ -17491,7 +17699,19 @@ mod tests {
     #[test]
     fn fail_closed_management_allow_routes_use_underlay_egress_interface() {
         let socket_path = phase10_test_socket_path("m");
-        let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![(
+                "ip -4 -o addr show dev enp0s9".to_string(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout:
+                        "3: enp0s9    inet 192.168.18.7/24 brd 192.168.18.255 scope global enp0s9\n"
+                            .to_string(),
+                    stderr: String::new(),
+                },
+            )],
+        );
         let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
             .expect("privileged client should initialize");
         let mut system = LinuxCommandSystem::new(
@@ -18639,6 +18859,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -18739,6 +18960,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -18890,6 +19112,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -18966,6 +19189,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -19050,6 +19274,7 @@ mod tests {
             .insert(ExpectedBypassRoute {
                 destination: "203.0.113.10/32".to_string(),
                 interface_name: "enp0s9".to_string(),
+                via: None,
                 family: RouteTableFamily::V4,
             });
 
@@ -19146,6 +19371,7 @@ mod tests {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "192.168.18.40".parse().expect("valid ipv4"),
             "enp0s8",
+            None,
         );
         assert_eq!(
             args,
@@ -19198,6 +19424,7 @@ mod tests {
         let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
             "fd00::10".parse().expect("valid ipv6"),
             "enp0s8",
+            None,
         );
         assert_eq!(
             args,
@@ -19212,6 +19439,690 @@ mod tests {
                 "51820".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn peer_endpoint_bypass_route_args_carry_the_kernel_next_hop() {
+        let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
+            "203.0.113.30".parse().expect("valid ipv4"),
+            "ens3",
+            Some("192.168.122.1".parse().expect("valid gateway")),
+        );
+        assert_eq!(
+            args.join(" "),
+            "route replace 203.0.113.30/32 via 192.168.122.1 dev ens3 table 51820"
+        );
+        let args = LinuxCommandSystem::peer_endpoint_bypass_route_args(
+            "2001:db8::7".parse().expect("valid ipv6"),
+            "ens3",
+            Some("fe80::1".parse().expect("valid gateway")),
+        );
+        assert_eq!(
+            args.join(" "),
+            "-6 route replace 2001:db8::7/128 via fe80::1 dev ens3 table 51820"
+        );
+    }
+
+    #[test]
+    fn management_bypass_route_args_carry_the_kernel_next_hop() {
+        let cidr = "100.122.143.29/32"
+            .parse::<ManagementCidr>()
+            .expect("valid cidr");
+        let args = LinuxCommandSystem::management_bypass_route_args(
+            &cidr,
+            "ens3",
+            Some("192.168.122.1".parse().expect("valid gateway")),
+        );
+        assert_eq!(
+            args.join(" "),
+            "route replace 100.122.143.29/32 via 192.168.122.1 dev ens3 table 51820"
+        );
+    }
+
+    #[test]
+    fn parse_route_get_reads_interface_and_next_hop() {
+        let v4: IpAddr = "203.0.113.30".parse().expect("valid ipv4");
+        let v6: IpAddr = "2001:db8::7".parse().expect("valid ipv6");
+        let gw4: IpAddr = "192.168.122.1".parse().expect("valid gateway");
+        let gw6: IpAddr = "fe80::1".parse().expect("valid gateway");
+        let ok: &[(IpAddr, &str, &str, Option<IpAddr>)] = &[
+            (
+                v4,
+                "203.0.113.30 via 192.168.122.1 dev ens3 src 192.168.122.45 uid 0\n    cache\n",
+                "ens3",
+                Some(gw4),
+            ),
+            (
+                v4,
+                "192.168.122.9 dev ens3 src 192.168.122.45 uid 0\n    cache\n",
+                "ens3",
+                None,
+            ),
+            (
+                v6,
+                "2001:db8::7 from :: via fe80::1 dev ens3 proto ra src 2001:db8::45 metric 1024 pref medium\n",
+                "ens3",
+                Some(gw6),
+            ),
+        ];
+        for (target, stdout, dev, via) in ok {
+            let route = LinuxCommandSystem::parse_route_get(*target, stdout)
+                .unwrap_or_else(|err| panic!("{stdout:?} should parse: {err}"));
+            assert_eq!(route.interface_name, *dev, "{stdout:?}");
+            assert_eq!(route.via, *via, "{stdout:?}");
+        }
+
+        let rejected: &[(IpAddr, &str)] = &[
+            (v4, ""),
+            (
+                v4,
+                "203.0.113.30 via 192.168.122.1 src 192.168.122.45 uid 0\n",
+            ),
+            (v4, "203.0.113.30 via 192.168.122.1 dev\n"),
+            (v4, "203.0.113.30 via 192.168.122.1 dev bad/name\n"),
+            (v4, "203.0.113.30 via dev ens3\n"),
+            (v4, "203.0.113.30 via not-an-ip dev ens3\n"),
+            (v4, "203.0.113.30 via\n"),
+            (v4, "203.0.113.30 via inet6 fe80::1 dev ens3\n"),
+            (v4, "203.0.113.30 via fe80::1 dev ens3\n"),
+            (v6, "2001:db8::7 via 192.168.122.1 dev ens3\n"),
+            (v4, "203.0.113.30 via 0.0.0.0 dev ens3\n"),
+            (v4, "203.0.113.30 via 224.0.0.1 dev ens3\n"),
+            (v4, "203.0.113.30 via 127.0.0.1 dev ens3\n"),
+            (v6, "2001:db8::7 via ::1 dev ens3\n"),
+            (v6, "2001:db8::7 via ::ffff:192.0.2.1 dev ens3\n"),
+            (v4, "blackhole 203.0.113.30 dev lo\n"),
+            (v4, "unreachable 203.0.113.30 dev lo\n"),
+            (v4, "prohibit 203.0.113.30 dev lo\n"),
+            (v4, "throw 203.0.113.30\n"),
+            (v4, "local 203.0.113.30 dev lo src 203.0.113.30 uid 0\n"),
+            (
+                v4,
+                "broadcast 255.255.255.255 dev ens3 src 192.168.122.45\n",
+            ),
+            (v4, "RTNETLINK answers: Network is unreachable\n"),
+        ];
+        for (target, stdout) in rejected {
+            assert!(
+                LinuxCommandSystem::parse_route_get(*target, stdout).is_err(),
+                "{stdout:?} must be rejected"
+            );
+        }
+    }
+
+    const OFFLINK_ROUTE_GET: &str =
+        "203.0.113.30 via 192.168.122.1 dev ens3 src 192.168.122.45 uid 0\n    cache\n";
+
+    #[cfg(target_os = "linux")]
+    fn run_peer_endpoint_bypass(
+        prefix: &str,
+        route_get: PrivilegedCommandOutput,
+        endpoint: &str,
+    ) -> (
+        Result<(), SystemError>,
+        Vec<String>,
+        BTreeSet<ExpectedBypassRoute>,
+    ) {
+        let socket_path = phase10_test_socket_path(prefix);
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![("route get".to_string(), route_get)],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "ens3",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        let peer = rustynet_backend_api::PeerConfig {
+            node_id: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            public_key: [0u8; 32],
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: endpoint.parse::<IpAddr>().expect("valid endpoint"),
+                port: 51820,
+            },
+            allowed_ips: Vec::new(),
+            persistent_keepalive_secs: None,
+            preshared_key: None,
+        };
+        let result = DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut system, &[peer]);
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let expected = system.expected_peer_endpoint_bypass_routes.clone();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        (result, command_log, expected)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn scripted_ok(stdout: &str) -> PrivilegedCommandOutput {
+        PrivilegedCommandOutput {
+            status: 0,
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_link_peer_endpoint_bypass_route_carries_the_kernel_next_hop() {
+        let (result, log, expected) =
+            run_peer_endpoint_bypass("vo", scripted_ok(OFFLINK_ROUTE_GET), "203.0.113.30");
+        result.expect("off-link endpoint bypass should apply");
+        assert!(
+            log.iter().any(|cmd| cmd.ends_with(
+                "ip route replace 203.0.113.30/32 via 192.168.122.1 dev ens3 table 51820"
+            )),
+            "off-link endpoint must be pinned via the kernel's gateway: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|cmd| cmd.ends_with("203.0.113.30/32 dev ens3 table 51820")),
+            "the via-less black-holing form must not be issued: {log:?}"
+        );
+        assert_eq!(
+            expected,
+            BTreeSet::from([ExpectedBypassRoute {
+                destination: "203.0.113.30/32".to_string(),
+                interface_name: "ens3".to_string(),
+                via: Some("192.168.122.1".to_string()),
+                family: RouteTableFamily::V4,
+            }])
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_subnet_peer_endpoint_bypass_route_stays_on_link() {
+        let (result, log, expected) = run_peer_endpoint_bypass(
+            "vs",
+            scripted_ok("192.168.122.9 dev ens3 src 192.168.122.45 uid 0\n    cache\n"),
+            "192.168.122.9",
+        );
+        result.expect("same-subnet endpoint bypass should apply");
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.ends_with("ip route replace 192.168.122.9/32 dev ens3 table 51820")),
+            "same-subnet endpoint keeps the on-link form: {log:?}"
+        );
+        assert!(expected.iter().all(|route| route.via.is_none()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ipv6_peer_endpoint_bypass_route_carries_the_kernel_next_hop() {
+        let (result, log, expected) = run_peer_endpoint_bypass(
+            "v6",
+            scripted_ok(
+                "2001:db8::7 from :: via fe80::1 dev ens3 proto ra src 2001:db8::45 metric 1024 pref medium\n",
+            ),
+            "2001:db8::7",
+        );
+        result.expect("ipv6 endpoint bypass should apply");
+        assert!(
+            log.iter().any(|cmd| cmd
+                .ends_with("ip -6 route replace 2001:db8::7/128 via fe80::1 dev ens3 table 51820")),
+            "{log:?}"
+        );
+        assert_eq!(
+            expected
+                .iter()
+                .next()
+                .and_then(|route| route.via.as_deref()),
+            Some("fe80::1")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn peer_endpoint_bypass_rejects_unusable_route_resolution() {
+        let cases = [
+            (
+                "vt",
+                scripted_ok("203.0.113.30 dev rustynet0 src 100.64.0.1 uid 0\n    cache\n"),
+                "tunnel interface",
+            ),
+            (
+                "vr",
+                PrivilegedCommandOutput {
+                    status: 2,
+                    stdout: String::new(),
+                    stderr: "RTNETLINK answers: Network is unreachable\n".to_string(),
+                },
+                "route interface resolution failed",
+            ),
+            (
+                "vb",
+                scripted_ok("blackhole 203.0.113.30 dev lo\n"),
+                "non-unicast",
+            ),
+            (
+                "vm",
+                scripted_ok("203.0.113.30 via 192.168.122.1 src 192.168.122.45\n"),
+                "missing dev",
+            ),
+            // The rollback flush is best-effort: a lookup answered from our own
+            // table 51820 is a stale pin echoed back, never a resolution.
+            (
+                "vs1",
+                scripted_ok(
+                    "203.0.113.30 via 192.168.122.1 dev ens3 table 51820 src 192.168.122.45 uid 0\n    cache\n",
+                ),
+                "answered from table 51820",
+            ),
+            (
+                "vs2",
+                scripted_ok("203.0.113.30 dev ens3 table 51820 src 192.168.122.45 uid 0\n"),
+                "answered from table 51820",
+            ),
+        ];
+        for (prefix, output, needle) in cases {
+            let (result, log, expected) = run_peer_endpoint_bypass(prefix, output, "203.0.113.30");
+            let err = result.expect_err("unusable resolution must fail closed");
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+            assert!(
+                !log.iter().any(|cmd| cmd.contains("route replace")),
+                "no route may be installed on a failed resolution: {log:?}"
+            );
+            assert!(expected.is_empty());
+        }
+    }
+
+    #[test]
+    fn bypass_route_matching_requires_the_pinned_next_hop() {
+        let via = LinuxCommandSystem::expected_bypass_route(
+            "203.0.113.30/32".to_owned(),
+            "ens3".to_owned(),
+            Some("192.168.122.1".parse().expect("valid gateway")),
+        );
+        let on_link = LinuxCommandSystem::expected_bypass_route(
+            "203.0.113.30/32".to_owned(),
+            "ens3".to_owned(),
+            None,
+        );
+        let via_line = "203.0.113.30 via 192.168.122.1 dev ens3";
+        let on_link_line = "203.0.113.30 dev ens3 scope link";
+        assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
+            via_line, &via
+        ));
+        assert!(LinuxCommandSystem::line_matches_expected_bypass_route(
+            on_link_line,
+            &on_link
+        ));
+        assert!(
+            !LinuxCommandSystem::line_matches_expected_bypass_route(on_link_line, &via),
+            "an on-link route must not satisfy an expected via route"
+        );
+        assert!(
+            !LinuxCommandSystem::line_matches_expected_bypass_route(via_line, &on_link),
+            "a via route must not satisfy an expected on-link route"
+        );
+        assert!(
+            !LinuxCommandSystem::line_matches_expected_bypass_route(
+                "203.0.113.30 via 192.168.122.2 dev ens3",
+                &via
+            ),
+            "a different gateway must not satisfy the pin"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn run_management_bypass(
+        prefix: &str,
+        cidrs: &[&str],
+        full_tunnel: bool,
+        responses: Vec<(String, PrivilegedCommandOutput)>,
+    ) -> (
+        Result<(), SystemError>,
+        Vec<String>,
+        BTreeSet<ExpectedBypassRoute>,
+    ) {
+        run_management_bypass_with_endpoint_pins(prefix, cidrs, full_tunnel, responses, &[])
+    }
+
+    /// As `run_management_bypass`, with peer-endpoint pins already recorded the
+    /// way `apply_peer_endpoint_bypass_routes` leaves them (it runs first).
+    #[cfg(target_os = "linux")]
+    fn run_management_bypass_with_endpoint_pins(
+        prefix: &str,
+        cidrs: &[&str],
+        full_tunnel: bool,
+        responses: Vec<(String, PrivilegedCommandOutput)>,
+        endpoint_pins: &[ExpectedBypassRoute],
+    ) -> (
+        Result<(), SystemError>,
+        Vec<String>,
+        BTreeSet<ExpectedBypassRoute>,
+    ) {
+        let socket_path = phase10_test_socket_path(prefix);
+        let (commands, stop, helper_thread) =
+            spawn_privileged_scripted_helper(&socket_path, responses);
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "ens3",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            true,
+            cidrs
+                .iter()
+                .map(|cidr| cidr.parse::<ManagementCidr>().expect("valid cidr"))
+                .collect(),
+        )
+        .expect("linux command system should initialize");
+        system.full_tunnel_engaged = full_tunnel;
+        system
+            .expected_peer_endpoint_bypass_routes
+            .extend(endpoint_pins.iter().cloned());
+        let result = DataplaneSystem::apply_routes(&mut system, &[]);
+        let command_log = commands.lock().expect("command log should lock").clone();
+        let expected = system.expected_management_bypass_routes.clone();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        (result, command_log, expected)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn connected_ens3() -> (String, PrivilegedCommandOutput) {
+        (
+            "ip -4 -o addr show dev ens3".to_string(),
+            scripted_ok(
+                "2: ens3    inet 192.168.122.45/24 brd 192.168.122.255 scope global ens3\n",
+            ),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn off_link_management_host_route_is_pinned_via_the_kernel_next_hop() {
+        let (result, log, expected) = run_management_bypass(
+            "ma",
+            &["192.168.122.0/24", "100.122.143.29/32"],
+            true,
+            vec![
+                connected_ens3(),
+                (
+                    "ip route get 100.122.143.29".to_string(),
+                    scripted_ok(
+                        "100.122.143.29 via 192.168.122.1 dev ens3 src 192.168.122.45 uid 0\n    cache\n",
+                    ),
+                ),
+            ],
+        );
+        result.expect("management bypass should apply");
+        assert!(
+            log.iter().any(|cmd| cmd.ends_with(
+                "ip route replace 100.122.143.29/32 via 192.168.122.1 dev ens3 table 51820"
+            )),
+            "{log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|cmd| cmd.ends_with("ip route replace 192.168.122.0/24 dev ens3 table 51820")),
+            "the connected CIDR keeps its on-link form: {log:?}"
+        );
+        assert!(expected.iter().any(|route| {
+            route.destination == "100.122.143.29/32"
+                && route.via.as_deref() == Some("192.168.122.1")
+        }));
+        assert!(
+            expected
+                .iter()
+                .any(|route| route.destination == "192.168.122.0/24" && route.via.is_none())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn undeliverable_management_cidrs_never_get_a_via_pin() {
+        // Resolves onto another interface, wider than a host route, or fails.
+        let cases: [(&str, &str, PrivilegedCommandOutput); 4] = [
+            (
+                "mb",
+                "100.122.143.29/32",
+                scripted_ok("100.122.143.29 via 10.9.0.1 dev eth9 src 10.9.0.4 uid 0\n"),
+            ),
+            (
+                "mc",
+                "100.122.143.0/24",
+                scripted_ok("100.122.143.0 via 192.168.122.1 dev ens3 src 192.168.122.45\n"),
+            ),
+            (
+                "md",
+                "100.122.143.29/32",
+                PrivilegedCommandOutput {
+                    status: 2,
+                    stdout: String::new(),
+                    stderr: "RTNETLINK answers: Network is unreachable\n".to_string(),
+                },
+            ),
+            (
+                "me",
+                "100.122.143.29/32",
+                scripted_ok("100.122.143.29 dev rustynet0 src 100.64.0.1 uid 0\n"),
+            ),
+        ];
+        for (prefix, cidr, route_get) in cases {
+            // Anchored by a connected CIDR: the undeliverable one keeps the
+            // on-link form as before and is never pinned via a gateway.
+            let (result, log, expected) = run_management_bypass(
+                prefix,
+                &["192.168.122.0/24", cidr],
+                true,
+                vec![
+                    connected_ens3(),
+                    ("route get".to_string(), route_get.clone()),
+                ],
+            );
+            result.expect("an anchored set still applies");
+            assert!(
+                !log.iter()
+                    .any(|cmd| cmd.contains(cidr) && cmd.contains(" via ")),
+                "{cidr} must not be pinned via a gateway: {log:?}"
+            );
+            assert!(
+                expected
+                    .iter()
+                    .filter(|route| route.destination == cidr)
+                    .all(|route| route.via.is_none())
+            );
+
+            // Only undeliverable CIDRs under full tunnel: the apply is refused
+            // before any route is installed (QH-60).
+            let (result, log, expected) = run_management_bypass(
+                prefix,
+                &[cidr],
+                true,
+                vec![connected_ens3(), ("route get".to_string(), route_get)],
+            );
+            let err = result.expect_err("full-tunnel with no deliverable carve-out must refuse");
+            assert!(err.to_string().contains("black-hole"), "{err}");
+            assert!(!log.iter().any(|cmd| cmd.contains("route replace")));
+            assert!(expected.is_empty());
+        }
+    }
+
+    #[test]
+    fn parse_route_get_flags_answers_served_from_table_51820() {
+        let target: IpAddr = "203.0.113.30".parse().expect("valid ipv4");
+        let stale = LinuxCommandSystem::parse_route_get(
+            target,
+            "203.0.113.30 via 192.168.122.1 dev ens3 table 51820 src 192.168.122.45 uid 0\n",
+        )
+        .expect("a table-51820 answer still parses");
+        assert!(stale.from_bypass_table);
+        let fresh = LinuxCommandSystem::parse_route_get(target, OFFLINK_ROUTE_GET)
+            .expect("main-table answer parses");
+        assert!(!fresh.from_bypass_table);
+        // `table 51820` must be two adjacent tokens, not a substring accident.
+        let other = LinuxCommandSystem::parse_route_get(
+            target,
+            "203.0.113.30 via 192.168.122.1 dev ens3 table 518200 src 192.168.122.45\n",
+        )
+        .expect("other table parses");
+        assert!(!other.from_bypass_table);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn endpoint_pin(address: &str, via: Option<&str>) -> ExpectedBypassRoute {
+        ExpectedBypassRoute {
+            destination: format!("{address}/32"),
+            interface_name: "ens3".to_string(),
+            via: via.map(str::to_string),
+            family: RouteTableFamily::V4,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn management_host_route_answered_from_table_51820_reuses_only_its_own_endpoint_pin() {
+        let table_answer = |gateway: &str| {
+            scripted_ok(
+                format!(
+                    "100.122.143.29 via {gateway} dev ens3 table 51820 src 192.168.122.45 uid 0\n    cache\n"
+                )
+                .as_str(),
+            )
+        };
+        let cidrs = ["192.168.122.0/24", "100.122.143.29/32"];
+
+        // Legitimate: the management /32 is also a peer endpoint, pinned just
+        // now in table 51820 - the lookup echoes that pin, so reuse it.
+        let (result, log, expected) = run_management_bypass_with_endpoint_pins(
+            "mt1",
+            &cidrs,
+            true,
+            vec![
+                connected_ens3(),
+                ("route get".to_string(), table_answer("192.168.122.1")),
+            ],
+            &[endpoint_pin("100.122.143.29", Some("192.168.122.1"))],
+        );
+        result.expect("management == endpoint apply should succeed");
+        assert!(
+            log.iter().any(|cmd| cmd.ends_with(
+                "ip route replace 100.122.143.29/32 via 192.168.122.1 dev ens3 table 51820"
+            )),
+            "{log:?}"
+        );
+        assert!(expected.iter().any(|route| {
+            route.destination == "100.122.143.29/32"
+                && route.via.as_deref() == Some("192.168.122.1")
+        }));
+
+        // Rejected: a table-51820 answer with no recorded endpoint pin (a stale
+        // pin after a failed flush), one whose gateway disagrees with the
+        // recorded pin, and an unrelated endpoint's pin.
+        let mismatched = ExpectedBypassRoute {
+            destination: "100.122.143.29/32".to_string(),
+            interface_name: "ens3".to_string(),
+            via: Some("192.168.122.254".to_string()),
+            family: RouteTableFamily::V4,
+        };
+        let rejected: Vec<(&str, Vec<ExpectedBypassRoute>)> = vec![
+            ("mt2", Vec::new()),
+            ("mt3", vec![mismatched]),
+            (
+                "mt4",
+                vec![endpoint_pin("198.51.100.9", Some("192.168.122.1"))],
+            ),
+            // Recorded for the right address and gateway but on another
+            // interface than the egress: not the underlay pin, never reused.
+            (
+                "mt5",
+                vec![ExpectedBypassRoute {
+                    destination: "100.122.143.29/32".to_string(),
+                    interface_name: "eth9".to_string(),
+                    via: Some("192.168.122.1".to_string()),
+                    family: RouteTableFamily::V4,
+                }],
+            ),
+        ];
+        for (prefix, pins) in rejected {
+            let (result, log, expected) = run_management_bypass_with_endpoint_pins(
+                prefix,
+                &cidrs,
+                true,
+                vec![
+                    connected_ens3(),
+                    ("route get".to_string(), table_answer("192.168.122.1")),
+                ],
+                &pins,
+            );
+            result.expect("an anchored set still applies");
+            assert!(
+                !log.iter()
+                    .any(|cmd| cmd.contains("100.122.143.29") && cmd.contains(" via ")),
+                "a stale table-51820 answer must never become a via pin: {log:?}"
+            );
+            assert!(
+                expected
+                    .iter()
+                    .filter(|route| route.destination == "100.122.143.29/32")
+                    .all(|route| route.via.is_none())
+            );
+        }
+    }
+
+    #[test]
+    fn bypass_route_emitters_agree_with_the_helper_allowlist() {
+        let accept = |args: Vec<String>| {
+            let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            crate::privileged_helper::validate_request(PrivilegedCommandProgram::Ip, &refs)
+                .map(|()| args.join(" "))
+        };
+        let v4_gw: Option<IpAddr> = Some("192.168.122.1".parse().expect("valid gateway"));
+        let v6_gw: Option<IpAddr> = Some("fe80::1".parse().expect("valid gateway"));
+        let v4_ep: IpAddr = "203.0.113.30".parse().expect("valid ipv4");
+        let v6_ep: IpAddr = "2001:db8::7".parse().expect("valid ipv6");
+        let mgmt_v4 = "100.122.143.29/32"
+            .parse::<ManagementCidr>()
+            .expect("valid cidr");
+        let mgmt_net = "192.168.18.0/24"
+            .parse::<ManagementCidr>()
+            .expect("valid cidr");
+        let mgmt_v6 = "fd00::/64".parse::<ManagementCidr>().expect("valid cidr");
+
+        for args in [
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "ens3", v4_gw),
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v6_ep, "ens3", v6_gw),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_v4, "ens3", v4_gw),
+            // on-link forms still accepted
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "ens3", None),
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v6_ep, "ens3", None),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_v4, "ens3", None),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_net, "ens3", None),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_v6, "ens3", None),
+        ] {
+            let rendered = accept(args.clone())
+                .unwrap_or_else(|err| panic!("emitted argv {args:?} must be allowlisted: {err}"));
+            assert!(rendered.ends_with("table 51820"), "{rendered}");
+        }
+
+        // Negative control: the witness is not vacuous. A malformed emission
+        // (gateway family mismatch, non-host route via a gateway, bad iface)
+        // is refused by the very same validator.
+        for args in [
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "ens3", v6_gw),
+            LinuxCommandSystem::management_bypass_route_args(&mgmt_net, "ens3", v4_gw),
+            LinuxCommandSystem::peer_endpoint_bypass_route_args(v4_ep, "bad iface", v4_gw),
+        ] {
+            assert!(
+                accept(args.clone()).is_err(),
+                "malformed emission {args:?} must be refused"
+            );
+        }
     }
 
     #[test]

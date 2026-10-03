@@ -2092,6 +2092,35 @@ fn is_cidr_token(value: &str) -> bool {
     }
 }
 
+fn is_v4_host_route_token(value: &str) -> bool {
+    value
+        .split_once('/')
+        .is_some_and(|(base, prefix)| prefix == "32" && base.parse::<std::net::Ipv4Addr>().is_ok())
+}
+
+fn is_v6_host_route_token(value: &str) -> bool {
+    value
+        .split_once('/')
+        .is_some_and(|(base, prefix)| prefix == "128" && base.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+/// A next-hop gateway must be a plain unicast address: never unspecified,
+/// multicast, broadcast or loopback.
+fn is_v4_unicast_gateway(value: &str) -> bool {
+    value.parse::<std::net::Ipv4Addr>().is_ok_and(|addr| {
+        !(addr.is_unspecified() || addr.is_multicast() || addr.is_broadcast() || addr.is_loopback())
+    })
+}
+
+fn is_v6_unicast_gateway(value: &str) -> bool {
+    value.parse::<std::net::Ipv6Addr>().is_ok_and(|addr| {
+        !(addr.is_unspecified()
+            || addr.is_multicast()
+            || addr.is_loopback()
+            || addr.to_ipv4_mapped().is_some())
+    })
+}
+
 fn is_wg_public_key_token(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -2955,6 +2984,43 @@ fn validate_ip_args(args: &[&str]) -> Result<(), String> {
         }
         ["route", "replace", cidr, "dev", interface, "table", "51820"]
             if is_cidr_token(cidr) && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        // Off-link peer-endpoint / management bypass pin: the same table-51820
+        // host route carrying the kernel's next hop. Only host routes are ever
+        // emitted (/32 here, /128 below), and the gateway must be a unicast
+        // address of the route's own family (the unprefixed form is IPv4).
+        [
+            "route",
+            "replace",
+            cidr,
+            "via",
+            gateway,
+            "dev",
+            interface,
+            "table",
+            "51820",
+        ] if is_v4_host_route_token(cidr)
+            && is_v4_unicast_gateway(gateway)
+            && is_interface_name(interface) =>
+        {
+            Ok(())
+        }
+        [
+            "-6",
+            "route",
+            "replace",
+            cidr,
+            "via",
+            gateway,
+            "dev",
+            interface,
+            "table",
+            "51820",
+        ] if is_v6_host_route_token(cidr)
+            && is_v6_unicast_gateway(gateway)
+            && is_interface_name(interface) =>
         {
             Ok(())
         }
@@ -4452,6 +4518,191 @@ mod tests {
             ],
         )
         .expect("known ip schema should be accepted");
+    }
+
+    // The off-link peer-endpoint / management bypass pin carries the kernel's
+    // next hop. Without this arm every off-link apply is refused by the helper.
+    #[test]
+    fn validate_request_accepts_via_bypass_route_schema_strictly() {
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &[
+                "route",
+                "replace",
+                "203.0.113.30/32",
+                "via",
+                "192.168.122.1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+        )
+        .expect("ipv4 via bypass route should be accepted");
+        validate_request(
+            PrivilegedCommandProgram::Ip,
+            &[
+                "-6",
+                "route",
+                "replace",
+                "2001:db8::7/128",
+                "via",
+                "fe80::1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+        )
+        .expect("ipv6 via bypass route should be accepted");
+        let rejected: &[&[&str]] = &[
+            // no table pin: would touch the main table
+            &[
+                "route",
+                "replace",
+                "0.0.0.0/0",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+            ],
+            // other table
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+                "table",
+                "main",
+            ],
+            // gateway is not an address
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1;id",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "gw",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            // gateway family differs from the route family
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "fe80::1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            &[
+                "-6",
+                "route",
+                "replace",
+                "2001:db8::7/128",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            // unprefixed form is IPv4 only; v6 destination needs -6
+            &[
+                "route",
+                "replace",
+                "2001:db8::7/128",
+                "via",
+                "fe80::1",
+                "dev",
+                "ens3",
+                "table",
+                "51820",
+            ],
+            // bad interface / extra flag
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "en s3",
+                "table",
+                "51820",
+            ],
+            &[
+                "route",
+                "replace",
+                "192.0.2.7/32",
+                "via",
+                "192.0.2.1",
+                "dev",
+                "ens3",
+                "onlink",
+                "table",
+                "51820",
+            ],
+        ];
+        for args in rejected {
+            validate_request(PrivilegedCommandProgram::Ip, args)
+                .expect_err("malformed via bypass route must be rejected");
+        }
+    }
+
+    // Emitters only ever produce host-route pins with a unicast gateway; the
+    // allowlist refuses everything wider or stranger so a compromised daemon
+    // cannot use the via arms to steer a prefix or a default route.
+    #[test]
+    fn validate_request_via_bypass_route_requires_host_route_and_unicast_gateway() {
+        let ip = |line: &str| {
+            let args = line.split_whitespace().collect::<Vec<_>>();
+            validate_request(PrivilegedCommandProgram::Ip, &args)
+        };
+        ip("route replace 192.0.2.7/32 via 192.0.2.1 dev ens3 table 51820")
+            .expect("v4 host route via unicast gateway");
+        ip("-6 route replace 2001:db8::7/128 via 2001:db8::1 dev ens3 table 51820")
+            .expect("v6 host route via global gateway");
+        for line in [
+            "route replace 0.0.0.0/0 via 192.0.2.1 dev ens3 table 51820",
+            "route replace 192.0.2.0/24 via 192.0.2.1 dev ens3 table 51820",
+            "route replace 192.0.2.7/31 via 192.0.2.1 dev ens3 table 51820",
+            "-6 route replace ::/0 via fe80::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::/64 via fe80::1 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 192.0.2.1 dev ens3 table 51820 onlink",
+            "route replace 192.0.2.7/32 via 192.0.2.1 onlink dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via fe80::1%ens3 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via inet6 fe80::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via 192.0.2.1 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 0.0.0.0 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 224.0.0.1 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 255.255.255.255 dev ens3 table 51820",
+            "route replace 192.0.2.7/32 via 127.0.0.1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via :: dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via ff02::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via ::1 dev ens3 table 51820",
+            "-6 route replace 2001:db8::7/128 via ::ffff:192.0.2.1 dev ens3 table 51820",
+        ] {
+            ip(line).expect_err(line);
+        }
     }
 
     #[test]
