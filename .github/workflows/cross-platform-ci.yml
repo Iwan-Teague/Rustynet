@@ -317,6 +317,13 @@ jobs:
           ./scripts/ci/security_regression_gates.sh
           ./scripts/ci/role_auth_matrix_gates.sh
           ./scripts/ci/nas_default_deny_gates.sh
+          # RSA-0065: static integrity-pin gate for the Windows lab-image
+          # provisioner — every download must carry a pinned SHA-256 (and
+          # the floating vs_BuildTools.exe bootstrapper an Authenticode
+          # 'Microsoft Corporation' publisher requirement) before execution.
+          # Text-only checks + self-test battery (must reject the pre-fix
+          # script shape); uses only grep/awk, no pwsh required on this leg.
+          ./scripts/ci/windows_provisioner_download_integrity_gates.sh
 
   supply_chain:
     name: cargo-vet supply-chain audit
