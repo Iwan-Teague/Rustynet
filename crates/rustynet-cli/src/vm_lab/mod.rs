@@ -1,17 +1,161 @@
 #![forbid(unsafe_code)]
+// AQ-08: per-file panic-free lock. Lint attributes on a directory-module root
+// propagate into every child module, so each child `mod` declaration below
+// carries a matching `allow` to keep this lock scoped to THIS file only
+// (child files are owned by other AQ buckets). Under cfg(test) the lock is
+// inactive entirely, so tests keep unrestricted access.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 mod bootstrap;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod capability;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod image_catalog;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod network_audit;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod network_prepare;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod network_profile;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod orchestrator;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod overnight;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod recover_guest_network;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod run_exclusion;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod run_history;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub(crate) mod script_template;
+// Per-file lock scoping: see the deny note at the top of this file.
+#[cfg_attr(
+    not(test),
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 pub mod topology;
 
 pub use overnight::{VmLabOvernightConfig, execute_ops_vm_lab_overnight};
@@ -62,6 +206,11 @@ use zip::{CompressionMethod, ZipWriter};
 /// production builds legitimately never call it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, String> {
+    // AQ-08: this scanner used to index `chars` directly at every step. All
+    // reads now go through `get`-based checked access; every guard below is
+    // equivalent to the bounds check the old code performed inline, so the
+    // accepted/rejected input domain is unchanged. Inputs work on a
+    // `Vec<char>`, so there is no UTF-8 byte-boundary panic surface here.
     let chars: Vec<char> = full_source.chars().collect();
     let mut out = String::with_capacity(full_source.len());
     let mut i = 0usize;
@@ -74,8 +223,11 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
         if idx == 0 {
             return true;
         }
-        let prev = chars[idx - 1];
-        !(prev.is_alphanumeric() || prev == '_')
+        // Every call site guarantees idx < chars.len(); `get` keeps the scan
+        // panic-free regardless.
+        chars
+            .get(idx - 1)
+            .is_some_and(|prev| !(prev.is_alphanumeric() || *prev == '_'))
     }
 
     // True when a raw/byte string (r"..." / r#"..."# / br#"..."#) opens at i.
@@ -83,12 +235,14 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
         if !at_identifier_boundary(chars, i) {
             return false;
         }
-        match chars[i] {
-            'r' => i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '#'),
-            'b' => {
-                i + 2 < chars.len()
-                    && chars[i + 1] == 'r'
-                    && (chars[i + 2] == '"' || chars[i + 2] == '#')
+        match chars.get(i).copied() {
+            Some('r') => {
+                chars.get(i + 1).copied() == Some('"') || chars.get(i + 1).copied() == Some('#')
+            }
+            Some('b') => {
+                chars.get(i + 1).copied() == Some('r')
+                    && (chars.get(i + 2).copied() == Some('"')
+                        || chars.get(i + 2).copied() == Some('#'))
             }
             _ => false,
         }
@@ -99,12 +253,11 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
     fn skip_string(chars: &[char], mut i: usize) -> Result<usize, String> {
         // Raw strings: r"..." / r#"..."# / br#"..."#.
         let raw_start = if at_identifier_boundary(chars, i)
-            && chars[i] == 'b'
-            && i + 1 < chars.len()
-            && chars[i + 1] == 'r'
+            && chars.get(i).copied() == Some('b')
+            && chars.get(i + 1).copied() == Some('r')
         {
             Some(i + 2)
-        } else if at_identifier_boundary(chars, i) && chars[i] == 'r' {
+        } else if at_identifier_boundary(chars, i) && chars.get(i).copied() == Some('r') {
             Some(i + 1)
         } else {
             None
@@ -112,17 +265,17 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
         if let Some(start) = raw_start {
             let mut hashes = 0usize;
             let mut j = start;
-            while j < chars.len() && chars[j] == '#' {
+            while chars.get(j).copied() == Some('#') {
                 hashes += 1;
                 j += 1;
             }
-            if j < chars.len() && chars[j] == '"' {
+            if chars.get(j).copied() == Some('"') {
                 if hashes == 0 {
                     // r"..." — a raw string with no hashes; it cannot contain
                     // a quote character and has no escape sequences.
                     j += 1;
-                    while j < chars.len() {
-                        if chars[j] == '"' {
+                    while let Some(&c) = chars.get(j) {
+                        if c == '"' {
                             return Ok(j + 1);
                         }
                         j += 1;
@@ -134,7 +287,7 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
                     .collect();
                 j += 1;
                 while j + terminator.len() <= chars.len() {
-                    if chars[j..j + terminator.len()] == terminator[..] {
+                    if chars.get(j..j + terminator.len()) == Some(terminator.as_slice()) {
                         return Ok(j + terminator.len());
                     }
                     j += 1;
@@ -144,12 +297,12 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             // `r`/`br` not followed by a raw string: fall through as normal.
         }
         // Regular string literal.
-        if chars[i] != '"' {
+        if chars.get(i).copied() != Some('"') {
             return Err(format!("skip_string called at non-quote index {i}"));
         }
         i += 1;
-        while i < chars.len() {
-            match chars[i] {
+        while let Some(&c) = chars.get(i) {
+            match c {
                 '\\' => i += 2,
                 '"' => return Ok(i + 1),
                 _ => i += 1,
@@ -165,33 +318,36 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             return Err("unterminated char literal".to_owned());
         }
         // Escaped char literal: '\n', '\'', '\\', '\u{1F600}'.
-        if chars[j] == '\\' {
+        if chars.get(j).copied() == Some('\\') {
             j += 1;
-            if j < chars.len() && chars[j] == 'u' {
-                while j < chars.len() && chars[j] != '}' {
+            if chars.get(j).copied() == Some('u') {
+                while chars.get(j).is_some_and(|c| *c != '}') {
                     j += 1;
                 }
                 j += 1; // '}'
             } else {
                 j += 1; // the escaped char itself
             }
-            if j < chars.len() && chars[j] == '\'' {
+            if chars.get(j).copied() == Some('\'') {
                 return Ok(j + 1);
             }
             return Err("unterminated escaped char literal".to_owned());
         }
-        if chars[j].is_alphabetic() || chars[j] == '_' {
+        if chars.get(j).is_some_and(|c| c.is_alphabetic() || *c == '_') {
             // Lifetime 'ident, unless the quote closes immediately ('a').
-            if j + 1 < chars.len() && chars[j + 1] == '\'' {
+            if chars.get(j + 1).copied() == Some('\'') {
                 return Ok(j + 2);
             }
-            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+            while chars
+                .get(j)
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
                 j += 1;
             }
             return Ok(j);
         }
         // Plain char literal: 'x'.
-        if j + 1 < chars.len() && chars[j + 1] == '\'' {
+        if chars.get(j + 1).copied() == Some('\'') {
             return Ok(j + 2);
         }
         Err(format!(
@@ -206,23 +362,23 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
     // Skip whitespace and comments from `i`; returns the next significant index.
     fn skip_trivia(chars: &[char], mut i: usize) -> usize {
         loop {
-            while i < chars.len() && chars[i].is_whitespace() {
+            while chars.get(i).is_some_and(|c| c.is_whitespace()) {
                 i += 1;
             }
-            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
-                while i < chars.len() && chars[i] != '\n' {
+            if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'/') {
+                while chars.get(i).is_some_and(|c| *c != '\n') {
                     i += 1;
                 }
                 continue;
             }
-            if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+            if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'*') {
                 let mut depth = 1usize;
                 i += 2;
                 while i < chars.len() && depth > 0 {
-                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                    if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'*') {
                         depth += 1;
                         i += 2;
-                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                    } else if chars.get(i) == Some(&'*') && chars.get(i + 1) == Some(&'/') {
                         depth -= 1;
                         i += 2;
                     } else {
@@ -238,14 +394,19 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
     while i < chars.len() {
         // Marker detection only on real code (strings/comments are consumed
         // below as units).
-        if i + marker.len() <= chars.len() && chars[i..i + marker.len()] == marker[..] {
+        if chars.get(i..i + marker.len()) == Some(marker.as_slice()) {
             let is_keyword = |chars: &[char], j: usize, kw: &str| -> bool {
                 let kw_chars: Vec<char> = kw.chars().collect();
-                chars.len() >= j + kw_chars.len()
-                    && chars[j..j + kw_chars.len()] == kw_chars[..]
-                    && (j + kw_chars.len() == chars.len()
-                        || !(chars[j + kw_chars.len()].is_alphanumeric()
-                            || chars[j + kw_chars.len()] == '_'))
+                match chars.get(j..j + kw_chars.len()) {
+                    Some(window) if window == kw_chars.as_slice() => {
+                        match chars.get(j + kw_chars.len()) {
+                            // End of input ends the keyword.
+                            None => true,
+                            Some(next) => !(next.is_alphanumeric() || *next == '_'),
+                        }
+                    }
+                    _ => false,
+                }
             };
             let after_marker = i + "#[cfg(test)]".len();
             let j = skip_trivia(&chars, after_marker);
@@ -257,8 +418,8 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
                 // `;` (string-aware, so a `&str` value cannot end the item
                 // early).
                 i = j;
-                while i < chars.len() && chars[i] != ';' {
-                    if chars[i] == '"' {
+                while chars.get(i).is_some_and(|c| *c != ';') {
+                    if chars.get(i).copied() == Some('"') {
                         i = skip_string(&chars, i)?;
                     } else {
                         i += 1;
@@ -277,27 +438,30 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             }
             i = j + "mod".len();
             let j = skip_trivia(&chars, i);
-            if j >= chars.len() || !(chars[j].is_alphabetic() || chars[j] == '_') {
+            if !chars.get(j).is_some_and(|c| c.is_alphabetic() || *c == '_') {
                 return Err("#[cfg(test)] mod without an identifier".to_owned());
             }
             i = j;
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+            while chars
+                .get(i)
+                .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+            {
                 i += 1;
             }
             let j = skip_trivia(&chars, i);
-            if j < chars.len() && chars[j] == ';' {
+            if chars.get(j).copied() == Some(';') {
                 // A cfg(test) mod declaration (no body).
                 i = j + 1;
                 continue;
             }
-            if j >= chars.len() || chars[j] != '{' {
+            if chars.get(j).copied() != Some('{') {
                 return Err("#[cfg(test)] mod without a body".to_owned());
             }
             // Brace-match the mod body, honouring strings and comments.
             let mut depth = 0usize;
             let mut k = j;
-            while k < chars.len() {
-                match chars[k] {
+            while let Some(&c) = chars.get(k) {
+                match c {
                     '{' => {
                         depth += 1;
                         k += 1;
@@ -318,20 +482,19 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
                     _ if opens_raw_string(&chars, k) => {
                         k = skip_string(&chars, k)?;
                     }
-                    '/' if k + 1 < chars.len() && chars[k + 1] == '/' => {
-                        while k < chars.len() && chars[k] != '\n' {
+                    '/' if chars.get(k + 1).copied() == Some('/') => {
+                        while chars.get(k).is_some_and(|c| *c != '\n') {
                             k += 1;
                         }
                     }
-                    '/' if k + 1 < chars.len() && chars[k + 1] == '*' => {
+                    '/' if chars.get(k + 1).copied() == Some('*') => {
                         let mut d = 1usize;
                         k += 2;
                         while k < chars.len() && d > 0 {
-                            if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+                            if chars.get(k) == Some(&'/') && chars.get(k + 1) == Some(&'*') {
                                 d += 1;
                                 k += 2;
-                            } else if k + 1 < chars.len() && chars[k] == '*' && chars[k + 1] == '/'
-                            {
+                            } else if chars.get(k) == Some(&'*') && chars.get(k + 1) == Some(&'/') {
                                 d -= 1;
                                 k += 2;
                             } else {
@@ -348,49 +511,55 @@ pub(crate) fn implementation_source_slice(full_source: &str) -> Result<String, S
             i = k;
             continue;
         }
-        match chars[i] {
-            '"' => {
+        match chars.get(i).copied() {
+            Some('"') => {
                 let end = skip_string(&chars, i)?;
-                out.extend(&chars[i..end]);
+                out.extend(chars.get(i..end).unwrap_or(&[]));
                 i = end;
             }
-            '\'' => {
+            Some('\'') => {
                 let end = skip_char_or_lifetime(&chars, i)?;
-                out.extend(&chars[i..end]);
+                out.extend(chars.get(i..end).unwrap_or(&[]));
                 i = end;
             }
             _ if opens_raw_string(&chars, i) => {
                 let end = skip_string(&chars, i)?;
-                out.extend(&chars[i..end]);
+                out.extend(chars.get(i..end).unwrap_or(&[]));
                 i = end;
             }
-            '/' if i + 1 < chars.len() && chars[i + 1] == '/' => {
-                while i < chars.len() && chars[i] != '\n' {
-                    out.push(chars[i]);
+            Some('/') if chars.get(i + 1).copied() == Some('/') => {
+                while let Some(&c) = chars.get(i) {
+                    if c == '\n' {
+                        break;
+                    }
+                    out.push(c);
                     i += 1;
                 }
             }
-            '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+            Some('/') if chars.get(i + 1).copied() == Some('*') => {
                 let start = i;
                 let mut d = 1usize;
                 i += 2;
                 while i < chars.len() && d > 0 {
-                    if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                    if chars.get(i) == Some(&'/') && chars.get(i + 1) == Some(&'*') {
                         d += 1;
                         i += 2;
-                    } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                    } else if chars.get(i) == Some(&'*') && chars.get(i + 1) == Some(&'/') {
                         d -= 1;
                         i += 2;
                     } else {
                         i += 1;
                     }
                 }
-                out.extend(&chars[start..i]);
+                out.extend(chars.get(start..i).unwrap_or(&[]));
             }
-            _ => {
-                out.push(chars[i]);
+            // The loop condition above guarantees i < chars.len(), so the
+            // None arm is unreachable; it breaks instead of looping forever.
+            Some(other) => {
+                out.push(other);
                 i += 1;
             }
+            None => break,
         }
     }
     Ok(out)
@@ -4741,13 +4910,23 @@ pub struct VmLabRenumberGuestNetworkConfig {
     pub json: bool,
 }
 
+/// Derive the `A.B.C.0/24` CIDR that contains `ip`, or `None` unless `ip` is a
+/// dotted quad.
+fn ipv4_to_24_cidr(ip: &str) -> Option<String> {
+    let parts: Vec<&str> = ip.split('.').collect();
+    let [a, b, c, _] = parts.as_slice() else {
+        return None;
+    };
+    Some(format!("{a}.{b}.{c}.0/24"))
+}
+
 /// Derive the `A.B.C.` prefix from a `A.B.C.0/24` guest subnet.
 fn guest_subnet_prefix(subnet: &str) -> Result<String, String> {
     let network = subnet.split('/').next().unwrap_or(subnet);
     let octets: Vec<&str> = network.split('.').collect();
-    if octets.len() != 4 {
+    let [a, b, c, _] = octets.as_slice() else {
         return Err(format!("guest_subnet {subnet:?} is not a dotted-quad CIDR"));
-    }
+    };
     for octet in &octets {
         if octet.is_empty() || !octet.chars().all(|c| c.is_ascii_digit()) {
             return Err(format!("guest_subnet {subnet:?} has a non-numeric octet"));
@@ -4757,7 +4936,7 @@ fn guest_subnet_prefix(subnet: &str) -> Result<String, String> {
             _ => return Err(format!("guest_subnet {subnet:?} has an octet out of range")),
         }
     }
-    Ok(format!("{}.{}.{}.", octets[0], octets[1], octets[2]))
+    Ok(format!("{a}.{b}.{c}."))
 }
 
 /// Renumber a host's libvirt default network onto its declared guest subnet.
@@ -5412,10 +5591,9 @@ fn alias_to_host_map(inventory_path: &Path) -> Result<BTreeMap<String, String>, 
             .iter()
             .filter(|host| host.kind == LabHostKind::LocalUtm)
             .collect();
-        if utm.len() == 1 {
-            Some(utm[0].host_id.as_str())
-        } else {
-            None
+        match utm.as_slice() {
+            [only] => Some(only.host_id.as_str()),
+            _ => None,
         }
     };
 
@@ -10765,11 +10943,14 @@ impl RemoteExec for WindowsRemoteExec {
         for arg in argv {
             ensure_no_control_chars("windows remote argv", arg)?;
         }
-        let exe = Self::quote_ps_single(&argv[0]);
-        let body = if argv.len() == 1 {
+        let Some((exe_arg, rest)) = argv.split_first() else {
+            return Err("argv must not be empty".to_owned());
+        };
+        let exe = Self::quote_ps_single(exe_arg);
+        let body = if rest.is_empty() {
             format!("& {exe}")
         } else {
-            let arg_list = argv[1..]
+            let arg_list = rest
                 .iter()
                 .map(|a| Self::quote_ps_single(a))
                 .collect::<Vec<_>>()
@@ -11923,12 +12104,7 @@ fn run_macos_orchestration_stages(
                 .as_deref()
                 .and_then(|ip| {
                     // Turn e.g. "192.168.64.18" into "192.168.64.0/24"
-                    let parts: Vec<&str> = ip.split('.').collect();
-                    if parts.len() == 4 {
-                        Some(format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2]))
-                    } else {
-                        None
-                    }
+                    ipv4_to_24_cidr(ip)
                 })
                 .unwrap_or_else(|| "192.168.64.0/24".to_owned());
 
@@ -13981,9 +14157,15 @@ fn capture_macos_exit_evidence_artifacts(
     }
 
     let remote_root = shell_quote(MACOS_EXIT_EVIDENCE_REMOTE_ROOT);
-    let nat_script = shell_quote(remote_scripts[0].as_str());
-    let dns_script = shell_quote(remote_scripts[1].as_str());
-    let killswitch_script = shell_quote(remote_scripts[2].as_str());
+    let [nat_path, dns_path, killswitch_path] = remote_scripts.as_slice() else {
+        return Err((
+            "internal: macOS Exit evidence capture did not upload exactly three scripts".to_owned(),
+            String::new(),
+        ));
+    };
+    let nat_script = shell_quote(nat_path.as_str());
+    let dns_script = shell_quote(dns_path.as_str());
+    let killswitch_script = shell_quote(killswitch_path.as_str());
     let mesh_cidr = shell_quote(MACOS_EXIT_EVIDENCE_MESH_CIDR);
     let lan_iface = shell_quote(MACOS_EXIT_EVIDENCE_LAN_IFACE);
     let mesh_hostname = shell_quote(MACOS_EXIT_EVIDENCE_MESH_HOSTNAME);
@@ -14492,15 +14674,13 @@ pub(crate) fn select_relay_forward_test_topology(
             .then_with(|| a.alias.cmp(&b.alias))
     });
 
-    if peer_candidates.len() < 2 {
+    let [sender, receiver, ..] = peer_candidates.as_slice() else {
         return Err(format!(
             "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found {}{}",
             peer_candidates.len(),
             exclusion_note
         ));
-    }
-    let sender = peer_candidates[0];
-    let receiver = peer_candidates[1];
+    };
     let sender_mesh_ip = sender
         .mesh_ip
         .clone()
@@ -14577,15 +14757,13 @@ pub(crate) fn select_relay_forward_test_topology_for_run(
             .then_with(|| a.alias.cmp(&b.alias))
     });
 
-    if peer_candidates.len() < 2 {
+    let [sender, receiver, ..] = peer_candidates.as_slice() else {
         return Err(format!(
             "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found {}{}",
             peer_candidates.len(),
             exclusion_note
         ));
-    }
-    let sender = peer_candidates[0];
-    let receiver = peer_candidates[1];
+    };
     let sender_mesh_ip = sender
         .mesh_ip
         .clone()
@@ -17433,8 +17611,8 @@ fn extract_trailing_json_object(output: &str) -> Option<String> {
     let mut depth = 0i32;
     let mut in_string = false;
     let mut escaped = false;
-    for idx in start..bytes.len() {
-        let ch = bytes[idx] as char;
+    for (idx, &byte) in bytes.iter().enumerate().skip(start) {
+        let ch = byte as char;
         if in_string {
             if escaped {
                 escaped = false;
@@ -17451,6 +17629,7 @@ fn extract_trailing_json_object(output: &str) -> Option<String> {
             '}' => {
                 depth -= 1;
                 if depth == 0 {
+                    // start/idx are ASCII byte offsets of '{'/'}', so always char boundaries.
                     return Some(output[start..=idx].to_owned());
                 }
             }
@@ -18877,8 +19056,9 @@ fn run_windows_orchestration_stages_with_options(
             format!("skipped: validate_windows_dns_failclosed did not pass for {windows_alias}"),
             vec![],
         )
-    } else {
-        let exit_alias = options.linux_exit_alias.as_deref().unwrap();
+    // Mirrors the stage-7b precedent: the alias is guaranteed Some here, so
+    // fail closed with a Fail outcome instead of unwrapping if that breaks.
+    } else if let Some(exit_alias) = options.linux_exit_alias.as_deref() {
         match amend_membership_for_windows_node(
             windows_alias,
             exit_alias,
@@ -18908,6 +19088,13 @@ fn run_windows_orchestration_stages_with_options(
                 )
             }
         }
+    } else {
+        stage_outcome(
+            "amend_membership_for_windows",
+            VmLabStageStatus::Fail,
+            "internal: amend_membership_for_windows reached without a linux_exit_alias".to_owned(),
+            vec![],
+        )
     };
     let amend_membership_passed = amend_membership_outcome.status == VmLabStageStatus::Pass;
 
@@ -20379,13 +20566,7 @@ fn promote_windows_to_active_exit(
             DEFAULT_RUN_TIMEOUT_SECS,
         ),
     )
-    .map_err(|err| {
-        if windows_trust_cli_status_output(err.as_str()) {
-            return classify_windows_active_exit_readiness_output(windows_alias, err.as_str())
-                .expect_err("trust CLI status output must classify as readiness error");
-        }
-        format!("polling Windows daemon readiness for {windows_alias} failed: {err}")
-    })?;
+    .map_err(|err| classify_windows_readiness_poll_error(windows_alias, err.as_str()))?;
     let poll_trimmed = poll_output.trim().to_owned();
     classify_windows_active_exit_readiness_output(windows_alias, poll_trimmed.as_str())?;
     Ok(format!(
@@ -20481,6 +20662,26 @@ fn classify_windows_active_exit_readiness_output(
     Err(format!(
         "Windows daemon on {windows_alias} did not reach SCM/env/probe readiness within {WINDOWS_ACTIVE_EXIT_PROMOTE_TIMEOUT_SECS}s: {raw_output}"
     ))
+}
+
+/// Classify the error half of a Windows active-exit readiness poll.
+///
+/// The inline closure this replaces used to `expect_err` the classification on
+/// the grounds that trust-CLI status output "must" classify as a readiness
+/// error, but the classifier checks `PROMOTED` first, so remote output that
+/// contains both that marker and a trust-CLI usage string reaches `Ok(())` and
+/// the old code panicked on a reachable-in-principle input. Fail closed with
+/// an explicit error string instead of panicking.
+fn classify_windows_readiness_poll_error(windows_alias: &str, err: &str) -> String {
+    if windows_trust_cli_status_output(err) {
+        return match classify_windows_active_exit_readiness_output(windows_alias, err) {
+            Ok(()) => format!(
+                "internal: Windows daemon readiness for {windows_alias} classified trust-CLI status output as promoted; failing closed: {err}"
+            ),
+            Err(classified) => classified,
+        };
+    }
+    format!("polling Windows daemon readiness for {windows_alias} failed: {err}")
 }
 
 fn capture_windows_exit_evidence_artifacts(
@@ -28873,13 +29074,16 @@ fn parse_live_lab_stage_records(report_dir: &Path) -> Result<Vec<LiveLabStageRec
         if columns.len() < 6 {
             continue;
         }
+        let [name, severity, status, rc, log_path, description, ..] = columns.as_slice() else {
+            continue;
+        };
         records.push(LiveLabStageRecord {
-            name: columns[0].to_owned(),
-            severity: columns[1].to_owned(),
-            status: columns[2].to_owned(),
-            rc: columns[3].to_owned(),
-            log_path: resolve_report_relative_path(columns[4], report_dir.as_path())?,
-            description: columns[5].to_owned(),
+            name: name.to_string(),
+            severity: severity.to_string(),
+            status: status.to_string(),
+            rc: rc.to_string(),
+            log_path: resolve_report_relative_path(log_path, report_dir.as_path())?,
+            description: description.to_string(),
         });
     }
     Ok(records)
@@ -28912,10 +29116,13 @@ fn summarize_live_lab_report(
         if columns.len() < 5 {
             continue;
         }
-        if columns[2] == "fail" {
-            first_failed_stage = Some(columns[0].to_owned());
+        let [name, _, status, _, log_path, ..] = columns.as_slice() else {
+            continue;
+        };
+        if *status == "fail" {
+            first_failed_stage = Some(name.to_string());
             key_log_path = Some(resolve_report_relative_path(
-                columns[4],
+                log_path,
                 report_dir.as_path(),
             )?);
             break;
@@ -29017,7 +29224,7 @@ fn tail_log_lines(path: &Path, max_lines: usize) -> Result<String, String> {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>();
     let start = lines.len().saturating_sub(max_lines.max(1));
-    Ok(lines[start..].join("\n"))
+    Ok(lines.get(start..).unwrap_or(&[]).join("\n"))
 }
 
 fn port_status_from_probe(value: &str) -> PortStatus {
@@ -30589,10 +30796,13 @@ pub fn execute_ops_vm_lab_restart(config: VmLabRestartConfig) -> Result<String, 
         };
     }
 
+    let Some(ready_targets) = ready_targets.as_deref() else {
+        return Err(
+            "internal: wait-ready restart reached without precomputed restart targets".to_owned(),
+        );
+    };
     let ready_states = wait_for_local_utm_targets_ready(
-        ready_targets
-            .as_deref()
-            .expect("wait-ready path precomputes restart targets"),
+        ready_targets,
         utmctl_path.as_path(),
         config.ssh_port,
         config.ssh_identity_file.as_deref(),
@@ -35344,8 +35554,7 @@ fn sync_local_source_archive_to_target(
             )?,
             "copy local ZIP source archive to Windows remote",
         )?;
-        if remote_target_local_utm(target).is_some() {
-            let (utm_name, _) = remote_target_local_utm(target).expect("validated local UTM");
+        if let Some((utm_name, _)) = remote_target_local_utm(target) {
             let remote_result_path = format!(r"{remote_archive}.result.json");
             let output = execute_windows_local_utm_result_file_probe(
                 utm_name,
@@ -37553,9 +37762,10 @@ fn utm_exec_windows_raw(
         // exit non-zero + empty stderr = UTM agent transient; retry after brief sleep
         thread::sleep(Duration::from_millis(UTMCTL_EXEC_RETRY_SLEEP_MS));
     }
-    Ok(last_output
-        .expect("retry loop always sets last_output")
-        .status)
+    let Some(last_output) = last_output else {
+        return Err("internal: utmctl exec retry loop exited without a result".to_owned());
+    };
+    Ok(last_output.status)
 }
 
 fn append_utmctl_windows_exec_command(command: &mut Command, args: &[&str]) {
@@ -37956,9 +38166,12 @@ fn build_windows_result_file_helper_invocation_script(
     helper_label: &str,
 ) -> Result<String, String> {
     let mut helper_args = args.to_vec();
-    let has_result_path = helper_args
-        .windows(2)
-        .any(|pair| pair[0] == "-OutputPath" || pair[0] == "-ResultPath");
+    let has_result_path = helper_args.windows(2).any(|pair| {
+        matches!(
+            pair.first().map(String::as_str),
+            Some("-OutputPath") | Some("-ResultPath")
+        )
+    });
     if !has_result_path {
         helper_args.push("-OutputPath".to_owned());
         helper_args.push(remote_result_path.to_owned());
@@ -58178,5 +58391,1458 @@ mod qh01_real_call_path_tests {
             "unreachable-marker fallback must remain the last statement"
         );
         assert!(!script.contains("__"), "no placeholder shape may appear");
+    }
+}
+
+#[cfg(test)]
+mod aq08_panic_free_tests {
+    use super::*;
+
+    // Verbatim copy of the pre-AQ-08 implementation_source_slice (renamed
+    // only). Differential oracle: for every input tried below, the old value
+    // (including every Err string) must equal the new value exactly.
+    pub(crate) fn old_implementation_source_slice(full_source: &str) -> Result<String, String> {
+        let chars: Vec<char> = full_source.chars().collect();
+        let mut out = String::with_capacity(full_source.len());
+        let mut i = 0usize;
+        let marker: Vec<char> = "#[cfg(test)]".chars().collect();
+
+        // True when `chars[idx]` is not preceded by an identifier character, so
+        // `r`/`b` can start a raw/byte string and `r` inside an identifier is not
+        // mistaken for one.
+        fn at_identifier_boundary(chars: &[char], idx: usize) -> bool {
+            if idx == 0 {
+                return true;
+            }
+            let prev = chars[idx - 1];
+            !(prev.is_alphanumeric() || prev == '_')
+        }
+
+        // True when a raw/byte string (r"..." / r#"..."# / br#"..."#) opens at i.
+        fn opens_raw_string(chars: &[char], i: usize) -> bool {
+            if !at_identifier_boundary(chars, i) {
+                return false;
+            }
+            match chars[i] {
+                'r' => i + 1 < chars.len() && (chars[i + 1] == '"' || chars[i + 1] == '#'),
+                'b' => {
+                    i + 2 < chars.len()
+                        && chars[i + 1] == 'r'
+                        && (chars[i + 2] == '"' || chars[i + 2] == '#')
+                }
+                _ => false,
+            }
+        }
+
+        // Consume one string-like literal starting at `chars[i]` (which is known
+        // to open one); returns the index just past its end.
+        fn skip_string(chars: &[char], mut i: usize) -> Result<usize, String> {
+            // Raw strings: r"..." / r#"..."# / br#"..."#.
+            let raw_start = if at_identifier_boundary(chars, i)
+                && chars[i] == 'b'
+                && i + 1 < chars.len()
+                && chars[i + 1] == 'r'
+            {
+                Some(i + 2)
+            } else if at_identifier_boundary(chars, i) && chars[i] == 'r' {
+                Some(i + 1)
+            } else {
+                None
+            };
+            if let Some(start) = raw_start {
+                let mut hashes = 0usize;
+                let mut j = start;
+                while j < chars.len() && chars[j] == '#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == '"' {
+                    if hashes == 0 {
+                        // r"..." — a raw string with no hashes; it cannot contain
+                        // a quote character and has no escape sequences.
+                        j += 1;
+                        while j < chars.len() {
+                            if chars[j] == '"' {
+                                return Ok(j + 1);
+                            }
+                            j += 1;
+                        }
+                        return Err("unterminated raw string literal".to_owned());
+                    }
+                    let terminator: Vec<char> = std::iter::once('"')
+                        .chain(std::iter::repeat_n('#', hashes))
+                        .collect();
+                    j += 1;
+                    while j + terminator.len() <= chars.len() {
+                        if chars[j..j + terminator.len()] == terminator[..] {
+                            return Ok(j + terminator.len());
+                        }
+                        j += 1;
+                    }
+                    return Err("unterminated raw string literal".to_owned());
+                }
+                // `r`/`br` not followed by a raw string: fall through as normal.
+            }
+            // Regular string literal.
+            if chars[i] != '"' {
+                return Err(format!("skip_string called at non-quote index {i}"));
+            }
+            i += 1;
+            while i < chars.len() {
+                match chars[i] {
+                    '\\' => i += 2,
+                    '"' => return Ok(i + 1),
+                    _ => i += 1,
+                }
+            }
+            Err("unterminated string literal".to_owned())
+        }
+
+        // Consume a char literal or lifetime starting at `chars[i] == '\''`.
+        fn skip_char_or_lifetime(chars: &[char], i: usize) -> Result<usize, String> {
+            let mut j = i + 1;
+            if j >= chars.len() {
+                return Err("unterminated char literal".to_owned());
+            }
+            // Escaped char literal: '\n', '\'', '\\', '\u{1F600}'.
+            if chars[j] == '\\' {
+                j += 1;
+                if j < chars.len() && chars[j] == 'u' {
+                    while j < chars.len() && chars[j] != '}' {
+                        j += 1;
+                    }
+                    j += 1; // '}'
+                } else {
+                    j += 1; // the escaped char itself
+                }
+                if j < chars.len() && chars[j] == '\'' {
+                    return Ok(j + 1);
+                }
+                return Err("unterminated escaped char literal".to_owned());
+            }
+            if chars[j].is_alphabetic() || chars[j] == '_' {
+                // Lifetime 'ident, unless the quote closes immediately ('a').
+                if j + 1 < chars.len() && chars[j + 1] == '\'' {
+                    return Ok(j + 2);
+                }
+                while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                    j += 1;
+                }
+                return Ok(j);
+            }
+            // Plain char literal: 'x'.
+            if j + 1 < chars.len() && chars[j + 1] == '\'' {
+                return Ok(j + 2);
+            }
+            Err(format!(
+                "unrecognised char-like token at char offset {i}: {:?}",
+                chars
+                    .get(i.saturating_sub(40)..(i + 40).min(chars.len()))
+                    .map(|window| window.iter().collect::<String>())
+                    .unwrap_or_default()
+            ))
+        }
+
+        // Skip whitespace and comments from `i`; returns the next significant index.
+        fn skip_trivia(chars: &[char], mut i: usize) -> usize {
+            loop {
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '/' {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                    let mut depth = 1usize;
+                    i += 2;
+                    while i < chars.len() && depth > 0 {
+                        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                            depth += 1;
+                            i += 2;
+                        } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                            depth -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                return i;
+            }
+        }
+
+        while i < chars.len() {
+            // Marker detection only on real code (strings/comments are consumed
+            // below as units).
+            if i + marker.len() <= chars.len() && chars[i..i + marker.len()] == marker[..] {
+                let is_keyword = |chars: &[char], j: usize, kw: &str| -> bool {
+                    let kw_chars: Vec<char> = kw.chars().collect();
+                    chars.len() >= j + kw_chars.len()
+                        && chars[j..j + kw_chars.len()] == kw_chars[..]
+                        && (j + kw_chars.len() == chars.len()
+                            || !(chars[j + kw_chars.len()].is_alphanumeric()
+                                || chars[j + kw_chars.len()] == '_'))
+                };
+                let after_marker = i + "#[cfg(test)]".len();
+                let j = skip_trivia(&chars, after_marker);
+                if is_keyword(&chars, j, "use")
+                    || is_keyword(&chars, j, "static")
+                    || is_keyword(&chars, j, "const")
+                {
+                    // `use`/`static`/`const` test items run to the terminating
+                    // `;` (string-aware, so a `&str` value cannot end the item
+                    // early).
+                    i = j;
+                    while i < chars.len() && chars[i] != ';' {
+                        if chars[i] == '"' {
+                            i = skip_string(&chars, i)?;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    if i >= chars.len() {
+                        return Err("unterminated #[cfg(test)] item".to_owned());
+                    }
+                    i += 1; // ';'
+                    continue;
+                }
+                if !is_keyword(&chars, j, "mod") {
+                    return Err(
+                        "unsupported #[cfg(test)] item form: expected `mod` or `use`".to_owned(),
+                    );
+                }
+                i = j + "mod".len();
+                let j = skip_trivia(&chars, i);
+                if j >= chars.len() || !(chars[j].is_alphabetic() || chars[j] == '_') {
+                    return Err("#[cfg(test)] mod without an identifier".to_owned());
+                }
+                i = j;
+                while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                    i += 1;
+                }
+                let j = skip_trivia(&chars, i);
+                if j < chars.len() && chars[j] == ';' {
+                    // A cfg(test) mod declaration (no body).
+                    i = j + 1;
+                    continue;
+                }
+                if j >= chars.len() || chars[j] != '{' {
+                    return Err("#[cfg(test)] mod without a body".to_owned());
+                }
+                // Brace-match the mod body, honouring strings and comments.
+                let mut depth = 0usize;
+                let mut k = j;
+                while k < chars.len() {
+                    match chars[k] {
+                        '{' => {
+                            depth += 1;
+                            k += 1;
+                        }
+                        '}' => {
+                            depth -= 1;
+                            k += 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        '"' => {
+                            k = skip_string(&chars, k)?;
+                        }
+                        '\'' => {
+                            k = skip_char_or_lifetime(&chars, k)?;
+                        }
+                        _ if opens_raw_string(&chars, k) => {
+                            k = skip_string(&chars, k)?;
+                        }
+                        '/' if k + 1 < chars.len() && chars[k + 1] == '/' => {
+                            while k < chars.len() && chars[k] != '\n' {
+                                k += 1;
+                            }
+                        }
+                        '/' if k + 1 < chars.len() && chars[k + 1] == '*' => {
+                            let mut d = 1usize;
+                            k += 2;
+                            while k < chars.len() && d > 0 {
+                                if k + 1 < chars.len() && chars[k] == '/' && chars[k + 1] == '*' {
+                                    d += 1;
+                                    k += 2;
+                                } else if k + 1 < chars.len()
+                                    && chars[k] == '*'
+                                    && chars[k + 1] == '/'
+                                {
+                                    d -= 1;
+                                    k += 2;
+                                } else {
+                                    k += 1;
+                                }
+                            }
+                        }
+                        _ => k += 1,
+                    }
+                }
+                if depth != 0 {
+                    return Err("unbalanced braces in #[cfg(test)] mod body".to_owned());
+                }
+                i = k;
+                continue;
+            }
+            match chars[i] {
+                '"' => {
+                    let end = skip_string(&chars, i)?;
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                '\'' => {
+                    let end = skip_char_or_lifetime(&chars, i)?;
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                _ if opens_raw_string(&chars, i) => {
+                    let end = skip_string(&chars, i)?;
+                    out.extend(&chars[i..end]);
+                    i = end;
+                }
+                '/' if i + 1 < chars.len() && chars[i + 1] == '/' => {
+                    while i < chars.len() && chars[i] != '\n' {
+                        out.push(chars[i]);
+                        i += 1;
+                    }
+                }
+                '/' if i + 1 < chars.len() && chars[i + 1] == '*' => {
+                    let start = i;
+                    let mut d = 1usize;
+                    i += 2;
+                    while i < chars.len() && d > 0 {
+                        if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
+                            d += 1;
+                            i += 2;
+                        } else if i + 1 < chars.len() && chars[i] == '*' && chars[i + 1] == '/' {
+                            d -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    out.extend(&chars[start..i]);
+                }
+                _ => {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn assert_same(input: &str) {
+        let old = old_implementation_source_slice(input);
+        let new = implementation_source_slice(input);
+        assert_eq!(old, new, "divergence for {input:?}");
+    }
+
+    #[test]
+    fn implementation_source_slice_matches_old_exhaustive_small_alphabet() {
+        // Exhaustive over every string of length <= 4 built from the
+        // scanner's interesting punctuation plus raw-string and cfg-marker
+        // fragments.
+        let alphabet: Vec<char> = "#\"'/*ru; ".chars().collect();
+        for len in 0..=4usize {
+            let total = alphabet.len().pow(len as u32);
+            for code in 0..total {
+                let mut n = code;
+                let mut s = String::new();
+                for _ in 0..len {
+                    s.push(alphabet[n % alphabet.len()]);
+                    n /= alphabet.len();
+                }
+                assert_same(&s);
+            }
+        }
+    }
+
+    #[test]
+    fn implementation_source_slice_matches_old_seeded_multibyte() {
+        // xorshift64* PRNG: deterministic, no external crate. The alphabet
+        // adds multibyte chars plus every scanner token (marker pieces,
+        // raw-string openers, escapes, comment pieces, braces, quote chars).
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let alphabet: Vec<char> = "#\"'/*rbu}{;/cf g()tes\\\n é😀[]a_0x".chars().collect();
+        for _ in 0..20_000 {
+            let len = (next() % 22) as usize + 3;
+            let s: String = (0..len)
+                .map(|_| alphabet[(next() % alphabet.len() as u64) as usize])
+                .collect();
+            assert_same(&s);
+        }
+    }
+
+    #[test]
+    fn implementation_source_slice_golden_behaviour_unchanged() {
+        assert_eq!(
+            implementation_source_slice(
+                "#[cfg(test)]\nmod tests {\n    assert!(true);\n}\nfn main() {}"
+            ),
+            Ok("\nfn main() {}".to_owned())
+        );
+        assert_eq!(
+            implementation_source_slice("#[cfg(test)] use a::b; fn k() {}"),
+            Ok(" fn k() {}".to_owned())
+        );
+        assert_eq!(
+            implementation_source_slice("let r = r#\"a\"#;"),
+            Ok("let r = r#\"a\"#;".to_owned())
+        );
+        assert_eq!(
+            implementation_source_slice("let b = br#\"x\"#;"),
+            Ok("let b = br#\"x\"#;".to_owned())
+        );
+        // Unsupported item form fails closed with the historical message.
+        assert_eq!(
+            implementation_source_slice("#[cfg(test)] struct S;"),
+            Err("unsupported #[cfg(test)] item form: expected `mod` or `use`".to_owned())
+        );
+        // Unterminated string fails closed with the historical message.
+        assert_eq!(
+            implementation_source_slice("\"abc"),
+            Err("unterminated string literal".to_owned())
+        );
+        // Unterminated raw string fails closed with the historical message.
+        assert_eq!(
+            implementation_source_slice("r#\"abc"),
+            Err("unterminated raw string literal".to_owned())
+        );
+    }
+
+    #[test]
+    fn implementation_source_slice_multibyte_and_comment_identity() {
+        assert_same("fn é() { let s = \"😀/string\"; } // é\n/* 😀 */");
+        assert_same("#[cfg(test)] mod é😀 { /* 😀 /* nested */ */ fn g() { 'é' } }");
+        assert_same("#[cfg(test)] mod m { let c = '\\u{1F600}'; let r = r##\"x\"##; }");
+        assert_same("/* unterminated");
+        assert_same("'a 'static '\\n");
+        assert_same("#[cfg(test)] static S: &str = \"a;b\"; fn f() {}");
+    }
+}
+// AQ-08 site-level differential + unit tests. The `old_*` functions in this
+// module are verbatim copies of the pre-AQ-08 implementations (renamed only)
+// and serve as the differential oracle: for every input tried below, the old
+// result (including every Err string) must equal the new result exactly.
+#[cfg(test)]
+mod aq08_site_tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // (1) guest_subnet_prefix
+    // -----------------------------------------------------------------------
+
+    // Verbatim copy of the pre-AQ-08 `guest_subnet_prefix` (HEAD), renamed
+    // only; indentation adjusted into this module.
+    fn old_guest_subnet_prefix(subnet: &str) -> Result<String, String> {
+        let network = subnet.split('/').next().unwrap_or(subnet);
+        let octets: Vec<&str> = network.split('.').collect();
+        if octets.len() != 4 {
+            return Err(format!("guest_subnet {subnet:?} is not a dotted-quad CIDR"));
+        }
+        for octet in &octets {
+            if octet.is_empty() || !octet.chars().all(|c| c.is_ascii_digit()) {
+                return Err(format!("guest_subnet {subnet:?} has a non-numeric octet"));
+            }
+            match octet.parse::<u16>() {
+                Ok(v) if v <= 255 => {}
+                _ => return Err(format!("guest_subnet {subnet:?} has an octet out of range")),
+            }
+        }
+        Ok(format!("{}.{}.{}.", octets[0], octets[1], octets[2]))
+    }
+
+    #[test]
+    fn guest_subnet_prefix_differential_matches_old_on_every_site_input() {
+        let inputs = [
+            "10.0.0.0/24",
+            "1.2.3.4/24",
+            "10.0.0.0",
+            "1.2.3/24",
+            "1.2.3.4.5/24",
+            "1.2.3.256/24",
+            "1.2.x.4/24",
+            "1..3.4/24",
+            "",
+            "/24",
+            "١.2.3.4/24",
+            "1.2.3.04/24",
+        ];
+        for input in inputs {
+            assert_eq!(
+                old_guest_subnet_prefix(input),
+                guest_subnet_prefix(input),
+                "old and new guest_subnet_prefix diverge on {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guest_subnet_prefix_expected_ok_and_err_strings_are_preserved() {
+        assert_eq!(guest_subnet_prefix("10.0.0.0/24"), Ok("10.0.0.".to_owned()));
+        // Leading zero parses fine on both sides.
+        assert_eq!(
+            old_guest_subnet_prefix("1.2.3.04/24"),
+            Ok("1.2.3.".to_owned())
+        );
+        assert_eq!(guest_subnet_prefix("1.2.3.04/24"), Ok("1.2.3.".to_owned()));
+        assert_eq!(
+            guest_subnet_prefix("1.2.3/24"),
+            Err("guest_subnet \"1.2.3/24\" is not a dotted-quad CIDR".to_owned())
+        );
+        // Five octets land in the SAME Err string as the old len check.
+        assert_eq!(
+            old_guest_subnet_prefix("1.2.3.4.5/24"),
+            Err("guest_subnet \"1.2.3.4.5/24\" is not a dotted-quad CIDR".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1.2.3.4.5/24"),
+            Err("guest_subnet \"1.2.3.4.5/24\" is not a dotted-quad CIDR".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1.2.3.256/24"),
+            Err("guest_subnet \"1.2.3.256/24\" has an octet out of range".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1.2.x.4/24"),
+            Err("guest_subnet \"1.2.x.4/24\" has a non-numeric octet".to_owned())
+        );
+        assert_eq!(
+            guest_subnet_prefix("1..3.4/24"),
+            Err("guest_subnet \"1..3.4/24\" has a non-numeric octet".to_owned())
+        );
+        // Arabic-Indic digit is not an ASCII digit → non-numeric octet.
+        assert_eq!(
+            guest_subnet_prefix("١.2.3.4/24"),
+            Err("guest_subnet \"١.2.3.4/24\" has a non-numeric octet".to_owned())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (2) ipv4_to_24_cidr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ipv4_to_24_cidr_unit_cases_match_spec() {
+        assert_eq!(
+            ipv4_to_24_cidr("192.168.64.18"),
+            Some("192.168.64.0/24".to_owned())
+        );
+        assert_eq!(ipv4_to_24_cidr("1.2.3"), None);
+        assert_eq!(ipv4_to_24_cidr("1.2.3.4.5"), None);
+        assert_eq!(ipv4_to_24_cidr(""), None);
+        // No numeric validation by design: only the four-part split matters.
+        assert_eq!(ipv4_to_24_cidr("a.b.c.d"), Some("a.b.c.0/24".to_owned()));
+        // Non-ASCII still splits into exactly four '.'-separated parts.
+        assert_eq!(ipv4_to_24_cidr("é.2.3.4"), Some("é.2.3.0/24".to_owned()));
+    }
+
+    // -----------------------------------------------------------------------
+    // (3) WindowsRemoteExec::build_invocation
+    // -----------------------------------------------------------------------
+
+    // Free-fn replica of the pre-AQ-08 `WindowsRemoteExec::build_invocation`
+    // body (HEAD), renamed only. The old body's `Self::quote_ps_single` calls
+    // are spelled `WindowsRemoteExec::quote_ps_single` here; the ssh_target is
+    // pinned to the value every case below uses ("win-host").
+    fn old_build_invocation_windows(argv: &[String]) -> Result<RemoteInvocation, String> {
+        let ssh_target = "win-host";
+        if ssh_target.trim().is_empty() {
+            return Err("ssh_target must not be empty".to_owned());
+        }
+        if argv.is_empty() {
+            return Err("argv must not be empty".to_owned());
+        }
+        for arg in argv {
+            ensure_no_control_chars("windows remote argv", arg)?;
+        }
+        let exe = WindowsRemoteExec::quote_ps_single(&argv[0]);
+        let body = if argv.len() == 1 {
+            format!("& {exe}")
+        } else {
+            let arg_list = argv[1..]
+                .iter()
+                .map(|a| WindowsRemoteExec::quote_ps_single(a))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("& {exe} @({arg_list})")
+        };
+        Ok(RemoteInvocation::WindowsSshEncodedPowerShell {
+            ssh_target: ssh_target.to_owned(),
+            powershell_body: body,
+        })
+    }
+
+    fn aq08_site_argv(pieces: &[&str]) -> Vec<String> {
+        pieces.iter().map(|piece| (*piece).to_owned()).collect()
+    }
+
+    #[test]
+    fn windows_build_invocation_differential_matches_old_on_site_inputs() {
+        let exec = WindowsRemoteExec;
+        let cases = vec![
+            aq08_site_argv(&[]),
+            aq08_site_argv(&["a"]),
+            aq08_site_argv(&["a", "b"]),
+            aq08_site_argv(&["a", "b", "c"]),
+            aq08_site_argv(&["a", "it's"]),
+            aq08_site_argv(&["a", "x;y"]),
+            aq08_site_argv(&["a\nb"]),
+        ];
+        for argv in &cases {
+            let new_invocation = RemoteExec::build_invocation(&exec, "win-host", argv);
+            assert_eq!(
+                old_build_invocation_windows(argv),
+                new_invocation,
+                "old and new Windows build_invocation diverge on {argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_build_invocation_ok_bodies_and_err_strings_are_preserved() {
+        let exec = WindowsRemoteExec;
+        let three_args = RemoteExec::build_invocation(
+            &exec,
+            "win-host",
+            aq08_site_argv(&["a", "b", "c"]).as_slice(),
+        )
+        .expect("three-arg invocation should build");
+        match three_args {
+            RemoteInvocation::WindowsSshEncodedPowerShell {
+                ssh_target,
+                powershell_body,
+            } => {
+                assert_eq!(ssh_target, "win-host");
+                assert_eq!(powershell_body, "& 'a' @('b','c')");
+            }
+            other => panic!("unexpected invocation variant: {other:?}"),
+        }
+        let single_arg =
+            RemoteExec::build_invocation(&exec, "win-host", aq08_site_argv(&["a"]).as_slice())
+                .expect("single-arg invocation should build");
+        match single_arg {
+            RemoteInvocation::WindowsSshEncodedPowerShell {
+                powershell_body, ..
+            } => {
+                assert_eq!(powershell_body, "& 'a'");
+            }
+            other => panic!("unexpected invocation variant: {other:?}"),
+        }
+        assert_eq!(
+            RemoteExec::build_invocation(&exec, "win-host", aq08_site_argv(&[]).as_slice())
+                .expect_err("empty argv must fail closed"),
+            "argv must not be empty"
+        );
+        // PS single-quote doubling survives the rewrite.
+        let quoted = RemoteExec::build_invocation(
+            &exec,
+            "win-host",
+            aq08_site_argv(&["a", "it's"]).as_slice(),
+        )
+        .expect("quote-embedded argv should build");
+        match quoted {
+            RemoteInvocation::WindowsSshEncodedPowerShell {
+                powershell_body, ..
+            } => {
+                assert_eq!(powershell_body, "& 'a' @('it''s')");
+            }
+            other => panic!("unexpected invocation variant: {other:?}"),
+        }
+        assert_eq!(
+            RemoteExec::build_invocation(&exec, "win-host", aq08_site_argv(&["a\nb"]).as_slice())
+                .expect_err("control chars must fail closed"),
+            "windows remote argv contains unsupported control characters or text-direction overrides (U+000A)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (4) select_relay_forward_test_topology{,_for_run}
+    // -----------------------------------------------------------------------
+
+    // Mirrors the existing test-entry constructor pattern in this file
+    // (see the hp3_* helpers): fully-populated Linux inventory entry with the
+    // candidate-filter-relevant fields parameterised. These values pass the
+    // positive allowlist: explicit Linux platform, optional exit/relay flags.
+    fn relay_peer_entry(
+        alias: &str,
+        lab_role: &str,
+        relay_capable: bool,
+        exit_capable: bool,
+        mesh_ip: Option<&str>,
+    ) -> VmInventoryEntry {
+        VmInventoryEntry {
+            alias: alias.to_owned(),
+            ssh_target: "192.168.0.200".to_owned(),
+            ssh_user: Some("debian".to_owned()),
+            ssh_password: None,
+            include_in_all: Some(true),
+            os: Some("Debian/Linux".to_owned()),
+            last_known_ip: None,
+            parent_device: None,
+            last_known_network: None,
+            network_group: None,
+            node_id: None,
+            lab_role: Some(lab_role.to_owned()),
+            mesh_ip: mesh_ip.map(ToString::to_string),
+            exit_capable: Some(exit_capable),
+            relay_capable: Some(relay_capable),
+            remote_temp_dir: None,
+            utm_staging_dir: None,
+            rustynet_src_dir: None,
+            platform: Some(VmGuestPlatform::Linux),
+            remote_shell: None,
+            guest_exec_mode: None,
+            service_manager: None,
+            dataplane_endpoint: None,
+            controller: None,
+        }
+    }
+
+    fn relay_topology_entry(alias: &str) -> VmInventoryEntry {
+        relay_peer_entry(alias, "relay", true, false, Some("100.64.0.1"))
+    }
+
+    fn relay_spare_peer_entry(alias: &str, lab_role: &str, mesh_ip: &str) -> VmInventoryEntry {
+        relay_peer_entry(alias, lab_role, false, false, Some(mesh_ip))
+    }
+
+    // Verbatim copy of the pre-AQ-08 `select_relay_forward_test_topology`
+    // (HEAD), renamed only; indentation adjusted into this module.
+    fn old_select_relay_forward_test_topology(
+        inventory: &[VmInventoryEntry],
+    ) -> Result<RelayForwardTestTopology, String> {
+        // QH-82: positive allowlist — ONLY entries with an explicit recorded
+        // Linux platform are selectable. A platform-less entry is excluded (it
+        // can never be minted into a Linux node) and its alias is surfaced
+        // through the existing error paths below. Hard-erroring inside the
+        // filter would abort every legitimate mixed topology (the standard lab
+        // holds Linux plus macOS/Windows guests); exclusion instead lands the
+        // failure in the already-tested relay-miss / peer-count errors with the
+        // cause named. Selecting nothing here is correct: the unacceptable
+        // outcome was never "no selection", it was "a selection made from a
+        // guess".
+        let unknown_platform: Vec<&str> = inventory
+            .iter()
+            .filter(|e| e.platform.is_none())
+            .map(|e| e.alias.as_str())
+            .collect();
+        let is_linux = |e: &&VmInventoryEntry| matches!(e.platform, Some(VmGuestPlatform::Linux));
+        let exclusion_note = unknown_platform_exclusion_note(unknown_platform.as_slice());
+
+        let relay_entry = inventory
+            .iter()
+            .filter(is_linux)
+            .find(|e| e.relay_capable == Some(true))
+            .ok_or_else(|| format!("no relay_capable Linux node in inventory{exclusion_note}"))?;
+
+        let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
+            .iter()
+            .filter(is_linux)
+            .filter(|e| e.alias != relay_entry.alias)
+            .filter(|e| e.exit_capable != Some(true))
+            .filter(|e| e.relay_capable != Some(true))
+            .collect();
+        // Deterministic ordering: prefer the conventional aux/extra lab_role
+        // names so repeated runs pick the same pair (stable evidence), falling
+        // back to alias order for topologies that don't use those names.
+        peer_candidates.sort_by(|a, b| {
+            relay_forward_test_peer_rank(a)
+                .cmp(&relay_forward_test_peer_rank(b))
+                .then_with(|| a.alias.cmp(&b.alias))
+        });
+
+        if peer_candidates.len() < 2 {
+            return Err(format!(
+                "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found {}{}",
+                peer_candidates.len(),
+                exclusion_note
+            ));
+        }
+        let sender = peer_candidates[0];
+        let receiver = peer_candidates[1];
+        let sender_mesh_ip = sender
+            .mesh_ip
+            .clone()
+            .ok_or_else(|| format!("peer {} has no mesh_ip recorded in inventory", sender.alias))?;
+        let receiver_mesh_ip = receiver.mesh_ip.clone().ok_or_else(|| {
+            format!(
+                "peer {} has no mesh_ip recorded in inventory",
+                receiver.alias
+            )
+        })?;
+
+        Ok(RelayForwardTestTopology {
+            relay_alias: relay_entry.alias.clone(),
+            sender_alias: sender.alias.clone(),
+            sender_mesh_ip,
+            receiver_alias: receiver.alias.clone(),
+            receiver_mesh_ip,
+        })
+    }
+
+    // Verbatim copy of the pre-AQ-08 `select_relay_forward_test_topology_for_run`
+    // (HEAD), renamed only; indentation adjusted into this module.
+    fn old_select_relay_forward_test_topology_for_run(
+        inventory: &[VmInventoryEntry],
+        relay_alias: &str,
+        run_aliases: &[String],
+    ) -> Result<RelayForwardTestTopology, String> {
+        // Same positive-allowlist treatment as `select_relay_forward_test_topology`
+        // (QH-82): only explicitly-Linux entries are selectable, excluded
+        // unknown-platform aliases are named through the existing error paths.
+        let unknown_platform: Vec<&str> = inventory
+            .iter()
+            .filter(|e| e.platform.is_none())
+            .map(|e| e.alias.as_str())
+            .collect();
+        let is_linux = |e: &&VmInventoryEntry| matches!(e.platform, Some(VmGuestPlatform::Linux));
+        let exclusion_note = unknown_platform_exclusion_note(unknown_platform.as_slice());
+
+        let relay_entry = inventory
+            .iter()
+            .filter(is_linux)
+            .find(|e| e.alias == relay_alias)
+            .ok_or_else(|| {
+                format!("assigned relay node {relay_alias} is not a Linux entry in the inventory{exclusion_note}")
+            })?;
+
+        let mut peer_candidates: Vec<&VmInventoryEntry> = inventory
+            .iter()
+            .filter(is_linux)
+            .filter(|e| run_aliases.iter().any(|a| a == &e.alias))
+            .filter(|e| e.alias != relay_entry.alias)
+            .filter(|e| e.exit_capable != Some(true))
+            .filter(|e| e.relay_capable != Some(true))
+            .collect();
+        // Same deterministic ordering as the inventory-wide election so repeated
+        // runs of the same topology pick the same peer pair (stable evidence).
+        peer_candidates.sort_by(|a, b| {
+            relay_forward_test_peer_rank(a)
+                .cmp(&relay_forward_test_peer_rank(b))
+                .then_with(|| a.alias.cmp(&b.alias))
+        });
+
+        if peer_candidates.len() < 2 {
+            return Err(format!(
+                "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found {}{}",
+                peer_candidates.len(),
+                exclusion_note
+            ));
+        }
+        let sender = peer_candidates[0];
+        let receiver = peer_candidates[1];
+        let sender_mesh_ip = sender
+            .mesh_ip
+            .clone()
+            .ok_or_else(|| format!("peer {} has no mesh_ip recorded in inventory", sender.alias))?;
+        let receiver_mesh_ip = receiver.mesh_ip.clone().ok_or_else(|| {
+            format!(
+                "peer {} has no mesh_ip recorded in inventory",
+                receiver.alias
+            )
+        })?;
+
+        Ok(RelayForwardTestTopology {
+            relay_alias: relay_entry.alias.clone(),
+            sender_alias: sender.alias.clone(),
+            sender_mesh_ip,
+            receiver_alias: receiver.alias.clone(),
+            receiver_mesh_ip,
+        })
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_differential_matches_old_for_zero_to_three_peers() {
+        // 0 peers: empty inventory.
+        let empty: Vec<VmInventoryEntry> = vec![];
+        assert_eq!(
+            old_select_relay_forward_test_topology(empty.as_slice()),
+            select_relay_forward_test_topology(empty.as_slice())
+        );
+        // 1 peer: under the two-peer minimum.
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology(one_peer.as_slice()),
+            select_relay_forward_test_topology(one_peer.as_slice())
+        );
+        // 2 peers: exactly at the minimum.
+        let two_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology(two_peers.as_slice()),
+            select_relay_forward_test_topology(two_peers.as_slice())
+        );
+        // 3 peers: ranking picks the preferred pair.
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology(three_peers.as_slice()),
+            select_relay_forward_test_topology(three_peers.as_slice())
+        );
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_err_strings_and_selection_are_preserved() {
+        let empty: Vec<VmInventoryEntry> = vec![];
+        assert_eq!(
+            select_relay_forward_test_topology(empty.as_slice()),
+            Err("no relay_capable Linux node in inventory".to_owned())
+        );
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        assert_eq!(
+            select_relay_forward_test_topology(one_peer.as_slice()),
+            Err(
+                "need at least 2 spare Linux peers (non-relay, non-exit) to force a relay-only path between them; found 1"
+                    .to_owned()
+            )
+        );
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let topology = select_relay_forward_test_topology(three_peers.as_slice())
+            .expect("three-peer topology should resolve");
+        assert_eq!(topology.relay_alias, "relay-a");
+        assert_eq!(topology.sender_alias, "aux-a");
+        assert_eq!(topology.sender_mesh_ip, "100.64.0.4");
+        assert_eq!(topology.receiver_alias, "extra-a");
+        assert_eq!(topology.receiver_mesh_ip, "100.64.0.5");
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_for_run_differential_matches_old_for_zero_to_three_peers()
+    {
+        // 0 peers: empty inventory, empty run.
+        let empty: Vec<VmInventoryEntry> = vec![];
+        let empty_run: Vec<String> = vec![];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                empty.as_slice(),
+                "relay-a",
+                empty_run.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                empty.as_slice(),
+                "relay-a",
+                empty_run.as_slice()
+            )
+        );
+        // 1 run peer: under the two-peer minimum.
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        let run_one = vec!["aux-a".to_owned()];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                one_peer.as_slice(),
+                "relay-a",
+                run_one.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                one_peer.as_slice(),
+                "relay-a",
+                run_one.as_slice()
+            )
+        );
+        // 2 run peers: exactly at the minimum.
+        let two_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let run_two = vec!["aux-a".to_owned(), "extra-a".to_owned()];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                two_peers.as_slice(),
+                "relay-a",
+                run_two.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                two_peers.as_slice(),
+                "relay-a",
+                run_two.as_slice()
+            )
+        );
+        // 3 run peers: ranking picks the preferred pair.
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let run_three = vec![
+            "client-a".to_owned(),
+            "aux-a".to_owned(),
+            "extra-a".to_owned(),
+        ];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_three.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_three.as_slice()
+            )
+        );
+        // Peers outside the run assignments are never candidates on either side.
+        let run_outside = vec!["absent-a".to_owned()];
+        assert_eq!(
+            old_select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_outside.as_slice()
+            ),
+            select_relay_forward_test_topology_for_run(
+                three_peers.as_slice(),
+                "relay-a",
+                run_outside.as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn select_relay_forward_test_topology_for_run_err_strings_and_selection_are_preserved() {
+        let empty: Vec<VmInventoryEntry> = vec![];
+        assert_eq!(
+            select_relay_forward_test_topology_for_run(empty.as_slice(), "relay-a", &[]),
+            Err("assigned relay node relay-a is not a Linux entry in the inventory".to_owned())
+        );
+        let one_peer = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+        ];
+        let run_one = vec!["aux-a".to_owned()];
+        assert_eq!(
+            select_relay_forward_test_topology_for_run(one_peer.as_slice(), "relay-a", run_one.as_slice()),
+            Err(
+                "need at least 2 spare Linux peers from the run's own node assignments (non-relay, non-exit) to force a relay-only path between them; found 1"
+                    .to_owned()
+            )
+        );
+        let three_peers = vec![
+            relay_topology_entry("relay-a"),
+            relay_spare_peer_entry("client-a", "client", "100.64.0.2"),
+            relay_spare_peer_entry("aux-a", "aux", "100.64.0.4"),
+            relay_spare_peer_entry("extra-a", "extra", "100.64.0.5"),
+        ];
+        let run_three = vec![
+            "client-a".to_owned(),
+            "aux-a".to_owned(),
+            "extra-a".to_owned(),
+        ];
+        let topology = select_relay_forward_test_topology_for_run(
+            three_peers.as_slice(),
+            "relay-a",
+            run_three.as_slice(),
+        )
+        .expect("three-peer run topology should resolve");
+        assert_eq!(topology.relay_alias, "relay-a");
+        assert_eq!(topology.sender_alias, "aux-a");
+        assert_eq!(topology.sender_mesh_ip, "100.64.0.4");
+        assert_eq!(topology.receiver_alias, "extra-a");
+        assert_eq!(topology.receiver_mesh_ip, "100.64.0.5");
+    }
+
+    // -----------------------------------------------------------------------
+    // (5) extract_trailing_json_object
+    // -----------------------------------------------------------------------
+
+    // Verbatim copy of the pre-AQ-08 `extract_trailing_json_object` (HEAD),
+    // renamed only; indentation adjusted into this module.
+    fn old_extract_trailing_json_object(output: &str) -> Option<String> {
+        let bytes = output.as_bytes();
+        let start = bytes.iter().position(|&b| b == b'{')?;
+        let mut depth = 0i32;
+        let mut in_string = false;
+        let mut escaped = false;
+        for idx in start..bytes.len() {
+            let ch = bytes[idx] as char;
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(output[start..=idx].to_owned());
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn extract_trailing_json_object_differential_matches_old_on_site_inputs() {
+        let inputs = [
+            "",
+            "no braces here",
+            "{",
+            "{}",
+            "{\"a\":1}",
+            "prefix {\"a\":{\"b\":2}} tail",
+            "{\"s\":\"}\"}",
+            "{\"a\":\"esc\\\"quote}\"}",
+            "{unterminated",
+            "é😀{\"k\":1}",
+            "x { y } { z }",
+            "{\"nested\":{\"deep\":true}}",
+            "brace } before {",
+        ];
+        for input in inputs {
+            assert_eq!(
+                old_extract_trailing_json_object(input),
+                extract_trailing_json_object(input),
+                "old and new extract_trailing_json_object diverge on {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_trailing_json_object_expected_some_and_none_values_are_preserved() {
+        assert_eq!(extract_trailing_json_object(""), None);
+        assert_eq!(extract_trailing_json_object("no braces here"), None);
+        assert_eq!(extract_trailing_json_object("{"), None);
+        assert_eq!(extract_trailing_json_object("{}"), Some("{}".to_owned()));
+        assert_eq!(
+            extract_trailing_json_object("{\"a\":1}"),
+            Some("{\"a\":1}".to_owned())
+        );
+        assert_eq!(
+            extract_trailing_json_object("prefix {\"a\":{\"b\":2}} tail"),
+            Some("{\"a\":{\"b\":2}}".to_owned())
+        );
+        // A '}' inside a string value must not unbalance the scan.
+        assert_eq!(
+            extract_trailing_json_object("{\"s\":\"}\"}"),
+            Some("{\"s\":\"}\"}".to_owned())
+        );
+        assert_eq!(extract_trailing_json_object("{unterminated"), None);
+        assert_eq!(extract_trailing_json_object("brace } before {"), None);
+        assert_eq!(
+            extract_trailing_json_object("x { y } { z }"),
+            Some("{ y }".to_owned())
+        );
+    }
+
+    #[test]
+    fn extract_trailing_json_object_multibyte_prefix_yields_ascii_object() {
+        // Witness: the rewritten scan is enumerate()-based, so the '{'/'}'
+        // offsets stay true ASCII byte indexes and slicing cannot split a
+        // multibyte char. The leading é😀 (4 + 3 UTF-8 bytes) must not corrupt
+        // the extracted object.
+        assert_eq!(
+            extract_trailing_json_object("é😀{\"k\":1}"),
+            Some("{\"k\":1}".to_owned())
+        );
+        assert_eq!(
+            old_extract_trailing_json_object("é😀{\"k\":1}"),
+            Some("{\"k\":1}".to_owned())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // (6) windows trust helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn windows_trust_cli_status_output_matches_known_trust_shapes_only() {
+        assert!(windows_trust_cli_status_output(
+            "UNKNOWN rustynet-windows-trust-cli command: status"
+        ));
+        assert!(windows_trust_cli_status_output("usage: rustynet trust"));
+        assert!(!windows_trust_cli_status_output("hello"));
+    }
+
+    #[test]
+    fn classify_windows_active_exit_readiness_output_unit_cases() {
+        assert_eq!(
+            classify_windows_active_exit_readiness_output("win-a", "PROMOTED"),
+            Ok(())
+        );
+        // Adversarial: output containing BOTH "PROMOTED" and a trust-CLI usage
+        // string classifies as Ok(()) because the promoted marker is checked
+        // first. The pre-AQ-08 caller expect_err'd the classifier on exactly
+        // this class of input and would have panicked; the Ok here is why the
+        // fail-closed `classify_windows_readiness_poll_error` helper exists.
+        assert_eq!(
+            classify_windows_active_exit_readiness_output(
+                "win-a",
+                "PROMOTED usage: rustynet trust"
+            ),
+            Ok(())
+        );
+        let trust_err =
+            classify_windows_active_exit_readiness_output("win-a", "usage: rustynet trust")
+                .expect_err("trust-CLI status output must classify as an error");
+        assert!(trust_err.contains("trust-CLI status output"));
+        let timeout_err = classify_windows_active_exit_readiness_output(
+            "win-a",
+            "timed out waiting for Windows daemon readiness on win-a",
+        )
+        .expect_err("generic timeout text must classify as an error");
+        assert!(timeout_err.contains("did not reach"));
+    }
+
+    #[test]
+    fn classify_windows_readiness_poll_error_unit_cases() {
+        // (a) Trust output WITHOUT "PROMOTED" falls through to the classifier's
+        // Err string unchanged.
+        let trust_only = "UNKNOWN rustynet-windows-trust-cli command: status";
+        let expected = classify_windows_active_exit_readiness_output("win-a", trust_only)
+            .expect_err("trust output without PROMOTED must be an error");
+        assert_eq!(
+            classify_windows_readiness_poll_error("win-a", trust_only),
+            expected
+        );
+        // (b) Generic errors pass through with the polling prefix.
+        assert_eq!(
+            classify_windows_readiness_poll_error("win-a", "boom"),
+            "polling Windows daemon readiness for win-a failed: boom"
+        );
+        // (c) Adversarial both-strings error fails closed ("internal:" prefix)
+        // instead of taking the old panic path (pre-AQ-08 expect_err).
+        let adversarial = "PROMOTED usage: rustynet trust";
+        let classified = classify_windows_readiness_poll_error("win-a", adversarial);
+        assert!(classified.starts_with("internal:"));
+        assert!(classified.contains("failing closed"));
+    }
+
+    // -----------------------------------------------------------------------
+    // (7) parse_live_lab_stage_records / summarize_live_lab_report / tail_log_lines
+    // -----------------------------------------------------------------------
+
+    // Mirrors the existing write_temp_report_dir convention in this file.
+    fn aq08_site_temp_report_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-aq08-site-{tag}-{}.dir", unique_suffix()));
+        fs::create_dir_all(dir.join("state")).expect("state dir should create");
+        dir
+    }
+
+    #[test]
+    fn parse_live_lab_stage_records_reads_full_rows_and_skips_short_rows() {
+        let report_dir = aq08_site_temp_report_dir("parse");
+        fs::create_dir_all(report_dir.join("logs")).expect("logs dir should create");
+        let a_log = report_dir.join("logs/a.log");
+        let full_row = format!(
+            "stage_a\thard\tpass\t0\t{}\tdoes the thing\t2026-04-03T20:00:00Z\t2026-04-03T20:00:01Z",
+            a_log.display()
+        );
+        let short_row = "stage_short\thard\tpass";
+        let six_col_row = "stage_b\tsoft\twarn\t2\trelative.log\tsome description";
+        fs::write(
+            report_dir.join("state/stages.tsv"),
+            format!("{full_row}\n{short_row}\n{six_col_row}\n"),
+        )
+        .expect("stages should write");
+        let records =
+            parse_live_lab_stage_records(report_dir.as_path()).expect("stages should parse");
+        // The <6-column row is skipped; the 8-column row keeps only the first
+        // six fields (trailing timestamps are ignored, same as HEAD).
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].name, "stage_a");
+        assert_eq!(records[0].severity, "hard");
+        assert_eq!(records[0].status, "pass");
+        assert_eq!(records[0].rc, "0");
+        assert_eq!(records[0].log_path, a_log);
+        assert_eq!(records[0].description, "does the thing");
+        assert_eq!(records[1].name, "stage_b");
+        assert_eq!(records[1].severity, "soft");
+        assert_eq!(records[1].status, "warn");
+        assert_eq!(records[1].rc, "2");
+        assert_eq!(records[1].log_path, report_dir.join("relative.log"));
+        assert_eq!(records[1].description, "some description");
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn summarize_live_lab_report_flags_first_failed_stage_with_key_log_path() {
+        let report_dir = aq08_site_temp_report_dir("summarize-fail");
+        fs::create_dir_all(report_dir.join("logs")).expect("logs dir should create");
+        let fail_log = report_dir.join("logs/live_two_hop.log");
+        fs::write(&fail_log, "[stage: live_two_hop] FAIL\nerror: exploded\n")
+            .expect("fail log should write");
+        let body = format!(
+            "preflight\thard\tpass\t0\t{}\tok\nlive_two_hop\thard\tfail\t1\t{}\tboom\n",
+            report_dir.join("logs/preflight.log").display(),
+            fail_log.display()
+        );
+        fs::write(report_dir.join("state/stages.tsv"), body).expect("stages should write");
+        let summary = summarize_live_lab_report(report_dir.as_path(), false, 20)
+            .expect("summary should build");
+        assert_eq!(summary.overall_status, "fail");
+        assert_eq!(summary.first_failed_stage.as_deref(), Some("live_two_hop"));
+        assert_eq!(summary.key_log_path.as_deref(), Some(fail_log.as_path()));
+        assert_eq!(summary.likely_reason.as_deref(), Some("error: exploded"));
+        assert_eq!(summary.failed_log_tail, None);
+        assert_eq!(
+            summary.key_report_path,
+            report_dir.join("failure_digest.md")
+        );
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn summarize_live_lab_report_all_pass_rows_yield_no_failure() {
+        let report_dir = aq08_site_temp_report_dir("summarize-pass");
+        // Five-column rows stay above the summarizer's five-column guard.
+        let body = format!(
+            "preflight\thard\tpass\t0\t{}\nlive_two_hop\thard\tpass\t0\t{}\n",
+            report_dir.join("logs/preflight.log").display(),
+            report_dir.join("logs/live_two_hop.log").display()
+        );
+        fs::write(report_dir.join("state/stages.tsv"), body).expect("stages should write");
+        let summary = summarize_live_lab_report(report_dir.as_path(), false, 20)
+            .expect("summary should build");
+        assert_eq!(summary.overall_status, "pass");
+        assert_eq!(summary.first_failed_stage, None);
+        assert_eq!(summary.key_log_path, None);
+        assert_eq!(summary.likely_reason, None);
+        assert_eq!(summary.failed_log_tail, None);
+        assert_eq!(
+            summary.key_report_path,
+            report_dir.join("failure_digest.md")
+        );
+        let _ = fs::remove_dir_all(&report_dir);
+    }
+
+    #[test]
+    fn tail_log_lines_returns_last_max_lines_and_full_body_when_shorter() {
+        let dir =
+            std::env::temp_dir().join(format!("rustynet-aq08-site-tail-{}.dir", unique_suffix()));
+        fs::create_dir_all(&dir).expect("tail temp dir should create");
+        let log = dir.join("boom.log");
+        fs::write(&log, "one\ntwo\nthree\nfour\nfive\n").expect("tail log should write");
+        assert_eq!(
+            tail_log_lines(log.as_path(), 3).expect("tail should read"),
+            "three\nfour\nfive"
+        );
+        assert_eq!(
+            tail_log_lines(log.as_path(), 10).expect("tail should read"),
+            "one\ntwo\nthree\nfour\nfive"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // (8) build_windows_result_file_helper_invocation_script
+    // -----------------------------------------------------------------------
+
+    // The pushed `-OutputPath <remote_result_path>` pair is rendered into the
+    // helper command, which the wrapper embeds base64/UTF-16-encoded; decoding
+    // it here is the only way to observe the appended-arg contract literally.
+    fn decode_windows_encoded_helper_from_script(script: &str) -> String {
+        let marker = "$encodedHelper = '";
+        let start = script
+            .find(marker)
+            .expect("encoded helper marker should appear")
+            + marker.len();
+        let rest = &script[start..];
+        let end = rest
+            .find('\'')
+            .expect("encoded helper literal should close");
+        let bytes = BASE64_STANDARD
+            .decode(&rest[..end])
+            .expect("helper payload should base64-decode");
+        let units: Vec<u16> = bytes
+            .chunks(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        String::from_utf16(&units).expect("helper payload should be UTF-16 text")
+    }
+
+    #[test]
+    fn build_windows_result_file_helper_invocation_script_appends_output_path_when_missing() {
+        let script = build_windows_result_file_helper_invocation_script(
+            "C:\\aq08\\helper.ps1",
+            &["-Verbose".to_owned()],
+            "C:\\aq08\\result.json",
+            "Windows result helper label",
+        )
+        .expect("script should build");
+        // The wrapper's result-path bookkeeping is always present.
+        assert!(script.contains("$resultPath = 'C:\\aq08\\result.json'"));
+        let helper_command = decode_windows_encoded_helper_from_script(script.as_str());
+        assert!(helper_command.starts_with("& 'C:\\aq08\\helper.ps1'"));
+        // No -OutputPath/-ResultPath in the caller's args → the default remote
+        // result path is appended to the helper invocation.
+        assert!(helper_command.contains("-OutputPath 'C:\\aq08\\result.json'"));
+    }
+
+    #[test]
+    fn build_windows_result_file_helper_invocation_script_keeps_caller_output_path() {
+        let script = build_windows_result_file_helper_invocation_script(
+            "C:\\aq08\\helper.ps1",
+            &[
+                "-OutputPath".to_owned(),
+                "C:\\aq08\\caller-owned.json".to_owned(),
+            ],
+            "C:\\aq08\\result.json",
+            "Windows result helper label",
+        )
+        .expect("script should build");
+        let helper_command = decode_windows_encoded_helper_from_script(script.as_str());
+        assert!(helper_command.contains("-OutputPath 'C:\\aq08\\caller-owned.json'"));
+        // The caller's -OutputPath wins: the default remote result path is NOT
+        // appended to the helper command. (It still appears in the wrapper's
+        // unconditional $resultPath bookkeeping, which both branches share.)
+        assert!(!helper_command.contains("C:\\aq08\\result.json"));
+    }
+
+    #[test]
+    fn build_windows_result_file_helper_invocation_script_rejects_control_char_label() {
+        let err = build_windows_result_file_helper_invocation_script(
+            "C:\\aq08\\helper.ps1",
+            &["-Verbose".to_owned()],
+            "C:\\aq08\\result.json",
+            "Windows result helper label\u{7}",
+        )
+        .expect_err("control-char helper label must fail closed");
+        assert!(err.contains("unsupported control characters"));
+        assert!(err.contains("U+0007"));
     }
 }
