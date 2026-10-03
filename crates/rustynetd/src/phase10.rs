@@ -247,6 +247,7 @@ pub(crate) const DEFAULT_WINDOWS_NETSH_BINARY_PATH: &str = r"C:\Windows\System32
 pub(crate) const DEFAULT_WINDOWS_POWERSHELL_BINARY_PATH: &str =
     r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 const DEFAULT_WINDOWS_REG_BINARY_PATH: &str = r"C:\Windows\System32\reg.exe";
+const DEFAULT_WINDOWS_ROUTE_BINARY_PATH: &str = r"C:\Windows\System32\route.exe";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ManagementCidr {
@@ -6299,6 +6300,17 @@ impl WindowsCommandSystem {
         Ok(PathBuf::from(raw))
     }
 
+    // No environment override on purpose: unlike netsh/powershell/reg there is
+    // no deployment that needs one, and an override would inherit the UNC-path
+    // hole in `validate_windows_binary_path` (a `\\host\share\…` path passes
+    // the validator), letting whoever controls the service environment run a
+    // binary off-box. The path is the fixed Microsoft-shipped constant.
+    fn resolve_route_binary() -> Result<PathBuf, SystemError> {
+        let raw = DEFAULT_WINDOWS_ROUTE_BINARY_PATH;
+        validate_windows_binary_path(raw, "route")?;
+        Ok(PathBuf::from(raw))
+    }
+
     fn run_netsh(&self, args: &[String]) -> Result<PrivilegedCommandOutput, SystemError> {
         let binary = Self::resolve_netsh_binary()?;
         let mut command = Command::new(&binary);
@@ -6607,27 +6619,157 @@ impl WindowsCommandSystem {
         }
     }
 
-    fn add_endpoint_bypass_route(&self, cidr: &str) -> Result<(), SystemError> {
-        let (family, nexthop) = if cidr.contains(':') {
-            ("ipv6", "nexthop=::")
-        } else {
-            ("ipv4", "nexthop=0.0.0.0")
-        };
-        self.run_netsh_success(&[
-            "interface".to_owned(),
-            family.to_owned(),
-            "add".to_owned(),
-            "route".to_owned(),
-            format!("prefix={cidr}"),
-            format!("interface={}", self.egress_interface),
-            nexthop.to_owned(),
-            "store=active".to_owned(),
-            "metric=1".to_owned(),
-        ])
-        .map_err(|err| {
+    /// Observe the live route table and adapter addresses ONCE per apply
+    /// pass (one `route print` spawn, one `GetAdaptersAddresses` call) so
+    /// planning N peer endpoints costs one observation, and so this apply's
+    /// own installs and deletes are decided from a single consistent
+    /// capture. The capture runs AFTER the caller's `rollback_routes()` has
+    /// already deleted every previous bypass route, and it is skipped
+    /// entirely when there is no IPv4 endpoint to plan. Fail-closed: an
+    /// unreadable table, a failed `route print`, or a missing/addressless
+    /// egress adapter aborts the apply — with the previous bypass routes
+    /// already gone (a fail-closed black hole for peer traffic, never a
+    /// plaintext leak). Split so tests can drive the apply through a fake
+    /// capture channel and count the real spawns.
+    fn windows_route_context_from_capture(
+        &self,
+        output: PrivilegedCommandOutput,
+    ) -> Result<WindowsRouteContext, SystemError> {
+        let adapters = rustynet_windows_native::get_adapters_addresses().map_err(|err| {
             SystemError::RouteApplyFailed(format!(
-                "peer endpoint bypass route failed for {cidr}: {err}"
+                "peer endpoint bypass routes could not enumerate adapters: {err}"
             ))
+        })?;
+        let egress = adapters
+            .iter()
+            .find(|adapter| {
+                adapter
+                    .friendly_name
+                    .eq_ignore_ascii_case(&self.egress_interface)
+                    || adapter
+                        .adapter_name
+                        .eq_ignore_ascii_case(&self.egress_interface)
+            })
+            .ok_or_else(|| {
+                SystemError::RouteApplyFailed(format!(
+                    "egress interface {} is not present in the adapter table",
+                    self.egress_interface
+                ))
+            })?;
+        let egress_addresses: Vec<std::net::Ipv4Addr> = egress
+            .unicast_addresses
+            .iter()
+            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+        if egress_addresses.is_empty() {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "egress interface {} has no IPv4 address to match route rows against",
+                self.egress_interface
+            )));
+        }
+        let tunnel_addresses: Vec<std::net::Ipv4Addr> = adapters
+            .iter()
+            .filter(|adapter| {
+                adapter
+                    .friendly_name
+                    .eq_ignore_ascii_case(&self.interface_name)
+                    || adapter
+                        .adapter_name
+                        .eq_ignore_ascii_case(&self.interface_name)
+            })
+            .flat_map(|adapter| adapter.unicast_addresses.iter())
+            .filter_map(|addr| match addr {
+                IpAddr::V4(v4) => Some(*v4),
+                IpAddr::V6(_) => None,
+            })
+            .collect();
+
+        if !output.success() {
+            return Err(SystemError::RouteApplyFailed(format!(
+                "route print exited unsuccessfully: status={} stderr={}",
+                output.status, output.stderr
+            )));
+        }
+        let routes = parse_windows_route_print_v4(&output.stdout).map_err(|err| {
+            SystemError::RouteApplyFailed(format!(
+                "peer endpoint bypass routes could not read the route table: {err}"
+            ))
+        })?;
+        Ok(WindowsRouteContext {
+            routes,
+            egress_addresses,
+            tunnel_addresses,
+        })
+    }
+
+    /// Apply with an injectable `route print` channel so tests can count the
+    /// observation spawns on any host (production passes `run_route_print`).
+    ///
+    /// Ordering note: the controller runs `rollback_routes()` BEFORE this
+    /// apply, so every previous bypass route is already deleted when the
+    /// capture happens — there is no resolve-before-delete ordering at this
+    /// level, and a resolution failure leaves no bypass routes installed
+    /// (fail closed, never a leak). What this apply does guarantee is that
+    /// the plan is built from ONE capture before its OWN deletes and
+    /// installs. With no IPv4 endpoint to plan (no peers, or every peer on
+    /// IPv6) the capture is skipped entirely: no `route.exe` spawn and no
+    /// adapter enumeration, so a peerless apply cannot fail on an unreadable
+    /// route table.
+    fn apply_peer_endpoint_bypass_routes_with_route_print(
+        &mut self,
+        peers: &[PeerConfig],
+        run_route_print: &mut dyn FnMut(&Self) -> Result<PrivilegedCommandOutput, SystemError>,
+    ) -> Result<(), SystemError> {
+        let endpoints = windows_collect_bypass_endpoints(peers)?;
+        let plan = if endpoints.is_empty() {
+            Vec::new()
+        } else {
+            let context = self.windows_route_context_from_capture(run_route_print(self)?)?;
+            windows_resolve_bypass_plan(&endpoints, &context)?
+        };
+        let old = std::mem::take(&mut self.endpoint_bypass_routes);
+        for cidr in &old {
+            let _ = self.delete_endpoint_bypass_route(cidr);
+        }
+        for (cidr, nexthop) in plan {
+            // Purge any OS-level leftover from a previous daemon run before re-adding.
+            let _ = self.delete_endpoint_bypass_route(&cidr);
+            self.run_netsh_success(&windows_endpoint_bypass_route_args(
+                &cidr,
+                &self.egress_interface,
+                nexthop,
+            ))
+            .map_err(|err| {
+                SystemError::RouteApplyFailed(format!(
+                    "peer endpoint bypass route failed for {cidr}: {err}"
+                ))
+            })?;
+            self.endpoint_bypass_routes.push(cidr);
+        }
+        Ok(())
+    }
+
+    /// Run `route.exe print -4` (argv-only, no WMI/CIM) to observe the live
+    /// kernel route table. `-4` restricts the output to the IPv4 table, so
+    /// the `=` terminator the parser requires actually follows the section
+    /// this parser reads. The output is locale-formatted, so this is an
+    /// observation channel only: the parser fails closed on anything it
+    /// cannot fully read.
+    fn run_route_print(&self) -> Result<PrivilegedCommandOutput, SystemError> {
+        let binary = Self::resolve_route_binary()?;
+        let mut command = Command::new(&binary);
+        command.arg("print").arg("-4");
+        let output = run_helper_command_with_timeout(command, WINDOWS_HELPER_COMMAND_TIMEOUT)
+            .map_err(|err| {
+                SystemError::Io(format!("route run failed ({}): {err}", binary.display()))
+            })?;
+        Ok(PrivilegedCommandOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
     }
 
@@ -6953,25 +7095,18 @@ impl DataplaneSystem for WindowsCommandSystem {
         &mut self,
         peers: &[PeerConfig],
     ) -> Result<(), SystemError> {
-        let old = std::mem::take(&mut self.endpoint_bypass_routes);
-        for cidr in &old {
-            let _ = self.delete_endpoint_bypass_route(cidr);
-        }
-        let mut seen = BTreeSet::new();
-        for peer in peers {
-            if !seen.insert(peer.endpoint.addr) {
-                continue;
-            }
-            let cidr = match peer.endpoint.addr {
-                std::net::IpAddr::V4(_) => format!("{}/32", peer.endpoint.addr),
-                std::net::IpAddr::V6(_) => format!("{}/128", peer.endpoint.addr),
-            };
-            // Purge any OS-level leftover from a previous daemon run before re-adding.
-            let _ = self.delete_endpoint_bypass_route(&cidr);
-            self.add_endpoint_bypass_route(&cidr)?;
-            self.endpoint_bypass_routes.push(cidr);
-        }
-        Ok(())
+        // The caller pairs this apply with `rollback_routes()`, which has
+        // ALREADY deleted every previous bypass route by the time we run:
+        // there is no resolve-before-delete ordering at the controller, and
+        // a resolution failure here leaves the node with NO bypass routes
+        // (fail closed: a black hole for tunnel-external peer traffic,
+        // never a plaintext leak). The capture can still contain this
+        // apply's own leftover bypass /32 (a purge delete is best-effort)
+        // and the tunnel's full-tunnel default; both are excluded from
+        // candidate selection inside the resolver precisely because they
+        // can be present at this point.
+        let mut route_print = |system: &Self| system.run_route_print();
+        self.apply_peer_endpoint_bypass_routes_with_route_print(peers, &mut route_print)
     }
 
     fn apply_routes(&mut self, _routes: &[Route]) -> Result<(), SystemError> {
@@ -10096,6 +10231,400 @@ fn windows_ipv6_egress_rollback_args(egress_interface: &str) -> Vec<String> {
     ]
 }
 
+/// One parsed row of `route print`'s IPv4 route table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowsRouteRow {
+    destination: std::net::Ipv4Addr,
+    prefix_len: u8,
+    /// `None` when the gateway column reads `On-link`.
+    gateway: Option<std::net::Ipv4Addr>,
+    interface: std::net::Ipv4Addr,
+    metric: u32,
+}
+
+/// The next hop a peer-endpoint bypass route must carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsBypassNexthop {
+    /// The endpoint sits inside a connected prefix on the egress interface,
+    /// so the on-link sentinel form (`nexthop=0.0.0.0` / `nexthop=::`)
+    /// delivers.
+    OnLink,
+    /// The endpoint is off-link; the route must carry the kernel's real next
+    /// hop or every packet to the endpoint would be ARP-resolved on the
+    /// egress interface and blackholed.
+    Gateway(std::net::Ipv4Addr),
+}
+
+/// Convert a netmask to its prefix length. `None` when the mask is not a
+/// contiguous run of leading ones — `route print` should never emit one, so
+/// such a row fails the parse closed instead of guessing.
+fn windows_netmask_to_prefix_len(netmask: std::net::Ipv4Addr) -> Option<u8> {
+    let bits = u32::from(netmask);
+    let leading = bits.leading_ones() as u8;
+    let is_contiguous = match leading {
+        0 => bits == 0,
+        32 => true,
+        _ => (bits >> (32 - leading)) << (32 - leading) == bits,
+    };
+    if is_contiguous { Some(leading) } else { None }
+}
+
+fn windows_prefix_len_to_netmask(prefix_len: u8) -> std::net::Ipv4Addr {
+    std::net::Ipv4Addr::from(if prefix_len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(prefix_len))
+    })
+}
+
+/// Parse the IPv4 route table out of `route print` output. Strictly
+/// fail-closed: any row this cannot fully understand (wrong column count,
+/// non-contiguous netmask, unparseable address, non-numeric metric) fails
+/// the WHOLE parse rather than being skipped, parsing stops at the `=`
+/// terminator so the Persistent Routes section is never read, and output
+/// that ends WITHOUT the `=` terminator (a truncated capture) is an error,
+/// never a short-but-Ok table.
+fn parse_windows_route_print_v4(stdout: &str) -> Result<Vec<WindowsRouteRow>, String> {
+    let mut lines = stdout.lines();
+    if lines
+        .by_ref()
+        .all(|line| !(line.contains("Network Destination") && line.contains("Netmask")))
+    {
+        return Err("route print output contains no IPv4 route table".to_owned());
+    }
+    let mut rows = Vec::new();
+    let mut terminator_seen = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('=') {
+            terminator_seen = true;
+            break;
+        }
+        let fields: Vec<&str> = trimmed.split_whitespace().collect();
+        let [destination, netmask, gateway, interface, metric] = fields.as_slice() else {
+            return Err(format!(
+                "route print row has {} fields, expected 5: {trimmed:?}",
+                fields.len()
+            ));
+        };
+        let destination: std::net::Ipv4Addr = destination
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad destination: {err}"))?;
+        let netmask: std::net::Ipv4Addr = netmask
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad netmask: {err}"))?;
+        let prefix_len = windows_netmask_to_prefix_len(netmask)
+            .ok_or_else(|| format!("route print row {trimmed:?} has a non-contiguous netmask"))?;
+        let gateway =
+            if gateway.eq_ignore_ascii_case("on-link") {
+                None
+            } else {
+                Some(gateway.parse().map_err(|err| {
+                    format!("route print row {trimmed:?} has a bad gateway: {err}")
+                })?)
+            };
+        let interface: std::net::Ipv4Addr = interface
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad interface: {err}"))?;
+        let metric: u32 = metric
+            .parse()
+            .map_err(|err| format!("route print row {trimmed:?} has a bad metric: {err}"))?;
+        rows.push(WindowsRouteRow {
+            destination,
+            prefix_len,
+            gateway,
+            interface,
+            metric,
+        });
+    }
+    if !terminator_seen {
+        return Err(
+            "route print output ended without the `=` section terminator; the route table \
+             may be truncated"
+                .to_owned(),
+        );
+    }
+    Ok(rows)
+}
+
+/// Decide the next hop for a peer-endpoint host bypass route from the parsed
+/// kernel route table, mirroring the kernel's own route selection: longest
+/// prefix wins, then the lower metric. Two answer classes are EXCLUDED from
+/// candidate selection before the kernel-mirror runs, because both would let
+/// the resolver trust a row that exists only because of the thing it is
+/// configuring:
+///
+/// 1. rows served by the tunnel interface — the Windows backend installs the
+///    full-tunnel default (`0.0.0.0/0` on-link on the tunnel, metric 1), so
+///    on every re-apply (rollback + apply) the live table's best answer for
+///    an off-link endpoint IS the tunnel row; excluding tunnel-owned rows
+///    yields what the kernel picks with the tunnel absent, which is exactly
+///    the route the bypass must carry;
+/// 2. the endpoint's own stale bypass row (destination == endpoint, /32) —
+///    the capture runs AFTER the caller's purge (`rollback_routes()` deletes
+///    every bypass route first), so this daemon's own previous /32 is
+///    normally absent; the exclusion is defensive against a purge whose
+///    deletes silently failed. An on-link /32 self-answer is the same class
+///    of answer the Linux twin (`03042b2ca`) rejects as a self-table answer.
+///
+/// If every matching row was excluded, the resolution fails closed with the
+/// matching reason. The winning row must additionally be served by the
+/// configured egress interface (matched by interface address). Equal-prefix,
+/// equal-metric rows do NOT fail as ambiguous when they agree: same gateway
+/// and both interface addresses inside `egress_addresses` (which is derived
+/// from ONE adapter, so containment proves both rows traverse that adapter,
+/// possibly via its secondary addresses). Anything else stays ambiguous.
+fn windows_endpoint_bypass_nexthop(
+    endpoint: std::net::Ipv4Addr,
+    routes: &[WindowsRouteRow],
+    egress_addresses: &[std::net::Ipv4Addr],
+    tunnel_addresses: &[std::net::Ipv4Addr],
+) -> Result<WindowsBypassNexthop, String> {
+    if endpoint.is_unspecified()
+        || endpoint.is_loopback()
+        || endpoint.is_broadcast()
+        || endpoint.is_multicast()
+    {
+        return Err(format!(
+            "endpoint {endpoint} is not a routable unicast destination"
+        ));
+    }
+    let mut best: Option<&WindowsRouteRow> = None;
+    let mut tunnel_matched = false;
+    let mut own_stale_matched = false;
+    for row in routes {
+        let mask = windows_prefix_len_to_netmask(row.prefix_len);
+        let matches_endpoint = (u32::from(endpoint) & u32::from(mask))
+            == (u32::from(row.destination) & u32::from(mask));
+        let tunnel_owned = tunnel_addresses.contains(&row.interface);
+        let own_stale = row.destination == endpoint && row.prefix_len == 32;
+        if tunnel_owned || own_stale {
+            if matches_endpoint {
+                if tunnel_owned {
+                    tunnel_matched = true;
+                }
+                if own_stale {
+                    own_stale_matched = true;
+                }
+            }
+            continue;
+        }
+        if !matches_endpoint {
+            continue;
+        }
+        match best {
+            None => best = Some(row),
+            Some(current) => {
+                if row.prefix_len > current.prefix_len
+                    || (row.prefix_len == current.prefix_len && row.metric < current.metric)
+                {
+                    best = Some(row);
+                } else if row.prefix_len == current.prefix_len
+                    && row.metric == current.metric
+                    && !windows_equal_preference_rows_agree(row, current, egress_addresses)
+                {
+                    return Err(
+                        "route table resolves the endpoint ambiguously (two equally preferred \
+                         routes disagree)"
+                            .to_owned(),
+                    );
+                }
+            }
+        }
+    }
+    let best = best.ok_or_else(|| {
+        if tunnel_matched {
+            format!(
+                "endpoint {endpoint} resolves only through the tunnel interface; refusing to \
+                 pin a bypass route from a tunnel-served answer (full-tunnel policy routing may \
+                 be engaged)"
+            )
+        } else if own_stale_matched {
+            format!(
+                "endpoint {endpoint} matches only its own stale bypass route; refusing the \
+                 self-table answer"
+            )
+        } else {
+            format!("no route in the kernel route table resolves endpoint {endpoint}")
+        }
+    })?;
+    if !egress_addresses.contains(&best.interface) {
+        return Err(format!(
+            "endpoint {endpoint} resolves via interface {}, which is not the configured egress \
+             interface",
+            best.interface
+        ));
+    }
+    match best.gateway {
+        None => Ok(WindowsBypassNexthop::OnLink),
+        Some(gateway) => {
+            if gateway.is_unspecified()
+                || gateway.is_loopback()
+                || gateway.is_broadcast()
+                || gateway.is_multicast()
+            {
+                return Err(format!(
+                    "route for endpoint {endpoint} has an unusable next hop {gateway}"
+                ));
+            }
+            Ok(WindowsBypassNexthop::Gateway(gateway))
+        }
+    }
+}
+
+/// Whether two equal-prefix, equal-metric rows describe the same routing
+/// decision: same gateway, and both interface addresses owned by the egress
+/// adapter. `egress_addresses` comes from a single adapter's unicast
+/// addresses, so containment is the same-adapter test — this is what keeps a
+/// multi-address egress NIC (several interface IPs, one default route row
+/// each) from being misread as an ambiguous tie, while differing gateways or
+/// a foreign interface still fail closed.
+fn windows_equal_preference_rows_agree(
+    row: &WindowsRouteRow,
+    current: &WindowsRouteRow,
+    egress_addresses: &[std::net::Ipv4Addr],
+) -> bool {
+    row.gateway == current.gateway
+        && egress_addresses.contains(&row.interface)
+        && egress_addresses.contains(&current.interface)
+}
+
+/// Build the `netsh interface <family> add route` argv for a peer-endpoint
+/// bypass route. The on-link arm is byte-identical to the historical Windows
+/// argv so same-subnet endpoints keep working unchanged; the gateway arm
+/// carries the kernel-resolved next hop for off-link endpoints.
+fn windows_endpoint_bypass_route_args(
+    cidr: &str,
+    egress_interface: &str,
+    nexthop: WindowsBypassNexthop,
+) -> Vec<String> {
+    let family = if cidr.contains(':') { "ipv6" } else { "ipv4" };
+    let nexthop = match nexthop {
+        WindowsBypassNexthop::OnLink if cidr.contains(':') => "nexthop=::".to_owned(),
+        WindowsBypassNexthop::OnLink => "nexthop=0.0.0.0".to_owned(),
+        WindowsBypassNexthop::Gateway(gateway) => format!("nexthop={gateway}"),
+    };
+    vec![
+        "interface".to_owned(),
+        family.to_owned(),
+        "add".to_owned(),
+        "route".to_owned(),
+        format!("prefix={cidr}"),
+        format!("interface={egress_interface}"),
+        nexthop,
+        "store=active".to_owned(),
+        "metric=1".to_owned(),
+    ]
+}
+
+/// Everything one apply pass needs from the live host: the parsed IPv4 route
+/// table plus the interface addresses that identify the egress and tunnel
+/// adapters. Captured once per apply through `WindowsCommandSystem::
+/// windows_route_context_from_capture` (one `route.exe print -4` spawn);
+/// constructible in tests so the planning logic below stays pure.
+struct WindowsRouteContext {
+    routes: Vec<WindowsRouteRow>,
+    egress_addresses: Vec<std::net::Ipv4Addr>,
+    tunnel_addresses: Vec<std::net::Ipv4Addr>,
+}
+
+/// Parse and validate the `<address>/<prefix>` cidr a bypass route is keyed
+/// on. IPv6 is refused outright: this dataplane hard-disables IPv6 egress,
+/// so an IPv6 endpoint bypass cannot deliver and is never installed (the
+/// apply path skips such peers with a warning instead of failing). Only host
+/// routes (/32) are bypass-route keys.
+fn windows_parse_bypass_endpoint(cidr: &str) -> Result<std::net::Ipv4Addr, SystemError> {
+    if cidr.contains(':') {
+        return Err(SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route for {cidr} refused: this dataplane hard-disables \
+             IPv6 egress, so an IPv6 endpoint bypass cannot deliver and is never installed"
+        )));
+    }
+    let (address_text, prefix_text) = cidr.split_once('/').ok_or_else(|| {
+        SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} is not a `<address>/<prefix>` route"
+        ))
+    })?;
+    let endpoint: std::net::Ipv4Addr = address_text.parse().map_err(|err| {
+        SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} has an invalid IPv4 address: {err}"
+        ))
+    })?;
+    let prefix_len: u8 = prefix_text.parse().map_err(|err| {
+        SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} has an invalid prefix length: {err}"
+        ))
+    })?;
+    if prefix_len != 32 {
+        return Err(SystemError::RouteApplyFailed(format!(
+            "peer endpoint bypass route {cidr} must be a host route (/32)"
+        )));
+    }
+    Ok(endpoint)
+}
+
+/// Collect the distinct IPv4 endpoints a bypass apply must plan, BEFORE any
+/// observation or mutation: deduplicate peer endpoints and skip IPv6 peers
+/// with a warning (one IPv6 endpoint must not fail the whole generation —
+/// IPv6 egress is hard-disabled on this dataplane anyway). An empty result
+/// means there is nothing to plan and the apply must not capture the route
+/// table at all.
+fn windows_collect_bypass_endpoints(
+    peers: &[PeerConfig],
+) -> Result<Vec<std::net::Ipv4Addr>, SystemError> {
+    let mut seen = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for peer in peers {
+        match peer.endpoint.addr {
+            std::net::IpAddr::V6(addr) => {
+                log::warn!(
+                    "skipping IPv6 peer endpoint {addr}: this dataplane hard-disables IPv6 \
+                     egress, so no IPv6 endpoint bypass route is installed"
+                );
+            }
+            std::net::IpAddr::V4(addr) => {
+                if seen.insert(addr) {
+                    let cidr = format!("{addr}/32");
+                    windows_parse_bypass_endpoint(&cidr)?;
+                    endpoints.push(addr);
+                }
+            }
+        }
+    }
+    Ok(endpoints)
+}
+
+/// Resolve the collected IPv4 endpoints against ONE capture. Any resolution
+/// failure fails the WHOLE plan. NOTE the controller ordering: this runs
+/// AFTER the caller's `rollback_routes()` has already deleted every previous
+/// bypass route, so a resolution failure leaves no bypass routes installed
+/// (fail closed, never a leak).
+fn windows_resolve_bypass_plan(
+    endpoints: &[std::net::Ipv4Addr],
+    context: &WindowsRouteContext,
+) -> Result<Vec<(String, WindowsBypassNexthop)>, SystemError> {
+    let mut plan = Vec::new();
+    for &addr in endpoints {
+        let cidr = format!("{addr}/32");
+        let nexthop = windows_endpoint_bypass_nexthop(
+            addr,
+            &context.routes,
+            &context.egress_addresses,
+            &context.tunnel_addresses,
+        )
+        .map_err(|err| {
+            SystemError::RouteApplyFailed(format!(
+                "peer endpoint bypass route for {cidr} could not be resolved: {err}"
+            ))
+        })?;
+        plan.push((cidr, nexthop));
+    }
+    Ok(plan)
+}
+
 pub fn write_state_transition_audit(
     path: impl AsRef<Path>,
     transitions: &[TransitionEvent],
@@ -10248,6 +10777,628 @@ pub fn write_phase10_perf_report(
 
 #[cfg(test)]
 mod tests {
+
+    // ------------------------------------------------------------------
+    // Windows peer-endpoint bypass next-hop resolution (b73 rework)
+    // ------------------------------------------------------------------
+    //
+    // The Windows backend used to install every peer-endpoint bypass route
+    // with the hardcoded on-link next hop (`nexthop=0.0.0.0`), the same
+    // defect the Linux backend fixed in `03042b2ca`; the b70 patch resolved
+    // the next hop from the live table but kept three defects this rework
+    // fixes: the tunnel's own full-tunnel default row (installed at metric
+    // 1) won candidate selection and made every post-rollback re-apply
+    // refuse; an IPv6 endpoint failed the whole generation; and a
+    // multi-address egress NIC was misread as an ambiguous tie. The
+    // resolution logic lives in pure functions
+    // (`parse_windows_route_print_v4`, `windows_endpoint_bypass_nexthop`,
+    // `windows_parse_bypass_endpoint`, `windows_collect_bypass_endpoints`,
+    // `windows_resolve_bypass_plan`, `windows_endpoint_bypass_route_args`)
+    // so it is unit-testable on every
+    // host; the Windows-only FFI (`get_adapters_addresses`, `route print`
+    // capture) stays behind `windows_route_context_from_capture`, the apply's
+    // own plan-before-its-own-mutations ordering and its no-IPv4-endpoint
+    // capture skip are source-pinned, and the capture skip is additionally
+    // witnessed behaviourally with a counting fake `route print` runner.
+    // There is NO resolve-before-delete ordering at the controller: the
+    // caller runs `rollback_routes()` first, so a resolution failure leaves
+    // no bypass routes (fail closed).
+
+    const ROUTE_PRINT_FIXTURE: &str = "\
+IPv4 Route Table
+===========================================================================
+Active Routes:
+Network Destination        Netmask          Gateway       Interface  Metric
+          0.0.0.0          0.0.0.0     192.168.1.1    192.168.1.23     25
+      127.0.0.0        255.0.0.0         On-link         127.0.0.1    331
+      127.0.0.1  255.255.255.255         On-link         127.0.0.1    331
+    192.168.1.0    255.255.255.0         On-link    192.168.1.23    281
+  192.168.1.255  255.255.255.255         On-link    192.168.1.23    281
+     224.0.0.0        240.0.0.0         On-link    192.168.1.23    281
+  255.255.255.255  255.255.255.255         On-link    192.168.1.23    281
+===========================================================================
+Persistent Routes:
+  Network Address          Netmask  Gateway Address   Metric
+          0.0.0.0          0.0.0.0     192.168.1.254  Default
+";
+
+    fn route_row(
+        destination: &str,
+        prefix_len: u8,
+        gateway: Option<&str>,
+        interface: &str,
+        metric: u32,
+    ) -> WindowsRouteRow {
+        WindowsRouteRow {
+            destination: destination.parse().expect("valid destination"),
+            prefix_len,
+            gateway: gateway.map(|gw| gw.parse().expect("valid gateway")),
+            interface: interface.parse().expect("valid interface"),
+            metric,
+        }
+    }
+
+    fn fixture_egress_addresses() -> Vec<std::net::Ipv4Addr> {
+        vec!["192.168.1.23".parse().expect("egress address")]
+    }
+
+    #[test]
+    fn windows_route_print_fixture_parses_rows_and_stops_at_terminator() {
+        let rows =
+            parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture must parse cleanly");
+        assert_eq!(rows.len(), 7, "persistent routes must not be parsed");
+        assert_eq!(
+            rows[0],
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25)
+        );
+        assert_eq!(
+            rows[3],
+            route_row("192.168.1.0", 24, None, "192.168.1.23", 281)
+        );
+        assert_eq!(
+            rows[6],
+            route_row("255.255.255.255", 32, None, "192.168.1.23", 281)
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.gateway != Some("192.168.1.254".parse().expect("gw"))),
+            "the Persistent Routes section must be ignored"
+        );
+    }
+
+    #[test]
+    fn windows_route_print_without_table_fails_closed() {
+        let err = parse_windows_route_print_v4("some unrelated localized output\n")
+            .expect_err("no table");
+        assert!(
+            err.contains("no IPv4 route table"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_route_print_malformed_rows_fail_closed() {
+        let header = "Network Destination        Netmask          Gateway       Interface  \
+                      Metric\n";
+        for (name, row) in [
+            (
+                "short row",
+                "      0.0.0.0          0.0.0.0         On-link\n",
+            ),
+            (
+                "non-contiguous netmask",
+                "   10.0.0.0      255.0.255.0         On-link    \
+             10.0.0.5      25\n",
+            ),
+            (
+                "bad gateway",
+                "      0.0.0.0          0.0.0.0   not-an-address    10.0.0.5      \
+             25\n",
+            ),
+            (
+                "bad metric",
+                "      0.0.0.0          0.0.0.0     192.168.1.1    10.0.0.5   \
+             Default\n",
+            ),
+        ] {
+            let err = parse_windows_route_print_v4(&format!("x\n====\n{header}{row}====\n"))
+                .expect_err(&format!("{name} must fail the whole parse"));
+            assert!(!err.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn windows_off_link_endpoint_resolves_gateway_next_hop() {
+        let routes = parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses");
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect("off-link endpoint must resolve");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    #[test]
+    fn windows_same_subnet_endpoint_keeps_on_link_form() {
+        let routes = parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses");
+        let endpoint = "192.168.1.200".parse().expect("endpoint");
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect("same-subnet endpoint must resolve");
+        assert_eq!(nexthop, WindowsBypassNexthop::OnLink);
+    }
+
+    #[test]
+    fn windows_tunnel_served_answer_is_refused() {
+        let routes = [route_row("0.0.0.0", 0, None, "10.0.0.2", 1)];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let err = windows_endpoint_bypass_nexthop(
+            endpoint,
+            &routes,
+            &fixture_egress_addresses(),
+            &["10.0.0.2".parse().expect("tunnel address")],
+        )
+        .expect_err("tunnel-served answer must be refused");
+        assert!(err.contains("tunnel interface"), "unexpected error: {err}");
+    }
+
+    /// F1 witness (production shape): the Windows backend installs the
+    /// full-tunnel default as `0.0.0.0/0` on-link ON THE TUNNEL at metric 1,
+    /// and that row persists across generations, so a re-apply
+    /// (`rollback_routes()` + this apply) always sees it in the live table.
+    /// b70 trusted that row, refused, and left the peer WITHOUT a bypass
+    /// route. The rework excludes tunnel-owned rows from candidate selection
+    /// and resolves the physical gateway the kernel would pick with the
+    /// tunnel absent.
+    #[test]
+    fn windows_full_tunnel_default_on_tunnel_resolves_via_physical_gateway() {
+        let routes = [
+            route_row("0.0.0.0", 0, None, "10.0.0.2", 1),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+        ];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let nexthop = windows_endpoint_bypass_nexthop(
+            endpoint,
+            &routes,
+            &fixture_egress_addresses(),
+            &["10.0.0.2".parse().expect("tunnel address")],
+        )
+        .expect("the physical default must resolve despite the tunnel default");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    /// F1 companion (stale self route): the apply's capture runs AFTER the
+    /// caller's purge, so this daemon's own previous on-link `/32` is
+    /// normally gone; a purge delete is best-effort, so the row can still be
+    /// present. That row must not win candidate selection (the self-table
+    /// answer the Linux twin rejects).
+    #[test]
+    fn windows_own_stale_bypass_row_is_not_trusted() {
+        let routes = [
+            route_row("203.0.113.7", 32, None, "192.168.1.23", 1),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+        ];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect("the stale self route must not win candidate selection");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    /// F3 witness: `egress_addresses` is derived from ONE adapter, so two
+    /// equal-prefix, equal-metric rows that carry the same gateway via two
+    /// addresses of that adapter describe the same routing decision, not an
+    /// ambiguous tie. A foreign interface (or a differing gateway) in the
+    /// tie still fails closed.
+    #[test]
+    fn windows_multi_address_egress_adapter_gateway_tie_is_not_ambiguous() {
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let routes = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.10", 25),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.11", 25),
+        ];
+        let egress: Vec<std::net::Ipv4Addr> = ["192.168.1.10", "192.168.1.11"]
+            .iter()
+            .map(|addr| addr.parse().expect("egress address"))
+            .collect();
+        let nexthop = windows_endpoint_bypass_nexthop(endpoint, &routes, &egress, &[])
+            .expect("same-adapter multi-address tie must not be ambiguous");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+
+        let foreign = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "10.9.9.5", 25),
+        ];
+        let err =
+            windows_endpoint_bypass_nexthop(endpoint, &foreign, &fixture_egress_addresses(), &[])
+                .expect_err("a tie through a foreign interface must stay ambiguous");
+        assert!(err.contains("ambiguously"), "unexpected error: {err}");
+    }
+
+    /// F4 witness: `route print` output that ends without the `=` section
+    /// terminator is a truncated capture; parsing it as a short-but-valid
+    /// table would let the resolver decide on partial data.
+    #[test]
+    fn windows_route_print_without_terminator_fails_closed() {
+        let header = "Network Destination        Netmask          Gateway       Interface  \
+                      Metric\n";
+        let row = "      0.0.0.0          0.0.0.0     192.168.1.1    192.168.1.23     25\n";
+        let err = parse_windows_route_print_v4(&format!("x\n====\n{header}{row}"))
+            .expect_err("a truncated table must fail closed");
+        assert!(err.contains("terminator"), "unexpected error: {err}");
+    }
+
+    /// F5 witness: the route binary must be the fixed Microsoft-shipped
+    /// constant. b70 added `RUSTYNET_WINDOWS_ROUTE_BINARY_PATH`, which
+    /// inherits the UNC hole in `validate_windows_binary_path` (a
+    /// `\\host\share\…` path passes the validator on every host) and lets
+    /// whoever controls the service environment run a binary off-box. The
+    /// constant itself still validates (portable string checks), so both
+    /// halves run on every host.
+    #[test]
+    fn windows_route_binary_resolves_to_system32_default_ignoring_environment() {
+        assert_eq!(
+            WindowsCommandSystem::resolve_route_binary().expect("the constant must validate"),
+            std::path::PathBuf::from(DEFAULT_WINDOWS_ROUTE_BINARY_PATH)
+        );
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        assert!(
+            !code.contains("RUSTYNET_WINDOWS_ROUTE_BINARY_PATH"),
+            "the route binary must not be environment-overridable; the override \
+             inherits the UNC hole in validate_windows_binary_path"
+        );
+    }
+
+    /// F4 companion (`route print -4`): the IPv6 section must never be in
+    /// the parser's input — `-4` keeps the `=` terminator directly after the
+    /// IPv4 table the parser reads. Source-pinned because the spawn is
+    /// Windows-only.
+    #[test]
+    fn windows_route_print_targets_the_ipv4_table() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let windows_impl = code
+            .find("impl WindowsCommandSystem {")
+            .expect("WindowsCommandSystem must have an inherent impl");
+        let body = &code[windows_impl..];
+        let fn_at = body
+            .find("fn run_route_print(&self) -> Result<PrivilegedCommandOutput, SystemError> {")
+            .expect("the bypass apply must observe the route table via route print");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+        let print_at = body
+            .find(r#"arg("print")"#)
+            .expect("route print must be invoked with the print subcommand");
+        let v4_at = body
+            .find(r#"arg("-4")"#)
+            .expect("route print must target the IPv4 table only");
+        assert!(
+            print_at < v4_at,
+            "the `-4` flag must be part of the route print argv"
+        );
+    }
+
+    /// F1/F2/F4 witness for the apply itself: the plan is built from ONE
+    /// capture before the apply's OWN deletes and installs. The controller
+    /// ordering is the opposite — the caller runs `rollback_routes()` first
+    /// and has already deleted every previous bypass route, so a resolution
+    /// failure leaves NO bypass routes (a fail-closed black hole, not
+    /// preserved routes). Also pins that a apply with no IPv4 endpoint to
+    /// plan never reaches the capture, that the per-peer install goes
+    /// through the pure argv builder (no hardcoded on-link sentinel), and
+    /// that the plan resolves through the pinned pure helpers.
+    /// Source-pinned because the apply drives Windows-only processes.
+    #[test]
+    fn windows_apply_peer_endpoint_bypass_plans_before_its_own_mutations() {
+        let source = include_str!("phase10.rs");
+        let code = &source[..source.find("\nmod tests {").unwrap_or(source.len())];
+        let windows_impl = code
+            .find("impl WindowsCommandSystem {")
+            .expect("WindowsCommandSystem must have an inherent impl");
+        let body = &code[windows_impl..];
+        let fn_at = body
+            .find("fn apply_peer_endpoint_bypass_routes_with_route_print(\n")
+            .expect("WindowsCommandSystem must install peer endpoint bypass routes");
+        let body = &body[fn_at..];
+        let body = &body[..body[1..]
+            .find("\n    fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len())];
+
+        let collect_at = body
+            .find("windows_collect_bypass_endpoints(peers)")
+            .expect("apply must collect the IPv4 endpoints before anything else");
+        let empty_at = body
+            .find("endpoints.is_empty()")
+            .expect("apply must skip the capture when there is no IPv4 endpoint to plan");
+        let capture_at = body
+            .find("run_route_print(self)")
+            .expect("apply must capture the route context through the injected runner");
+        let take_at = body
+            .find("std::mem::take")
+            .expect("apply replaces the recorded bypass routes");
+        assert!(
+            collect_at < capture_at,
+            "endpoint collection must run before the capture: an apply with no \
+             IPv4 endpoint to plan must never spawn route.exe"
+        );
+        assert!(
+            empty_at < capture_at,
+            "the empty-plan early return must precede the capture"
+        );
+        assert!(
+            capture_at < take_at,
+            "the plan must be built from the one capture before the apply's own \
+             deletes and installs; a resolution failure leaves no bypass routes"
+        );
+        assert!(
+            body.contains("windows_resolve_bypass_plan"),
+            "apply must plan every route through the pinned pure resolver"
+        );
+        assert!(
+            body.contains("windows_endpoint_bypass_route_args"),
+            "apply must build its argv through the pinned pure builder"
+        );
+        assert!(
+            !body.contains("\"nexthop=0.0.0.0\""),
+            "the apply must not hardcode the on-link sentinel; the next hop comes \
+             from the planned resolution"
+        );
+        assert!(
+            !body.contains("\"nexthop=::\""),
+            "the apply must not hardcode an IPv6 on-link sentinel"
+        );
+    }
+
+    /// R3-nit witness (behavioural, not only source-pinned): with no IPv4
+    /// endpoint to plan — no peers, or every peer on IPv6 — the apply must
+    /// not observe the route table at all. The counting fake runner replaces
+    /// the `route.exe print -4` spawn and asserts ZERO invocations; every
+    /// capture performs exactly one spawn (`run_route_print`), so zero
+    /// captures prove zero spawns. On the pre-b77 apply the capture ran
+    /// unconditionally, so the fake counted 1 and this test failed. The
+    /// empty-plan apply must also SUCCEED: a peerless apply must not fail on
+    /// an unreadable or missing route table.
+    #[test]
+    fn windows_apply_with_no_ipv4_endpoint_performs_zero_route_print_spawns() {
+        let mut system = WindowsCommandSystem::new(
+            "rustynet0",
+            "Ethernet",
+            "127.0.0.1:53535".parse().expect("loopback dns bind"),
+        )
+        .expect("windows command system should initialize");
+
+        let mut spawns = 0u32;
+        let mut fake_route_print = |_system: &WindowsCommandSystem| {
+            spawns += 1;
+            Err::<PrivilegedCommandOutput, SystemError>(SystemError::RouteApplyFailed(
+                "fake route print: must never be invoked without an IPv4 endpoint".to_owned(),
+            ))
+        };
+        system
+            .apply_peer_endpoint_bypass_routes_with_route_print(&[], &mut fake_route_print)
+            .expect("a peerless apply must succeed without observing the route table");
+
+        let mut v6_peer = sample_peer("v6-only");
+        v6_peer.endpoint.addr = "2001:db8::1".parse().expect("v6 endpoint");
+        system
+            .apply_peer_endpoint_bypass_routes_with_route_print(&[v6_peer], &mut fake_route_print)
+            .expect("an all-IPv6 apply must succeed without observing the route table");
+
+        assert_eq!(
+            spawns, 0,
+            "no IPv4 endpoint to plan: route.exe must never be invoked"
+        );
+    }
+
+    /// F2 witness (pure planning half): an IPv6 endpoint is skipped with a
+    /// warning and records nothing, while the IPv4 peer still plans — one
+    /// IPv6 endpoint must not fail the whole generation (IPv6 egress is
+    /// hard-disabled on this dataplane anyway).
+    #[test]
+    fn windows_bypass_plan_skips_ipv6_and_keeps_ipv4() {
+        let mut v6_peer = sample_peer("v6-peer");
+        v6_peer.endpoint.addr = "2001:db8::1".parse().expect("v6 endpoint");
+        let peers = [sample_peer("v4-peer"), v6_peer];
+        let context = WindowsRouteContext {
+            routes: parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses"),
+            egress_addresses: fixture_egress_addresses(),
+            tunnel_addresses: Vec::new(),
+        };
+        let endpoints =
+            windows_collect_bypass_endpoints(&peers).expect("the endpoints must collect");
+        let plan = windows_resolve_bypass_plan(&endpoints, &context)
+            .expect("a mixed peer list must plan the IPv4 endpoints");
+        assert_eq!(plan.len(), 1, "the IPv6 endpoint must be skipped");
+        assert_eq!(plan[0].0, "203.0.113.10/32");
+        assert_eq!(
+            plan[0].1,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+    }
+
+    #[test]
+    fn windows_bypass_endpoint_validation_refuses_ipv6_and_non_host_prefixes() {
+        for (cidr, needle) in [
+            ("2001:db8::1/128", "hard-disables"),
+            ("203.0.113.7/24", "host route"),
+            ("not-a-cidr", "not a `<address>/<prefix>` route"),
+            ("10.0.0.999/32", "invalid IPv4 address"),
+            ("203.0.113.7/oops", "invalid prefix length"),
+        ] {
+            let err =
+                windows_parse_bypass_endpoint(cidr).expect_err(&format!("{cidr} must be refused"));
+            let message = format!("{err}");
+            assert!(
+                message.contains(needle),
+                "refusal for {cidr} must name the problem ({needle}): {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_answer_from_other_interface_is_refused() {
+        let routes = [route_row("0.0.0.0", 0, Some("10.9.9.1"), "10.9.9.5", 1)];
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let err =
+            windows_endpoint_bypass_nexthop(endpoint, &routes, &fixture_egress_addresses(), &[])
+                .expect_err("a non-egress answer must be refused");
+        assert!(
+            err.contains("not the configured egress interface"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn windows_lower_metric_wins_prefix_tie_but_equal_metric_conflict_is_ambiguous() {
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let better = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+            route_row("0.0.0.0", 0, Some("192.168.7.1"), "192.168.1.23", 100),
+        ];
+        let nexthop =
+            windows_endpoint_bypass_nexthop(endpoint, &better, &fixture_egress_addresses(), &[])
+                .expect("the lower metric must win the tie");
+        assert_eq!(
+            nexthop,
+            WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+        );
+
+        let ambiguous = [
+            route_row("0.0.0.0", 0, Some("192.168.1.1"), "192.168.1.23", 25),
+            route_row("0.0.0.0", 0, Some("192.168.7.1"), "192.168.1.23", 25),
+        ];
+        let err =
+            windows_endpoint_bypass_nexthop(endpoint, &ambiguous, &fixture_egress_addresses(), &[])
+                .expect_err("an equal-metric conflict must fail closed");
+        assert!(err.contains("ambiguously"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn windows_unresolvable_endpoints_fail_closed() {
+        let routes = parse_windows_route_print_v4(ROUTE_PRINT_FIXTURE).expect("fixture parses");
+        let egress = fixture_egress_addresses();
+        for endpoint in ["0.0.0.0", "127.0.0.1", "224.0.0.5", "255.255.255.255"] {
+            let err = windows_endpoint_bypass_nexthop(
+                endpoint.parse().expect("endpoint"),
+                &routes,
+                &egress,
+                &[],
+            )
+            .expect_err(&format!("{endpoint} must be refused"));
+            assert!(
+                err.contains("not a routable unicast destination"),
+                "unexpected error for {endpoint}: {err}"
+            );
+        }
+        let unmatched = windows_endpoint_bypass_nexthop(
+            "203.0.113.7".parse().expect("endpoint"),
+            &[route_row("127.0.0.0", 8, None, "127.0.0.1", 331)],
+            &egress,
+            &[],
+        )
+        .expect_err("an unmatched endpoint must fail closed");
+        assert!(
+            unmatched.contains("no route"),
+            "unexpected error: {unmatched}"
+        );
+    }
+
+    #[test]
+    fn windows_unusable_gateway_answers_fail_closed() {
+        let endpoint = "203.0.113.7".parse().expect("endpoint");
+        let egress = fixture_egress_addresses();
+        for gateway in ["0.0.0.0", "127.0.0.1", "224.0.0.5", "255.255.255.255"] {
+            let routes = [route_row("0.0.0.0", 0, Some(gateway), "192.168.1.23", 25)];
+            let err = windows_endpoint_bypass_nexthop(endpoint, &routes, &egress, &[])
+                .expect_err(&format!("gateway {gateway} must be refused"));
+            assert!(
+                err.contains("unusable next hop"),
+                "unexpected error for {gateway}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_on_link_bypass_argv_is_byte_identical_to_historical_form() {
+        assert_eq!(
+            windows_endpoint_bypass_route_args(
+                "192.168.1.200/32",
+                "Ethernet",
+                WindowsBypassNexthop::OnLink
+            ),
+            vec![
+                "interface".to_owned(),
+                "ipv4".to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
+                "prefix=192.168.1.200/32".to_owned(),
+                "interface=Ethernet".to_owned(),
+                "nexthop=0.0.0.0".to_owned(),
+                "store=active".to_owned(),
+                "metric=1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_off_link_bypass_argv_carries_resolved_gateway() {
+        assert_eq!(
+            windows_endpoint_bypass_route_args(
+                "203.0.113.7/32",
+                "Ethernet",
+                WindowsBypassNexthop::Gateway("192.168.1.1".parse().expect("gateway"))
+            ),
+            vec![
+                "interface".to_owned(),
+                "ipv4".to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
+                "prefix=203.0.113.7/32".to_owned(),
+                "interface=Ethernet".to_owned(),
+                "nexthop=192.168.1.1".to_owned(),
+                "store=active".to_owned(),
+                "metric=1".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn windows_ipv6_on_link_bypass_argv_is_unchanged_in_builder() {
+        assert_eq!(
+            windows_endpoint_bypass_route_args(
+                "2001:db8::1/128",
+                "Ethernet",
+                WindowsBypassNexthop::OnLink
+            ),
+            vec![
+                "interface".to_owned(),
+                "ipv6".to_owned(),
+                "add".to_owned(),
+                "route".to_owned(),
+                "prefix=2001:db8::1/128".to_owned(),
+                "interface=Ethernet".to_owned(),
+                "nexthop=::".to_owned(),
+                "store=active".to_owned(),
+                "metric=1".to_owned(),
+            ]
+        );
+    }
 
     /// S1 (MacosDnsFailclosedS1S4FixDesign_2026-08-31 §2.4 test 7): the
     /// daemon's periodic DNS posture re-assert consumes exactly the error
