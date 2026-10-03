@@ -9,6 +9,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::process::Command;
 
 use rustynet_backend_api::{
@@ -193,6 +194,70 @@ impl<R: WireguardCommandRunner> LinuxWireguardBackend<R> {
             ));
         }
         Ok(())
+    }
+
+    /// RSA-0044: the Linux `configure_peer`/`update_peer_endpoint` paths
+    /// format the peer endpoint straight into `wg` argv. Mirror the macOS
+    /// backend's `validate_peer_endpoint` (macos_command.rs:115) so both
+    /// platforms reject zero-port / unspecified / multicast / broadcast
+    /// endpoints instead of handing them to `wg`.
+    fn validate_peer_endpoint(endpoint: SocketEndpoint) -> Result<(), BackendError> {
+        if endpoint.port == 0 {
+            return Err(BackendError::invalid_input(
+                "peer endpoint port must be non-zero",
+            ));
+        }
+        if endpoint.addr.is_unspecified() {
+            return Err(BackendError::invalid_input(
+                "peer endpoint address must not be unspecified",
+            ));
+        }
+        if endpoint.addr.is_multicast() {
+            return Err(BackendError::invalid_input(
+                "peer endpoint address must not be multicast",
+            ));
+        }
+        if matches!(endpoint.addr, IpAddr::V4(addr) if addr.is_broadcast()) {
+            return Err(BackendError::invalid_input(
+                "peer endpoint address must not be broadcast",
+            ));
+        }
+        Ok(())
+    }
+
+    /// RSA-0044 defense-in-depth for the argv surface: the rendered
+    /// `addr:port` token must stay a bare IPv4/IPv6 socket-address form —
+    /// non-empty, no leading dash, no whitespace, no shell metacharacters.
+    /// Unreachable for the typed `SocketEndpoint` (`IpAddr` + `u16`) today;
+    /// this pins the invariant the `wg` argv depends on against future
+    /// format changes.
+    fn validate_endpoint_arg_token(value: &str) -> Result<(), BackendError> {
+        fn is_clean_token_char(ch: char) -> bool {
+            !(ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '&' | '|' | '$' | '`' | '(' | ')' | '<' | '>' | '\\' | '\'' | '"'
+                ))
+        }
+        if value.is_empty() || value.starts_with('-') || !value.chars().all(is_clean_token_char) {
+            return Err(BackendError::invalid_input(
+                "peer endpoint must render as a bare IPv4/IPv6 addr:port argv token",
+            ));
+        }
+        Ok(())
+    }
+
+    fn endpoint_arg(endpoint: SocketEndpoint) -> Result<String, BackendError> {
+        Self::validate_peer_endpoint(endpoint)?;
+        // IPv6 needs the bracketed `[addr]:port` form for wg(8) — same
+        // rendering as macOS `render_peer_endpoint` (macos_command.rs:1010).
+        let token = if endpoint.addr.is_ipv6() {
+            format!("[{}]:{}", endpoint.addr, endpoint.port)
+        } else {
+            format!("{}:{}", endpoint.addr, endpoint.port)
+        };
+        Self::validate_endpoint_arg_token(&token)?;
+        Ok(token)
     }
 
     fn is_missing_ip_route_error(err: &BackendError) -> bool {
@@ -448,7 +513,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
         }
 
         let allowed_ips = peer.allowed_ips.join(",");
-        let endpoint = format!("{}:{}", peer.endpoint.addr, peer.endpoint.port);
+        let endpoint = Self::endpoint_arg(peer.endpoint)?;
         let mut args = vec![
             "set".to_owned(),
             self.interface_name.clone(),
@@ -484,7 +549,7 @@ impl<R: WireguardCommandRunner + Send + Sync> TunnelBackend for LinuxWireguardBa
         let Some(peer) = self.peers.get_mut(node_id) else {
             return Err(BackendError::invalid_input("peer is not configured"));
         };
-        let endpoint_value = format!("{}:{}", endpoint.addr, endpoint.port);
+        let endpoint_value = Self::endpoint_arg(endpoint)?;
         self.runner.run(
             "wg",
             &[
@@ -1318,5 +1383,221 @@ mod tests {
         )
         .expect_err("malformed timestamp must fail");
         assert_eq!(err.kind, BackendErrorKind::Internal);
+    }
+
+    // RSA-0044 witnesses: the macOS backend rejects zero-port / unspecified /
+    // multicast / broadcast peer endpoints before they reach `wg` argv; the
+    // Linux configure/update paths must refuse them the same way.
+    fn started_backend() -> LinuxWireguardBackend<RecordingRunner> {
+        let mut backend = LinuxWireguardBackend::new(
+            RecordingRunner::default(),
+            "rustynet0",
+            "/tmp/wg.key",
+            51820,
+        )
+        .expect("backend should be constructed");
+        backend
+            .start(runtime_context())
+            .expect("start should execute runner calls");
+        backend
+    }
+
+    #[test]
+    fn linux_backend_configure_peer_rejects_zero_port_endpoint() {
+        let mut backend = started_backend();
+        let mut peer = sample_peer("peer-bad-port");
+        peer.endpoint.port = 0;
+
+        let err = backend
+            .configure_peer(peer)
+            .expect_err("zero-port endpoint must be rejected before wg argv");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        assert!(
+            !backend
+                .runner
+                .calls
+                .iter()
+                .any(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned())),
+            "rejected endpoint must never reach wg argv: {:?}",
+            backend
+                .runner
+                .calls
+                .iter()
+                .filter(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linux_backend_configure_peer_rejects_unspecified_endpoint() {
+        for addr in ["0.0.0.0", "::"] {
+            let mut backend = started_backend();
+            let mut peer = sample_peer("peer-unspecified");
+            peer.endpoint.addr = addr.parse().expect("valid ip");
+
+            let err = backend
+                .configure_peer(peer)
+                .expect_err("unspecified endpoint must be rejected before wg argv");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+            assert!(
+                !backend.runner.calls.iter().any(|(program, args)| program
+                    == "wg"
+                    && args.contains(&"endpoint".to_owned())),
+                "rejected endpoint must never reach wg argv: {:?}",
+            backend
+                .runner
+                .calls
+                .iter()
+                .filter(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned()))
+                .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn linux_backend_configure_peer_rejects_multicast_and_broadcast_endpoint() {
+        for addr in ["224.0.0.1", "255.255.255.255", "ff02::1"] {
+            let mut backend = started_backend();
+            let mut peer = sample_peer("peer-bad-addr");
+            peer.endpoint.addr = addr.parse().expect("valid ip");
+
+            let err = backend
+                .configure_peer(peer)
+                .expect_err("multicast/broadcast endpoint must be rejected before wg argv");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+            assert!(
+                !backend.runner.calls.iter().any(|(program, args)| program
+                    == "wg"
+                    && args.contains(&"endpoint".to_owned())),
+                "rejected endpoint must never reach wg argv: {:?}",
+            backend
+                .runner
+                .calls
+                .iter()
+                .filter(|(program, args)| program == "wg" && args.contains(&"endpoint".to_owned()))
+                .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn linux_backend_update_peer_endpoint_rejects_invalid_endpoint() {
+        let mut backend = started_backend();
+        let node_id = NodeId::new("peer-a").expect("valid node id");
+        backend
+            .configure_peer(sample_peer("peer-a"))
+            .expect("peer configure should work");
+        let calls_before = backend.runner.calls.len();
+
+        for bad_endpoint in [
+            SocketEndpoint {
+                addr: "203.0.113.10".parse().expect("valid ip"),
+                port: 0,
+            },
+            SocketEndpoint {
+                addr: "0.0.0.0".parse().expect("valid ip"),
+                port: 51820,
+            },
+        ] {
+            let err = backend
+                .update_peer_endpoint(&node_id, bad_endpoint)
+                .expect_err("invalid endpoint must be rejected before wg argv");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        }
+
+        assert_eq!(
+            backend.runner.calls.len(),
+            calls_before,
+            "rejected endpoint updates must not run wg"
+        );
+        let stored = backend
+            .current_peer_endpoint(&node_id)
+            .expect("current endpoint should read")
+            .expect("peer should remain configured");
+        assert_eq!(stored.port, 51820, "stored endpoint must stay unchanged");
+    }
+
+    #[test]
+    fn linux_backend_endpoint_arg_rejects_injection_shaped_tokens() {
+        for bad in [
+            "--help",
+            "1.2.3.4:51820 extra",
+            "[::1]:1;x",
+            "",
+            "1.2.3.4:51820\n51821",
+            "1.2.3.4:51820 & id",
+            "1.2.3.4:51820$(id)",
+        ] {
+            let err = LinuxWireguardBackend::<RecordingRunner>::validate_endpoint_arg_token(bad)
+                .expect_err("injection-shaped endpoint token must be rejected");
+            assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        }
+        for good in ["203.0.113.10:51820", "2001:db8::1:51820"] {
+            LinuxWireguardBackend::<RecordingRunner>::validate_endpoint_arg_token(good)
+                .expect("bare addr:port token must be accepted");
+        }
+    }
+
+    #[test]
+    fn linux_backend_endpoint_arg_mirrors_macos_accepted_forms() {
+        // macOS parity: the forms macOS accepts reach argv, rendered the way
+        // macOS renders them (bracketed IPv6); the forms it rejects never do.
+        let rendered_v4 = LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(SocketEndpoint {
+            addr: "203.0.113.10".parse().expect("valid ip"),
+            port: 51820,
+        })
+        .expect("accepted form must render");
+        assert_eq!(rendered_v4, "203.0.113.10:51820");
+
+        let rendered_v6 = LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(SocketEndpoint {
+            addr: "2001:db8::1".parse().expect("valid ip"),
+            port: 51820,
+        })
+        .expect("accepted IPv6 form must render");
+        assert_eq!(rendered_v6, "[2001:db8::1]:51820");
+
+        LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(SocketEndpoint {
+            addr: "127.0.0.1".parse().expect("valid ip"),
+            port: 1,
+        })
+        .expect("loopback is accepted");
+
+        let rejected_port_zero = SocketEndpoint {
+            addr: "203.0.113.10".parse().expect("valid ip"),
+            port: 0,
+        };
+        let err = LinuxWireguardBackend::<RecordingRunner>::endpoint_arg(rejected_port_zero)
+            .expect_err("zero port must be rejected");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn linux_backend_ipv6_endpoint_renders_bracketed_in_wg_args() {
+        let mut backend = started_backend();
+        let mut peer = sample_peer("peer-v6");
+        peer.endpoint = SocketEndpoint {
+            addr: "2001:db8::10".parse().expect("valid ip"),
+            port: 51820,
+        };
+        backend
+            .configure_peer(peer)
+            .expect("peer configure should work");
+        assert!(
+            backend
+                .runner
+                .calls
+                .iter()
+                .any(|(program, args)| program == "wg"
+                    && args.iter().any(|arg| arg == "[2001:db8::10]:51820")),
+            "IPv6 endpoint must render bracketed for wg(8)"
+        );
+        assert!(
+            !backend
+                .runner
+                .calls
+                .iter()
+                .any(|(_, args)| args.iter().any(|arg| arg == "2001:db8::10:51820")),
+            "unbracketed IPv6 rendering must not reach wg argv"
+        );
     }
 }
