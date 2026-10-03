@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Developer task runner for the Rustynet workspace.
 //!
 //! Currently provides one subcommand, `gates`, a fail-fast replacement
@@ -84,10 +93,18 @@ const PINNED_NEXTEST_VERSION: &str = "0.9.114";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let exit_code = match args.first().map(String::as_str) {
-        Some("gates") => run_gates(&args[1..]),
-        Some(other) => {
-            eprintln!("xtask: unknown subcommand: {other}");
+    let exit_code = dispatch(&args);
+    std::process::exit(exit_code);
+}
+
+/// Subcommand dispatch. Extracted from `main` (AQ-08 step 8) so the
+/// no-arguments and unknown-subcommand exit codes stay unit-testable;
+/// `split_first` replaces the `args[1..]` slice lookup.
+fn dispatch(args: &[String]) -> i32 {
+    match args.split_first() {
+        Some((first, rest)) if first == "gates" => run_gates(rest),
+        Some((first, _)) => {
+            eprintln!("xtask: unknown subcommand: {first}");
             eprintln!("usage: xtask gates [--skip-test] [--with-check] [cargo scope args...]");
             2
         }
@@ -95,8 +112,7 @@ fn main() {
             eprintln!("usage: xtask gates [--skip-test] [--with-check] [cargo scope args...]");
             2
         }
-    };
-    std::process::exit(exit_code);
+    }
 }
 
 struct Stage {
@@ -970,5 +986,24 @@ mod tests {
             "exactly six separators -> seven fields"
         );
         assert!(row.contains("-p a;-p b"), "comma sanitised to ';'");
+    }
+}
+
+/// AQ-08 step 8 witness tests: `dispatch` must keep the pre-patch exit
+/// codes for the error paths (empty argv and unknown subcommand both exit
+/// 2, exactly as the old inline `match` did).
+#[cfg(test)]
+mod aq08_step8_differential {
+    use super::*;
+
+    #[test]
+    fn dispatch_empty_argv_exits_two() {
+        assert_eq!(dispatch(&[]), 2);
+    }
+
+    #[test]
+    fn dispatch_unknown_subcommand_exits_two() {
+        assert_eq!(dispatch(&["bogus".to_owned()]), 2);
+        assert_eq!(dispatch(&["gate".to_owned(), "--skip-test".to_owned()]), 2);
     }
 }

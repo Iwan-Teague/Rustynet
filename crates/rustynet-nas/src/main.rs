@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! `rustynet-nas` daemon binary — the tunnel-only, default-deny
 //! storage endpoint for the `nas` preset (NAS design §3/§4).
 //!

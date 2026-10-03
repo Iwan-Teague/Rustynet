@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Boringtun userspace `WireGuard` backend for Rustynet.
 //!
 //! Provides [`UserspaceBackend`], a second non-kernel `TunnelBackend`

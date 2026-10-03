@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 use std::net::{IpAddr, Ipv4Addr};
 #[cfg(not(windows))]
 use std::path::Path;
@@ -2604,7 +2613,14 @@ pub mod wfp_filter_shape {
                 count: shape.conditions.len(),
             });
         }
-        let condition = shape.conditions[0];
+        // Unreachable `else`: the guard above rejects any shape whose
+        // condition count differs from one. Destructuring replaces a
+        // constant-index lookup (AQ-08 step 8).
+        let &[condition] = shape.conditions.as_slice() else {
+            return Err(WfpShapeError::WrongConditionCount {
+                count: shape.conditions.len(),
+            });
+        };
         if condition.field_key != CONDITION_IP_LOCAL_INTERFACE {
             return Err(WfpShapeError::WrongFieldKey {
                 field_key: condition.field_key,

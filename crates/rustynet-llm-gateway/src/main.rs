@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! `rustynet-llm-gateway` daemon binary — the tunnel-only,
 //! default-deny, no-API-key inference endpoint for the `llm`
 //! preset (LLM design §3/§4).

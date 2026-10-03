@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! AEAD-encrypted, per-peer-namespaced, quota-enforced object store
 //! (NAS design §3.1/§3.3).
 //!
@@ -551,11 +560,19 @@ impl NasStore {
         }
         let bytes = fs::read(path)
             .map_err(|err| NasStoreError::Io(format!("{}: {err}", path.display())))?;
+        let Some((nonce_bytes, ciphertext_bytes)) = bytes.split_at_checked(SEALED_NONCE_LEN) else {
+            // Unreachable: the length guard above requires at least
+            // SEALED_NONCE_LEN + AEAD_TAG_LEN bytes.
+            return Err(NasStoreError::Io(format!(
+                "{}: sealed file shorter than its nonce",
+                path.display()
+            )));
+        };
         let mut nonce = [0u8; SEALED_NONCE_LEN];
-        nonce.copy_from_slice(&bytes[..SEALED_NONCE_LEN]);
+        nonce.copy_from_slice(nonce_bytes);
         Ok(AeadSealedBlob {
             nonce,
-            ciphertext: bytes[SEALED_NONCE_LEN..].to_vec(),
+            ciphertext: ciphertext_bytes.to_vec(),
         })
     }
 

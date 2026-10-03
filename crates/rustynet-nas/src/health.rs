@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Health reporting for the fail-closed gate (taxonomy ext §5
 //! rule 6). The daemon's `service_exposure` controller consumes
 //! this: an unhealthy report closes session admission and blocks

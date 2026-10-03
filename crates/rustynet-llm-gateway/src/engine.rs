@@ -1,3 +1,12 @@
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
 //! Loopback-only inference-engine boundary (LLM design §3.1).
 //!
 //! The gateway proxies to a co-located engine (llama.cpp / Ollama /
