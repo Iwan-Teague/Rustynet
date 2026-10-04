@@ -2441,6 +2441,32 @@ impl LinuxCommandSystem {
         )))
     }
 
+    /// Exact folding-aware ABSENCE assertion, the mirror of
+    /// [`Self::assert_chain_holds_exact_rule`]: the chain must NOT hold
+    /// exactly this builder rule (again tolerating only the observability
+    /// `counter` splice). Exists for postures whose reviewed rule set
+    /// deliberately FORBIDS a rule another posture requires — a blind_exit
+    /// node must not carry the regular-exit unrestricted tunnel→egress
+    /// forward accept (`evaluate_linux_blind_exit_ruleset` rejects it as a
+    /// bypass), so its fail-closed self-assertion must treat that rule's
+    /// presence as a violation, not as the goal.
+    fn assert_chain_lacks_exact_rule(
+        chain_lines: &[String],
+        rule_tokens: &[String],
+        message: &str,
+    ) -> Result<(), SystemError> {
+        if !Self::chain_holds_exact_rule(chain_lines, rule_tokens, &[])
+            && !Self::chain_holds_exact_rule(chain_lines, rule_tokens, &["counter"])
+        {
+            return Ok(());
+        }
+        Err(SystemError::KillSwitchAssertionFailed(format!(
+            "{message}: forbidden tokens={} chain_lines={}",
+            rule_tokens.join(" "),
+            chain_lines.join(" | ")
+        )))
+    }
+
     // ── QH-29: shared rule-token builders ────────────────────────────────────
     //
     // Every nft rule the Linux dataplane emits is built from ONE of these
@@ -3070,14 +3096,44 @@ impl LinuxCommandSystem {
                 "forward established/related allow rule missing",
             )?;
         }
-        Self::assert_chain_holds_exact_rule(
-            &forward,
-            &Self::forward_tunnel_to_egress_tokens(
-                self.interface_name.as_str(),
-                self.egress_interface.as_str(),
-            ),
-            "forwarding allow rule to underlay egress missing",
-        )?;
+        if let Some(blind_exit_config) = self.blind_exit_config.as_ref() {
+            // Blind-exit posture: the reviewed rule set installs ONLY the
+            // mesh-source-scoped final-hop forward allow and FORBIDS the
+            // unrestricted tunnel→egress rule a regular exit requires
+            // (`evaluate_linux_blind_exit_ruleset` treats the unrestricted
+            // rule as a posture violation). Asserting the regular-exit rule
+            // here made every blind_exit generation apply fail its own
+            // killswitch assertion post-exact-matcher (d98b8a8c2), rolling
+            // back fail-closed on every reconcile until the node restricted
+            // itself permanently (katana-u40). Both sides of each assertion
+            // come from shared builders (QH-29), so the emitter and this
+            // check cannot drift.
+            let scoped_tokens =
+                crate::linux_blind_exit::mesh_scoped_forward_allow_tokens(blind_exit_config)
+                    .map_err(SystemError::KillSwitchAssertionFailed)?;
+            Self::assert_chain_holds_exact_rule(
+                &forward,
+                &scoped_tokens,
+                "mesh-scoped blind-exit forwarding allow rule missing",
+            )?;
+            Self::assert_chain_lacks_exact_rule(
+                &forward,
+                &Self::forward_tunnel_to_egress_tokens(
+                    self.interface_name.as_str(),
+                    self.egress_interface.as_str(),
+                ),
+                "unrestricted regular-exit forward rule present on a blind-exit posture",
+            )?;
+        } else {
+            Self::assert_chain_holds_exact_rule(
+                &forward,
+                &Self::forward_tunnel_to_egress_tokens(
+                    self.interface_name.as_str(),
+                    self.egress_interface.as_str(),
+                ),
+                "forwarding allow rule to underlay egress missing",
+            )?;
+        }
         if self.allow_tunnel_relay_forward {
             Self::assert_chain_holds_exact_rule(
                 &forward,
@@ -20768,6 +20824,196 @@ Persistent Routes:
         );
         run(&with_hairpin, "b97hairpin1")
             .expect("hairpin expectation must PASS once the hairpin rule is installed");
+    }
+
+    /// katana-u40 witness: on a blind_exit node the forward chain holds ONLY
+    /// the mesh-source-scoped final-hop allow (the emitter
+    /// `build_linux_blind_exit_forward_commands` installs exactly that, and
+    /// `evaluate_linux_blind_exit_ruleset` REJECTS the unrestricted
+    /// tunnel→egress rule as a regular-exit bypass) — yet the killswitch
+    /// self-assertion demanded the unrestricted rule on every generation,
+    /// so every apply rolled back fail-closed, the reconcile loop escalated
+    /// to restrict_permanent and the LAN-toggle stage postcondition failed.
+    /// RED on plain HEAD (fails with exactly the u40 journal error,
+    /// "forwarding allow rule to underlay egress missing"); GREEN only with
+    /// the blind_exit-aware assertion branch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_firewall_ruleset_accepts_mesh_scoped_blind_exit_forward_chain() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "enp0s9",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+        let ruleset = "table inet rustynet_g0 {\n\
+            \tchain killswitch {\n\
+            \t\ttype filter hook output priority filter; policy drop;\n\
+            \t\toifname \"lo\" accept\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\toifname \"rustynet0\" meta nfproto ipv4 accept\n\
+            \t}\n\
+            \tchain forward {\n\
+            \t\ttype filter hook forward priority filter; policy drop;\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" ip saddr 100.64.0.0/10 accept\n\
+            \t}\n\
+            }\n";
+        let socket_path = phase10_test_socket_path("b40blindexit0");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![(
+                "list table inet rustynet_g0".to_string(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout: ruleset.to_owned(),
+                    stderr: String::new(),
+                },
+            )],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.blind_exit_config = Some(config);
+        let result = system.assert_firewall_ruleset();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        result.expect(
+            "the blind_exit forward chain (scoped allow only, no unrestricted \
+             tunnel→egress rule) must satisfy the killswitch self-assertion",
+        );
+    }
+
+    /// Negative control for the blind_exit branch: the unrestricted
+    /// regular-exit forward rule is FORBIDDEN on a blind_exit posture (it is
+    /// the bypass `evaluate_linux_blind_exit_ruleset` rejects), so its
+    /// presence must fail the self-assertion with the new absence check.
+    /// GREEN on HEAD only because the old code never reached an absence
+    /// check — it accepted this ruleset, which is precisely the drift the
+    /// branch closes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_firewall_ruleset_rejects_unscoped_forward_rule_on_blind_exit_posture() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "enp0s9",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+        let ruleset = "table inet rustynet_g0 {\n\
+            \tchain killswitch {\n\
+            \t\ttype filter hook output priority filter; policy drop;\n\
+            \t\toifname \"lo\" accept\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\toifname \"rustynet0\" meta nfproto ipv4 accept\n\
+            \t}\n\
+            \tchain forward {\n\
+            \t\ttype filter hook forward priority filter; policy drop;\n\
+            \t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept\n\
+            \t\tct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" ip saddr 100.64.0.0/10 accept\n\
+            \t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\
+            \t}\n\
+            }\n";
+        let socket_path = phase10_test_socket_path("b40blindexit1");
+        let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![(
+                "list table inet rustynet_g0".to_string(),
+                PrivilegedCommandOutput {
+                    status: 0,
+                    stdout: ruleset.to_owned(),
+                    stderr: String::new(),
+                },
+            )],
+        );
+        let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+            .expect("privileged client should initialize");
+        let mut system = LinuxCommandSystem::new(
+            "rustynet0",
+            "enp0s9",
+            LinuxDataplaneMode::HybridNative,
+            Some(client),
+            false,
+            Vec::new(),
+        )
+        .expect("linux command system should initialize");
+        system.firewall_table = Some("rustynet_g0".to_owned());
+        system.blind_exit_config = Some(config);
+        let result = system.assert_firewall_ruleset();
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        let err = result.expect_err(
+            "an unrestricted regular-exit forward rule must FAIL the blind_exit \
+             posture's self-assertion",
+        );
+        assert!(
+            err.to_string()
+                .contains("unrestricted regular-exit forward rule present"),
+            "failure must name the forbidden bypass rule: {err}"
+        );
+    }
+
+    /// QH-29 pairing pin, portable (no privileged helper): the assertion-side
+    /// `mesh_scoped_forward_allow_tokens` builder must produce EXACTLY the
+    /// rule-body tail of the emitter's final `nft add rule` argv, one word per
+    /// argv element with no embedded whitespace, so the emitter's installed
+    /// rule and the fail-closed check can never drift apart.
+    #[test]
+    fn blind_exit_scoped_forward_tokens_agree_with_emitted_nft_argv() {
+        let config = crate::linux_blind_exit::LinuxBlindExitConfig::new(
+            "rustynet0",
+            "enp0s9",
+            "100.64.0.0/10",
+        )
+        .expect("blind_exit config should initialize");
+        let commands = crate::linux_blind_exit::build_linux_blind_exit_forward_commands(
+            &config,
+            "rustynet_g0",
+        )
+        .expect("blind_exit forward commands should build");
+        let final_argv = commands.last().expect("emitter must emit a final rule");
+        let prefix: Vec<&str> = final_argv[..5].iter().map(String::as_str).collect();
+        assert_eq!(
+            prefix,
+            ["add", "rule", "inet", "rustynet_g0", "forward"],
+            "the final command must add a rule to the forward chain: {final_argv:?}"
+        );
+        let assertion_tokens = crate::linux_blind_exit::mesh_scoped_forward_allow_tokens(&config)
+            .expect("scoped forward tokens should build");
+        assert_eq!(
+            &final_argv[5..],
+            &assertion_tokens[..],
+            "assertion tokens must equal the emitter's rule body exactly"
+        );
+        for token in &assertion_tokens {
+            assert!(
+                !token.contains(|c: char| c.is_whitespace()),
+                "builder tokens must be one word per argv element: {token:?}"
+            );
+        }
     }
 
     /// AQ-253 (review §3): the blind_exit rollback must RE-LOCK, not relax:

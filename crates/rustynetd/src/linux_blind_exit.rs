@@ -111,7 +111,6 @@ pub fn build_linux_blind_exit_forward_commands(
 ) -> Result<Vec<Vec<String>>, String> {
     validate_linux_blind_exit_config(config)?;
     validate_nft_table_name(table)?;
-    let saddr_family = nft_saddr_family_for_cidr(config.mesh_cidr.as_str())?;
     let mut commands = vec![vec![
         "flush".to_owned(),
         "chain".to_owned(),
@@ -130,12 +129,33 @@ pub fn build_linux_blind_exit_forward_commands(
         argv.extend(rule_tokens);
         commands.push(argv);
     }
-    commands.push(vec![
+    let mut scoped = vec![
         "add".to_owned(),
         "rule".to_owned(),
         "inet".to_owned(),
         table.to_owned(),
         "forward".to_owned(),
+    ];
+    scoped.extend(mesh_scoped_forward_allow_tokens(config)?);
+    commands.push(scoped);
+    Ok(commands)
+}
+
+/// The rule tokens of the single **mesh-source-scoped** final-hop forward
+/// allow the blind_exit posture installs:
+/// `iifname <tunnel> oifname <egress> <family> saddr <mesh_cidr> accept`.
+///
+/// This is the shared builder for the emitter ([`build_linux_blind_exit_forward_commands`])
+/// and the runtime fail-closed self-assertion in `phase10`'s
+/// `assert_firewall_ruleset`, so the rule the emitter installs and the rule
+/// the assertion demands cannot drift apart (the AQ-70/F2 lesson, applied to
+/// the blind_exit final hop).
+pub fn mesh_scoped_forward_allow_tokens(
+    config: &LinuxBlindExitConfig,
+) -> Result<Vec<String>, String> {
+    validate_linux_blind_exit_config(config)?;
+    let saddr_family = nft_saddr_family_for_cidr(config.mesh_cidr.as_str())?;
+    Ok(vec![
         "iifname".to_owned(),
         config.tunnel_interface.clone(),
         "oifname".to_owned(),
@@ -144,8 +164,7 @@ pub fn build_linux_blind_exit_forward_commands(
         "saddr".to_owned(),
         config.mesh_cidr.clone(),
         "accept".to_owned(),
-    ]);
-    Ok(commands)
+    ])
 }
 
 /// Evaluate a captured `nft list ruleset` dump against the reviewed

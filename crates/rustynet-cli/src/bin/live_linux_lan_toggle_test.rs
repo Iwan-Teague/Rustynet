@@ -351,6 +351,8 @@ fn run() -> Result<(), String> {
         ctx: ctx.clone(),
         exit_host: exit_host.clone(),
         dns_passphrase_remote: None,
+        blind_exit_host: blind_exit_host.clone(),
+        blind_exit_daemon_stopped: false,
     };
 
     for host in [&exit_host, &client_host, &blind_exit_host] {
@@ -453,6 +455,16 @@ fn run() -> Result<(), String> {
         &assign_pub_local,
         &client_assignment_local,
     )?;
+    // The blind-exit promotion is ATOMIC from the daemon's point of view:
+    // the daemon is stopped before its signed assignment lands, so it can
+    // never reconcile against a bundle that mismatches its current role or
+    // the torn pub-then-bundle swap window (katana-u40: a still-client
+    // daemon burned its five-reconcile budget in ~4s and restricted itself
+    // permanently before the later enforce_host promotion could align it).
+    // exit and client keep their roles, so their live-daemon installs are
+    // intent-compatible and stay as-is.
+    stop_daemon_for_atomic_promotion(&ctx, &blind_exit_host)?;
+    cleanup.blind_exit_daemon_stopped = true;
     install_assignment_bundle(
         &ctx,
         &blind_exit_host,
@@ -486,6 +498,9 @@ fn run() -> Result<(), String> {
     )?;
     install_assignment_refresh_env(&ctx, &exit_host, &exit_refresh_local)?;
     install_assignment_refresh_env(&ctx, &client_host, &client_refresh_local)?;
+    // Still inside the stopped-daemon window: the node-local refresh env
+    // must be in place before the daemon comes back so its first refresh
+    // already agrees with the installed assignment.
     install_assignment_refresh_env(&ctx, &blind_exit_host, &blind_exit_refresh_local)?;
 
     let traversal_env = ctx.work_dir.join("rn_issue_lan_traversal.env");
@@ -983,10 +998,24 @@ struct LanToggleCleanup {
     ctx: LiveLabContext,
     exit_host: String,
     dns_passphrase_remote: Option<String>,
+    blind_exit_host: String,
+    blind_exit_daemon_stopped: bool,
 }
 
 impl Drop for LanToggleCleanup {
     fn drop(&mut self) {
+        // The atomic blind-exit promotion stopped this daemon so its signed
+        // assignment could be installed with no role/intent mismatch window.
+        // `enforce_host` normally restarts it, but every earlier error path
+        // lands here with the daemon still down; start it best-effort (a
+        // no-op when it is already running) so no failure can strand the
+        // guest daemonless for the next stage.
+        if self.blind_exit_daemon_stopped {
+            let _ = self.ctx.run_root_allow_failure(
+                &self.blind_exit_host,
+                &["systemctl", "start", "rustynetd.service"],
+            );
+        }
         let _ = self.ctx.run_root_allow_failure(
             &self.exit_host,
             &["ip", "link", "delete", LAN_TEST_INTERFACE],
@@ -2059,6 +2088,24 @@ fn issue_traversal_bundles_from_env(
     Ok(())
 }
 
+/// Stop the daemon on the to-be-promoted blind-exit host so its signed
+/// assignment bundle is installed while NO daemon is reconciling.
+///
+/// Installing the blind_exit-intent assignment while the daemon still runs
+/// as a client is not atomic today (pub-then-bundle over two scp targets):
+/// the live daemon reconciles mid-swap, sees a bundle that mismatches either
+/// its trust anchor (torn pub swap) or its current role ("assignment target
+/// intent lacks required local capability client"), burns its
+/// five-reconcile budget within seconds and restricts itself permanently —
+/// all BEFORE the later `enforce_host` promotion could have aligned it
+/// (katana-u40 aux journal 22:26:59-22:27:03 UTC). With the daemon stopped
+/// the swap is invisible to it; the subsequent `enforce_host` call rewrites
+/// the role config and starts the daemon straight into the aligned state.
+/// `LanToggleCleanup` restarts it if any earlier error path skips enforcement.
+fn stop_daemon_for_atomic_promotion(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
+    ctx.run_root(target, &["systemctl", "stop", "rustynetd.service"])
+}
+
 fn enforce_host(
     ctx: &LiveLabContext,
     target: &str,
@@ -2439,6 +2486,57 @@ mod tests {
         }
         let impl_end = source.find("\nmod tests {").unwrap_or(source.len());
         assert!(fence_engage < impl_end && release < impl_end);
+    }
+
+    #[test]
+    fn lan_toggle_blind_exit_bundle_installed_while_daemon_is_stopped() {
+        // katana-u40 root cause: run() installed the blind_exit-intent
+        // signed assignment on the aux while its daemon still ran as a
+        // client (the promotion via enforce_host only happened later). The
+        // live daemon reconciled against the mismatched intent, burned its
+        // five-reconcile budget in ~4s, restricted itself permanently and
+        // failed the stage postcondition. The install must therefore happen
+        // INSIDE a stopped-daemon window: stop, install, and only then let
+        // enforce_host flip the role and bring the daemon back aligned.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let stop = run_body
+            .find("stop_daemon_for_atomic_promotion(&ctx, &blind_exit_host)")
+            .expect(
+                "run() must stop the blind-exit daemon before its signed \
+                 assignment is installed (atomic promotion)",
+            );
+        let last_install = run_body
+            .rfind("install_assignment_bundle(")
+            .expect("run() must install the signed assignment bundles");
+        let last_env_install = run_body
+            .rfind("install_assignment_refresh_env(&ctx, &blind_exit_host")
+            .expect("run() must install the blind-exit node-local refresh env");
+        let first_enforce = run_body
+            .find("enforce_host(&ctx, &exit_host")
+            .expect("run() must enforce the host roles");
+        assert!(
+            stop < last_install,
+            "the blind-exit daemon must be STOPPED before the last \
+             install_assignment_bundle call; a live still-client daemon \
+             reconciling a blind_exit-intent bundle restricts itself \
+             permanently (katana-u40)"
+        );
+        assert!(
+            stop < last_env_install,
+            "the node-local refresh env must be installed inside the \
+             stopped-daemon window so the daemon's first refresh already \
+             agrees with the installed assignment"
+        );
+        assert!(
+            last_install < first_enforce,
+            "the blind-exit assignment must be installed before enforce_host \
+             flips the role, so the daemon first boots already aligned"
+        );
     }
 
     #[test]
