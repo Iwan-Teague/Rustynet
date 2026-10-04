@@ -1444,6 +1444,12 @@ pub struct LinuxCommandSystem {
     blind_exit_config: Option<crate::linux_blind_exit::LinuxBlindExitConfig>,
     expected_management_bypass_routes: BTreeSet<ExpectedBypassRoute>,
     expected_peer_endpoint_bypass_routes: BTreeSet<ExpectedBypassRoute>,
+    /// LAB-ONLY (AQ-256): the validated vxlan substrate transit attestation.
+    /// `None` unless `/etc/rustynet/lab/substrate-transit` was present and
+    /// valid at daemon start; compiled only with the default-OFF
+    /// `lab-substrate` feature. See [`crate::lab_substrate_transit`].
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    substrate_transit: Option<crate::lab_substrate_transit::SubstrateTransit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1521,12 +1527,32 @@ impl LinuxCommandSystem {
             blind_exit_config: None,
             expected_management_bypass_routes: BTreeSet::new(),
             expected_peer_endpoint_bypass_routes: BTreeSet::new(),
+            #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+            substrate_transit: None,
         })
     }
 
     pub fn with_traversal_bootstrap_allow_endpoints(mut self, endpoints: Vec<SocketAddr>) -> Self {
         self.traversal_bootstrap_allow_endpoints = dedupe_socket_addrs(endpoints);
         self
+    }
+
+    /// LAB-ONLY (AQ-256): attach the validated substrate transit attestation
+    /// (`None` = transit off, byte-identical to a default node).
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    pub fn with_substrate_transit(
+        mut self,
+        transit: Option<crate::lab_substrate_transit::SubstrateTransit>,
+    ) -> Self {
+        self.substrate_transit = transit;
+        self
+    }
+
+    /// LAB-ONLY (AQ-256): the active substrate transit, for the daemon's
+    /// status line and start-up journal warning.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    pub fn substrate_transit(&self) -> Option<&crate::lab_substrate_transit::SubstrateTransit> {
+        self.substrate_transit.as_ref()
     }
 
     pub fn with_wg_listen_port(mut self, port: u16) -> Self {
@@ -1848,6 +1874,144 @@ impl LinuxCommandSystem {
                         "traversal bootstrap allow rule failed for {endpoint}: {err}"
                     ))
                 })?;
+        }
+        Ok(())
+    }
+
+    /// LAB-ONLY (AQ-256, design D): the substrate transit allowances in the
+    /// generation killswitch chain. The WireGuard listen-port allows are the
+    /// EXISTING `wg_listen_port_allow_tokens` re-anchored on the attested
+    /// overlay (the dataplane rides the overlay there), and each attested peer
+    /// gets the ONE shared transit rule from
+    /// `lab_substrate_transit::substrate_transit_allow_tokens` — the same
+    /// builder the runtime assertion and the boot installer use. Every add
+    /// goes through the exact-rule idempotent path, so a retried apply never
+    /// grows the chain, and a failure fails the stage closed.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn apply_substrate_transit_allow_rules(&self, table: &str) -> Result<(), SystemError> {
+        let Some(transit) = self.substrate_transit.as_ref() else {
+            return Ok(());
+        };
+        if self.wg_listen_port == 0 {
+            return Err(SystemError::FirewallApplyFailed(
+                "lab substrate transit is active but the wireguard listen port is 0".to_owned(),
+            ));
+        }
+        for port_match in ["dport", "sport"] {
+            self.add_nft_rule_if_absent(
+                "inet",
+                table,
+                "killswitch",
+                &Self::wg_listen_port_allow_tokens(
+                    port_match,
+                    transit.overlay_interface(),
+                    self.wg_listen_port,
+                ),
+                &[],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "lab substrate transit wireguard {port_match} allow on {} failed: {err}",
+                    transit.overlay_interface()
+                ))
+            })?;
+        }
+        for peer in transit.peers() {
+            self.add_nft_rule_if_absent(
+                "inet",
+                table,
+                "killswitch",
+                &crate::lab_substrate_transit::substrate_transit_allow_tokens(
+                    transit.underlay_interface(),
+                    *peer,
+                ),
+                &[],
+            )
+            .map_err(|err| {
+                SystemError::FirewallApplyFailed(format!(
+                    "lab substrate transit rule for peer {peer} failed: {err}"
+                ))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// LAB-ONLY (AQ-256): runtime self-assertion for the transit allowances,
+    /// on the SAME builders the emitter uses and the same exact matcher as
+    /// every other killswitch assertion. Fail-closed: a missing rule is a
+    /// `KillSwitchAssertionFailed`.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn assert_substrate_transit_rules(&self, killswitch: &[String]) -> Result<(), SystemError> {
+        let Some(transit) = self.substrate_transit.as_ref() else {
+            return Ok(());
+        };
+        for port_match in ["dport", "sport"] {
+            Self::assert_chain_holds_exact_rule(
+                killswitch,
+                &Self::wg_listen_port_allow_tokens(
+                    port_match,
+                    transit.overlay_interface(),
+                    self.wg_listen_port,
+                ),
+                "lab substrate transit wireguard allow rule on the overlay missing",
+            )?;
+        }
+        for peer in transit.peers() {
+            Self::assert_chain_holds_exact_rule(
+                killswitch,
+                &crate::lab_substrate_transit::substrate_transit_allow_tokens(
+                    transit.underlay_interface(),
+                    *peer,
+                ),
+                "lab substrate transit rule missing",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// LAB-ONLY (AQ-256, review finding 3): pin every attested transit peer
+    /// in table 51820 on the attested underlay, with the kernel's next hop,
+    /// so full-tunnel policy routing can neither loop the vxlan encapsulation
+    /// into the tunnel nor send it on-link to an off-link host. The lookup is
+    /// `resolve_route_for_ip` (refuses tunnel and table-51820 answers) and
+    /// must land on the attested underlay, else the apply fails closed. The
+    /// pins are recorded with the endpoint pins, so the existing bypass-route
+    /// self-check verifies them and the table-51820 rollback flush removes
+    /// them.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn apply_substrate_transit_peer_pins(&mut self) -> Result<(), SystemError> {
+        let Some(transit) = self.substrate_transit.clone() else {
+            return Ok(());
+        };
+        for peer in transit.peers() {
+            let target = IpAddr::V4(*peer);
+            let route = self.resolve_route_for_ip(target)?;
+            if route.interface_name != transit.underlay_interface() {
+                return Err(SystemError::RouteApplyFailed(format!(
+                    "substrate transit peer {peer} resolves via {}, not the attested underlay \
+                     {}; refusing (fail closed, the reconcile loop will retry)",
+                    route.interface_name,
+                    transit.underlay_interface()
+                )));
+            }
+            let args = Self::peer_endpoint_bypass_route_args(
+                target,
+                transit.underlay_interface(),
+                route.via,
+            );
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            self.run(PrivilegedCommandProgram::Ip, &arg_refs)
+                .map_err(|err| {
+                    SystemError::RouteApplyFailed(format!(
+                        "substrate transit peer pin failed for {peer}: {err}"
+                    ))
+                })?;
+            self.expected_peer_endpoint_bypass_routes
+                .insert(Self::expected_bypass_route(
+                    format!("{peer}/32"),
+                    transit.underlay_interface().to_owned(),
+                    route.via,
+                ));
         }
         Ok(())
     }
@@ -3187,6 +3351,11 @@ impl LinuxCommandSystem {
         // installs the IPv4 catch-all there. On a non-exit / no-NAT node
         // nothing is acknowledged, so even the scoped shape fails loudly, and
         // the terminal `policy drop` must stay reachable past every rule.
+        // LAB-ONLY (AQ-256): the transit allowances, when an attestation is
+        // active. They classify as narrow allows below (exact port + daddr),
+        // and the overlay is never credited as a contained interface.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        self.assert_substrate_transit_rules(&killswitch)?;
         let acknowledged_wide_open: Vec<&str> = if self.nat_table.is_some() {
             vec![self.egress_interface.as_str()]
         } else {
@@ -3424,6 +3593,16 @@ impl LinuxCommandSystem {
     /// hard-lock anchor; the rule builder + evaluator live in
     /// [`crate::linux_blind_exit`].
     fn apply_linux_blind_exit_locked(&mut self, mesh_cidr: &str) -> Result<(), SystemError> {
+        // LAB-ONLY (AQ-256): the daemon already refuses to start a blind_exit
+        // with an attestation; this keeps the irreversible posture from ever
+        // being installed next to the transit allowances.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        if self.substrate_transit.is_some() {
+            return Err(SystemError::NatApplyFailed(
+                "blind_exit refused: the LAB-ONLY substrate transit is active on this node"
+                    .to_owned(),
+            ));
+        }
         let table = self.firewall_table.clone().ok_or_else(|| {
             SystemError::NatApplyFailed(
                 "blind_exit requires the killswitch table to be applied first".to_owned(),
@@ -3600,6 +3779,10 @@ impl LinuxCommandSystem {
                 ))
             })?;
         }
+        // LAB-ONLY (AQ-256): the overlay WireGuard allows and the per-peer
+        // transit rules, only while an attestation is active.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        self.apply_substrate_transit_allow_rules(table.as_str())?;
         self.firewall_table = Some(table.clone());
         Ok(table)
     }
@@ -3869,6 +4052,10 @@ impl DataplaneSystem for LinuxCommandSystem {
                     route.via,
                 ));
         }
+        // LAB-ONLY (AQ-256): the transit peers' underlay pins, recorded with
+        // the endpoint pins above.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        self.apply_substrate_transit_peer_pins()?;
         Ok(())
     }
 
@@ -7974,6 +8161,17 @@ impl RuntimeSystem {
             system.dns_probe_servicer = servicer;
         }
     }
+
+    /// LAB-ONLY (AQ-256): the active substrate transit of the Linux system.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    pub(crate) fn lab_substrate_transit(
+        &self,
+    ) -> Option<&crate::lab_substrate_transit::SubstrateTransit> {
+        match self {
+            RuntimeSystem::Linux(system) => system.substrate_transit(),
+            _ => None,
+        }
+    }
 }
 
 impl DataplaneSystem for RuntimeSystem {
@@ -10098,7 +10296,7 @@ fn validate_binary_path(raw: &str, program: PrivilegedCommandProgram) -> Result<
     Ok(())
 }
 
-fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
+pub(crate) fn validate_net_device_name(value: &str) -> Result<(), &'static str> {
     if value.is_empty() || value.len() > 15 {
         return Err("device name length must be between 1 and 15 characters");
     }
@@ -20505,6 +20703,37 @@ Persistent Routes:
             "ip daddr 127.0.0.1 tcp dport 53 redirect to :53535",
             "ip daddr 127.0.0.1 tcp dport 53 redirect to :53535",
         ),
+        // AQ-256 (LAB-ONLY substrate transit): the body is spelled literally
+        // so this fixture stays a transcript of reality in every build; with
+        // `lab-substrate` compiled in, the test
+        // `lab_substrate_transit_tests::live_nft_golden_transit_entry_is_the_shared_builder`
+        // pins it to `substrate_transit_allow_tokens`. Real line re-recorded
+        // on nftables 1.0.9 (kernel 6.8, throwaway table, AQ-256 lane); it
+        // matches the review's render experiment byte for byte (no l4proto
+        // folding, no reordering of the sport/dport pair).
+        (
+            "lab substrate transit (counter, comment)",
+            &[
+                "oifname",
+                "eth0",
+                "ip",
+                "daddr",
+                "192.168.122.31",
+                "udp",
+                "sport",
+                "4789",
+                "udp",
+                "dport",
+                "4789",
+                "counter",
+                "accept",
+                "comment",
+                "rustynet_substrate_transit",
+            ],
+            &[],
+            "oifname \"eth0\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter packets 0 bytes 0 accept comment \"rustynet_substrate_transit\"",
+            "oifname \"eth0\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter packets 3 bytes 291 accept comment \"rustynet_substrate_transit\"",
+        ),
     ];
 
     /// b97 (a120 RF1+RF2): pin BOTH consumers of rendered rule text to the
@@ -25360,5 +25589,787 @@ Persistent Routes:
             !report.contains("return Err"),
             "a flush failure must never fail an otherwise-healthy generation"
         );
+    }
+
+    // ── AQ-256: byte-identical witness for a default node ──────────────────
+    //
+    // The LAB-ONLY `lab-substrate` feature must not change a single privileged
+    // argv a default node sends. This drives the three node shapes the review
+    // names (a default client, a full-tunnel client, an exit) through the
+    // dataplane stages the feature touches (killswitch table + chains,
+    // peer-endpoint pins, management bypass routes, exit NAT) against a
+    // scripted privileged helper and compares the FULL captured argv
+    // sequence with a checked-in golden. The golden was captured on the
+    // pre-change tree; the test runs in BOTH `cargo test -p rustynetd`
+    // (feature off) and `--all-features` (feature compiled in, no
+    // attestation attached), so it proves both "release builds are unchanged"
+    // and "a lab build without an attestation is a default node".
+    #[cfg(target_os = "linux")]
+    const DEFAULT_NODE_PRIVILEGED_ARGV_GOLDEN: &[&str] = &[
+        "== default client",
+        "nft delete table inet rustynet_g1",
+        "nft add table inet rustynet_g1",
+        "nft add chain inet rustynet_g1 killswitch { type filter hook output priority 0 ; policy drop ; }",
+        "nft add rule inet rustynet_g1 killswitch oifname lo accept",
+        "nft add rule inet rustynet_g1 killswitch ip daddr 192.168.0.0/24 tcp dport 22 accept",
+        "nft add rule inet rustynet_g1 killswitch ip daddr 192.168.0.0/24 tcp sport 22 accept",
+        "nft add rule inet rustynet_g1 killswitch oifname enp0s9 ip daddr 198.51.100.7 udp dport 3478 accept comment rustynet_traversal_bootstrap",
+        "nft add rule inet rustynet_g1 killswitch oifname enp0s9 meta nfproto ipv4 udp dport 51820 accept",
+        "nft add rule inet rustynet_g1 killswitch oifname enp0s9 meta nfproto ipv4 udp sport 51820 accept",
+        "nft add chain inet rustynet_g1 forward { type filter hook forward priority 0 ; policy drop ; }",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g1 killswitch",
+        "nft add rule inet rustynet_g1 killswitch oifname rustynet0 meta nfproto ipv4 accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g1 forward",
+        "nft add rule inet rustynet_g1 forward iifname rustynet0 oifname enp0s9 accept",
+        "ip route get 203.0.113.10",
+        "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
+        "ip -4 -o addr show dev enp0s9",
+        "ip route replace 192.168.0.0/24 dev enp0s9 table 51820",
+        "ip route replace 100.64.0.0/10 dev rustynet0 table 51820",
+        "== full-tunnel client",
+        "nft delete table inet rustynet_g2",
+        "nft add table inet rustynet_g2",
+        "nft add chain inet rustynet_g2 killswitch { type filter hook output priority 0 ; policy drop ; }",
+        "nft add rule inet rustynet_g2 killswitch oifname lo accept",
+        "nft add rule inet rustynet_g2 killswitch ip daddr 192.168.0.0/24 tcp dport 22 accept",
+        "nft add rule inet rustynet_g2 killswitch ip daddr 192.168.0.0/24 tcp sport 22 accept",
+        "nft add rule inet rustynet_g2 killswitch oifname enp0s9 ip daddr 198.51.100.7 udp dport 3478 accept comment rustynet_traversal_bootstrap",
+        "nft add rule inet rustynet_g2 killswitch oifname enp0s9 meta nfproto ipv4 udp dport 51820 accept",
+        "nft add rule inet rustynet_g2 killswitch oifname enp0s9 meta nfproto ipv4 udp sport 51820 accept",
+        "nft add chain inet rustynet_g2 forward { type filter hook forward priority 0 ; policy drop ; }",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g2 killswitch",
+        "nft add rule inet rustynet_g2 killswitch oifname rustynet0 meta nfproto ipv4 accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g2 forward",
+        "nft add rule inet rustynet_g2 forward iifname rustynet0 oifname enp0s9 accept",
+        "ip route get 203.0.113.10",
+        "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
+        "ip -4 -o addr show dev enp0s9",
+        "ip route replace 192.168.0.0/24 dev enp0s9 table 51820",
+        "ip route replace 100.64.0.0/10 dev rustynet0 table 51820",
+        "ip route replace 0.0.0.0/0 dev rustynet0 table 51820",
+        "ip route flush table 51820",
+        "ip -6 route flush table 51820",
+        "== exit",
+        "nft delete table inet rustynet_g3",
+        "nft add table inet rustynet_g3",
+        "nft add chain inet rustynet_g3 killswitch { type filter hook output priority 0 ; policy drop ; }",
+        "nft add rule inet rustynet_g3 killswitch oifname lo accept",
+        "nft add rule inet rustynet_g3 killswitch ip daddr 192.168.0.0/24 tcp dport 22 accept",
+        "nft add rule inet rustynet_g3 killswitch ip daddr 192.168.0.0/24 tcp sport 22 accept",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 ip daddr 198.51.100.7 udp dport 3478 accept comment rustynet_traversal_bootstrap",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 udp dport 51820 accept",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 udp sport 51820 accept",
+        "nft add chain inet rustynet_g3 forward { type filter hook forward priority 0 ; policy drop ; }",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname rustynet0 meta nfproto ipv4 accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward iifname rustynet0 oifname enp0s9 accept",
+        "nft list chain inet rustynet_g3 forward",
+        "nft add rule inet rustynet_g3 forward iifname rustynet0 oifname rustynet0 counter accept",
+        "ip route get 203.0.113.10",
+        "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
+        "ip -4 -o addr show dev enp0s9",
+        "ip route replace 192.168.0.0/24 dev enp0s9 table 51820",
+        "ip route replace 100.64.0.0/10 dev rustynet0 table 51820",
+        "sysctl -w net.ipv4.ip_forward=1",
+        "nft add table ip rustynet_nat_g3",
+        "nft add chain ip rustynet_nat_g3 postrouting { type nat hook postrouting priority 100 ; policy accept ; }",
+        "nft list chain ip rustynet_nat_g3 postrouting",
+        "nft add rule ip rustynet_nat_g3 postrouting oifname enp0s9 masquerade",
+        "nft list chain ip rustynet_nat_g3 postrouting",
+        "nft add rule ip rustynet_nat_g3 postrouting iifname rustynet0 oifname rustynet0 counter masquerade",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 udp dport { 53, 853 } drop",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 tcp dport { 53, 853 } drop",
+        "nft list chain inet rustynet_g3 killswitch",
+        "nft add rule inet rustynet_g3 killswitch oifname enp0s9 meta nfproto ipv4 accept",
+    ];
+
+    #[cfg(target_os = "linux")]
+    fn default_node_argv_capture() -> Vec<String> {
+        let socket_path = phase10_test_socket_path("goldargv");
+        let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+            &socket_path,
+            vec![
+                (
+                    "ip -4 -o addr show dev enp0s9".to_owned(),
+                    scripted_ok(
+                        "2: enp0s9    inet 192.168.0.30/24 brd 192.168.0.255 scope global \
+                         enp0s9\\       valid_lft forever preferred_lft forever\n",
+                    ),
+                ),
+                (
+                    "route get 203.0.113.10".to_owned(),
+                    scripted_ok(
+                        "203.0.113.10 via 192.168.0.1 dev enp0s9 src 192.168.0.30 uid 0\n    \
+                         cache\n",
+                    ),
+                ),
+            ],
+        );
+        let peer = rustynet_backend_api::PeerConfig {
+            node_id: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            public_key: [0u8; 32],
+            endpoint: rustynet_backend_api::SocketEndpoint {
+                addr: "203.0.113.10".parse::<IpAddr>().expect("valid endpoint"),
+                port: 51820,
+            },
+            allowed_ips: Vec::new(),
+            persistent_keepalive_secs: None,
+            preshared_key: None,
+        };
+        let new_system = || {
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                true,
+                vec![
+                    "192.168.0.0/24"
+                        .parse::<ManagementCidr>()
+                        .expect("management cidr"),
+                ],
+            )
+            .expect("linux command system should initialize")
+            .with_traversal_bootstrap_allow_endpoints(vec![
+                "198.51.100.7:3478".parse().expect("stun endpoint"),
+            ])
+            .with_wg_listen_port(51820)
+            .with_dns_resolver_port(53535)
+        };
+        let mesh_route = Route {
+            destination_cidr: "100.64.0.0/10".to_owned(),
+            via_node: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            kind: RouteKind::Mesh,
+        };
+        let default_route = Route {
+            destination_cidr: "0.0.0.0/0".to_owned(),
+            via_node: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+            kind: RouteKind::ExitNodeDefault,
+        };
+        let mut marks = Vec::new();
+        let mark = |label: &str, marks: &mut Vec<(usize, String)>| {
+            let at = commands.lock().expect("command log should lock").len();
+            marks.push((at, label.to_owned()));
+        };
+
+        // 1. A default client: mesh routes only, exit mode off.
+        mark("default client", &mut marks);
+        let mut client = new_system();
+        DataplaneSystem::set_generation(&mut client, 1);
+        DataplaneSystem::set_full_tunnel_engaged(&mut client, false);
+        DataplaneSystem::apply_firewall_killswitch(&mut client)
+            .expect("default client firewall stage should apply");
+        DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut client, &[peer.clone()])
+            .expect("default client endpoint pins should apply");
+        DataplaneSystem::apply_routes(&mut client, std::slice::from_ref(&mesh_route))
+            .expect("default client routes should apply");
+
+        // 2. A full-tunnel client: the QH-60 anchoring engages.
+        mark("full-tunnel client", &mut marks);
+        let mut full_tunnel = new_system();
+        DataplaneSystem::set_generation(&mut full_tunnel, 2);
+        DataplaneSystem::set_full_tunnel_engaged(&mut full_tunnel, true);
+        DataplaneSystem::apply_firewall_killswitch(&mut full_tunnel)
+            .expect("full-tunnel client firewall stage should apply");
+        DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut full_tunnel, &[peer.clone()])
+            .expect("full-tunnel client endpoint pins should apply");
+        DataplaneSystem::apply_routes(&mut full_tunnel, &[mesh_route.clone(), default_route])
+            .expect("full-tunnel client routes should apply");
+        DataplaneSystem::rollback_routes(&mut full_tunnel)
+            .expect("full-tunnel client route rollback should run");
+
+        // 3. An exit with the protected-DNS egress drops.
+        mark("exit", &mut marks);
+        let mut exit = new_system();
+        DataplaneSystem::set_generation(&mut exit, 3);
+        DataplaneSystem::set_relay_forwarding(&mut exit, true);
+        DataplaneSystem::set_exit_egress_dns_drop(&mut exit, true);
+        DataplaneSystem::apply_firewall_killswitch(&mut exit)
+            .expect("exit firewall stage should apply");
+        DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut exit, &[peer])
+            .expect("exit endpoint pins should apply");
+        DataplaneSystem::apply_routes(&mut exit, &[mesh_route]).expect("exit routes should apply");
+        DataplaneSystem::apply_nat_forwarding(
+            &mut exit,
+            true,
+            ExitMode::Off,
+            false,
+            "100.64.0.0/10",
+        )
+        .expect("exit nat stage should apply");
+
+        stop.store(true, Ordering::Relaxed);
+        helper_thread
+            .join()
+            .expect("helper thread should join cleanly");
+        let _ = std::fs::remove_file(&socket_path);
+        let log = commands.lock().expect("command log should lock").clone();
+        let mut labelled = Vec::with_capacity(log.len() + marks.len());
+        for (index, command) in log.into_iter().enumerate() {
+            for (_, label) in marks.iter().filter(|(at, _)| *at == index) {
+                labelled.push(format!("== {label}"));
+            }
+            labelled.push(command);
+        }
+        labelled
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_node_privileged_argv_golden() {
+        let actual = default_node_argv_capture();
+        let golden: Vec<String> = DEFAULT_NODE_PRIVILEGED_ARGV_GOLDEN
+            .iter()
+            .map(|line| (*line).to_owned())
+            .collect();
+        assert!(
+            actual == golden,
+            "a default node's privileged argv sequence changed; captured:\n{}",
+            actual
+                .iter()
+                .map(|line| format!("        {line:?},"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // ── AQ-256: LAB-ONLY vxlan substrate transit (feature `lab-substrate`) ──
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    mod lab_substrate_transit_tests {
+        use super::*;
+        use crate::lab_substrate_transit::{
+            SubstrateTransit, parse_attestation, substrate_transit_allow_tokens,
+        };
+
+        const ATTESTATION: &str = "version=1\noverlay_interface=rustynet-vx0\n\
+                                   underlay_interface=enp0s9\npeer=192.168.122.31\n\
+                                   peer=192.168.0.32\n";
+
+        fn transit() -> SubstrateTransit {
+            parse_attestation(ATTESTATION).expect("test attestation must parse")
+        }
+
+        fn transit_system(socket_path: &Path) -> LinuxCommandSystem {
+            let client =
+                PrivilegedCommandClient::new(socket_path.to_path_buf(), Duration::from_secs(2))
+                    .expect("privileged client should initialize");
+            LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize")
+            .with_wg_listen_port(51820)
+            .with_substrate_transit(Some(transit()))
+        }
+
+        fn stop_helper(
+            socket_path: &Path,
+            stop: Arc<AtomicBool>,
+            helper_thread: std::thread::JoinHandle<()>,
+        ) {
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(socket_path);
+        }
+
+        fn killswitch_add(table: &str, tokens: &[String]) -> String {
+            format!("nft add rule inet {table} killswitch {}", tokens.join(" "))
+        }
+
+        /// The generation killswitch carries exactly the shared-builder rules:
+        /// the overlay WireGuard allows and one transit rule per peer, each
+        /// emitted once, next to the unchanged egress WireGuard allows — and
+        /// every emitted argv passes the REAL privileged-helper allowlist.
+        #[test]
+        fn substrate_transit_rule_tokens_agree_with_emitted_nft_argv() {
+            let socket_path = phase10_test_socket_path("aq256emit");
+            let (commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+            let mut system = transit_system(&socket_path);
+            DataplaneSystem::apply_firewall_killswitch(&mut system)
+                .expect("firewall stage with transit should apply");
+            let log = commands.lock().expect("command log should lock").clone();
+            stop_helper(&socket_path, stop, helper_thread);
+
+            let transit = transit();
+            let mut expected = Vec::new();
+            for port_match in ["dport", "sport"] {
+                expected.push(killswitch_add(
+                    "rustynet_g0",
+                    &LinuxCommandSystem::wg_listen_port_allow_tokens(port_match, "enp0s9", 51820),
+                ));
+                expected.push(killswitch_add(
+                    "rustynet_g0",
+                    &LinuxCommandSystem::wg_listen_port_allow_tokens(
+                        port_match,
+                        "rustynet-vx0",
+                        51820,
+                    ),
+                ));
+            }
+            for peer in transit.peers() {
+                expected.push(killswitch_add(
+                    "rustynet_g0",
+                    &substrate_transit_allow_tokens("enp0s9", *peer),
+                ));
+            }
+            for rule in &expected {
+                assert_eq!(
+                    log.iter().filter(|command| *command == rule).count(),
+                    1,
+                    "expected exactly one {rule:?} in {log:#?}"
+                );
+            }
+            assert!(
+                log.iter().any(|command| command
+                    == "nft add rule inet rustynet_g0 killswitch oifname enp0s9 ip daddr \
+                        192.168.122.31 udp sport 4789 udp dport 4789 counter accept comment \
+                        rustynet_substrate_transit"),
+                "the contract rendering must be emitted verbatim: {log:#?}"
+            );
+            // No transit rule anywhere but the killswitch chain (no forward
+            // rule, review finding 7).
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("rustynet_substrate_transit"))
+                    .count(),
+                transit.peers().len(),
+                "{log:#?}"
+            );
+            for command in &log {
+                let mut tokens = command.split_whitespace();
+                if tokens.next() != Some("nft") {
+                    continue;
+                }
+                let args: Vec<&str> = tokens.collect();
+                crate::privileged_helper::validate_request(PrivilegedCommandProgram::Nft, &args)
+                    .unwrap_or_else(|err| panic!("helper must admit {command:?}: {err}"));
+            }
+        }
+
+        /// ONE builder: the boot table's transit argv bodies, the runtime
+        /// emitter's bodies and `substrate_transit_allow_tokens` are equal.
+        #[test]
+        fn boot_and_runtime_transit_rules_share_one_builder() {
+            let transit = transit();
+            let boot = crate::linux_killswitch_boot::boot_substrate_transit_rule_argvs(&transit);
+            assert_eq!(boot.len(), transit.peers().len());
+            for (argv, peer) in boot.iter().zip(transit.peers()) {
+                assert_eq!(
+                    argv.get(..5).expect("boot argv head"),
+                    ["add", "rule", "inet", "rustynet_boot", "killswitch"]
+                );
+                let body = argv.get(5..).expect("boot argv body").to_vec();
+                assert_eq!(body, substrate_transit_allow_tokens("enp0s9", *peer));
+                // The runtime emitter's argv for the same peer has the same body.
+                let runtime = LinuxCommandSystem::nft_add_rule_argv(
+                    "inet",
+                    "rustynet_g7",
+                    "killswitch",
+                    &substrate_transit_allow_tokens(transit.underlay_interface(), *peer),
+                    &[],
+                );
+                assert_eq!(runtime.get(5..).expect("runtime body"), body.as_slice());
+            }
+            // The port the builder renders is the helper arm's fixed literal
+            // and the device's pinned vxlan port.
+            assert_eq!(crate::lab_substrate_transit::VXLAN_UDP_PORT, 4789);
+            assert_eq!(
+                crate::lab_substrate_transit::SUBSTRATE_TRANSIT_COMMENT,
+                "rustynet_substrate_transit"
+            );
+        }
+
+        /// The golden fixture entry is the shared builder's output.
+        #[test]
+        fn live_nft_golden_transit_entry_is_the_shared_builder() {
+            let entry = LIVE_NFT_GOLDEN_RULES
+                .iter()
+                .find(|(name, ..)| name.starts_with("lab substrate transit"))
+                .expect("golden transit entry");
+            let body: Vec<String> = entry.1.iter().map(|token| (*token).to_owned()).collect();
+            assert_eq!(
+                body,
+                substrate_transit_allow_tokens("eth0", "192.168.122.31".parse().expect("ip"))
+            );
+        }
+
+        fn transit_ruleset(omit: Option<&str>, transit_line_override: Option<&str>) -> String {
+            let mut lines = vec![
+                "oifname \"lo\" accept".to_owned(),
+                "oifname \"enp0s9\" meta nfproto ipv4 udp dport 51820 accept".to_owned(),
+                "oifname \"enp0s9\" meta nfproto ipv4 udp sport 51820 accept".to_owned(),
+                "oifname \"rustynet-vx0\" meta nfproto ipv4 udp dport 51820 accept".to_owned(),
+                "oifname \"rustynet-vx0\" meta nfproto ipv4 udp sport 51820 accept".to_owned(),
+                "oifname \"enp0s9\" ip daddr 192.168.0.32 udp sport 4789 udp dport 4789 counter \
+                 packets 0 bytes 0 accept comment \"rustynet_substrate_transit\""
+                    .to_owned(),
+                transit_line_override
+                    .unwrap_or(
+                        "oifname \"enp0s9\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 \
+                         counter packets 12 bytes 1944 accept comment \
+                         \"rustynet_substrate_transit\"",
+                    )
+                    .to_owned(),
+                "ct state established,related meta nfproto ipv4 tcp dport != { 53, 853 } accept"
+                    .to_owned(),
+                "ct state established,related meta nfproto ipv4 udp dport != { 53, 853 } accept"
+                    .to_owned(),
+                "ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } \
+                 accept"
+                    .to_owned(),
+                "oifname \"rustynet0\" meta nfproto ipv4 accept".to_owned(),
+            ];
+            if let Some(needle) = omit {
+                lines.retain(|line| !line.contains(needle));
+            }
+            let mut ruleset = String::from(
+                "table inet rustynet_g0 {\n\tchain killswitch {\n\t\ttype filter hook output \
+                 priority filter; policy drop;\n",
+            );
+            for line in lines {
+                ruleset.push_str("\t\t");
+                ruleset.push_str(&line);
+                ruleset.push('\n');
+            }
+            ruleset.push_str(
+                "\t}\n\tchain forward {\n\t\ttype filter hook forward priority filter; policy \
+                 drop;\n\t\tct state established,related meta nfproto ipv4 tcp dport != { 53, 853 \
+                 } accept\n\t\tct state established,related meta nfproto ipv4 udp dport != { 53, \
+                 853 } accept\n\t\tct state established,related meta nfproto ipv4 meta l4proto != \
+                 { tcp, udp } accept\n\t\tiifname \"rustynet0\" oifname \"enp0s9\" accept\n\t}\n}\n",
+            );
+            ruleset
+        }
+
+        fn assert_against(ruleset: &str, tag: &str) -> Result<(), SystemError> {
+            let socket_path = phase10_test_socket_path(tag);
+            let (_commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![(
+                    "list table inet rustynet_g0".to_owned(),
+                    scripted_ok(ruleset),
+                )],
+            );
+            let mut system = transit_system(&socket_path);
+            system.firewall_table = Some("rustynet_g0".to_owned());
+            let result = system.assert_firewall_ruleset();
+            stop_helper(&socket_path, stop, helper_thread);
+            result
+        }
+
+        /// The runtime self-assertion holds every transit rule to its exact
+        /// shape: the healthy (real-nft-rendered) chain passes, and dropping
+        /// any one overlay WireGuard allow or any one transit rule — or
+        /// installing a transit rule without its counter — fails closed.
+        #[test]
+        fn assert_firewall_ruleset_fails_closed_when_a_transit_rule_is_missing() {
+            assert_against(&transit_ruleset(None, None), "aq256ok")
+                .expect("healthy transit chain must assert");
+            for (index, needle) in [
+                "\"rustynet-vx0\" meta nfproto ipv4 udp dport",
+                "\"rustynet-vx0\" meta nfproto ipv4 udp sport",
+                "daddr 192.168.0.32",
+                "daddr 192.168.122.31",
+            ]
+            .iter()
+            .enumerate()
+            {
+                let err = assert_against(
+                    &transit_ruleset(Some(needle), None),
+                    &format!("aq256m{index}"),
+                )
+                .expect_err("a missing transit rule must fail the assertion");
+                assert!(
+                    matches!(err, SystemError::KillSwitchAssertionFailed(_)),
+                    "{needle}: {err:?}"
+                );
+                assert!(err.to_string().contains("lab substrate transit"), "{err}");
+            }
+            for (index, wrong) in [
+                // no counter
+                "oifname \"enp0s9\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 accept \
+                 comment \"rustynet_substrate_transit\"",
+                // dport-only
+                "oifname \"enp0s9\" ip daddr 192.168.122.31 udp dport 4789 counter packets 0 \
+                 bytes 0 accept comment \"rustynet_substrate_transit\"",
+                // wrong interface
+                "oifname \"rustynet-vx0\" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 \
+                 counter packets 0 bytes 0 accept comment \"rustynet_substrate_transit\"",
+                // wrong peer
+                "oifname \"enp0s9\" ip daddr 192.168.122.32 udp sport 4789 udp dport 4789 \
+                 counter packets 0 bytes 0 accept comment \"rustynet_substrate_transit\"",
+            ]
+            .iter()
+            .enumerate()
+            {
+                assert_against(
+                    &transit_ruleset(None, Some(wrong)),
+                    &format!("aq256w{index}"),
+                )
+                .expect_err("a wrong-shape transit rule must fail the assertion");
+            }
+        }
+
+        fn run_transit_pins(
+            tag: &str,
+            responses: Vec<(String, PrivilegedCommandOutput)>,
+        ) -> (
+            Result<(), SystemError>,
+            Vec<String>,
+            BTreeSet<ExpectedBypassRoute>,
+        ) {
+            let socket_path = phase10_test_socket_path(tag);
+            let (commands, stop, helper_thread) =
+                spawn_privileged_scripted_helper(&socket_path, responses);
+            let mut system = transit_system(&socket_path);
+            let result = DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut system, &[]);
+            let log = commands.lock().expect("command log should lock").clone();
+            let expected = system.expected_peer_endpoint_bypass_routes.clone();
+            stop_helper(&socket_path, stop, helper_thread);
+            (result, log, expected)
+        }
+
+        /// Review finding 3 / experiment R: each transit peer is pinned in
+        /// table 51820 on the underlay with the kernel's next hop (off-link)
+        /// or on-link, and recorded for the bypass-route self-check.
+        #[test]
+        fn transit_peer_pins_land_on_the_underlay_with_the_kernel_next_hop() {
+            let (result, log, expected) = run_transit_pins(
+                "aq256pin",
+                vec![
+                    (
+                        "route get 192.168.122.31".to_owned(),
+                        scripted_ok(
+                            "192.168.122.31 via 192.168.0.29 dev enp0s9 src 192.168.0.30 uid 0\n",
+                        ),
+                    ),
+                    (
+                        "route get 192.168.0.32".to_owned(),
+                        scripted_ok("192.168.0.32 dev enp0s9 src 192.168.0.30 uid 0\n"),
+                    ),
+                ],
+            );
+            result.expect("transit pins should apply");
+            assert!(
+                log.iter().any(|command| command
+                    == "ip route replace 192.168.122.31/32 via 192.168.0.29 dev enp0s9 table 51820"),
+                "{log:#?}"
+            );
+            assert!(
+                log.iter()
+                    .any(|command| command
+                        == "ip route replace 192.168.0.32/32 dev enp0s9 table 51820"),
+                "{log:#?}"
+            );
+            assert!(expected.contains(&ExpectedBypassRoute {
+                destination: "192.168.122.31/32".to_owned(),
+                interface_name: "enp0s9".to_owned(),
+                via: Some("192.168.0.29".to_owned()),
+                family: RouteTableFamily::V4,
+            }));
+            assert!(expected.contains(&ExpectedBypassRoute {
+                destination: "192.168.0.32/32".to_owned(),
+                interface_name: "enp0s9".to_owned(),
+                via: None,
+                family: RouteTableFamily::V4,
+            }));
+            for command in &log {
+                let mut tokens = command.split_whitespace();
+                if tokens.next() != Some("ip") {
+                    continue;
+                }
+                let args: Vec<&str> = tokens.collect();
+                crate::privileged_helper::validate_request(PrivilegedCommandProgram::Ip, &args)
+                    .unwrap_or_else(|err| panic!("helper must admit {command:?}: {err}"));
+            }
+        }
+
+        #[test]
+        fn transit_peer_pin_refuses_resolution_off_underlay() {
+            let (result, log, _) = run_transit_pins(
+                "aq256off",
+                vec![(
+                    "route get".to_owned(),
+                    scripted_ok("192.168.0.32 dev rustynet-vx0 src 172.20.10.2 uid 0\n"),
+                )],
+            );
+            match result {
+                Err(SystemError::RouteApplyFailed(message)) => assert_eq!(
+                    message,
+                    "substrate transit peer 192.168.0.32 resolves via rustynet-vx0, not the \
+                     attested underlay enp0s9; refusing (fail closed, the reconcile loop will \
+                     retry)"
+                ),
+                other => panic!("an off-underlay resolution must refuse: {other:?}"),
+            }
+            assert!(
+                !log.iter().any(|command| command.contains("route replace")),
+                "nothing may be pinned on a refused resolution: {log:#?}"
+            );
+        }
+
+        #[test]
+        fn transit_peer_pin_refuses_table_51820_answer() {
+            let (result, log, _) = run_transit_pins(
+                "aq25651820",
+                vec![(
+                    "route get".to_owned(),
+                    scripted_ok(
+                        "192.168.0.32 via 192.168.0.1 dev enp0s9 table 51820 src 192.168.0.30 \
+                         uid 0\n",
+                    ),
+                )],
+            );
+            match result {
+                Err(SystemError::RouteApplyFailed(message)) => {
+                    assert!(message.contains("table 51820"), "{message}")
+                }
+                other => panic!("a table-51820 answer must refuse: {other:?}"),
+            }
+            assert!(!log.iter().any(|command| command.contains("route replace")));
+            // A tunnel answer is refused by the shared lookup too.
+            let (result, _, _) = run_transit_pins(
+                "aq256tun",
+                vec![(
+                    "route get".to_owned(),
+                    scripted_ok("192.168.0.32 dev rustynet0 src 100.64.0.2 uid 0\n"),
+                )],
+            );
+            assert!(matches!(result, Err(SystemError::RouteApplyFailed(_))));
+        }
+
+        /// QH-60 is untouched by an active transit: a management CIDR that
+        /// reaches nothing on the egress interface still refuses full-tunnel.
+        #[test]
+        fn qh60_still_refuses_when_transit_active_and_no_management_cidr_reaches_egress() {
+            let socket_path = phase10_test_socket_path("aq256qh60");
+            let (_commands, stop, helper_thread, system) =
+                anchoring_system(&socket_path, &["10.200.0.0/24"], true, QH60_CONNECTED, 0);
+            let mut system = system
+                .with_wg_listen_port(51820)
+                .with_substrate_transit(Some(transit()));
+            let result = DataplaneSystem::apply_routes(&mut system, &[]);
+            stop_helper(&socket_path, stop, helper_thread);
+            match result {
+                Err(SystemError::RouteApplyFailed(message)) => {
+                    assert!(message.contains("QH-60"), "{message}")
+                }
+                other => panic!("QH-60 must still refuse with transit active: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn blind_exit_is_refused_while_transit_is_active() {
+            let socket_path = phase10_test_socket_path("aq256blind");
+            let (_commands, stop, helper_thread) = spawn_privileged_capture_helper(&socket_path);
+            let mut system = transit_system(&socket_path);
+            system.firewall_table = Some("rustynet_g0".to_owned());
+            let result = DataplaneSystem::apply_nat_forwarding(
+                &mut system,
+                true,
+                ExitMode::Off,
+                true,
+                "100.64.0.0/10",
+            );
+            stop_helper(&socket_path, stop, helper_thread);
+            match result {
+                Err(SystemError::NatApplyFailed(message)) => {
+                    assert!(message.contains("blind_exit refused"), "{message}")
+                }
+                other => panic!("blind_exit must be refused with transit active: {other:?}"),
+            }
+        }
+
+        /// Retries never grow the chain: the transit emitter goes through the
+        /// exact-rule idempotent path (stateful nft fake that renders like
+        /// nft 1.0.9, counter statistics included).
+        #[test]
+        fn transit_rules_are_idempotent_across_reapplies() {
+            let socket_path = phase10_test_socket_path("aq256idem");
+            let (commands, stop, helper_thread, rules) =
+                spawn_privileged_stateful_nft_helper(&socket_path);
+            let mut system = transit_system(&socket_path);
+            DataplaneSystem::apply_firewall_killswitch(&mut system)
+                .expect("first apply should succeed");
+            for _ in 0..10 {
+                system
+                    .apply_substrate_transit_allow_rules("rustynet_g0")
+                    .expect("re-apply should succeed");
+            }
+            let log = commands.lock().expect("command log should lock").clone();
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            let killswitch = stateful_fake_chain_rules(&rules, "inet rustynet_g0 killswitch");
+            let transit_rules = killswitch
+                .iter()
+                .filter(|rule| {
+                    rule.iter()
+                        .any(|token| token == "rustynet_substrate_transit")
+                })
+                .count();
+            assert_eq!(transit_rules, 2, "{killswitch:?}");
+            let overlay_rules = killswitch
+                .iter()
+                .filter(|rule| rule.get(1).map(String::as_str) == Some("rustynet-vx0"))
+                .count();
+            assert_eq!(overlay_rules, 2, "{killswitch:?}");
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("add rule")
+                        && command.contains("rustynet_substrate_transit"))
+                    .count(),
+                2
+            );
+        }
     }
 }

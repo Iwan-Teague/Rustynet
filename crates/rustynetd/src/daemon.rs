@@ -4857,6 +4857,11 @@ struct DaemonRuntime {
     state_fetcher: StateFetcher,
     #[cfg(target_os = "linux")]
     egress_interface: String,
+    /// LAB-ONLY (AQ-256): the `substrate_transit=lab-active ...` status field
+    /// while a vxlan substrate transit attestation is active. Compiled only
+    /// with the default-OFF `lab-substrate` feature.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    lab_substrate_transit_status: Option<String>,
     state_path: PathBuf,
     trust_evidence_path: PathBuf,
     trust_verifier_key_path: PathBuf,
@@ -5378,12 +5383,15 @@ impl DaemonRuntime {
             .transport_socket_identity_blocker()
             .filter(|_| !config.traversal_stun_servers.is_empty() || relay_client.is_some());
         let transport_socket_identity_blocked = transport_socket_identity_blocker.is_some();
-        let controller = Phase10Controller::new(
-            backend,
-            daemon_system(config)?,
-            policy.clone(),
-            trust_policy,
-        );
+        let system = daemon_system(config)?;
+        // LAB-ONLY (AQ-256): loud at start while the vxlan substrate transit
+        // is active, so a lab build can never quietly carry it.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        let lab_substrate_transit_status = system.lab_substrate_transit().map(|transit| {
+            log::warn!("{}", transit.journal_line());
+            transit.status_field()
+        });
+        let controller = Phase10Controller::new(backend, system, policy.clone(), trust_policy);
         let privileged_helper_client = config
             .privileged_helper_socket_path
             .as_ref()
@@ -5421,6 +5429,8 @@ impl DaemonRuntime {
             state_fetcher: StateFetcher::new_from_daemon(config),
             #[cfg(target_os = "linux")]
             egress_interface: config.egress_interface.clone(),
+            #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+            lab_substrate_transit_status,
             state_path: config.state_path.clone(),
             trust_evidence_path: config.trust_evidence_path.clone(),
             trust_verifier_key_path: config.trust_verifier_key_path.clone(),
@@ -9578,8 +9588,19 @@ impl DaemonRuntime {
                 let dns_scoped_apply_degraded = self.dns_scoped_apply_degraded;
                 let local_wireguard_public_key =
                     self.local_wireguard_public_key.as_deref().unwrap_or("none");
+                // LAB-ONLY (AQ-256): present only while the vxlan substrate
+                // transit is active in a `lab-substrate` build; absent (empty)
+                // otherwise, so a default node's status line is unchanged.
+                #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+                let lab_substrate_suffix = self
+                    .lab_substrate_transit_status
+                    .as_deref()
+                    .map(|field| format!(" {field}"))
+                    .unwrap_or_default();
+                #[cfg(not(all(target_os = "linux", feature = "lab-substrate")))]
+                let lab_substrate_suffix = "";
                 IpcResponse::ok(format!(
-                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={} dns_scoped_apply_degraded={dns_scoped_apply_degraded} local_wg_public_key={local_wireguard_public_key}{gossip_suffix}",
+                    "node_id={} node_role={} state={:?} generation={} exit_node={} selected_exit_peer_endpoint={} selected_exit_peer_endpoint_error={} managed_peer_endpoints={} managed_peer_endpoints_error={} serving_exit_node={} lan_access={} restricted_safe_mode={} restriction_mode={:?} bootstrap_error={} reconcile_attempts={} reconcile_failures={} last_reconcile_unix={} last_reconcile_error={} encrypted_key_store={} auto_tunnel_enforce={} path_mode={} path_reason={} path_programmed_mode={} path_programmed_reason={} path_live_proven={} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={} relay_session_configured={} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={} transport_socket_identity_state={} transport_socket_identity_error={} transport_socket_identity_label={} transport_socket_identity_local_addr={} dns_zone_state={} dns_zone_record_count={} dns_zone_error={} traversal_authority={} traversal_peer_count={} traversal_probe_max_candidates={} traversal_probe_max_pairs={} traversal_probe_rounds={} traversal_probe_round_spacing_ms={} traversal_probe_relay_switch_after_failures={} traversal_probe_handshake_freshness_secs={} traversal_probe_reprobe_interval_secs={} traversal_probe_result={} traversal_probe_reason={} traversal_probe_attempts={} traversal_probe_endpoint={} traversal_probe_latest_handshake_unix={} traversal_probe_next_reprobe_unix={} traversal_probe_peer_count={} traversal_probe_direct_peers={} traversal_probe_relay_peers={} traversal_preexpiry_refresh_events={} traversal_last_preexpiry_refresh_unix={} traversal_stale_rejections={} traversal_replay_rejections={} traversal_future_dated_rejections={} traversal_endpoint_change_events={} traversal_endpoint_fingerprint={} traversal_alarm_state={} traversal_alarm_reason={} dns_alarm_state={} dns_alarm_reason={} dns_preexpiry_refresh_events={} dns_last_preexpiry_refresh_unix={} dns_stale_rejections={} dns_replay_rejections={} dns_future_dated_rejections={} stun_candidate_local_addrs={} stun_transport_port_binding={} auto_port_forward_exit={} port_forward_external_port={} port_forward_error={} last_assignment={} membership_epoch={} membership_active_nodes={} dns_scoped_apply_degraded={dns_scoped_apply_degraded} local_wg_public_key={local_wireguard_public_key}{gossip_suffix}{lab_substrate_suffix}",
                     self.local_node_id,
                     self.node_role.as_str(),
                     self.controller.state(),
@@ -12021,6 +12042,21 @@ fn zeroize_optional_bytes(value: &mut Option<Vec<u8>>) {
     }
 }
 
+/// LAB-ONLY (AQ-256): what the vxlan substrate transit attestation is checked
+/// against — the RESOLVED egress interface (`run_daemon` resolves `auto`
+/// before preflight builds the system), whether this node is a blind_exit, and
+/// the WireGuard listen port. One function so the wiring is unit-tested.
+#[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+fn lab_substrate_transit_context(
+    config: &DaemonConfig,
+) -> crate::lab_substrate_transit::DaemonTransitContext<'_> {
+    crate::lab_substrate_transit::DaemonTransitContext {
+        egress_interface: config.egress_interface.as_str(),
+        blind_exit: config.node_role.is_blind_exit(),
+        wg_listen_port: config.wg_listen_port,
+    }
+}
+
 fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
     #[cfg(target_os = "linux")]
     {
@@ -12064,6 +12100,15 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
                 .with_dns_resolver_port(config.dns_resolver_bind_addr.port())
         })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
+        // LAB-ONLY (AQ-256): read and validate the orchestrator's vxlan
+        // substrate transit attestation against the RESOLVED egress interface
+        // (`run_daemon` resolves `auto` before preflight builds this system).
+        // Absent: transit off. Present but invalid: refuse to start.
+        #[cfg(feature = "lab-substrate")]
+        let system = system.with_substrate_transit(
+            crate::lab_substrate_transit::load_for_daemon(&lab_substrate_transit_context(config))
+                .map_err(DaemonError::InvalidConfig)?,
+        );
         Ok(RuntimeSystem::Linux(system))
     }
     #[cfg(target_os = "macos")]
@@ -39620,5 +39665,72 @@ mod rotation_io_backup_zeroizing_contract {
             &'a Option<zeroize::Zeroizing<Vec<u8>>>,
         ) = backup_field_types;
         let _ = probe;
+    }
+}
+
+/// AQ-256: the daemon-side wiring of the LAB-ONLY substrate transit
+/// attestation (review mutant A8): the context the daemon checks the
+/// attestation against carries the node's real role, resolved egress and
+/// WireGuard port, and a blind_exit node or a mismatched egress refuses.
+#[cfg(all(test, target_os = "linux", feature = "lab-substrate"))]
+mod lab_substrate_transit_wiring_tests {
+    use super::*;
+    use crate::lab_substrate_transit::{AttestationSource, HostTransitFacts, load_for_daemon_from};
+    use std::os::unix::fs::PermissionsExt;
+
+    const ATTESTATION: &str = "version=1\noverlay_interface=rustynet-vx0\n\
+                               underlay_interface=eth0\npeer=192.168.122.31\n";
+
+    fn facts(_overlay: &str) -> Result<HostTransitFacts, String> {
+        Ok(HostTransitFacts {
+            local_ipv4: vec![std::net::Ipv4Addr::new(192, 168, 0, 30)],
+            overlay_present: true,
+            overlay_link_details: "7: rustynet-vx0: <UP> \\    vxlan id 4242 srcport 4789 4790"
+                .to_owned(),
+        })
+    }
+
+    fn config(role: NodeRole, egress: &str) -> DaemonConfig {
+        DaemonConfig {
+            node_role: role,
+            egress_interface: egress.to_owned(),
+            wg_listen_port: 51820,
+            ..DaemonConfig::default()
+        }
+    }
+
+    #[test]
+    fn transit_context_carries_role_egress_and_port() {
+        let client = config(NodeRole::Client, "eth0");
+        let context = lab_substrate_transit_context(&client);
+        assert!(!context.blind_exit);
+        assert_eq!(context.egress_interface, "eth0");
+        assert_eq!(context.wg_listen_port, 51820);
+        let blind = config(NodeRole::BlindExit, "eth0");
+        assert!(lab_substrate_transit_context(&blind).blind_exit);
+    }
+
+    #[test]
+    fn daemon_refuses_transit_on_blind_exit_and_on_an_egress_mismatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("substrate-transit");
+        std::fs::write(&path, ATTESTATION).expect("write attestation");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+        let source = AttestationSource {
+            path: &path,
+            required_uid: nix::unistd::getuid().as_raw(),
+        };
+        let client = config(NodeRole::Client, "eth0");
+        load_for_daemon_from(&source, &lab_substrate_transit_context(&client), facts)
+            .expect("a client on the attested underlay loads")
+            .expect("present");
+        let blind = config(NodeRole::BlindExit, "eth0");
+        let err = load_for_daemon_from(&source, &lab_substrate_transit_context(&blind), facts)
+            .expect_err("a blind_exit node must refuse");
+        assert!(err.contains("blind_exit"), "{err}");
+        let mismatch = config(NodeRole::Client, "rustynet-vx0");
+        let err = load_for_daemon_from(&source, &lab_substrate_transit_context(&mismatch), facts)
+            .expect_err("an egress mismatch must refuse");
+        assert!(err.contains("egress_interface=rustynet-vx0"), "{err}");
     }
 }

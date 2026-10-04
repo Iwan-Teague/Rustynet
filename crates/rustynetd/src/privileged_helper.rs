@@ -2700,6 +2700,68 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
         {
             Ok(())
         }
+        // LAB-ONLY (AQ-256, design D): the vxlan substrate transit rule, and
+        // only in a `lab-substrate` build — a default helper refuses this
+        // shape like any other. Modelled on the traversal-bootstrap arm above
+        // but narrower: both ports are FIXED to 4789 (the source-port match is
+        // what limits the rule to the kernel vxlan socket), the comment is
+        // fixed, the destination is one exact IPv4 address in the attestable
+        // private/CGNAT classes, the interface is never a rustynet* link, and
+        // `counter` (pure observability, no authority) is optional. It adds no
+        // authority a compromised daemon lacks: the scoped catch-all arm above
+        // already admits `oifname <any> meta nfproto ipv4 accept`.
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "ip",
+            "daddr",
+            address,
+            "udp",
+            "sport",
+            "4789",
+            "udp",
+            "dport",
+            "4789",
+            "counter",
+            "accept",
+            "comment",
+            "rustynet_substrate_transit",
+        ]
+        | [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "killswitch",
+            "oifname",
+            interface,
+            "ip",
+            "daddr",
+            address,
+            "udp",
+            "sport",
+            "4789",
+            "udp",
+            "dport",
+            "4789",
+            "accept",
+            "comment",
+            "rustynet_substrate_transit",
+        ] if is_owned_failclosed_table_token(table)
+            && crate::lab_substrate_transit::is_attestable_underlay_interface(interface)
+            && address.parse::<Ipv4Addr>().is_ok_and(|peer| {
+                peer.to_string() == *address
+                    && crate::lab_substrate_transit::is_attestable_transit_peer(peer)
+            }) =>
+        {
+            Ok(())
+        }
         [
             "add",
             "rule",
@@ -7100,5 +7162,196 @@ mod tests {
             super::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH,
             "/run/rustynet/rustynetd-privileged.sock"
         );
+    }
+
+    // ── AQ-256: the LAB-ONLY substrate transit arm ─────────────────────────
+
+    const SUBSTRATE_TRANSIT_ARGV: &[&str] = &[
+        "add",
+        "rule",
+        "inet",
+        "rustynet_g1",
+        "killswitch",
+        "oifname",
+        "eth0",
+        "ip",
+        "daddr",
+        "192.168.122.31",
+        "udp",
+        "sport",
+        "4789",
+        "udp",
+        "dport",
+        "4789",
+        "counter",
+        "accept",
+        "comment",
+        "rustynet_substrate_transit",
+    ];
+
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn substrate_transit_variant(edit: impl Fn(&mut Vec<&'static str>)) -> Vec<&'static str> {
+        let mut argv = SUBSTRATE_TRANSIT_ARGV.to_vec();
+        edit(&mut argv);
+        argv
+    }
+
+    /// A DEFAULT build refuses the transit shape like any other unknown rule:
+    /// the arm exists only with `lab-substrate` compiled in.
+    #[cfg(not(all(target_os = "linux", feature = "lab-substrate")))]
+    #[test]
+    fn nft_allowlist_refuses_substrate_transit_shape_without_the_feature() {
+        let err = validate_request(PrivilegedCommandProgram::Nft, SUBSTRATE_TRANSIT_ARGV)
+            .expect_err("a default helper must refuse the lab transit rule");
+        assert!(
+            err.contains("unsupported nft add rule argument schema"),
+            "{err}"
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    #[test]
+    fn nft_allowlist_admits_exact_substrate_transit_shape() {
+        validate_request(PrivilegedCommandProgram::Nft, SUBSTRATE_TRANSIT_ARGV)
+            .expect("the exact transit shape must be admitted");
+        // `counter` is optional (pure observability).
+        let without_counter = substrate_transit_variant(|argv| {
+            argv.retain(|token| *token != "counter");
+        });
+        validate_request(PrivilegedCommandProgram::Nft, &without_counter)
+            .expect("the counter-less transit shape must be admitted");
+        // CGNAT and 10/8 peers are attestable.
+        for peer in ["100.64.0.9", "10.1.2.3", "172.16.0.1"] {
+            let argv = substrate_transit_variant(|argv| argv[9] = peer);
+            validate_request(PrivilegedCommandProgram::Nft, &argv)
+                .unwrap_or_else(|err| panic!("{peer} must be admitted: {err}"));
+        }
+        // The arm's fixed literals are the module's constants.
+        assert_eq!(
+            SUBSTRATE_TRANSIT_ARGV[12],
+            crate::lab_substrate_transit::VXLAN_UDP_PORT.to_string()
+        );
+        assert_eq!(
+            SUBSTRATE_TRANSIT_ARGV[19],
+            crate::lab_substrate_transit::SUBSTRATE_TRANSIT_COMMENT
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    #[test]
+    fn nft_allowlist_refuses_every_loosened_substrate_transit_shape() {
+        let refusals: Vec<(&str, Vec<&'static str>)> = vec![
+            (
+                "dport-only",
+                substrate_transit_variant(|argv| {
+                    argv.drain(10..13);
+                }),
+            ),
+            (
+                "sport-only",
+                substrate_transit_variant(|argv| {
+                    argv.drain(13..16);
+                }),
+            ),
+            (
+                "other sport",
+                substrate_transit_variant(|argv| argv[12] = "4790"),
+            ),
+            (
+                "other dport",
+                substrate_transit_variant(|argv| argv[15] = "51820"),
+            ),
+            (
+                "both ports other",
+                substrate_transit_variant(|argv| {
+                    argv[12] = "53";
+                    argv[15] = "53";
+                }),
+            ),
+            (
+                "cidr daddr",
+                substrate_transit_variant(|argv| argv[9] = "192.168.122.0/24"),
+            ),
+            (
+                "host-prefix daddr",
+                substrate_transit_variant(|argv| argv[9] = "192.168.122.31/32"),
+            ),
+            (
+                "public daddr",
+                substrate_transit_variant(|argv| argv[9] = "8.8.8.8"),
+            ),
+            (
+                "non-canonical daddr",
+                substrate_transit_variant(|argv| argv[9] = "192.168.122.031"),
+            ),
+            (
+                "loopback daddr",
+                substrate_transit_variant(|argv| argv[9] = "127.0.0.1"),
+            ),
+            (
+                "ip6",
+                substrate_transit_variant(|argv| {
+                    argv[7] = "ip6";
+                    argv[9] = "fd00::31";
+                }),
+            ),
+            (
+                "ip6 family, v4 address",
+                substrate_transit_variant(|argv| argv[7] = "ip6"),
+            ),
+            (
+                "other comment",
+                substrate_transit_variant(|argv| argv[19] = "rustynet_traversal_bootstrap"),
+            ),
+            (
+                "no comment",
+                substrate_transit_variant(|argv| {
+                    argv.truncate(18);
+                }),
+            ),
+            (
+                "drop verdict",
+                substrate_transit_variant(|argv| argv[17] = "drop"),
+            ),
+            (
+                "rustynet underlay",
+                substrate_transit_variant(|argv| argv[6] = "rustynet-vx0"),
+            ),
+            (
+                "tunnel underlay",
+                substrate_transit_variant(|argv| argv[6] = "rustynet0"),
+            ),
+            (
+                "bad interface",
+                substrate_transit_variant(|argv| argv[6] = "eth0;"),
+            ),
+            (
+                "not owned table",
+                substrate_transit_variant(|argv| argv[3] = "filter"),
+            ),
+            (
+                "forward chain",
+                substrate_transit_variant(|argv| argv[4] = "forward"),
+            ),
+            (
+                "tcp",
+                substrate_transit_variant(|argv| {
+                    argv[10] = "tcp";
+                    argv[13] = "tcp";
+                }),
+            ),
+            (
+                "trailing token",
+                substrate_transit_variant(|argv| argv.push("accept")),
+            ),
+        ];
+        for (label, argv) in refusals {
+            let err = validate_request(PrivilegedCommandProgram::Nft, &argv)
+                .expect_err(&format!("{label} must be refused: {argv:?}"));
+            assert!(
+                err.contains("unsupported nft add rule argument schema"),
+                "{label}: {err}"
+            );
+        }
     }
 }

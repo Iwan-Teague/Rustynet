@@ -58,6 +58,12 @@ test-harness = ["rustynet-backend-wireguard/test-harness"]
 # fuzz targets can drive the private local-custody bundle loaders. Empty in
 # production builds; no production surface.
 fuzzing = []
+# AQ-256 (design D, charter/reviews/REVIEW-vxlan-substrate-transit-design-2026-10-03.md):
+# LAB-ONLY vxlan cross-network substrate transit. Default OFF: release builds
+# contain none of it (no attestation read, no transit rule, no route pin, no
+# privileged-helper arm, no status field, no `lab-substrate-capability`
+# subcommand). Lab binaries are built with `--features rustynetd/lab-substrate`.
+lab-substrate = []
 
 [lints.rust]
 # Downgrade workspace `unsafe_code = "forbid"` to `deny` so the scoped

@@ -255,6 +255,20 @@ jobs:
         # helper or by renaming anything.
         run: |
           cargo check -p rustynet-cli --bin rustynet-cli --locked
+      - name: Shipped-daemon feature gate (AQ-256)
+        # The same gap for rustynetd, which release.yml also builds with
+        # default features: everything above runs --all-features, so the
+        # LAB-ONLY `lab-substrate` code (vxlan substrate transit, AQ-256) is
+        # compiled into every CI test binary and its absence from the shipped
+        # daemon is never exercised. This runs the daemon's suite with DEFAULT
+        # features, which is where the feature-OFF witnesses live:
+        # default_node_privileged_argv_golden (a default node's privileged
+        # argv is byte-identical), the helper's refusal of the lab transit
+        # rule, and the lab-substrate-capability probe being unknown. A cfg
+        # gate dropped from any of that code fails here, not at tag time.
+        # Linux leg only: the witnesses are Linux dataplane tests.
+        run: |
+          cargo nextest run -p rustynetd --all-targets --locked --retries 0
       - name: Lab monitor standalone gates
         # Excluded from the workspace; gate it explicitly on the Linux leg
         # too (macOS/Linux only crate). See scripts/ci/lab_monitor_gates.sh.

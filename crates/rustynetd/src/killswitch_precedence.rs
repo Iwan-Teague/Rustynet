@@ -1026,4 +1026,73 @@ mod tests {
             "a dequoted negated tunnel match must still be caught"
         );
     }
+
+    /// AQ-256 (review finding 11): the lab vxlan substrate transit rule, in
+    /// the exact shape real nft renders it (quoted and, as the daemon's
+    /// assertion passes it, dequoted), is a NARROW allow — exact ports and an
+    /// exact destination — never contained and never an escape. Its comment
+    /// text cannot change that.
+    #[test]
+    fn substrate_transit_rule_is_narrow_allow() {
+        let contained = ContainedInterfaces::default();
+        for rule in [
+            r#"oifname "eth0" ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter packets 7 bytes 588 accept comment "rustynet_substrate_transit""#,
+            "oifname eth0 ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter accept comment rustynet_substrate_transit",
+        ] {
+            assert_eq!(
+                classify_nft_general_egress_rule(rule, &contained, &[]),
+                RuleDisposition::NarrowAllow,
+                "{rule}"
+            );
+        }
+        // The WireGuard allows re-anchored on the overlay are narrow too.
+        for rule in [
+            r#"oifname "rustynet-vx0" meta nfproto ipv4 udp dport 51820 accept"#,
+            "oifname rustynet-vxl meta nfproto ipv4 udp sport 51820 accept",
+        ] {
+            assert_eq!(
+                classify_nft_general_egress_rule(rule, &contained, &[]),
+                RuleDisposition::NarrowAllow,
+                "{rule}"
+            );
+        }
+        // A chain carrying them still reaches its terminal drop.
+        let chain = "type filter hook output priority 0; policy drop;\n\
+                     oifname lo accept\n\
+                     oifname rustynet-vx0 meta nfproto ipv4 udp dport 51820 accept\n\
+                     oifname rustynet-vx0 meta nfproto ipv4 udp sport 51820 accept\n\
+                     oifname eth0 ip daddr 192.168.122.31 udp sport 4789 udp dport 4789 counter accept comment rustynet_substrate_transit\n\
+                     oifname rustynet0 meta nfproto ipv4 accept";
+        evaluate_linux_killswitch_chain_precedence(chain, "rustynet0", &[])
+            .expect("the transit posture must stay contained");
+    }
+
+    /// AQ-256 (review finding 11): the overlay carries cleartext vxlan frames,
+    /// so it must never be credited as a contained (tunnel) interface — the
+    /// `rustynet` prefix family only admits a digits-only suffix — and a
+    /// broad accept on it is an escape.
+    #[test]
+    fn overlay_interface_is_never_contained() {
+        let contained = ContainedInterfaces::default();
+        for overlay in ["rustynet-vx0", "rustynet-vxl", "\"rustynet-vx0\""] {
+            assert!(
+                !contained.contains(overlay),
+                "{overlay} must not be contained"
+            );
+        }
+        assert!(
+            contained.contains("rustynet0"),
+            "the tunnel family is still contained"
+        );
+        for rule in [
+            r#"oifname "rustynet-vx0" accept"#,
+            "oifname rustynet-vxl meta nfproto ipv4 accept",
+        ] {
+            assert_eq!(
+                classify_nft_general_egress_rule(rule, &contained, &[]),
+                RuleDisposition::Escapes,
+                "{rule}"
+            );
+        }
+    }
 }

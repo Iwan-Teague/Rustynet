@@ -458,6 +458,93 @@ fn install_linux_boot_killswitch_inner(
     Ok(())
 }
 
+/// LAB-ONLY (AQ-256, review finding 1): the boot table's substrate transit
+/// rules. `rustynet_boot` hooks `output` at the same priority as the daemon's
+/// generation table and stays live for the daemon's whole lifetime, and an
+/// accept in one base chain does not exempt a packet from another, so the
+/// vxlan encapsulation must be allowed in BOTH tables (review experiments
+/// D1/D2). The body is the ONE shared builder
+/// (`lab_substrate_transit::substrate_transit_allow_tokens`) the runtime
+/// emitter and the runtime assertion use; the boot table needs no WireGuard
+/// change (its WireGuard allows are interface-agnostic, finding 13).
+#[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+pub fn boot_substrate_transit_rule_argvs(
+    transit: &crate::lab_substrate_transit::SubstrateTransit,
+) -> Vec<Vec<String>> {
+    transit
+        .peers()
+        .iter()
+        .map(|peer| {
+            let mut argv: Vec<String> =
+                ["add", "rule", "inet", BOOT_KILLSWITCH_TABLE, "killswitch"]
+                    .iter()
+                    .map(|token| (*token).to_owned())
+                    .collect();
+            argv.extend(
+                crate::lab_substrate_transit::substrate_transit_allow_tokens(
+                    transit.underlay_interface(),
+                    *peer,
+                ),
+            );
+            argv
+        })
+        .collect()
+}
+
+/// LAB-ONLY (AQ-256): [`install_linux_boot_killswitch`] plus the substrate
+/// transit rules when an attestation is active. Every refusal happens BEFORE
+/// the first nft exec: the attestation was validated by the caller
+/// (`lab_substrate_transit::load_for_boot_check`), and the WireGuard listen
+/// port it needs is checked here first. With `None` this is exactly
+/// [`install_linux_boot_killswitch`].
+#[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+pub fn install_linux_boot_killswitch_with_substrate_transit(
+    iface: &str,
+    ssh_allow: bool,
+    ssh_cidrs: &[BootSshCidr],
+    wg_listen_port: Option<u16>,
+    traversal_endpoints: &[BootTraversalEndpoint],
+    substrate_transit: Option<&crate::lab_substrate_transit::SubstrateTransit>,
+) -> Result<(), String> {
+    let transit_argvs = match substrate_transit {
+        None => Vec::new(),
+        Some(transit) => {
+            if wg_listen_port.unwrap_or(0) == 0 {
+                return Err(crate::lab_substrate_transit::rejected(
+                    "linux-killswitch-boot-check was given no --wg-listen-port; the transit \
+                     needs the real WireGuard listen port",
+                ));
+            }
+            boot_substrate_transit_rule_argvs(transit)
+        }
+    };
+    install_linux_boot_killswitch(
+        iface,
+        ssh_allow,
+        ssh_cidrs,
+        wg_listen_port,
+        traversal_endpoints,
+    )?;
+    for argv in &transit_argvs {
+        // Argv-only, no shell: the underlay name passed the device-name gate
+        // and the peer is a parsed IPv4 address, so nothing here can add nft
+        // grammar to the boot chain.
+        let output = std::process::Command::new("nft")
+            .args(argv)
+            .output()
+            .map_err(|err| format!("nft spawn failed: {err}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "nft {} failed ({}): {}",
+                argv.join(" "),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(target_os = "linux"))]
 fn install_linux_boot_killswitch_inner(
     _iface: &str,
@@ -1499,5 +1586,52 @@ table inet rustynetfoo {
         // fails closed at ExecStartPre.
         super::install_linux_boot_killswitch("rustynet0", false, &[], None, &[])
             .expect("the canonical tunnel interface name must pass the boot gate");
+    }
+
+    /// AQ-256 (review mutant A11): with an active substrate transit the boot
+    /// installer refuses a missing or zero `--wg-listen-port` BEFORE it execs
+    /// anything. The interface name is deliberately invalid, so a regression
+    /// that dropped the port check would fail on the interface gate instead
+    /// (a different message, still before any nft exec) — this test never
+    /// runs nft.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    #[test]
+    fn boot_installer_with_transit_requires_the_wireguard_listen_port() {
+        let transit = crate::lab_substrate_transit::parse_attestation(
+            "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=eth0\n\
+             peer=192.168.122.31\n",
+        )
+        .expect("test attestation parses");
+        for port in [None, Some(0)] {
+            let err = super::install_linux_boot_killswitch_with_substrate_transit(
+                "not a valid iface!",
+                false,
+                &[],
+                port,
+                &[],
+                Some(&transit),
+            )
+            .expect_err("a transit boot install without the port must refuse");
+            assert!(err.contains("--wg-listen-port"), "{port:?}: {err}");
+            assert!(
+                err.contains("re-run cross_network_substrate_setup"),
+                "{err}"
+            );
+        }
+        // Without a transit nothing changes: the same call reaches the
+        // unchanged installer, whose interface gate refuses (no nft exec).
+        let err = super::install_linux_boot_killswitch_with_substrate_transit(
+            "not a valid iface!",
+            false,
+            &[],
+            None,
+            &[],
+            None,
+        )
+        .expect_err("the interface gate still applies");
+        assert!(
+            err.contains("invalid boot killswitch interface name"),
+            "{err}"
+        );
     }
 }

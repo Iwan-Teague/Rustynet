@@ -37,6 +37,10 @@ pub mod keepalive;
 pub mod key_material;
 pub mod key_rotation;
 pub mod killswitch_precedence;
+// LAB-ONLY (AQ-256): compiled only with the default-OFF `lab-substrate`
+// feature, so release builds carry none of the vxlan substrate transit.
+#[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+pub mod lab_substrate_transit;
 pub mod linux_authenticode;
 pub mod linux_blind_exit;
 pub mod linux_blind_exit_dataplane;

@@ -430,6 +430,18 @@ fn run() -> Result<(), String> {
             [cmd, rest @ ..] if cmd == "linux-killswitch-boot-check" => {
                 run_linux_killswitch_boot_check_command(rest)
             }
+            // LAB-ONLY (AQ-256): the lab tool's capability probe. Exists only
+            // in a `lab-substrate` build; it reads no attestation, touches no
+            // nft and needs no root. Without the feature the subcommand is
+            // unknown, which the lab tool reads as "capability missing".
+            #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+            [cmd] if cmd == "lab-substrate-capability" => {
+                println!(
+                    "{}",
+                    rustynetd::lab_substrate_transit::LAB_SUBSTRATE_CAPABILITY_LINE
+                );
+                Ok(())
+            }
             [cmd, rest @ ..] if cmd == "linux-authenticode-check" => {
                 run_linux_authenticode_check_command(rest)
             }
@@ -1478,7 +1490,6 @@ fn run_linux_authenticode_check_command(args: &[String]) -> Result<(), String> {
 fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String> {
     use rustynetd::linux_killswitch_boot::{
         BootSshCidr, BootTraversalEndpoint, collect_linux_killswitch_boot_report,
-        install_linux_boot_killswitch,
     };
     let mut fail_on_drift = true;
     let mut iface_name: String = "rustynet0".to_owned();
@@ -1588,17 +1599,33 @@ fn run_linux_killswitch_boot_check_command(args: &[String]) -> Result<(), String
         }
     }
 
+    // LAB-ONLY (AQ-256): validate the vxlan substrate transit attestation
+    // BEFORE anything below execs nft, so an invalid attestation exits
+    // non-zero with the boot table untouched. Absent file: transit off.
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    let substrate_transit = rustynetd::lab_substrate_transit::load_for_boot_check()?;
+
     // Install the pre-protective boot-time killswitch before running the
     // L8 drift check.  The boot table name (rustynet_boot) is distinct from
     // the reviewed daemon tables (rustynet / rustynet_g<N>) so the verifier
     // below is unaffected.
     if install_boot {
-        install_linux_boot_killswitch(
+        #[cfg(not(all(target_os = "linux", feature = "lab-substrate")))]
+        rustynetd::linux_killswitch_boot::install_linux_boot_killswitch(
             iface_name.as_str(),
             ssh_allow,
             &ssh_cidrs,
             wg_listen_port,
             &traversal_endpoints,
+        )?;
+        #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+        rustynetd::linux_killswitch_boot::install_linux_boot_killswitch_with_substrate_transit(
+            iface_name.as_str(),
+            ssh_allow,
+            &ssh_cidrs,
+            wg_listen_port,
+            &traversal_endpoints,
+            substrate_transit.as_ref(),
         )?;
     }
 
@@ -7110,5 +7137,33 @@ mod tests {
             ExitCode::GenericFailure
         );
         assert_eq!(classify_top_level_error(""), ExitCode::GenericFailure);
+    }
+
+    /// AQ-256: an invalid lab substrate transit attestation must stop the
+    /// boot check BEFORE anything execs nft (the installer and the L8
+    /// collector are the only nft execs in this command), so the boot table
+    /// is never half-built from a rejected attestation.
+    #[test]
+    fn linux_killswitch_boot_check_validates_the_transit_attestation_before_any_nft_exec() {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("fn run_linux_killswitch_boot_check_command(")
+            .expect("boot-check command fn");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\nfn ").expect("next fn")];
+        let load = body
+            .find("lab_substrate_transit::load_for_boot_check()?")
+            .expect("the boot check must load the attestation");
+        for nft_exec in [
+            "install_linux_boot_killswitch(",
+            "install_linux_boot_killswitch_with_substrate_transit(",
+            "collect_linux_killswitch_boot_report(iface_name",
+        ] {
+            let at = body.find(nft_exec).expect(nft_exec);
+            assert!(
+                load < at,
+                "{nft_exec} must come after the attestation check"
+            );
+        }
     }
 }
