@@ -128,6 +128,12 @@ tempfile = "3"
 signal-hook = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
+# TEST-ONLY (AQ-256): the lab substrate-transit write tool and the
+# security-audit control are differentially tested against the daemon's own
+# validator and status formatter. The feature is enabled for test builds only
+# (resolver 2 never unifies dev-dependency features into a normal build), so a
+# shipped `rustynetd` is unaffected.
+rustynetd = { path = "../rustynetd", features = ["lab-substrate"] }
 
 [lints]
 workspace = true

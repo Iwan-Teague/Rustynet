@@ -1810,25 +1810,212 @@ fn inherited_pin_may_be_rederived(resolved: &ResolvedEgressInterface) -> bool {
     resolved.inherited && resolved.provenance == EgressPinProvenance::Derived
 }
 
+/// The subset of the lab substrate-transit attestation this installer needs:
+/// which interface carries the overlay and which one carries the underlay.
+///
+/// LAB-ONLY (AQ-256, design D): compiled only under `--features vm-lab`, so a
+/// default (shipped) CLI carries no lab-aware code at all. The write side
+/// lives in the vm-lab-gated `ops_vm_lab_substrate_transit` module.
+#[cfg(feature = "vm-lab")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LabTransitAttestation {
+    pub(crate) overlay_interface: String,
+    pub(crate) underlay_interface: String,
+}
+
+#[cfg(feature = "vm-lab")]
+impl LabTransitAttestation {
+    /// Strict parser mirroring the daemon contract: the first line must be
+    /// `version=1`, the overlay/underlay keys must each appear exactly once,
+    /// the overlay must be one of the known lab overlay interfaces, and at
+    /// least one peer line must be present.
+    pub(crate) fn parse(content: &str) -> Result<Self, String> {
+        const OVERLAY_INTERFACES: [&str; 2] = ["rustynet-vx0", "rustynet-vxl"];
+        let mut overlay: Option<String> = None;
+        let mut underlay: Option<String> = None;
+        let mut peers = 0usize;
+        for (index, raw_line) in content.lines().enumerate() {
+            let line = raw_line.trim_end_matches('\r');
+            if index == 0 {
+                if line != "version=1" {
+                    return Err("attestation must start with version=1".to_owned());
+                }
+                continue;
+            }
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                return Err(format!("malformed attestation line: {line}"));
+            };
+            match key {
+                "version" => return Err("duplicate version= line".to_owned()),
+                "overlay_interface" => {
+                    if overlay.replace(value.to_owned()).is_some() {
+                        return Err("duplicate overlay_interface= line".to_owned());
+                    }
+                }
+                "underlay_interface" => {
+                    if underlay.replace(value.to_owned()).is_some() {
+                        return Err("duplicate underlay_interface= line".to_owned());
+                    }
+                }
+                "peer" => peers += 1,
+                other => return Err(format!("unknown attestation key: {other}")),
+            }
+        }
+        let overlay_interface =
+            overlay.ok_or_else(|| "attestation missing overlay_interface".to_owned())?;
+        let underlay_interface =
+            underlay.ok_or_else(|| "attestation missing underlay_interface".to_owned())?;
+        if !OVERLAY_INTERFACES.contains(&overlay_interface.as_str()) {
+            return Err(format!(
+                "attestation overlay_interface {overlay_interface} is not a lab overlay interface"
+            ));
+        }
+        if underlay_interface.is_empty() {
+            return Err("attestation underlay_interface is empty".to_owned());
+        }
+        if peers == 0 {
+            return Err("attestation carries no peer= lines".to_owned());
+        }
+        Ok(Self {
+            overlay_interface,
+            underlay_interface,
+        })
+    }
+}
+
+/// Path duplicated from the vm-lab-gated ops module (that module is
+/// binary-only under `--features vm-lab` and cannot be referenced from here).
+#[cfg(feature = "vm-lab")]
+const LAB_SUBSTRATE_TRANSIT_PATH: &str = "/etc/rustynet/lab/substrate-transit";
+
+/// Reads and parses the lab attestation at `path`, if present. Any absence or
+/// parse failure degrades to `None`: the installer must keep behaving
+/// byte-for-byte like the pre-substrate installer whenever no lab attestation
+/// exists. Only a regular file (never a symlink) owned by root and not
+/// group/other-writable counts, mirroring the daemon's leaf rules.
+#[cfg(feature = "vm-lab")]
+fn read_lab_transit_attestation_at(
+    path: &Path,
+    required_uid: u32,
+) -> Option<LabTransitAttestation> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    if !metadata.file_type().is_file()
+        || metadata.mode() & 0o022 != 0
+        || metadata.uid() != required_uid
+    {
+        return None;
+    }
+    let content = std::fs::read_to_string(path).ok()?;
+    LabTransitAttestation::parse(&content).ok()
+}
+
+/// Egress interface for a selected exit endpoint, honoring the lab substrate
+/// attestation: when the route to the exit endpoint lands on the attested
+/// overlay interface, the underlay interface is what traffic must use.
+#[cfg(feature = "vm-lab")]
+fn resolve_endpoint_derived_egress(
+    route_derived: &str,
+    lab_transit: Option<&LabTransitAttestation>,
+) -> String {
+    match lab_transit {
+        Some(attestation) if attestation.overlay_interface == route_derived => {
+            attestation.underlay_interface.clone()
+        }
+        _ => route_derived.to_owned(),
+    }
+}
+
+/// The egress interface the selected exit endpoint routes through. Without
+/// the lab feature this is exactly the route-derived interface; with it, the
+/// lab substrate attestation may substitute the underlay for the overlay (see
+/// [`resolve_endpoint_derived_egress`]).
+fn derive_endpoint_egress(endpoint: &str) -> Result<String, String> {
+    #[cfg(feature = "vm-lab")]
+    {
+        derive_endpoint_egress_with(
+            endpoint,
+            &detect_egress_interface_for_endpoint,
+            Path::new(LAB_SUBSTRATE_TRANSIT_PATH),
+            0,
+        )
+    }
+    #[cfg(not(feature = "vm-lab"))]
+    {
+        detect_egress_interface_for_endpoint(endpoint)
+    }
+}
+
+/// [`derive_endpoint_egress`] with the route detector, the attestation path
+/// and the required owner injected, so the glue (the attestation actually being
+/// consulted and its underlay actually substituted) is unit-testable.
+#[cfg(feature = "vm-lab")]
+fn derive_endpoint_egress_with(
+    endpoint: &str,
+    detect: &dyn Fn(&str) -> Result<String, String>,
+    attestation_path: &Path,
+    required_uid: u32,
+) -> Result<String, String> {
+    let route_derived = detect(endpoint)?;
+    let attestation = read_lab_transit_attestation_at(attestation_path, required_uid);
+    Ok(resolve_endpoint_derived_egress(
+        &route_derived,
+        attestation.as_ref(),
+    ))
+}
+
+/// An explicit egress value must match the (substituted) endpoint-derived one,
+/// otherwise the operator pin would silently steer traffic somewhere the
+/// selected exit endpoint does not route through.
+fn confirm_explicit_egress(
+    explicit_egress: Option<&str>,
+    derived: &str,
+    endpoint: &str,
+) -> Result<bool, String> {
+    let Some(explicit_value) = explicit_egress else {
+        return Ok(false);
+    };
+    if explicit_value.trim().is_empty() {
+        return Ok(false);
+    }
+    if explicit_value != derived {
+        return Err(format!(
+            "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
+        ));
+    }
+    Ok(true)
+}
+
 fn resolve_egress_interface(
     explicit_egress: Option<String>,
     existing_egress: Option<String>,
     existing_provenance: EgressPinProvenance,
     selected_exit_endpoint: Option<&str>,
 ) -> Result<ResolvedEgressInterface, String> {
+    resolve_egress_interface_with(
+        explicit_egress,
+        existing_egress,
+        existing_provenance,
+        selected_exit_endpoint,
+        &derive_endpoint_egress,
+    )
+}
+
+/// [`resolve_egress_interface`] with the endpoint-derived egress injected.
+fn resolve_egress_interface_with(
+    explicit_egress: Option<String>,
+    existing_egress: Option<String>,
+    existing_provenance: EgressPinProvenance,
+    selected_exit_endpoint: Option<&str>,
+    derive_egress: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<ResolvedEgressInterface, String> {
     if let Some(endpoint) = selected_exit_endpoint {
-        let derived = detect_egress_interface_for_endpoint(endpoint)?;
-        let mut operator_confirmed = false;
-        if let Some(explicit_value) = explicit_egress.as_deref()
-            && !explicit_value.trim().is_empty()
-        {
-            if explicit_value != derived {
-                return Err(format!(
-                    "explicit egress interface {explicit_value} does not route to selected exit endpoint {endpoint}; expected {derived}"
-                ));
-            }
-            operator_confirmed = true;
-        }
+        let derived = derive_egress(endpoint)?;
+        let operator_confirmed =
+            confirm_explicit_egress(explicit_egress.as_deref(), &derived, endpoint)?;
         return Ok(ResolvedEgressInterface {
             interface: derived,
             // The operator did state this value explicitly; it merely happens
@@ -3029,12 +3216,17 @@ mod tests {
 
     use super::{
         EGRESS_SOURCE_DERIVED, EGRESS_SOURCE_OPERATOR, EgressPinProvenance,
-        ResolvedEgressInterface, assignment_peer_endpoint, bytes_to_hex,
+        ResolvedEgressInterface, assignment_peer_endpoint, bytes_to_hex, confirm_explicit_egress,
         inherited_pin_may_be_rederived, installer_unit_start_order, parse_dev_interface_token,
         parse_dns_resolver_bind_addr_install, parse_install_bool,
         parse_traversal_stun_servers_install, read_env_file_values,
         render_assignment_refresh_env_contents, resolve_egress_interface,
         resolve_selected_exit_node_id, systemctl_state_retryable, wait_for_unix_socket,
+    };
+    #[cfg(feature = "vm-lab")]
+    use super::{
+        LabTransitAttestation, derive_endpoint_egress_with, read_lab_transit_attestation_at,
+        resolve_egress_interface_with, resolve_endpoint_derived_egress,
     };
 
     /// The provenance marker is the ONLY thing that distinguishes a pin this
@@ -3131,6 +3323,247 @@ mod tests {
                     inherited: true,
                 }
             );
+        }
+    }
+
+    /// The lab substrate attestation rewrites the endpoint-derived egress ONLY
+    /// when the route lands on the attested overlay interface; every other
+    /// route (and every no-attestation run) must resolve unchanged.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn lab_transit_substitutes_underlay_only_for_the_attested_overlay() {
+        let attestation = LabTransitAttestation {
+            overlay_interface: "rustynet-vx0".to_owned(),
+            underlay_interface: "mgmt0".to_owned(),
+        };
+        assert_eq!(
+            resolve_endpoint_derived_egress("rustynet-vx0", Some(&attestation)),
+            "mgmt0"
+        );
+        assert_eq!(
+            resolve_endpoint_derived_egress("rustynet-vxl", Some(&attestation)),
+            "rustynet-vxl"
+        );
+        assert_eq!(
+            resolve_endpoint_derived_egress("eth0", Some(&attestation)),
+            "eth0"
+        );
+        assert_eq!(
+            resolve_endpoint_derived_egress("rustynet-vx0", None),
+            "rustynet-vx0"
+        );
+    }
+
+    /// Without an attestation the explicit-vs-derived comparison is untouched:
+    /// an explicit egress that disagrees with the endpoint-derived interface
+    /// must still be refused with the established error text.
+    #[test]
+    fn without_attestation_explicit_mismatch_still_refuses() {
+        let err = confirm_explicit_egress(Some("wlan0"), "eth0", "100.64.0.1:41820")
+            .expect_err("mismatching explicit egress must be refused");
+        assert_eq!(
+            err,
+            "explicit egress interface wlan0 does not route to selected exit endpoint 100.64.0.1:41820; expected eth0"
+        );
+        assert!(!confirm_explicit_egress(None, "eth0", "100.64.0.1:41820").unwrap());
+        assert!(!confirm_explicit_egress(Some("  "), "eth0", "100.64.0.1:41820").unwrap());
+        assert!(confirm_explicit_egress(Some("eth0"), "eth0", "100.64.0.1:41820").unwrap());
+    }
+
+    /// The attestation parser is strict: version first, each key at most once,
+    /// known overlay interfaces only, at least one peer.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn lab_transit_attestation_parser_is_strict() {
+        let good = LabTransitAttestation::parse(
+            "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+        )
+        .expect("valid attestation should parse");
+        assert_eq!(good.overlay_interface, "rustynet-vx0");
+        assert_eq!(good.underlay_interface, "mgmt0");
+
+        for (bad, fragment) in [
+            (
+                "overlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "version=1",
+            ),
+            (
+                "version=2\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "version=1",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\noverlay_interface=rustynet-vxl\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "duplicate",
+            ),
+            (
+                "version=1\noverlay_interface=eth0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n",
+                "not a lab overlay interface",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\npeer=100.64.0.11\n",
+                "missing underlay_interface",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\n",
+                "no peer= lines",
+            ),
+            (
+                "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\nsurprise=yes\npeer=100.64.0.11\n",
+                "unknown attestation key",
+            ),
+        ] {
+            let err =
+                LabTransitAttestation::parse(bad).expect_err("invalid attestation must be refused");
+            assert!(
+                err.contains(fragment),
+                "unexpected error for {fragment}: {err}"
+            );
+        }
+    }
+
+    /// A scratch attestation file owned by the running user (the stand-in for
+    /// root) with the given mode, plus that user's uid.
+    #[cfg(feature = "vm-lab")]
+    fn scratch_attestation(tag: &str, mode: u32, body: &str) -> (std::path::PathBuf, u32) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir =
+            std::env::temp_dir().join(format!("rn-install-attest-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("substrate-transit");
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        let uid = std::fs::metadata(&path).unwrap().uid();
+        (path, uid)
+    }
+
+    #[cfg(feature = "vm-lab")]
+    const GOOD_ATTESTATION: &str =
+        "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=mgmt0\npeer=100.64.0.11\n";
+
+    /// The glue the unit tests above do not reach: the installer must actually
+    /// CONSULT the attestation file and substitute the attested underlay, but
+    /// only for the attested overlay, and only from a trustworthy file.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn the_endpoint_derived_egress_consults_the_attestation_file() {
+        let overlay = |_: &str| Ok("rustynet-vx0".to_owned());
+        let (path, uid) = scratch_attestation("glue", 0o644, GOOD_ATTESTATION);
+        assert_eq!(
+            derive_endpoint_egress_with("100.64.0.1:51820", &overlay, &path, uid).unwrap(),
+            "mgmt0",
+            "the attested underlay replaces the attested overlay"
+        );
+        // Route lands elsewhere: untouched.
+        let nic = |_: &str| Ok("eth0".to_owned());
+        assert_eq!(
+            derive_endpoint_egress_with("100.64.0.1:51820", &nic, &path, uid).unwrap(),
+            "eth0"
+        );
+        // A route-detection failure propagates untouched.
+        let failing = |_: &str| Err("no route".to_owned());
+        assert_eq!(
+            derive_endpoint_egress_with("100.64.0.1:51820", &failing, &path, uid).unwrap_err(),
+            "no route"
+        );
+        // Untrustworthy or absent attestations never substitute: wrong owner,
+        // group/other-writable, a symlink, a directory, a missing file.
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &path, uid.wrapping_add(1)).unwrap(),
+            "rustynet-vx0",
+            "wrong owner"
+        );
+        let (loose, loose_uid) = scratch_attestation("glue-loose", 0o664, GOOD_ATTESTATION);
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &loose, loose_uid).unwrap(),
+            "rustynet-vx0",
+            "group-writable"
+        );
+        let link = path.with_file_name("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &link, uid).unwrap(),
+            "rustynet-vx0",
+            "symlink"
+        );
+        let missing = path.with_file_name("nope");
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &missing, uid).unwrap(),
+            "rustynet-vx0",
+            "absent"
+        );
+        assert!(read_lab_transit_attestation_at(path.parent().unwrap(), uid).is_none());
+        let (bad, bad_uid) = scratch_attestation("glue-bad", 0o644, "version=2\n");
+        assert_eq!(
+            derive_endpoint_egress_with("e", &overlay, &bad, bad_uid).unwrap(),
+            "rustynet-vx0",
+            "unparseable"
+        );
+    }
+
+    /// An explicit egress value is compared against the SUBSTITUTED
+    /// interface: the underlay is accepted (and recorded as an operator pin),
+    /// the overlay the route reported is refused.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn explicit_egress_is_compared_against_the_substituted_interface() {
+        let (path, uid) = scratch_attestation("explicit", 0o644, GOOD_ATTESTATION);
+        let derive = |endpoint: &str| {
+            derive_endpoint_egress_with(endpoint, &|_| Ok("rustynet-vx0".to_owned()), &path, uid)
+        };
+        let ok = resolve_egress_interface_with(
+            Some("mgmt0".to_owned()),
+            None,
+            EgressPinProvenance::Derived,
+            Some("100.64.0.1:51820"),
+            &derive,
+        )
+        .unwrap();
+        assert_eq!(ok.interface, "mgmt0");
+        assert_eq!(ok.provenance, EgressPinProvenance::Operator);
+        assert!(!ok.inherited);
+        let err = resolve_egress_interface_with(
+            Some("rustynet-vx0".to_owned()),
+            None,
+            EgressPinProvenance::Derived,
+            Some("100.64.0.1:51820"),
+            &derive,
+        )
+        .unwrap_err();
+        assert!(err.contains("expected mgmt0"), "{err}");
+        // No explicit value: the substituted interface is recorded as derived.
+        let derived = resolve_egress_interface_with(
+            None,
+            None,
+            EgressPinProvenance::Derived,
+            Some("100.64.0.1:51820"),
+            &derive,
+        )
+        .unwrap();
+        assert_eq!(derived.interface, "mgmt0");
+        assert_eq!(derived.provenance, EgressPinProvenance::Derived);
+    }
+
+    /// The installer must never ignore an attestation the daemon accepts: a
+    /// file the daemon parses is a file this reader parses to the same
+    /// overlay and underlay.
+    #[cfg(all(feature = "vm-lab", target_os = "linux"))]
+    #[test]
+    fn whatever_the_daemon_accepts_the_installer_reader_accepts() {
+        use rustynetd::lab_substrate_transit::parse_attestation;
+        for (overlay, underlay) in [
+            ("rustynet-vx0", "eth0"),
+            ("rustynet-vxl", "enp0s8"),
+            ("rustynet-vx0", "br-lan_dev"),
+        ] {
+            let doc = format!(
+                "version=1\noverlay_interface={overlay}\nunderlay_interface={underlay}\n\
+                 peer=10.0.0.2\npeer=100.64.0.3\n"
+            );
+            let daemon = parse_attestation(&doc).expect("daemon accepts");
+            let installer = LabTransitAttestation::parse(&doc).expect("installer accepts");
+            assert_eq!(installer.overlay_interface, daemon.overlay_interface());
+            assert_eq!(installer.underlay_interface, daemon.underlay_interface());
         }
     }
 

@@ -7,7 +7,8 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::security_audit::{
-    AuditResult, run_security_audits, security_audit_runtime_implemented, security_audits_ok,
+    AuditResult, run_security_audits, run_substrate_transit_control,
+    security_audit_runtime_implemented, security_audits_ok, substrate_transit_declared,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -130,6 +131,31 @@ impl OrchestrationStage for SecurityAuditValidationStage {
                 failures.push(format!("{alias}: {e}"));
             }
             per_control.push((alias.clone(), tag, results));
+            // Substrate-transit control: Linux-only (the vxlan lab substrate is
+            // a Linux construct), evaluated outside the eight-entry battery so
+            // it never claims a run-matrix column on macOS/Windows. Passes iff
+            // the run's declared vxlan posture matches the daemon's live
+            // substrate_transit status; when active, the nft ruleset must
+            // carry the exact attested rule shape with non-zero counters in
+            // both the group and boot tables. Evidence lands in the stage log
+            // so a PASS is never backed by nothing.
+            if platform == VmGuestPlatform::Linux {
+                let declared = substrate_transit_declared(ctx.substrate_record.as_ref());
+                match run_substrate_transit_control(&*shell, declared) {
+                    Ok(line) => {
+                        if let Err(e) = append_stage_evidence_line(
+                            &ctx.report_dir,
+                            StageId::SecurityAuditValidation.as_str(),
+                            &format!("{alias}: {line}"),
+                        ) {
+                            failures.push(format!(
+                                "{alias}: substrate transit evidence not written: {e}"
+                            ));
+                        }
+                    }
+                    Err(e) => failures.push(format!("{alias}: substrate transit control: {e}")),
+                }
+            }
         }
 
         if !reported_skips.is_empty() {

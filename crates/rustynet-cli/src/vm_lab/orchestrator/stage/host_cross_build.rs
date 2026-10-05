@@ -82,6 +82,21 @@ const BUILD_PACKAGES: &[&str] = &["rustynetd", "rustynet-cli", "rustynet-relay"]
 /// Package-qualified features, comma-joined as `cargo --features` expects when
 /// several `-p` packages are built at once.
 const BUILD_FEATURES: &str = "rustynet-cli/vm-lab,rustynet-relay/daemon";
+/// Same set plus the daemon-side lab-substrate feature. Only vxlan-substrate
+/// runs need it; every other run keeps the default-off daemon build so the
+/// feature surface stays exactly as wide as the run asked for.
+const BUILD_FEATURES_VXLAN: &str =
+    "rustynet-cli/vm-lab,rustynet-relay/daemon,rustynetd/lab-substrate";
+
+/// The `cargo --features` value for a run: the daemon lab-substrate feature is
+/// added only when the run declared the vxlan cross-network substrate.
+pub fn build_features(vxlan: bool) -> &'static str {
+    if vxlan {
+        BUILD_FEATURES_VXLAN
+    } else {
+        BUILD_FEATURES
+    }
+}
 
 /// Map a node's platform + probed CPU arch (`uname -m`) onto the Rust target
 /// triple the host must build for.
@@ -144,7 +159,11 @@ fn normalise_arch(arch: &str) -> Result<Arch, String> {
 ///
 /// Fail-closed: an empty triple, or a glibc floor requested for a non-linux
 /// triple, is an error.
-pub fn host_build_argv(triple: &str, glibc_floor: Option<&str>) -> Result<Vec<String>, String> {
+pub fn host_build_argv(
+    triple: &str,
+    glibc_floor: Option<&str>,
+    vxlan: bool,
+) -> Result<Vec<String>, String> {
     if triple.trim().is_empty() {
         return Err("host_build_argv: empty target triple".to_owned());
     }
@@ -184,7 +203,7 @@ pub fn host_build_argv(triple: &str, glibc_floor: Option<&str>) -> Result<Vec<St
         argv.push((*pkg).to_owned());
     }
     argv.push("--features".to_owned());
-    argv.push(BUILD_FEATURES.to_owned());
+    argv.push(build_features(vxlan).to_owned());
     Ok(argv)
 }
 
@@ -289,6 +308,7 @@ pub struct HostBuildArtifact {
 pub fn execute_host_builds<B, E, D>(
     target_root: &Path,
     tasks: &[HostBuildTask],
+    vxlan: bool,
     run_build: B,
     binary_exists: E,
     objdump_dynamic: D,
@@ -300,7 +320,7 @@ where
 {
     let mut artifacts = Vec::with_capacity(tasks.len());
     for task in tasks {
-        let argv = host_build_argv(&task.triple, task.glibc_floor.as_deref())?;
+        let argv = host_build_argv(&task.triple, task.glibc_floor.as_deref(), vxlan)?;
         run_build(&argv, target_root)
             .map_err(|e| format!("host build failed for {}: {e}", task.triple))?;
 
@@ -357,10 +377,12 @@ pub fn run_planned_host_builds(
     repo_dir: &Path,
     target_root: &Path,
     tasks: &[HostBuildTask],
+    vxlan: bool,
 ) -> Result<Vec<HostBuildArtifact>, String> {
     execute_host_builds(
         target_root,
         tasks,
+        vxlan,
         |argv, tr| run_host_cargo(repo_dir, argv, tr),
         |bin| bin.is_file(),
         objdump_dynamic_symbols,
@@ -1334,7 +1356,7 @@ mod tests {
 
     #[test]
     fn linux_argv_uses_zigbuild_with_glibc_floor() {
-        let argv = host_build_argv("x86_64-unknown-linux-gnu", Some("2.31")).unwrap();
+        let argv = host_build_argv("x86_64-unknown-linux-gnu", Some("2.31"), false).unwrap();
         assert_eq!(argv[0], "zigbuild");
         assert_eq!(argv[1], "--release");
         assert_eq!(argv[2], "--target");
@@ -1349,9 +1371,28 @@ mod tests {
         );
     }
 
+    /// Only a vxlan-substrate run builds the daemon with `lab-substrate`; the
+    /// default run keeps the daemon feature set untouched.
+    #[test]
+    fn vxlan_runs_add_the_daemon_lab_substrate_feature_others_do_not() {
+        let plain = host_build_argv("x86_64-unknown-linux-gnu", None, false).unwrap();
+        let vxlan = host_build_argv("x86_64-unknown-linux-gnu", None, true).unwrap();
+        assert!(
+            plain
+                .windows(2)
+                .any(|w| w == ["--features", "rustynet-cli/vm-lab,rustynet-relay/daemon"])
+        );
+        assert!(vxlan.windows(2).any(|w| w
+            == [
+                "--features",
+                "rustynet-cli/vm-lab,rustynet-relay/daemon,rustynetd/lab-substrate"
+            ]));
+        assert_eq!(plain.len(), vxlan.len());
+    }
+
     #[test]
     fn macos_argv_is_plain_cargo_build_no_zig() {
-        let argv = host_build_argv("aarch64-apple-darwin", None).unwrap();
+        let argv = host_build_argv("aarch64-apple-darwin", None, false).unwrap();
         assert_eq!(argv[0], "build");
         assert_eq!(argv[3], "aarch64-apple-darwin");
     }
@@ -1359,11 +1400,11 @@ mod tests {
     #[test]
     fn argv_fails_closed_on_bad_inputs() {
         // Empty triple.
-        assert!(host_build_argv("", None).is_err());
+        assert!(host_build_argv("", None, false).is_err());
         // glibc floor on a non-linux triple is meaningless — reject, don't ignore.
-        assert!(host_build_argv("aarch64-apple-darwin", Some("2.31")).is_err());
+        assert!(host_build_argv("aarch64-apple-darwin", Some("2.31"), false).is_err());
         // An unrecognised triple family.
-        assert!(host_build_argv("wasm32-unknown-unknown", None).is_err());
+        assert!(host_build_argv("wasm32-unknown-unknown", None, false).is_err());
     }
 
     #[test]
@@ -1479,6 +1520,7 @@ mod tests {
         let out = execute_host_builds(
             root,
             &linux_task(),
+            false,
             |argv, tr| {
                 assert_eq!(argv[0], "zigbuild");
                 assert_eq!(tr, root);
@@ -1499,6 +1541,7 @@ mod tests {
         let err = execute_host_builds(
             Path::new("/tmp/x"),
             &linux_task(),
+            false,
             |_argv, _tr| Err("linker exploded".to_owned()),
             |_bin| true,
             |_bin| Ok(String::new()),
@@ -1512,6 +1555,7 @@ mod tests {
         let err = execute_host_builds(
             Path::new("/tmp/x"),
             &linux_task(),
+            false,
             |_argv, _tr| Ok(()),
             |_bin| true,
             // 2.40 exceeds the 2.31 floor — must abort, never ship.
@@ -1526,6 +1570,7 @@ mod tests {
         let err = execute_host_builds(
             Path::new("/tmp/x"),
             &linux_task(),
+            false,
             |_argv, _tr| Ok(()),
             |_bin| false,
             |_bin| Ok(String::new()),
@@ -1569,6 +1614,7 @@ mod tests {
         let out = execute_host_builds(
             Path::new("/tmp/x"),
             &task,
+            false,
             |argv, _tr| {
                 assert_eq!(argv[0], "build");
                 Ok(())

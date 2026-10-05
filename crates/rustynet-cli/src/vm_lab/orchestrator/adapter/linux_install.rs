@@ -858,6 +858,23 @@ fn wait_for_linux_daemon_ready(conn: &NodeConnection) -> Result<(), AdapterError
     }
 }
 
+/// Env line telling rn_bootstrap.sh to build the daemon with the
+/// `lab-substrate` cargo feature. Emitted ONLY for a vxlan run that actually
+/// provisioned the overlay; every other run keeps the env byte-identical to
+/// the pre-substrate format (the bootstrap treats the variable as unset).
+fn lab_substrate_env_line(
+    substrate_record: Option<
+        &crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord,
+    >,
+) -> &'static str {
+    match substrate_record {
+        Some(record) if record.substrate_id == "vxlan" && record.provisioned => {
+            "RN_LAB_SUBSTRATE=1\n"
+        }
+        _ => "",
+    }
+}
+
 fn build_bootstrap_env(
     node_id: &str,
     role: &NodeRole,
@@ -905,7 +922,8 @@ fn build_bootstrap_env(
         None => String::new(),
     };
     Ok(format!(
-        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n{lab_stun_line}{linux_backend_line}"
+        "ROLE={role_str}\nNODE_ID={node_id}\nNETWORK_ID={network_id}\nSSH_ALLOW_CIDRS={ssh_allow_cidrs}\nSOURCE_ARCHIVE=/tmp/rn_source.tar.gz\nRUSTYNET_BOOTSTRAP_REGISTRY_ATTEMPTS=2\n{lab_stun_line}{linux_backend_line}{}",
+        lab_substrate_env_line(ctx.substrate_record.as_ref())
     ))
 }
 
@@ -2194,6 +2212,9 @@ mod daemon_launch_flag_parity_tests {
     //! [`REQUIRED_DAEMON_LAUNCH_FLAGS`] entry — a dropped `--node-role`
     //! silently defaults the daemon to admin (the Windows N4 failure class).
 
+    use super::BOOTSTRAP_SCRIPT;
+    use super::lab_substrate_env_line;
+
     /// The exact unit `ops install-systemd` renders to
     /// /etc/systemd/system/rustynetd.service during bootstrap.
     static LINUX_DAEMON_UNIT: &str =
@@ -2236,6 +2257,94 @@ mod daemon_launch_flag_parity_tests {
         assert!(
             LINUX_DAEMON_UNIT.contains("--node-role ${RUSTYNET_NODE_ROLE}"),
             "unit must consume the node role env the bootstrap env provides"
+        );
+    }
+
+    /// Only a vxlan run that provisioned the overlay asks the bootstrap to
+    /// build the daemon with `lab-substrate`; every other substrate state
+    /// (no record, different substrate, not provisioned) keeps the env
+    /// byte-identical to the pre-substrate format.
+    #[test]
+    fn lab_substrate_env_line_is_emitted_only_for_provisioned_vxlan() {
+        use crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord;
+        let record = |substrate_id: &str, provisioned: bool| SubstrateRecord {
+            substrate_id: substrate_id.to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned,
+            participants: vec![],
+        };
+        assert_eq!(
+            lab_substrate_env_line(Some(&record("vxlan", true))),
+            "RN_LAB_SUBSTRATE=1\n"
+        );
+        for record in [
+            None,
+            Some(record("vxlan", false)),
+            Some(record("netns", true)),
+        ] {
+            assert_eq!(
+                lab_substrate_env_line(record.as_ref()),
+                "",
+                "non-vxlan or unprovisioned substrate must not enable the lab build feature"
+            );
+        }
+    }
+
+    /// Source pin: build_bootstrap_env must thread the substrate line into the
+    /// env content (mutation caught: dropping the lab_substrate_env_line call
+    /// would strand vxlan runs on daemons without the lab-substrate feature).
+    #[test]
+    fn bootstrap_env_threads_the_lab_substrate_line() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
+        let start = source
+            .find("fn build_bootstrap_env(")
+            .expect("build_bootstrap_env must exist");
+        let body = &source[start..];
+        assert!(
+            body.contains("lab_substrate_env_line(ctx.substrate_record.as_ref())"),
+            "bootstrap env must forward the vxlan lab-substrate request to rn_bootstrap.sh"
+        );
+    }
+
+    /// Source pin (script side): rn_bootstrap.sh must (a) allowlist
+    /// RN_LAB_SUBSTRATE in the strict env parser and (b) apply the feature
+    /// flag to BOTH daemon build paths (registry + offline fallback) without
+    /// touching the cli/relay feature sets.
+    #[test]
+    fn bootstrap_script_gates_the_daemon_lab_substrate_feature() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("\n  RN_LAB_SUBSTRATE\n"),
+            "env parser allowlist must accept RN_LAB_SUBSTRATE"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("rn_daemon_features=\"--features lab-substrate\""),
+            "bootstrap must map RN_LAB_SUBSTRATE=1 to --features lab-substrate"
+        );
+        let build_lines = BOOTSTRAP_SCRIPT
+            .lines()
+            .filter(|line| line.contains("-p rustynetd "))
+            .count();
+        assert!(
+            build_lines >= 2,
+            "both the registry and the offline daemon build must exist: {build_lines}"
+        );
+        for line in BOOTSTRAP_SCRIPT
+            .lines()
+            .filter(|l| l.contains("-p rustynetd "))
+        {
+            assert!(
+                line.contains("$rn_daemon_features"),
+                "daemon build must honour the lab-substrate gate: {line}"
+            );
+        }
+        assert_eq!(
+            BOOTSTRAP_SCRIPT
+                .lines()
+                .filter(|line| line.contains("rn_daemon_features"))
+                .count(),
+            4,
+            "gate init + condition + exactly two build sites expected"
         );
     }
 

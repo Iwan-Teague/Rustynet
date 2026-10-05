@@ -89,6 +89,10 @@ mod vm_lab;
 mod workspace_root;
 
 use std::collections::{HashMap, HashSet};
+// LAB-ONLY (AQ-256). Declared here, not with the other `mod` lines above, so
+// this declaration never shares diff context with the crate-root lint preamble.
+#[cfg(feature = "vm-lab")]
+mod ops_vm_lab_substrate_transit;
 use std::convert::TryFrom;
 use std::fs;
 use std::fs::OpenOptions;
@@ -942,6 +946,12 @@ enum OpsCommand {
     Sha256File {
         config: ops_live_lab_orchestrator::Sha256FileConfig,
     },
+    #[cfg(feature = "vm-lab")]
+    VmLabWriteSubstrateTransit {
+        config: ops_vm_lab_substrate_transit::VmLabWriteSubstrateTransitConfig,
+    },
+    #[cfg(feature = "vm-lab")]
+    VmLabRemoveSubstrateTransit,
     #[cfg(feature = "vm-lab")]
     ValidateCrossNetworkForensicsBundle {
         config: ops_live_lab_orchestrator::ValidateCrossNetworkForensicsBundleConfig,
@@ -3060,6 +3070,26 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                 path: parser.required_path("--path")?,
             },
         }),
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-write-substrate-transit" => {
+            let peers = collect_repeated_option_values(args.get(1..).unwrap_or(&[]), "--peer");
+            Ok(OpsCommand::VmLabWriteSubstrateTransit {
+                config: ops_vm_lab_substrate_transit::VmLabWriteSubstrateTransitConfig {
+                    overlay_interface: parser.required("--overlay-interface")?,
+                    underlay_interface: parser.required("--underlay-interface")?,
+                    peers,
+                },
+            })
+        }
+        #[cfg(feature = "vm-lab")]
+        "vm-lab-remove-substrate-transit" => {
+            if args.len() != 1 {
+                return Err(
+                    "ops vm-lab-remove-substrate-transit does not accept options".to_owned(),
+                );
+            }
+            Ok(OpsCommand::VmLabRemoveSubstrateTransit)
+        }
         #[cfg(feature = "vm-lab")]
         "validate-cross-network-forensics-bundle" => {
             Ok(OpsCommand::ValidateCrossNetworkForensicsBundle {
@@ -8898,6 +8928,14 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::Sha256File { config } => {
             ops_live_lab_orchestrator::execute_ops_sha256_file(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabWriteSubstrateTransit { config } => {
+            ops_vm_lab_substrate_transit::execute_ops_vm_lab_write_substrate_transit(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabRemoveSubstrateTransit => {
+            ops_vm_lab_substrate_transit::execute_ops_vm_lab_remove_substrate_transit()
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::ValidateCrossNetworkForensicsBundle { config } => {
@@ -20693,6 +20731,8 @@ fn help_text() -> String {
         "  ops vm-lab-sync-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] [--require-same-network] (--repo-url <url> | --local-source-dir <path>) --dest-dir <absolute-path> [--workdir <absolute-path>] [--branch <name>] [--remote <name>] --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-run [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
         "  ops vm-lab-bootstrap [--inventory <path>] [--vm <alias>]... [--vms <alias[,alias...]>] [--all] [--target <ssh-target>]... [--targets <ssh-target[,ssh-target...]>] --workdir <absolute-path> --program <path|name> [--arg <value>]... [--ssh-user <user>] [--ssh-identity-file <path>] [--known-hosts-file <path>] [--sudo] [--timeout-secs <secs>]",
+        "  ops vm-lab-write-substrate-transit --overlay-interface <rustynet-vx0|rustynet-vxl> --underlay-interface <dev> --peer <ip>...  (atomically write /etc/rustynet/lab/substrate-transit, mode 0644 root:root in a 0755 root:root dir; every --peer must route over --underlay-interface; 1..=32 unique private/CGNAT peers)",
+        "  ops vm-lab-remove-substrate-transit  (idempotently remove /etc/rustynet/lab/substrate-transit)",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--dry-run]",
         "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>] [--lab-stun-servers <ip:port[,ip:port...]>] [--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>] [--prebuilt-node-binaries <alias>=<abs-dir>]... [--prebuilt-glibc-floor <ver>]",

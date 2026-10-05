@@ -71,6 +71,10 @@ pub(crate) fn execute_rust_native_orchestration(
         config.cross_network_impairment_profile.as_deref(),
         config.cross_network_substrate.as_deref(),
     )?;
+    let vxlan_substrate = matches!(
+        cross_network_options.substrate,
+        orchestrator::stage::cross_network::CrossNetworkSubstrate::Vxlan
+    );
     let setup_only = config.setup_only;
     let run_only = config.run_only;
     // RNQ-07: a nonzero per-stage deadline is now enforced (real cancellable
@@ -801,7 +805,12 @@ pub(crate) fn execute_rust_native_orchestration(
             tasks.len(),
             target_root.display()
         );
-        let artifacts = host_cross_build::run_planned_host_builds(&repo_dir, &target_root, &tasks)?;
+        let artifacts = host_cross_build::run_planned_host_builds(
+            &repo_dir,
+            &target_root,
+            &tasks,
+            vxlan_substrate,
+        )?;
         for a in &artifacts {
             eprintln!(
                 "[host-cross] built {} ({} binaries, glibc_max={:?})",

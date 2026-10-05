@@ -29,6 +29,7 @@ RN_BOOTSTRAP_ENV_KEYS=(
   RUSTYNET_BACKEND
   RN_PREBUILT_BINARIES
   RN_PREBUILT_DIR
+  RN_LAB_SUBSTRATE
 )
 
 load_bootstrap_env() {
@@ -720,6 +721,13 @@ pin_regular_resolv_conf 1.1.1.1 8.8.8.8
 # during dependency resolution on a cache miss, so the bootstrap still fails
 # loudly for a genuine network problem and never silently builds stale/partial
 # state. Mirrors the macOS bootstrap's existing `cargo build --offline` path.
+# RN_LAB_SUBSTRATE=1 (set by the orchestrator for vxlan-substrate runs) builds
+# the daemon with the `lab-substrate` cargo feature; every other run keeps the
+# default-off daemon build.
+rn_daemon_features=""
+if [[ "${RN_LAB_SUBSTRATE:-0}" == "1" ]]; then
+  rn_daemon_features="--features lab-substrate"
+fi
 if [[ "${RN_PREBUILT_BINARIES:-0}" == "1" ]]; then
   # host-cross-binary mode: the orchestrator cross-built the node binaries on the
   # host and scp'd them here, so install those and SKIP the guest build entirely
@@ -746,7 +754,7 @@ if [[ "${RN_PREBUILT_BINARIES:-0}" == "1" ]]; then
   rn_bin_src="target/release"
 elif wait_for_cargo_registry_endpoint; then
   rn_bin_src="target/release"
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynetd $rn_daemon_features
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release -p rustynet-cli --features vm-lab --bin rustynet-cli
   # rustynet-relay is a separate binary whose bin target requires the `daemon`
   # feature, so it builds as its own invocation. Built on every node (cheap —
@@ -759,7 +767,7 @@ elif wait_for_cargo_registry_endpoint; then
 else
   echo "[bootstrap] cargo registry unreachable; falling back to offline build from cargo cache" >&2
   rn_bin_src="target/release"
-  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd
+  run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynetd $rn_daemon_features
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-cli --features vm-lab --bin rustynet-cli
   run_local_timed 7200 rustup run "${RUST_TOOLCHAIN_CHANNEL}" cargo build --release --offline -p rustynet-relay --features daemon
 fi

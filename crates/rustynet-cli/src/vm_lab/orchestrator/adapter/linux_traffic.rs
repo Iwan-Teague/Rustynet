@@ -247,6 +247,137 @@ pub(crate) fn parse_node_clean_probe(raw: &str) -> Result<(), AdapterError> {
     }
 }
 
+/// Post-cleanup substrate-transit residue probe, run by
+/// [`assert_node_clean`] as a SECOND read-only pass after
+/// [`LINUX_NODE_CLEAN_PROBE`] (which stays byte-identical for the three
+/// dimensions the base probe owns). The vxlan lab substrate leaves exactly two
+/// kinds of node-local state — the `rustynet_substrate_transit` nft rules and
+/// the root-only attestation file `/etc/rustynet/lab/substrate-transit` — and
+/// both must be gone for a node to be clean again:
+///
+///   `substrate nft=<ok|fail|absent> rules=<count|unknown> attest=<present|absent|unknown>`
+///
+/// `nft=absent` means the `nft` binary is missing (benign only when the
+/// attestation is also absent — without the file no daemon will re-provision);
+/// `nft=fail` means the tool exists but `sudo -n nft list ruleset` failed →
+/// UNVERIFIABLE → dirty (the base probe's fail-closed posture). The attestation
+/// check is only trusted when `sudo -n true` succeeds, so a sudo denial cannot
+/// read as "file absent" (fail-OPEN guard).
+const LINUX_SUBSTRATE_RESIDUE_PROBE: &str = "export PATH=\"/usr/sbin:/sbin:$PATH\"; \
+     rn_nft_state=absent; rn_rules=unknown; rn_attest=unknown; \
+     if command -v nft >/dev/null 2>&1; then \
+         if rn_rs=$(sudo -n nft list ruleset 2>/dev/null); then \
+             rn_nft_state=ok; \
+             rn_rules=$(printf '%s\\n' \"$rn_rs\" | grep -c rustynet_substrate_transit || true); \
+         else \
+             rn_nft_state=fail; \
+         fi; \
+     fi; \
+     if sudo -n true >/dev/null 2>&1; then \
+         if sudo -n test -e /etc/rustynet/lab/substrate-transit 2>/dev/null; then \
+             rn_attest=present; \
+         else \
+             rn_attest=absent; \
+         fi; \
+     fi; \
+     printf 'substrate nft=%s rules=%s attest=%s\\n' \"$rn_nft_state\" \"$rn_rules\" \"$rn_attest\"";
+
+/// Idempotent removal of the vxlan lab substrate attestation, run by
+/// [`cleanup_runtime_state`] so a FAILED or killed run (whose always-run
+/// substrate teardown never completed, or whose double removal failed) cannot
+/// wedge the next run: [`assert_node_clean`]'s residue probe fails on that
+/// file, and nothing else in the cleanup would ever delete it. `rm -f` is a
+/// no-op on a missing file; a failure here is not swallowed silently, because
+/// [`assert_node_clean`] still reads the file and reports the node dirty.
+///
+/// ORDER (daemon review finding 16): this runs after every rustynet unit is
+/// stopped (no daemon can re-run ExecStartPre against it) and BEFORE the nft
+/// reset and the interface reset. The nft reset then destroys the persistent
+/// `rustynet_boot` table that carried the transit allowance, while the daemon
+/// is deliberately left stopped — a restart here would only re-install a boot
+/// table — so the allowance is gone before the vxlan link is deleted, which is
+/// what the mandatory teardown order protects.
+///
+/// Built through the validated argv seam (`RemoteCommand` + `ValidatedArg`),
+/// like the other `rm` in this file, so it adds no raw remote-sink call site.
+const LINUX_SUBSTRATE_ATTESTATION_PATH: &str = "/etc/rustynet/lab/substrate-transit";
+
+fn substrate_attestation_reset_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = [
+        ValidatedArg::cli_token("sudo")?,
+        ValidatedArg::cli_token("-n")?,
+        ValidatedArg::cli_token("rm")?,
+        ValidatedArg::cli_token("-f")?,
+        ValidatedArg::path(LINUX_SUBSTRATE_ATTESTATION_PATH)?,
+    ];
+    ssh::RemoteCommand::from_args("linux remove substrate attestation", &args)
+}
+
+/// Pure parser for [`LINUX_SUBSTRATE_RESIDUE_PROBE`]. Clean ONLY on an
+/// explicit all-benign reading (`nft=ok rules=0 attest=absent`, or the
+/// tool-missing pair `nft=absent rules=unknown attest=absent`); every other
+/// combination — including anything malformed or unverifiable — fails closed.
+pub(crate) fn parse_substrate_residue_probe(raw: &str) -> Result<(), AdapterError> {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .rev()
+        .find(|l| l.contains("nft=") && l.contains("rules=") && l.contains("attest="));
+    let Some(line) = line else {
+        return Err(AdapterError::Protocol {
+            message: format!(
+                "substrate residue: probe output unrecognised (fail closed): {:?}",
+                raw.trim()
+            ),
+        });
+    };
+    let mut nft: Option<&str> = None;
+    let mut rules: Option<&str> = None;
+    let mut attest: Option<&str> = None;
+    for tok in line.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("nft=") {
+            nft = Some(v);
+        } else if let Some(v) = tok.strip_prefix("rules=") {
+            rules = Some(v);
+        } else if let Some(v) = tok.strip_prefix("attest=") {
+            attest = Some(v);
+        }
+    }
+    match attest {
+        Some("absent") => {}
+        Some("present") => {
+            return Err(AdapterError::Protocol {
+                message: "substrate residue: attestation file \
+                          /etc/rustynet/lab/substrate-transit still present"
+                    .to_owned(),
+            });
+        }
+        _ => {
+            return Err(AdapterError::Protocol {
+                message: "substrate residue: attestation state unknown/unreadable (fail closed)"
+                    .to_owned(),
+            });
+        }
+    }
+    match (nft, rules) {
+        (Some("ok"), Some("0")) => Ok(()),
+        (Some("absent"), Some("unknown")) => Ok(()),
+        (Some("ok"), Some(n)) => Err(AdapterError::Protocol {
+            message: format!(
+                "substrate residue: {n} rustynet_substrate_transit rule(s) still installed"
+            ),
+        }),
+        (Some("fail"), _) => Err(AdapterError::Protocol {
+            message: "substrate residue: nft ruleset query failed — rule state unverifiable (fail closed)"
+                .to_owned(),
+        }),
+        _ => Err(AdapterError::Protocol {
+            message: "substrate residue: rule state unknown (fail closed)".to_owned(),
+        }),
+    }
+}
+
 /// Collect `WireGuard` public key from `/var/lib/rustynet/keys/wireguard.pub`.
 /// Returns the base64-encoded key as a hex string (32-byte decode → hex).
 pub fn collect_wireguard_public_key(conn: &NodeConnection) -> Result<String, AdapterError> {
@@ -913,6 +1044,11 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
          done",
         Duration::from_secs(60),
     );
+    // Remove the vxlan lab substrate attestation (see the constant for why it
+    // sits here: daemon stopped, attestation gone, THEN the nft reset destroys
+    // the boot table, THEN the interface reset deletes the overlay links).
+    let attestation_rm = substrate_attestation_reset_command()?;
+    let _ = ssh::run_remote(conn, attestation_rm.as_str(), Duration::from_secs(30));
     // Flush every rustynet nftables table the daemon may have left behind so the
     // next bootstrap is not blocked by a leftover default-deny killswitch.
     let _ = ssh::run_remote(
@@ -992,13 +1128,21 @@ pub fn collect_daemon_failure_reason(
 /// device collides with the fresh bring-up). Fails loudly so a reset that did
 /// not take is caught here, not as a cargo DNS timeout five stages later.
 ///
+/// A SECOND read-only pass extends the assertion with the vxlan lab
+/// substrate's residue — `rustynet_substrate_transit` nft rules and the
+/// `/etc/rustynet/lab/substrate-transit` attestation file — so a torn-down
+/// substrate can never leak into the next run (see
+/// [`LINUX_SUBSTRATE_RESIDUE_PROBE`]).
+///
 /// Checking the daemon and interface — not just the nft table — closes the gap
 /// where a daemon mid-shutdown (or relaunched inside `RestartSec`) had already
 /// re-deleted/re-added the table between the reset and an nft-only probe, so the
 /// node read "clean" while still actively dirty.
 pub fn assert_node_clean(conn: &NodeConnection) -> Result<(), AdapterError> {
     let raw = ssh::run_remote(conn, LINUX_NODE_CLEAN_PROBE, SHORT_TIMEOUT)?;
-    parse_node_clean_probe(&raw)
+    parse_node_clean_probe(&raw)?;
+    let residue_raw = ssh::run_remote(conn, LINUX_SUBSTRATE_RESIDUE_PROBE, SHORT_TIMEOUT)?;
+    parse_substrate_residue_probe(&residue_raw)
 }
 
 /// Verify SSH connectivity by running a no-op command.
@@ -1729,6 +1873,55 @@ node-b|10.0.0.2:51820|b|client\nALLOW_SPEC=\n";
         );
     }
 
+    /// A failed run must not wedge the next one: the cleanup removes the
+    /// substrate attestation, and does so in the mandatory order — after the
+    /// units are stopped, before the nft reset (which destroys the boot table
+    /// carrying the transit allowance) and before the interface reset (which
+    /// deletes the overlay links).
+    #[test]
+    fn cleanup_removes_the_substrate_attestation_before_the_nft_and_interface_resets() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
+        let body = source
+            .split_once("pub fn cleanup_runtime_state")
+            .expect("cleanup_runtime_state must exist")
+            .1;
+        let stop_at = body
+            .find("systemctl disable --now")
+            .expect("units must be stopped first");
+        let attest_at = body
+            .find("substrate_attestation_reset_command()")
+            .expect("the attestation removal must be invoked");
+        let nft_at = body
+            .find("LINUX_NFT_KILLSWITCH_RESET_COMMAND")
+            .expect("nft reset must be invoked");
+        let iface_at = body
+            .find("LINUX_INTERFACE_RESET_COMMAND")
+            .expect("interface reset must be invoked");
+        assert!(stop_at < attest_at, "stop the daemon before removing it");
+        assert!(
+            attest_at < nft_at,
+            "remove the attestation before the nft reset"
+        );
+        assert!(
+            attest_at < iface_at,
+            "remove the attestation before the overlay links are deleted"
+        );
+    }
+
+    #[test]
+    fn the_attestation_reset_command_is_exactly_an_idempotent_rm_of_the_attestation() {
+        let cmd = substrate_attestation_reset_command().expect("valid argv");
+        assert_eq!(
+            cmd.as_str(),
+            "'sudo' '-n' 'rm' '-f' '/etc/rustynet/lab/substrate-transit'"
+        );
+        assert_eq!(
+            LINUX_SUBSTRATE_ATTESTATION_PATH,
+            "/etc/rustynet/lab/substrate-transit"
+        );
+    }
+
     #[test]
     fn linux_interface_reset_enumerates_and_deletes_rustynet_links() {
         let cmd = LINUX_INTERFACE_RESET_COMMAND;
@@ -1786,6 +1979,75 @@ node-b|10.0.0.2:51820|b|client\nALLOW_SPEC=\n";
         let msg = err.to_string();
         assert!(msg.contains("interface"));
         assert!(msg.contains("rustynet0"));
+    }
+
+    #[test]
+    fn parse_substrate_residue_probe_accepts_only_explicitly_clean_nodes() {
+        // Verifiably clean: no substrate rules, no attestation file.
+        assert!(parse_substrate_residue_probe("substrate nft=ok rules=0 attest=absent\n").is_ok());
+        // No nft binary on the host is benign ONLY while the attestation is
+        // also gone — without the file nothing will re-provision the rules.
+        assert!(
+            parse_substrate_residue_probe("substrate nft=absent rules=unknown attest=absent\n")
+                .is_ok()
+        );
+        // Leading banner lines are tolerated like the base probe.
+        assert!(
+            parse_substrate_residue_probe("banner\nsubstrate nft=ok rules=0 attest=absent").is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_substrate_residue_probe_fails_on_rules_and_attestation_residue() {
+        let err = parse_substrate_residue_probe("substrate nft=ok rules=2 attest=absent\n")
+            .expect_err("leftover substrate rules must fail");
+        assert!(
+            err.to_string().contains("rustynet_substrate_transit"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("2"), "{err}");
+
+        let err = parse_substrate_residue_probe("substrate nft=ok rules=0 attest=present\n")
+            .expect_err("leftover attestation file must fail");
+        assert!(err.to_string().contains("substrate-transit"), "{err}");
+
+        let err =
+            parse_substrate_residue_probe("substrate nft=absent rules=unknown attest=present\n")
+                .expect_err("attestation present with no nft tool must still fail");
+        assert!(err.to_string().contains("substrate-transit"), "{err}");
+    }
+
+    #[test]
+    fn parse_substrate_residue_probe_fails_closed_when_unverifiable() {
+        // nft present but the ruleset query failed → unverifiable.
+        let err = parse_substrate_residue_probe("substrate nft=fail rules=unknown attest=absent\n")
+            .expect_err("unverifiable ruleset must fail");
+        assert!(err.to_string().contains("unverifiable"), "{err}");
+
+        // sudo denied → attestation state never asserted.
+        let err = parse_substrate_residue_probe("substrate nft=ok rules=0 attest=unknown\n")
+            .expect_err("unreadable attestation state must fail");
+        assert!(err.to_string().contains("fail closed"), "{err}");
+
+        // Garbled output → fail closed.
+        let err = parse_substrate_residue_probe("echo hi\n").expect_err("garbled must fail");
+        assert!(err.to_string().contains("fail closed"), "{err}");
+    }
+
+    #[test]
+    fn linux_substrate_residue_probe_script_is_read_only_and_fail_closed() {
+        // The probe must never mutate state, must keep the sudo -n posture,
+        // and must gate the attestation read behind a working sudo so a
+        // denial cannot read as "file absent" (fail-OPEN guard).
+        assert!(!LINUX_SUBSTRATE_RESIDUE_PROBE.contains("nft delete"));
+        assert!(!LINUX_SUBSTRATE_RESIDUE_PROBE.contains("nft add"));
+        assert!(LINUX_SUBSTRATE_RESIDUE_PROBE.contains("sudo -n nft list ruleset"));
+        assert!(LINUX_SUBSTRATE_RESIDUE_PROBE.contains("sudo -n true"));
+        assert!(
+            LINUX_SUBSTRATE_RESIDUE_PROBE
+                .contains("sudo -n test -e /etc/rustynet/lab/substrate-transit")
+        );
+        assert!(LINUX_SUBSTRATE_RESIDUE_PROBE.contains("rustynet_substrate_transit"));
     }
 
     #[test]
