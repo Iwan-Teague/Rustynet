@@ -9,6 +9,7 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::security_audit::{
     AuditResult, run_security_audits, run_substrate_transit_control,
     security_audit_runtime_implemented, security_audits_ok, substrate_transit_declared,
+    substrate_transit_probe_targets,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -141,7 +142,35 @@ impl OrchestrationStage for SecurityAuditValidationStage {
             // so a PASS is never backed by nothing.
             if platform == VmGuestPlatform::Linux {
                 let declared = substrate_transit_declared(ctx.substrate_record.as_ref());
-                match run_substrate_transit_control(&*shell, declared) {
+                // Live mesh addresses, resolved at control time through each
+                // peer's adapter: the collect_pubkeys cache in ctx.mesh_ips
+                // was gathered pre-enforce and is stale (the traffic-test
+                // stage re-collects for the same reason). The control
+                // validates the value as IPv4 and fails closed when a peer's
+                // live address cannot be resolved.
+                let resolve_mesh_ip = |peer: &str| -> Result<String, String> {
+                    ctx.adapters
+                        .get(peer)
+                        .ok_or_else(|| format!("no adapter for peer `{peer}`"))?
+                        .collect_mesh_ip()
+                        .map_err(|e| format!("collect_mesh_ip failed for `{peer}`: {e}"))
+                };
+                // Probe targets: every attested peer minus this node, so the
+                // control drives real transit through each rule BEFORE reading
+                // its counter (the stage runs before any traffic stage —
+                // without the probes the counters are vacuously zero).
+                let participants = ctx
+                    .substrate_record
+                    .as_ref()
+                    .map(|record| record.participants.clone())
+                    .unwrap_or_default();
+                let probe_targets = substrate_transit_probe_targets(&participants, alias);
+                match run_substrate_transit_control(
+                    &*shell,
+                    declared,
+                    &probe_targets,
+                    &resolve_mesh_ip,
+                ) {
                     Ok(line) => {
                         if let Err(e) = append_stage_evidence_line(
                             &ctx.report_dir,
@@ -562,6 +591,286 @@ mod tests {
         let err = write_security_audit_witness(&dir, &[("deb-1".to_owned(), "linux")])
             .expect_err("witness write must fail when the logs path is a regular file");
         assert!(!err.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    // ── substrate-transit stage wiring: live targets, self never probed ─────
+
+    use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+    use crate::vm_lab::orchestrator::error::{
+        AdapterError, BundleKind, GossipIdentity, InstallReport, MembershipOwnerKey,
+        MembershipSnapshot, NodeId, NodeMembershipPeer, TrafficTestResult, TunnelsList,
+        ValidatorReport,
+    };
+    use crate::vm_lab::orchestrator::remote_shell::{
+        MockRunInvocation, MockShellHost, RemoteExitStatus, RemoteShellHost,
+    };
+    use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
+    use crate::vm_lab::orchestrator::role_validation::security_audit::{
+        SUBSTRATE_TRANSIT_RULE_COMMENT, parse_substrate_transit_status,
+    };
+    use crate::vm_lab::orchestrator::source_archive::SourceArchive;
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord;
+
+    /// Adapter double whose shell is a shared [`MockShellHost`] and whose live
+    /// mesh ip is a configured value — enough for the substrate-transit
+    /// control path; every other adapter surface fails loudly.
+    #[derive(Debug)]
+    struct ShellNodeAdapter {
+        alias: &'static str,
+        platform: crate::vm_lab::VmGuestPlatform,
+        shell: std::sync::Arc<MockShellHost>,
+        mesh_ip: String,
+    }
+
+    impl NodeAdapter for ShellNodeAdapter {
+        fn platform(&self) -> crate::vm_lab::VmGuestPlatform {
+            self.platform
+        }
+        fn alias(&self) -> &str {
+            self.alias
+        }
+        fn shell_host(&self) -> Result<std::sync::Arc<dyn RemoteShellHost>, AdapterError> {
+            Ok(self.shell.clone())
+        }
+        fn collect_mesh_ip(&self) -> Result<String, AdapterError> {
+            Ok(self.mesh_ip.clone())
+        }
+        fn collect_artifacts(&self, _dst: &std::path::Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn start_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn stop_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn restart_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn uninstall_daemon(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_membership_owner_key(&self) -> Result<MembershipOwnerKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_wireguard_public_key(
+            &self,
+        ) -> Result<crate::vm_lab::orchestrator::error::WireguardPublicKey, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_node_id(&self) -> Result<NodeId, AdapterError> {
+            unimplemented!()
+        }
+        fn run_validator(
+            &self,
+            _op: crate::vm_lab::DaemonProbeOp,
+            _extra_args: &[String],
+        ) -> Result<ValidatorReport, AdapterError> {
+            unimplemented!()
+        }
+        fn ping_mesh_peer(&self, _peer_mesh_ip: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn probe_denied_peer(&self, _denied_ip: &str) -> Result<TrafficTestResult, AdapterError> {
+            unimplemented!()
+        }
+        fn collect_active_tunnels(&self) -> Result<TunnelsList, AdapterError> {
+            unimplemented!()
+        }
+        fn cleanup_runtime_state(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn check_ssh_reachable(&self) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn endpoint(&self) -> String {
+            unimplemented!()
+        }
+        fn install_daemon(
+            &self,
+            _source: &SourceArchive,
+            _ctx: &OrchestrationContext,
+        ) -> Result<InstallReport, AdapterError> {
+            unimplemented!()
+        }
+        fn init_membership_snapshot(
+            &self,
+            _owner_key: &MembershipOwnerKey,
+            _peers: &[NodeMembershipPeer],
+        ) -> Result<MembershipSnapshot, AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_signed_bundle(
+            &self,
+            _kind: BundleKind,
+            _bundle_path: &std::path::Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn distribute_verifier_key(
+            &self,
+            _kind: BundleKind,
+            _pub_key_path: &std::path::Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+        fn issue_bundles_to_dir(
+            &self,
+            _kind: BundleKind,
+            _env_content: &str,
+            _local_out_dir: &std::path::Path,
+        ) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+    }
+
+    fn stage_exit_ok(stdout: &str) -> RemoteExitStatus {
+        RemoteExitStatus {
+            code: 0,
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    fn stage_status_argv() -> [&'static str; 6] {
+        [
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "status",
+        ]
+    }
+
+    fn stage_ruleset_argv() -> [&'static str; 5] {
+        ["sudo", "-n", "nft", "list", "ruleset"]
+    }
+
+    fn stage_ping_argv(ip: &str) -> [&str; 6] {
+        ["ping", "-c", "3", "-W", "3", ip]
+    }
+
+    fn stage_rendered_rule(daddr: &str, packets: u64) -> String {
+        format!(
+            "oifname \"mgmt0\" ip daddr {daddr} udp sport 4789 udp dport 4789 counter \
+             packets {packets} bytes 400 accept comment \"{SUBSTRATE_TRANSIT_RULE_COMMENT}\""
+        )
+    }
+
+    fn stage_ruleset(peer_a: u64, peer_b: u64) -> String {
+        format!(
+            "table inet rustynet_g2 {{\n    {}\n    {}\n}}\ntable inet rustynet_boot {{\n    {}\n    {}\n}}\n",
+            stage_rendered_rule("192.0.2.11", peer_a),
+            stage_rendered_rule("192.0.2.12", peer_b),
+            stage_rendered_rule("192.0.2.11", peer_a),
+            stage_rendered_rule("192.0.2.12", peer_b),
+        )
+    }
+
+    #[test]
+    fn stage_probes_live_peer_mesh_ips_never_self_nor_the_stale_cache() {
+        let dir = std::env::temp_dir().join(format!(
+            "secaudit_transit_stage_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test dir");
+
+        let deb_shell = std::sync::Arc::new(MockShellHost::new());
+        let active_status = "node_id=deb-1-node node_role=client state=FullTunnel \
+             gossip_transport_error=none substrate_transit=lab-active overlay=rustynet-vx0 \
+             underlay=mgmt0 peers=2";
+        assert!(
+            parse_substrate_transit_status(active_status).is_ok(),
+            "test status line must parse"
+        );
+        deb_shell.program_run_response(&stage_status_argv(), stage_exit_ok(active_status));
+        deb_shell.program_run_response(&stage_ruleset_argv(), stage_exit_ok(&stage_ruleset(2, 3)));
+        deb_shell.program_run_response(&stage_ruleset_argv(), stage_exit_ok(&stage_ruleset(5, 7)));
+        deb_shell.program_run_response(&stage_ping_argv("192.0.2.11"), stage_exit_ok(""));
+
+        let mut ctx = OrchestrationContext::new(
+            vec![NodeRoleAssignment {
+                alias: "deb-1".to_owned(),
+                role: NodeRole::Client,
+            }],
+            dir.clone(),
+            "net".to_owned(),
+        );
+        // The STALE pre-enforce cache: the control must resolve probe targets
+        // through the live adapters instead of reading these values.
+        ctx.mesh_ips
+            .insert("peer-1".to_owned(), "203.0.113.99".to_owned());
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned: true,
+            participants: vec!["deb-1".to_owned(), "peer-1".to_owned()],
+        });
+        ctx.adapters.insert(
+            "deb-1".to_owned(),
+            Box::new(ShellNodeAdapter {
+                alias: "deb-1",
+                platform: VmGuestPlatform::Linux,
+                shell: deb_shell.clone(),
+                mesh_ip: "192.0.2.10".to_owned(),
+            }),
+        );
+        ctx.adapters.insert(
+            "peer-1".to_owned(),
+            Box::new(ShellNodeAdapter {
+                alias: "peer-1",
+                platform: VmGuestPlatform::Linux,
+                shell: std::sync::Arc::new(MockShellHost::new()),
+                mesh_ip: "192.0.2.11".to_owned(),
+            }),
+        );
+
+        // The eight daemon audits are unprogrammed here, so the stage fails —
+        // but the substrate-transit control itself must have run its probes
+        // against the LIVE addresses and appended its evidence line.
+        let outcome = SecurityAuditValidationStage.execute(&mut ctx);
+        assert!(
+            matches!(outcome, StageOutcome::Failed(_)),
+            "unprogrammed audits must fail the stage; got {outcome:?}"
+        );
+        let log = std::fs::read_to_string(dir.join("logs").join("security_audit_validation.log"))
+            .expect("the control passed, so its evidence line must be on disk");
+        assert!(
+            log.contains("probes=probe peer=peer-1 ip=192.0.2.11 exit=0"),
+            "the evidence line must name the LIVE post-enforce probe target: {log}"
+        );
+        assert!(
+            log.contains("counters=rustynet_g2:192.0.2.11=2->5,rustynet_g2:192.0.2.12=3->7"),
+            "{log}"
+        );
+        let log = deb_shell.run_log();
+        let pings: Vec<&MockRunInvocation> = log
+            .iter()
+            .filter(|call| call.argv.first().map(String::as_str) == Some("ping"))
+            .collect();
+        assert_eq!(pings.len(), 1, "exactly one probe: {pings:?}");
+        assert_eq!(
+            pings[0].argv.last().map(String::as_str),
+            Some("192.0.2.11"),
+            "the probe must use the live adapter address, never the stale cache value \
+             203.0.113.99: {pings:?}"
+        );
+        assert!(
+            !deb_shell
+                .run_log()
+                .iter()
+                .any(|call| call.argv.last().map(String::as_str) == Some("192.0.2.10")),
+            "the stage must never probe the node's own mesh ip"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

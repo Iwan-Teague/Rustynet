@@ -375,6 +375,12 @@ pub struct SubstrateTransitEvidence {
     pub tables: Vec<String>,
     pub rule_count: usize,
     pub min_packets: u64,
+    /// Per-rule counter witness: `(table, peer daddr, packets)` for every
+    /// substrate rule, recorded so the evidence line can prove the transit
+    /// probes ran BEFORE the counters were read (ordering is the defect this
+    /// control exists to close — counters read before any transit traffic are
+    /// vacuously zero).
+    pub per_rule: Vec<(String, String, u64)>,
 }
 
 /// Parse ONE rendered nft rule against the attested underlay. The rendered
@@ -488,6 +494,7 @@ pub fn evaluate_substrate_transit_ruleset(
     let mut evidence_tables: Vec<String> = Vec::new();
     let mut rule_count = 0usize;
     let mut min_packets: Option<u64> = None;
+    let mut per_rule: Vec<(String, String, u64)> = Vec::new();
     for (name, body) in substrate_tables(ruleset) {
         let rules: Vec<&String> = body
             .iter()
@@ -527,6 +534,7 @@ pub fn evaluate_substrate_transit_ruleset(
                         Some(seen) => seen.min(packets),
                         None => packets,
                     });
+                    per_rule.push((name.clone(), daddr.clone(), packets));
                     daddrs.push(daddr);
                 }
                 Err(e) => errors.push(format!("table `{name}`: {e}")),
@@ -553,6 +561,7 @@ pub fn evaluate_substrate_transit_ruleset(
             tables: evidence_tables,
             rule_count,
             min_packets: min_packets.unwrap_or(0),
+            per_rule,
         })
     } else {
         Err(errors.join("; "))
@@ -565,6 +574,213 @@ pub fn substrate_transit_declared(
     record: Option<&crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord>,
 ) -> bool {
     matches!(record, Some(record) if record.substrate_id == "vxlan" && record.provisioned)
+}
+
+/// The raw `substrate_transit=…` field text as it appeared in the daemon
+/// status, for the evidence line. Display only — the structured
+/// [`parse_substrate_transit_status`] runs first and fails closed on anything
+/// malformed, so this helper only ever renders already-validated output.
+/// Absent field → empty string.
+pub fn raw_substrate_transit_status_field(status_stdout: &str) -> String {
+    for line in status_stdout.lines() {
+        let mut tokens = line.split_whitespace();
+        while let Some(token) = tokens.next() {
+            let Some(("substrate_transit", state)) = token.split_once('=') else {
+                continue;
+            };
+            if state != "lab-active" {
+                return token.to_owned();
+            }
+            // lab-active carries exactly three payload tokens in the daemon's
+            // order (same contract the parser enforces).
+            let mut field = vec![token.to_owned()];
+            for _ in 0..3 {
+                match tokens.next() {
+                    Some(extra) => field.push(extra.to_owned()),
+                    None => return field.join(" "),
+                }
+            }
+            return field.join(" ");
+        }
+    }
+    String::new()
+}
+
+/// Probe targets for the substrate-transit control: every attested
+/// participant except this node, in the substrate record's participant order.
+/// The mesh IP itself is deliberately NOT resolved here — it is collected
+/// LIVE per peer at probe time (post-enforce values, the same source the
+/// traffic-test stage trusts), because the collect_pubkeys cache is stale.
+pub fn substrate_transit_probe_targets(participants: &[String], self_alias: &str) -> Vec<String> {
+    participants
+        .iter()
+        .filter(|alias| alias.as_str() != self_alias)
+        .cloned()
+        .collect()
+}
+
+/// A mesh IP may reach a command only as a strict dotted-quad IPv4 address.
+/// Anything else — a hostname, an option-like `-f` token, an empty string —
+/// is refused here instead of being appended to `ping`'s argv.
+fn validated_mesh_ip(raw: &str) -> Result<String, String> {
+    let ip: std::net::Ipv4Addr = raw
+        .parse()
+        .map_err(|_| format!("`{raw}` is not an IPv4 address"))?;
+    Ok(ip.to_string())
+}
+
+/// Collapse newlines so a probe outcome can never forge extra lines in the
+/// stage evidence file (`append_stage_evidence_line` refuses multi-line text,
+/// which would flip a passing node to a stage failure for the wrong reason).
+fn single_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch == '\n' || ch == '\r' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Drive real transit through every peer's rule BEFORE the post-probe nft
+/// counters are read: one bounded `ping` per peer across the lab mesh, whose
+/// packets leave as vxlan outer UDP/4789 through the attested underlay and
+/// increment exactly the OUTPUT-chain rules the control inspects. The mesh IP
+/// is resolved LIVE per peer via `resolve_mesh_ip` and validated as IPv4
+/// before it reaches any argv. EVERY peer is attempted even after a failure;
+/// a skip (unresolvable address), an invalid address, a dispatch error or a
+/// non-zero exit fails the control (fail closed) — a pass always has a
+/// working probe behind it.
+fn run_substrate_transit_probes(
+    shell: &dyn RemoteShellHost,
+    targets: &[String],
+    resolve_mesh_ip: &dyn Fn(&str) -> Result<String, String>,
+) -> Result<Vec<String>, String> {
+    let mut outcomes = Vec::new();
+    let mut failures = Vec::new();
+    for peer_alias in targets {
+        let recorded = match resolve_mesh_ip(peer_alias) {
+            Err(e) => Err(format!(
+                "probe peer={peer_alias} failed: {}",
+                single_line(&e)
+            )),
+            Ok(raw) => match validated_mesh_ip(&raw) {
+                Err(e) => Err(format!("probe peer={peer_alias} ip={raw} failed: {e}")),
+                Ok(ip) => {
+                    let argv: [&str; 6] = ["ping", "-c", "3", "-W", "3", ip.as_str()];
+                    match shell.run_argv(&argv, &[], &[]) {
+                        Ok(status) => {
+                            let outcome =
+                                format!("probe peer={peer_alias} ip={ip} exit={}", status.code);
+                            if status.code == 0 {
+                                Ok(outcome)
+                            } else {
+                                Err(format!("{outcome} (non-zero exit)"))
+                            }
+                        }
+                        Err(e) => Err(format!(
+                            "probe peer={peer_alias} ip={ip} dispatch error: {}",
+                            single_line(&e.to_string())
+                        )),
+                    }
+                }
+            },
+        };
+        match recorded {
+            Ok(line) => outcomes.push(line),
+            Err(line) => {
+                outcomes.push(line.clone());
+                failures.push(line);
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(outcomes)
+    } else {
+        Err(format!(
+            "substrate transit probes failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// Per-rule counter snapshot from a raw `nft list ruleset` dump:
+/// `(table, daddr, packets)` for every substrate rule. Unlike the full
+/// evaluation this ACCEPTS zero counters — it is the pre-probe baseline —
+/// but a rule that does not render the attested shape is a hard error.
+fn substrate_rule_counters(
+    ruleset: &str,
+    underlay: &str,
+) -> Result<Vec<(String, String, u64)>, String> {
+    let mut counters = Vec::new();
+    for (name, body) in substrate_tables(ruleset) {
+        for rule in body
+            .iter()
+            .filter(|l| l.contains(SUBSTRATE_TRANSIT_RULE_COMMENT))
+        {
+            let (daddr, packets) = parse_substrate_transit_rule(rule, underlay)
+                .map_err(|e| format!("table `{name}`: {e}"))?;
+            counters.push((name.clone(), daddr, packets));
+        }
+    }
+    Ok(counters)
+}
+
+/// The probes must have MOVED every rule's counter: after > before, in
+/// addition to the after > 0 gate the evaluation already enforces. Counters
+/// that rose on their own (WireGuard handshake/keepalive traffic) cannot
+/// carry a pass whose probes failed — those probes already fail the control —
+/// and counters that did not rise prove the probes never crossed the rule.
+fn require_transit_counters_rose(
+    before: &[(String, String, u64)],
+    after: &[(String, String, u64)],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (table, daddr, after_packets) in after {
+        let before_packets = before
+            .iter()
+            .find(|(t, d, _)| t == table && d == daddr)
+            .map(|(_, _, packets)| *packets);
+        match before_packets {
+            None => errors.push(format!(
+                "rule {table}:{daddr} was not present before the probes — the ruleset changed while the control ran"
+            )),
+            Some(before) if *after_packets <= before => errors.push(format!(
+                "rule {table}:{daddr} counter did not rise during the probes (before={before} after={after_packets}) — the transit was not generated by this control"
+            )),
+            Some(_) => {}
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+/// `table:daddr=before->after` per rule, in the post-probe read order.
+fn render_counter_witness(
+    before: &[(String, String, u64)],
+    after: &[(String, String, u64)],
+) -> String {
+    after
+        .iter()
+        .map(|(table, daddr, after_packets)| {
+            match before
+                .iter()
+                .find(|(t, d, _)| t == table && d == daddr)
+                .map(|(_, _, packets)| *packets)
+            {
+                Some(before_packets) => {
+                    format!("{table}:{daddr}={before_packets}->{after_packets}")
+                }
+                None => format!("{table}:{daddr}=?->{after_packets}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// The substrate-transit control, pure decision core:
@@ -580,6 +796,7 @@ pub fn substrate_transit_scoped(
             tables: Vec::new(),
             rule_count: 0,
             min_packets: 0,
+            per_rule: Vec::new(),
         }),
         (true, Some(status)) => {
             evaluate_substrate_transit_ruleset(&status.underlay_interface, status.peers, ruleset)
@@ -597,30 +814,57 @@ pub fn substrate_transit_scoped(
     }
 }
 
-/// Render the evidence line appended to the stage log for one node.
+/// Render the evidence line appended to the stage log for one node. When
+/// transit is active the line carries the raw daemon field, the probe
+/// outcomes, and the per-rule before->after counters — proof the probes ran
+/// before the counters were read AND moved them, on every attested peer.
 pub fn substrate_transit_evidence_line(
     observed: Option<&SubstrateTransitStatus>,
     evidence: &SubstrateTransitEvidence,
+    raw_field: &str,
+    probes: &[String],
+    counters: &str,
 ) -> String {
     match observed {
         None => "substrate_transit=inactive rules=0".to_owned(),
         Some(status) => format!(
-            "substrate_transit=active underlay={} peers={} rules={} min_packets={} tables={}",
+            "substrate_transit=active underlay={} peers={} rules={} min_packets={} tables={} field={raw_field} probes={} counters={counters}",
             status.underlay_interface,
             status.peers,
             evidence.rule_count,
             evidence.min_packets,
             evidence.tables.join(","),
+            probes.join("; "),
         ),
     }
 }
 
+/// One `nft list ruleset` read, dispatch and exit fail-closed.
+fn read_nft_ruleset(shell: &dyn RemoteShellHost) -> Result<String, String> {
+    let ruleset_out = shell
+        .run_argv(&["sudo", "-n", "nft", "list", "ruleset"], &[], &[])
+        .map_err(|e| format!("`nft list ruleset` dispatch failed: {e}"))?;
+    if !ruleset_out.is_success() {
+        return Err(format!(
+            "`nft list ruleset` exited {} — substrate rules unverifiable",
+            ruleset_out.code
+        ));
+    }
+    Ok(String::from_utf8_lossy(&ruleset_out.stdout).into_owned())
+}
+
 /// Live dispatch of the substrate-transit control for one Linux node: query
-/// `rustynet status` (socket env pinned, `sudo -n`), and when transit is
-/// active, `nft list ruleset`. Returns the evidence line on PASS.
+/// `rustynet status` (socket env pinned, `sudo -n`); when transit is active,
+/// snapshot the counters, drive a real bounded ping through EVERY attested
+/// peer's rule (mesh IP resolved live, post-enforce), re-read the ruleset,
+/// and require BOTH the attested shape and a per-rule counter rise. Any
+/// probe skip, invalid address, dispatch error or non-zero exit fails the
+/// control. Returns the evidence line on PASS.
 pub fn run_substrate_transit_control(
     shell: &dyn RemoteShellHost,
     declared: bool,
+    probe_targets: &[String],
+    resolve_mesh_ip: &dyn Fn(&str) -> Result<String, String>,
 ) -> Result<String, String> {
     use crate::vm_lab::LINUX_RUSTYNET_CLI_PATH;
     const DAEMON_SOCKET: &str = "/run/rustynet/rustynetd.sock";
@@ -643,24 +887,38 @@ pub fn run_substrate_transit_control(
         ));
     }
     let stdout = String::from_utf8_lossy(&status_out.stdout).into_owned();
+    let raw_field = raw_substrate_transit_status_field(&stdout);
     let status = parse_substrate_transit_status(&stdout)?;
+    let mut probes: Vec<String> = Vec::new();
+    let mut counters = String::new();
     let evidence = match &status {
         None => substrate_transit_scoped(declared, None, "")?,
         Some(active) => {
-            let ruleset_out = shell
-                .run_argv(&["sudo", "-n", "nft", "list", "ruleset"], &[], &[])
-                .map_err(|e| format!("`nft list ruleset` dispatch failed: {e}"))?;
-            if !ruleset_out.is_success() {
-                return Err(format!(
-                    "`nft list ruleset` exited {} — substrate rules unverifiable",
-                    ruleset_out.code
-                ));
-            }
-            let ruleset = String::from_utf8_lossy(&ruleset_out.stdout).into_owned();
-            substrate_transit_scoped(declared, Some(active), &ruleset)?
+            // Baseline BEFORE any transit is generated: the post-probe read
+            // must show every rule RISEN above this snapshot, else whatever
+            // the counters hold was not moved by this control.
+            let before = read_nft_ruleset(shell)
+                .map_err(|e| format!("pre-probe {e}"))
+                .and_then(|ruleset| {
+                    substrate_rule_counters(&ruleset, &active.underlay_interface)
+                })?;
+            // Probes BEFORE the counters that judge them: without transit
+            // traffic the rules are vacuously zero (the u41 defect).
+            probes = run_substrate_transit_probes(shell, probe_targets, resolve_mesh_ip)?;
+            let after_ruleset = read_nft_ruleset(shell)?;
+            let evidence = substrate_transit_scoped(declared, Some(active), &after_ruleset)?;
+            require_transit_counters_rose(&before, &evidence.per_rule)?;
+            counters = render_counter_witness(&before, &evidence.per_rule);
+            evidence
         }
     };
-    Ok(substrate_transit_evidence_line(status.as_ref(), &evidence))
+    Ok(substrate_transit_evidence_line(
+        status.as_ref(),
+        &evidence,
+        &raw_field,
+        &probes,
+        &counters,
+    ))
 }
 
 #[cfg(test)]
@@ -715,7 +973,9 @@ mod tests {
         }
     }
 
-    use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
+    use crate::vm_lab::orchestrator::remote_shell::{
+        MockRunInvocation, MockShellHost, RemoteExitStatus,
+    };
 
     const TEST_DAEMON: &str = "/usr/local/bin/rustynetd";
 
@@ -1214,14 +1474,24 @@ mod tests {
         let status_stdout = &real_status_line(Some(
             "substrate_transit=lab-active overlay=rustynet-vx0 underlay=mgmt0 peers=2",
         ));
+        let resolver = resolve_from(&[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")]);
 
         let mock = MockShellHost::new();
         mock.program_run_response(&status_argv, exit_ok(status_stdout));
+        program_pings(
+            &mock,
+            &[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")],
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
         mock.program_run_response(
             &["sudo", "-n", "nft", "list", "ruleset"],
             exit_ok(&good_ruleset()),
         );
-        let line = run_substrate_transit_control(&mock, true).expect("control passes");
+        let line = run_substrate_transit_control(&mock, true, &mesh_targets(), &resolver)
+            .expect("control passes");
         assert!(line.contains("substrate_transit=active"), "{line}");
         assert!(
             line.contains("peers=2") && line.contains("min_packets=5"),
@@ -1235,16 +1505,26 @@ mod tests {
         // Daemon status contradicts the run's declared posture → fail.
         let mock = MockShellHost::new();
         mock.program_run_response(&status_argv, exit_ok(status_stdout));
+        program_pings(
+            &mock,
+            &[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")],
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
         mock.program_run_response(
             &["sudo", "-n", "nft", "list", "ruleset"],
             exit_ok(&good_ruleset()),
         );
-        let err = run_substrate_transit_control(&mock, false).expect_err("undeclared+active");
+        let err = run_substrate_transit_control(&mock, false, &mesh_targets(), &resolver)
+            .expect_err("undeclared+active");
         assert!(err.contains("did not declare a vxlan substrate"), "{err}");
 
         // Undispatchable status → fail-closed, never a pass.
         let mock = MockShellHost::new();
-        let err = run_substrate_transit_control(&mock, false).expect_err("no dispatch");
+        let err = run_substrate_transit_control(&mock, false, &mesh_targets(), &resolver)
+            .expect_err("no dispatch");
         assert!(err.contains("`rustynet status` dispatch failed"), "{err}");
 
         // Non-zero status exit → unverifiable, fail closed.
@@ -1257,20 +1537,537 @@ mod tests {
                 stderr: b"daemon down".to_vec(),
             },
         );
-        let err = run_substrate_transit_control(&mock, true).expect_err("status failed");
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &resolver)
+            .expect_err("status failed");
         assert!(err.contains("substrate posture unverifiable"), "{err}");
 
         // Inactive + undeclared → pass with an inactive evidence line.
         let mock = MockShellHost::new();
         mock.program_run_response(&status_argv, exit_ok(&real_status_line(None)));
-        let line = run_substrate_transit_control(&mock, false).expect("inactive pass");
+        let line = run_substrate_transit_control(&mock, false, &mesh_targets(), &resolver)
+            .expect("inactive pass");
         assert!(line.contains("substrate_transit=inactive"), "{line}");
 
         // Declared vxlan run but the REAL status shows no transit → fail
         // (the control must never pass a run whose transit is not active).
         let mock = MockShellHost::new();
         mock.program_run_response(&status_argv, exit_ok(&real_status_line(None)));
-        let err = run_substrate_transit_control(&mock, true).expect_err("declared+inactive");
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &resolver)
+            .expect_err("declared+inactive");
         assert!(err.contains("substrate_transit=lab-active"), "{err}");
+    }
+
+    // ── transit probes: live targets, fail-on-error, counters must rise ─────
+
+    fn mesh_targets() -> Vec<String> {
+        vec!["peer-a".to_owned(), "peer-b".to_owned()]
+    }
+
+    /// A live `collect_mesh_ip` stand-in: peer → dotted-quad, Err when the
+    /// peer's address cannot be collected.
+    fn resolve_from(map: &[(&str, &str)]) -> impl Fn(&str) -> Result<String, String> {
+        let owned: std::collections::HashMap<String, String> = map
+            .iter()
+            .map(|(alias, ip)| ((*alias).to_owned(), (*ip).to_owned()))
+            .collect();
+        move |peer: &str| -> Result<String, String> {
+            owned
+                .get(peer)
+                .cloned()
+                .ok_or_else(|| format!("no live mesh ip for `{peer}`"))
+        }
+    }
+
+    fn ping_argv(ip: &str) -> [&str; 6] {
+        ["ping", "-c", "3", "-W", "3", ip]
+    }
+
+    fn program_pings(mock: &MockShellHost, targets: &[(&str, &str)]) {
+        for (_, ip) in targets {
+            mock.program_run_response(&ping_argv(ip), exit_ok(""));
+        }
+    }
+
+    fn active_status_stdout() -> String {
+        real_status_line(Some(
+            "substrate_transit=lab-active overlay=rustynet-vx0 underlay=mgmt0 peers=2",
+        ))
+    }
+
+    fn is_nft_ruleset_call(call: &MockRunInvocation) -> bool {
+        call.argv
+            .iter()
+            .map(String::as_str)
+            .eq(["sudo", "-n", "nft", "list", "ruleset"])
+    }
+
+    fn pinged_ip(call: &MockRunInvocation) -> Option<&str> {
+        if call.argv.first().map(String::as_str) == Some("ping") {
+            call.argv.last().map(String::as_str)
+        } else {
+            None
+        }
+    }
+
+    fn status_argv() -> [&'static str; 6] {
+        [
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "status",
+        ]
+    }
+
+    /// Both substrate tables at the given per-peer counters (group table then
+    /// boot table, peer-a then peer-b in both).
+    fn ruleset_with_counters(peer_a: u64, peer_b: u64) -> String {
+        format!(
+            "table inet rustynet_g2 {{\n    {}\n    {}\n}}\ntable inet rustynet_boot {{\n    {}\n    {}\n}}\n",
+            rendered_rule("192.168.64.11", peer_a),
+            rendered_rule("192.168.64.10", peer_b),
+            rendered_rule("192.168.64.11", peer_a),
+            rendered_rule("192.168.64.10", peer_b),
+        )
+    }
+
+    /// Program a full PASS: active status, both pings exit 0, pre-probe
+    /// counters (2,3), post-probe counters (5,7).
+    fn program_passing_control(mock: &MockShellHost) {
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        program_pings(
+            mock,
+            &[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")],
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&good_ruleset()),
+        );
+    }
+
+    fn pass_resolver() -> impl Fn(&str) -> Result<String, String> {
+        resolve_from(&[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")])
+    }
+
+    #[test]
+    fn zero_counters_after_probes_still_fail_and_the_log_proves_probe_order() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        // Both rules carry packets=0 EVEN THOUGH the probes ran — the gate
+        // must stay shut (probes are a witness, never a waiver).
+        let vacuous = ruleset_with_counters(0, 0);
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        program_pings(
+            &mock,
+            &[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")],
+        );
+        // pre-probe read: also zero; post-probe read: still zero.
+        mock.program_run_response(&["sudo", "-n", "nft", "list", "ruleset"], exit_ok(&vacuous));
+        mock.program_run_response(&["sudo", "-n", "nft", "list", "ruleset"], exit_ok(&vacuous));
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &pass_resolver())
+            .expect_err("zero counters must fail even after real probes");
+        assert!(err.contains("never exercised"), "{err}");
+
+        // And the log proves the probes ran BETWEEN the two ruleset reads:
+        // status → nft (pre) → ping peer-a → ping peer-b → nft (post).
+        let log = mock.run_log();
+        let nfts: Vec<usize> = log
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| is_nft_ruleset_call(call))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(nfts.len(), 2, "exactly two ruleset reads: {log:?}");
+        let ping_a = log
+            .iter()
+            .position(|call| pinged_ip(call) == Some("192.168.64.11"))
+            .expect("peer-a ping dispatched");
+        let ping_b = log
+            .iter()
+            .position(|call| pinged_ip(call) == Some("192.168.64.10"))
+            .expect("peer-b ping dispatched");
+        assert!(
+            nfts[0] < ping_a && ping_a < nfts[1] && nfts[0] < ping_b && ping_b < nfts[1],
+            "pings must sit between the pre- and post-probe ruleset reads: {log:?}"
+        );
+    }
+
+    #[test]
+    fn nonzero_counters_after_probes_pass_with_the_full_witness_line() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        let mock = MockShellHost::new();
+        program_passing_control(&mock);
+        let line = run_substrate_transit_control(&mock, true, &mesh_targets(), &pass_resolver())
+            .expect("control passes");
+        // All the original witness substrings…
+        for fragment in [
+            "substrate_transit=active",
+            "underlay=mgmt0",
+            "peers=2",
+            "rules=4",
+            "min_packets=5",
+            "tables=rustynet_g2,rustynet_boot",
+        ] {
+            assert!(line.contains(fragment), "missing `{fragment}`: {line}");
+        }
+        // …the raw daemon field and the probe outcomes…
+        assert!(
+            line.contains(
+                "field=substrate_transit=lab-active overlay=rustynet-vx0 underlay=mgmt0 peers=2"
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(
+                "probes=probe peer=peer-a ip=192.168.64.11 exit=0; probe peer=peer-b ip=192.168.64.10 exit=0"
+            ),
+            "{line}"
+        );
+        // …and the per-rule BEFORE->AFTER counters: every rule visibly rose
+        // during the probes the same evidence line names.
+        assert!(
+            line.contains(
+                "counters=rustynet_g2:192.168.64.11=2->5,rustynet_g2:192.168.64.10=3->7,rustynet_boot:192.168.64.11=2->5,rustynet_boot:192.168.64.10=3->7"
+            ),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn probes_dispatch_once_per_attested_peer_with_the_bounded_argv_and_never_self() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        let mock = MockShellHost::new();
+        program_passing_control(&mock);
+        run_substrate_transit_control(&mock, true, &mesh_targets(), &pass_resolver())
+            .expect("control passes");
+        let log = mock.run_log();
+        let pings: Vec<&MockRunInvocation> = log
+            .iter()
+            .filter(|call| pinged_ip(call).is_some())
+            .collect();
+        assert_eq!(
+            pings.len(),
+            2,
+            "exactly one ping per attested peer, none for the node itself: {pings:?}"
+        );
+        for ip in ["192.168.64.11", "192.168.64.10"] {
+            assert_eq!(
+                pings
+                    .iter()
+                    .filter(|call| pinged_ip(call) == Some(ip))
+                    .count(),
+                1,
+                "peer {ip} pinged exactly once: {pings:?}"
+            );
+        }
+        // The argv must stay the bounded, fixed shape — in particular a real
+        // count of 3, never a variant that would send nothing.
+        for call in &pings {
+            let ip = pinged_ip(call).unwrap();
+            assert!(
+                call.argv.iter().map(String::as_str).eq(ping_argv(ip)),
+                "ping argv must be exactly ping -c 3 -W 3 <ip>: {:?}",
+                call.argv
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_dispatch_error_fails_the_control_even_when_counters_rose() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        // No ping response programmed → both probes dispatch-error, yet the
+        // counters ROSE (keepalive-style traffic). The control must FAIL: a
+        // counted pass is only evidence when a working probe moved the rule.
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&good_ruleset()),
+        );
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &pass_resolver())
+            .expect_err("probe dispatch errors must fail the control");
+        assert!(err.contains("substrate transit probes failed:"), "{err}");
+        assert!(
+            err.contains("probe peer=peer-a ip=192.168.64.11 dispatch error:"),
+            "{err}"
+        );
+        // Run-all, not fail-fast: BOTH peers' outcomes are named.
+        assert!(
+            err.contains("probe peer=peer-b ip=192.168.64.10 dispatch error:"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_probe_nonzero_exit_fails_the_control_and_names_the_code() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        // peer-a's ping EXITS 1 (destination unreachable / dropped ICMP) while
+        // peer-b answers; counters rise regardless. The control must fail and
+        // the failing exit code must be named.
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        mock.program_run_response(
+            &ping_argv("192.168.64.11"),
+            RemoteExitStatus {
+                code: 1,
+                stdout: b"100% packet loss".to_vec(),
+                stderr: Vec::new(),
+            },
+        );
+        mock.program_run_response(&ping_argv("192.168.64.10"), exit_ok(""));
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&good_ruleset()),
+        );
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &pass_resolver())
+            .expect_err("a non-zero probe exit must fail the control");
+        assert!(
+            err.contains("probe peer=peer-a ip=192.168.64.11 exit=1"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("peer-b"),
+            "the passing probe is not a failure: {err}"
+        );
+    }
+
+    #[test]
+    fn probe_targets_follow_participant_order_minus_self() {
+        let participants: Vec<String> = ["client-1", "anchor-1", "exit-1"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let targets = substrate_transit_probe_targets(&participants, "client-1");
+        assert_eq!(
+            targets,
+            vec!["anchor-1".to_owned(), "exit-1".to_owned()],
+            "participants order, self excluded"
+        );
+    }
+
+    #[test]
+    fn a_peer_without_a_live_mesh_ip_fails_the_control() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        // peer-b cannot be resolved live (no adapter / collect failure): the
+        // probe for it must FAIL the control, never degrade to a skipped
+        // outcome next to a counted pass. peer-a is still attempted.
+        let resolver = |peer: &str| -> Result<String, String> {
+            if peer == "peer-a" {
+                Ok("192.168.64.11".to_owned())
+            } else {
+                Err("collect_mesh_ip failed: no such interface".to_owned())
+            }
+        };
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        mock.program_run_response(&ping_argv("192.168.64.11"), exit_ok(""));
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&good_ruleset()),
+        );
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &resolver)
+            .expect_err("an unresolvable mesh ip must fail the control");
+        assert!(
+            err.contains("probe peer=peer-b failed: collect_mesh_ip failed: no such interface"),
+            "{err}"
+        );
+        assert!(
+            mock.run_log()
+                .iter()
+                .any(|call| pinged_ip(call) == Some("192.168.64.11")),
+            "peer-a is still probed (run-all): {:?}",
+            mock.run_log()
+        );
+    }
+
+    #[test]
+    fn a_non_ipv4_mesh_ip_never_reaches_the_ping_argv() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        // A guest-reported "mesh ip" that is option-like (`-f`) or a hostname
+        // must be refused BEFORE any command is built; the control fails and
+        // the well-formed peer is still probed.
+        let resolver = |peer: &str| -> Result<String, String> {
+            if peer == "peer-a" {
+                Ok("-f".to_owned())
+            } else {
+                Ok("gateway.local".to_owned())
+            }
+        };
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&good_ruleset()),
+        );
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &resolver)
+            .expect_err("non-IPv4 mesh ips must fail the control");
+        assert!(
+            err.contains("probe peer=peer-a ip=-f failed: `-f` is not an IPv4 address"),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "probe peer=peer-b ip=gateway.local failed: `gateway.local` is not an IPv4 address"
+            ),
+            "{err}"
+        );
+        for call in mock.run_log() {
+            assert_ne!(
+                call.argv.first().map(String::as_str),
+                Some("ping"),
+                "no ping may be dispatched when every mesh ip is invalid: {:?}",
+                call.argv
+            );
+        }
+    }
+
+    #[test]
+    fn flat_nonzero_counters_after_probes_fail_the_rise_gate() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        // Counters non-zero but UNCHANGED across the probes: the probes did
+        // not cross the rules, so whatever the counters hold is not transit
+        // generated by this control. The control must fail.
+        let static_ruleset = ruleset_with_counters(5, 7);
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        program_pings(
+            &mock,
+            &[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")],
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&static_ruleset),
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&static_ruleset),
+        );
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &pass_resolver())
+            .expect_err("counters that did not rise must fail the control");
+        assert!(
+            err.contains(
+                "rule rustynet_g2:192.168.64.11 counter did not rise during the probes (before=5 after=5)"
+            ),
+            "{err}"
+        );
+        assert!(
+            err.contains(
+                "rule rustynet_boot:192.168.64.10 counter did not rise during the probes (before=7 after=7)"
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_rule_that_appears_only_after_the_probes_fails_the_rise_gate() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        // The post-probe ruleset swapped a peer address in: rule counts stay
+        // consistent with the attested peers, but the new rule has no
+        // pre-probe baseline, so no rise can be witnessed for it.
+        let swapped = format!(
+            "table inet rustynet_g2 {{\n    {}\n    {}\n}}\ntable inet rustynet_boot {{\n    {}\n    {}\n}}\n",
+            rendered_rule("192.168.64.12", 9),
+            rendered_rule("192.168.64.10", 7),
+            rendered_rule("192.168.64.12", 9),
+            rendered_rule("192.168.64.10", 7),
+        );
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&active_status_stdout()));
+        program_pings(
+            &mock,
+            &[("peer-a", "192.168.64.11"), ("peer-b", "192.168.64.10")],
+        );
+        mock.program_run_response(
+            &["sudo", "-n", "nft", "list", "ruleset"],
+            exit_ok(&ruleset_with_counters(2, 3)),
+        );
+        mock.program_run_response(&["sudo", "-n", "nft", "list", "ruleset"], exit_ok(&swapped));
+        let err = run_substrate_transit_control(&mock, true, &mesh_targets(), &pass_resolver())
+            .expect_err("a rule without a pre-probe baseline must fail");
+        assert!(
+            err.contains("rule rustynet_g2:192.168.64.12 was not present before the probes"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn inactive_transit_never_dispatches_probes_or_ruleset_reads() {
+        use crate::vm_lab::orchestrator::remote_shell::MockShellHost;
+
+        let mock = MockShellHost::new();
+        mock.program_run_response(&status_argv(), exit_ok(&real_status_line(None)));
+        let line = run_substrate_transit_control(&mock, false, &mesh_targets(), &pass_resolver())
+            .expect("inactive pass");
+        assert!(line.contains("substrate_transit=inactive"), "{line}");
+        let log = mock.run_log();
+        assert!(
+            log.iter()
+                .all(|call| !is_nft_ruleset_call(call) && pinged_ip(call).is_none()),
+            "the inactive path dispatches status only — no probes, no nft reads: {log:?}"
+        );
+    }
+
+    #[test]
+    fn raw_status_field_renders_the_daemon_field_text() {
+        assert_eq!(
+            raw_substrate_transit_status_field(&real_status_line(Some(GOLDEN_ACTIVE_FIELD))),
+            GOLDEN_ACTIVE_FIELD
+        );
+        assert_eq!(
+            raw_substrate_transit_status_field("x=1\nsubstrate_transit=off\n"),
+            "substrate_transit=off"
+        );
+        assert_eq!(
+            raw_substrate_transit_status_field(&real_status_line(None)),
+            ""
+        );
+    }
+
+    #[test]
+    fn probe_errors_are_sanitized_to_a_single_evidence_safe_line() {
+        let multi_line = "transport died\nwith a trace\n\r\nand crlf";
+        let sanitized = single_line(multi_line);
+        assert!(
+            !sanitized.contains('\n') && !sanitized.contains('\r'),
+            "newlines must be collapsed: {sanitized:?}"
+        );
+        assert_eq!(
+            substrate_transit_probe_targets(&["self".to_owned(), "p".to_owned()], "self"),
+            vec!["p".to_owned()]
+        );
+        assert!(
+            validated_mesh_ip("192.168.064.1").is_err(),
+            "leading-zero octets are not a canonical IPv4 address"
+        );
     }
 }

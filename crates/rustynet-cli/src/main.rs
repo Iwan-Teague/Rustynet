@@ -1427,6 +1427,19 @@ enum OpsCommand {
     // the real verify), so a CLI that advertises the flag without enforcing
     // it is still refused.
     VerifyReleaseManifestHelp,
+    // u41-r2 incident 5: `ops vm-lab-orchestrate-live-lab --help` had no help
+    // handling, so with a full valid argument set it parsed as a real run and
+    // STARTED A LIVE-LAB RUN (and the orchestrate arm resolves the workspace
+    // root from `--inventory` at parse time, before the executor is ever
+    // reached). Every `ops vm-lab-*` verb now short-circuits `--help`/`-h` in
+    // `parse_ops_command` into this variant, which prints the verb's own usage
+    // line and exits 0 — before any inventory resolution, guest contact or
+    // execution. Gated on `vm-lab` like the verbs themselves: in a default
+    // build these verbs do not exist and must keep failing as unknown.
+    #[cfg(feature = "vm-lab")]
+    VmLabHelp {
+        verb: String,
+    },
     ApplyManagedDnsRouting,
     ClearManagedDnsRouting,
     DisconnectCleanup,
@@ -2353,6 +2366,27 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
         return Err("ops subcommand is required".to_owned());
     }
     let subcommand = args[0].as_str();
+    // u41-r2 incident 5: a `--help`/`-h` request on any `ops vm-lab-*` verb
+    // must short-circuit HERE — before `OptionParser::parse` and before the
+    // vm-lab arms run their parse-time side effects (the orchestrate arm
+    // calls `workspace_root::init_workspace_root`, which walks the
+    // filesystem from the operator's `--inventory`) and long before the
+    // executor could start a run. Only tokens BEFORE a `--` separator count:
+    // `vm-lab-launch-on-host` forwards everything after `--` verbatim to the
+    // inner orchestrate argv, and that inner `--help` must stay addressable.
+    // No indexing on `args` here: this runs for every vm-lab verb.
+    #[cfg(feature = "vm-lab")]
+    if subcommand.starts_with("vm-lab-")
+        && args
+            .iter()
+            .skip(1)
+            .take_while(|arg| arg.as_str() != "--")
+            .any(|arg| arg == "--help" || arg == "-h")
+    {
+        return Ok(OpsCommand::VmLabHelp {
+            verb: subcommand.to_owned(),
+        });
+    }
     let parser = match OptionParser::parse(&args[1..]) {
         Ok(parser) => parser,
         Err(err) => {
@@ -8697,6 +8731,27 @@ struct GuestClaim {
     claim: vm_lab::run_exclusion::GuestClaimRefs,
 }
 
+/// Usage text for `ops vm-lab-help`-style `--help` short-circuits (u41-r2
+/// incident 5): the verb's own usage line(s), extracted verbatim from the
+/// one `help_text` so the top-level help and per-verb help cannot drift.
+/// A verb that somehow has no line there still prints the FULL help text —
+/// a help request always prints usage and exits 0, never an error.
+#[cfg(feature = "vm-lab")]
+fn vm_lab_verb_usage(verb: &str) -> String {
+    let prefix = format!("  ops {verb} ");
+    let exact = format!("  ops {verb}");
+    let text = help_text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| *line == exact.as_str() || line.starts_with(prefix.as_str()))
+        .collect();
+    if lines.is_empty() {
+        text
+    } else {
+        lines.join("\n")
+    }
+}
+
 /// The guest set each live-lab-driving command claims.
 ///
 /// `vm-lab-overnight` is deliberately absent: it drives the whole fleet for
@@ -9401,6 +9456,8 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
                 .trim()
                 .to_owned(),
         ),
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::VmLabHelp { verb } => Ok(vm_lab_verb_usage(&verb)),
         OpsCommand::ApplyManagedDnsRouting => execute_ops_apply_managed_dns_routing(),
         OpsCommand::ClearManagedDnsRouting => execute_ops_clear_managed_dns_routing(),
         OpsCommand::DisconnectCleanup => execute_ops_disconnect_cleanup(),
@@ -28212,6 +28269,188 @@ mod tests {
         assert!(
             help_text().contains(OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE),
             "top-level help must carry the shared usage line verbatim"
+        );
+    }
+
+    // ---- u41-r2 incident 5: `ops vm-lab-* --help` must be help, never a run
+    // (witnesses: all three vm_lab_help tests below FAIL against the old
+    // code, where the orchestrate arm parsed a full valid argument set with
+    // --help into a real run and the other vm-lab arms rejected --help as a
+    // usage error). ------------------------------------------------------------
+
+    /// The full valid `vm-lab-orchestrate-live-lab` argument shape the u41-r2
+    /// driver used (required flags present, repeated `--node` assignments),
+    /// with `--help`/`-h` deliberately LAST so a mutant that only inspects
+    /// the first token cannot pass.
+    #[cfg(feature = "vm-lab")]
+    fn vm_lab_orchestrate_full_argv_with_help(flag: &str) -> Vec<String> {
+        vec![
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--inventory".to_owned(),
+            "/nonexistent/b112-help-witness/inventory.toml".to_owned(),
+            "--report-dir".to_owned(),
+            "/tmp/b112-help-witness-report".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/tmp/b112-help-witness-identity".to_owned(),
+            "--node".to_owned(),
+            "lenovo-client-1:client".to_owned(),
+            "--node".to_owned(),
+            "lenovo-exit-1:exit".to_owned(),
+            "--node".to_owned(),
+            "lenovo-entry-1:entry".to_owned(),
+            flag.to_owned(),
+        ]
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_orchestrate_help_short_circuits_before_the_executor() {
+        // THE witness: the exact invocation form that STARTED A REAL RUN in
+        // u41-r2 must parse as help. On the old code this argv parsed to
+        // `VmLabOrchestrateLiveLab` — the value the executor runs — because
+        // the orchestrate arm had no help handling; on the fixed code the
+        // executor can never see it. `--inventory` points at a path that does
+        // not exist: the old arm resolved the workspace root from it at parse
+        // time (filesystem access); the fix must return help without ever
+        // doing that.
+        for flag in ["--help", "-h"] {
+            let argv = vm_lab_orchestrate_full_argv_with_help(flag);
+            match parse_command(&argv) {
+                CliCommand::Ops(command) => match *command {
+                    OpsCommand::VmLabHelp { verb } => {
+                        assert_eq!(
+                            verb, "vm-lab-orchestrate-live-lab",
+                            "help must name the verb it was asked for"
+                        );
+                    }
+                    other => panic!(
+                        "`--help` with a full valid argument set must short-circuit \
+                         before the executor, got {other:?} (flag {flag})"
+                    ),
+                },
+                other => {
+                    panic!("a help request must never be a usage error (flag {flag}): {other:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_family_help_short_circuits_for_every_verb() {
+        // The same defect class, not just the one verb: `--help`/`-h` on any
+        // `ops vm-lab-*` verb must parse as help, never as the (potentially
+        // guest-contacting) command and never as a usage error.
+        for (verb, argv) in [
+            (
+                "vm-lab-launch-on-host",
+                vec![
+                    "ops",
+                    "vm-lab-launch-on-host",
+                    "--host",
+                    "h1",
+                    "--report-dir",
+                    "reports/b112",
+                    "--help",
+                ],
+            ),
+            (
+                "vm-lab-sync-repo",
+                vec![
+                    "ops",
+                    "vm-lab-sync-repo",
+                    "-h",
+                    "--inventory",
+                    "lab/inventory.toml",
+                ],
+            ),
+            ("vm-lab-list", vec!["ops", "vm-lab-list", "--help"]),
+        ] {
+            match parse_command(&argv.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>()) {
+                CliCommand::Ops(command) => match *command {
+                    OpsCommand::VmLabHelp { verb: helped_verb } => {
+                        assert_eq!(helped_verb, verb, "help must name the requested verb")
+                    }
+                    other => panic!("`{verb} --help` must short-circuit to help, got {other:?}"),
+                },
+                other => panic!("a help request for `{verb}` must never be an error: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_help_prints_usage_from_the_one_help_text_and_exits_ok() {
+        // Executing the parsed help command returns Ok (main() prints Ok
+        // output and exits 0) carrying the verb's usage line VERBATIM from
+        // the one help_text, so the two cannot drift.
+        for verb in ["vm-lab-orchestrate-live-lab", "vm-lab-launch-on-host"] {
+            let text = execute_ops(OpsCommand::VmLabHelp {
+                verb: verb.to_owned(),
+            })
+            .expect("help must execute Ok (exit 0 path), not Err");
+            assert!(
+                text.contains(&format!("ops {verb} ")),
+                "help output must carry the `{verb}` usage line: {text}"
+            );
+            assert!(
+                help_text().contains(&text),
+                "per-verb help must be an exact line of help_text: {text}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_launch_on_host_passthrough_help_after_ddash_is_not_hijacked() {
+        // `vm-lab-launch-on-host` forwards everything after `--` verbatim to
+        // the inner orchestrate argv. An inner `--help` must stay addressable
+        // (the remote binary turns it into help); the launch itself must not
+        // be turned into launch-on-host help by a token it merely forwards.
+        let argv = [
+            "ops",
+            "vm-lab-launch-on-host",
+            "--host",
+            "h1",
+            "--report-dir",
+            "reports/b112",
+            "--",
+            "--help",
+        ];
+        match parse(&argv) {
+            CliCommand::Ops(command) => assert!(
+                matches!(*command, OpsCommand::VmLabLaunchOnHost { .. }),
+                "a `--`-forwarded --help belongs to the inner command, got {command:?}"
+            ),
+            other => panic!("expected the launch to keep parsing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn ops_vm_lab_orchestrate_without_help_still_parses_to_the_run() {
+        // Control for the witness: the SAME full valid argument set without a
+        // help flag must still parse to the real command (and its missing
+        // required options must still be bad-args errors), so the fix is help
+        // short-circuiting and not a blanket amputation of the verb.
+        let argv = vm_lab_orchestrate_full_argv_with_help("--skip-soak");
+        match parse_command(&argv) {
+            CliCommand::Ops(command) => assert!(
+                matches!(*command, OpsCommand::VmLabOrchestrateLiveLab { .. }),
+                "without a help flag the run command must still parse, got {command:?}"
+            ),
+            other => panic!("expected CliCommand::Ops for the run command, got {other:?}"),
+        }
+        let parsed = parse(&[
+            "ops",
+            "vm-lab-orchestrate-live-lab",
+            "--inventory",
+            "/tmp/b112-control/inventory.toml",
+        ]);
+        assert!(
+            matches!(&parsed, CliCommand::UsageError(m) if m.contains("missing required option")),
+            "missing required options must stay bad-args errors, got {parsed:?}"
         );
     }
 
