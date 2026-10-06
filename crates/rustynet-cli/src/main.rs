@@ -4604,6 +4604,16 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     },
                     resume_from: parser.value("--resume-from"),
                     rerun_stage: parser.value("--rerun-stage"),
+                    skip_stages: {
+                        if parser.has_flag("--skip-stage") {
+                            return Err("--skip-stage requires a stage-name value (repeatable, \
+                                 comma-separated allowed; run `ops vm-lab-orchestrate-live-lab \
+                                 --help` for the stage list)"
+                                .to_owned());
+                        }
+                        let raw = collect_repeated_option_values(&args[1..], "--skip-stage");
+                        vm_lab::parse_skip_stages(&raw)?
+                    },
                     prebuilt_node_binaries: {
                         let raw =
                             collect_repeated_option_values(&args[1..], "--prebuilt-node-binaries");
@@ -20792,7 +20802,8 @@ fn help_text() -> String {
         "  ops vm-lab-remove-substrate-transit  (idempotently remove /etc/rustynet/lab/substrate-transit)",
         "  ops vm-lab-write-live-lab-profile [--inventory <path>] --output <path> --ssh-identity-file <path> [--ssh-known-hosts-file <path>] (--exit-vm <alias>|--exit-target <user@host>) (--client-vm <alias>|--client-target <user@host>) [--entry-vm <alias>|--entry-target <user@host>] [--aux-vm <alias>|--aux-target <user@host>] [--extra-vm <alias>|--extra-target <user@host>] [--fifth-client-vm <alias>|--fifth-client-target <user@host>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--ssh-allow-cidrs <cidrs>] [--network-id <id>] [--traversal-ttl-secs <secs>] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--backend <mode>] [--source-mode <mode>] [--repo-ref <ref>] [--report-dir <path>]",
         "  ops vm-lab-setup-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--linux-blind-exit-vm <alias>] [--require-same-network] [--source-mode <mode>] [--repo-ref <ref>] [--resume-from <stage>] [--rerun-stage <stage>] [--max-parallel-node-workers <n>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--dry-run]",
-        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>] [--lab-stun-servers <ip:port[,ip:port...]>] [--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>] [--prebuilt-node-binaries <alias>=<abs-dir>]... [--prebuilt-glibc-floor <ver>]",
+        "  ops vm-lab-orchestrate-live-lab [--inventory <path>] [--profile <path>] [--profile-output <path>] [--network-profile <id>] --report-dir <path> --ssh-identity-file <path> [--known-hosts-file <path>] [--exit-vm <alias>] [--client-vm <alias>] [--entry-vm <alias>] [--aux-vm <alias>] [--extra-vm <alias>] [--fifth-client-vm <alias>] [--node <alias>:<role>]... [--setup-only] [--run-only] [--ssh-allow-cidrs <cidr[,cidr...]>] [--require-same-network] [--source-mode <local-head|working-tree>] [--repo-ref <ref>] [--rebuild-nodes <alias[,alias]>] [--max-parallel-node-workers <n>] [--skip-gates] [--skip-soak] [--skip-cross-network] [--cross-network-substrate <netns|vxlan|slirp>] [--cross-network-nat-profiles <csv>] [--cross-network-required-nat-profiles <csv>] [--cross-network-impairment-profile <profile>] [--skip-linux-live-suite] [--resume-from <stage>] [--rerun-stage <stage>] [--skip-stage <stage>]... [--utm-documents-root <path>] [--utmctl-path <path>] [--ssh-port <port>] [--discovery-timeout-secs <secs>] [--wait-ready-timeout-secs <secs>] [--timeout-secs <secs>] [--stage-timeout-secs <secs>] [--collect-artifacts-on-failure] [--skip-diagnose-on-failure] [--stop-after-ready] [--trust-inventory-ready] [--dry-run] [--validate-linux-daemon-state] [--windows-vm <alias>] [--windows-only] [--no-fail-on-authenticode] [--macos-vm <alias>] [--topology-profile <path>] [--exit-platform <linux|macos|windows>] [--relay-platform <linux|macos|windows>] [--anchor-platform <linux|macos|windows>] [--admin-platform <linux|macos|windows>] [--blind-exit-platform <linux|macos|windows>] [--lab-stun-servers <ip:port[,ip:port...]>] [--linux-backend <linux-wireguard|linux-wireguard-userspace-shared>] [--prebuilt-node-binaries <alias>=<abs-dir>]... [--prebuilt-glibc-floor <ver>]",
+        "      --skip-stage: RUNTIME omission of a planned stage in a FULL run (repeatable, CSV allowed). The named stage stays in the resolved plan and is recorded as a blocking not_run row with reason 'omitted by --skip-stage'; its dependents cascade-skip, the run verdict fails closed and the report can never claim a full-suite pass. Names are validated exactly against the Rust-native stage list (unknown names, case variants, empty entries and duplicates are hard errors before anything runs); always-run teardown stages cannot be skipped. Mutually exclusive with --setup-only/--run-only/--resume-from/--rerun-stage.",
         "      --prebuilt-node-binaries: <abs-dir> holds rustynetd, rustynet-cli, rustynet-relay (flat, x86_64 Linux, owned by you and not group/world-writable) and PREBUILT.json (scripts/lab/make_prebuilt_manifest.sh); PREBUILT.json's commit and sha256 are SELF-DECLARED by whoever wrote it (checked for consistency, label == HEAD and host->node transfer integrity, not that the build came from that commit); only the listed --node aliases skip the guest build, every other node still builds on its guest; excludes --source-mode host-cross-binary and --allow-dirty; --prebuilt-glibc-floor defaults to 2.39.",
         "      --ssh-allow-cidrs: REQUIRED when a selected node declares an inventory dataplane_endpoint (e.g. a cloud node managed over the tailnet): pass the orchestrator host's tailnet /32 plus the guests' management CIDR, because the /24 auto-derive is refused for such a node. --trust-inventory-ready: a controller-less SSH-only node (no start controller) is reported unready (not-reported-by-discovery) and cannot be restarted, so pass this flag to skip the restart and let bootstrap/live SSH decide.",
         "  ops vm-lab-overnight --ssh-identity-file <path> [--inventory <path>] [--known-hosts-file <path>] [--branch-prefix <name>] [--backlog <path>] [--max-duration-secs <secs>] [--max-attempts-per-cell <n>] [--rotation <breadth-first|deep-first>] [--auto-merge-safe-cells] [--agent-cmd <path>] [--agent-timeout-secs <secs>] [--seed-status <os:role=status,...>] [--dry-run]",
@@ -28376,6 +28387,175 @@ mod tests {
                 },
                 other => panic!("a help request for `{verb}` must never be an error: {other:?}"),
             }
+        }
+    }
+
+    // ── b119: `--skip-stage <name>` must fail closed at parse time ────────────
+    //
+    // Each witness carries a valid orchestrate argv and asserts the PARSE
+    // refuses it. On the pre-b119 code the orchestrate arm never read
+    // `--skip-stage`, so OptionParser absorbed the value silently and these
+    // parsed to `CliCommand::Ops(VmLabOrchestrateLiveLab { .. })` — the value
+    // the executor runs — with the omission dropped on the floor. No
+    // `--inventory` is passed: the arm's parse-time workspace-root init
+    // re-derives the same root the rest of this binary already pinned, so a
+    // refusal below can only come from --skip-stage validation, never from
+    // path resolution.
+
+    #[cfg(feature = "vm-lab")]
+    fn b119_skip_stage_orchestrate_argv(extra: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--report-dir".to_owned(),
+            "/tmp/b119-skip-stage-witness-report".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/tmp/b119-skip-stage-witness-identity".to_owned(),
+            "--node".to_owned(),
+            "n1:client".to_owned(),
+            "--node".to_owned(),
+            "n2:exit".to_owned(),
+        ];
+        argv.extend(extra.iter().map(|s| (*s).to_owned()));
+        argv
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_empty_value_is_refused_at_parse_time() {
+        for argv in [
+            b119_skip_stage_orchestrate_argv(&["--skip-stage", ""]),
+            b119_skip_stage_orchestrate_argv(&[
+                "--skip-stage",
+                "live_managed_dns_validation,,live_network_flap_validation",
+            ]),
+        ] {
+            let parsed = parse_command(&argv);
+            assert!(
+                matches!(parsed, CliCommand::UsageError(_)),
+                "an empty --skip-stage value must be refused at parse time, got {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_unknown_name_is_refused_at_parse_time() {
+        let argv = b119_skip_stage_orchestrate_argv(&["--skip-stage", "not_a_rust_native_stage"]);
+        let parsed = parse_command(&argv);
+        assert!(
+            matches!(parsed, CliCommand::UsageError(ref err) if err.contains("--skip-stage")),
+            "an unknown --skip-stage name must be refused with the option named: {parsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_case_variant_is_refused_no_case_folding() {
+        let argv =
+            b119_skip_stage_orchestrate_argv(&["--skip-stage", "LIVE_MANAGED_DNS_VALIDATION"]);
+        let parsed = parse_command(&argv);
+        assert!(
+            matches!(parsed, CliCommand::UsageError(_)),
+            "a case-variant --skip-stage name must be refused (exact match only): {parsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_duplicate_is_refused_at_parse_time() {
+        for argv in [
+            b119_skip_stage_orchestrate_argv(&[
+                "--skip-stage",
+                "live_managed_dns_validation",
+                "--skip-stage",
+                "live_managed_dns_validation",
+            ]),
+            b119_skip_stage_orchestrate_argv(&[
+                "--skip-stage",
+                "live_managed_dns_validation,live_network_flap_validation",
+                "--skip-stage",
+                "live_managed_dns_validation",
+            ]),
+        ] {
+            let parsed = parse_command(&argv);
+            assert!(
+                matches!(parsed, CliCommand::UsageError(ref err) if err.contains("duplicate")),
+                "a duplicate --skip-stage name must be refused: {parsed:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_without_a_value_is_refused() {
+        // `--skip-stage` followed by another flag: the option parser records
+        // it as a bare flag, so no stage name ever arrived — refuse instead
+        // of silently skipping nothing.
+        let argv = b119_skip_stage_orchestrate_argv(&["--skip-stage", "--skip-soak"]);
+        let parsed = parse_command(&argv);
+        assert!(
+            matches!(parsed, CliCommand::UsageError(_)),
+            "--skip-stage without a stage-name value must be refused: {parsed:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_valid_names_parse_and_land_in_the_config_in_order() {
+        // The happy path: repeatable + CSV values land (trimmed, in operator
+        // order) on the executor's config. On the pre-b119 code this parsed
+        // to the same command shape but with an EMPTY skip_stages list — the
+        // omission silently vanished.
+        let argv = b119_skip_stage_orchestrate_argv(&[
+            "--skip-stage",
+            "live_managed_dns_validation",
+            "--skip-stage",
+            "live_network_flap_validation, live_reboot_recovery_validation",
+            "--skip-stage",
+            " live_secrets_not_in_logs_validation ",
+        ]);
+        match parse_command(&argv) {
+            CliCommand::Ops(command) => match *command {
+                OpsCommand::VmLabOrchestrateLiveLab { config } => {
+                    assert_eq!(
+                        config.skip_stages,
+                        vec![
+                            "live_managed_dns_validation".to_owned(),
+                            "live_network_flap_validation".to_owned(),
+                            "live_reboot_recovery_validation".to_owned(),
+                            "live_secrets_not_in_logs_validation".to_owned(),
+                        ],
+                        "repeatable + CSV --skip-stage values must land, trimmed, in order"
+                    );
+                }
+                other => panic!(
+                    "a valid --skip-stage set must parse to the orchestrate command, got {other:?}"
+                ),
+            },
+            other => panic!("a valid --skip-stage set must parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "vm-lab")]
+    fn skip_stage_help_short_circuits_and_never_starts_a_run() {
+        // The u41-r2 incident-5 contract must hold for the new flag too:
+        // `--help` anywhere before `--` short-circuits to help, even with a
+        // --skip-stage value present.
+        let mut argv =
+            b119_skip_stage_orchestrate_argv(&["--skip-stage", "live_managed_dns_validation"]);
+        argv.push("--help".to_owned());
+        match parse_command(&argv) {
+            CliCommand::Ops(command) => match *command {
+                OpsCommand::VmLabHelp { verb } => {
+                    assert_eq!(verb, "vm-lab-orchestrate-live-lab");
+                }
+                other => {
+                    panic!("`--skip-stage … --help` must short-circuit to help, got {other:?}")
+                }
+            },
+            other => panic!("a help request must never be a usage error: {other:?}"),
         }
     }
 

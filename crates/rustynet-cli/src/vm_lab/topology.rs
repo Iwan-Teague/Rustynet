@@ -944,6 +944,7 @@ mod tests {
             linux_backend: None,
             prebuilt_node_binaries: Vec::new(),
             prebuilt_glibc_floor: None,
+            skip_stages: Vec::new(),
         }
     }
 

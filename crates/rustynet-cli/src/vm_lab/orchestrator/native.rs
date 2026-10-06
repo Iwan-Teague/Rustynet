@@ -118,6 +118,17 @@ pub(crate) fn execute_rust_native_orchestration(
                 .join(", ")
         ));
     }
+    // b119: `--skip-stage` names were validated at parse time
+    // (`vm_lab::parse_skip_stages`), but the executor re-derives the ids so a
+    // directly-constructed config cannot bypass validation, and so the
+    // runtime set below works with [`orchestrator::stage::StageId`]s.
+    // Mutual exclusion with the focused-invocation modes is enforced earlier
+    // (`validate_orchestrate_live_lab_config`); an empty set changes nothing.
+    let operator_skip_ids: Vec<orchestrator::stage::StageId> = config
+        .skip_stages
+        .iter()
+        .map(|name| orchestrator::stage::StageId::try_from(name.as_str()))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let known_hosts = config
         .known_hosts_path
@@ -533,6 +544,28 @@ pub(crate) fn execute_rust_native_orchestration(
         && plan_stage_ids.contains(&orchestrator::stage::StageId::MacosRebootRecoveryValidation);
     ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation
         && plan_stage_ids.contains(&orchestrator::stage::StageId::RefreshSignedBundles);
+
+    // b119: resolve the operator's --skip-stage set against THIS run's active
+    // plan BEFORE anything runs. A named stage that is not in the plan is a
+    // no-op (its plan membership governs what this run may claim), and an
+    // always-run teardown stage is refused: the runner exempts teardown from
+    // every skip source, so accepting that name would silently run a stage
+    // the operator asked to omit.
+    let always_run_stage_ids: Vec<orchestrator::stage::StageId> = stages
+        .iter()
+        .filter(|stage| stage.always_run())
+        .map(|stage| stage.id())
+        .collect();
+    let (operator_skips, operator_skips_not_in_plan) =
+        resolve_operator_skips(&operator_skip_ids, &plan_stage_ids, &always_run_stage_ids)?;
+    if !operator_skips_not_in_plan.is_empty() {
+        eprintln!(
+            "note: --skip-stage named {} stage(s) that are not in this run's active plan \
+             (no-op, nothing to omit): {}",
+            operator_skips_not_in_plan.len(),
+            operator_skips_not_in_plan.join(", ")
+        );
+    }
 
     // Audit F2: the binding is a validated `ReuseDigest`, not a raw String —
     // it can only be produced by `validate_rust_native_reuse_evidence`, so an
@@ -1119,6 +1152,13 @@ pub(crate) fn execute_rust_native_orchestration(
             .ok_or_else(|| format!("--rerun-stage stage '{target}' is not in the active plan"))?;
         runner = runner.with_explicit_skips(plan_stage_ids.iter().skip(pos + 1).cloned());
     }
+    // b119: the operator's --skip-stage set rides the same explicit-skip
+    // channel as the rerun tail. Every entry is a bare (non-reused) skip, so
+    // each records `NotRun` — a BLOCKING outcome — and its dependents
+    // cascade-skip; the run verdict fails closed (see the finalizer).
+    if !operator_skips.is_empty() {
+        runner = runner.with_explicit_skips(operator_skips.iter().cloned());
+    }
     // Realtime: the observer upserts a `running` stages.tsv row at each stage
     // start and its terminal row at finish, so the monitor reads active-stage
     // + outcomes directly instead of inferring them.
@@ -1127,6 +1167,7 @@ pub(crate) fn execute_rust_native_orchestration(
         started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
         errors: std::cell::RefCell::new(Vec::new()),
         run_instance_id: Some(run_instance_id.clone()),
+        operator_skips: operator_skips.iter().cloned().collect(),
     };
     let pre_cleanup_diagnostics = |hook_ctx: &orchestrator::context::OrchestrationContext,
                                    prior: &[(orchestrator::stage::StageId, StageOutcome)]|
@@ -1297,6 +1338,7 @@ pub(crate) fn execute_rust_native_orchestration(
             skip_live_suite,
             skip_soak: config.skip_soak,
             skip_cross_network: config.skip_cross_network,
+            operator_skips: operator_skips.iter().cloned().collect(),
         },
         |vm_lab_outcomes| {
             finalize_vm_lab_orchestration_result_with_inventory(
@@ -1563,6 +1605,36 @@ pub(crate) fn rust_native_orchestration_stage_ids_for_mode(
 const NETWORK_PROFILE_RECORD_RELATIVE_PATH: &str = "orchestration/network_profile.json";
 const NETWORK_EVIDENCE_RELATIVE_PATH: &str = "orchestration/vm_network_evidence.json";
 
+/// Resolve the operator's `--skip-stage` requests against the run's active
+/// plan (b119). An id outside the plan is a no-op and is reported back so the
+/// caller can surface it as a note; an id in the plan that names an
+/// always-run teardown stage is a hard error — the runner exempts teardown
+/// from every skip source, so honoring the name is impossible and refusing is
+/// the only honest answer. The returned skips preserve operator order.
+fn resolve_operator_skips(
+    requested: &[orchestrator::stage::StageId],
+    plan: &[orchestrator::stage::StageId],
+    always_run: &[orchestrator::stage::StageId],
+) -> Result<(Vec<orchestrator::stage::StageId>, Vec<String>), String> {
+    let mut skips = Vec::new();
+    let mut not_in_plan = Vec::new();
+    for id in requested {
+        if !plan.contains(id) {
+            not_in_plan.push(id.as_str().to_owned());
+            continue;
+        }
+        if always_run.contains(id) {
+            return Err(format!(
+                "--skip-stage: stage '{}' is an always-run teardown stage and cannot be skipped; \
+                 the teardown exemption is what guarantees this run's own residue is removed",
+                id.as_str()
+            ));
+        }
+        skips.push(id.clone());
+    }
+    Ok((skips, not_in_plan))
+}
+
 /// Resolve and immutably record the run's network profile (rulebook §15.4),
 /// then capture a read-only network audit into the report directory.
 ///
@@ -1708,6 +1780,85 @@ mod tests {
             alias: alias.to_string(),
             role,
         }
+    }
+
+    // ── b119: --skip-stage resolution against the active plan ─────────────────
+
+    #[test]
+    fn operator_skip_in_plan_resolves_and_teardown_is_refused() {
+        let plan = rust_native_orchestration_stage_ids();
+        let always_run = [orchestrator::stage::StageId::Cleanup];
+        let (skips, not_in_plan) = resolve_operator_skips(
+            &[orchestrator::stage::StageId::LiveManagedDnsValidation],
+            &plan,
+            &always_run,
+        )
+        .expect("a planned non-teardown stage must resolve");
+        assert_eq!(
+            skips,
+            vec![orchestrator::stage::StageId::LiveManagedDnsValidation],
+            "the named stage must survive into the runtime skip set"
+        );
+        assert!(not_in_plan.is_empty());
+
+        let err =
+            resolve_operator_skips(&[orchestrator::stage::StageId::Cleanup], &plan, &always_run)
+                .expect_err("an always-run teardown stage must be refused");
+        assert!(
+            err.contains("always-run"),
+            "the refusal must say teardown cannot be skipped: {err}"
+        );
+    }
+
+    #[test]
+    fn operator_skip_outside_plan_is_a_reported_noop_not_an_error() {
+        let plan = vec![orchestrator::stage::StageId::Preflight];
+        let (skips, not_in_plan) = resolve_operator_skips(
+            &[orchestrator::stage::StageId::CrossNetworkPreflight],
+            &plan,
+            &[],
+        )
+        .expect("a stage outside the plan is a no-op, not an error");
+        assert!(
+            skips.is_empty(),
+            "nothing outside the plan may enter the runtime skip set: {skips:?}"
+        );
+        assert_eq!(not_in_plan, vec!["cross_network_preflight"]);
+    }
+
+    /// b119 review F2 (mutant M9): the ONLY thing that carries the operator's
+    /// `--skip-stage` set into the executor is the `with_explicit_skips`
+    /// wiring inside `execute_rust_native_orchestration`. If that wiring
+    /// regresses, the named stages execute AND pass (run_passed = true) while
+    /// the summary still attests "focused run ... omitted by --skip-stage" —
+    /// a false focused-run attestation no other test can catch: the runner
+    /// tests pin the skip mechanics, the evidence tests pin the wording, and
+    /// the full executor path needs real guests, so it cannot run under test.
+    /// Pin the wiring at source level (the b115 style): the call must exist,
+    /// and it must sit INSIDE the `!operator_skips.is_empty()` guard, because
+    /// the empty set must stay a byte-identical legacy run.
+    #[test]
+    fn operator_skip_set_reaches_the_runner_through_the_guarded_explicit_skip_wiring() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/native.rs"
+        ));
+        let wiring = "runner = runner.with_explicit_skips(operator_skips.iter().cloned());";
+        let call = source
+            .find(wiring)
+            .expect("the operator skip set must ride the runner's explicit-skip channel");
+        let guard = source
+            .find("if !operator_skips.is_empty() {")
+            .expect("the explicit-skip wiring must be guarded by the non-empty check");
+        assert!(
+            guard < call,
+            "the explicit-skip wiring must come after its non-empty guard"
+        );
+        let block_open = guard + "if !operator_skips.is_empty() ".len();
+        assert!(
+            !source[block_open..call].contains('}'),
+            "the explicit-skip wiring must sit INSIDE the non-empty guard block"
+        );
     }
 
     fn inventory_entry(alias: &str, platform: Option<VmGuestPlatform>) -> VmInventoryEntry {

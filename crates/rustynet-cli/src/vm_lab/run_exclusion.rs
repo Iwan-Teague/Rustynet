@@ -409,6 +409,9 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         stop_after_ready: _,
         resume_from: _,
         rerun_stage: _,
+        // b119: a runtime stage omission names no guest, so it cannot affect
+        // the guest-exclusion set.
+        skip_stages: _,
         trust_inventory_ready: _,
         windows_only: _,
         no_fail_on_authenticode: _,

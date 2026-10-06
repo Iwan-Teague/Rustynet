@@ -1725,6 +1725,20 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// stages are skipped-as-passed. Mutually exclusive with `--resume-from`
     /// and `--run-only`.
     pub rerun_stage: Option<String>,
+    /// `--skip-stage <name>` (repeatable, comma-separated values allowed):
+    /// RUNTIME omission of named stages from a FULL run. Unlike the plan-level
+    /// `--skip-*` suite flags this never shrinks the resolved plan — the named
+    /// stages stay in the plan and the runner records each as a blocking
+    /// `NotRun` with reason "omitted by --skip-stage" (their dependents
+    /// cascade-skip), so the run verdict fails closed and the report can never
+    /// pass as a full-suite run. Validated fail-closed at parse time against
+    /// [`StageId::ALL`] by [`parse_skip_stages`]: unknown names, case
+    /// variants, empty entries and duplicates are hard errors. Mutually
+    /// exclusive with `--setup-only`, `--run-only`, `--resume-from` and
+    /// `--rerun-stage` (enforced in
+    /// [`validate_orchestrate_live_lab_config`]). Empty (the default) changes
+    /// nothing.
+    pub skip_stages: Vec<String>,
     /// `--trust-inventory-ready`: skip the pre-run restart-unready gate.
     ///
     /// The readiness gate keys off `probe_tcp_port_status`, a raw `TcpStream`
@@ -1974,6 +1988,44 @@ pub fn parse_lab_stun_servers(raw: &str) -> Result<Vec<std::net::SocketAddr>, St
     Ok(servers)
 }
 
+/// Parse `--skip-stage <name>` values (repeatable, comma-separated allowed)
+/// into validated stage names. Fail closed at parse time: every entry must be
+/// an exact-case member of [`StageId::ALL`] — unknown names and case variants
+/// are errors naming the valid stages, an empty entry (bare flag, empty
+/// string, or an empty CSV slot) is an error, and a duplicate across any of
+/// the repeated values is an error rather than a silent fold. Returns the
+/// trimmed names in operator order.
+pub fn parse_skip_stages(raw_values: &[String]) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    for raw in raw_values {
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                return Err(format!(
+                    "--skip-stage: empty stage name in {raw:?} (expected <stage>[,<stage>...]; \
+                     the option requires a value)"
+                ));
+            }
+            if !StageId::ALL.iter().any(|s| s.as_str() == entry) {
+                return Err(format!(
+                    "--skip-stage: stage '{entry}' is not a Rust-native stage; valid stages: {}",
+                    StageId::ALL
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            if !seen.insert(entry.to_owned()) {
+                return Err(format!("--skip-stage: duplicate stage '{entry}'"));
+            }
+            names.push(entry.to_owned());
+        }
+    }
+    Ok(names)
+}
+
 /// Validate cross-flag invariants for `vm-lab-orchestrate-live-lab`.
 pub fn validate_orchestrate_live_lab_config(
     config: &VmLabOrchestrateLiveLabConfig,
@@ -1987,6 +2039,20 @@ pub fn validate_orchestrate_live_lab_config(
     if config.stop_after_ready && (config.setup_only || config.run_only) {
         return Err(
             "--stop-after-ready cannot be combined with --setup-only or --run-only".to_owned(),
+        );
+    }
+    // Before the shape requirements below: a run combining --skip-stage with a
+    // focused-invocation mode is invalid regardless of what else it carries.
+    if !config.skip_stages.is_empty()
+        && (config.setup_only
+            || config.run_only
+            || config.resume_from.is_some()
+            || config.rerun_stage.is_some())
+    {
+        return Err(
+            "--skip-stage is a runtime skip on a full run's plan and is mutually \
+                    exclusive with --setup-only, --run-only, --resume-from and --rerun-stage"
+                .to_owned(),
         );
     }
     if config.setup_only && config.node_assignments.is_empty() {
@@ -54517,6 +54583,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             linux_backend: None,
             prebuilt_node_binaries: Vec::new(),
             prebuilt_glibc_floor: None,
+            skip_stages: Vec::new(),
         }
     }
 
@@ -54893,6 +54960,129 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .expect("absence of both flags must validate");
     }
 
+    // ── b119: --skip-stage parse + validation ─────────────────────────────────
+
+    #[test]
+    fn parse_skip_stages_accepts_repeatable_and_csv_values_in_order() {
+        let raw = vec![
+            "live_managed_dns_validation".to_owned(),
+            " live_network_flap_validation , live_reboot_recovery_validation ".to_owned(),
+            "live_secrets_not_in_logs_validation".to_owned(),
+        ];
+        let names = super::parse_skip_stages(&raw).expect("valid skip set must parse");
+        assert_eq!(
+            names,
+            vec![
+                "live_managed_dns_validation".to_owned(),
+                "live_network_flap_validation".to_owned(),
+                "live_reboot_recovery_validation".to_owned(),
+                "live_secrets_not_in_logs_validation".to_owned(),
+            ],
+            "entries must land trimmed, in operator order, one per stage"
+        );
+        assert!(
+            super::parse_skip_stages(&[])
+                .expect("no skips is valid")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parse_skip_stages_rejects_empty_entries() {
+        for raw in [
+            vec![String::new()],
+            vec!["live_managed_dns_validation,,".to_owned()],
+            vec!["   ".to_owned()],
+        ] {
+            let err = super::parse_skip_stages(&raw)
+                .expect_err("an empty --skip-stage entry must be refused");
+            assert!(
+                err.contains("--skip-stage") && err.contains("empty"),
+                "the error must name the option and the empty entry: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_skip_stages_rejects_unknown_and_case_variant_names() {
+        for raw in [
+            vec!["not_a_rust_native_stage".to_owned()],
+            vec!["LIVE_MANAGED_DNS_VALIDATION".to_owned()],
+            vec!["Live_Managed_Dns_Validation".to_owned()],
+        ] {
+            let err = super::parse_skip_stages(&raw)
+                .expect_err("an unknown or case-variant name must be refused");
+            assert!(
+                err.contains("is not a Rust-native stage"),
+                "the error must say the stage is unknown (exact match only): {err}"
+            );
+            assert!(
+                err.contains("live_managed_dns_validation"),
+                "the error must list valid stages: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_skip_stages_rejects_duplicates() {
+        for raw in [
+            vec![
+                "live_managed_dns_validation".to_owned(),
+                "live_managed_dns_validation".to_owned(),
+            ],
+            vec![
+                "live_managed_dns_validation,live_network_flap_validation".to_owned(),
+                "live_managed_dns_validation".to_owned(),
+            ],
+        ] {
+            let err = super::parse_skip_stages(&raw)
+                .expect_err("a duplicate --skip-stage name must be refused");
+            assert!(
+                err.contains("duplicate"),
+                "the error must call the entry a duplicate: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_stage_is_mutually_exclusive_with_focused_invocation_modes() {
+        use super::orchestrator::stage::StageId;
+        type Cfg = super::VmLabOrchestrateLiveLabConfig;
+        type ModeSetter = fn(&mut Cfg);
+        const MODES: &[(&str, ModeSetter)] = &[
+            ("setup_only", |cfg| cfg.setup_only = true),
+            ("run_only", |cfg| cfg.run_only = true),
+            ("resume_from", |cfg| {
+                cfg.resume_from = Some(StageId::Preflight.as_str().to_owned())
+            }),
+            ("rerun_stage", |cfg| {
+                cfg.rerun_stage = Some(StageId::Preflight.as_str().to_owned())
+            }),
+        ];
+        for (field, mode) in MODES.iter() {
+            let mut cfg = empty_orchestrate_live_lab_config();
+            cfg.skip_stages = vec!["live_managed_dns_validation".to_owned()];
+            mode(&mut cfg);
+            let err = super::validate_orchestrate_live_lab_config(&cfg)
+                .expect_err("--skip-stage with a focused-invocation mode must be refused");
+            assert!(
+                err.contains("--skip-stage") && err.contains("mutually"),
+                "the {field} refusal must name --skip-stage and the exclusivity: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_stage_alone_validates_on_a_full_run() {
+        let mut cfg = empty_orchestrate_live_lab_config();
+        cfg.skip_stages = vec![
+            "live_managed_dns_validation".to_owned(),
+            "live_reboot_recovery_validation".to_owned(),
+        ];
+        super::validate_orchestrate_live_lab_config(&cfg)
+            .expect("--skip-stage on a full run must validate");
+    }
+
     #[test]
     fn legacy_role_flags_deprecation_warnings_silent_when_node_set() {
         let mut cfg = empty_orchestrate_live_lab_config();
@@ -55043,6 +55233,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "working-tree",
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("run summary must write");
 
@@ -55131,6 +55322,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             "working-tree",
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .expect("summary");
         super::write_rust_native_failure_digest(&tmp, "rust-test", "net-test", "fail")
@@ -55169,6 +55361,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         rec.stage_started(&StageId::TrafficTestMatrix);
         rec.stage_finished(
@@ -55230,6 +55423,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         recorder.stage_started(&StageId::Preflight);
         // QH-83 Setup batch: preflight declares a File witness now, so a
@@ -55304,6 +55498,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         for id in [StageId::Preflight, StageId::TrafficTestMatrix] {
             recorder.stage_started(&id);
@@ -55361,6 +55556,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             started_at: std::cell::RefCell::new(std::collections::HashMap::new()),
             errors: std::cell::RefCell::new(Vec::new()),
             run_instance_id: None,
+            operator_skips: Default::default(),
         };
         recorder.stage_started(&StageId::Preflight);
         // QH-83 Setup batch: preflight declares a File witness now, so a
@@ -55497,6 +55693,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             parity_path.as_path(),
             &StageId::BootstrapHosts,
             &StageOutcome::Failed("cargo registry unreachable".to_owned()),
+            &Default::default(),
         );
 
         assert_eq!(outcome.stage, "bootstrap_hosts");
