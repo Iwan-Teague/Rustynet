@@ -157,16 +157,48 @@ clear_residual_rustynet_state() {
 wait_for_package_manager_idle() {
   local pattern="$1"
   local label="$2"
+  # Bounded wait: 60 attempts x 2s (120s) unless the caller overrides it.
+  # The apt install path passes 300 (10 min) because it genuinely needs the
+  # dpkg lock and unattended-upgrades can hold it for many minutes on a slow
+  # uplink (rz1-r2, linux-x86-client-1: held ~2h by pid 3515).
+  local max_attempts="${3:-60}"
   local attempt
-  for attempt in $(seq 1 60); do
+  for attempt in $(seq 1 "${max_attempts}"); do
     if ! pgrep -f "$pattern" >/dev/null 2>&1; then
       return 0
     fi
     sleep 2
   done
-  echo "${label} remained busy after waiting for prior lab processes to exit" >&2
+  echo "${label} remained busy after waiting $((max_attempts * 2))s for the package manager to go idle; current holder(s):" >&2
   pgrep -af "$pattern" >&2 || true
   exit 1
+}
+
+# Detects apt/dpkg lock-contention failures in one attempt's captured log
+# (rz1-r2, linux-x86-client-1: unattended-upgrades held the dpkg frontend
+# lock and three install attempts seconds apart were mislabelled as DNS
+# failures). Deliberately narrow — only the two lock shapes apt-get emits —
+# so genuine network failures keep the DNS-repair treatment.
+apt_attempt_failed_on_package_lock() {
+  local apt_log="$1"
+  grep -Eq '^E: (Could not get lock|Unable to acquire the dpkg frontend lock)' "${apt_log}" 2>/dev/null
+}
+
+# Lock diagnostics: name the holder of the apt/dpkg locks. A lock error is
+# not a network error, so on the lock path this REPLACES — never accompanies
+# — repair_bootstrap_dns_state and emit_bootstrap_network_diagnostics.
+emit_bootstrap_package_lock_diagnostics() {
+  local lock_file
+  echo "[bootstrap] package-lock diagnostics: an apt/dpkg lock is held by another process" >&2
+  pgrep -af 'apt-get|apt|dpkg|unattended-upgr|packagekitd' >&2 \
+    || echo "[bootstrap] no apt/dpkg/unattended-upgrade process is running now" >&2
+  if command -v fuser >/dev/null 2>&1; then
+    for lock_file in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
+      [[ -e "${lock_file}" ]] || continue
+      echo "--- fuser -v ${lock_file} ---" >&2
+      run_root_timed 30 fuser -v "${lock_file}" >&2 || true
+    done
+  fi
 }
 
 # EL detection for the dnf family branch: Fedora shares dnf with the EL
@@ -340,7 +372,7 @@ install_prereqs() {
     return 0
   fi
   if [[ "${os_id}" == "fedora" || "${os_like}" == *"fedora"* || "${os_like}" == *"rhel"* ]]; then
-    wait_for_package_manager_idle 'dnf|rpm' 'dnf/rpm'
+    wait_for_package_manager_idle 'dnf|rpm|packagekitd' 'dnf/rpm'
     # b30: the core transaction deliberately EXCLUDES libfaketime. On EL the
     # base repositories lack it (EPEL-only; not enabled per ADR-027) and dnf
     # refuses the WHOLE transaction when any one name is unresolvable (live
@@ -400,6 +432,7 @@ ensure_llvm_config_alias() {
 run_apt_update_hardened() {
   local attempt
   local apt_log
+  local lock_failure=false
   local -a apt_network_opts
   apt_network_opts=(
     -o Acquire::Retries=3
@@ -409,7 +442,7 @@ run_apt_update_hardened() {
     -o Dpkg::Use-Pty=0
   )
   for attempt in $(seq 1 3); do
-    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg' 'apt/dpkg'
+    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg'
     apt_log="$(mktemp /tmp/rn-apt-update.XXXXXX.log)"
     if run_root_timed 240 env DEBIAN_FRONTEND=noninteractive apt-get \
       "${apt_network_opts[@]}" \
@@ -420,14 +453,28 @@ run_apt_update_hardened() {
       fi
       echo "[bootstrap] apt-get update reported fetch warnings; treating as failure" >&2
     fi
+    if apt_attempt_failed_on_package_lock "${apt_log}"; then
+      lock_failure=true
+      emit_bootstrap_package_lock_diagnostics
+    else
+      lock_failure=false
+    fi
     rm -f "${apt_log}"
     if [[ "${attempt}" -lt 3 ]]; then
-      echo "[bootstrap] apt-get update attempt ${attempt} failed; retrying after DNS repair" >&2
-      run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
-      repair_bootstrap_dns_state
+      if [[ "${lock_failure}" == true ]]; then
+        echo "[bootstrap] apt-get update attempt ${attempt} failed: the apt/dpkg lock is held by another process; NOT repairing DNS" >&2
+      else
+        echo "[bootstrap] apt-get update attempt ${attempt} failed; retrying after DNS repair" >&2
+        run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+        repair_bootstrap_dns_state
+      fi
       sleep 2
     fi
   done
+  if [[ "${lock_failure}" == true ]]; then
+    echo "[bootstrap] apt-get update failed after retries: the apt/dpkg lock stayed held by another process (holders named above); this is not a DNS/network problem" >&2
+    return 1
+  fi
   echo "[bootstrap] apt-get update failed after retries" >&2
   emit_bootstrap_network_diagnostics "deb.debian.org"
   return 1
@@ -435,6 +482,8 @@ run_apt_update_hardened() {
 
 run_apt_install_hardened() {
   local attempt
+  local apt_log
+  local lock_failure=false
   local -a apt_network_opts
   apt_network_opts=(
     -o Acquire::Retries=3
@@ -448,18 +497,40 @@ run_apt_install_hardened() {
     return 2
   fi
   for attempt in $(seq 1 3); do
+    # The install needs the dpkg lock itself (the update does not), so wait
+    # bounded before EVERY attempt, covering the unattended-upgrade python
+    # parent that holds the lock between phases. rz1-r2 proved the gap.
+    wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg' 300
+    apt_log="$(mktemp /tmp/rn-apt-install.XXXXXX.log)"
     if run_root_timed 5400 env DEBIAN_FRONTEND=noninteractive apt-get \
       "${apt_network_opts[@]}" \
-      install -y --no-install-recommends "$@"; then
+      install -y --no-install-recommends "$@" 2>&1 | tee "${apt_log}"; then
+      rm -f "${apt_log}"
       return 0
     fi
+    if apt_attempt_failed_on_package_lock "${apt_log}"; then
+      lock_failure=true
+      emit_bootstrap_package_lock_diagnostics
+    else
+      lock_failure=false
+    fi
+    rm -f "${apt_log}"
     if [[ "${attempt}" -lt 3 ]]; then
-      echo "[bootstrap] apt-get install attempt ${attempt} failed; retrying after DNS repair" >&2
-      run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
-      repair_bootstrap_dns_state
-      sleep 2
+      if [[ "${lock_failure}" == true ]]; then
+        echo "[bootstrap] apt-get install attempt ${attempt} failed: the apt/dpkg lock is held by another process; NOT repairing DNS" >&2
+        sleep 2
+      else
+        echo "[bootstrap] apt-get install attempt ${attempt} failed; retrying after DNS repair" >&2
+        run_root_timed 120 env DEBIAN_FRONTEND=noninteractive apt-get clean >/dev/null 2>&1 || true
+        repair_bootstrap_dns_state
+        sleep 2
+      fi
     fi
   done
+  if [[ "${lock_failure}" == true ]]; then
+    echo "[bootstrap] apt-get install failed after retries: the apt/dpkg lock stayed held by another process (holders named above); this is not a DNS/network problem" >&2
+    return 1
+  fi
   echo "[bootstrap] apt-get install failed after retries" >&2
   emit_bootstrap_network_diagnostics "deb.debian.org"
   return 1

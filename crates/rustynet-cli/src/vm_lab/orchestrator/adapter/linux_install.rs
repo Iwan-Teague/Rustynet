@@ -1829,6 +1829,314 @@ echo OK
         let _ = std::fs::remove_file(&script_path);
     }
 
+    /// Collects a top-level shell function's text from the embedded bootstrap
+    /// script, starting at the byte offset of its `name() {` header, through
+    /// the closing `}` at column 0 (the script's functions are column-0
+    /// delimited; every inner block is indented).
+    fn bootstrap_function_block(start: usize) -> String {
+        let rest = &BOOTSTRAP_SCRIPT[start..];
+        let mut block = String::new();
+        for line in rest.lines() {
+            block.push_str(line);
+            block.push('\n');
+            if line == "}" {
+                break;
+            }
+        }
+        block
+    }
+
+    /// rz1-r2 (live 2026-10-06, linux-x86-client-1): unattended-upgrades held
+    /// the dpkg frontend lock and `run_apt_install_hardened` had NO package
+    /// manager wait (the update path already had one), so its three install
+    /// attempts burned seconds apart and the run died. The install path must
+    /// wait before every attempt, with a pattern covering the unattended-
+    /// upgrade python parent (`/usr/bin/python3 /usr/sbin/unattended-upgrade`)
+    /// that holds the lock between phases, and a bounded wait (300 x 2s).
+    #[test]
+    fn bootstrap_apt_install_waits_for_the_package_manager_before_installing() {
+        let start = BOOTSTRAP_SCRIPT
+            .find("run_apt_install_hardened() {")
+            .expect("run_apt_install_hardened must exist in the embedded bootstrap script");
+        let block = bootstrap_function_block(start);
+        assert!(
+            block.contains(
+                "wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg' 300"
+            ),
+            "the apt install path must wait for the package manager before each attempt, covering \
+             the unattended-upgrade python parent, with a bounded wait (rz1-r2: pid 3515 held the \
+             dpkg lock ~2h while three installs burned seconds apart): {block}"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains(
+                "wait_for_package_manager_idle 'apt-get|/usr/lib/apt/methods/|dpkg|unattended-upgr' 'apt/dpkg'"
+            ),
+            "the update path's wait pattern must cover unattended-upgr too"
+        );
+    }
+
+    /// The dnf path already waited, but on `'dnf|rpm'` — packagekitd (the
+    /// GNOME Software backend) holds the same rpm/dnf lock and is invisible
+    /// to that pattern. Same gap class as the apt install path.
+    #[test]
+    fn bootstrap_dnf_wait_pattern_covers_packagekitd() {
+        assert!(
+            BOOTSTRAP_SCRIPT
+                .contains("wait_for_package_manager_idle 'dnf|rpm|packagekitd' 'dnf/rpm'"),
+            "the dnf path's idle-wait pattern must cover packagekitd: {}",
+            BOOTSTRAP_SCRIPT
+                .lines()
+                .filter(|line| line.contains("wait_for_package_manager_idle"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// rz1-r2: on the lock error the script ran `repair_bootstrap_dns_state`
+    /// and then two screens of `emit_bootstrap_network_diagnostics` (healthy
+    /// DNS!) and mislabelled the failure. Lock errors must be classified,
+    /// get lock diagnostics (who holds the lock), and NEVER trigger DNS
+    /// repair or network diagnostics — on both apt paths.
+    #[test]
+    fn bootstrap_apt_lock_failures_get_lock_diagnostics_never_dns_repair() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("apt_attempt_failed_on_package_lock() {"),
+            "a lock-error classifier must exist in the embedded bootstrap script"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("emit_bootstrap_package_lock_diagnostics() {"),
+            "lock diagnostics (who holds the lock) must exist in the embedded bootstrap script"
+        );
+        let install_start = BOOTSTRAP_SCRIPT
+            .find("run_apt_install_hardened() {")
+            .expect("run_apt_install_hardened must exist");
+        let install_block = bootstrap_function_block(install_start);
+        let update_start = BOOTSTRAP_SCRIPT
+            .find("run_apt_update_hardened() {")
+            .expect("run_apt_update_hardened must exist");
+        let update_block = bootstrap_function_block(update_start);
+        for (label, block) in [("install", &install_block), ("update", &update_block)] {
+            assert!(
+                block.contains("apt_attempt_failed_on_package_lock"),
+                "the apt {label} path must classify lock failures per attempt: {block}"
+            );
+            assert!(
+                block.contains("emit_bootstrap_package_lock_diagnostics"),
+                "the apt {label} path must emit lock diagnostics on a lock failure: {block}"
+            );
+            assert!(
+                block.contains("NOT repairing DNS"),
+                "the apt {label} path must say explicitly that DNS is NOT being repaired on the lock path: {block}"
+            );
+            let final_lock = block
+                .find("lock stayed held by another process")
+                .unwrap_or_else(|| {
+                    panic!("the apt {label} path must fail loudly on a persistent lock: {block}")
+                });
+            let tail = &block[final_lock..];
+            let return_at = tail
+                .find("return 1")
+                .unwrap_or_else(|| panic!("the apt {label} lock path must return 1: {tail}"));
+            assert!(
+                !tail[..return_at].contains("emit_bootstrap_network_diagnostics"),
+                "the apt {label} lock-final path must return WITHOUT network diagnostics: {}",
+                &tail[..return_at]
+            );
+            assert!(
+                !tail[..return_at].contains("repair_bootstrap_dns_state"),
+                "the apt {label} lock-final path must return WITHOUT DNS repair: {}",
+                &tail[..return_at]
+            );
+            assert!(
+                !tail[..return_at].contains("return 0"),
+                "the apt {label} lock path must not return success before its failure return: {}",
+                &tail[..return_at]
+            );
+        }
+        assert!(
+            install_block.contains("emit_bootstrap_network_diagnostics \"deb.debian.org\""),
+            "the non-lock install failure keeps its network diagnostics (existing behaviour)"
+        );
+        // Exactly ONE DNS-repair call site per apt block: the non-lock retry
+        // branch. A second one on the lock branch is the rz1-r2 misdiagnosis.
+        for (label, block) in [("install", &install_block), ("update", &update_block)] {
+            assert_eq!(
+                block.matches("repair_bootstrap_dns_state").count(),
+                1,
+                "the apt {label} block must call repair_bootstrap_dns_state exactly once (the non-lock branch only): {block}"
+            );
+        }
+    }
+
+    /// Behavioural witness: run the REAL extracted lock classifier under bash
+    /// against the two E: shapes apt-get emitted on rz1-r2 and against a
+    /// genuine fetch failure. On the pre-fix script the function does not
+    /// exist, the awk extraction is empty, and the lock log misclassifies.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_apt_lock_error_classifier_recognises_lock_shapes_under_bash() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_lock_classifier.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        let lock_log_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_lock.log",
+            concat!(
+                "Reading package lists...\n",
+                "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 3515 (unattended-upgr)\n",
+                "E: Unable to acquire the dpkg frontend lock /var/lib/dpkg/lock-frontend, are you root?\n",
+            )
+            .as_bytes(),
+            0o600,
+        );
+        let net_log_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_net.log",
+            concat!(
+                "Err:1 http://deb.debian.org/debian bookworm InRelease\n",
+                "W: Failed to fetch http://deb.debian.org/debian bookworm InRelease: Temporary failure resolving 'deb.debian.org'\n",
+                "E: Some index files failed to download.\n",
+            )
+            .as_bytes(),
+            0o600,
+        );
+        let harness = r#"set -euo pipefail
+eval "$(awk '/^apt_attempt_failed_on_package_lock\(\) \{/,/^\}$/ {print}' "$1")"
+if apt_attempt_failed_on_package_lock "$2"; then echo LOCK; else echo OTHER; fi
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_bootstrap_b126_classifier_extract")
+            .arg(script_path.as_os_str())
+            .arg(lock_log_path.as_os_str())
+            .output()
+            .expect("run the extracted lock classifier under bash");
+        assert!(
+            output.status.success(),
+            "classifier must run under bash: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "LOCK",
+            "the dpkg-lock E: shapes must classify as a lock failure: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(harness)
+            .arg("rn_bootstrap_b126_classifier_extract")
+            .arg(script_path.as_os_str())
+            .arg(net_log_path.as_os_str())
+            .output()
+            .expect("run the extracted lock classifier under bash");
+        assert!(
+            output.status.success(),
+            "classifier must run under bash: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "OTHER",
+            "a genuine fetch failure must stay on the DNS-repair path: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&lock_log_path);
+        let _ = std::fs::remove_file(&net_log_path);
+    }
+
+    /// Behavioural witness for the bounded wait: with a fake unattended-upgr
+    /// holder running, the extracted `wait_for_package_manager_idle` must
+    /// fail (exit 1, holder named on stderr) within the caller's bound
+    /// (`timeout 15`); the pre-fix helper ignores the max-attempts argument
+    /// and loops 60x2s, so it cannot answer inside 15s. With no holder it
+    /// must return 0 immediately.
+    ///
+    /// Linux-only: the bootstrap script runs on Linux guests and names the
+    /// holder with `pgrep -af`, where `-a` prints the command line. On macOS
+    /// `pgrep -a` means "include ancestors" and prints bare pids, so the
+    /// holder-naming assertion cannot hold there (the macOS landing gate
+    /// failed on exactly that); the Linux leg of the landing gates runs it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bootstrap_wait_for_package_manager_idle_bounds_its_wait_and_names_the_holder() {
+        use std::process::Command;
+
+        let script_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_wait_idle.sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+            0o700,
+        );
+        // The driver runs from a FILE, never `bash -c <text>`: with -c the
+        // driver's own argv carries the pgrep pattern and pgrep -f would
+        // match the driver itself, making every run look busy.
+        let driver_path = write_rsa0068_test_file(
+            "rn_bootstrap_b126_wait_driver.sh",
+            r#"set -u
+eval "$(awk '/^wait_for_package_manager_idle\(\) \{/,/^\}$/ {print}' "$1")"
+case "$2" in
+  busy)
+    bash -c 'exec -a rn-b126-fake-unattended-upgr sleep 30' &
+    holder=$!
+    wait_for_package_manager_idle 'rn-b126-fake-unattended-upgr' 'apt/dpkg' 2
+    rc=$?
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    if [ "$rc" -eq 0 ]; then echo IDLE-UNEXPECTED; else exit "$rc"; fi
+    ;;
+  idle)
+    wait_for_package_manager_idle 'rn-b126-no-such-process-xyz' 'apt/dpkg' 2
+    echo IDLE-OK
+    ;;
+esac
+"#
+            .as_bytes(),
+            0o700,
+        );
+        let output = Command::new("timeout")
+            .arg("15")
+            .arg("bash")
+            .arg(driver_path.as_os_str())
+            .arg(script_path.as_os_str())
+            .arg("busy")
+            .output()
+            .expect("run the extracted idle-wait under bash");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "a busy package manager must fail with exit 1 inside the bounded wait \
+             (pre-fix helper loops 60x2s and cannot answer inside timeout 15): status={:?} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("remained busy"),
+            "the busy failure must say the label remained busy: {stderr}"
+        );
+        assert!(
+            stderr.contains("rn-b126-fake-unattended-upgr"),
+            "the busy failure must name the lock holder: {stderr}"
+        );
+        let output = Command::new("bash")
+            .arg(driver_path.as_os_str())
+            .arg(script_path.as_os_str())
+            .arg("idle")
+            .output()
+            .expect("run the extracted idle-wait under bash");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "IDLE-OK",
+            "an idle package manager must return 0 immediately: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _ = std::fs::remove_file(&script_path);
+        let _ = std::fs::remove_file(&driver_path);
+    }
+
     #[test]
     fn bootstrap_root_timeout_wraps_child_command_not_sudo() {
         // `timeout sudo resolvectl ...` can leave the root child alive after
