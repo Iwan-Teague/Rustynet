@@ -43,7 +43,7 @@ use std::time::Duration;
 
 use super::host::ScenarioHost;
 use super::provisioning::{
-    self, AllowSpec, AssignmentsSpec, EnvFile, LabContext, NodeSpec, during,
+    self, AllowSpec, AssignmentsSpec, EXIT_NODE_CAPABILITIES, EnvFile, LabContext, NodeSpec, during,
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
@@ -295,7 +295,8 @@ fn provision(inputs: &ScenarioInputs<'_>, lab: &LabContext) -> Result<(), String
                 &exit.address,
                 WIREGUARD_PORT,
                 exit_pub_hex,
-            )?,
+            )?
+            .with_capabilities(&EXIT_NODE_CAPABILITIES),
             NodeSpec::new(
                 client.node_id.as_str(),
                 &client.address,

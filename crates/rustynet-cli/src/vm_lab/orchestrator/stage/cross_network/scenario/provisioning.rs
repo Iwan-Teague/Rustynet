@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use base64::Engine as _;
+use rustynet_control::roles::{RoleCapability, role_capability_csv};
 
 use super::super::substrate::NetLeafRunner;
 use super::{DAEMON_SOCKET, REMOTE_RUSTYNET_BIN, capture_root, run_root, run_root_allow_failure};
@@ -258,12 +259,29 @@ pub fn collect_pubkey_hex(runner: &dyn NetLeafRunner) -> Result<String, String> 
 
 // ───────────────────────────── spec builders ─────────────────────────────
 
-/// One entry of `RUSTYNET_ASSIGNMENT_NODES`: `<node-id>|<addr>:<port>|<pubkey-hex>`.
+/// Lab-role → wire capability for a scenario exit node: it must advertise
+/// `exit_server` or the issuer refuses every remote-exit assignment naming it
+/// (`validate_assignment_exit_provider`: "exit node {id} lacks exit_server
+/// capability" — katana-xnet-1 root cause A, seven stage failures). Client and
+/// entry nodes carry no extra capability: their [`NodeSpec`] stays
+/// capability-free, keeps the issuer's `[Client]` default, and therefore
+/// renders byte-identical to the old three-field entry.
+pub const EXIT_NODE_CAPABILITIES: [RoleCapability; 1] = [RoleCapability::ExitServer];
+
+/// One entry of `NODES_SPEC`:
+/// `<node-id>|<addr>:<port>|<pubkey-hex>[|<capabilities-csv>]`.
+///
+/// The optional fourth field carries the node's role capabilities. It is
+/// rendered only from the closed [`RoleCapability`] enum via
+/// `role_capability_csv`, never from caller text, so nothing can inject `|`,
+/// `;` or an unknown token into the spec line; the guest-side issuer re-parses
+/// it with `parse_role_capability_csv` and refuses unknown tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeSpec {
     node_id: String,
     endpoint: String,
     pubkey_hex: String,
+    capabilities: Vec<RoleCapability>,
 }
 
 impl NodeSpec {
@@ -282,11 +300,29 @@ impl NodeSpec {
             node_id,
             endpoint: format!("{address}:{port}"),
             pubkey_hex,
+            capabilities: Vec::new(),
         })
     }
 
+    /// Tag the node with the capabilities its lab role carries. The wire value
+    /// is produced from the closed [`RoleCapability`] enum only; see
+    /// [`EXIT_NODE_CAPABILITIES`] for the one mapping the scenarios need.
+    pub fn with_capabilities(mut self, capabilities: &[RoleCapability]) -> Self {
+        self.capabilities = capabilities.to_vec();
+        self
+    }
+
     fn render(&self) -> String {
-        format!("{}|{}|{}", self.node_id, self.endpoint, self.pubkey_hex)
+        if self.capabilities.is_empty() {
+            return format!("{}|{}|{}", self.node_id, self.endpoint, self.pubkey_hex);
+        }
+        format!(
+            "{}|{}|{}|{}",
+            self.node_id,
+            self.endpoint,
+            self.pubkey_hex,
+            role_capability_csv(&self.capabilities),
+        )
     }
 }
 
@@ -1057,4 +1093,120 @@ pub fn remote_src_dir(ssh_user: &str) -> Result<String, String> {
 /// is no untrusted content for the conversion to mangle.
 pub fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EXIT_NODE_CAPABILITIES, NodeSpec, nodes_spec};
+
+    const EXIT_PUB: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ENTRY_PUB: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const CLIENT_PUB: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn exit_node() -> NodeSpec {
+        NodeSpec::new(
+            "katana-exit-1-bootstrap",
+            "192.168.123.222",
+            51820,
+            EXIT_PUB,
+        )
+        .expect("exit spec")
+        .with_capabilities(&EXIT_NODE_CAPABILITIES)
+    }
+
+    fn entry_node() -> NodeSpec {
+        NodeSpec::new(
+            "katana-entry-1-bootstrap",
+            "192.168.122.57",
+            51820,
+            ENTRY_PUB,
+        )
+        .expect("entry spec")
+    }
+
+    fn client_node() -> NodeSpec {
+        NodeSpec::new(
+            "katana-client-1-bootstrap",
+            "192.168.122.45",
+            51820,
+            CLIENT_PUB,
+        )
+        .expect("client spec")
+    }
+
+    /// Client and entry keep the issuer's `[Client]` default: their entries
+    /// stay byte-identical to the old three-field wire form (no fourth field,
+    /// no capability token anywhere) — the "identical output" pin.
+    #[test]
+    fn client_and_entry_spec_stays_three_fields() {
+        let spec = nodes_spec(&[entry_node(), client_node()]).expect("spec");
+        assert_eq!(
+            spec,
+            format!(
+                "katana-entry-1-bootstrap|192.168.122.57:51820|{ENTRY_PUB};\
+                 katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
+            )
+        );
+        assert!(!spec.contains("exit_server"));
+        for entry in spec.split(';') {
+            assert_eq!(
+                entry.split('|').count(),
+                3,
+                "entry {entry:?} must stay three-field"
+            );
+        }
+    }
+
+    /// Golden wire form for the direct remote-exit topology: the exit entry
+    /// grows exactly `|exit_server`. This is the katana-xnet-1 root-cause-A
+    /// witness: on HEAD `with_capabilities` does not exist, so the exit entry
+    /// can only render three-field and the issuer refuses every assignment.
+    #[test]
+    fn exit_spec_carries_exit_server_capability() {
+        let spec = nodes_spec(&[exit_node(), client_node()]).expect("spec");
+        assert_eq!(
+            spec,
+            format!(
+                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|exit_server;\
+                 katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
+            )
+        );
+    }
+
+    /// Golden wire form for the relay-chain / failback topologies (exit,
+    /// entry, client — the shell's order): only the exit's entry is four-field.
+    #[test]
+    fn relay_chain_spec_carries_capability_only_on_exit() {
+        let spec = nodes_spec(&[exit_node(), entry_node(), client_node()]).expect("spec");
+        assert_eq!(
+            spec,
+            format!(
+                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|exit_server;\
+                 katana-entry-1-bootstrap|192.168.122.57:51820|{ENTRY_PUB};\
+                 katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
+            )
+        );
+    }
+
+    /// Capability values come only from the closed `RoleCapability` enum and
+    /// are rendered in canonical form: caller order is normalized and no free
+    /// text can reach the spec line.
+    #[test]
+    fn capabilities_render_canonically_from_closed_enum() {
+        let spec = nodes_spec(&[NodeSpec::new(
+            "katana-exit-1-bootstrap",
+            "192.168.123.222",
+            51820,
+            EXIT_PUB,
+        )
+        .expect("exit spec")
+        .with_capabilities(&[RoleCapability::ExitServer, RoleCapability::Client])])
+        .expect("spec");
+        assert_eq!(
+            spec,
+            format!("katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|client,exit_server")
+        );
+    }
+
+    use rustynet_control::roles::RoleCapability;
 }

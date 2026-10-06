@@ -67,7 +67,7 @@ use super::baseline::{self, BaselinePaths, BaselineScenario};
 use super::endpoint_switch::{self, RoamAlias, SAMPLE_INTERVAL, unix_now};
 use super::host::ScenarioHost;
 use super::provisioning::{
-    self, AllowSpec, AssignmentsSpec, EnvFile, LabContext, NodeSpec, during,
+    self, AllowSpec, AssignmentsSpec, EXIT_NODE_CAPABILITIES, EnvFile, LabContext, NodeSpec, during,
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
@@ -598,7 +598,8 @@ fn reissue_for_roam(
                 &alias.ip,
                 WIREGUARD_PORT,
                 exit_pub_hex,
-            )?,
+            )?
+            .with_capabilities(&EXIT_NODE_CAPABILITIES),
             NodeSpec::new(
                 relay.node_id.as_str(),
                 &relay.address,

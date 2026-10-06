@@ -8400,6 +8400,135 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
         assert!(client_bundle.wire.contains("via_node=exit-1"));
     }
 
+    /// katana-xnet-1 root cause A, guest side: a NODES_SPEC exit entry WITHOUT
+    /// the optional capabilities field materializes as the issuer's `[Client]`
+    /// default, and issuing a remote-exit assignment through that exit is
+    /// REFUSED — the exact refusal the lab printed (`exit node ... lacks
+    /// exit_server capability`, seven stage failures). This pins the refusal so
+    /// the builder fix cannot "land" by weakening the validator: emitting the
+    /// capability (provisioning `EXIT_NODE_CAPABILITIES`) is the fix.
+    #[test]
+    fn exit_spec_without_capability_defaults_to_client_and_is_refused() {
+        let nodes = parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let exit = nodes
+            .iter()
+            .find(|node| node.node_id == "exit-1")
+            .expect("exit node entry");
+        assert_eq!(
+            exit.capabilities, None,
+            "a 3-field entry must keep the issuer's default (no override)"
+        );
+
+        let allow_pairs =
+            parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("allow pairs");
+        let assignments =
+            parse_generic_assignment_specs("exit-1|-;client-1|exit-1").expect("assignments");
+        let err = issue_assignment_bundle_artifacts(
+            &[21u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignments.as_slice(),
+            300,
+        )
+        .expect_err("a capability-less exit must not provide remote exit");
+        assert!(
+            err.contains("lacks exit_server capability"),
+            "unexpected refusal message: {err}"
+        );
+    }
+
+    /// Differential: every NODES_SPEC the cross-network scenario builders emit
+    /// (direct, relay chain, and the failback roam alias re-spell) must parse
+    /// with the REAL guest-side issuer parser, and exactly the exit entry may
+    /// carry the `exit_server` capability override. This is the end-to-end pin
+    /// for katana-xnet-1 root cause A: builder (provisioning.rs) and consumer
+    /// (this parser) agree on the fourth field.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn scenario_node_specs_parse_with_real_issuer_parser() {
+        use crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::{
+            EXIT_NODE_CAPABILITIES, NodeSpec, nodes_spec,
+        };
+        use rustynet_control::roles::RoleCapability;
+
+        const EXIT_PUB: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const ENTRY_PUB: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        const CLIENT_PUB: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+        let exit_at = |address: &str| {
+            NodeSpec::new("katana-exit-1-bootstrap", address, 51820, EXIT_PUB)
+                .expect("exit spec")
+                .with_capabilities(&EXIT_NODE_CAPABILITIES)
+        };
+        let entry = || {
+            NodeSpec::new(
+                "katana-entry-1-bootstrap",
+                "192.168.122.57",
+                51820,
+                ENTRY_PUB,
+            )
+            .expect("entry spec")
+        };
+        let client = || {
+            NodeSpec::new(
+                "katana-client-1-bootstrap",
+                "192.168.122.45",
+                51820,
+                CLIENT_PUB,
+            )
+            .expect("client spec")
+        };
+
+        let topologies = [
+            (
+                "direct",
+                nodes_spec(&[exit_at("192.168.123.222"), client()]).expect("direct spec"),
+                2,
+            ),
+            (
+                "relay chain",
+                nodes_spec(&[exit_at("192.168.123.222"), entry(), client()])
+                    .expect("relay chain spec"),
+                3,
+            ),
+            (
+                "roam alias",
+                nodes_spec(&[exit_at("10.10.0.7"), entry(), client()]).expect("roam spec"),
+                3,
+            ),
+        ];
+
+        for (name, spec, expected_len) in topologies {
+            let nodes = parse_generic_nodes(&spec)
+                .unwrap_or_else(|err| panic!("{name} spec must parse with the real parser: {err}"));
+            assert_eq!(nodes.len(), expected_len, "{name}: entry count");
+
+            let exit_entry = nodes
+                .iter()
+                .find(|node| node.node_id == "katana-exit-1-bootstrap")
+                .expect("exit entry");
+            assert_eq!(
+                exit_entry.capabilities.as_deref(),
+                Some(&[RoleCapability::ExitServer][..]),
+                "{name}: exit entry must carry exactly exit_server"
+            );
+            for other in nodes
+                .iter()
+                .filter(|node| node.node_id != "katana-exit-1-bootstrap")
+            {
+                assert_eq!(
+                    other.capabilities, None,
+                    "{name}: non-exit entry {} must keep the default",
+                    other.node_id
+                );
+            }
+        }
+    }
+
     #[test]
     fn generic_traversal_bundle_artifacts_issue_pair_and_aggregate_outputs() {
         let nodes = parse_generic_nodes(
