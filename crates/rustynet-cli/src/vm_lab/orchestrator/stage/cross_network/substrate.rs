@@ -850,6 +850,185 @@ pub fn topology_digest(
 pub struct VxlanSubstrateProvider;
 
 impl VxlanSubstrateProvider {
+    /// `setup` over EVERY participant when `aliases` is `None`, or over ONLY
+    /// the given aliases (the post-reboot re-provision: never bounce the
+    /// overlay on a node that did not reboot). The returned handle always
+    /// describes the FULL topology (record participants, overlay/underlay
+    /// maps), but `created_resources` lists only what THIS call created.
+    fn setup_aliases(
+        &self,
+        topology: &SubstrateTopology,
+        runners: &BTreeMap<String, &dyn NetLeafRunner>,
+        aliases: Option<&[&str]>,
+    ) -> Result<SubstrateHandle, Box<SubstrateSetupFailure>> {
+        let underlay_ips: BTreeMap<String, String> = topology
+            .nodes
+            .iter()
+            .map(|(alias, ip)| (alias.clone(), ip.to_string()))
+            .collect();
+        let fail = |message: String, partial: SubstrateHandle| {
+            Box::new(SubstrateSetupFailure { message, partial })
+        };
+        let empty_handle = |digest: String| SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: self.id().to_owned(),
+                topology_digest: digest,
+                provisioned: false,
+                participants: Vec::new(),
+            },
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: underlay_ips.clone(),
+            created_resources: Vec::new(),
+        };
+        let plan = match plan_overlay(topology) {
+            Ok(plan) => plan,
+            Err(err) => {
+                let digest = topology_digest(self.id(), topology, None);
+                return Err(fail(err, empty_handle(digest)));
+            }
+        };
+        let digest = topology_digest(self.id(), topology, plan.as_ref());
+        let Some(plan) = plan else {
+            // Single network group: nothing to provision, recorded honestly.
+            return Ok(empty_handle(digest));
+        };
+        let participants: Vec<String> = plan.overlay_ips.keys().cloned().collect();
+        let mut handle = SubstrateHandle {
+            record: SubstrateRecord {
+                substrate_id: self.id().to_owned(),
+                topology_digest: digest,
+                provisioned: true,
+                participants: participants.clone(),
+            },
+            overlay_ips: plan
+                .overlay_ips
+                .iter()
+                .map(|(alias, ip)| (alias.clone(), ip.to_string()))
+                .collect(),
+            underlay_ips,
+            created_resources: Vec::new(),
+        };
+        let every: Vec<&str> = participants.iter().map(String::as_str).collect();
+        for alias in aliases.unwrap_or(every.as_slice()) {
+            let runner = match Self::runner_for(runners, alias) {
+                Ok(runner) => runner,
+                Err(err) => return Err(fail(err, handle)),
+            };
+            if let Err(err) = self.provision_overlay_node(
+                alias,
+                &participants,
+                &mut handle,
+                &plan.overlay_ips,
+                runner,
+            ) {
+                return Err(fail(err, handle));
+            }
+        }
+        Ok(handle)
+    }
+
+    /// Provision ONE topology participant's overlay membership, in the
+    /// documented per-node order: idempotent pre-delete, vxlan link, an fdb
+    /// entry for every peer, the overlay address, up, and the transit
+    /// attestation written LAST (a guest must never hold an attestation for
+    /// a device that does not exist). Extracted verbatim from `setup` so
+    /// the post-reboot re-provision can re-create ONLY the nodes that
+    /// actually rebooted instead of bouncing the overlay under every live
+    /// participant (review finding 3).
+    fn provision_overlay_node(
+        &self,
+        alias: &str,
+        participants: &[String],
+        handle: &mut SubstrateHandle,
+        plan_overlay_ips: &BTreeMap<String, Ipv4Addr>,
+        runner: &dyn NetLeafRunner,
+    ) -> Result<(), String> {
+        let local = handle.underlay_ips[alias].clone();
+        let overlay = handle.overlay_ips[alias].clone();
+        let mac = overlay_mac(plan_overlay_ips[alias]);
+        // Idempotent pre-delete: a leftover device from an aborted run is
+        // expected, so a non-zero exit here is fine — but a transport
+        // failure is not.
+        runner
+            .run(&["sudo", "-n", "ip", "link", "del", VXLAN_LINK_NAME])
+            .map_err(|err| format!("{alias}: pre-delete: {err}"))?;
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "link",
+                "add",
+                VXLAN_LINK_NAME,
+                "address",
+                &mac,
+                "type",
+                "vxlan",
+                "id",
+                VXLAN_VNI,
+                "local",
+                &local,
+                "dstport",
+                VXLAN_DSTPORT,
+                "srcport",
+                VXLAN_SRCPORT_LOW,
+                VXLAN_SRCPORT_HIGH,
+                "nolearning",
+            ],
+        )?;
+        handle
+            .created_resources
+            .push(CreatedResource::link(alias, VXLAN_LINK_NAME));
+        for peer in participants {
+            if peer.as_str() == alias {
+                continue;
+            }
+            let peer_underlay = handle.underlay_ips[peer].clone();
+            Self::run_required(
+                runner,
+                alias,
+                &[
+                    "sudo",
+                    "-n",
+                    "bridge",
+                    "fdb",
+                    "append",
+                    "00:00:00:00:00:00",
+                    "dev",
+                    VXLAN_LINK_NAME,
+                    "dst",
+                    &peer_underlay,
+                ],
+            )?;
+        }
+        let overlay_cidr = format!("{overlay}/{OVERLAY_PREFIX_LEN}");
+        Self::run_required(
+            runner,
+            alias,
+            &[
+                "sudo",
+                "-n",
+                "ip",
+                "addr",
+                "replace",
+                &overlay_cidr,
+                "dev",
+                VXLAN_LINK_NAME,
+            ],
+        )?;
+        Self::run_required(
+            runner,
+            alias,
+            &["sudo", "-n", "ip", "link", "set", VXLAN_LINK_NAME, "up"],
+        )?;
+        // Substrate-transit attestation: the daemon gates its transit
+        // ruleset on this file, so it is provisioned as part of the overlay
+        // itself — a guest without it never enables transit.
+        Self::write_transit_attestation(runner, alias, VXLAN_LINK_NAME, handle)?;
+        Ok(())
+    }
     fn runner_for<'a>(
         runners: &'a BTreeMap<String, &'a dyn NetLeafRunner>,
         alias: &str,
@@ -915,26 +1094,38 @@ impl VxlanSubstrateProvider {
 
     /// Teardown step (b): restart `rustynetd` so its ExecStartPre rebuilds
     /// the persistent boot table from the CURRENT (now absent) attestation,
-    /// dropping the transit allowance. A restart that fails is residue
-    /// (fail closed): the stale boot rule may still be armed. The one
-    /// exception is a guest that has no `rustynetd` unit at all (setup failed
-    /// before the install stage): there is no ExecStartPre to rebuild and no
-    /// boot table this run could have created, and the nft residue assertion
-    /// still verifies that.
+    /// dropping the transit allowance. `systemctl reset-failed` runs first,
+    /// best-effort: a guest that crash-looped earlier in the run (u41-r2's
+    /// `overlay device rustynet-vx0 does not exist` loop) arms systemd's
+    /// start-rate limit, and an unguarded `restart` then fails with
+    /// `Start request repeated too quickly` — turning the rebuild into a
+    /// false residue report. A restart that still fails (both attempts) is
+    /// residue (fail closed): the stale boot rule may still be armed. The
+    /// other exception is a guest that has no `rustynetd` unit at all (setup
+    /// failed before the install stage): there is no ExecStartPre to rebuild
+    /// and no boot table this run could have created, and the nft residue
+    /// assertion still verifies that.
     fn restart_daemon_for_boot_table(
         runner: &dyn NetLeafRunner,
         alias: &str,
     ) -> Result<(), String> {
-        let argv = restart_daemon_argv();
-        match runner.run(&argv) {
-            Err(err) => Err(format!("{alias}: rustynetd restart: {err}")),
-            Ok(output) if output.success => Ok(()),
-            Ok(output) if daemon_unit_absent(&output.stderr) => Ok(()),
-            Ok(output) => Err(format!(
-                "{alias}: rustynetd restart failed (boot table not rebuilt): {}",
-                output.stderr.trim()
-            )),
-        }
+        let restart_argv = restart_daemon_argv();
+        let reset_argv = reset_failed_argv();
+        let attempt = || -> Result<(), String> {
+            // Best-effort: the reset cannot itself decide the outcome, the
+            // restart below is the gate.
+            let _ = runner.run(&reset_argv);
+            match runner.run(&restart_argv) {
+                Err(err) => Err(format!("{alias}: rustynetd restart: {err}")),
+                Ok(output) if output.success => Ok(()),
+                Ok(output) if daemon_unit_absent(&output.stderr) => Ok(()),
+                Ok(output) => Err(format!(
+                    "{alias}: rustynetd restart failed (boot table not rebuilt): {}",
+                    output.stderr.trim()
+                )),
+            }
+        };
+        attempt().or_else(|_first| attempt())
     }
 
     /// Probe one guest's daemon for the `lab-substrate` feature. The probe
@@ -1668,156 +1859,7 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
         topology: &SubstrateTopology,
         runners: &BTreeMap<String, &dyn NetLeafRunner>,
     ) -> Result<SubstrateHandle, Box<SubstrateSetupFailure>> {
-        let underlay_ips: BTreeMap<String, String> = topology
-            .nodes
-            .iter()
-            .map(|(alias, ip)| (alias.clone(), ip.to_string()))
-            .collect();
-        let fail = |message: String, partial: SubstrateHandle| {
-            Box::new(SubstrateSetupFailure { message, partial })
-        };
-        let empty_handle = |digest: String| SubstrateHandle {
-            record: SubstrateRecord {
-                substrate_id: self.id().to_owned(),
-                topology_digest: digest,
-                provisioned: false,
-                participants: Vec::new(),
-            },
-            overlay_ips: BTreeMap::new(),
-            underlay_ips: underlay_ips.clone(),
-            created_resources: Vec::new(),
-        };
-        let plan = match plan_overlay(topology) {
-            Ok(plan) => plan,
-            Err(err) => {
-                let digest = topology_digest(self.id(), topology, None);
-                return Err(fail(err, empty_handle(digest)));
-            }
-        };
-        let digest = topology_digest(self.id(), topology, plan.as_ref());
-        let Some(plan) = plan else {
-            // Single network group: nothing to provision, recorded honestly.
-            return Ok(empty_handle(digest));
-        };
-        let participants: Vec<String> = plan.overlay_ips.keys().cloned().collect();
-        let mut handle = SubstrateHandle {
-            record: SubstrateRecord {
-                substrate_id: self.id().to_owned(),
-                topology_digest: digest,
-                provisioned: true,
-                participants: participants.clone(),
-            },
-            overlay_ips: plan
-                .overlay_ips
-                .iter()
-                .map(|(alias, ip)| (alias.clone(), ip.to_string()))
-                .collect(),
-            underlay_ips,
-            created_resources: Vec::new(),
-        };
-        for alias in &participants {
-            let runner = match Self::runner_for(runners, alias) {
-                Ok(runner) => runner,
-                Err(err) => return Err(fail(err, handle)),
-            };
-            let local = handle.underlay_ips[alias].clone();
-            let overlay = handle.overlay_ips[alias].clone();
-            let mac = overlay_mac(plan.overlay_ips[alias]);
-            // Idempotent pre-delete: a leftover device from an aborted run is
-            // expected, so a non-zero exit here is fine — but a transport
-            // failure is not.
-            if let Err(err) = runner.run(&["sudo", "-n", "ip", "link", "del", VXLAN_LINK_NAME]) {
-                return Err(fail(format!("{alias}: pre-delete: {err}"), handle));
-            }
-            if let Err(err) = Self::run_required(
-                runner,
-                alias,
-                &[
-                    "sudo",
-                    "-n",
-                    "ip",
-                    "link",
-                    "add",
-                    VXLAN_LINK_NAME,
-                    "address",
-                    &mac,
-                    "type",
-                    "vxlan",
-                    "id",
-                    VXLAN_VNI,
-                    "local",
-                    &local,
-                    "dstport",
-                    VXLAN_DSTPORT,
-                    "srcport",
-                    VXLAN_SRCPORT_LOW,
-                    VXLAN_SRCPORT_HIGH,
-                    "nolearning",
-                ],
-            ) {
-                return Err(fail(err, handle));
-            }
-            handle
-                .created_resources
-                .push(CreatedResource::link(alias, VXLAN_LINK_NAME));
-            for peer in &participants {
-                if peer == alias {
-                    continue;
-                }
-                let peer_underlay = handle.underlay_ips[peer].clone();
-                if let Err(err) = Self::run_required(
-                    runner,
-                    alias,
-                    &[
-                        "sudo",
-                        "-n",
-                        "bridge",
-                        "fdb",
-                        "append",
-                        "00:00:00:00:00:00",
-                        "dev",
-                        VXLAN_LINK_NAME,
-                        "dst",
-                        &peer_underlay,
-                    ],
-                ) {
-                    return Err(fail(err, handle));
-                }
-            }
-            let overlay_cidr = format!("{overlay}/{OVERLAY_PREFIX_LEN}");
-            if let Err(err) = Self::run_required(
-                runner,
-                alias,
-                &[
-                    "sudo",
-                    "-n",
-                    "ip",
-                    "addr",
-                    "replace",
-                    &overlay_cidr,
-                    "dev",
-                    VXLAN_LINK_NAME,
-                ],
-            ) {
-                return Err(fail(err, handle));
-            }
-            if let Err(err) = Self::run_required(
-                runner,
-                alias,
-                &["sudo", "-n", "ip", "link", "set", VXLAN_LINK_NAME, "up"],
-            ) {
-                return Err(fail(err, handle));
-            }
-            // Substrate-transit attestation: the daemon gates its transit
-            // ruleset on this file, so it is provisioned as part of the
-            // overlay itself — a guest without it never enables transit.
-            if let Err(err) =
-                Self::write_transit_attestation(runner, alias, VXLAN_LINK_NAME, &handle)
-            {
-                return Err(fail(err, handle));
-            }
-        }
-        Ok(handle)
+        self.setup_aliases(topology, runners, None)
     }
 
     fn teardown(
@@ -1866,7 +1908,8 @@ impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
         //   (a) remove the attestation (one retry; a failure is recorded as
         //       residue but does NOT stop the teardown — a half-up overlay is
         //       worse than a reported residue),
-        //   (b) restart rustynetd so ExecStartPre rebuilds the boot table
+        //   (b) clear the crash-loop start-rate limit (reset-failed) and
+        //       restart rustynetd so ExecStartPre rebuilds the boot table
         //       WITHOUT the transit rule (failure = residue, fail closed),
         //   (c) ONLY THEN delete the vxlan/veth links and the router netns,
         //   (d) revert the egress pin, then the residue assertion (nft
@@ -2038,6 +2081,14 @@ fn remove_attestation_argv() -> Vec<&'static str> {
 /// persists, and only a start re-runs ExecStartPre.
 fn restart_daemon_argv() -> Vec<&'static str> {
     vec!["sudo", "-n", "systemctl", "restart", "rustynetd"]
+}
+
+/// The argv that clears systemd's per-unit start-rate limit
+/// (`Start request repeated too quickly`) so a guest that crash-looped
+/// earlier in the run can still have its daemon restarted for the boot-table
+/// rebuild. Run before every restart attempt, best-effort.
+fn reset_failed_argv() -> Vec<&'static str> {
+    vec!["sudo", "-n", "systemctl", "reset-failed", "rustynetd"]
 }
 
 /// `systemctl restart` on a unit the guest never had.
@@ -2298,6 +2349,358 @@ fn check_record_against_request(
             _ => Ok(()),
         },
     }
+}
+
+/// Re-provision the persisted substrate after a stage rebooted guests.
+///
+/// The vxlan overlay is volatile guest state: a reboot loses the
+/// `rustynet-vx0` device (and its fdb/addresses) while the persistent
+/// attestation at `SUBSTRATE_TRANSIT_ATTESTATION_PATH` survives, so the
+/// daemon's ExecStartPre rebuilds a boot table whose transit rules reference
+/// an overlay device that no longer exists and the daemon refuses to start
+/// (u41-r2: `overlay device rustynet-vx0 does not exist`).
+///
+/// ONLY the nodes that actually rebooted are re-created (review finding 3):
+/// running setup over every participant would pre-delete and re-add
+/// `rustynet-vx0` under LIVE daemons on the other nodes — a transient
+/// overlay outage and a new ifindex this run does not need. The re-created
+/// nodes' resources are MERGED into the live handle instead of replacing
+/// it, so teardown still removes everything the run ever created. fdb
+/// entries still name every peer, so a rebooted node rejoins the full mesh.
+///
+/// Fail-closed: a persisted substrate this code has no provider for, a
+/// topology whose digest disagrees with the persisted record, or a
+/// rebooted alias that is not a topology participant is a hard error —
+/// never a silent skip. A run with no provisioned substrate (netns, slirp,
+/// or a recorded no-op) is untouched. On a failed re-provision the partial
+/// handle is recorded (merged with the previous state) so teardown still
+/// removes whatever was created.
+pub(crate) fn reprovision_substrate_after_guest_reboot(
+    ctx: &mut OrchestrationContext,
+    topology: &SubstrateTopology,
+    runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    rebooted: &[&str],
+) -> Result<(), String> {
+    let Some(record) = ctx.substrate_record.clone() else {
+        return Ok(());
+    };
+    if !record.provisioned {
+        return Ok(());
+    }
+    // The re-provision path is inherently the vxlan provider's
+    // (`setup_aliases` is its operation); a record naming any other
+    // substrate stays fail-closed instead of widening the provider trait
+    // for one caller.
+    let provider = VxlanSubstrateProvider;
+    if provider.id() != record.substrate_id {
+        return Err(format!(
+            "no re-provision provider for persisted substrate '{}'; refusing to continue \
+             over unknown overlay state",
+            record.substrate_id
+        ));
+    }
+    let plan = plan_overlay(topology)?;
+    let digest = topology_digest(provider.id(), topology, plan.as_ref());
+    check_record_against_request(Some(&record), Some(provider.id()), Some(&digest))?;
+    for alias in rebooted {
+        if !topology.nodes.contains_key(*alias) {
+            return Err(format!(
+                "rebooted node '{alias}' is not a participant of the substrate topology; \
+                 refusing to re-provision an inventory it does not belong to"
+            ));
+        }
+    }
+    match provider.setup_aliases(topology, runners, Some(rebooted)) {
+        Ok(handle) => {
+            let mut handle = handle;
+            if let Some(previous) = ctx.substrate.as_ref() {
+                handle.created_resources =
+                    merge_created_resources(&previous.created_resources, handle.created_resources);
+            }
+            ctx.substrate_record = Some(handle.record.clone());
+            ctx.substrate = Some(handle);
+            Ok(())
+        }
+        Err(failure) => {
+            let mut partial = failure.partial;
+            if let Some(previous) = ctx.substrate.as_ref() {
+                partial.created_resources =
+                    merge_created_resources(&previous.created_resources, partial.created_resources);
+            }
+            ctx.substrate_record = Some(partial.record.clone());
+            ctx.substrate = Some(partial);
+            Err(format!(
+                "{} substrate re-provision after a guest reboot failed (partial state \
+                 recorded for teardown): {}",
+                provider.id(),
+                failure.message
+            ))
+        }
+    }
+}
+
+/// Union of the resources a previous provision created and the ones a
+/// re-provision just created, deduplicated: a rebooted node's vxlan link is
+/// pre-deleted and re-added under the SAME name, so both lists name it.
+fn merge_created_resources(
+    previous: &[CreatedResource],
+    fresh: Vec<CreatedResource>,
+) -> Vec<CreatedResource> {
+    let mut merged = previous.to_vec();
+    for resource in fresh {
+        if !merged.contains(&resource) {
+            merged.push(resource);
+        }
+    }
+    merged
+}
+
+/// How long the post-reboot daemon recovery may take: 30 polls, 2 s apart
+/// (29 sleeps ≈ 58 s plus probe time — the review's "up to ~60 s" budget).
+pub(crate) const DAEMON_ACTIVE_POLL_ATTEMPTS: usize = 30;
+pub(crate) const DAEMON_ACTIVE_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(2);
+
+/// A wireguard handshake older than this (or none at all) fails the
+/// post-reboot verification: the rebooted pair must have re-keyed after the
+/// reboot for the mesh to count as re-converged.
+pub(crate) const WG_HANDSHAKE_MAX_AGE_SECS: u64 = 600;
+
+/// Boundedly poll `systemctl is-active rustynetd` until it prints exactly
+/// `active` TWICE in a row (one clean read could race the unit flapping
+/// between auto-restart attempts). Sleeps between polls via `sleep`, never
+/// before the first probe. Fails with the last observed state after
+/// `attempts` probes.
+fn poll_daemon_active(
+    runner: &dyn NetLeafRunner,
+    alias: &str,
+    attempts: usize,
+    sleep: &dyn Fn(std::time::Duration),
+) -> Result<(), String> {
+    let argv = ["sudo", "-n", "systemctl", "is-active", "rustynetd"];
+    let mut consecutive_active = 0usize;
+    let mut last_state = "no probe ran".to_owned();
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            sleep(DAEMON_ACTIVE_POLL_INTERVAL);
+        }
+        match runner.run(&argv) {
+            Err(err) => {
+                consecutive_active = 0;
+                last_state = format!("probe error: {err}");
+            }
+            Ok(output) => {
+                let state = output.stdout.trim();
+                if output.success && state == "active" {
+                    consecutive_active += 1;
+                    if consecutive_active >= 2 {
+                        return Ok(());
+                    }
+                } else {
+                    consecutive_active = 0;
+                }
+                last_state = state.to_owned();
+            }
+        }
+    }
+    Err(format!(
+        "{alias}: rustynetd did not reach a stable active state after the restart \
+         ({attempts} polls, last observed state {last_state:?})"
+    ))
+}
+
+/// Recover ONE rebooted guest's daemon (review finding 1): clear the
+/// systemd start-limit latch (`reset-failed`, best-effort — the teardown
+/// restart path's same ordering), `restart` rustynetd so ExecStartPre
+/// rebuilds the boot table / transit rules against the re-provisioned
+/// overlay, then bounded-poll for a stable active state. A restart that
+/// still fails, or a unit that vanished, is a hard error — the stage must
+/// not pass a guest it cannot verify.
+fn recover_daemon_after_reboot(
+    runner: &dyn NetLeafRunner,
+    alias: &str,
+    sleep: &dyn Fn(std::time::Duration),
+) -> Result<(), String> {
+    let _ = runner.run(&reset_failed_argv());
+    let output = runner
+        .run(&restart_daemon_argv())
+        .map_err(|err| format!("{alias}: rustynetd restart after the reboot: {err}"))?;
+    if !output.success {
+        if daemon_unit_absent(&output.stderr) {
+            return Err(format!(
+                "{alias}: no rustynetd unit after the reboot; the guest cannot be verified"
+            ));
+        }
+        return Err(format!(
+            "{alias}: rustynetd restart failed after the reboot (start limit still latched?): {}",
+            output.stderr.trim()
+        ));
+    }
+    poll_daemon_active(runner, alias, DAEMON_ACTIVE_POLL_ATTEMPTS, sleep)
+}
+
+/// Require a wireguard handshake fresh enough to prove the rebooted node
+/// re-keyed after the reboot (review finding 2): the stage's two-hop and
+/// DNS-refresh checks run skipped without entry/second-client arguments, so
+/// without this a daemon that came up with NO working mesh would pass.
+fn assert_fresh_wg_handshake(
+    runner: &dyn NetLeafRunner,
+    alias: &str,
+    now_unix: u64,
+) -> Result<(), String> {
+    let output = runner
+        .run(&["sudo", "-n", "wg", "show", "all", "latest-handshakes"])
+        .map_err(|err| format!("{alias}: wg handshake probe: {err}"))?;
+    if !output.success {
+        return Err(format!(
+            "{alias}: wg show all latest-handshakes failed: {}",
+            output.stderr.trim()
+        ));
+    }
+    let freshest = output
+        .stdout
+        .lines()
+        .filter_map(|line| line.split_whitespace().last())
+        .filter_map(|field| field.parse::<u64>().ok())
+        .max();
+    match freshest {
+        Some(timestamp) if now_unix.saturating_sub(timestamp) <= WG_HANDSHAKE_MAX_AGE_SECS => {
+            Ok(())
+        }
+        Some(timestamp) => Err(format!(
+            "{alias}: no fresh wireguard handshake after the reboot (latest handshake \
+             {timestamp}, now {now_unix}; the mesh did not re-key within \
+             {WG_HANDSHAKE_MAX_AGE_SECS}s)"
+        )),
+        None => Err(format!(
+            "{alias}: wg reports no handshakes at all after the reboot; the mesh did not \
+             re-converge"
+        )),
+    }
+}
+
+/// Recover and VERIFY every rebooted guest (review findings 1 + 2). For
+/// each rebooted alias: clear the start-limit latch, restart `rustynetd`,
+/// boundedly poll `is-active` to a stable `active`, then require a fresh
+/// wireguard handshake. A probe that cannot run, a unit that never reaches
+/// active within the bound, or a stale handshake is a failure naming the
+/// alias — the stage must fail closed, never skip.
+fn recover_and_verify_rebooted_guests(
+    runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    rebooted: &[&str],
+    now_unix: u64,
+    sleep: &dyn Fn(std::time::Duration),
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for alias in rebooted {
+        let Some(&runner) = runners.get(*alias) else {
+            errors.push(format!(
+                "{alias}: no leaf runner to recover rustynetd after the reboot"
+            ));
+            continue;
+        };
+        if let Err(err) = recover_daemon_after_reboot(runner, alias, sleep) {
+            errors.push(err);
+            continue;
+        }
+        if let Err(err) = assert_fresh_wg_handshake(runner, alias, now_unix) {
+            errors.push(err);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "rebooted-node recovery failed: {}",
+            errors.join("; ")
+        ))
+    }
+}
+
+/// The reboot-recovery stage's substrate glue: re-provision the persisted
+/// overlay for the nodes the binary rebooted, recover their daemons
+/// (reset-failed + restart + bounded `is-active` poll), require a fresh WG
+/// handshake, and only then record the evidence line. A run without a
+/// provisioned substrate is a no-op pass (nothing was rebooted INTO an
+/// overlay-dependent state).
+pub(crate) fn reprovision_and_verify_after_reboot(
+    ctx: &mut OrchestrationContext,
+    rebooted: &[&str],
+) -> Result<(), String> {
+    let provisioned = ctx
+        .substrate_record
+        .as_ref()
+        .is_some_and(|record| record.provisioned);
+    if !provisioned {
+        return Ok(());
+    }
+    let stage = StageId::LiveRebootRecoveryValidation.as_str();
+    let topology = substrate_topology_from_ctx(ctx)?;
+    let runners = build_remote_runners(ctx, stage)?;
+    let refs = runner_refs(&runners);
+    let report_dir = ctx.report_dir.clone();
+    reprovision_and_verify_after_reboot_with(
+        ctx,
+        &topology,
+        rebooted,
+        &refs,
+        &|line| {
+            crate::vm_lab::orchestrator::evidence::append_stage_evidence_line(
+                &report_dir,
+                stage,
+                line,
+            )
+        },
+        &|duration| std::thread::sleep(duration),
+    )
+}
+
+/// The injectable core of the stage glue: the same behavior as
+/// [`reprovision_and_verify_after_reboot`] with the leaf runners, the
+/// evidence writer and the poll sleep injected, so mock tests can drive the
+/// provisioned path end to end (review required fix 2: the glue must be
+/// witnessed, not just the skip path).
+pub(crate) fn reprovision_and_verify_after_reboot_with(
+    ctx: &mut OrchestrationContext,
+    topology: &SubstrateTopology,
+    rebooted: &[&str],
+    runners: &BTreeMap<String, &dyn NetLeafRunner>,
+    record_evidence: &dyn Fn(&str) -> Result<(), String>,
+    sleep: &dyn Fn(std::time::Duration),
+) -> Result<(), String> {
+    let provisioned = ctx
+        .substrate_record
+        .as_ref()
+        .is_some_and(|record| record.provisioned);
+    if !provisioned {
+        return Ok(());
+    }
+    reprovision_substrate_after_guest_reboot(ctx, topology, runners, rebooted)?;
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        // A clock before the epoch makes every handshake look stale: fail
+        // closed rather than skip the gate.
+        .unwrap_or(0);
+    recover_and_verify_rebooted_guests(runners, rebooted, now_unix, sleep)?;
+    let overlay_nodes: Vec<&str> = topology.nodes.keys().map(String::as_str).collect();
+    // Evidence ONLY after every check passed, and only claims that are true
+    // at write time (review finding 5): the old line logged
+    // `daemon_active=<csv>` BEFORE the assertion ran, so a failing run
+    // recorded a claim its daemons were active. The two-hop and DNS-refresh
+    // post-reboot checks stay skipped for this stage (it passes no
+    // entry/second-client arguments), so they are marked not-verified here
+    // instead of silently omitted (review finding 2).
+    record_evidence(&format!(
+        "substrate re-provisioned after guest reboot: overlay_nodes={} rebooted={} \
+         daemon_active=restarted-and-verified:{} wg_handshake_fresh=verified:{} \
+         post_reboot_twohop=not-verified post_reboot_dns_refresh=not-verified",
+        overlay_nodes.join(","),
+        rebooted.join(","),
+        rebooted.join(","),
+        rebooted.join(",")
+    ))?;
+    Ok(())
 }
 
 /// Provision the topology-level substrate BEFORE `collect_pubkeys` so overlay
@@ -2673,6 +3076,10 @@ pub(crate) mod mock {
         /// scripts "whatever call runs `nat-classify` answers this", without
         /// having to count the calls before it.
         pub stdout_by_match: Vec<(String, String)>,
+        /// stdout SEQUENCES keyed by an argv substring: the nth matching call
+        /// gets `seq[n]` (clamped to the last entry) — how a test scripts
+        /// `is-active` answering `activating`, then `active`, then `active`.
+        pub stdout_seq_by_match: Vec<(String, Vec<String>)>,
     }
 
     impl MockLeafRunner {
@@ -2681,6 +3088,19 @@ pub(crate) mod mock {
                 return text.clone();
             }
             let joined = argv.join(" ");
+            if let Some((needle, seq)) = self
+                .stdout_seq_by_match
+                .iter()
+                .find(|(needle, _)| joined.contains(needle.as_str()))
+            {
+                if !seq.is_empty() {
+                    let answered = self.calls.lock().expect("mock runner lock")[..index]
+                        .iter()
+                        .filter(|call| call.join(" ").contains(needle.as_str()))
+                        .count();
+                    return seq[answered.min(seq.len() - 1)].clone();
+                }
+            }
             self.stdout_by_match
                 .iter()
                 .find(|(needle, _)| joined.contains(needle.as_str()))
@@ -2988,10 +3408,11 @@ mod tests {
             provisioned: true,
             participants: vec!["a".to_owned()],
         });
-        // Calls 0/1 are the attestation removal + daemon restart, 2..=4 the three
-        // record-derived removals; call 5 is the revert.
+        // Calls 0/1/2 are the attestation removal + limit reset + daemon
+        // restart, 3..=5 the three record-derived removals; call 6 is the
+        // revert.
         let td_a = MockLeafRunner {
-            fail_on: vec![5],
+            fail_on: vec![6],
             failure_stderr: "sed: can't read /etc/default/rustynetd: No such file or directory"
                 .to_owned(),
             ..MockLeafRunner::default()
@@ -3016,7 +3437,7 @@ mod tests {
             participants: vec!["a".to_owned()],
         });
         let td_a = MockLeafRunner {
-            fail_on: vec![5],
+            fail_on: vec![6],
             failure_stderr: "sed: couldn't open temporary file: Read-only file system".to_owned(),
             ..MockLeafRunner::default()
         };
@@ -3384,10 +3805,10 @@ mod tests {
             underlay_ips: BTreeMap::new(),
             created_resources: Vec::new(),
         };
-        // Calls 0/1 are the attestation removal + daemon restart; 2..=4 are the
-        // three link/netns deletions.
+        // Calls 0/1/2 are the attestation removal + limit reset + daemon
+        // restart; 3..=5 are the three link/netns deletions.
         let gone = MockLeafRunner {
-            fail_on: vec![2, 3, 4],
+            fail_on: vec![3, 4, 5],
             failure_stderr: "Cannot find device \"rustynet-vx0\"".to_owned(),
             ..MockLeafRunner::default()
         };
@@ -3398,7 +3819,7 @@ mod tests {
             .expect("already-deleted must be idempotent success");
 
         let broken = MockLeafRunner {
-            fail_on: vec![2],
+            fail_on: vec![3],
             failure_stderr: "RTNETLINK answers: Operation not permitted".to_owned(),
             ..MockLeafRunner::default()
         };
@@ -3562,9 +3983,10 @@ mod tests {
     #[test]
     fn a_failed_daemon_restart_is_residue_but_links_are_still_deleted() {
         use mock::MockLeafRunner;
-        // Call 0 = attestation removal, call 1 = restart.
+        // Call 0 = attestation removal, 1 = limit reset, 2 = restart, and on
+        // a retrying teardown the second attempt is 3 = reset, 4 = restart.
         let a = MockLeafRunner {
-            fail_on: vec![1],
+            fail_on: vec![2, 4],
             failure_stderr: "Job for rustynetd.service failed".to_owned(),
             ..MockLeafRunner::default()
         };
@@ -3579,7 +4001,7 @@ mod tests {
         assert_teardown_order(&calls, "a (restart failed)");
         // A transport failure of the restart is the same residue channel.
         let c = MockLeafRunner {
-            transport_error_on: vec![1],
+            transport_error_on: vec![2, 4],
             ..MockLeafRunner::default()
         };
         let d = MockLeafRunner::default();
@@ -3597,7 +4019,7 @@ mod tests {
     fn a_guest_without_a_daemon_unit_is_not_residue_for_the_restart_step() {
         use mock::MockLeafRunner;
         let a = MockLeafRunner {
-            fail_on: vec![1],
+            fail_on: vec![2],
             failure_stderr:
                 "Failed to restart rustynetd.service: Unit rustynetd.service not found.".to_owned(),
             ..MockLeafRunner::default()
@@ -3608,6 +4030,805 @@ mod tests {
             .teardown(&resume_handle_ab(), &runners)
             .expect("an absent unit is not residue");
         assert_teardown_order(&joined(&a), "a (no unit)");
+    }
+
+    /// u41-r2 teardown fix: a guest that crash-looped earlier in the run arms
+    /// systemd's start-rate limit, so the teardown's restart must be preceded
+    /// by `systemctl reset-failed` on EVERY attempt, and a first restart
+    /// refused for rate limiting must be retried once — not reported as
+    /// residue.
+    #[test]
+    fn daemon_restart_resets_failed_state_before_restart_and_retries_once() {
+        use mock::MockLeafRunner;
+        let a = MockLeafRunner {
+            // Call 2 is the first restart; its rate-limit failure must not
+            // become residue.
+            fail_on: vec![2],
+            failure_stderr: "Start request repeated too quickly.".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let b = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a), ("b", &b)]);
+        VxlanSubstrateProvider
+            .teardown(&resume_handle_ab(), &runners)
+            .expect("a rate-limited first restart is retried, not residue");
+        let calls = joined(&a);
+        let count = |needle: &str| calls.iter().filter(|call| call.contains(needle)).count();
+        assert_eq!(count("systemctl reset-failed rustynetd"), 2, "{calls:?}");
+        assert_eq!(count("systemctl restart rustynetd"), 2, "{calls:?}");
+        let remove = position_of(&calls, |call| {
+            call.contains("vm-lab-remove-substrate-transit")
+        })
+        .expect("removal");
+        let reset1 = position_of(&calls, |call| call.contains("reset-failed")).expect("reset1");
+        let restart1 = position_of(&calls, |call| call == "sudo -n systemctl restart rustynetd")
+            .expect("restart1");
+        let reset2 = calls
+            .iter()
+            .rposition(|call| call.contains("reset-failed"))
+            .expect("reset2");
+        let restart2 = calls
+            .iter()
+            .rposition(|call| call == "sudo -n systemctl restart rustynetd")
+            .expect("restart2");
+        let first_delete = position_of(&calls, |call| {
+            call.starts_with("sudo -n ip link del") || call.starts_with("sudo -n ip netns del")
+        })
+        .expect("first delete");
+        assert!(remove < reset1 && reset1 < restart1, "{calls:?}");
+        assert!(restart1 < reset2 && reset2 < restart2, "{calls:?}");
+        assert!(restart2 < first_delete, "{calls:?}");
+        assert_teardown_order(&calls, "a (rate-limited restart)");
+    }
+
+    /// Both restart attempts failing stays residue (fail closed), and the
+    /// link deletions still happen.
+    #[test]
+    fn a_daemon_restart_that_fails_twice_is_still_residue() {
+        use mock::MockLeafRunner;
+        let a = MockLeafRunner {
+            fail_on: vec![2, 4],
+            failure_stderr: "Start request repeated too quickly.".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let b = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a), ("b", &b)]);
+        let err = VxlanSubstrateProvider
+            .teardown(&resume_handle_ab(), &runners)
+            .expect_err("an unrecoverable restart is residue");
+        assert!(err.contains("possible residue"), "{err}");
+        assert!(err.contains("boot table not rebuilt"), "{err}");
+        let calls = joined(&a);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| {
+                    call.starts_with("sudo -n ip link del")
+                        || call.starts_with("sudo -n ip netns del")
+                })
+                .count(),
+            3,
+            "deletions still run: {calls:?}"
+        );
+    }
+
+    /// A failing `reset-failed` must not block the boot-table rebuild: the
+    /// restart is the gate, the reset is best-effort.
+    #[test]
+    fn reset_failed_failure_does_not_block_the_boot_table_rebuild() {
+        use mock::MockLeafRunner;
+        let a = MockLeafRunner {
+            // Reset fails on BOTH attempts and the first restart is
+            // rate-limited; the retry must still reach a clean teardown.
+            fail_on: vec![1, 2, 3],
+            failure_stderr: "Failed to query unit: Unit rustynetd.service not loaded.".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let b = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a), ("b", &b)]);
+        VxlanSubstrateProvider
+            .teardown(&resume_handle_ab(), &runners)
+            .expect("reset-failed failures are not residue");
+        let calls = joined(&a);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("reset-failed"))
+                .count(),
+            2,
+            "{calls:?}"
+        );
+        assert_teardown_order(&calls, "a (reset failed)");
+    }
+
+    /// u41-r2 fix 1 + review finding 3: after the reboot-recovery stage
+    /// reboots guests in a vxlan run, the persisted substrate is re-created
+    /// for the REBOOTED ALIASES ONLY (no overlay bounce under live nodes),
+    /// fdb entries still name every peer, and the fresh created resources
+    /// are MERGED into the live handle so teardown removes everything.
+    #[test]
+    fn reprovision_after_guest_reboot_touches_only_rebooted_nodes_and_merges_resources() {
+        let mut ctx = empty_ctx();
+        let topo = two_lan_topology();
+        let plan = plan_overlay(&topo)
+            .expect("plan")
+            .expect("two network groups need an overlay");
+        let digest = topology_digest("vxlan", &topo, Some(&plan));
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: digest.clone(),
+            provisioned: true,
+            participants: topo.nodes.keys().cloned().collect(),
+        });
+        ctx.substrate = Some(SubstrateHandle {
+            record: ctx.substrate_record.clone().expect("record"),
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: BTreeMap::new(),
+            created_resources: vec![CreatedResource::netns("lenovo-1", VXLAN_ROUTER_NS)],
+        });
+        let lenovo = substrate_ready_runner();
+        let utm1 = substrate_ready_runner();
+        let utm2 = substrate_ready_runner();
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        reprovision_substrate_after_guest_reboot(&mut ctx, &topo, &runners, &["utm-1"])
+            .expect("re-provisioning the rebooted node restores the overlay");
+        assert!(
+            lenovo.recorded().is_empty(),
+            "lenovo-1 did not reboot: {:?}",
+            lenovo.recorded()
+        );
+        assert!(
+            utm2.recorded().is_empty(),
+            "utm-2 did not reboot: {:?}",
+            utm2.recorded()
+        );
+        let calls = joined(&utm1);
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("ip link add") && call.contains(VXLAN_LINK_NAME)),
+            "no vxlan link re-created on the rebooted node: {calls:?}"
+        );
+        // fdb for EVERY peer, so the rebooted node rejoins the whole mesh.
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("fdb") && call.contains("192.168.0.30")),
+            "no fdb entry for lenovo-1: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("fdb") && call.contains("192.168.64.11")),
+            "no fdb entry for utm-2: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("vm-lab-write-substrate-transit")),
+            "no attestation rewritten: {calls:?}"
+        );
+        let handle = ctx.substrate.expect("the live handle is refreshed");
+        assert!(handle.overlay_ips.contains_key("lenovo-1"));
+        assert!(
+            handle
+                .created_resources
+                .contains(&CreatedResource::netns("lenovo-1", VXLAN_ROUTER_NS)),
+            "merge must keep pre-reboot resources: {:?}",
+            handle.created_resources
+        );
+        assert!(
+            handle
+                .created_resources
+                .contains(&CreatedResource::link("utm-1", VXLAN_LINK_NAME)),
+            "merge must add the re-created resources: {:?}",
+            handle.created_resources
+        );
+        let record = ctx.substrate_record.expect("the record is refreshed");
+        assert!(record.provisioned);
+        assert_eq!(record.topology_digest, digest);
+    }
+
+    /// A rebooted alias that is not a topology participant is a hard error,
+    /// never an index panic or a silent skip.
+    #[test]
+    fn reprovision_after_guest_reboot_refuses_a_rebooted_alias_outside_the_topology() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        let topo = two_lan_topology();
+        let plan = plan_overlay(&topo)
+            .expect("plan")
+            .expect("two network groups need an overlay");
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: topology_digest("vxlan", &topo, Some(&plan)),
+            provisioned: true,
+            participants: topo.nodes.keys().cloned().collect(),
+        });
+        let ready = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &ready)]);
+        let err = reprovision_substrate_after_guest_reboot(
+            &mut ctx,
+            &topo,
+            &runners,
+            &["ghost-not-in-topology"],
+        )
+        .expect_err("an unknown rebooted alias must fail closed");
+        assert!(err.contains("not a participant"), "{err}");
+        assert!(ready.recorded().is_empty());
+        assert!(ctx.substrate.is_none());
+    }
+
+    /// A run without a provisioned substrate (no record, or a recorded no-op)
+    /// is untouched by the re-provision: no leaf command may run.
+    #[test]
+    fn reprovision_after_guest_reboot_skips_when_not_provisioned() {
+        use mock::MockLeafRunner;
+        let topo = two_lan_topology();
+        let mut ctx = empty_ctx();
+        let a = MockLeafRunner::default();
+        let b = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &a), ("utm-1", &b)]);
+        reprovision_substrate_after_guest_reboot(&mut ctx, &topo, &runners, &[])
+            .expect("no substrate, nothing to re-provision");
+        assert!(a.recorded().is_empty());
+        assert!(ctx.substrate.is_none());
+        let mut ctx = empty_ctx();
+        ctx.substrate_record = Some(vxlan_record(false));
+        let c = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &c)]);
+        reprovision_substrate_after_guest_reboot(&mut ctx, &topo, &runners, &[])
+            .expect("a recorded no-op stays a no-op");
+        assert!(c.recorded().is_empty());
+        // And the stage-level glue skips before building any runner.
+        let mut ctx = empty_ctx();
+        ctx.substrate_record = Some(vxlan_record(false));
+        reprovision_and_verify_after_reboot(&mut ctx, &["lenovo-1"])
+            .expect("the glue passes without a substrate");
+    }
+
+    /// A persisted substrate this build has no provider for is a hard
+    /// failure, never a silent skip.
+    #[test]
+    fn reprovision_after_guest_reboot_fails_closed_on_unknown_substrate() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "mystery".to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned: true,
+            participants: vec!["a".to_owned()],
+        });
+        let a = MockLeafRunner::default();
+        let runners = runner_map(&[("a", &a)]);
+        let err = reprovision_substrate_after_guest_reboot(
+            &mut ctx,
+            &topology(&[("a", "192.168.64.10"), ("b", "192.168.0.30")]),
+            &runners,
+            &["a"],
+        )
+        .expect_err("unknown substrate must fail closed");
+        assert!(err.contains("no re-provision provider"), "{err}");
+        assert!(err.contains("mystery"), "{err}");
+        assert!(a.recorded().is_empty());
+    }
+
+    /// A topology that no longer digests to the persisted record (the
+    /// inventory changed under the overlay) refuses to re-provision stale
+    /// addressing.
+    #[test]
+    fn reprovision_after_guest_reboot_refuses_a_topology_mismatch() {
+        use mock::MockLeafRunner;
+        let mut ctx = empty_ctx();
+        let topo = two_lan_topology();
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: "stale".to_owned(),
+            provisioned: true,
+            participants: topo.nodes.keys().cloned().collect(),
+        });
+        let a = MockLeafRunner::default();
+        let b = MockLeafRunner::default();
+        let c = MockLeafRunner::default();
+        let runners = runner_map(&[("lenovo-1", &a), ("utm-1", &b), ("utm-2", &c)]);
+        let err = reprovision_substrate_after_guest_reboot(&mut ctx, &topo, &runners, &["utm-1"])
+            .expect_err("a changed inventory must fail closed");
+        assert!(err.contains("substrate topology mismatch"), "{err}");
+        assert!(
+            a.recorded().is_empty(),
+            "no overlay command may run: {:?}",
+            a.recorded()
+        );
+    }
+
+    // ── u41-r3 (b115): post-reboot daemon recovery + mesh verification ──
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs()
+    }
+
+    fn no_sleep(_: std::time::Duration) {}
+
+    /// A mock whose `is-active` probes answer with the given states in
+    /// order, the last one repeating.
+    fn is_active_seq(states: &[&str]) -> mock::MockLeafRunner {
+        mock::MockLeafRunner {
+            stdout_seq_by_match: vec![(
+                "is-active".to_owned(),
+                states.iter().map(|state| format!("{state}\n")).collect(),
+            )],
+            ..mock::MockLeafRunner::default()
+        }
+    }
+
+    /// A guest mock that survives re-provision (route-get derivation),
+    /// answers `is-active` with the given sequence, and reports a wireguard
+    /// handshake `handshake_age_secs` old (negative = the guest clock is
+    /// slightly ahead of ours).
+    fn recovering_runner(states: &[&str], handshake_age_secs: i64) -> mock::MockLeafRunner {
+        let mut runner = is_active_seq(states);
+        runner
+            .stdout_by_match
+            .push(("route get".to_owned(), route_answer_stdout()));
+        let timestamp = (now_unix() as i64 - handshake_age_secs) as u64;
+        runner.stdout_by_match.push((
+            "latest-handshakes".to_owned(),
+            format!("rustynet0\tpeer-public-key\t{timestamp}\n"),
+        ));
+        runner
+    }
+
+    /// Review finding 1: a latched unit recovers — reset-failed runs first,
+    /// then the restart (whose ExecStartPre rebuilds the boot table), then a
+    /// bounded poll that needs `active` twice in a row, then the mesh check.
+    #[test]
+    fn daemon_recovery_resets_the_latch_restarts_then_requires_stable_active() {
+        let a = recovering_runner(&["activating", "active", "active"], 10);
+        let runners = runner_map(&[("a", &a)]);
+        recover_and_verify_rebooted_guests(&runners, &["a"], now_unix(), &no_sleep)
+            .expect("a latched unit that re-converges must pass");
+        let calls = joined(&a);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("reset-failed"))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("systemctl restart rustynetd"))
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        let reset = position_of(&calls, |call| call.contains("reset-failed")).expect("reset");
+        let restart = position_of(&calls, |call| call.contains("systemctl restart rustynetd"))
+            .expect("restart");
+        let first_poll = position_of(&calls, |call| call.contains("is-active")).expect("poll");
+        assert!(
+            reset < restart && restart < first_poll,
+            "reset-failed < restart < poll required: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("is-active"))
+                .count(),
+            3,
+            "two consecutive actives must stop the poll: {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|call| call.contains("latest-handshakes")),
+            "mesh re-convergence is checked too: {calls:?}"
+        );
+    }
+
+    /// Review finding 1: a daemon that never reaches `active` fails after
+    /// exactly the bounded number of polls, naming the last state.
+    #[test]
+    fn daemon_recovery_poll_is_bounded_and_names_the_last_state() {
+        let a = recovering_runner(&["inactive"], 10);
+        let runners = runner_map(&[("a", &a)]);
+        let err = recover_and_verify_rebooted_guests(&runners, &["a"], now_unix(), &no_sleep)
+            .expect_err("a daemon that never reaches active must fail");
+        assert!(err.contains("did not reach a stable active state"), "{err}");
+        assert!(
+            err.contains("\"inactive\""),
+            "the last state must be named: {err}"
+        );
+        let calls = joined(&a);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("is-active"))
+                .count(),
+            DAEMON_ACTIVE_POLL_ATTEMPTS,
+            "the poll must be bounded by the constant"
+        );
+        assert!(
+            !calls.iter().any(|call| call.contains("latest-handshakes")),
+            "no mesh check for a guest whose daemon never came back: {calls:?}"
+        );
+    }
+
+    /// The poll is bounded by `attempts`, sleeps only BETWEEN probes, and a
+    /// single `active` read never decides recovery.
+    #[test]
+    fn daemon_poll_requires_two_consecutive_active_probes_within_its_bound() {
+        let sleeps = std::cell::Cell::new(0usize);
+        let count_sleep = |_: std::time::Duration| sleeps.set(sleeps.get() + 1);
+        let flapping = is_active_seq(&["active", "inactive"]);
+        poll_daemon_active(&flapping, "a", 5, &count_sleep)
+            .expect_err("a single active probe must not decide recovery");
+        assert_eq!(flapping.recorded().len(), 5, "bounded by attempts");
+        assert_eq!(sleeps.get(), 4, "sleep between polls, not before the first");
+        let settles = is_active_seq(&["inactive", "active", "active"]);
+        poll_daemon_active(&settles, "a", 5, &count_sleep)
+            .expect("two consecutive actives pass early");
+        assert_eq!(settles.recorded().len(), 3);
+        assert_eq!(sleeps.get(), 6, "2 + 4 sleeps across both polls");
+    }
+
+    /// The documented budget: 30 polls, 2 s apart (≈58 s of sleeps plus
+    /// probe time — the review's "up to ~60 s").
+    #[test]
+    fn daemon_poll_bound_is_the_documented_sixty_second_budget() {
+        assert_eq!(DAEMON_ACTIVE_POLL_ATTEMPTS, 30);
+        assert_eq!(
+            DAEMON_ACTIVE_POLL_INTERVAL,
+            std::time::Duration::from_secs(2)
+        );
+        assert_eq!(
+            DAEMON_ACTIVE_POLL_INTERVAL * (DAEMON_ACTIVE_POLL_ATTEMPTS as u32 - 1),
+            std::time::Duration::from_secs(58),
+        );
+    }
+
+    /// Review finding 2: the mesh gate. Fresh handshake passes (a guest
+    /// clock a few seconds ahead counts as fresh too); stale, absent,
+    /// failing and unrunnable probes all fail closed.
+    #[test]
+    fn the_handshake_gate_requires_a_fresh_rekey() {
+        let now = now_unix();
+        let handshake = |age: i64| mock::MockLeafRunner {
+            stdout_by_match: vec![(
+                "latest-handshakes".to_owned(),
+                format!(
+                    "rustynet0\tpeer-public-key\t{}\n",
+                    (now as i64 - age) as u64
+                ),
+            )],
+            ..mock::MockLeafRunner::default()
+        };
+        assert_fresh_wg_handshake(&handshake(10), "a", now).expect("a 10s-old handshake is fresh");
+        assert_fresh_wg_handshake(&handshake(-5), "a", now)
+            .expect("a slightly future stamp (guest clock skew) is fresh");
+        let err = assert_fresh_wg_handshake(&handshake(10_000), "a", now)
+            .expect_err("a stale handshake fails");
+        assert!(err.contains("did not re-key"), "{err}");
+        let err = assert_fresh_wg_handshake(&mock::MockLeafRunner::default(), "a", now)
+            .expect_err("no handshake at all fails");
+        assert!(err.contains("no handshakes"), "{err}");
+        let broken = mock::MockLeafRunner {
+            transport_error_on: vec![0],
+            ..mock::MockLeafRunner::default()
+        };
+        let err = assert_fresh_wg_handshake(&broken, "a", now)
+            .expect_err("an unrunnable probe fails closed");
+        assert!(err.contains("wg handshake probe"), "{err}");
+        let failing = mock::MockLeafRunner {
+            fail_on: vec![0],
+            failure_stderr: "operation not permitted".to_owned(),
+            ..mock::MockLeafRunner::default()
+        };
+        let err = assert_fresh_wg_handshake(&failing, "a", now)
+            .expect_err("a failing probe fails closed");
+        assert!(err.contains("latest-handshakes failed"), "{err}");
+    }
+
+    /// Recovery fails closed on a rebooted node with no runner, on a restart
+    /// that fails, and on a unit that vanished — and a failed restart never
+    /// reaches the poll.
+    #[test]
+    fn daemon_recovery_fails_closed_on_a_missing_runner_a_failed_restart_or_a_vanished_unit() {
+        let good = recovering_runner(&["activating", "active", "active"], 10);
+        let runners = runner_map(&[("a", &good)]);
+        let err =
+            recover_and_verify_rebooted_guests(&runners, &["a", "ghost"], now_unix(), &no_sleep)
+                .expect_err("a rebooted node with no runner is a failure, never a skip");
+        assert!(err.contains("ghost"), "{err}");
+
+        let restart_fails = mock::MockLeafRunner {
+            fail_on: vec![1],
+            failure_stderr: "Job for rustynetd.service failed".to_owned(),
+            ..recovering_runner(&["active"], 10)
+        };
+        let runners = runner_map(&[("a", &restart_fails)]);
+        let err = recover_and_verify_rebooted_guests(&runners, &["a"], now_unix(), &no_sleep)
+            .expect_err("a failed restart is a hard error");
+        assert!(err.contains("restart failed after the reboot"), "{err}");
+        assert!(
+            !joined(&restart_fails)
+                .iter()
+                .any(|call| call.contains("is-active")),
+            "no point polling a daemon that never restarted: {:?}",
+            joined(&restart_fails)
+        );
+
+        let unit_gone = mock::MockLeafRunner {
+            fail_on: vec![1],
+            failure_stderr:
+                "Failed to restart rustynetd.service: Unit rustynetd.service not found.".to_owned(),
+            ..recovering_runner(&["active"], 10)
+        };
+        let runners = runner_map(&[("a", &unit_gone)]);
+        let err = recover_and_verify_rebooted_guests(&runners, &["a"], now_unix(), &no_sleep)
+            .expect_err("a vanished unit cannot be verified");
+        assert!(err.contains("no rustynetd unit"), "{err}");
+    }
+
+    /// The full glue happy path: only rebooted nodes are touched, daemons
+    /// are reset+restarted+polled, handshakes checked, and the evidence line
+    /// is written LAST with only true claims (review findings 2 + 5).
+    #[test]
+    fn reboot_glue_recovers_verifies_then_records_honest_evidence() {
+        let mut ctx = empty_ctx();
+        let topo = two_lan_topology();
+        let plan = plan_overlay(&topo)
+            .expect("plan")
+            .expect("two network groups need an overlay");
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: topology_digest("vxlan", &topo, Some(&plan)),
+            provisioned: true,
+            participants: topo.nodes.keys().cloned().collect(),
+        });
+        let lenovo = substrate_ready_runner();
+        let utm1 = recovering_runner(&["activating", "active", "active"], 10);
+        let utm2 = recovering_runner(&["activating", "active", "active"], 10);
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let evidence = std::cell::RefCell::new(None::<String>);
+        let polls_at_evidence = std::cell::Cell::new(0usize);
+        let record = |line: &str| -> Result<(), String> {
+            polls_at_evidence.set(
+                utm1.recorded()
+                    .iter()
+                    .filter(|call| call.join(" ").contains("is-active"))
+                    .count(),
+            );
+            *evidence.borrow_mut() = Some(line.to_owned());
+            Ok(())
+        };
+        reprovision_and_verify_after_reboot_with(
+            &mut ctx,
+            &topo,
+            &["utm-1", "utm-2"],
+            &runners,
+            &record,
+            &no_sleep,
+        )
+        .expect("a re-provisioned overlay with recovered daemons passes");
+        assert!(
+            lenovo.recorded().is_empty(),
+            "lenovo-1 did not reboot: {:?}",
+            lenovo.recorded()
+        );
+        for (alias, runner) in [("utm-1", &utm1), ("utm-2", &utm2)] {
+            let calls = joined(runner);
+            let reset = position_of(&calls, |call| call.contains("reset-failed"))
+                .unwrap_or_else(|| panic!("{alias}: no reset-failed: {calls:?}"));
+            let restart = position_of(&calls, |call| call.contains("systemctl restart rustynetd"))
+                .unwrap_or_else(|| panic!("{alias}: no restart: {calls:?}"));
+            let first_poll = position_of(&calls, |call| call.contains("is-active"))
+                .unwrap_or_else(|| panic!("{alias}: no poll: {calls:?}"));
+            assert!(
+                reset < restart && restart < first_poll,
+                "{alias}: recovery order wrong: {calls:?}"
+            );
+            assert!(
+                calls.iter().any(|call| call.contains("latest-handshakes")),
+                "{alias}: no wg probe: {calls:?}"
+            );
+        }
+        let line = evidence.borrow().clone().expect("evidence recorded");
+        assert!(
+            line.contains("daemon_active=restarted-and-verified:utm-1,utm-2"),
+            "{line}"
+        );
+        assert!(line.contains("wg_handshake_fresh=verified"), "{line}");
+        assert!(line.contains("post_reboot_twohop=not-verified"), "{line}");
+        assert!(
+            line.contains("post_reboot_dns_refresh=not-verified"),
+            "{line}"
+        );
+        assert!(
+            line.contains("overlay_nodes=lenovo-1,utm-1,utm-2"),
+            "{line}"
+        );
+        assert!(
+            polls_at_evidence.get() >= 3,
+            "evidence must be written AFTER the daemon checks, not before"
+        );
+    }
+
+    /// Review mutant m14: if the glue dropped the daemon check entirely, a
+    /// daemon that never recovers must still fail the stage — and no
+    /// evidence line may be recorded.
+    #[test]
+    fn reboot_glue_fails_when_a_rebooted_daemon_never_recovers() {
+        let mut ctx = empty_ctx();
+        let topo = two_lan_topology();
+        let plan = plan_overlay(&topo)
+            .expect("plan")
+            .expect("two network groups need an overlay");
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: topology_digest("vxlan", &topo, Some(&plan)),
+            provisioned: true,
+            participants: topo.nodes.keys().cloned().collect(),
+        });
+        let lenovo = substrate_ready_runner();
+        let utm1 = recovering_runner(&["inactive"], 10);
+        let utm2 = recovering_runner(&["activating", "active", "active"], 10);
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let evidence_calls = std::cell::Cell::new(0usize);
+        let record = |_: &str| -> Result<(), String> {
+            evidence_calls.set(evidence_calls.get() + 1);
+            Ok(())
+        };
+        let err = reprovision_and_verify_after_reboot_with(
+            &mut ctx,
+            &topo,
+            &["utm-1", "utm-2"],
+            &runners,
+            &record,
+            &no_sleep,
+        )
+        .expect_err("a daemon that never recovers must fail the stage");
+        assert!(err.contains("did not reach a stable active state"), "{err}");
+        assert!(err.contains("utm-1"), "{err}");
+        let calls = joined(&utm1);
+        assert!(
+            calls.iter().any(|call| call.contains("reset-failed")),
+            "the latch reset must be attempted: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.contains("systemctl restart rustynetd")),
+            "the restart must be attempted: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.contains("is-active"))
+                .count(),
+            DAEMON_ACTIVE_POLL_ATTEMPTS,
+            "bounded poll: {calls:?}"
+        );
+        assert_eq!(
+            evidence_calls.get(),
+            0,
+            "no evidence line when verification failed"
+        );
+    }
+
+    /// Review mutant m13: a failing evidence write must fail the glue, and
+    /// it must be attempted only after every check passed.
+    #[test]
+    fn reboot_glue_fails_when_the_evidence_line_cannot_be_written() {
+        let mut ctx = empty_ctx();
+        let topo = two_lan_topology();
+        let plan = plan_overlay(&topo)
+            .expect("plan")
+            .expect("two network groups need an overlay");
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: topology_digest("vxlan", &topo, Some(&plan)),
+            provisioned: true,
+            participants: topo.nodes.keys().cloned().collect(),
+        });
+        let lenovo = substrate_ready_runner();
+        let utm1 = recovering_runner(&["activating", "active", "active"], 10);
+        let utm2 = recovering_runner(&["activating", "active", "active"], 10);
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let record = |_: &str| -> Result<(), String> { Err("stage log disk full".to_owned()) };
+        let err = reprovision_and_verify_after_reboot_with(
+            &mut ctx,
+            &topo,
+            &["utm-1", "utm-2"],
+            &runners,
+            &record,
+            &no_sleep,
+        )
+        .expect_err("a failing evidence write must fail the stage");
+        assert!(err.contains("stage log disk full"), "{err}");
+        assert!(
+            !lenovo.recorded().is_empty() || !utm1.recorded().is_empty(),
+            "the evidence write is attempted after the checks ran"
+        );
+    }
+
+    /// Review mutants m12 + m16: a setup failure in the re-provision fails
+    /// the glue AND stores the merged partial handle/record for teardown;
+    /// non-rebooted nodes stay untouched and no evidence is written.
+    #[test]
+    fn reboot_glue_setup_failure_fails_and_records_merged_partial_state() {
+        let mut ctx = empty_ctx();
+        let topo = two_lan_topology();
+        let plan = plan_overlay(&topo)
+            .expect("plan")
+            .expect("two network groups need an overlay");
+        ctx.substrate_record = Some(SubstrateRecord {
+            substrate_id: "vxlan".to_owned(),
+            topology_digest: topology_digest("vxlan", &topo, Some(&plan)),
+            provisioned: true,
+            participants: topo.nodes.keys().cloned().collect(),
+        });
+        ctx.substrate = Some(SubstrateHandle {
+            record: ctx.substrate_record.clone().expect("record"),
+            overlay_ips: BTreeMap::new(),
+            underlay_ips: BTreeMap::new(),
+            created_resources: vec![CreatedResource::netns("lenovo-1", VXLAN_ROUTER_NS)],
+        });
+        let lenovo = mock::MockLeafRunner::default();
+        let utm1 = mock::MockLeafRunner {
+            // Call 0 pre-delete, call 1 link add: fail the link add.
+            fail_on: vec![1],
+            failure_stderr: "RTNETLINK answers: Operation not permitted".to_owned(),
+            ..substrate_ready_runner()
+        };
+        let utm2 = substrate_ready_runner();
+        let runners = runner_map(&[("lenovo-1", &lenovo), ("utm-1", &utm1), ("utm-2", &utm2)]);
+        let evidence_calls = std::cell::Cell::new(0usize);
+        let record = |_: &str| -> Result<(), String> {
+            evidence_calls.set(evidence_calls.get() + 1);
+            Ok(())
+        };
+        let err = reprovision_and_verify_after_reboot_with(
+            &mut ctx,
+            &topo,
+            &["utm-1"],
+            &runners,
+            &record,
+            &no_sleep,
+        )
+        .expect_err("a failed re-provision must fail the stage");
+        assert!(err.contains("partial state recorded"), "{err}");
+        assert!(err.contains("utm-1"), "{err}");
+        assert!(
+            lenovo.recorded().is_empty(),
+            "non-rebooted nodes untouched: {:?}",
+            lenovo.recorded()
+        );
+        assert!(utm2.recorded().is_empty());
+        let handle = ctx
+            .substrate
+            .expect("partial state must be stored for teardown");
+        assert!(
+            handle.overlay_ips.contains_key("utm-1"),
+            "the stored handle must be the re-provision partial: {:?}",
+            handle.overlay_ips.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            handle
+                .created_resources
+                .contains(&CreatedResource::netns("lenovo-1", VXLAN_ROUTER_NS)),
+            "previous resources must survive the merge: {:?}",
+            handle.created_resources
+        );
+        assert!(ctx.substrate_record.expect("record").provisioned);
+        assert_eq!(
+            evidence_calls.get(),
+            0,
+            "no evidence line on a failed re-provision"
+        );
     }
 
     #[test]
@@ -3877,12 +5098,14 @@ mod tests {
         "192.168.64.10 dev mgmt0 src 192.168.0.30 uid 0\n".to_owned()
     }
 
-    /// The two calls that open every participant's teardown (finding 16):
-    /// idempotent attestation removal, then the daemon restart that rebuilds
-    /// the boot table without the transit rule. Both precede ANY link delete.
+    /// The three calls that open every participant's teardown (finding 16):
+    /// idempotent attestation removal, the best-effort crash-loop limit
+    /// reset, then the daemon restart that rebuilds the boot table without
+    /// the transit rule. All precede ANY link delete.
     fn substrate_teardown_head() -> Vec<String> {
         vec![
             format!("sudo -n {GUEST_RUSTYNET_CLI} ops vm-lab-remove-substrate-transit"),
+            "sudo -n systemctl reset-failed rustynetd".to_owned(),
             "sudo -n systemctl restart rustynetd".to_owned(),
         ]
     }
@@ -4368,9 +5591,10 @@ mod tests {
             created_resources: Vec::new(),
         };
         // The namespace and the site LAN were never created on this guest.
-        // (Calls 0/1 are the attestation removal + daemon restart.)
+        // (Calls 0/1/2 are the attestation removal + limit reset + restart;
+        // 3/4 are the netns and site-LAN deletions.)
         let a = MockLeafRunner {
-            fail_on: vec![2, 3],
+            fail_on: vec![3, 4],
             failure_stderr: "Cannot remove namespace file: No such file or directory".to_owned(),
             ..MockLeafRunner::default()
         };
@@ -4736,14 +5960,15 @@ mod tests {
             created_resources: Vec::new(),
         };
         let residue = mock::MockLeafRunner {
-            // Call 6 is the nft probe (0 removal, 1 restart, 2..=4 deletions,
-            // 5 egress-pin revert): its stdout carries a transit rule.
+            // Call 9 is the nft probe (0 removal, 1 limit reset, 2 restart,
+            // 3..=5 deletions, 6 egress-pin revert): its stdout carries a
+            // transit rule.
             stdout_by_match: vec![(
                 "nft list ruleset".to_owned(),
                 "... comment \"rustynet_substrate_transit\" ...".to_owned(),
             )],
-            // Call 7 is `test ! -e`: failing it means the file is STILL there.
-            fail_on: vec![7],
+            // Call 8 is `test ! -e`: failing it means the file is STILL there.
+            fail_on: vec![8],
             ..MockLeafRunner::default()
         };
         let runners = runner_map(&[("a", &residue)]);

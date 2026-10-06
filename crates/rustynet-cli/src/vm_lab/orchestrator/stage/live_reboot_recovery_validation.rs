@@ -3,6 +3,7 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::stage::cross_network::substrate;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
 /// QH-83 F1: the reboot-recovery stage's pass witness. The
@@ -128,6 +129,20 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
         match result {
             Ok(output) => {
                 if output.status.success() {
+                    // u41-r2: the binary's reboot loses the vxlan overlay on
+                    // the guests while the persistent attestation survives,
+                    // so the daemon cannot come back on its own. Restore the
+                    // overlay and REFUSE to pass while any rebooted node's
+                    // daemon is still down (the binary's post-reboot checks
+                    // are skipped for these guests, so this is the only
+                    // gate). Runs BEFORE the artifact check: a stage that
+                    // cannot restore the substrate has failed, whatever the
+                    // binary's own report says.
+                    let rebooted = [exit_params.alias.as_str(), client_params.alias.as_str()];
+                    if let Err(err) = substrate::reprovision_and_verify_after_reboot(ctx, &rebooted)
+                    {
+                        return StageOutcome::Failed(err);
+                    }
                     match verify_report_artifact(&ctx.report_dir) {
                         Ok(()) => StageOutcome::Passed,
                         Err(e) => StageOutcome::Failed(e),
@@ -260,5 +275,25 @@ mod tests {
             "the failure must name the missing witness artifact"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// u41-r3 (review mutant m11): the whole substrate fix is ONE call
+    /// inside `execute`. If that call disappears, no mock test can notice —
+    /// the stage would pass a vxlan run with the overlay down and the
+    /// daemons latched. Pin the wiring at source level: the call must exist
+    /// and must precede the Passed verdict.
+    #[test]
+    fn stage_execute_calls_the_substrate_reprovision_glue_before_the_passed_verdict() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/vm_lab/orchestrator/stage/live_reboot_recovery_validation.rs"
+        ));
+        let call = source
+            .find("substrate::reprovision_and_verify_after_reboot(ctx, &rebooted)")
+            .expect("execute must call the substrate re-provision glue");
+        let passed = source
+            .find("StageOutcome::Passed")
+            .expect("the Passed verdict exists");
+        assert!(call < passed, "the glue must run BEFORE the stage can pass");
     }
 }
