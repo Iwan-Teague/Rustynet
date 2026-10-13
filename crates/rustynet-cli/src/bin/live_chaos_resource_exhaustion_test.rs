@@ -561,6 +561,24 @@ printf 'teardown_registered_before_fault=true\n'
 printf 'target_ingest=gossip\n'
 printf 'gossip_datagram_cap_bytes=%s\n' "$gossip_cap"
 printf 'gossip_port=%s\n' "$gossip_port"
+# The daemon binds its gossip socket on the node's own mesh (overlay) address
+# only, never a wildcard or loopback, so the flood must target that address.
+# Delivery to a local address stays on `lo` and never touches the underlay NIC.
+# Falls back to loopback when the mesh interface carries no IPv4 address.
+gossip_target="$(ip -4 -o addr show dev rustynet0 2>/dev/null | awk '{{print $4}}' | cut -d/ -f1 | head -n 1 || true)"
+gossip_target_source=overlay
+case "$gossip_target" in ""|*[!0-9.]*) gossip_target=127.0.0.1; gossip_target_source=fallback ;; esac
+printf 'gossip_target=%s\n' "$gossip_target"
+# `fallback` means the node has no overlay address, so nothing listens on the
+# target and the flood cannot reach the daemon: the verdict FAILS on it, a
+# fallback run must never pass vacuously.
+printf 'gossip_target_source=%s\n' "$gossip_target_source"
+# Receipt witness: the daemon counts every inbound datagram that failed to
+# decode in `gossip_recv_errors_total`; a flood that really reached the
+# gossip socket must move it.
+read_gossip_recv_errors() {{
+  printf 'status\n' | timeout 5 socat - "UNIX-CONNECT:$socket_path" 2>/dev/null | tr ' ' '\n' | sed -n 's/^gossip_recv_errors_total=//p' | head -n 1
+}}
 command -v timeout >/dev/null 2>&1 || {{ printf 'missing_timeout=true\n'; exit 1; }}
 command -v socat >/dev/null 2>&1 || {{ printf 'missing_socat=true\n'; exit 1; }}
 printf 'ipc_sender=socat\n'
@@ -583,17 +601,25 @@ head -c "$payload_bytes" /dev/zero | tr '\0' 'A' > "$work_dir/payload"
 generated_bytes="$(wc -c < "$work_dir/payload" 2>/dev/null || echo 0)"
 case "$generated_bytes" in ""|*[!0-9]*) generated_bytes=0 ;; esac
 printf 'generated_payload_bytes=%s\n' "$generated_bytes"
+gossip_recv_errors_before="$(read_gossip_recv_errors || true)"
+case "$gossip_recv_errors_before" in ""|*[!0-9]*) gossip_recv_errors_before=none ;; esac
+printf 'gossip_recv_errors_before=%s\n' "$gossip_recv_errors_before"
 sent=0
 i=0
 while [ "$i" -lt "$flood_count" ]; do
-  # SENDTO over loopback so we never touch the underlay NIC. The oversized UDP
-  # datagram is fragmented by the kernel; the daemon recv bounds at the cap.
-  timeout 5 socat -t1 - "UDP4-SENDTO:127.0.0.1:$gossip_port" < "$work_dir/payload" >/dev/null 2>&1 || true
+  # SENDTO to this node's own mesh address (local delivery over `lo`), so we
+  # never touch the underlay NIC. The oversized UDP datagram is fragmented by
+  # the kernel; the daemon recv bounds at the cap.
+  timeout 5 socat -t1 - "UDP4-SENDTO:$gossip_target:$gossip_port" < "$work_dir/payload" >/dev/null 2>&1 || true
   sent=$((sent + 1))
   i=$((i + 1))
 done
 printf 'flood_sent=%s\n' "$sent"
 printf 'endless_stream_attempted=true\n'
+sleep 2
+gossip_recv_errors_after="$(read_gossip_recv_errors || true)"
+case "$gossip_recv_errors_after" in ""|*[!0-9]*) gossip_recv_errors_after=none ;; esac
+printf 'gossip_recv_errors_after=%s\n' "$gossip_recv_errors_after"
 service_active_after=false
 if systemctl is-active --quiet "$service"; then service_active_after=true; fi
 printf 'service_active_after=%s\n' "$service_active_after"
@@ -639,6 +665,11 @@ struct ExhaustionObservation {
     rss_before_kib: u64,
     rss_after_kib: u64,
     daemon_pid_stable: bool,
+    /// Gossip-only receipt evidence (absent from the IPC script's output):
+    /// `overlay` when the flood was aimed at the node's own overlay address.
+    gossip_target_source: Option<String>,
+    gossip_recv_errors_before: Option<u64>,
+    gossip_recv_errors_after: Option<u64>,
 }
 
 impl ExhaustionObservation {
@@ -678,7 +709,28 @@ impl ExhaustionObservation {
             rss_before_kib: parse_u64("rss_before_kib")?,
             rss_after_kib: parse_u64("rss_after_kib")?,
             daemon_pid_stable: parse_bool("daemon_pid_stable")?,
+            gossip_target_source: value("gossip_target_source").map(str::to_owned),
+            gossip_recv_errors_before: value("gossip_recv_errors_before")
+                .and_then(|raw| raw.parse::<u64>().ok()),
+            gossip_recv_errors_after: value("gossip_recv_errors_after")
+                .and_then(|raw| raw.parse::<u64>().ok()),
         })
+    }
+
+    /// A gossip flood only proves anything if it reached the gossip socket.
+    /// Fail closed: the target must be the node's overlay address (a
+    /// loopback fallback hits an unbound port) AND the daemon's own
+    /// `gossip_recv_errors_total` must have moved. Non-gossip ingests have
+    /// no such requirement.
+    fn gossip_flood_reached_daemon(&self) -> bool {
+        if self.target_ingest != "gossip" {
+            return true;
+        }
+        self.gossip_target_source.as_deref() == Some("overlay")
+            && matches!(
+                (self.gossip_recv_errors_before, self.gossip_recv_errors_after),
+                (Some(before), Some(after)) if after > before
+            )
     }
 
     /// PASS verdict — the bounded-handling fail-closed assertion. ALL must hold:
@@ -700,6 +752,7 @@ impl ExhaustionObservation {
             && self.post_socket_present
             && self.post_status_ok
             && self.daemon_pid_stable
+            && self.gossip_flood_reached_daemon()
             && rss_bounded(
                 self.rss_before_kib,
                 self.rss_after_kib,
@@ -781,6 +834,9 @@ fn render_live_report(config: &Config, observation: &ExhaustionObservation) -> V
                     "rss_after_kib": observation.rss_after_kib,
                     "rss_growth_limit_kib": DEFAULT_RSS_GROWTH_LIMIT_KIB,
                     "daemon_pid_stable": observation.daemon_pid_stable,
+                    "gossip_target_source": observation.gossip_target_source,
+                    "gossip_recv_errors_before": observation.gossip_recv_errors_before,
+                    "gossip_recv_errors_after": observation.gossip_recv_errors_after,
                     "teardown_registered_before_fault": observation.teardown_registered_before_fault,
                 })
             } else {
@@ -972,6 +1028,13 @@ mod tests {
     }
 
     fn passing_output(ingest: &str) -> String {
+        let gossip_receipt = if ingest == "gossip" {
+            "gossip_target_source=overlay\n\
+             gossip_recv_errors_before=3\n\
+             gossip_recv_errors_after=67\n"
+        } else {
+            ""
+        };
         format!(
             "teardown_registered_before_fault=true\n\
              target_ingest={ingest}\n\
@@ -984,8 +1047,58 @@ mod tests {
              post_status_ok=true\n\
              rss_before_kib=12000\n\
              rss_after_kib=12100\n\
-             daemon_pid_stable=true\n"
+             daemon_pid_stable=true\n\
+             {gossip_receipt}"
         )
+    }
+
+    #[test]
+    fn gossip_flood_that_fell_back_to_loopback_fails_instead_of_passing_vacuously() {
+        let output = passing_output("gossip").replace(
+            "gossip_target_source=overlay",
+            "gossip_target_source=fallback",
+        );
+        let observation = ExhaustionObservation::parse(&output).expect("observation should parse");
+        assert!(!observation.passed(120, DEFAULT_RSS_GROWTH_LIMIT_KIB));
+    }
+
+    #[test]
+    fn gossip_flood_without_a_recv_counter_delta_fails() {
+        for (from, to) in [
+            ("gossip_recv_errors_after=67", "gossip_recv_errors_after=3"),
+            (
+                "gossip_recv_errors_after=67",
+                "gossip_recv_errors_after=none",
+            ),
+            (
+                "gossip_recv_errors_before=3",
+                "gossip_recv_errors_before=none",
+            ),
+            ("gossip_recv_errors_after=67\n", ""),
+        ] {
+            let output = passing_output("gossip").replace(from, to);
+            let observation =
+                ExhaustionObservation::parse(&output).expect("observation should parse");
+            assert!(
+                !observation.passed(120, DEFAULT_RSS_GROWTH_LIMIT_KIB),
+                "{from} -> {to} must fail"
+            );
+        }
+        // The IPC ingest has no gossip receipt requirement.
+        let ipc = ExhaustionObservation::parse(&passing_output("ipc")).expect("parse");
+        assert!(ipc.passed(120, DEFAULT_RSS_GROWTH_LIMIT_KIB));
+    }
+
+    #[test]
+    fn gossip_flood_script_records_target_source_and_recv_counters() {
+        let config =
+            parse(&["--dry-run", "--target-ingest", "gossip"]).expect("config should parse");
+        let script = render_gossip_flood_script(&config);
+        assert!(script.contains("gossip_target_source=fallback"));
+        assert!(script.contains("printf 'gossip_target_source=%s"));
+        assert!(script.contains("gossip_recv_errors_total="));
+        assert!(script.contains("gossip_recv_errors_before"));
+        assert!(script.contains("gossip_recv_errors_after"));
     }
 
     #[test]
@@ -1104,13 +1217,18 @@ mod tests {
     }
 
     #[test]
-    fn gossip_flood_script_targets_loopback_gossip_port() {
+    fn gossip_flood_script_targets_the_local_mesh_address_gossip_port() {
         let config =
             parse(&["--dry-run", "--target-ingest", "gossip"]).expect("config should parse");
         let script = render_gossip_flood_script(&config);
-        assert!(script.contains("UDP4-SENDTO:127.0.0.1:$gossip_port"));
+        // The daemon binds gossip on its overlay address only, so the flood
+        // targets that address (read from the mesh interface), with loopback
+        // only as the no-address fallback.
+        assert!(script.contains("UDP4-SENDTO:$gossip_target:$gossip_port"));
+        assert!(script.contains("ip -4 -o addr show dev rustynet0"));
+        assert!(script.contains("gossip_target=127.0.0.1"));
         assert!(script.contains("gossip_datagram_cap_bytes"));
-        // never touches the underlay NIC: loopback target only.
+        // never touches the underlay NIC: a local address only.
         assert!(!script.contains("0.0.0.0"));
         let trap_idx = script
             .find("trap cleanup EXIT HUP INT TERM")

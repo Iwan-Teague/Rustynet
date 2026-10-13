@@ -2184,7 +2184,8 @@ fn is_anchor_name_token(value: &str) -> bool {
 fn is_owned_nft_table_token(value: &str) -> bool {
     (value.starts_with("rustynet_g")
         || value.starts_with("rustynet_nat_g")
-        || is_owned_tandem_dns_table_token(value))
+        || is_owned_tandem_dns_table_token(value)
+        || is_owned_gossip_scope_table_token(value))
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
@@ -2199,6 +2200,21 @@ fn is_owned_nft_table_token(value: &str) -> bool {
 /// into) any other reviewed table.
 fn is_owned_tandem_dns_table_token(value: &str) -> bool {
     value.starts_with("rustynet_tdns_")
+}
+
+/// True ONLY for the single gossip-port scope table
+/// (`crate::linux_runtime_nftables::GOSSIP_SCOPE_TABLE`). An exact match, not
+/// a prefix: the `input`-hook chain and its two rules are permitted on this
+/// one fixed name and nowhere else, so an input-hook chain can never be slipped
+/// into the killswitch (`rustynet_g…`), NAT or DNS tables.
+fn is_owned_gossip_scope_table_token(value: &str) -> bool {
+    value == crate::linux_runtime_nftables::GOSSIP_SCOPE_TABLE
+}
+
+/// The gossip UDP port token (the only port the scope table may name).
+#[cfg(not(windows))]
+fn is_gossip_scope_port_token(value: &str) -> bool {
+    value == crate::gossip_transport::RUSTYNET_GOSSIP_PORT.to_string()
 }
 
 fn is_owned_failclosed_table_token(value: &str) -> bool {
@@ -2367,6 +2383,30 @@ fn validate_nft_add_chain_args(args: &[&str]) -> Result<(), String> {
             ";",
             "}",
         ] if is_owned_dns_redirect_table_token(table) => Ok(()),
+        // Gossip-port scope table ONLY (exact table name): an ACCEPT-policy
+        // input-hook filter chain that can only ever carry drops/loopback
+        // accepts for the gossip port. `policy accept` is the only policy
+        // admitted here, so this chain can never become a default-deny input
+        // policy.
+        [
+            "add",
+            "chain",
+            "inet",
+            table,
+            "input",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "input",
+            "priority",
+            "-10",
+            ";",
+            "policy",
+            "accept",
+            ";",
+            "}",
+        ] if is_owned_gossip_scope_table_token(table) => Ok(()),
         _ => Err("unsupported nft add chain argument schema".to_owned()),
     }
 }
@@ -2975,6 +3015,43 @@ fn validate_nft_add_rule_args(args: &[&str]) -> Result<(), String> {
             && matches!(*proto, "udp" | "tcp")
             && proto == proto2
             && is_loopback_dns_redirect_target(target) =>
+        {
+            Ok(())
+        }
+        // Gossip-port scope table ONLY: loopback accept, then drop on every
+        // interface but the tunnel. Port fixed to the gossip port; the tunnel
+        // interface is a validated name and can never be `lo` (that would
+        // scope the port to loopback and drop the tunnel's own traffic).
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "input",
+            "udp",
+            "dport",
+            port,
+            "iifname",
+            "lo",
+            "accept",
+        ] if is_owned_gossip_scope_table_token(table) && is_gossip_scope_port_token(port) => Ok(()),
+        [
+            "add",
+            "rule",
+            "inet",
+            table,
+            "input",
+            "udp",
+            "dport",
+            port,
+            "iifname",
+            "!=",
+            tunnel_iface,
+            "drop",
+        ] if is_owned_gossip_scope_table_token(table)
+            && is_gossip_scope_port_token(port)
+            && *tunnel_iface != "lo"
+            && is_interface_name(tunnel_iface) =>
         {
             Ok(())
         }
@@ -4436,6 +4513,268 @@ mod tests {
             validate_request(PrivilegedCommandProgram::Nft, &forward_argv).unwrap_or_else(|err| {
                 panic!("forward scoped rule {forward_argv:?} should be accepted: {err}")
             });
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn validate_request_admits_only_the_exact_gossip_scope_shapes() {
+        let admit = |args: &[&str]| validate_request(PrivilegedCommandProgram::Nft, args);
+        // Accepted: table ops, the accept-policy input chain, the two rules.
+        admit(&["add", "table", "inet", "rustynet_svc_gossip"]).expect("add table");
+        admit(&["list", "table", "inet", "rustynet_svc_gossip"]).expect("list table");
+        admit(&["list", "chain", "inet", "rustynet_svc_gossip", "input"]).expect("list chain");
+        admit(&["delete", "table", "inet", "rustynet_svc_gossip"]).expect("delete table");
+        admit(&[
+            "add",
+            "chain",
+            "inet",
+            "rustynet_svc_gossip",
+            "input",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "input",
+            "priority",
+            "-10",
+            ";",
+            "policy",
+            "accept",
+            ";",
+            "}",
+        ])
+        .expect("accept-policy input chain");
+        admit(&[
+            "add",
+            "rule",
+            "inet",
+            "rustynet_svc_gossip",
+            "input",
+            "udp",
+            "dport",
+            "51821",
+            "iifname",
+            "lo",
+            "accept",
+        ])
+        .expect("loopback accept");
+        admit(&[
+            "add",
+            "rule",
+            "inet",
+            "rustynet_svc_gossip",
+            "input",
+            "udp",
+            "dport",
+            "51821",
+            "iifname",
+            "!=",
+            "rustynet0",
+            "drop",
+        ])
+        .expect("tunnel scope drop");
+
+        // The helper allowlist's output must be exactly what the daemon
+        // emits: every install argv the renderer produces is admitted.
+        for argv in crate::linux_runtime_nftables::gossip_scope_install_argvs(51821, "rustynet0")
+            .expect("install argvs")
+        {
+            let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+            admit(&refs).unwrap_or_else(|err| panic!("{argv:?} must be admitted: {err}"));
+        }
+
+        // Refused: every deviation.
+        let rule_head = ["add", "rule", "inet", "rustynet_svc_gossip", "input"];
+        let denied: Vec<Vec<&str>> = vec![
+            // wrong / extended table names
+            vec!["add", "table", "inet", "rustynet_svc_nas"],
+            vec!["add", "table", "inet", "rustynet_svc_gossip2"],
+            vec!["add", "table", "inet", "rustynet_svc_gossip;x"],
+            // input chain on any other table
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_g1",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            // default-deny, other hook, other priority, other chain name
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "drop",
+                ";",
+                "}",
+            ],
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "forward",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-300",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            vec![
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "output",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "output",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+        ];
+        for args in &denied {
+            assert!(
+                validate_request(PrivilegedCommandProgram::Nft, args).is_err(),
+                "{args:?} must be refused"
+            );
+        }
+        let rules_denied: Vec<Vec<&str>> = vec![
+            // another port / proto
+            [
+                &rule_head[..],
+                &["udp", "dport", "22", "iifname", "!=", "rustynet0", "drop"],
+            ]
+            .concat(),
+            [
+                &rule_head[..],
+                &[
+                    "tcp",
+                    "dport",
+                    "51821",
+                    "iifname",
+                    "!=",
+                    "rustynet0",
+                    "drop",
+                ],
+            ]
+            .concat(),
+            // scope to loopback = drop the tunnel's own gossip
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "!=", "lo", "drop"],
+            ]
+            .concat(),
+            // unvalidated interface names
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "!=", "a;b", "drop"],
+            ]
+            .concat(),
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "!=", "", "drop"],
+            ]
+            .concat(),
+            // accept for a non-loopback interface = an allow hole
+            [
+                &rule_head[..],
+                &["udp", "dport", "51821", "iifname", "eth0", "accept"],
+            ]
+            .concat(),
+            [&rule_head[..], &["udp", "dport", "51821", "accept"]].concat(),
+            // trailing tokens
+            [
+                &rule_head[..],
+                &[
+                    "udp",
+                    "dport",
+                    "51821",
+                    "iifname",
+                    "!=",
+                    "rustynet0",
+                    "drop",
+                    "counter",
+                ],
+            ]
+            .concat(),
+            // the same shape on a killswitch table
+            vec![
+                "add",
+                "rule",
+                "inet",
+                "rustynet_g1",
+                "input",
+                "udp",
+                "dport",
+                "51821",
+                "iifname",
+                "!=",
+                "rustynet0",
+                "drop",
+            ],
+        ];
+        for args in &rules_denied {
+            assert!(
+                validate_request(PrivilegedCommandProgram::Nft, args).is_err(),
+                "{args:?} must be refused"
+            );
         }
     }
 

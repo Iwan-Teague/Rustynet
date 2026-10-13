@@ -14,8 +14,11 @@
 
 //! D2.5 — UDP transport for peer-distributed signed-bundle gossip.
 //!
-//! Each peer binds a dedicated UDP socket on the rustynet0 mesh
-//! interface at [`RUSTYNET_GOSSIP_PORT`] (51821). The WireGuard
+//! Each peer binds a dedicated UDP socket on its own mesh (overlay)
+//! address - never a wildcard, never the underlay - at
+//! [`RUSTYNET_GOSSIP_PORT`] (51821). The daemon derives that address from
+//! the verified assignment bundle and refuses to bind anything wider
+//! (`resolve_gossip_overlay_bind_addr` in `daemon.rs`). The WireGuard
 //! listen port is 51820 — chosen one above so the two sockets never
 //! collide. Because the rustynet0 interface only carries traffic
 //! that has already traversed the WG tunnel, the bundle datagrams

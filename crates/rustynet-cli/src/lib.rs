@@ -92,6 +92,11 @@ mod ops_e2e;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 pub mod ops_live_lab_orchestrator;
+// CS4: OPT-IN expected-listener-set control-surface check (owner approval required
+// before it replaces the shipped definition). Pure evaluator; same feature gate.
+#[cfg(feature = "vm-lab")]
+#[allow(dead_code)]
+pub mod ops_control_surface_expected_set;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod secret_material;

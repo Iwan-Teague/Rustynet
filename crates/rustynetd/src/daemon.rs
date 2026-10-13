@@ -1864,8 +1864,10 @@ fn handle_anchor_bundle_pull_stream(
 }
 
 /// Bind the anchor bundle-pull listener if this node is configured to
-/// serve it (a configured token path implies the `anchor.bundle_pull` role).
-/// Returns `Ok(None)` when not configured. Validates the bind addr
+/// serve it AND the signed membership snapshot grants it `anchor.bundle_pull`
+/// (a configured token path only means the operator provisioned the surface;
+/// the capability decides whether the port exists at all).
+/// Returns `Ok(None)` when not configured or the capability is not held. Validates the bind addr
 /// (loopback-only unless `allow_lan`) and that the token file is readable BEFORE
 /// binding, then sets the socket non-blocking — exactly the steps the Unix main
 /// loop performed inline. Kept portable (`std::net`) and outside any `cfg` so
@@ -1892,14 +1894,29 @@ fn bind_anchor_bundle_pull_listener(
         )
     })?;
     validate_anchor_bundle_pull_addr(addr, config.anchor_bundle_pull_allow_lan)?;
+    // Control-surface gate: a token path only says the operator PROVISIONED
+    // the listener (`ops install-systemd` seeds one for every admin-role
+    // node). The socket itself exists only while the signed membership
+    // snapshot grants THIS node `anchor.bundle_pull`; every request would be
+    // refused ("capability revoked") otherwise, so an open port on a
+    // non-anchor is pure attack surface. Absent capability is not an error
+    // (the node may be granted it later — see [`AnchorBundlePullService`]).
+    //
+    // The token is validated BEFORE the gate: a provisioned-but-unreadable
+    // token is a misconfiguration that must surface at startup on every node
+    // that was given a token path, not only later at grant time.
+    load_anchor_bundle_pull_token(token_path)?;
+    if !anchor_bundle_pull_capability_held(config) {
+        log::info!(
+            "anchor_bundle_pull: not listening (local node does not hold signed capability anchor.bundle_pull)"
+        );
+        return Ok(None);
+    }
     let tls = if config.anchor_bundle_pull_allow_lan {
         Some(std::sync::Arc::new(load_anchor_tls_server_config(config)?))
     } else {
         None
     };
-    // Fail fast at startup if the token file is missing/unreadable rather than
-    // discovering it per-request.
-    load_anchor_bundle_pull_token(token_path)?;
     let listener = TcpListener::bind(addr)
         .map_err(|err| DaemonError::Io(format!("anchor bundle-pull bind failed: {err}")))?;
     listener
@@ -1910,6 +1927,140 @@ fn bind_anchor_bundle_pull_listener(
         tls.is_some()
     );
     Ok(Some(AnchorListenerBinding { listener, tls }))
+}
+
+/// True when the signed membership snapshot at `membership_snapshot_path`
+/// grants the local node `anchor.bundle_pull`. Same fail-closed read as the
+/// per-request check ([`handle_anchor_bundle_pull_stream`]): a missing,
+/// symlinked, oversized or malformed snapshot, an unknown or non-Active node
+/// and an absent capability all read as "not held".
+fn anchor_bundle_pull_capability_held(config: &DaemonConfig) -> bool {
+    require_local_signed_capability(
+        config.membership_snapshot_path.as_path(),
+        config.node_id.as_str(),
+        rustynet_control::roles::RoleCapability::AnchorBundlePull,
+    )
+    .is_ok()
+}
+
+/// How often [`AnchorBundlePullService`] re-evaluates the capability gate.
+/// Short enough that a freshly advertised anchor starts listening inside the
+/// lab probes' retry budget, long enough that a non-anchor admin pays one
+/// bounded snapshot read per second.
+const ANCHOR_BUNDLE_PULL_CAPABILITY_RECHECK: Duration = Duration::from_secs(1);
+
+/// How long the capability must stay continuously absent before an already
+/// open listener is closed. Opening is immediate (a grant is a positive,
+/// signed fact); closing is deliberately lagged. The per-request check
+/// already refuses every request the instant the snapshot stops granting the
+/// capability (`ERR forbidden after revocation`), which is the revocation
+/// guarantee the live anchor stages assert, including the clean-fail-closed
+/// answer for a pull in flight during a revoke. Closing the port at once
+/// would turn that clean answer into a refused connection; the lag only
+/// bounds how long a de-anchored node keeps an inert, loopback-only,
+/// refuse-everything socket.
+const ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE: Duration = Duration::from_secs(15);
+
+/// Minimum spacing between repeats of the SAME bind-failure log line.
+const ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The anchor bundle-pull listener, opened only while the local node holds
+/// the signed `anchor.bundle_pull` capability and closed when it loses it.
+///
+/// This replaces the one-shot startup bind: the capability arrives (or is
+/// revoked) through quorum-signed membership updates while the daemon runs, so
+/// the gate has to be re-evaluated, not latched. Nodes with no token path
+/// configured (every non-admin node) never touch the filesystem here.
+struct AnchorBundlePullService {
+    binding: Option<AnchorListenerBinding>,
+    next_check: Instant,
+    /// Since when the capability has been continuously absent while the
+    /// listener is open; `None` while held (or while closed).
+    absent_since: Option<Instant>,
+    close_grace: Duration,
+    /// Last runtime bind failure and when it was logged, so a persistent
+    /// failure (TLS identity, address in use) logs once per distinct message
+    /// and then at most once per [`ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL`], not
+    /// once per recheck: the daemon log has no rotation.
+    last_bind_failure: Option<(String, Instant)>,
+    /// Number of bind-failure log lines emitted (test witness).
+    bind_failure_logs: u32,
+}
+
+impl AnchorBundlePullService {
+    /// Initial bind attempt. Configuration errors (bad address, unreadable
+    /// token, TLS identity) stay fatal at startup exactly as before; only the
+    /// capability gate is soft.
+    fn new(config: &DaemonConfig) -> Result<Self, DaemonError> {
+        Ok(Self {
+            binding: bind_anchor_bundle_pull_listener(config)?,
+            next_check: Instant::now() + ANCHOR_BUNDLE_PULL_CAPABILITY_RECHECK,
+            absent_since: None,
+            close_grace: ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE,
+            last_bind_failure: None,
+            bind_failure_logs: 0,
+        })
+    }
+
+    /// Re-evaluate the capability gate, opening or closing the listener.
+    fn refresh(&mut self, config: &DaemonConfig, now: Instant) {
+        let held = anchor_bundle_pull_capability_held(config);
+        match (held, self.binding.is_some()) {
+            (true, false) => match bind_anchor_bundle_pull_listener(config) {
+                Ok(binding) => {
+                    self.binding = binding;
+                    self.last_bind_failure = None;
+                }
+                // A runtime bind problem (port briefly in use) must not kill
+                // the daemon; it is retried at the next recheck, logged once
+                // per distinct reason (then at most once a minute).
+                Err(err) => {
+                    let reason = err.to_string();
+                    let due = match self.last_bind_failure.as_ref() {
+                        Some((last, at)) => {
+                            *last != reason
+                                || now.saturating_duration_since(*at)
+                                    >= ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL
+                        }
+                        None => true,
+                    };
+                    if due {
+                        log::warn!("anchor_bundle_pull: bind deferred reason={reason}");
+                        self.bind_failure_logs = self.bind_failure_logs.saturating_add(1);
+                        self.last_bind_failure = Some((reason, now));
+                    }
+                }
+            },
+            (true, true) => self.absent_since = None,
+            (false, true) => {
+                let since = *self.absent_since.get_or_insert(now);
+                if now.saturating_duration_since(since) >= self.close_grace {
+                    self.binding = None;
+                    self.absent_since = None;
+                    log::info!(
+                        "anchor_bundle_pull: listener closed (signed capability anchor.bundle_pull no longer held)"
+                    );
+                }
+            }
+            (false, false) => self.last_bind_failure = None,
+        }
+    }
+
+    /// Serve at most one pending connection; `Ok(false)` when closed or idle.
+    fn poll_once(&mut self, config: &DaemonConfig) -> Result<bool, DaemonError> {
+        if config.anchor_bundle_pull_token_path.is_none() {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if now >= self.next_check {
+            self.next_check = now + ANCHOR_BUNDLE_PULL_CAPABILITY_RECHECK;
+            self.refresh(config, now);
+        }
+        match self.binding.as_ref() {
+            Some(binding) => poll_anchor_bundle_pull_once(binding, config),
+            None => Ok(false),
+        }
+    }
 }
 
 /// Accept and serve AT MOST ONE pending anchor bundle-pull connection on a
@@ -5051,13 +5202,34 @@ struct DaemonRuntime {
     // unaffected.
     gossip_node: Option<crate::gossip_runtime::GossipNode>,
     gossip_transport: Option<crate::gossip_transport::GossipTransport>,
-    /// I1b: address the gossip transport binds when it attaches at the
-    /// first verified-membership commit. Production value is
-    /// `0.0.0.0:RUSTYNET_GOSSIP_PORT` (the D2.5 fixed gossip port, one
-    /// above the WG listen port); tests override it to `127.0.0.1:0` so
-    /// parallel test runs never contend for the fixed port. Not an
-    /// operator surface — deliberately absent from `DaemonConfig`.
-    gossip_bind_addr: SocketAddr,
+    /// I1b: explicit bind address override for the gossip transport.
+    /// Production is always `None`: the transport then binds ONLY the
+    /// node's own mesh (overlay) address — the host `assigned_cidr` of the
+    /// verified assignment bundle — on `RUSTYNET_GOSSIP_PORT` (the D2.5
+    /// fixed gossip port, one above the WG listen port), never a wildcard.
+    /// Gossip rides inside the WireGuard tunnel, so peers only ever address
+    /// our overlay IP; a wildcard bind would additionally expose an
+    /// unauthenticated datagram parser on the underlay NIC. When no
+    /// verified bundle has supplied the overlay address yet the transport
+    /// stays unbound (fail closed) and the status reports why. Tests set
+    /// `Some("127.0.0.1:0")` so parallel runs never contend for the fixed
+    /// port. Not an operator surface — deliberately absent from
+    /// `DaemonConfig`.
+    gossip_bind_addr: Option<SocketAddr>,
+    /// Port the production (bundle-derived) gossip bind uses. Always
+    /// `RUSTYNET_GOSSIP_PORT` in production; tests set `0` so the
+    /// bundle-derived path can be exercised without contending for the
+    /// fixed port.
+    gossip_bind_port: u16,
+    /// Test-only: permit a loopback overlay address in the bundle-derived
+    /// bind so the production derivation can be exercised on any host.
+    /// Always `false` in production (nothing outside `mod tests` sets it).
+    gossip_allow_loopback_overlay: bool,
+    /// Overlay address whose bind failed at the last signed-state seam
+    /// (typically `EADDRNOTAVAIL`: the tunnel address is not on the interface
+    /// yet). Retried from `reconcile` so gossip does not wait for the next
+    /// dataplane generation to come up. Cleared on success.
+    gossip_bind_retry: Option<SocketAddr>,
     /// I1c: one-shot latch for the signer/verifier consistency warning.
     /// When our own membership entry's pubkey differs from the daemon's
     /// gossip verifying key, peers will reject every mint we send; that
@@ -5566,10 +5738,10 @@ impl DaemonRuntime {
             // gossip identity and verified membership exist.
             gossip_node: build_gossip_node(config)?,
             gossip_transport: None,
-            gossip_bind_addr: SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
-            ),
+            gossip_bind_addr: None,
+            gossip_bind_port: crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
+            gossip_allow_loopback_overlay: false,
+            gossip_bind_retry: None,
             gossip_identity_mismatch_warned: false,
             gossip_transport_error: None,
             gossip_recv_errors: 0,
@@ -6811,10 +6983,12 @@ impl DaemonRuntime {
     /// membership snapshot has been committed. Until then
     /// `gossip_mint_attached()` stays false, so the main loop neither
     /// builds candidate sets nor mints, and `drain_gossip_inbound` stays
-    /// inert. A bind failure is logged and retried at the next commit
-    /// seam — a transient EADDRINUSE from a daemon-restart race must not
-    /// permanently disable gossip, and the retry path is loud, never
-    /// silent. On non-unix platforms this is unreachable:
+    /// inert. A bind failure is recorded in the status and retried on every
+    /// reconcile tick (`retry_gossip_bind`) as well as at the next commit
+    /// seam — a transient EADDRINUSE from a daemon-restart race, or an
+    /// overlay address not yet on the interface, must not permanently disable
+    /// gossip, and the retry path is visible (status field, one log line per
+    /// distinct failure), never silent. On non-unix platforms this is unreachable:
     /// `validate_daemon_config` rejects a configured gossip signing
     /// secret because the transport is unix-only, so `gossip_node` is
     /// always `None` there.
@@ -6857,22 +7031,74 @@ impl DaemonRuntime {
         // is verified-provenance by construction; the setter itself
         // additionally refuses regression.
         node.set_local_membership_epoch(membership_state.epoch);
-        if self.gossip_transport.is_none() {
-            match crate::gossip_transport::GossipTransport::bind(self.gossip_bind_addr) {
-                Ok(transport) => {
-                    log::info!("gossip transport bound; gossip data plane active");
-                    self.gossip_transport = Some(transport);
-                    // Clear on recovery: a bind that succeeded on a later
-                    // commit seam must not keep reporting the earlier
-                    // failure as though it were still live.
-                    self.gossip_transport_error = None;
+        // Where the transport must live. Production binds ONLY the node's
+        // own overlay address (never a wildcard): see `gossip_bind_addr`.
+        let desired_bind = match (self.gossip_bind_addr, auto_tunnel) {
+            (Some(addr), _) => Some(Ok(addr)),
+            (None, Some(bundle)) => Some(resolve_gossip_overlay_bind_addr(
+                bundle.assigned_cidr.as_str(),
+                bundle.mesh_cidr.as_str(),
+                self.gossip_bind_port,
+                self.gossip_allow_loopback_overlay,
+            )),
+            // No verified bundle at this seam (e.g. membership apply): no
+            // new information about the overlay address, leave state alone.
+            (None, None) => None,
+        };
+        // A re-assigned overlay address must move the socket: keeping the
+        // old bind would leave a stale listener and no listener where peers
+        // now push. IP-only comparison (the port is fixed in production).
+        // A verified bundle whose assigned address is unusable (`Err`) also
+        // unbinds: the old socket would sit on an address the node no longer
+        // legitimately owns, and fail-closed beats a stale listener. A seam
+        // with no bundle (`None`) carries no information and changes nothing.
+        if self.gossip_bind_addr.is_none()
+            && let Some(transport) = self.gossip_transport.as_ref()
+        {
+            let drop_reason = match desired_bind.as_ref() {
+                Some(Ok(want))
+                    if transport.local_addr().map(|bound| bound.ip()).ok() != Some(want.ip()) =>
+                {
+                    Some("gossip overlay address changed; rebinding gossip transport")
                 }
-                Err(err) => {
-                    self.gossip_transport_error =
-                        Some(sanitize_and_cap_status_value(&err.to_string()));
-                    log::error!(
-                        "gossip transport bind failed; retrying on next signed-state commit: {err}"
-                    );
+                Some(Err(_)) => Some(
+                    "gossip overlay address no longer usable; unbinding gossip transport (fail closed)",
+                ),
+                _ => None,
+            };
+            if let Some(reason) = drop_reason {
+                log::info!("{reason}");
+                self.gossip_transport = None;
+                self.gossip_bind_retry = None;
+            }
+        }
+        if self.gossip_transport.is_none() {
+            match desired_bind {
+                Some(Ok(bind_addr)) => bind_gossip_transport_into(
+                    &mut self.gossip_transport,
+                    &mut self.gossip_transport_error,
+                    &mut self.gossip_bind_retry,
+                    bind_addr,
+                ),
+                Some(Err(reason)) => {
+                    self.gossip_bind_retry = None;
+                    let message = sanitize_and_cap_status_value(&reason);
+                    if self.gossip_transport_error.as_deref() != Some(message.as_str()) {
+                        log::error!(
+                            "gossip transport not bound (fail closed); retrying on next signed-state commit: {reason}"
+                        );
+                    }
+                    self.gossip_transport_error = Some(message);
+                }
+                None => {
+                    // Awaiting the first verified assignment bundle. Report
+                    // the reason once; never overwrite a more specific
+                    // earlier bind failure.
+                    if self.gossip_transport_error.is_none() {
+                        self.gossip_transport_error = Some(
+                            "awaiting_verified_assignment_bundle_for_overlay_address".to_owned(),
+                        );
+                    }
                 }
             }
         }
@@ -6933,6 +7159,27 @@ impl DaemonRuntime {
         }
     }
 
+    /// Reconcile-cadence retry of a failed overlay bind. The overlay address
+    /// only exists once the dataplane has brought the tunnel interface up, so
+    /// a bind attempted at a seam that ran slightly early fails with
+    /// `EADDRNOTAVAIL`; without this the retry would wait for the next
+    /// signed-state commit. A no-op unless a bind failed and the transport is
+    /// still down, so the steady-state cost is two field reads.
+    fn retry_gossip_bind(&mut self) {
+        if self.gossip_transport.is_some() {
+            self.gossip_bind_retry = None;
+            return;
+        }
+        if let Some(bind_addr) = self.gossip_bind_retry {
+            bind_gossip_transport_into(
+                &mut self.gossip_transport,
+                &mut self.gossip_transport_error,
+                &mut self.gossip_bind_retry,
+                bind_addr,
+            );
+        }
+    }
+
     /// Periodic hook: drain any pending gossip datagrams from the
     /// transport and route them through the ingestion path
     /// (signature + freshness + replay + scope checks, plus epidemic
@@ -6957,10 +7204,13 @@ impl DaemonRuntime {
         // The warn below is emitted at most once per drain pass. The
         // counter is per datagram; the log deliberately is not.
         //
-        // This split matters because the gossip socket is bound
-        // `0.0.0.0:51821` and the production killswitch table has no
-        // `hook input` chain, so this arm is reachable by any host that
-        // can send us a datagram, unauthenticated. Logging per datagram
+        // This split matters because the gossip socket accepts datagrams
+        // before any signature check. The gossip scope table
+        // (`rustynet_svc_gossip`, CS3) holds an `input` chain with ACCEPT
+        // policy — it only pins the gossip port to the tunnel interface, so
+        // this arm is reachable by any sender that can address our overlay
+        // IP (the socket is bound to that address only, not a wildcard),
+        // unauthenticated. Logging per datagram
         // would let that host drive 16x the log volume that breaking out
         // of the pass allowed, into a file opened with `truncate(true)`
         // and no rotation or size cap, on the same filesystem the daemon
@@ -10777,6 +11027,7 @@ impl DaemonRuntime {
 
     fn reconcile(&mut self) {
         self.reconcile_attempts = self.reconcile_attempts.saturating_add(1);
+        self.retry_gossip_bind();
         self.last_reconcile_unix = Some(unix_now());
         if let Err(err) = self.enforce_blind_exit_invariants() {
             self.reconcile_failures = self.reconcile_failures.saturating_add(1);
@@ -12098,6 +12349,9 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
                 .with_traversal_bootstrap_allow_endpoints(config.traversal_stun_servers.clone())
                 .with_wg_listen_port(config.wg_listen_port)
                 .with_dns_resolver_port(config.dns_resolver_bind_addr.port())
+                // CS3 fix: the gossip nft scope is installed only when the
+                // gossip transport is configured (signing secret present).
+                .with_gossip_configured(config.gossip_signing_secret_path.is_some())
         })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         // LAB-ONLY (AQ-256): read and validate the orchestrator's vxlan
@@ -12610,7 +12864,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // (Follow-up: the DNS bind above retries on the SCM stop/start
         // WSAEADDRINUSE race; if a live restart ever races the 51822 bind, wrap
         // this in the same backoff — left single-attempt for parity with Unix.)
-        let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
+        let mut anchor_bundle_pull_service = AnchorBundlePullService::new(&config)?;
         // Anchor enrollment-consume listener (D-3 §7(1)): same shared,
         // portable bind seam as bundle-pull, so a Windows anchor opens the
         // same verified enrollment surface a Linux anchor does.
@@ -12725,9 +12979,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
 
             // Serve one pending anchor bundle-pull connection (shared,
             // Linux-verified serve path — same as the Unix loop).
-            if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
-                && poll_anchor_bundle_pull_once(anchor_listener, &config)?
-            {
+            if anchor_bundle_pull_service.poll_once(&config)? {
                 processed = processed.saturating_add(1);
                 processed_io = true;
             }
@@ -12844,7 +13096,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
         // `dns_socket` was bound (and made nonblocking) BEFORE `bootstrap()`
         // above — M1 — so the bootstrap-time probe and this serve loop drain
         // the same socket. Nothing to bind here.
-        let anchor_bundle_pull_listener = bind_anchor_bundle_pull_listener(&config)?;
+        let mut anchor_bundle_pull_service = AnchorBundlePullService::new(&config)?;
         // Anchor enrollment-consume listener (D-3 §7(1)): opt-in, fail-closed
         // bind — see `bind_anchor_enrollment_listener` for the pre-bind gates.
         let anchor_enrollment_listener = bind_anchor_enrollment_listener(&config)?;
@@ -13003,9 +13255,7 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
                     }
                 }
             }
-            if let Some(anchor_listener) = anchor_bundle_pull_listener.as_ref()
-                && poll_anchor_bundle_pull_once(anchor_listener, &config)?
-            {
+            if anchor_bundle_pull_service.poll_once(&config)? {
                 processed = processed.saturating_add(1);
                 processed_io = true;
             }
@@ -13689,6 +13939,17 @@ fn validate_daemon_config(config: &DaemonConfig) -> Result<(), DaemonError> {
         return Err(DaemonError::InvalidConfig(
             "wireguard listen port must be in range 1-65535".to_owned(),
         ));
+    }
+    // CS3 fix: the wireguard data port and the gossip transport port are
+    // distinct services on distinct addresses (wireguard on the underlay,
+    // gossip bound to the tunnel overlay address). A collision would make
+    // the second binder fail at runtime; reject the config up front.
+    if config.wg_listen_port == crate::gossip_transport::RUSTYNET_GOSSIP_PORT {
+        return Err(DaemonError::InvalidConfig(format!(
+            "wireguard listen port {} collides with the gossip transport port ({}); choose a different wireguard listen port",
+            config.wg_listen_port,
+            crate::gossip_transport::RUSTYNET_GOSSIP_PORT
+        )));
     }
     if config.egress_interface.is_empty() {
         return Err(DaemonError::InvalidConfig(
@@ -18403,6 +18664,86 @@ fn membership_directory_from_state(
     directory
 }
 
+/// Bind the gossip transport at `bind_addr` (always the node's own overlay
+/// address in production). Takes the three runtime fields separately so the
+/// caller can hold a borrow on `gossip_node` across the call. On failure the
+/// address is remembered for `DaemonRuntime::retry_gossip_bind`; nothing ever
+/// falls back to a wider bind.
+fn bind_gossip_transport_into(
+    transport: &mut Option<crate::gossip_transport::GossipTransport>,
+    error: &mut Option<String>,
+    retry: &mut Option<SocketAddr>,
+    bind_addr: SocketAddr,
+) {
+    match crate::gossip_transport::GossipTransport::bind(bind_addr) {
+        Ok(bound) => {
+            log::info!("gossip transport bound; gossip data plane active");
+            *transport = Some(bound);
+            // Clear on recovery: a bind that succeeded on a later commit seam
+            // must not keep reporting the earlier failure as though it were
+            // still live.
+            *error = None;
+            *retry = None;
+        }
+        Err(err) => {
+            let message = sanitize_and_cap_status_value(&err.to_string());
+            // Retried every reconcile tick, so log only when the failure
+            // changes: the log file is opened with truncate(true) and has no
+            // rotation, an unchanged failure must not grow it unboundedly.
+            if error.as_deref() != Some(message.as_str()) || *retry != Some(bind_addr) {
+                log::error!(
+                    "gossip transport bind failed; retrying on every reconcile tick: {err}"
+                );
+            }
+            *error = Some(message);
+            *retry = Some(bind_addr);
+        }
+    }
+}
+
+/// Derive the gossip transport bind address from the local host CIDR of the
+/// verified assignment bundle (`assigned_cidr`, e.g. `100.64.0.1/32`).
+///
+/// Fail closed: anything that is not a single, unicast host address INSIDE the
+/// bundle's `mesh_cidr` is an error, never a fallback to `0.0.0.0`:
+/// a malformed or broad CIDR; the unspecified address (a wildcard bind), in
+/// any spelling, including the IPv4-mapped / IPv4-compatible IPv6 forms
+/// (`::ffff:0.0.0.0`) that a dual-stack socket treats as an IPv4 wildcard;
+/// loopback (not reachable by peers); multicast; IPv4 broadcast; and an
+/// address outside the mesh. The control-surface contract is that the gossip
+/// datagram parser is reachable through the WireGuard tunnel only, not on the
+/// underlay NIC. `allow_loopback` is false in production (the runtime field
+/// that feeds it is only ever set by tests).
+fn resolve_gossip_overlay_bind_addr(
+    assigned_cidr: &str,
+    mesh_cidr: &str,
+    port: u16,
+    allow_loopback: bool,
+) -> Result<SocketAddr, String> {
+    let Some(ip) = parse_host_cidr_addr(assigned_cidr) else {
+        return Err(
+            "assigned_cidr is not a host cidr; gossip needs the overlay address".to_owned(),
+        );
+    };
+    let mapped_v4 = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4(),
+        IpAddr::V4(_) => None,
+    };
+    let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
+    if ip.is_unspecified()
+        || ip.is_multicast()
+        || broadcast
+        || mapped_v4.is_some()
+        || (ip.is_loopback() && !allow_loopback)
+    {
+        return Err("assigned_cidr is not a usable unicast overlay address".to_owned());
+    }
+    if !cidr_contains(mesh_cidr, assigned_cidr) {
+        return Err("assigned_cidr is outside mesh_cidr".to_owned());
+    }
+    Ok(SocketAddr::new(ip, port))
+}
+
 /// D13: per-node overlay addresses from the verified assignment
 /// bundle, for the `peers.v1` identity map the service binaries
 /// resolve tunnel source addresses against. The bundle's peer
@@ -19085,15 +19426,17 @@ mod tests {
     };
 
     use super::{
+        ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL, ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE,
         ANCHOR_BUNDLE_PULL_TOKEN_LINE_BUDGET, ANCHOR_SERVE_COUNTERS, ANCHOR_TLS_HANDSHAKE_DEADLINE,
-        AnchorBundlePullStreamError, AnchorControlStream, AnchorListenerBinding, AutoTunnelBundle,
-        AutoTunnelWatermark, DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS,
-        DEFAULT_EGRESS_INTERFACE, DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR,
-        DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL, DaemonBackendMode, DaemonConfig, DaemonError,
-        DaemonRuntime, DnsZoneBootstrapError, DnsZoneLoadContext,
-        MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES, MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES,
-        MAX_AUTO_TUNNEL_BUNDLE_BYTES, MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT,
-        MAX_RELAY_FLEET_BUNDLE_BYTES, MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
+        AnchorBundlePullService, AnchorBundlePullStreamError, AnchorControlStream,
+        AnchorListenerBinding, AutoTunnelBundle, AutoTunnelWatermark,
+        DEFAULT_AUTO_TUNNEL_MAX_AGE_SECS, DEFAULT_DNS_ZONE_MAX_AGE_SECS, DEFAULT_EGRESS_INTERFACE,
+        DEFAULT_TRAVERSAL_MAX_AGE_SECS, DNS_RCODE_NOERROR, DNS_RCODE_REFUSED, DNS_RCODE_SERVFAIL,
+        DaemonBackendMode, DaemonConfig, DaemonError, DaemonRuntime, DnsZoneBootstrapError,
+        DnsZoneLoadContext, MAX_ANCHOR_BUNDLE_PULL_TOKEN_BYTES,
+        MAX_ANCHOR_ENROLLMENT_REQUEST_LINE_BYTES, MAX_AUTO_TUNNEL_BUNDLE_BYTES,
+        MAX_AUTO_TUNNEL_PEER_COUNT, MAX_AUTO_TUNNEL_ROUTE_COUNT, MAX_RELAY_FLEET_BUNDLE_BYTES,
+        MAX_TRAVERSAL_BUNDLE_BYTES, MAX_TRAVERSAL_CANDIDATE_COUNT,
         MAX_TRAVERSAL_PROBE_REPROBE_INTERVAL_SECS, MAX_TRUST_EVIDENCE_BYTES,
         MIN_TRAVERSAL_REFRESH_COOLDOWN_SECS, MembershipWatermark, NodeRole,
         SignedStateRefreshReason, StateFetcher, TRAVERSAL_LOCAL_HOST_CANDIDATE_RETRY_DELAY_MS,
@@ -19112,11 +19455,12 @@ mod tests {
         persist_traversal_watermark, persist_trust_watermark, poll_anchor_bundle_pull_once,
         poll_anchor_enrollment_once, port_mapping_bring_up_skip_reason,
         prepare_runtime_wireguard_key_material, read_line_bounded, require_local_signed_capability,
-        resolve_egress_interface_value, run_daemon, run_preflight_checks,
-        sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
-        select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
-        sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
-        unix_now, validate_anchor_bundle_pull_addr, validate_anchor_enrollment_addr,
+        resolve_egress_interface_value, resolve_gossip_overlay_bind_addr, run_daemon,
+        run_preflight_checks, sanitize_dataplane_routes_for_node_role,
+        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
+        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
+        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
+        validate_anchor_bundle_pull_addr, validate_anchor_enrollment_addr,
         validate_auto_tunnel_role_membership_alignment, validate_daemon_config,
         validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
@@ -20681,7 +21025,11 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("tmp dir");
         let token = dir.join("token");
         std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.join("snapshot.v1");
+        std::fs::write(&snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
         let config = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot,
             anchor_bundle_pull_token_path: Some(token),
             anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
             anchor_bundle_pull_allow_lan: false,
@@ -20694,6 +21042,288 @@ mod tests {
             poll_anchor_bundle_pull_once(&listener, &config).expect("poll must not error");
         assert!(!processed, "no pending connection ⇒ no I/O (WouldBlock)");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Control-surface contract: a provisioned token path alone must NOT open
+    /// a TCP port. Without the signed `anchor.bundle_pull` capability for THIS
+    /// node (non-anchor admin, unknown node, missing snapshot) there is no
+    /// listener at all.
+    #[test]
+    fn bind_anchor_bundle_pull_listener_is_none_without_signed_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token = dir.path().join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.path().join("snapshot.v1");
+        let base = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot.clone(),
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+
+        // Missing snapshot: fail closed, no listener, no error.
+        assert!(
+            bind_anchor_bundle_pull_listener(&base)
+                .expect("absent capability is not an error")
+                .is_none(),
+            "no snapshot ⇒ no listener"
+        );
+
+        // Snapshot present but this node holds no such capability.
+        std::fs::write(&snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
+        let other = DaemonConfig {
+            node_id: "not-an-anchor".to_owned(),
+            ..base.clone()
+        };
+        assert!(
+            bind_anchor_bundle_pull_listener(&other)
+                .expect("absent capability is not an error")
+                .is_none(),
+            "node without anchor.bundle_pull ⇒ no listener"
+        );
+
+        // The capability holder does bind.
+        assert!(
+            bind_anchor_bundle_pull_listener(&base)
+                .expect("holder binds")
+                .is_some(),
+            "capability holder ⇒ listener"
+        );
+    }
+
+    /// The listener follows the signed capability at runtime: absent ⇒ no
+    /// port; granted ⇒ port opens without a restart; revoked ⇒ port closes
+    /// (a connect is refused, not merely rejected at the application layer).
+    #[test]
+    fn anchor_bundle_pull_service_follows_the_signed_capability() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token = dir.path().join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.path().join("snapshot.v1");
+        let mut config = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot.clone(),
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+
+        // Starts closed (no snapshot yet).
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        assert!(service.binding.is_none());
+        assert!(!service.poll_once(&config).expect("poll"));
+
+        // Capability granted by a signed update: opens on the next recheck.
+        std::fs::write(&snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
+        service.next_check = Instant::now();
+        service.poll_once(&config).expect("poll");
+        let addr = service
+            .binding
+            .as_ref()
+            .expect("capability granted ⇒ listener opens")
+            .listener
+            .local_addr()
+            .expect("addr");
+        assert!(addr.ip().is_loopback());
+
+        // Capability lost (modelled as this node no longer being listed):
+        // still open inside the grace window (the per-request check answers
+        // `ERR forbidden after revocation`), closed once it has stayed lost
+        // for the whole grace, and the port then refuses connections.
+        config.node_id = "someone-else".to_owned();
+        service.close_grace = Duration::from_secs(3600);
+        service.next_check = Instant::now();
+        service.poll_once(&config).expect("poll");
+        assert!(
+            service.binding.is_some(),
+            "inside the grace window the listener stays open"
+        );
+        service.close_grace = Duration::ZERO;
+        service.next_check = Instant::now();
+        service.poll_once(&config).expect("poll");
+        assert!(
+            service.binding.is_none(),
+            "capability lost ⇒ listener closed"
+        );
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "a closed listener must refuse connections"
+        );
+    }
+
+    /// Snapshot bytes for the conditional-pull fixture with the anchor's
+    /// membership status overridden (e.g. `Revoked`), so revocation-by-status
+    /// can be driven without touching the capability list.
+    fn conditional_pull_snapshot_bytes_with_status(status: MembershipNodeStatus) -> Vec<u8> {
+        let mut state = conditional_pull_snapshot_state();
+        for node in &mut state.nodes {
+            node.status = status;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("snapshot.v1");
+        persist_membership_snapshot(&path, &state).expect("persist snapshot");
+        std::fs::read(&path).expect("read snapshot")
+    }
+
+    fn pull_service_fixture(
+        dir: &std::path::Path,
+        snapshot_bytes: &[u8],
+    ) -> (DaemonConfig, std::path::PathBuf) {
+        let token = dir.join("token");
+        std::fs::write(&token, "abcdefghijklmnopqrstuvwxyz012345\n").expect("write token");
+        let snapshot = dir.join("snapshot.v1");
+        std::fs::write(&snapshot, snapshot_bytes).expect("write snapshot");
+        let config = DaemonConfig {
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: snapshot.clone(),
+            anchor_bundle_pull_token_path: Some(token),
+            anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("addr")),
+            anchor_bundle_pull_allow_lan: false,
+            ..DaemonConfig::default()
+        };
+        (config, snapshot)
+    }
+
+    /// Revocation by STATUS (node row flips to Revoked, capability list
+    /// untouched) is "not held" too: after the grace the listener closes.
+    #[test]
+    fn anchor_bundle_pull_service_closes_when_the_node_is_revoked_by_status() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (config, snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        service.close_grace = Duration::ZERO;
+        assert!(service.binding.is_some(), "active holder listens");
+
+        std::fs::write(
+            &snapshot,
+            conditional_pull_snapshot_bytes_with_status(MembershipNodeStatus::Revoked),
+        )
+        .expect("write revoked snapshot");
+        service.refresh(&config, Instant::now());
+        assert!(
+            service.binding.is_none(),
+            "a Revoked node row must close the listener even though its capability list is intact"
+        );
+        // And a revoked node is never (re)opened.
+        service.refresh(&config, Instant::now());
+        assert!(service.binding.is_none());
+    }
+
+    /// A regrant inside the grace window resets the absence timer: a later
+    /// loss needs a FULL grace again, it must not inherit the earlier absence.
+    #[test]
+    fn anchor_bundle_pull_service_regrant_inside_grace_resets_the_timer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut config, _snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        service.close_grace = Duration::from_secs(15);
+        let t0 = Instant::now();
+
+        // Lost at t0: timer starts, listener stays.
+        config.node_id = "someone-else".to_owned();
+        service.refresh(&config, t0);
+        assert!(service.binding.is_some());
+        assert_eq!(service.absent_since, Some(t0));
+
+        // Regranted at t0+10s (inside the grace): timer cleared.
+        config.node_id = "anchor-a".to_owned();
+        service.refresh(&config, t0 + Duration::from_secs(10));
+        assert!(service.binding.is_some());
+        assert_eq!(service.absent_since, None, "regrant must reset the timer");
+
+        // Lost again at t0+20s: only 10s after the OLD loss, but the timer
+        // restarts, so t0+30s (10s later) must still be open ...
+        config.node_id = "someone-else".to_owned();
+        service.refresh(&config, t0 + Duration::from_secs(20));
+        service.refresh(&config, t0 + Duration::from_secs(30));
+        assert!(
+            service.binding.is_some(),
+            "a regrant must not let the earlier absence count toward the grace"
+        );
+        // ... and a full grace after the second loss closes it.
+        service.refresh(&config, t0 + Duration::from_secs(35));
+        assert!(service.binding.is_none());
+    }
+
+    /// A persistent bind failure logs once per distinct reason (then at most
+    /// once a minute), not once per recheck, and recovers when it clears.
+    #[test]
+    fn anchor_bundle_pull_service_bind_failure_logging_is_bounded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Occupy a port so the service's bind fails with "address in use".
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").expect("squatter");
+        let taken = squatter.local_addr().expect("addr");
+        let (mut config, _snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        config.anchor_bundle_pull_addr = Some(taken);
+        let mut service = AnchorBundlePullService::new(&config).unwrap_or_else(|_| {
+            // Startup bind is fatal by design; build the idle service by hand
+            // to drive the runtime path.
+            AnchorBundlePullService {
+                binding: None,
+                next_check: Instant::now(),
+                absent_since: None,
+                close_grace: ANCHOR_BUNDLE_PULL_REVOKED_CLOSE_GRACE,
+                last_bind_failure: None,
+                bind_failure_logs: 0,
+            }
+        });
+        let t0 = Instant::now();
+        for second in 0..30u64 {
+            service.refresh(&config, t0 + Duration::from_secs(second));
+        }
+        assert!(service.binding.is_none());
+        assert_eq!(
+            service.bind_failure_logs, 1,
+            "30 identical failures within a minute must log once"
+        );
+        // Past the repeat interval the same failure is logged once more.
+        service.refresh(
+            &config,
+            t0 + ANCHOR_BUNDLE_PULL_BIND_LOG_INTERVAL + Duration::from_secs(1),
+        );
+        assert_eq!(service.bind_failure_logs, 2);
+
+        // The failure clears: the listener opens and the failure memory resets.
+        drop(squatter);
+        service.refresh(&config, t0 + Duration::from_secs(200));
+        assert!(service.binding.is_some());
+        assert!(service.last_bind_failure.is_none());
+    }
+
+    /// A token path that cannot be read is a startup misconfiguration on
+    /// EVERY node given one, including a non-holder (the token check runs
+    /// before the capability gate).
+    #[test]
+    fn bind_anchor_bundle_pull_listener_rejects_an_unreadable_token_before_the_gate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (mut config, _snapshot) =
+            pull_service_fixture(dir.path(), &conditional_pull_snapshot_bytes());
+        config.node_id = "not-an-anchor".to_owned();
+        config.anchor_bundle_pull_token_path = Some(dir.path().join("missing-token"));
+        assert!(
+            bind_anchor_bundle_pull_listener(&config).is_err(),
+            "a provisioned but unreadable token must fail startup even without the capability"
+        );
+    }
+
+    /// A node with no token path (every non-admin node) never opens or even
+    /// evaluates the surface.
+    #[test]
+    fn anchor_bundle_pull_service_is_inert_without_a_token_path() {
+        let config = DaemonConfig {
+            anchor_bundle_pull_token_path: None,
+            ..DaemonConfig::default()
+        };
+        let mut service = AnchorBundlePullService::new(&config).expect("service");
+        service.next_check = Instant::now();
+        assert!(!service.poll_once(&config).expect("poll"));
+        assert!(service.binding.is_none());
     }
 
     /// State files the bundle-pull serve path reads must be regular files,
@@ -21112,8 +21742,11 @@ mod tests {
         let tls_dir = tempfile::tempdir().expect("tempdir");
         let tls_token_path = tls_dir.path().join("token");
         std::fs::write(&tls_token_path, "abcdefghijklmnopqrstuvwxyz012345").expect("write token");
+        let tls_snapshot = tls_dir.path().join("membership.snapshot");
+        std::fs::write(&tls_snapshot, conditional_pull_snapshot_bytes()).expect("write snapshot");
         let tls_config = DaemonConfig {
-            membership_snapshot_path: tls_dir.path().join("membership.snapshot"),
+            node_id: "anchor-a".to_owned(),
+            membership_snapshot_path: tls_snapshot,
             anchor_bundle_pull_token_path: Some(tls_token_path),
             anchor_bundle_pull_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
             anchor_bundle_pull_allow_lan: true,
@@ -21280,6 +21913,12 @@ mod tests {
                         .iter()
                         .any(|prefix| message.starts_with(prefix))
                         || message.starts_with("anchor_bundle_pull: listening")
+                        // CS1/CS2 pull-service STATE lines (logged on a state change, never
+                        // per flow, and they name no peer or client): the capability gate,
+                        // a deferred bind, and the post-revocation close.
+                        || message.starts_with("anchor_bundle_pull: not listening")
+                        || message.starts_with("anchor_bundle_pull: bind deferred")
+                        || message.starts_with("anchor_bundle_pull: listener closed")
                         || message.starts_with("anchor_enrollment: listening"),
                     "unexpected anchor log line (per-flow success logging must stay gone, E8): {message}"
                 );
@@ -25987,6 +26626,36 @@ mod tests {
         let err = validate_daemon_config(&config)
             .expect_err("fail-closed ssh allow must require management cidrs");
         assert!(err.to_string().contains("at least one management cidr"));
+    }
+
+    #[test]
+    fn validate_daemon_config_rejects_wg_listen_port_colliding_with_gossip_port() {
+        // CS3 fix: the gossip transport owns UDP 51821 (bound to the tunnel
+        // overlay address); a daemon told to serve wireguard on the same
+        // port must be rejected at config validation, not fail at bind time.
+        let config = DaemonConfig {
+            wg_listen_port: crate::gossip_transport::RUSTYNET_GOSSIP_PORT,
+            ..DaemonConfig::default()
+        };
+        let err = validate_daemon_config(&config)
+            .expect_err("wg listen port == gossip port must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gossip"),
+            "rejection must name the gossip collision: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_daemon_config_accepts_default_wg_listen_port() {
+        // Boundary witness: the default wireguard port (51820) is one below
+        // the gossip port and must keep validating.
+        let config = DaemonConfig {
+            wg_listen_port: crate::gossip_transport::RUSTYNET_GOSSIP_PORT - 1,
+            ..DaemonConfig::default()
+        };
+        validate_daemon_config(&config)
+            .expect("a wireguard port distinct from the gossip port is valid");
     }
 
     #[test]
@@ -32748,7 +33417,7 @@ mod tests {
         );
         // Loopback + OS-assigned port so parallel test runs never contend
         // for the fixed production gossip port.
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
 
         // Neither key nor membership: inert.
         runtime.sync_gossip_data_plane(None);
@@ -32809,6 +33478,300 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    // ── Control-surface contract: the gossip datagram parser is reachable
+    //    through the overlay address ONLY, never on a wildcard/underlay bind. ──
+
+    #[test]
+    fn gossip_overlay_bind_addr_is_the_assigned_host_address_never_a_wildcard() {
+        let resolve = |assigned: &str, mesh: &str| {
+            resolve_gossip_overlay_bind_addr(assigned, mesh, 51821, false)
+        };
+        let ok = resolve("100.64.0.1/32", "100.64.0.0/10").expect("host cidr");
+        assert_eq!(ok, "100.64.0.1:51821".parse::<SocketAddr>().expect("addr"));
+        let v6 = resolve("fd00::1/128", "fd00::/8").expect("v6 host cidr");
+        assert_eq!(v6.ip(), "fd00::1".parse::<IpAddr>().expect("ip"));
+        // Every wildcard spelling, plus everything that is not a usable
+        // unicast overlay address, must fail closed. The mesh is chosen so a
+        // mesh-containment check alone could not be what rejects them where
+        // the mesh is the whole address family.
+        for (bad, mesh) in [
+            ("0.0.0.0/32", "0.0.0.0/0"),
+            ("0.0.0.0/32", "100.64.0.0/10"),
+            ("::/128", "::/0"),
+            ("::ffff:0.0.0.0/128", "::/0"),
+            ("::ffff:0:0/128", "::/0"),
+            ("::0.0.0.0/128", "::/0"),
+            ("::ffff:100.64.0.1/128", "::/0"),
+            ("127.0.0.1/32", "127.0.0.0/8"),
+            ("::1/128", "::/0"),
+            ("::ffff:127.0.0.1/128", "::/0"),
+            ("255.255.255.255/32", "0.0.0.0/0"),
+            ("224.0.0.1/32", "0.0.0.0/0"),
+            ("ff02::1/128", "::/0"),
+            ("100.64.0.0/10", "100.64.0.0/10"),
+            ("100.64.0.1", "100.64.0.0/10"),
+            ("", "100.64.0.0/10"),
+            ("garbage/32", "100.64.0.0/10"),
+            // Outside the mesh (or mesh unusable): refused.
+            ("203.0.113.9/32", "100.64.0.0/10"),
+            ("100.64.0.1/32", "garbage"),
+            ("100.64.0.1/32", ""),
+            ("fd00::1/128", "100.64.0.0/10"),
+        ] {
+            assert!(
+                resolve(bad, mesh).is_err(),
+                "{bad:?} in {mesh:?} must fail closed, never fall back to a wildcard bind"
+            );
+        }
+        // Loopback is only ever accepted through the test-only switch, and
+        // even then it must be inside the mesh.
+        assert!(resolve_gossip_overlay_bind_addr("127.0.0.1/32", "127.0.0.0/8", 0, true).is_ok());
+        assert!(
+            resolve_gossip_overlay_bind_addr("127.0.0.1/32", "100.64.0.0/10", 0, true).is_err()
+        );
+        // The switch never admits a wildcard.
+        assert!(resolve_gossip_overlay_bind_addr("0.0.0.0/32", "0.0.0.0/0", 0, true).is_err());
+        assert!(resolve_gossip_overlay_bind_addr("::ffff:0.0.0.0/128", "::/0", 0, true).is_err());
+    }
+
+    fn gossip_bundle_assigning_in(assigned_cidr: &str, mesh_cidr: &str) -> AutoTunnelBundle {
+        AutoTunnelBundle {
+            node_id: "node-a".to_owned(),
+            node_capabilities: vec![RoleCapability::Client],
+            mesh_cidr: mesh_cidr.to_owned(),
+            assigned_cidr: assigned_cidr.to_owned(),
+            peers: Vec::new(),
+            routes: Vec::new(),
+            signed_exit_node_id: None,
+            signed_exit_node_capabilities: Vec::new(),
+            selected_exit_node: None,
+        }
+    }
+
+    /// A loopback "mesh" so the bundle-derived bind can be exercised on any
+    /// host (127.0.0.0/8 is local; `gossip_allow_loopback_overlay` is the
+    /// test-only switch, off in production).
+    fn gossip_loopback_bundle(assigned_cidr: &str) -> AutoTunnelBundle {
+        gossip_bundle_assigning_in(assigned_cidr, "127.0.0.0/8")
+    }
+
+    fn gossip_runtime_ready_for_bind(name: &str) -> (DaemonRuntime, std::path::PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.65:40065".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay(name, relay_addr, "relay-eu-1");
+        // Production derivation (no explicit override) on an OS-assigned port
+        // so parallel runs never contend for the fixed gossip port.
+        assert!(
+            runtime.gossip_bind_addr.is_none(),
+            "production default must derive the bind from the overlay address"
+        );
+        assert!(
+            !runtime.gossip_allow_loopback_overlay,
+            "production default must refuse a loopback overlay address"
+        );
+        runtime.gossip_bind_port = 0;
+        runtime.gossip_allow_loopback_overlay = true;
+        runtime.gossip_node = Some(
+            crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
+                .expect("gossip node should build"),
+        );
+        runtime.membership_state = Some(make_membership_state_with_capabilities(
+            "node-a",
+            vec![RoleCapability::Client],
+        ));
+        (runtime, test_dir)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gossip_transport_stays_unbound_without_a_verified_overlay_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-no-overlay");
+
+        // No verified bundle at this seam: nothing to bind, fail closed.
+        runtime.sync_gossip_data_plane(None);
+        assert!(runtime.gossip_transport.is_none());
+        assert_eq!(
+            runtime.gossip_transport_error.as_deref(),
+            Some("awaiting_verified_assignment_bundle_for_overlay_address")
+        );
+
+        // A bundle whose assigned address would be a wildcard (any spelling)
+        // / is not a host address / lies outside the mesh must be refused,
+        // not turned into 0.0.0.0.
+        for (bad, mesh) in [
+            ("0.0.0.0/32", "0.0.0.0/0"),
+            ("::ffff:0.0.0.0/128", "::/0"),
+            ("::/128", "::/0"),
+            ("255.255.255.255/32", "0.0.0.0/0"),
+            ("100.64.0.0/10", "100.64.0.0/10"),
+            ("203.0.113.9/32", "100.64.0.0/10"),
+        ] {
+            runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(bad, mesh)));
+            assert!(
+                runtime.gossip_transport.is_none(),
+                "{bad} in {mesh}: transport must not bind"
+            );
+            assert!(
+                runtime
+                    .gossip_transport_error
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("assigned_cidr")),
+                "{bad} in {mesh}: reason must name assigned_cidr"
+            );
+            assert!(runtime.gossip_bind_retry.is_none());
+        }
+
+        // A non-local overlay address must fail the bind rather than widen it:
+        // TEST-NET-3 is not configured on this host.
+        runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(
+            "203.0.113.9/32",
+            "203.0.113.0/24",
+        )));
+        assert!(
+            runtime.gossip_transport.is_none(),
+            "an overlay address that is not local must leave the transport unbound"
+        );
+        assert!(runtime.gossip_transport_error.is_some());
+        assert_eq!(
+            runtime.gossip_bind_retry,
+            Some("203.0.113.9:0".parse().expect("addr")),
+            "the failed overlay address is remembered for the reconcile retry"
+        );
+
+        // Reconcile-cadence retry: still failing keeps retrying the SAME
+        // overlay address (never widens); once the address is bindable (the
+        // tunnel came up) the transport attaches and the error clears.
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_none());
+        runtime.gossip_bind_retry = Some("127.0.0.1:0".parse().expect("addr"));
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_some());
+        assert!(runtime.gossip_transport_error.is_none());
+        assert!(runtime.gossip_bind_retry.is_none());
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gossip_transport_binds_only_the_assigned_overlay_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-overlay-bind");
+
+        // 127.0.0.1 stands in for the tunnel address (always local in tests).
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        let bound = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("verified overlay address must attach the transport")
+            .local_addr()
+            .expect("local addr");
+        assert_eq!(bound.ip(), "127.0.0.1".parse::<IpAddr>().expect("ip"));
+        assert!(!bound.ip().is_unspecified(), "never a wildcard bind");
+        assert!(runtime.gossip_transport_error.is_none());
+
+        // A seam with no bundle (membership apply) must neither unbind nor
+        // rebind.
+        runtime.sync_gossip_data_plane(None);
+        assert_eq!(
+            runtime
+                .gossip_transport
+                .as_ref()
+                .expect("still attached")
+                .local_addr()
+                .expect("local addr"),
+            bound
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A later verified bundle whose assigned address is unusable must not
+    /// leave the old socket listening (fail closed), and it must not leave a
+    /// stale retry address behind.
+    #[cfg(unix)]
+    #[test]
+    fn gossip_transport_unbinds_when_a_later_bundle_has_an_unusable_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-overlay-unbind");
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        assert!(runtime.gossip_transport.is_some());
+
+        runtime
+            .sync_gossip_data_plane(Some(&gossip_bundle_assigning_in("0.0.0.0/32", "0.0.0.0/0")));
+        assert!(
+            runtime.gossip_transport.is_none(),
+            "an unusable verified address must unbind the old socket"
+        );
+        assert!(
+            runtime.gossip_bind_retry.is_none(),
+            "no stale retry address"
+        );
+        assert!(runtime.gossip_transport_error.is_some());
+
+        // Reconcile retries nothing (there is no address to retry) ...
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_none());
+        // ... and a later good bundle re-attaches.
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        assert!(runtime.gossip_transport.is_some());
+        assert!(runtime.gossip_transport_error.is_none());
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// After an address change the retry target is the NEW address, never the
+    /// one that was failing before.
+    #[cfg(unix)]
+    #[test]
+    fn gossip_retry_address_follows_an_address_change() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-retry-follow");
+        runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(
+            "203.0.113.9/32",
+            "203.0.113.0/24",
+        )));
+        assert_eq!(
+            runtime.gossip_bind_retry,
+            Some("203.0.113.9:0".parse().expect("addr"))
+        );
+        runtime.sync_gossip_data_plane(Some(&gossip_bundle_assigning_in(
+            "203.0.113.10/32",
+            "203.0.113.0/24",
+        )));
+        assert_eq!(
+            runtime.gossip_bind_retry,
+            Some("203.0.113.10:0".parse().expect("addr")),
+            "a stale retry address must not survive an address change"
+        );
+        // A bound transport clears the retry target on the next tick.
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        runtime.retry_gossip_bind();
+        assert!(runtime.gossip_transport.is_some());
+        assert!(runtime.gossip_bind_retry.is_none());
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// 127.0.0.0/8 is wholly local on Linux only; macOS configures just
+    /// 127.0.0.1, so the re-assignment witness runs on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_transport_follows_a_reassigned_overlay_address() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-gossip-overlay-rebind");
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.1/32")));
+        runtime.sync_gossip_data_plane(Some(&gossip_loopback_bundle("127.0.0.2/32")));
+        let bound = runtime
+            .gossip_transport
+            .as_ref()
+            .expect("transport must follow the new overlay address")
+            .local_addr()
+            .expect("local addr");
+        assert_eq!(bound.ip(), "127.0.0.2".parse::<IpAddr>().expect("ip"));
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     /// Extract only the `gossip_*` tokens from a status line. The rest of
     /// the line legitimately carries node ids, endpoints and candidate
     /// addresses, so any assertion about what gossip fields may contain
@@ -32839,7 +33802,7 @@ mod tests {
         let relay_addr: SocketAddr = "203.0.113.63:40063".parse().expect("relay addr");
         let (mut runtime, test_dir) =
             build_runtime_with_custom_relay(label, relay_addr, "relay-eu-1");
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
         (runtime, test_dir)
     }
 
@@ -32880,7 +33843,7 @@ mod tests {
                 .expect("gossip node should build"),
         );
         // Unbindable: a routable-but-not-local address cannot be bound.
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.membership_state = Some(make_membership_state_with_capabilities(
             "node-a",
             vec![RoleCapability::Client],
@@ -32926,13 +33889,13 @@ mod tests {
             vec![RoleCapability::Client],
         ));
 
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         let failed = runtime.gossip_status_suffix();
         assert_ne!(gossip_field(&failed, "gossip_transport_error"), "none");
 
         // Recover: a bindable address on the next seam.
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
         runtime.sync_gossip_data_plane(None);
         let recovered = runtime.gossip_status_suffix();
         assert_eq!(gossip_field(&recovered, "gossip_state"), "active");
@@ -33096,7 +34059,7 @@ mod tests {
 
         // Force a real bind failure so the one free-form field is
         // populated rather than sitting at `none`.
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         let suffix = runtime.gossip_status_suffix();
         assert_ne!(
@@ -33378,7 +34341,7 @@ mod tests {
             "node-a",
             vec![RoleCapability::Client],
         ));
-        runtime.gossip_bind_addr = "203.0.113.9:40099".parse().expect("unbindable addr");
+        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         assert_ne!(
             gossip_field(&runtime.gossip_status_suffix(), "gossip_transport_error"),
@@ -33639,7 +34602,7 @@ mod tests {
             relay_addr,
             "relay-eu-1",
         );
-        runtime.gossip_bind_addr = "127.0.0.1:0".parse().expect("test bind addr");
+        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
         runtime.gossip_node = Some(
             crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
                 .expect("gossip node should build"),

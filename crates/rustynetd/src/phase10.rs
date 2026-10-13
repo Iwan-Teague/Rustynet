@@ -1407,6 +1407,14 @@ fn join_connected_prefixes(connected: &[(std::net::Ipv4Addr, u8)]) -> String {
         .join(", ")
 }
 
+/// CS3: what `apply_gossip_port_scope` must do given the live chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GossipScopePlan {
+    Noop,
+    Install,
+    Reinstall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LinuxCommandSystem {
     interface_name: String,
@@ -1421,6 +1429,17 @@ pub struct LinuxCommandSystem {
     prior_ipv4_forwarding: Option<bool>,
     prior_ipv6_disabled: Option<bool>,
     allow_tunnel_relay_forward: bool,
+    /// CS3: true once `rustynet_svc_gossip` (the gossip-port tunnel scope) has
+    /// been installed and verified by this process. Gates its runtime
+    /// self-assertion and its clean-shutdown teardown, so a system that never
+    /// applied it (tests, other roles) issues no extra nft commands.
+    gossip_scope_applied: bool,
+    /// CS3 fix: whether the gossip transport is configured for this daemon (a
+    /// gossip signing secret is present). Only then does
+    /// `apply_firewall_killswitch` install the `rustynet_svc_gossip` scope;
+    /// otherwise it deletes any stale table left by an earlier
+    /// gossip-enabled run on the same node.
+    gossip_configured: bool,
     /// QH-60 apply-scoped context; set by the controller before the stages.
     full_tunnel_engaged: bool,
     traversal_bootstrap_allow_endpoints: Vec<SocketAddr>,
@@ -1518,6 +1537,8 @@ impl LinuxCommandSystem {
             prior_ipv4_forwarding: None,
             prior_ipv6_disabled: None,
             allow_tunnel_relay_forward: false,
+            gossip_scope_applied: false,
+            gossip_configured: false,
             full_tunnel_engaged: false,
             traversal_bootstrap_allow_endpoints: Vec::new(),
             wg_listen_port: 0,
@@ -1557,6 +1578,15 @@ impl LinuxCommandSystem {
 
     pub fn with_wg_listen_port(mut self, port: u16) -> Self {
         self.wg_listen_port = port;
+        self
+    }
+
+    /// CS3 fix: declare whether the gossip transport is configured for this
+    /// daemon. The `rustynet_svc_gossip` nft scope is installed only when this
+    /// is true; when false, `apply_firewall_killswitch` instead deletes any
+    /// stale scope table.
+    pub fn with_gossip_configured(mut self, configured: bool) -> Self {
+        self.gossip_configured = configured;
         self
     }
 
@@ -3283,6 +3313,7 @@ impl LinuxCommandSystem {
                 "forward established/related allow rule missing",
             )?;
         }
+        self.assert_gossip_port_scope()?;
         if let Some(blind_exit_config) = self.blind_exit_config.as_ref() {
             // Blind-exit posture: the reviewed rule set installs ONLY the
             // mesh-source-scoped final-hop forward allow and FORBIDS the
@@ -3926,6 +3957,155 @@ impl LinuxCommandSystem {
             .collect())
     }
 
+    /// True when a rendered base-chain header line pins the reviewed hook
+    /// (`type filter hook input`), accept policy and hook priority. Real nft
+    /// (1.0.9) lists the chain as
+    /// `type filter hook input priority filter - 10; policy accept;`. The
+    /// priority is compared textually: the text after `priority` up to the
+    /// first `;`, whitespace-stripped, must end in `-10`. That accepts
+    /// `filter - 10` and rejects drift to `0`, `10`, `-100` or a missing
+    /// priority (a bare `type filter hook input` line with no `priority`
+    /// token fails this check, and so does re-parenting the chain at a
+    /// different priority).
+    fn gossip_scope_header_priority_ok(line: &str) -> bool {
+        let Some(index) = line.find("priority") else {
+            return false;
+        };
+        let rest = &line[index + "priority".len()..];
+        let rest = rest.split(';').next().unwrap_or("");
+        rest.replace(' ', "").ends_with("-10")
+    }
+
+    /// CS3: classify the live `rustynet_svc_gossip` input chain against the
+    /// two reviewed rules. Pure (takes the `nft list chain` lines).
+    ///
+    /// Both sides are canonicalized with
+    /// [`Self::fold_implied_l4proto_dependency`] before the exact
+    /// comparison: nft 1.0.9 FOLDS `meta l4proto udp` out of its `list`
+    /// rendering when the rule later carries `udp dport`, while older
+    /// nft (1.0.2) leaves the unfolded `meta l4proto udp udp dport 51821`
+    /// form in the listing. Folding both sides accepts either rendering of
+    /// the same reviewed rule (and every other token difference still
+    /// fails), so a node running an older nft is not reinstall-looped.
+    ///
+    /// * `Noop` - the chain is accept-policy, hooked on `input` at the
+    ///   reviewed priority, and holds EXACTLY the loopback accept followed
+    ///   by the tunnel-scope drop, in that order, and nothing else.
+    /// * `Install` - the chain does not exist yet.
+    /// * `Reinstall` - it exists but differs (extra/missing/reordered rule,
+    ///   stale tunnel interface after a restart with a different one, wrong
+    ///   policy/hook/priority). The table is deleted and rebuilt from the
+    ///   reviewed argvs rather than patched in place: the helper deliberately
+    ///   offers no `flush chain` here.
+    fn plan_gossip_scope(
+        lines: &[String],
+        accept_tokens: &[String],
+        drop_tokens: &[String],
+    ) -> GossipScopePlan {
+        if lines.is_empty() {
+            return GossipScopePlan::Install;
+        }
+        let header_ok = lines.iter().any(|line| {
+            line.starts_with("type filter hook input")
+                && line.contains("policy accept")
+                && Self::gossip_scope_header_priority_ok(line)
+        });
+        let rules: Vec<Vec<String>> = lines
+            .iter()
+            .filter(|line| {
+                !(line.is_empty()
+                    || line.starts_with("table ")
+                    || line.starts_with("chain ")
+                    || line.starts_with("type ")
+                    || line.as_str() == "}"
+                    || line.as_str() == "{")
+            })
+            .map(|line| Self::fold_implied_l4proto_dependency(&Self::rendered_rule_tokens(line)))
+            .collect();
+        let accept_tokens = &Self::fold_implied_l4proto_dependency(accept_tokens);
+        let drop_tokens = &Self::fold_implied_l4proto_dependency(drop_tokens);
+        if header_ok
+            && rules.len() == 2
+            && rules.first().map(Vec::as_slice) == Some(accept_tokens.as_slice())
+            && rules.get(1).map(Vec::as_slice) == Some(drop_tokens.as_slice())
+        {
+            GossipScopePlan::Noop
+        } else {
+            GossipScopePlan::Reinstall
+        }
+    }
+
+    /// CS3: pin the gossip UDP port to the tunnel interface at the kernel
+    /// (see `linux_runtime_nftables::GOSSIP_SCOPE_TABLE`). Binding the socket
+    /// to the overlay address narrows who can reach it but Linux still
+    /// accepts a packet for a local address on ANY interface; this drops
+    /// gossip-port datagrams that did not arrive on the tunnel. Accept-policy
+    /// chain with one drop (plus a loopback accept for local senders): it
+    /// admits nothing the rest of the ruleset did not already admit.
+    ///
+    /// Fail closed: a failed install is a firewall apply failure, and a
+    /// missing/drifted rule is a killswitch-assertion failure
+    /// (`assert_gossip_port_scope`), both of which roll the generation back
+    /// and fail-close the node exactly like a missing killswitch rule. Idempotent
+    /// and rerun on every apply: a correct existing chain is left untouched
+    /// (no window, no growth).
+    fn apply_gossip_port_scope(&mut self) -> Result<(), SystemError> {
+        use crate::linux_runtime_nftables as scope;
+        let port = crate::gossip_transport::RUSTYNET_GOSSIP_PORT;
+        let accept_tokens = scope::gossip_scope_loopback_accept_tokens(port);
+        let drop_tokens =
+            scope::gossip_scope_tunnel_drop_tokens(port, self.interface_name.as_str())
+                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+        let lines =
+            self.chain_lines("inet", scope::GOSSIP_SCOPE_TABLE, scope::GOSSIP_SCOPE_CHAIN)?;
+        let plan = Self::plan_gossip_scope(&lines, &accept_tokens, &drop_tokens);
+        if plan != GossipScopePlan::Noop {
+            if plan == GossipScopePlan::Reinstall {
+                self.run_allow_failure(
+                    PrivilegedCommandProgram::Nft,
+                    &["delete", "table", "inet", scope::GOSSIP_SCOPE_TABLE],
+                );
+            }
+            let argvs = scope::gossip_scope_install_argvs(port, self.interface_name.as_str())
+                .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            for argv in argvs {
+                let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+                self.run(PrivilegedCommandProgram::Nft, &refs)
+                    .map_err(|err| SystemError::FirewallApplyFailed(err.to_string()))?;
+            }
+        }
+        // Read-back verification is NOT done here: like every other rule the
+        // killswitch stage installs, the rules are verified by the runtime
+        // self-assertion (`assert_firewall_ruleset` -> `assert_gossip_port_scope`),
+        // which runs after the stage and fails the generation closed.
+        self.gossip_scope_applied = true;
+        Ok(())
+    }
+
+    /// CS3 runtime self-assertion (drift): the gossip scope rules must still
+    /// be exactly the reviewed pair. A no-op until this process applied them.
+    fn assert_gossip_port_scope(&self) -> Result<(), SystemError> {
+        use crate::linux_runtime_nftables as scope;
+        if !self.gossip_scope_applied {
+            return Ok(());
+        }
+        let port = crate::gossip_transport::RUSTYNET_GOSSIP_PORT;
+        let accept_tokens = scope::gossip_scope_loopback_accept_tokens(port);
+        let drop_tokens =
+            scope::gossip_scope_tunnel_drop_tokens(port, self.interface_name.as_str())
+                .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))?;
+        let lines = self
+            .chain_lines("inet", scope::GOSSIP_SCOPE_TABLE, scope::GOSSIP_SCOPE_CHAIN)
+            .map_err(|err| SystemError::KillSwitchAssertionFailed(err.to_string()))?;
+        if Self::plan_gossip_scope(&lines, &accept_tokens, &drop_tokens) != GossipScopePlan::Noop {
+            return Err(SystemError::KillSwitchAssertionFailed(format!(
+                "gossip port tunnel scope missing or drifted: chain_lines={}",
+                lines.join(" | ")
+            )));
+        }
+        Ok(())
+    }
+
     /// Append a rule to an nft chain ONLY when that EXACT rule (builder
     /// tokens with the observability tokens spliced exactly where
     /// `nft_add_rule_argv` puts them) is not already installed.
@@ -4207,6 +4387,23 @@ impl DataplaneSystem for LinuxCommandSystem {
                 &["counter"],
             )?;
         }
+        // CS3 fix: install the gossip-port tunnel scope ONLY when the gossip
+        // transport is actually configured for this daemon (a gossip signing
+        // secret is present). A non-gossip node (relay/exit-only, older
+        // configs) must not grow a nft table that pins its tunnel interface
+        // name — reinstalling with gossip disabled used to leave the scope
+        // behind and drop nothing, but it also advertised a stale pin after
+        // an interface rename. When gossip is NOT configured, delete any
+        // stale table left by a previously gossip-enabled run on the same
+        // node; allow-failure so a first-ever apply on a clean node is not
+        // poisoned by ENOENT.
+        if self.gossip_configured {
+            self.apply_gossip_port_scope()?;
+        } else {
+            let teardown = crate::linux_runtime_nftables::gossip_scope_teardown_argv();
+            let argv: Vec<&str> = teardown.iter().map(String::as_str).collect();
+            self.run_allow_failure(PrivilegedCommandProgram::Nft, &argv);
+        }
         if let Some(previous) = previous_table
             && previous != table
         {
@@ -4256,6 +4453,19 @@ impl DataplaneSystem for LinuxCommandSystem {
                 PrivilegedCommandProgram::Nft,
                 &["delete", "table", "inet", table.as_str()],
             );
+        }
+        if self.gossip_scope_applied {
+            // CS3: the scope table is part of this system's firewall state;
+            // a clean teardown must leave no `rustynet_svc_gossip` behind
+            // (the node-clean probe lists every rustynet* table).
+            self.run_allow_failure(
+                PrivilegedCommandProgram::Nft,
+                &crate::linux_runtime_nftables::gossip_scope_teardown_argv()
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            );
+            self.gossip_scope_applied = false;
         }
         Ok(())
     }
@@ -19853,7 +20063,11 @@ Persistent Routes:
         // apply_dns_protection refuses to take loopback DNS ownership without a
         // configured resolver port (fail-closed); the capture helper only records
         // argv, so any non-zero port exercises the emitted rule tokens.
-        .with_dns_resolver_port(53535);
+        .with_dns_resolver_port(53535)
+        // CS3 fix: mirror the production (gossip-configured) shape so
+        // this generator↔matcher agreement check also covers the gossip
+        // scope argvs.
+        .with_gossip_configured(true);
         DataplaneSystem::set_relay_forwarding(&mut system, true);
         // RN-12/IPV-01: mirror the runtime ordering — the DNS posture is
         // threaded to the egress shaper BEFORE the NAT stage, so the scoped
@@ -20150,10 +20364,21 @@ Persistent Routes:
                                             args[2], args[3]
                                         ));
                                         stdout.push_str(&format!("\tchain {} {{\n", args[4]));
-                                        stdout.push_str(&format!(
-                                            "\t\ttype filter hook {} priority 0; policy drop;\n",
-                                            args[4]
-                                        ));
+                                        // The CS3 gossip scope chain is an ACCEPT-policy
+                                        // input chain at priority -10, which real nft
+                                        // 1.0.9 renders as `priority filter - 10`
+                                        // (live-probed on lenovo, netns witness); every
+                                        // other chain here is a policy-drop base chain.
+                                        if args[4] == "input" {
+                                            stdout.push_str(
+                                                "\t\ttype filter hook input priority filter - 10; policy accept;\n",
+                                            );
+                                        } else {
+                                            stdout.push_str(&format!(
+                                                "\t\ttype filter hook {} priority 0; policy drop;\n",
+                                                args[4]
+                                            ));
+                                        }
                                         for (position, rule) in chain_rules.iter().enumerate() {
                                             stdout.push_str("\t\t");
                                             stdout.push_str(&stateful_fake_render_rule(
@@ -20403,6 +20628,369 @@ Persistent Routes:
                         .any(|window| window == ["oifname", "rustynet0"])),
             "hairpin forward-accept rule must be present: {forward_after:?}"
         );
+    }
+
+    // ── CS3: gossip-port tunnel scope (`rustynet_svc_gossip`) ─────────────
+
+    fn gossip_scope_tokens_for_tests() -> (Vec<String>, Vec<String>) {
+        use crate::linux_runtime_nftables as scope;
+        (
+            scope::gossip_scope_loopback_accept_tokens(51821),
+            scope::gossip_scope_tunnel_drop_tokens(51821, "rustynet0").expect("drop tokens"),
+        )
+    }
+
+    fn gossip_scope_listing(rules: &[&str]) -> Vec<String> {
+        // What `nft list chain inet rustynet_svc_gossip input` prints (real
+        // nft 1.0.9, live-probed): header with `priority filter - 10`,
+        // interface names quoted.
+        let mut lines = vec![
+            "table inet rustynet_svc_gossip {".to_owned(),
+            "chain input {".to_owned(),
+            "type filter hook input priority filter - 10; policy accept;".to_owned(),
+        ];
+        lines.extend(rules.iter().map(|rule| (*rule).to_owned()));
+        lines.push("}".to_owned());
+        lines.push("}".to_owned());
+        lines
+    }
+
+    #[test]
+    fn gossip_scope_plan_classifies_the_live_chain() {
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let exact = [
+            "udp dport 51821 iifname \"lo\" accept",
+            "udp dport 51821 iifname != \"rustynet0\" drop",
+        ];
+        let plan =
+            |lines: Vec<String>| LinuxCommandSystem::plan_gossip_scope(&lines, &accept, &drop);
+        // Missing chain => fresh install.
+        assert_eq!(plan(Vec::new()), GossipScopePlan::Install);
+        // Exactly the reviewed pair, in order => nothing to do.
+        assert_eq!(plan(gossip_scope_listing(&exact)), GossipScopePlan::Noop);
+        // Anything else => rebuild (never patch in place).
+        for (label, rules) in [
+            ("empty chain", vec![]),
+            ("only the drop", vec![exact[1]]),
+            ("reordered", vec![exact[1], exact[0]]),
+            (
+                "extra accept",
+                vec![exact[0], exact[1], "udp dport 51821 accept"],
+            ),
+            ("duplicate drop", vec![exact[0], exact[1], exact[1]]),
+            (
+                "stale tunnel interface",
+                vec![exact[0], "udp dport 51821 iifname != \"wg0\" drop"],
+            ),
+            (
+                "other port",
+                vec![exact[0], "udp dport 51822 iifname != \"rustynet0\" drop"],
+            ),
+            (
+                "tcp not udp",
+                vec![exact[0], "tcp dport 51821 iifname != \"rustynet0\" drop"],
+            ),
+        ] {
+            assert_eq!(
+                plan(gossip_scope_listing(&rules)),
+                GossipScopePlan::Reinstall,
+                "{label}"
+            );
+        }
+        // Wrong policy / hook on an otherwise-correct pair => rebuild.
+        for header in [
+            "type filter hook input priority filter - 10; policy drop;",
+            "type filter hook forward priority filter - 10; policy accept;",
+        ] {
+            let mut lines = gossip_scope_listing(&exact);
+            lines[2] = header.to_owned();
+            assert_eq!(plan(lines), GossipScopePlan::Reinstall, "{header}");
+        }
+    }
+
+    #[test]
+    fn gossip_scope_plan_accepts_the_unfolded_nft_1_0_2_rendering() {
+        // HAND-WRITTEN (not a live capture): what OLDER nft (1.0.2-class)
+        // lists back for the same two reviewed rules — the explicit
+        // `meta l4proto udp` dependency stays in the listing, whereas real
+        // nft 1.0.9 FOLDS it (see `fold_implied_l4proto_dependency`).
+        // plan_gossip_scope must fold BOTH sides, else an older-nft node is
+        // reinstall-looped on every apply.
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let listing = gossip_scope_listing(&[
+            "meta l4proto udp udp dport 51821 iifname \"lo\" accept",
+            "meta l4proto udp udp dport 51821 iifname != \"rustynet0\" drop",
+        ]);
+        assert_eq!(
+            LinuxCommandSystem::plan_gossip_scope(&listing, &accept, &drop),
+            GossipScopePlan::Noop,
+            "the unfolded 1.0.2 rendering of the reviewed pair is a no-op"
+        );
+    }
+
+    #[test]
+    fn gossip_scope_plan_rejects_drifted_unfolded_rules_and_header_priority() {
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let folded_pair = &[
+            "udp dport 51821 iifname \"lo\" accept",
+            "udp dport 51821 iifname != \"rustynet0\" drop",
+        ];
+        // A wrong port in the unfolded (1.0.2-form) drop is still drift.
+        let wrong_port = gossip_scope_listing(&[
+            "meta l4proto udp udp dport 51821 iifname \"lo\" accept",
+            "meta l4proto udp udp dport 51822 iifname != \"rustynet0\" drop",
+        ]);
+        assert_eq!(
+            LinuxCommandSystem::plan_gossip_scope(&wrong_port, &accept, &drop),
+            GossipScopePlan::Reinstall
+        );
+        // Header priority drift: real nft 1.0.9 prints `priority filter
+        // - 10`; any other priority (or a missing priority token) must be
+        // treated as drift so the chain is rebuilt at the reviewed one.
+        for header in [
+            "type filter hook input priority filter 0; policy accept;",
+            "type filter hook input priority filter 10; policy accept;",
+            "type filter hook input priority filter - 100; policy accept;",
+            "type filter hook input; policy accept;",
+        ] {
+            let mut lines = gossip_scope_listing(folded_pair);
+            lines[2] = header.to_owned();
+            assert_eq!(
+                LinuxCommandSystem::plan_gossip_scope(&lines, &accept, &drop),
+                GossipScopePlan::Reinstall,
+                "{header}"
+            );
+        }
+        // The reviewed header itself stays a no-op.
+        let mut lines = gossip_scope_listing(folded_pair);
+        lines[2] = "type filter hook input priority filter - 10; policy accept;".to_owned();
+        assert_eq!(
+            LinuxCommandSystem::plan_gossip_scope(&lines, &accept, &drop),
+            GossipScopePlan::Noop
+        );
+    }
+
+    /// A `LinuxCommandSystem` wired to the stateful nft fake.
+    #[cfg(target_os = "linux")]
+    struct GossipScopeFixture {
+        system: LinuxCommandSystem,
+        commands: Arc<Mutex<Vec<String>>>,
+        rules: StatefulNftShared,
+        stop: Arc<AtomicBool>,
+        helper_thread: std::thread::JoinHandle<()>,
+        socket_path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl GossipScopeFixture {
+        fn new(tag: &str) -> Self {
+            Self::new_with_gossip(tag, true)
+        }
+
+        /// `gossip_configured=false` exercises the CS3 fix: no scope install,
+        /// stale scope tables are deleted.
+        fn new_with_gossip(tag: &str, gossip_configured: bool) -> Self {
+            let socket_path = phase10_test_socket_path(tag);
+            let (commands, stop, helper_thread, rules) =
+                spawn_privileged_stateful_nft_helper(&socket_path);
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize")
+            .with_gossip_configured(gossip_configured);
+            system.dns_resolver_port = 53535;
+            Self {
+                system,
+                commands,
+                rules,
+                stop,
+                helper_thread,
+                socket_path,
+            }
+        }
+
+        fn finish(self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.helper_thread.join().expect("helper thread");
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_fresh_apply_installs_exactly_the_reviewed_pair_and_reapply_is_a_noop() {
+        let mut fx = GossipScopeFixture::new("cs3fresh");
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("fresh apply");
+        let key = "inet rustynet_svc_gossip input";
+        let installed = stateful_fake_chain_rules(&fx.rules, key);
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        assert_eq!(installed, vec![accept, drop], "exactly the reviewed pair");
+        assert!(fx.system.gossip_scope_applied);
+        let scope_writes = |fx: &GossipScopeFixture| {
+            fx.commands
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|c| {
+                    c.contains("rustynet_svc_gossip")
+                        && (c.contains(" add ") || c.contains(" delete "))
+                })
+                .count()
+        };
+        assert_eq!(scope_writes(&fx), 4, "table + chain + accept + drop");
+
+        // 50 further applies: the chain stays bounded and NO further
+        // gossip-scope write is issued (no delete/add window on a correct
+        // chain).
+        for _ in 0..50 {
+            DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("reapply");
+        }
+        assert_eq!(stateful_fake_chain_rules(&fx.rules, key).len(), 2);
+        assert_eq!(
+            scope_writes(&fx),
+            4,
+            "reapply must not touch a correct chain"
+        );
+        fx.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_drift_is_rebuilt_and_a_removed_drop_trips_the_assertion() {
+        let mut fx = GossipScopeFixture::new("cs3drift");
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("fresh apply");
+        let key = "inet rustynet_svc_gossip input".to_owned();
+        fx.system
+            .assert_gossip_port_scope()
+            .expect("pristine chain asserts");
+
+        // Tamper: an extra rule appears in the chain.
+        fx.rules
+            .lock()
+            .expect("rules")
+            .get_mut(&key)
+            .expect("chain")
+            .push(vec![
+                "udp".into(),
+                "dport".into(),
+                "51821".into(),
+                "accept".into(),
+            ]);
+        assert!(
+            fx.system.assert_gossip_port_scope().is_err(),
+            "an extra rule is drift"
+        );
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply repairs");
+        assert_eq!(stateful_fake_chain_rules(&fx.rules, &key).len(), 2);
+        assert!(
+            fx.commands
+                .lock()
+                .expect("log")
+                .iter()
+                .any(|c| c.contains("delete table inet rustynet_svc_gossip")),
+            "drift is repaired by rebuilding the table"
+        );
+        fx.system
+            .assert_gossip_port_scope()
+            .expect("repaired chain asserts");
+
+        // Tamper: the drop rule disappears => fail-closed assertion.
+        fx.rules
+            .lock()
+            .expect("rules")
+            .get_mut(&key)
+            .expect("chain")
+            .pop();
+        let err = fx
+            .system
+            .assert_gossip_port_scope()
+            .expect_err("a missing drop must fail the runtime assertion");
+        assert!(err.to_string().contains("gossip port tunnel scope"));
+
+        // A stale tunnel interface (restart with a different one) is rebuilt.
+        fx.system.interface_name = "wg1".to_owned();
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply with new iface");
+        let rebuilt = stateful_fake_chain_rules(&fx.rules, &key);
+        assert_eq!(rebuilt.len(), 2);
+        assert!(rebuilt[1].iter().any(|t| t == "wg1"), "{rebuilt:?}");
+        fx.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_is_removed_by_clean_rollback_and_untouched_when_never_applied() {
+        let mut fx = GossipScopeFixture::new("cs3rollback");
+        // Never applied: rollback issues no gossip-scope command.
+        DataplaneSystem::rollback_firewall(&mut fx.system).expect("rollback");
+        assert!(
+            !fx.commands
+                .lock()
+                .expect("log")
+                .iter()
+                .any(|c| c.contains("rustynet_svc_gossip")),
+            "a system that never applied the scope must not touch it"
+        );
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply");
+        assert!(!stateful_fake_chain_rules(&fx.rules, "inet rustynet_svc_gossip input").is_empty());
+        DataplaneSystem::rollback_firewall(&mut fx.system).expect("rollback");
+        assert!(
+            stateful_fake_chain_rules(&fx.rules, "inet rustynet_svc_gossip input").is_empty(),
+            "clean shutdown leaves no rustynet_svc_gossip residue"
+        );
+        assert!(!fx.system.gossip_scope_applied);
+        fx.finish();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gossip_scope_not_configured_installs_nothing_and_deletes_a_stale_table() {
+        // CS3 fix: a node without a gossip signing secret must not grow the
+        // `rustynet_svc_gossip` scope; a table left behind by a previously
+        // gossip-enabled run (or an old daemon version that installed it
+        // unconditionally) is deleted best-effort.
+        let mut fx = GossipScopeFixture::new_with_gossip("cs3nogossip", false);
+        // Seed the stale scope table directly in the fake's state (the same
+        // map the drift tests tamper with).
+        fx.rules.lock().expect("rules").insert(
+            "inet rustynet_svc_gossip input".to_owned(),
+            vec![vec![
+                "udp".into(),
+                "dport".into(),
+                "51821".into(),
+                "accept".into(),
+            ]],
+        );
+        DataplaneSystem::apply_firewall_killswitch(&mut fx.system).expect("apply");
+        let commands = fx.commands.lock().expect("log");
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("delete table inet rustynet_svc_gossip")),
+            "a stale scope table must be deleted when gossip is not configured: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.contains("rustynet_svc_gossip") && c.contains(" add ")),
+            "no gossip scope install argvs when gossip is not configured: {commands:?}"
+        );
+        drop(commands);
+        assert!(
+            stateful_fake_chain_rules(&fx.rules, "inet rustynet_svc_gossip input").is_empty(),
+            "the stale scope chain must be gone after the apply"
+        );
+        assert!(
+            !fx.system.gossip_scope_applied,
+            "the scope was not applied by this process"
+        );
+        fx.finish();
     }
 
     /// Guard for the witnesses above (reviewer witness W2 shape): on a FRESH
@@ -25656,6 +26244,11 @@ Persistent Routes:
         "nft add rule inet rustynet_g1 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
         "nft list chain inet rustynet_g1 forward",
         "nft add rule inet rustynet_g1 forward iifname rustynet0 oifname enp0s9 accept",
+        "nft list chain inet rustynet_svc_gossip input",
+        "nft add table inet rustynet_svc_gossip",
+        "nft add chain inet rustynet_svc_gossip input { type filter hook input priority -10 ; policy accept ; }",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname lo accept",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname != rustynet0 drop",
         "ip route get 203.0.113.10",
         "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
         "ip -4 -o addr show dev enp0s9",
@@ -25688,6 +26281,11 @@ Persistent Routes:
         "nft add rule inet rustynet_g2 forward ct state established,related meta nfproto ipv4 meta l4proto != { tcp, udp } accept",
         "nft list chain inet rustynet_g2 forward",
         "nft add rule inet rustynet_g2 forward iifname rustynet0 oifname enp0s9 accept",
+        "nft list chain inet rustynet_svc_gossip input",
+        "nft add table inet rustynet_svc_gossip",
+        "nft add chain inet rustynet_svc_gossip input { type filter hook input priority -10 ; policy accept ; }",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname lo accept",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname != rustynet0 drop",
         "ip route get 203.0.113.10",
         "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
         "ip -4 -o addr show dev enp0s9",
@@ -25725,6 +26323,11 @@ Persistent Routes:
         "nft add rule inet rustynet_g3 forward iifname rustynet0 oifname enp0s9 accept",
         "nft list chain inet rustynet_g3 forward",
         "nft add rule inet rustynet_g3 forward iifname rustynet0 oifname rustynet0 counter accept",
+        "nft list chain inet rustynet_svc_gossip input",
+        "nft add table inet rustynet_svc_gossip",
+        "nft add chain inet rustynet_svc_gossip input { type filter hook input priority -10 ; policy accept ; }",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname lo accept",
+        "nft add rule inet rustynet_svc_gossip input udp dport 51821 iifname != rustynet0 drop",
         "ip route get 203.0.113.10",
         "ip route replace 203.0.113.10/32 via 192.168.0.1 dev enp0s9 table 51820",
         "ip -4 -o addr show dev enp0s9",
@@ -25799,6 +26402,9 @@ Persistent Routes:
             ])
             .with_wg_listen_port(51820)
             .with_dns_resolver_port(53535)
+            // CS3 fix: capture the production (gossip-configured) shape so
+            // the golden keeps pinning the gossip scope argvs.
+            .with_gossip_configured(true)
         };
         let mesh_route = Route {
             destination_cidr: "100.64.0.0/10".to_owned(),

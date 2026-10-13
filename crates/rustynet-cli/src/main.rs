@@ -596,6 +596,15 @@ pub enum EnrollmentCliCommand {
     /// <b64> --push-addr <ip:port>` — sends the IPC `enrollment
     /// consume` verb to the running daemon. The daemon loads the
     /// secret + ledger from its configured paths.
+    ///
+    /// `--push-addr` SHOULD be the enrollee's OVERLAY (mesh) address and the
+    /// gossip port. The gossip socket is bound to the node's overlay address
+    /// only (never the underlay), so a push to an underlay address is not
+    /// received by an up-to-date enrollee, and the datagram leaves this node
+    /// sourced from its overlay address on the underlay NIC. The daemon
+    /// replaces the registered address with the member's overlay address as
+    /// soon as the member appears in a verified assignment bundle, so the
+    /// underlay form is only ever used in the window before that.
     Consume {
         token: String,
         pubkey_b64: String,
@@ -11600,6 +11609,17 @@ fn install_trust_material_file(
     Ok(())
 }
 
+/// Managed nft tables swept by `ops disconnect-cleanup`. The daemon's
+/// generation tables (`inet rustynet_g*`, `ip rustynet_nat_g*`) plus the
+/// exact CS3 gossip-port scope table `inet rustynet_svc_gossip` (exact-name
+/// match so an unrelated `rustynet_svc_*` table is never deleted). The
+/// boot-time recovery table `inet rustynet_boot` is deliberately absent.
+fn is_managed_disconnect_nft_table(family: &str, table_name: &str) -> bool {
+    (family == "inet" && table_name.starts_with("rustynet_g"))
+        || (family == "ip" && table_name.starts_with("rustynet_nat_g"))
+        || (family == "inet" && table_name == "rustynet_svc_gossip")
+}
+
 fn execute_ops_disconnect_cleanup() -> Result<String, String> {
     require_root_execution()?;
     if cfg!(target_os = "macos") {
@@ -11784,9 +11804,11 @@ fn execute_ops_disconnect_cleanup() -> Result<String, String> {
                         // survives daemon teardown and provides an SSH recovery
                         // path when the daemon fails to restart.  It is
                         // reinstalled idempotently on each ExecStartPre run.
-                        let managed = (family == "inet" && table_name.starts_with("rustynet_g"))
-                            || (family == "ip" && table_name.starts_with("rustynet_nat_g"));
-                        if !managed {
+                        // CS3 fix: the gossip scope table `inet
+                        // rustynet_svc_gossip` is daemon-generated too and
+                        // must be swept here (and by the ExecStopPost that
+                        // runs this same command).
+                        if !is_managed_disconnect_nft_table(family, table_name) {
                             continue;
                         }
                         match run_command_capture("nft", &["delete", "table", family, table_name]) {
@@ -23003,22 +23025,50 @@ mod tests {
         classify_cli_error, command_supports_json_render, consume_enrollment_token_locked,
         contains_ip_rule_lookup_table, detect_tampered_log, execute,
         execute_macos_relay_service_action, execute_ops, extract_json_flag, finalize_role_audit,
-        help_text, is_interface_absent_detail, launchd_xml_escape, load_dns_zone_records_manifest,
-        load_signing_key, managed_dns_resolver_server_arg, managed_dns_routing_already_absent,
-        parse_bool_value, parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
-        parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
-        persist_encrypted_secret_material, phase6_stage_probe_from_source,
-        phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
-        phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
-        render_launchd_plist, required_macos_tunnel_keychain_account,
-        required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
-        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        update_node_role_env_file, update_node_role_macos_plist, update_node_role_windows_env_file,
+        help_text, is_interface_absent_detail, is_managed_disconnect_nft_table, launchd_xml_escape,
+        load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
+        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
+        parse_command, parse_managed_pf_anchors, parse_prior_membership_evidence_body,
+        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
+        phase6_stage_probe_from_source, phase6_sync_platform_probe_from_inbox,
+        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
+        read_json_value, render_key_value_line_as_json, render_launchd_plist,
+        required_macos_tunnel_keychain_account, required_macos_tunnel_keychain_service,
+        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
+        rewrite_env_key_value, to_ipc_command, unix_now, update_node_role_env_file,
+        update_node_role_macos_plist, update_node_role_windows_env_file,
         validate_control_socket_security, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
     use std::fs;
+
+    #[test]
+    fn is_managed_disconnect_nft_table_sweeps_generation_and_gossip_scope_tables() {
+        // CS3 fix: `ops disconnect-cleanup` (and the ExecStopPost that runs
+        // it) must sweep the gossip scope table `inet rustynet_svc_gossip`
+        // exactly, alongside the daemon generation tables. Boot recovery and
+        // lookalike tables stay untouched.
+        assert!(is_managed_disconnect_nft_table("inet", "rustynet_g100"));
+        assert!(is_managed_disconnect_nft_table("ip", "rustynet_nat_g5"));
+        assert!(is_managed_disconnect_nft_table(
+            "inet",
+            "rustynet_svc_gossip"
+        ));
+        // Boot-time recovery table is intentionally preserved.
+        assert!(!is_managed_disconnect_nft_table("inet", "rustynet_boot"));
+        // Exact-name match for the scope table: no prefix sweep.
+        assert!(!is_managed_disconnect_nft_table(
+            "inet",
+            "rustynet_svc_gossip2"
+        ));
+        // Wrong family: never managed.
+        assert!(!is_managed_disconnect_nft_table(
+            "ip",
+            "rustynet_svc_gossip"
+        ));
+        assert!(!is_managed_disconnect_nft_table("inet6", "rustynet_g100"));
+    }
 
     // ── MacosPathConstantAudit 2026-08-28 follow-up shapes #2/#3 ────────────
     // The CLI resolves its socket and custody defaults through `rustynetd`'s
