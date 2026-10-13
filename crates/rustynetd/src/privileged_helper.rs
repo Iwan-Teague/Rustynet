@@ -3631,6 +3631,11 @@ mod tests {
         assert!(!is_owned_failclosed_table_token("filter"));
         assert!(!is_owned_failclosed_table_token("rustynet_g5; x"));
 
+        // D5/H10: the gossip scope table is its own exact-name carve-out and
+        // must never satisfy the failclosed predicate — otherwise the
+        // killswitch-chain and flush-forward schemas would accept it.
+        assert!(!is_owned_failclosed_table_token("rustynet_svc_gossip"));
+
         // NAT tables require the rustynet_nat_g prefix.
         assert!(is_owned_nat_table_token("rustynet_nat_g5"));
         assert!(!is_owned_nat_table_token("rustynet_g5"));

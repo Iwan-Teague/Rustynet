@@ -5214,7 +5214,9 @@ struct DaemonRuntime {
     /// stays unbound (fail closed) and the status reports why. Tests set
     /// `Some("127.0.0.1:0")` so parallel runs never contend for the fixed
     /// port. Not an operator surface — deliberately absent from
-    /// `DaemonConfig`.
+    /// `DaemonConfig`. D9: tests may only write it through
+    /// `set_gossip_bind_addr_for_test` (compiled solely under `cfg(test)`),
+    /// so no production code path can pin an explicit bind.
     gossip_bind_addr: Option<SocketAddr>,
     /// Port the production (bundle-derived) gossip bind uses. Always
     /// `RUSTYNET_GOSSIP_PORT` in production; tests set `0` so the
@@ -5223,7 +5225,8 @@ struct DaemonRuntime {
     gossip_bind_port: u16,
     /// Test-only: permit a loopback overlay address in the bundle-derived
     /// bind so the production derivation can be exercised on any host.
-    /// Always `false` in production (nothing outside `mod tests` sets it).
+    /// Always `false` in production — D9 gates all writes behind
+    /// `set_gossip_allow_loopback_overlay_for_test` (`cfg(test)` only).
     gossip_allow_loopback_overlay: bool,
     /// Overlay address whose bind failed at the last signed-state seam
     /// (typically `EADDRNOTAVAIL`: the tunnel address is not on the interface
@@ -7178,6 +7181,24 @@ impl DaemonRuntime {
                 bind_addr,
             );
         }
+    }
+
+    /// D9: the ONLY way tests may pin the gossip bind address. Compiled
+    /// exclusively under `cfg(test)` so the "not an operator surface"
+    /// contract on `gossip_bind_addr` is enforced by the compiler: in
+    /// production builds no setter exists and the field stays private, so
+    /// the bind is always derived from the verified overlay bundle (or the
+    /// transport stays unbound).
+    #[cfg(test)]
+    fn set_gossip_bind_addr_for_test(&mut self, addr: SocketAddr) {
+        self.gossip_bind_addr = Some(addr);
+    }
+
+    /// D9: test-only counterpart for `gossip_allow_loopback_overlay` —
+    /// production can never permit a loopback overlay bind.
+    #[cfg(test)]
+    fn set_gossip_allow_loopback_overlay_for_test(&mut self, allow: bool) {
+        self.gossip_allow_loopback_overlay = allow;
     }
 
     /// Periodic hook: drain any pending gossip datagrams from the
@@ -12308,6 +12329,15 @@ fn lab_substrate_transit_context(
     }
 }
 
+/// CS3: whether the gossip nft port scope must be configured for this
+/// daemon — true exactly when the gossip transport has a signing secret.
+/// One pure function so the production wiring is unit-testable on every
+/// platform (the call site itself is linux-only).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn gossip_scope_wanted(config: &DaemonConfig) -> bool {
+    config.gossip_signing_secret_path.is_some()
+}
+
 fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
     #[cfg(target_os = "linux")]
     {
@@ -12351,7 +12381,7 @@ fn daemon_system(config: &DaemonConfig) -> Result<RuntimeSystem, DaemonError> {
                 .with_dns_resolver_port(config.dns_resolver_bind_addr.port())
                 // CS3 fix: the gossip nft scope is installed only when the
                 // gossip transport is configured (signing secret present).
-                .with_gossip_configured(config.gossip_signing_secret_path.is_some())
+                .with_gossip_configured(gossip_scope_wanted(config))
         })
         .map_err(|err| DaemonError::InvalidConfig(err.to_string()))?;
         // LAB-ONLY (AQ-256): read and validate the orchestrator's vxlan
@@ -20610,20 +20640,14 @@ mod tests {
 
     fn conditional_pull_snapshot_bytes() -> Vec<u8> {
         let state = conditional_pull_snapshot_state();
-        let dir = std::env::temp_dir().join(format!(
-            "rustynet-cond-pull-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&dir).expect("snapshot dir");
-        let path = dir.join("snapshot.v1");
+        // D6: a unique temp dir per call. The pid+nanos spelling raced with
+        // concurrent test threads (same nanosecond tick => `persist snapshot:
+        // NotFound` flake in the anchor_bundle_pull tests); `tempfile` gives
+        // a collision-free directory that is removed on drop even on panic.
+        let dir = tempfile::tempdir().expect("snapshot tempdir");
+        let path = dir.path().join("snapshot.v1");
         persist_membership_snapshot(&path, &state).expect("persist snapshot");
-        let bytes = std::fs::read(&path).expect("read snapshot");
-        let _ = std::fs::remove_dir_all(&dir);
-        bytes
+        std::fs::read(&path).expect("read snapshot")
     }
 
     /// AT-1: a peer that dribbles the TLS handshake — feeding one record
@@ -27120,6 +27144,25 @@ mod tests {
         assert!(err.to_string().contains("relay session token ttl"));
     }
 
+    /// CS3 witness: the pure production predicate that decides whether the
+    /// gossip nft port scope is wired into the dataplane system tracks the
+    /// gossip signing secret exactly — present => configured, absent => not.
+    /// Guards the linux call site in `daemon_system` against regressing to a
+    /// hardcoded `true` (which would install a port scope for a transport
+    /// that does not exist) or a hardcoded `false` (which would leave the
+    /// gossip UDP port reachable with no nft scope).
+    #[test]
+    fn gossip_scope_wanted_tracks_gossip_signing_secret_presence() {
+        let with_secret = DaemonConfig {
+            gossip_signing_secret_path: Some(std::path::PathBuf::from("/tmp/gossip.secret")),
+            ..DaemonConfig::default()
+        };
+        assert!(super::gossip_scope_wanted(&with_secret));
+
+        let without_secret = DaemonConfig::default();
+        assert!(!super::gossip_scope_wanted(&without_secret));
+    }
+
     /// I1b: the gossip signing secret and its passphrase are a custody
     /// pair — configuring one without the other must be a hard startup
     /// error in BOTH directions, never a silent fallback.
@@ -33417,7 +33460,7 @@ mod tests {
         );
         // Loopback + OS-assigned port so parallel test runs never contend
         // for the fixed production gossip port.
-        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
 
         // Neither key nor membership: inert.
         runtime.sync_gossip_data_plane(None);
@@ -33570,7 +33613,7 @@ mod tests {
             "production default must refuse a loopback overlay address"
         );
         runtime.gossip_bind_port = 0;
-        runtime.gossip_allow_loopback_overlay = true;
+        runtime.set_gossip_allow_loopback_overlay_for_test(true);
         runtime.gossip_node = Some(
             crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
                 .expect("gossip node should build"),
@@ -33721,6 +33764,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    /// D3/RT8 witness: the reconcile cadence itself must run the gossip bind
+    /// retry. A failed overlay bind arms `gossip_bind_retry`; the NEXT
+    /// `reconcile()` pass (not a direct `retry_gossip_bind()` call) is the
+    /// production path that re-attempts it — once the tunnel address is
+    /// bindable the transport must attach and the error/retry state clear.
+    /// Deleting the `retry_gossip_bind()` call from `reconcile()` turns this
+    /// red (the armed address is never retried and the transport stays
+    /// unbound, silently partitioning the node from gossip).
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_retries_the_armed_gossip_overlay_bind() {
+        let (mut runtime, test_dir) =
+            gossip_runtime_ready_for_bind("rustynetd-runtime-reconcile-gossip-retry");
+
+        // Arm the retry at an always-bindable loopback address: it stands in
+        // for the tunnel address that only became local after the first bind
+        // attempt failed (the transport is down and the error is latched).
+        // The fixture's assignment addresses 100.64.0.1 is not local on the
+        // test host, so the verified-trust load is broken afterwards: that
+        // makes reconcile take an early fail-closed return — which is exactly
+        // the point of the witness. The retry runs BEFORE any trust work, so
+        // even a reconcile that fails closed must have re-attempted the
+        // armed bind; a reconcile that skips the retry silently partitions
+        // the node from gossip.
+        runtime.gossip_bind_retry = Some("127.0.0.1:0".parse().expect("addr"));
+        runtime.gossip_transport_error = Some("previous bind failure".to_owned());
+        assert!(runtime.gossip_transport.is_none());
+        std::fs::write(test_dir.join("trust.evidence"), b"corrupted").expect("corrupt trust");
+
+        runtime.reconcile();
+
+        assert!(
+            runtime.gossip_transport.is_some(),
+            "reconcile must retry the armed gossip overlay bind"
+        );
+        assert!(
+            runtime.gossip_transport_error.is_none(),
+            "a successful retry must clear the bind error"
+        );
+        assert!(
+            runtime.gossip_bind_retry.is_none(),
+            "a successful retry must consume the retry address"
+        );
+
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
     /// After an address change the retry target is the NEW address, never the
     /// one that was failing before.
     #[cfg(unix)]
@@ -33802,7 +33892,7 @@ mod tests {
         let relay_addr: SocketAddr = "203.0.113.63:40063".parse().expect("relay addr");
         let (mut runtime, test_dir) =
             build_runtime_with_custom_relay(label, relay_addr, "relay-eu-1");
-        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
         (runtime, test_dir)
     }
 
@@ -33843,7 +33933,8 @@ mod tests {
                 .expect("gossip node should build"),
         );
         // Unbindable: a routable-but-not-local address cannot be bound.
-        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.membership_state = Some(make_membership_state_with_capabilities(
             "node-a",
             vec![RoleCapability::Client],
@@ -33889,13 +33980,14 @@ mod tests {
             vec![RoleCapability::Client],
         ));
 
-        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         let failed = runtime.gossip_status_suffix();
         assert_ne!(gossip_field(&failed, "gossip_transport_error"), "none");
 
         // Recover: a bindable address on the next seam.
-        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
         runtime.sync_gossip_data_plane(None);
         let recovered = runtime.gossip_status_suffix();
         assert_eq!(gossip_field(&recovered, "gossip_state"), "active");
@@ -34059,7 +34151,8 @@ mod tests {
 
         // Force a real bind failure so the one free-form field is
         // populated rather than sitting at `none`.
-        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         let suffix = runtime.gossip_status_suffix();
         assert_ne!(
@@ -34341,7 +34434,8 @@ mod tests {
             "node-a",
             vec![RoleCapability::Client],
         ));
-        runtime.gossip_bind_addr = Some("203.0.113.9:40099".parse().expect("unbindable addr"));
+        runtime
+            .set_gossip_bind_addr_for_test("203.0.113.9:40099".parse().expect("unbindable addr"));
         runtime.sync_gossip_data_plane(None);
         assert_ne!(
             gossip_field(&runtime.gossip_status_suffix(), "gossip_transport_error"),
@@ -34602,7 +34696,7 @@ mod tests {
             relay_addr,
             "relay-eu-1",
         );
-        runtime.gossip_bind_addr = Some("127.0.0.1:0".parse().expect("test bind addr"));
+        runtime.set_gossip_bind_addr_for_test("127.0.0.1:0".parse().expect("test bind addr"));
         runtime.gossip_node = Some(
             crate::gossip_runtime::GossipNode::new(SigningKey::from_bytes(&[7u8; 32]), None)
                 .expect("gossip node should build"),

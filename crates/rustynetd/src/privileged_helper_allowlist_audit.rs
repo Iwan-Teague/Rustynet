@@ -246,6 +246,113 @@ pub fn allowlist_audit_corpus() -> Vec<AllowlistAuditCase> {
             ],
             expectation: Deny,
         },
+        // D5/H8: the gossip carve-out pins the chain NAME, not just the hook.
+        // A second input-hook chain under any other name on the gossip table
+        // (e.g. to shadow the reviewed `input` chain or carry a wider policy)
+        // must be refused.
+        AllowlistAuditCase {
+            label: "nft_gossip_scope_other_chain_name",
+            program: "nft",
+            args: &[
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "bypass",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "input",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            expectation: Deny,
+        },
+        // D5: the gossip carve-out also pins the HOOK: a chain that filters
+        // some other hook (e.g. `forward`) on the gossip table is not part
+        // of the reviewed port scope and must be refused.
+        AllowlistAuditCase {
+            label: "nft_gossip_scope_other_hook",
+            program: "nft",
+            args: &[
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "input",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "forward",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "accept",
+                ";",
+                "}",
+            ],
+            expectation: Deny,
+        },
+        // D5/H10: the killswitch-chain schema (forward-hook default-deny
+        // chain) stays exclusive to the failclosed `rustynet_g…` tables —
+        // never on the gossip scope table.
+        AllowlistAuditCase {
+            label: "nft_killswitch_shaped_chain_on_gossip_table",
+            program: "nft",
+            args: &[
+                "add",
+                "chain",
+                "inet",
+                "rustynet_svc_gossip",
+                "killswitch",
+                "{",
+                "type",
+                "filter",
+                "hook",
+                "forward",
+                "priority",
+                "-10",
+                ";",
+                "policy",
+                "drop",
+                ";",
+                "}",
+            ],
+            expectation: Deny,
+        },
+        // D5/H10+H11: flushing the `forward` chain (which keeps its
+        // `policy drop` while dropping its rules) is a failclosed-table-only
+        // operation — the gossip scope table and the NAT tables must never
+        // admit it.
+        AllowlistAuditCase {
+            label: "nft_flush_forward_on_gossip_table",
+            program: "nft",
+            args: &["flush", "chain", "inet", "rustynet_svc_gossip", "forward"],
+            expectation: Deny,
+        },
+        AllowlistAuditCase {
+            label: "nft_flush_forward_on_nat_table",
+            program: "nft",
+            args: &["flush", "chain", "inet", "rustynet_nat_g0", "forward"],
+            expectation: Deny,
+        },
+        // D5: even on a failclosed table the flush arm pins the chain NAME:
+        // only `forward` (whose `policy drop` survives) may be flushed —
+        // never the default-deny `killswitch`/`input` chains themselves.
+        AllowlistAuditCase {
+            label: "nft_flush_killswitch_chain_on_failclosed_table",
+            program: "nft",
+            args: &["flush", "chain", "inet", "rustynet_g1", "killswitch"],
+            expectation: Deny,
+        },
         AllowlistAuditCase {
             label: "sysctl_arbitrary_key_core_pattern",
             program: "sysctl",
@@ -669,6 +776,16 @@ pub fn allowlist_audit_corpus() -> Vec<AllowlistAuditCase> {
             label: "nft_add_owned_table",
             program: "nft",
             args: &["add", "table", "inet", "rustynet_g1"],
+            expectation: Allow,
+        },
+        // D5: the blind_exit hardened-egress path legitimately flushes the
+        // `forward` chain on a failclosed table (policy drop survives the
+        // flush). Pin the acceptance so the H10/H11 deny cases above can
+        // never be "fixed" by over-tightening the flush arm.
+        AllowlistAuditCase {
+            label: "nft_flush_forward_on_owned_failclosed_table",
+            program: "nft",
+            args: &["flush", "chain", "inet", "rustynet_g1", "forward"],
             expectation: Allow,
         },
         AllowlistAuditCase {

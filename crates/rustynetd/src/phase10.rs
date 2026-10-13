@@ -20923,6 +20923,183 @@ Persistent Routes:
         fx.finish();
     }
 
+    /// RT12 witness (D1): the runtime-facing assertions
+    /// `assert_killswitch` / `assert_exit_policy` must trip on gossip-scope
+    /// drift. The call site lives inside `assert_firewall_ruleset`; these
+    /// tests exercise THAT path (not `assert_gossip_port_scope` directly, as
+    /// the earlier drift test does), so deleting the
+    /// `assert_gossip_port_scope()` call from the killswitch assertion turns
+    /// these red. Each scenario scripts a live-looking
+    /// `nft list chain inet rustynet_svc_gossip input` answer plus a valid
+    /// killswitch table, and pins `gossip_scope_applied` so the runtime
+    /// assertion cannot no-op. Tamper matrix: missing tunnel drop, extra
+    /// accept rule, wrong tunnel-interface pin — each is drift; the pristine
+    /// chain is the control and must pass both assertions (and the control
+    /// proves the killswitch path actually inspected the gossip chain).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assert_killswitch_and_exit_policy_fail_closed_on_gossip_scope_drift() {
+        const GOSSIP_CHAIN_CMD: &str = "nft list chain inet rustynet_svc_gossip input";
+        let scope_assert = |scenario: &'static str, chain_rules: Vec<Vec<String>>| {
+            let socket_path = phase10_test_socket_path("cs3assert");
+            let rendered: Vec<String> = chain_rules
+                .iter()
+                .map(|rule| stateful_fake_render_rule(rule, 0))
+                .collect();
+            let listing =
+                gossip_scope_listing(&rendered.iter().map(String::as_str).collect::<Vec<_>>())
+                    .join("\n")
+                    + "\n";
+            let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![
+                    (
+                        GOSSIP_CHAIN_CMD.to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: listing,
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "nft list table inet rustynet_g1".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: sample_linux_firewall_ruleset(
+                                "rustynet0", "enp0s9", false, false, false, 0,
+                            ),
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "ip rule show".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: "0: from all lookup local\n32765: from all lookup 51820\n32766: from all lookup main\n".to_string(),
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "ip -4 route show table 51820".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: "default dev rustynet0 scope link\n203.0.113.10/32 dev enp0s9 scope link\n".to_string(),
+                            stderr: String::new(),
+                        },
+                    ),
+                    (
+                        "ip -4 route get 1.1.1.1".to_owned(),
+                        PrivilegedCommandOutput {
+                            status: 0,
+                            stdout: "1.1.1.1 dev rustynet0 src 100.64.0.1 uid 0\n    cache\n"
+                                .to_string(),
+                            stderr: String::new(),
+                        },
+                    ),
+                ],
+            );
+            let client = PrivilegedCommandClient::new(socket_path.clone(), Duration::from_secs(2))
+                .expect("privileged client should initialize");
+            let mut system = LinuxCommandSystem::new(
+                "rustynet0",
+                "enp0s9",
+                LinuxDataplaneMode::HybridNative,
+                Some(client),
+                false,
+                Vec::new(),
+            )
+            .expect("linux command system should initialize");
+            system.firewall_table = Some("rustynet_g1".to_string());
+            system
+                .expected_peer_endpoint_bypass_routes
+                .insert(ExpectedBypassRoute {
+                    destination: "203.0.113.10/32".to_string(),
+                    interface_name: "enp0s9".to_string(),
+                    via: None,
+                    family: RouteTableFamily::V4,
+                });
+            // The scope stage ran in this process: the runtime assertion must
+            // inspect the live chain rather than no-op.
+            system.gossip_scope_applied = true;
+            let killswitch = DataplaneSystem::assert_killswitch(&mut system);
+            let exit_policy =
+                DataplaneSystem::assert_exit_policy(&mut system, ExitMode::FullTunnel);
+            let saw_scope_list = commands
+                .lock()
+                .expect("command log should lock")
+                .iter()
+                .any(|cmd| cmd.contains(GOSSIP_CHAIN_CMD));
+            stop.store(true, Ordering::Relaxed);
+            helper_thread
+                .join()
+                .expect("helper thread should join cleanly");
+            let _ = std::fs::remove_file(&socket_path);
+            (scenario, killswitch, exit_policy, saw_scope_list)
+        };
+
+        let (accept, drop) = gossip_scope_tokens_for_tests();
+        let extra = vec![
+            "udp".to_owned(),
+            "dport".to_owned(),
+            "51821".to_owned(),
+            "accept".to_owned(),
+        ];
+        let wrong_pin = {
+            let mut drop = drop.clone();
+            let pin = drop
+                .iter()
+                .position(|token| token == "rustynet0")
+                .expect("drop rule should carry the tunnel pin");
+            drop[pin] = "wg9".to_owned();
+            drop
+        };
+
+        // Control: the pristine pair passes both runtime assertions, and the
+        // killswitch path really listed the gossip chain (RT12 deletes that
+        // listing from the path these assertions go through).
+        let (scenario, killswitch, exit_policy, saw_scope_list) =
+            scope_assert("pristine", vec![accept.clone(), drop.clone()]);
+        assert!(
+            saw_scope_list,
+            "{scenario}: the killswitch path must list the gossip chain"
+        );
+        if let Err(err) = killswitch {
+            panic!("{scenario}: pristine scope must pass assert_killswitch: {err}");
+        }
+        if let Err(err) = exit_policy {
+            panic!("{scenario}: pristine scope must pass assert_exit_policy: {err}");
+        }
+
+        for (scenario, chain) in [
+            ("missing drop", vec![accept.clone()]),
+            (
+                "extra accept",
+                vec![accept.clone(), drop.clone(), extra.clone()],
+            ),
+            ("wrong tunnel pin", vec![accept.clone(), wrong_pin.clone()]),
+        ] {
+            let (scenario, killswitch, exit_policy, _) = scope_assert(scenario, chain);
+            let err = match killswitch {
+                Ok(()) => panic!("{scenario}: tampered scope must fail assert_killswitch"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("gossip port tunnel scope missing or drifted"),
+                "{scenario}: wrong error: {err}"
+            );
+            let err = match exit_policy {
+                Ok(()) => panic!("{scenario}: tampered scope must fail assert_exit_policy"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("gossip port tunnel scope missing or drifted"),
+                "{scenario}: assert_exit_policy must surface the drift first: {err}"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn gossip_scope_is_removed_by_clean_rollback_and_untouched_when_never_applied() {

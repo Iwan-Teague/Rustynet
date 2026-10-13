@@ -362,30 +362,30 @@ fn run() -> Result<(), String> {
                 verdict.reasons
             ))?;
         }
-        // Gate on the SHIPPED checks from the primary report (fail closed on
-        // any missing field/host).
-        let shipped_defects = match std::fs::read_to_string(&report_path)
+        // Gate on the CONJUNCTION (D4/CS4): the shipped checks from the
+        // primary report (fail closed on any missing field/host) AND the
+        // expected-set report's own status. The decision lives in one pure,
+        // unit-tested function.
+        let verdict = match std::fs::read_to_string(&report_path)
             .map_err(|err| format!("read primary report {}: {err}", report_path.display()))
             .and_then(|text| {
                 serde_json::from_str::<serde_json::Value>(&text)
                     .map_err(|err| format!("parse primary report {}: {err}", report_path.display()))
             }) {
-            Ok(report) => {
-                ops_control_surface_expected_set::shipped_check_gate_defects(&report, &host_labels)
-            }
-            Err(why) => vec![why],
+            Ok(report) => ops_control_surface_expected_set::combined_verdict(
+                &expected_report,
+                &ops_control_surface_expected_set::shipped_check_gate_defects(
+                    &report,
+                    &host_labels,
+                ),
+            ),
+            Err(why) => Err(vec![why]),
         };
-        if !shipped_defects.is_empty() {
+        if let Err(failures) = verdict {
             return Err(format!(
-                "control-surface expected-listener-set check failed: the shipped report does not pass: {shipped_defects:?}; see {} and {}",
+                "control-surface expected-listener-set check failed: {failures:?}; see {} and {}",
                 expected_path.display(),
                 report_path.display()
-            ));
-        }
-        if expected_report["status"] != "pass" {
-            return Err(format!(
-                "control-surface expected-listener-set check failed; see {}",
-                expected_path.display()
             ));
         }
         logger.line(format!(

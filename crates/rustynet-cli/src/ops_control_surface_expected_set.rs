@@ -574,6 +574,36 @@ pub fn render_report(
     })
 }
 
+/// D4/CS4 second-eyes: the single pure decision for the opt-in
+/// expected-listener-set gate. The verdict is the CONJUNCTION of
+/// (a) the shipped primary report carrying zero `shipped_check_gate_defects`
+/// and (b) the expected-set report's own `status` being exactly `"pass"`.
+/// One function so the production gate in
+/// `live_linux_control_surface_exposure_test` is unit-testable: dropping
+/// either conjunct would let a perfect listener set mask a bad daemon/helper
+/// socket mode or a failed remote-DNS probe (or the shipped report mask a
+/// drifted listener set). Fail closed: a missing `status` is a failure.
+pub fn combined_verdict(
+    expected_report: &Value,
+    shipped_defects: &[String],
+) -> Result<(), Vec<String>> {
+    let mut failures: Vec<String> = shipped_defects.to_vec();
+    if expected_report.get("status").and_then(Value::as_str) != Some("pass") {
+        failures.push(format!(
+            "expected-listener-set report status is not \"pass\" (got {})",
+            expected_report
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>")
+        ));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1398,5 +1428,35 @@ mod tests {
         assert_eq!(render_report(&[ok], DNS, NO_TABLE, 1)["status"], "pass");
         // zero hosts never passes
         assert_eq!(render_report(&[], DNS, NO_TABLE, 1)["status"], "fail");
+    }
+
+    /// D4 witness: the opt-in gate is the conjunction of the shipped-report
+    /// defect list and the expected-set status. Each conjunct is load-bearing:
+    /// a mutant that ignores `shipped_defects` (CS4 regression) or ignores the
+    /// expected-set `status` must turn these red.
+    #[test]
+    fn combined_verdict_requires_both_shipped_defects_empty_and_pass_status() {
+        let passing = json!({ "status": "pass" });
+        let failing = json!({ "status": "fail" });
+        let defects = vec!["shipped check all_daemon_sockets_secure is not \"pass\"".to_owned()];
+
+        // Both conjuncts hold.
+        assert!(combined_verdict(&passing, &[]).is_ok());
+
+        // Shipped defects must fail the verdict even with a perfect set.
+        let err = combined_verdict(&passing, &defects)
+            .expect_err("shipped defects must fail the combined verdict");
+        assert!(err.iter().any(|f| f.contains("all_daemon_sockets_secure")));
+
+        // A drifted expected set must fail even with a clean shipped report.
+        assert!(combined_verdict(&failing, &[]).is_err());
+
+        // Fail closed on a missing status (malformed expected-set report).
+        assert!(combined_verdict(&json!({}), &[]).is_err());
+
+        // Both conjuncts broken: every reason is reported, not just the first.
+        let err = combined_verdict(&failing, &defects)
+            .expect_err("both halves failing must fail the combined verdict");
+        assert_eq!(err.len(), 2, "both failure reasons surface: {err:?}");
     }
 }
