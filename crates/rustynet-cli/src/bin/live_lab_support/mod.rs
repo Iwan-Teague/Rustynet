@@ -199,13 +199,27 @@ pub fn stat_mode_argv(
     }
 }
 
+/// D2 (review macos-harness-b): the macOS unified-log chunk's scan window is
+/// FIXED at 15 minutes, deliberately NOT derived from the `lines` argument:
+/// `journalctl -n <lines>` counts lines while `log show --last` takes a time
+/// window and there is no honest line→seconds mapping, so inventing one would
+/// silently change how much of the unified log a scan covers. The launchd
+/// tail chunks below DO honour `lines` byte-for-byte. The window is named in
+/// the argv (pinned byte-for-byte by
+/// `daemon_unit_log_argv_macos_scans_unified_log_and_launchd_log_files`) and
+/// must be named in every stage's collection log line so a scan window is
+/// never silent.
+pub const MACOS_UNIFIED_LOG_WINDOW: &str = "15m";
+
 /// Daemon unit-log collection argv, per OS: every chunk's stdout must be
 /// scanned for leaked key material. Linux returns the journald unit log
 /// (byte-identical to the pre-port argv; `--output=short-monotonic` is
 /// appended only when `with_monotonic_output`). macOS returns the unified log
-/// window for the daemon process plus the launchd StandardOut/StandardError
-/// files (`/usr/local/var/log/rustynet/`), because a plain Rust daemon does
-/// not mirror its stderr into the unified log. Windows fails closed.
+/// window for the daemon process (fixed `--last {MACOS_UNIFIED_LOG_WINDOW}`
+/// window — see that const for why `lines` is not threaded into it) plus the
+/// launchd StandardOut/StandardError files (`/usr/local/var/log/rustynet/`),
+/// because a plain Rust daemon does not mirror its stderr into the unified
+/// log. Windows fails closed.
 pub fn daemon_unit_log_argv(
     platform: LiveLabPlatform,
     lines: &'static str,
@@ -224,7 +238,7 @@ pub fn daemon_unit_log_argv(
                 "/usr/bin/log",
                 "show",
                 "--last",
-                "15m",
+                MACOS_UNIFIED_LOG_WINDOW,
                 "--predicate",
                 "process == \"rustynetd\"",
                 "--style",
@@ -1929,13 +1943,13 @@ pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabContext, LiveLabPlatform, REMOTE_RUSTYNET_BIN, assignment_refresh_env_path,
-        cli_invocation_parse_failure, daemon_status_probe_argv, daemon_unit_log_argv,
-        enforce_linux_only_until_validator_lands, enrollment_ledger_path, enrollment_secret_path,
-        env_flag_truthy, known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g, scp_failure_is_transient, stat_mode_argv,
-        strip_host_port, target_port, wait_for_daemon_socket_ready,
-        wait_for_daemon_socket_with_runner, wg_encrypted_key_paths,
+        LiveLabContext, LiveLabPlatform, MACOS_UNIFIED_LOG_WINDOW, REMOTE_RUSTYNET_BIN,
+        assignment_refresh_env_path, cli_invocation_parse_failure, daemon_status_probe_argv,
+        daemon_unit_log_argv, enforce_linux_only_until_validator_lands, enrollment_ledger_path,
+        enrollment_secret_path, env_flag_truthy, known_hosts_lookup_host,
+        resolved_known_hosts_candidates, resolved_target_address_from_ssh_g,
+        scp_failure_is_transient, stat_mode_argv, strip_host_port, target_port,
+        wait_for_daemon_socket_ready, wait_for_daemon_socket_with_runner, wg_encrypted_key_paths,
     };
 
     /// The probe must be a full IPC round trip, bounded in the guest by the
@@ -2788,25 +2802,58 @@ port 22
 
     #[test]
     fn daemon_unit_log_argv_macos_scans_unified_log_and_launchd_log_files() {
-        let chunks = daemon_unit_log_argv(LiveLabPlatform::MacOs, "500", true).expect("macos");
-        assert_eq!(chunks.len(), 3, "unified log + stdout + stderr files");
-        assert!(
-            chunks[0].contains(&"/usr/bin/log"),
-            "{:?}",
-            "the unified-log window must target the daemon process"
+        // D6 (review macos-harness-b): the full macOS argv vectors are pinned
+        // byte-for-byte, exactly like the Linux twin above, so a silent argv
+        // regression on the macOS half cannot survive the test suite.
+        assert_eq!(
+            daemon_unit_log_argv(LiveLabPlatform::MacOs, "500", true).expect("macos"),
+            vec![
+                vec![
+                    "/usr/bin/log",
+                    "show",
+                    "--last",
+                    "15m",
+                    "--predicate",
+                    "process == \"rustynetd\"",
+                    "--style",
+                    "compact",
+                ],
+                vec![
+                    "/usr/bin/tail",
+                    "-n",
+                    "500",
+                    "/usr/local/var/log/rustynet/rustynetd.log",
+                ],
+                vec![
+                    "/usr/bin/tail",
+                    "-n",
+                    "500",
+                    "/usr/local/var/log/rustynet/rustynetd-error.log",
+                ],
+            ],
+            "unified log + stdout + stderr files; the fixed --last 15m window \
+             and the launchd log paths must not drift"
         );
-        assert!(
-            chunks[0].contains(&"process == \"rustynetd\""),
-            "predicate must scope to the daemon process"
+        // The two tail chunks honour the `lines` argument; the unified-log
+        // chunk keeps its documented fixed window (MACOS_UNIFIED_LOG_WINDOW).
+        let chunks50 = daemon_unit_log_argv(LiveLabPlatform::MacOs, "50", false).expect("macos");
+        assert_eq!(chunks50.len(), 3, "unified log + stdout + stderr files");
+        assert_eq!(
+            chunks50[0],
+            vec![
+                "/usr/bin/log",
+                "show",
+                "--last",
+                MACOS_UNIFIED_LOG_WINDOW,
+                "--predicate",
+                "process == \"rustynetd\"",
+                "--style",
+                "compact",
+            ],
+            "the unified-log window is fixed and documented, not derived from `lines`"
         );
-        assert!(
-            chunks[1].contains(&"/usr/local/var/log/rustynet/rustynetd.log"),
-            "launchd StandardOutPath file must be scanned"
-        );
-        assert!(
-            chunks[2].contains(&"/usr/local/var/log/rustynet/rustynetd-error.log"),
-            "launchd StandardErrorPath file must be scanned (a refused start logs there)"
-        );
+        assert_eq!(chunks50[1][2], "50", "tail chunks honour `lines`");
+        assert_eq!(chunks50[2][2], "50", "tail chunks honour `lines`");
         assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "50", false).is_err());
     }
 }

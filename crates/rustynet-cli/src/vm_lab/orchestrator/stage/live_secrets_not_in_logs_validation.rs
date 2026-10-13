@@ -6,21 +6,48 @@ use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
-/// QH-83 F1: the secrets-not-in-logs stage's pass witness. The
-/// `live_secrets_not_in_logs` binary writes this report on every success
-/// path, so a Passed verdict is only proven when this artifact exists and
-/// is non-empty.
+/// QH-83 F1: the secrets-not-in-logs stage's pass witness — the report the
+/// `live_secrets_not_in_logs` binary writes on every success path.
 pub(crate) const SECRETS_REPORT_RELATIVE: &str = "live_secrets_not_in_logs_report.json";
 
-/// QH-83 F1: fail a success exit whose pass witness artifact is missing or
-/// empty instead of declaring Passed without evidence on disk.
+/// QH-83 F1 + D1 (review macos-harness-b): fail a success exit whose pass
+/// witness artifact is missing or empty instead of declaring Passed without
+/// evidence on disk. The artifact must also SAY what it scanned: the
+/// `log_lines_checked` field written by
+/// `execute_ops_write_live_linux_secrets_not_in_logs_report` must be
+/// present, parseable as an unsigned integer, and > 0 — a report whose scan
+/// read nothing is a collection failure, never a pass.
 fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
     let path = report_dir.join(SECRETS_REPORT_RELATIVE);
     match std::fs::metadata(&path) {
-        Ok(meta) if meta.len() > 0 => Ok(()),
-        Ok(_) => Err(format!("pass witness artifact {path:?} is empty")),
-        Err(err) => Err(format!("pass witness artifact {path:?} missing: {err}")),
+        Ok(meta) if meta.len() > 0 => {}
+        Ok(_) => return Err(format!("pass witness artifact {path:?} is empty")),
+        Err(err) => return Err(format!("pass witness artifact {path:?} missing: {err}")),
     }
+    let body = std::fs::read_to_string(&path)
+        .map_err(|err| format!("pass witness artifact {path:?} unreadable: {err}"))?;
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|err| format!("pass witness artifact {path:?} is not valid JSON: {err}"))?;
+    let field = value.get("log_lines_checked").ok_or_else(|| {
+        format!(
+            "pass witness artifact {path:?} is missing log_lines_checked: a report that does \
+             not say how many log lines it scanned cannot witness a pass (fail closed; D1)"
+        )
+    })?;
+    let lines_checked = field.as_u64().ok_or_else(|| {
+        format!(
+            "pass witness artifact {path:?} has an unparseable log_lines_checked ({field}): \
+             expected an unsigned integer (fail closed; D1)"
+        )
+    })?;
+    if lines_checked == 0 {
+        return Err(format!(
+            "pass witness artifact {path:?} records log_lines_checked=0: the secrets scan \
+             read nothing, so its clean verdict proves nothing and the stage cannot pass \
+             (fail closed; D1)"
+        ));
+    }
+    Ok(())
 }
 
 /// AQ-68 lab/production alignment: the enrollment secret is seeded for
@@ -30,8 +57,8 @@ fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
 /// additionally witnesses that a client-daemon node carries NONE (the
 /// fail-closed boundary this alignment exists to preserve).
 ///
-/// Same literal as `ENROLLMENT_SECRET_PATH` in the production installer and
-/// the negative-control enrollment replay.
+/// Same literal as `enrollment_secret_path_for()` (below) in the production
+/// installer and the negative-control enrollment replay.
 ///
 /// Per-OS: the deployed daemon's seeded secret path differs by service
 /// manager — launchd passes `${STATE_ROOT}/keys/enrollment.secret` with
@@ -390,6 +417,83 @@ mod tests {
             result.unwrap_err().contains(SECRETS_REPORT_RELATIVE),
             "the failure must name the missing witness artifact"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D1 (review macos-harness-b): the stage consumer refuses a report whose
+    /// `log_lines_checked` is missing, unparseable, or 0 — presence of a
+    /// non-empty file alone must not witness a pass.
+    #[test]
+    fn secrets_report_without_a_real_scan_line_count_cannot_pass() {
+        let dir = std::env::temp_dir().join(format!(
+            "secrets_witness_scan_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        let write = |body: &str| {
+            std::fs::write(dir.join(SECRETS_REPORT_RELATIVE), body).unwrap_or_default();
+        };
+        let verdict = |result: Result<(), String>| {
+            let err = result.expect_err("must refuse");
+            assert!(
+                err.contains(SECRETS_REPORT_RELATIVE),
+                "the refusal must name the witness artifact: {err}"
+            );
+            err
+        };
+
+        // Positive control: the exact producer schema with a real scan passes.
+        write(
+            r#"{
+  "schema_version": 1,
+  "mode": "live_linux_secrets_not_in_logs",
+  "status": "pass",
+  "verdict": "clean",
+  "log_lines_checked": 500,
+  "suspicious_match_counts": {
+    "total": 0,
+    "hex64_pattern": 0,
+    "hex32_pattern": 0,
+    "b64_key_header": 0
+  }
+}
+"#,
+        );
+        verify_report_artifact(&dir).expect("a real scan with zero suspicious matches passes");
+
+        // Missing field.
+        write("{\"schema_version\":1,\"status\":\"pass\",\"verdict\":\"clean\"}\n");
+        let err = verdict(verify_report_artifact(&dir));
+        assert!(
+            err.contains("missing log_lines_checked"),
+            "a report without log_lines_checked must be refused: {err}"
+        );
+        // Unparseable field.
+        write("{\"log_lines_checked\":\"many\"}\n");
+        let err = verdict(verify_report_artifact(&dir));
+        assert!(
+            err.contains("unparseable log_lines_checked"),
+            "a non-integer log_lines_checked must be refused: {err}"
+        );
+        // Zero — the D1 poison: a "clean" verdict that scanned nothing.
+        write("{\"log_lines_checked\":0,\"status\":\"pass\",\"verdict\":\"clean\"}\n");
+        let err = verdict(verify_report_artifact(&dir));
+        assert!(
+            err.contains("log_lines_checked=0") && err.contains("cannot pass"),
+            "a zero-line scan must not pass: {err}"
+        );
+        // Unparseable JSON entirely.
+        write("{not json");
+        let err = verdict(verify_report_artifact(&dir));
+        assert!(
+            err.contains("not valid JSON"),
+            "a non-JSON witness must be refused: {err}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -59,12 +59,14 @@ impl OrchestrationStage for LiveRebootRecoveryValidationStage {
         };
 
         // The helper binary is Linux-only; never point it at a macOS/Windows node.
-        if let Some(skip) = crate::vm_lab::orchestrator::stage::non_linux_node_skip(
+        match crate::vm_lab::orchestrator::stage::non_linux_node_skip(
             ctx,
             "reboot-recovery validation",
             &[exit_params.alias.as_str(), client_params.alias.as_str()],
         ) {
-            return skip;
+            Ok(Some(skip)) => return skip,
+            Ok(None) => {}
+            Err(unresolved) => return StageOutcome::Failed(unresolved),
         }
 
         let exit_node_id = match ctx.node_ids.get(&exit_params.alias) {

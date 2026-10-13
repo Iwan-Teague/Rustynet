@@ -250,22 +250,27 @@ pub(crate) fn non_linux_node_skip_message(
 }
 
 /// Context wrapper over [`non_linux_node_skip_message`]: resolves each alias's platform
-/// from the adapters and returns the `Skipped` outcome.
+/// from the adapters and returns the `Skipped` outcome. FAILS CLOSED (review
+/// macos-harness-a D5): an alias missing from `ctx.adapters` is an `Err`, never a
+/// silent drop — the old `filter_map` would have skipped neither checked the node
+/// nor named it.
 pub(crate) fn non_linux_node_skip(
     ctx: &crate::vm_lab::orchestrator::context::OrchestrationContext,
     what: &str,
     aliases: &[&str],
-) -> Option<crate::vm_lab::orchestrator::error::StageOutcome> {
-    let nodes: Vec<(&str, crate::vm_lab::VmGuestPlatform)> = aliases
-        .iter()
-        .filter_map(|alias| {
-            ctx.adapters
-                .get(*alias)
-                .map(|adapter| (*alias, adapter.platform()))
-        })
-        .collect();
-    non_linux_node_skip_message(what, &nodes)
-        .map(crate::vm_lab::orchestrator::error::StageOutcome::Skipped)
+) -> Result<Option<crate::vm_lab::orchestrator::error::StageOutcome>, String> {
+    let mut nodes: Vec<(&str, crate::vm_lab::VmGuestPlatform)> = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        let adapter = ctx.adapters.get(*alias).ok_or_else(|| {
+            format!(
+                "{what}: alias {alias:?} has no adapter in this run's context; refusing to \
+                 silently drop it from the non-Linux skip check (fail closed)"
+            )
+        })?;
+        nodes.push((alias, adapter.platform()));
+    }
+    Ok(non_linux_node_skip_message(what, &nodes)
+        .map(crate::vm_lab::orchestrator::error::StageOutcome::Skipped))
 }
 
 /// A path the orchestrator must hand to a child process as a UTF-8 argv
@@ -971,5 +976,88 @@ mod non_linux_skip_tests {
     #[test]
     fn an_empty_node_list_is_not_a_skip() {
         assert!(non_linux_node_skip_message("x", &[]).is_none());
+    }
+
+    /// D5 witness (review macos-harness-a): an alias missing from
+    /// `ctx.adapters` must fail CLOSED — the old `filter_map` silently dropped
+    /// it, so an unresolved node would be neither skipped nor named. The
+    /// connection in every adapter below is never dialled: the wrapper only
+    /// reads `platform()`.
+    fn ctx_with_adapters(
+        entries: &[(&str, crate::vm_lab::VmGuestPlatform)],
+    ) -> crate::vm_lab::orchestrator::context::OrchestrationContext {
+        use crate::vm_lab::orchestrator::adapter::linux::LinuxNodeAdapter;
+        use crate::vm_lab::orchestrator::adapter::macos::MacosNodeAdapter;
+        use crate::vm_lab::orchestrator::connection::NodeConnection;
+        let mut ctx = crate::vm_lab::orchestrator::context::OrchestrationContext::new(
+            Vec::new(),
+            std::path::PathBuf::from("report"),
+            "net".to_owned(),
+        );
+        for (alias, platform) in entries {
+            let adapter: Box<dyn crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter> =
+                match platform {
+                    crate::vm_lab::VmGuestPlatform::Linux => Box::new(LinuxNodeAdapter::new(
+                        *alias,
+                        NodeConnection::Adb {
+                            device_serial: "unused".to_owned(),
+                        },
+                    )),
+                    crate::vm_lab::VmGuestPlatform::Macos => Box::new(MacosNodeAdapter::new(
+                        *alias,
+                        NodeConnection::Adb {
+                            device_serial: "unused".to_owned(),
+                        },
+                        None,
+                    )),
+                    other => panic!("test factory lacks a {other:?} adapter"),
+                };
+            ctx.adapters.insert((*alias).to_owned(), adapter);
+        }
+        ctx
+    }
+
+    #[test]
+    fn non_linux_node_skip_fails_closed_on_an_unknown_alias() {
+        let ctx = ctx_with_adapters(&[("linux-1", crate::vm_lab::VmGuestPlatform::Linux)]);
+        let result =
+            super::non_linux_node_skip(&ctx, "reboot-recovery validation", &["linux-1", "ghost-9"]);
+        let err = result.expect_err("an alias with no adapter must fail closed, not be dropped");
+        assert!(
+            err.contains("ghost-9"),
+            "must name the unresolved alias: {err}"
+        );
+        assert!(
+            err.contains("no adapter"),
+            "must explain the failure: {err}"
+        );
+    }
+
+    #[test]
+    fn non_linux_node_skip_still_skips_and_names_a_known_macos_node() {
+        let ctx = ctx_with_adapters(&[
+            ("linux-1", crate::vm_lab::VmGuestPlatform::Linux),
+            ("mac-1", crate::vm_lab::VmGuestPlatform::Macos),
+        ]);
+        let outcome =
+            super::non_linux_node_skip(&ctx, "reboot-recovery validation", &["linux-1", "mac-1"])
+                .expect("all aliases resolve");
+        match outcome {
+            Some(crate::vm_lab::orchestrator::error::StageOutcome::Skipped(reason)) => {
+                assert!(reason.contains("mac-1 (Macos)"), "{reason}");
+            }
+            other => panic!("a known macOS node must produce a named skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_linux_node_skip_is_ok_none_when_every_alias_is_linux() {
+        let ctx = ctx_with_adapters(&[
+            ("linux-1", crate::vm_lab::VmGuestPlatform::Linux),
+            ("linux-2", crate::vm_lab::VmGuestPlatform::Linux),
+        ]);
+        let outcome =
+            super::non_linux_node_skip(&ctx, "reboot-recovery validation", &["linux-1", "linux-2"]);
+        assert_eq!(outcome, Ok(None), "all-Linux aliases must not skip");
     }
 }

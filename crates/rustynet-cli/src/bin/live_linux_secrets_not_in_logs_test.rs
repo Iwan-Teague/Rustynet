@@ -19,8 +19,8 @@ mod live_lab_support;
 use std::path::PathBuf;
 
 use live_lab_support::{
-    LiveLabContext, LiveLabPlatform, Logger, REMOTE_RUSTYNET_BIN, daemon_unit_log_argv,
-    enrollment_secret_path, repo_root, run_cargo_ops,
+    LiveLabContext, LiveLabPlatform, Logger, MACOS_UNIFIED_LOG_WINDOW, REMOTE_RUSTYNET_BIN,
+    daemon_unit_log_argv, enrollment_secret_path, repo_root, run_cargo_ops,
 };
 
 fn main() {
@@ -194,31 +194,47 @@ fn run() -> Result<(), String> {
 
     // ── Stage 3: collect daemon log lines ────────────────────────────────────
     // Linux: the journald unit log (unchanged argv). macOS: the unified-log
-    // window for the daemon process PLUS the launchd StandardOut/StandardError
-    // files — a plain Rust daemon does not mirror its stderr into the unified
-    // log, so the files are where a leak would actually appear. Every chunk is
-    // allow-failure (a missing log file is not a custody violation) and every
-    // chunk's lines are scanned identically below.
+    // window for the daemon process (FIXED `--last 15m` window, see
+    // MACOS_UNIFIED_LOG_WINDOW — never derived from `lines`) PLUS the launchd
+    // StandardOut/StandardError files — a plain Rust daemon does not mirror
+    // its stderr into the unified log, so the files are where a leak would
+    // actually appear. Every chunk is allow-failure (a missing log file is
+    // not a custody violation) and every chunk's lines are scanned identically
+    // below. D1 (review macos-harness-b): a pass is IMPOSSIBLE when every
+    // chunk came back empty — the run fails below with the per-chunk counts
+    // instead of reporting a clean scan that read nothing.
     logger.line(format!(
-        "[secrets-log] collecting daemon log lines from rustynetd (platform {})",
+        "[secrets-log] collecting daemon log lines from rustynetd (platform {}; unified-log \
+         window fixed at {MACOS_UNIFIED_LOG_WINDOW} on macos; tail chunks honour the lines \
+         argument)",
         platform.as_str()
     ))?;
     let log_chunks = daemon_unit_log_argv(platform, "500", true)?;
     let mut journal = String::new();
+    let mut chunk_line_counts: Vec<usize> = Vec::with_capacity(log_chunks.len());
     for chunk in &log_chunks {
         let chunk_output = ctx
             .capture_root_allow_failure(&target_host, chunk)
             .unwrap_or_default();
+        let chunk_lines = chunk_output.lines().count();
+        chunk_line_counts.push(chunk_lines);
         journal.push_str(&chunk_output);
         if !journal.ends_with('\n') {
             journal.push('\n');
         }
     }
 
-    let line_count = journal.lines().count();
+    // Count what was ACTUALLY collected (sum of the chunks' own line counts),
+    // not the newline-padded merge buffer: padding an empty collection to
+    // "\n" must not read as one scanned line.
+    let line_count: usize = chunk_line_counts.iter().sum();
     logger.line(format!(
-        "[secrets-log] collected {line_count} journal lines"
+        "[secrets-log] collected {line_count} journal lines (per chunk: {chunk_line_counts:?})"
     ))?;
+    if let Some(refusal) = secrets_zero_line_refusal(&platform, &chunk_line_counts) {
+        logger.line(format!("[secrets-log] FAIL {refusal}"))?;
+        return Err(refusal);
+    }
 
     // ── Stage 4-6: scan for key patterns ─────────────────────────────────────
     let hex64_matches = scan_hex_pattern(&journal, 64);
@@ -283,6 +299,33 @@ fn run() -> Result<(), String> {
         report_path.display()
     ))?;
     Ok(())
+}
+
+/// D1 (review macos-harness-b): the named refusal when a secrets scan read
+/// nothing. `chunk_line_counts` holds one entry per
+/// [`daemon_unit_log_argv`] chunk, in collection order. `Some` ⇒ the caller
+/// must fail the run: `total_suspicious == 0` over zero scanned lines is a
+/// collection failure, not a clean log, and a pass on it would be
+/// indistinguishable from `sudo -n log show` failing or both launchd log
+/// files being absent on a fresh/rotated guest.
+fn secrets_zero_line_refusal(
+    platform: &LiveLabPlatform,
+    chunk_line_counts: &[usize],
+) -> Option<String> {
+    if chunk_line_counts.iter().sum::<usize>() > 0 {
+        return None;
+    }
+    let per_chunk = chunk_line_counts
+        .iter()
+        .enumerate()
+        .map(|(idx, count)| format!("chunk {idx} collected {count} lines"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "secrets-not-in-logs log collection read NOTHING on platform {}: {per_chunk} — a pass \
+         is impossible without scanned evidence (fail closed; D1)",
+        platform.as_str()
+    ))
 }
 
 fn scan_hex_pattern(text: &str, char_len: usize) -> Vec<String> {
@@ -419,6 +462,40 @@ mod tests {
     fn windows_platform_fails_closed_before_any_remote_work() {
         assert!(enrollment_secret_path(LiveLabPlatform::Windows).is_err());
         assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "500", true).is_err());
+    }
+
+    #[test]
+    fn zero_collected_lines_refuse_a_pass_with_platform_and_per_chunk_counts() {
+        // D1: a secrets scan that read nothing must fail with a named error
+        // that names the platform and every chunk's collected line count —
+        // never a clean verdict over zero evidence.
+        for platform in [LiveLabPlatform::Linux, LiveLabPlatform::MacOs] {
+            let chunk_counts = if platform == LiveLabPlatform::MacOs {
+                vec![0, 0, 0]
+            } else {
+                vec![0]
+            };
+            let refusal = secrets_zero_line_refusal(&platform, &chunk_counts).expect("must refuse");
+            assert!(
+                refusal.contains(platform.as_str()),
+                "the refusal must name the platform: {refusal}"
+            );
+            for (idx, count) in chunk_counts.iter().enumerate() {
+                assert!(
+                    refusal.contains(&format!("chunk {idx} collected {count} lines")),
+                    "the refusal must name each chunk's collected line count: {refusal}"
+                );
+            }
+            assert!(
+                refusal.contains("fail closed") && refusal.contains("impossible"),
+                "the refusal must state that a pass is impossible: {refusal}"
+            );
+        }
+        // Positive control: real collected evidence never refuses.
+        assert!(secrets_zero_line_refusal(&LiveLabPlatform::MacOs, &[0, 12, 3]).is_none());
+        assert!(secrets_zero_line_refusal(&LiveLabPlatform::Linux, &[500]).is_none());
+        // And an empty slice (no chunks at all) is zero evidence too.
+        assert!(secrets_zero_line_refusal(&LiveLabPlatform::Linux, &[]).is_some());
     }
 
     #[test]

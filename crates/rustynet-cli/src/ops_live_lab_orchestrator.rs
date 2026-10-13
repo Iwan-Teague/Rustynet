@@ -3288,6 +3288,17 @@ pub fn execute_ops_write_live_linux_key_custody_report(
 pub fn execute_ops_write_live_linux_secrets_not_in_logs_report(
     config: WriteLiveLinuxSecretsNotInLogsReportConfig,
 ) -> Result<String, String> {
+    // D1 (review macos-harness-b): a pass is IMPOSSIBLE when the scan read
+    // nothing — the report's own log_lines_checked must be > 0 for status
+    // pass, so a producer bug cannot mint a passing witness over zero
+    // evidence even if every downstream consumer were absent.
+    if config.log_lines_checked == 0 && config.overall_status.trim() == CHECK_PASS {
+        return Err(
+            "live_linux_secrets_not_in_logs report refused: log_lines_checked=0 cannot carry \
+             status=pass — a scan that read nothing proves nothing (fail closed; D1)"
+                .to_owned(),
+        );
+    }
     let report_path = resolve_path(config.report_path.as_path())?;
     let verdict = if config.verdict.trim() == "clean" || config.verdict.trim() == "contaminated" {
         config.verdict.trim().to_owned()
@@ -4277,10 +4288,11 @@ mod tests {
         WriteActiveNetworkSignedStateTamperReportConfig, WriteLiveLabStageArtifactIndexConfig,
         WriteLiveLinuxControlSurfaceReportConfig, WriteLiveLinuxEndpointHijackReportConfig,
         WriteLiveLinuxLabRunSummaryConfig, WriteLiveLinuxRebootRecoveryReportConfig,
-        WriteLiveLinuxServerIpBypassReportConfig, WriteRealWireguardExitnodeE2eReportConfig,
-        WriteRoleSwitchMatrixReportConfig, count_no_leak_cleartext_packets,
-        count_no_leak_tunnel_packets, dns_query_bind_addr, execute_ops_check_local_file_mode,
-        execute_ops_rewrite_assignment_mesh_cidr, execute_ops_rewrite_assignment_peer_endpoint_ip,
+        WriteLiveLinuxSecretsNotInLogsReportConfig, WriteLiveLinuxServerIpBypassReportConfig,
+        WriteRealWireguardExitnodeE2eReportConfig, WriteRoleSwitchMatrixReportConfig,
+        count_no_leak_cleartext_packets, count_no_leak_tunnel_packets, dns_query_bind_addr,
+        execute_ops_check_local_file_mode, execute_ops_rewrite_assignment_mesh_cidr,
+        execute_ops_rewrite_assignment_peer_endpoint_ip,
         execute_ops_update_role_switch_host_result,
         execute_ops_validate_cross_network_forensics_bundle,
         execute_ops_write_active_network_rogue_path_hijack_report,
@@ -4290,6 +4302,7 @@ mod tests {
         execute_ops_write_live_linux_endpoint_hijack_report,
         execute_ops_write_live_linux_lab_run_summary,
         execute_ops_write_live_linux_reboot_recovery_report,
+        execute_ops_write_live_linux_secrets_not_in_logs_report,
         execute_ops_write_live_linux_server_ip_bypass_report,
         execute_ops_write_real_wireguard_exitnode_e2e_report,
         execute_ops_write_role_switch_matrix_report, redact_forensics_payload,
@@ -4307,6 +4320,57 @@ mod tests {
             .expect("clock")
             .as_nanos();
         std::env::temp_dir().join(format!("rustynet-cli-{name}-{stamp}"))
+    }
+
+    /// D1 (review macos-harness-b): the report writer itself refuses to mint
+    /// a passing secrets-not-in-logs witness whose scan read nothing, so a
+    /// pass over zero evidence is impossible even before any consumer reads
+    /// the file.
+    #[test]
+    fn secrets_report_writer_refuses_pass_over_zero_scanned_lines() {
+        let report_path = temp_path("secrets_zero_lines_refused.json");
+        let err = execute_ops_write_live_linux_secrets_not_in_logs_report(
+            WriteLiveLinuxSecretsNotInLogsReportConfig {
+                report_path: report_path.clone(),
+                log_lines_checked: 0,
+                suspicious_matches: 0,
+                hex64_matches: 0,
+                hex32_matches: 0,
+                b64_key_matches: 0,
+                verdict: "clean".to_owned(),
+                overall_status: "pass".to_owned(),
+            },
+        )
+        .expect_err("log_lines_checked=0 with status=pass must be refused");
+        assert!(
+            err.contains("log_lines_checked=0") && err.contains("fail closed"),
+            "the refusal must name the impossible pass: {err}"
+        );
+        assert!(
+            !report_path.exists(),
+            "a refused report must not be written"
+        );
+        // Positive control: a real scan with zero suspicious matches writes
+        // and passes.
+        execute_ops_write_live_linux_secrets_not_in_logs_report(
+            WriteLiveLinuxSecretsNotInLogsReportConfig {
+                report_path: report_path.clone(),
+                log_lines_checked: 500,
+                suspicious_matches: 0,
+                hex64_matches: 0,
+                hex32_matches: 0,
+                b64_key_matches: 0,
+                verdict: "clean".to_owned(),
+                overall_status: "pass".to_owned(),
+            },
+        )
+        .expect("a real scan with zero suspicious matches passes");
+        let body = fs::read_to_string(&report_path).expect("report written");
+        assert!(
+            body.contains("\"log_lines_checked\": 500"),
+            "the report must carry the scanned line count: {body}"
+        );
+        let _ = fs::remove_file(&report_path);
     }
 
     #[test]

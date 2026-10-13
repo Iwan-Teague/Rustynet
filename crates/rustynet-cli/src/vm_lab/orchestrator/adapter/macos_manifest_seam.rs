@@ -75,6 +75,35 @@ const ENV_PREBUILT_MANIFEST_PATH: &str = "RN_PREBUILT_RELEASE_MANIFEST";
 /// bootstrap hard-fails on every one of these names in RN_PREBUILT_DIR.
 const PREBUILT_ARTIFACT_NAMES: [&str; 3] = ["rustynetd", "rustynet-cli", "rustynet-relay"];
 
+/// D5 (review macos-harness-b): the artifact triple every lab manifest line
+/// carries. The lab fleet is aarch64-macOS-only, and the manifest triple
+/// must label the artifacts honestly — signing an x86_64 build under an
+/// `aarch64-apple-darwin` triple would mislabel what the guest verifies.
+/// [`seam_target_triple_for_arch`] refuses any other host arch instead.
+pub(crate) const LAB_SEAM_TARGET_TRIPLE: &str = "aarch64-apple-darwin";
+
+/// D5: resolve the manifest triple for the seam's host, refusing (named
+/// error) when the host arch is not aarch64. Split from
+/// [`seam_target_triple`] so the refusal is unit-testable on any host.
+fn seam_target_triple_for_arch(host_arch: &str) -> Result<&'static str, AdapterError> {
+    if host_arch == "aarch64" {
+        Ok(LAB_SEAM_TARGET_TRIPLE)
+    } else {
+        Err(AdapterError::Protocol {
+            message: format!(
+                "lab manifest seam: this host is '{host_arch}' but every lab manifest triple \
+                 is pinned to '{LAB_SEAM_TARGET_TRIPLE}' (the lab fleet is aarch64-macOS-only); \
+                 signing here would mislabel the artifacts — refuse instead (fail closed; D5)"
+            ),
+        })
+    }
+}
+
+/// The manifest triple for THIS host (`std::env::consts::ARCH`).
+fn seam_target_triple() -> Result<&'static str, AdapterError> {
+    seam_target_triple_for_arch(std::env::consts::ARCH)
+}
+
 /// Seeds older than this are leftovers from a SIGKILLed/`process::exit`ed
 /// run (the Drop guard only covers unwinding). Swept at the next mint; the
 /// threshold is far above any single install's lifetime, so a concurrent
@@ -345,7 +374,8 @@ impl LabManifestSeam {
         let staged = stage_source_archive(&run_dir, source_archive)?;
         let source_manifest_path = create_lab_manifest(
             &[format!(
-                "rn_source.tar.gz:aarch64-apple-darwin:{}",
+                "rn_source.tar.gz:{}:{}",
+                seam_target_triple()?,
                 staged.display()
             )],
             &seed_path,
@@ -421,6 +451,7 @@ fn stage_source_archive(run_dir: &Path, source_archive: &Path) -> Result<PathBuf
 /// hard-fails if any of the three is missing from RN_PREBUILT_DIR, so a
 /// subset would only move the failure to the guest.
 fn prebuilt_artifact_specs(binaries: &[PathBuf]) -> Result<Vec<String>, AdapterError> {
+    let triple = seam_target_triple()?;
     let mut specs = Vec::with_capacity(binaries.len());
     for bin in binaries {
         let name =
@@ -438,7 +469,7 @@ fn prebuilt_artifact_specs(binaries: &[PathBuf]) -> Result<Vec<String>, AdapterE
                 ),
             });
         }
-        specs.push(format!("{name}:aarch64-apple-darwin:{}", bin.display()));
+        specs.push(format!("{name}:{triple}:{}", bin.display()));
     }
     let mut names: Vec<&str> = specs
         .iter()
@@ -655,6 +686,55 @@ mod tests {
         // manifest itself survives (evidence for the run report)
         assert!(manifest_path.exists());
         std::fs::remove_dir_all(&report).unwrap();
+    }
+
+    /// D5 (review macos-harness-b): the manifest triple is pinned to
+    /// aarch64 macOS; a host that is not aarch64 must be REFUSED with a
+    /// named error instead of receiving mislabelled artifact specs.
+    #[test]
+    fn seam_triple_refuses_a_non_aarch64_host_arch() {
+        assert_eq!(
+            seam_target_triple_for_arch("aarch64").expect("aarch64 is the pinned lab host"),
+            LAB_SEAM_TARGET_TRIPLE,
+        );
+        let err = seam_target_triple_for_arch("x86_64").expect_err("must refuse");
+        match err {
+            AdapterError::Protocol { message } => {
+                assert!(
+                    message.contains("x86_64"),
+                    "the refusal must name the offending arch: {message}"
+                );
+                assert!(
+                    message.contains(LAB_SEAM_TARGET_TRIPLE),
+                    "the refusal must name the pinned triple: {message}"
+                );
+                assert!(
+                    message.contains("mislabel"),
+                    "the refusal must say why: {message}"
+                );
+            }
+            other => panic!("expected AdapterError::Protocol, got {other:?}"),
+        }
+    }
+
+    /// D5: on the lab fleet (aarch64 macOS) the real host arch resolves, and
+    /// the artifact specs carry exactly the pinned triple — the mislabelled
+    /// hardcoded string is gone from both manifest paths.
+    #[test]
+    fn prebuilt_specs_carry_the_pinned_lab_triple() {
+        let triple =
+            seam_target_triple().expect("this host must be aarch64 for the seam to run at all");
+        assert_eq!(triple, "aarch64-apple-darwin");
+        let bins: Vec<PathBuf> = PREBUILT_ARTIFACT_NAMES
+            .iter()
+            .map(|name| PathBuf::from(format!("/tmp/fake-target-dir/{name}")))
+            .collect();
+        for spec in prebuilt_artifact_specs(&bins).expect("specs") {
+            assert!(
+                spec.contains(":aarch64-apple-darwin:"),
+                "every spec must carry the pinned triple: {spec}"
+            );
+        }
     }
 
     #[test]

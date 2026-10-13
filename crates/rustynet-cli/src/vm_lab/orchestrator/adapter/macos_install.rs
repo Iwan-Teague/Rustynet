@@ -117,6 +117,14 @@ const SUDO_N: &str = "sudo -n";
 /// only (the bootstrap's `manage_enrollment_secret`): an admin node must carry it at 0600
 /// and every other node must NOT (live macOS run46: requiring it on a client failed a
 /// correct bootstrap with an empty remote error).
+///
+/// Fail-closed: the script opens with a `sudo -n true` canary. Without it, a broken
+/// `sudo -n` (expired ticket, sudoers change) made the non-admin leg
+/// `! sudo -n test -e <path>` a PASS — the negation inverted sudo's own failure into
+/// "secret absent" (review macos-harness-a D3). The canary proves sudo works before any
+/// leg runs; the non-admin leg is additionally a positive `if ... then exit 1` so a
+/// PRESENT secret is itself a non-zero exit, never an inverted accident. argv-only:
+/// no `sh -c`, matching every other leg.
 fn macos_post_install_verify_script(daemon_node_role: &str) -> String {
     let enrollment_check = if daemon_node_role == "admin" {
         format!(
@@ -124,10 +132,11 @@ fn macos_post_install_verify_script(daemon_node_role: &str) -> String {
              test $(sudo -n stat -f '%Mp%Lp' {MACOS_ENROLLMENT_SECRET_PATH}) = '0600'"
         )
     } else {
-        format!("! sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}")
+        format!("if sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}; then exit 1; fi")
     };
     format!(
-        "test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
+        "sudo -n true || exit 1; \
+         test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
          sudo -n test -f {MACOS_KEYS_DIR}/wireguard.pub && \
          {enrollment_check}"
     )
@@ -2893,14 +2902,129 @@ mod tests {
         for role in ["client", "blind_exit"] {
             let script = macos_post_install_verify_script(role);
             assert!(
-                script.contains(&format!("! sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}")),
-                "{role} must be secretless: {script}"
+                script.contains(&format!(
+                    "if sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}; then exit 1; fi"
+                )),
+                "{role} must fail the run if the secret is PRESENT (positive absence check, \
+                 fail closed): {script}"
             );
             assert!(
-                !script.contains("test -f /usr/local/var/rustynet/keys/enrollment.secret"),
+                !script.contains(&format!("test -f {MACOS_ENROLLMENT_SECRET_PATH}")),
                 "{role} must not require the secret: {script}"
             );
+            assert!(
+                !script.contains(&format!("! sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}")),
+                "{role} must not use the fail-open negated form: {script}"
+            );
         }
+        for script in [
+            macos_post_install_verify_script("admin"),
+            macos_post_install_verify_script("client"),
+            macos_post_install_verify_script("blind_exit"),
+        ] {
+            assert!(
+                script.starts_with("sudo -n true || exit 1; "),
+                "every leg must open with the sudo canary so a broken sudo -n is a failure, \
+                 never an inverted pass: {script}"
+            );
+        }
+    }
+
+    /// D3 behavioural witness: the generated verify script, executed locally under /bin/sh
+    /// with a stubbed `sudo` on PATH, must fail closed in every broken-sudo/secret-present
+    /// combination. On the pre-D3 script the `client` + broken-sudo cell inverted sudo's
+    /// failure into a pass (exit 0).
+    #[test]
+    #[cfg(unix)]
+    fn post_install_verify_script_fails_closed_when_sudo_is_broken() {
+        let sudo_bin = std::env::temp_dir().join(format!("mra-sudo-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&sudo_bin).expect("sudo stub dir");
+        let sudo = sudo_bin.join("sudo");
+        std::fs::write(
+            &sudo,
+            "#!/bin/sh
+if [ \"$MRA_SUDO\" = broken ]; then
+  echo 'sudo: a password is required' >&2
+  exit 1
+fi
+shift # drop -n
+if [ \"$1\" = true ]; then exit 0; fi
+if [ \"$1\" = test ]; then
+  shift # $1 is now the operator (-f/-e), $2 the path
+  if [ \"$2\" = \"/usr/local/var/rustynet/keys/enrollment.secret\" ]; then
+    if [ \"$MRA_SECRET\" = present ]; then exit 0; else exit 1; fi
+  fi
+  exit 0
+fi
+if [ \"$1\" = stat ]; then echo 0600; exit 0; fi
+exit 1
+",
+        )
+        .expect("write sudo stub");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod sudo stub");
+
+        let script_for = |role: &str, sudo_mode: &str, secret: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("verify.sh");
+            // Harness: shadow the `test` builtin so the absolute daemon paths
+            // (`test -x /usr/local/bin/rustynetd`, which do not exist on this
+            // build host) pass, while `command test` keeps every other
+            // comparison real; `sudo` comes from the stub dir above.
+            let harness = format!(
+                "#!/bin/sh\ntest() {{\n  if [ \"$1\" = -x ]; then return 0; fi\n  \
+                 command test \"$@\"\n}}\n{}\n",
+                macos_post_install_verify_script(role)
+            );
+            std::fs::write(&path, harness).expect("write script");
+            let output = std::process::Command::new("/bin/sh")
+                .arg(path)
+                .env_clear()
+                .env("PATH", &sudo_bin)
+                .env("MRA_SUDO", sudo_mode)
+                .env("MRA_SECRET", secret)
+                .output()
+                .expect("run verify script");
+            output.status.success()
+        };
+
+        // sudo works: admin needs the secret at 0600, non-admin needs it absent.
+        assert!(
+            script_for("admin", "ok", "present"),
+            "admin + secret present"
+        );
+        assert!(!script_for("admin", "ok", "absent"), "admin + no secret");
+        assert!(script_for("client", "ok", "absent"), "client + no secret");
+        assert!(
+            !script_for("client", "ok", "present"),
+            "client + secret present must FAIL the verify"
+        );
+        // sudo broken: EVERY role must fail (the old negated non-admin leg passed here).
+        for role in ["admin", "client", "blind_exit"] {
+            for secret in ["present", "absent"] {
+                assert!(
+                    !script_for(role, "broken", secret),
+                    "{role} + broken sudo + secret {secret} must fail closed"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&sudo_bin);
+    }
+
+    /// Slice the full `manage_enrollment_secret` function text out of the embedded
+    /// bootstrap script — by function body (first `\n}` at column 0), never by grepping
+    /// the whole file, so a second copy of these tokens elsewhere cannot satisfy this.
+    fn bootstrap_manage_enrollment_secret_function() -> String {
+        const HEADER: &str = "manage_enrollment_secret() {";
+        let start = BOOTSTRAP_SCRIPT
+            .find(HEADER)
+            .expect("manage_enrollment_secret must be defined in the bootstrap script");
+        let rest = &BOOTSTRAP_SCRIPT[start..];
+        let close = rest
+            .find("\n}\n")
+            .expect("manage_enrollment_secret must be closed by a column-0 brace");
+        rest[..close + "\n}\n".len()].to_owned()
     }
 
     #[test]
@@ -2916,20 +3040,130 @@ mod tests {
             !BOOTSTRAP_SCRIPT.contains("\n  provision_enrollment_secret\n"),
             "no main branch may call the unconditional provisioner directly"
         );
-        let start = BOOTSTRAP_SCRIPT
-            .find("manage_enrollment_secret() {")
-            .expect("role gate defined");
-        let rest = &BOOTSTRAP_SCRIPT[start..];
-        let end = rest.find("\n}\n").expect("role gate closed");
-        let body = &rest[..end];
+        let function = bootstrap_manage_enrollment_secret_function();
+        // The gate itself, verbatim: exactly the admin role, no widened
+        // `admin || client` (mutant M2 of review macos-harness-a survived the
+        // old presence-only check).
+        let gate_line = function
+            .lines()
+            .find(|line| line.contains("DAEMON_NODE_ROLE") && line.contains("=="))
+            .expect("gate line must exist");
+        assert_eq!(
+            gate_line.trim(),
+            "if [[ \"${DAEMON_NODE_ROLE:-}\" == \"admin\" ]]; then",
+            "the gate must key on EXACTLY the admin role: {function}"
+        );
+        // Slice the if-arm (between the gate's `then` and its `fi`) and everything
+        // AFTER that fi (the non-admin arm) apart, and assert each side's calls.
+        let after_then = function
+            .split_once("then\n")
+            .map(|(_, rest)| rest)
+            .expect("gate must open a then-arm");
+        let (admin_arm, after_fi) = after_then
+            .split_once("\n  fi\n")
+            .expect("gate's fi must close at two-space indent");
         assert!(
-            body.contains("\"${DAEMON_NODE_ROLE:-}\" == \"admin\""),
-            "the gate must key on the admin role: {body}"
+            admin_arm.contains("provision_enrollment_secret"),
+            "the admin arm must provision the secret: {function}"
         );
         assert!(
-            body.contains("secure_remove_file \"${secret_path}\""),
-            "a leftover secret on a non-admin node must be removed: {body}"
+            !admin_arm.contains("secure_remove_file"),
+            "the admin arm must not remove the secret: {function}"
         );
+        assert!(
+            after_fi.contains("secure_remove_file"),
+            "the non-admin arm must remove a leftover secret: {function}"
+        );
+        assert!(
+            !after_fi.contains("provision_enrollment_secret"),
+            "the non-admin arm (and any code after it) must NOT provision: {function}"
+        );
+    }
+
+    /// D1 behavioural witness: run the EXTRACTED `manage_enrollment_secret` function
+    /// under bash with `provision_enrollment_secret`/`secure_remove_file` stubbed to
+    /// record their calls, for every node role, and assert the call matrix. A widened
+    /// gate (`admin || client`, the survived mutant M2) makes `client` call the
+    /// provisioner and fails here; a non-admin arm that stops removing leftovers
+    /// fails the remove cases.
+    #[test]
+    #[cfg(unix)]
+    fn manage_enrollment_secret_call_matrix_under_bash() {
+        let function = bootstrap_manage_enrollment_secret_function();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys = dir.path().join("keys");
+        std::fs::create_dir_all(&keys).expect("keys dir");
+        let secret_path = keys.join("enrollment.secret");
+        let calls_path = dir.path().join("calls");
+        let harness_path = dir.path().join("harness.sh");
+        std::fs::write(
+            &harness_path,
+            format!(
+                "#!/bin/bash\nset -u\nKEYS_DIR={keys:?}\nCALLS_FILE={calls_path:?}\n\
+                 provision_enrollment_secret() {{ echo provision >> \"$CALLS_FILE\"; }}\n\
+                 secure_remove_file() {{ rm -f \"$1\"; echo \"remove:$1\" >> \"$CALLS_FILE\"; }}\"remove:$1\" >> \"$CALLS_FILE\"; }}\n\
+                 {function}\n\
+                 DAEMON_NODE_ROLE=\"$1\" manage_enrollment_secret\n"
+            ),
+        )
+        .expect("write harness");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&harness_path, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod harness");
+
+        // (role, seed a leftover secret first, expected recorded calls)
+        let matrix = [
+            ("admin", true, vec!["provision"]),
+            ("client", true, vec!["remove"]),
+            ("relay", true, vec!["remove"]),
+            ("exit", false, vec![]),
+            ("unset", false, vec![]),
+        ];
+        for (role, seed_secret, expected) in matrix {
+            let _ = std::fs::remove_file(&calls_path);
+            let _ = std::fs::remove_file(&secret_path);
+            if seed_secret {
+                std::fs::write(&secret_path, b"seed").expect("seed secret");
+            }
+            let output = std::process::Command::new("/bin/bash")
+                .arg(&harness_path)
+                .arg(role)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .expect("run harness");
+            assert!(
+                output.status.success(),
+                "role {role}: harness must exit 0 (bootstrap never fails on the role gate): \
+                 {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let calls = std::fs::read_to_string(&calls_path).unwrap_or_default();
+            let calls: Vec<&str> = calls.lines().filter(|l| !l.is_empty()).collect();
+            let expected_remove = expected.contains(&"remove");
+            if expected_remove {
+                assert_eq!(
+                    calls,
+                    vec![format!("remove:{}", secret_path.display())],
+                    "role {role}: non-admin arm must remove the leftover and nothing else"
+                );
+                assert!(
+                    !secret_path.exists(),
+                    "role {role}: the leftover secret must be gone"
+                );
+            } else {
+                assert_eq!(
+                    calls, expected,
+                    "role {role}: unexpected provisioner/remover calls (gate leaked?)"
+                );
+            }
+            assert!(
+                calls
+                    .iter()
+                    .all(|c| *c == "provision" || c.starts_with("remove:")),
+                "role {role}: only stubbed calls may be recorded: {calls:?}"
+            );
+        }
     }
 
     #[test]
@@ -3602,6 +3836,152 @@ mod tests {
                 .contains("Idempotent: if the secret already exists it is left untouched"),
             "the header comment must not contradict the always-re-mint behaviour"
         );
+    }
+
+    /// D4 (review macos-harness-b): the gossip mint's trap window must not
+    /// silently disarm a trap the caller armed before it. Runs the REAL
+    /// `provision_gossip_signing_secret` body (awk-extracted verbatim from
+    /// BOOTSTRAP_SCRIPT) under bash with `chown`/`sudo`/`sleep` stubbed, so
+    /// no root/keychain work happens: a pre-existing EXIT/TERM/INT/HUP trap
+    /// must still be armed after a successful mint (the old code ran
+    /// `trap - EXIT TERM INT HUP`, wiping it) and must FIRE when a mint
+    /// failure exits. Running under whatever `bash` resolves to (3.2 on
+    /// stock macOS) also pins the script's bash 3.2 compatibility.
+    #[cfg(unix)]
+    #[test]
+    fn bootstrap_gossip_mint_preserves_pre_existing_traps() {
+        use std::process::Command;
+
+        let script = write_temp_file("rn_d4_bootstrap_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())
+            .expect("write a copy of the bootstrap script");
+        let work = std::env::temp_dir().join(format!("rn_d4_work_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).expect("work dir");
+
+        let success_harness = r#"set -euo pipefail
+SCRIPT="$1"; WORK="$2"
+awk '/^provision_gossip_signing_secret\(\) \{/,/^\}$/' "$SCRIPT" > "$WORK/fn.sh"
+# shellcheck source=/dev/null
+source "$WORK/fn.sh"
+KEYS_DIR="$WORK/keys"; BOOTSTRAP_DIR="$WORK"; RUSTYNETD_BIN="rustynetd-stub"
+mkdir -p "$KEYS_DIR"
+: > "${BOOTSTRAP_DIR}/wireguard.passphrase"
+: > "${KEYS_DIR}/gossip.signing.secret"
+CALLS="$WORK/calls.log"; : > "$CALLS"
+chown() { printf '%s\n' "chown $*" >> "$CALLS"; }
+sudo() { return 0; }
+sleep() { return 0; }
+trap 'touch "$WORK/prior_exit_fired"' EXIT
+trap 'touch "$WORK/prior_term_fired"' TERM
+trap 'touch "$WORK/prior_int_fired"' INT
+trap 'touch "$WORK/prior_hup_fired"' HUP
+trap -p EXIT > "$WORK/before_exit.txt"
+trap -p TERM > "$WORK/before_term.txt"
+trap -p INT > "$WORK/before_int.txt"
+trap -p HUP > "$WORK/before_hup.txt"
+provision_gossip_signing_secret
+trap -p EXIT > "$WORK/after_exit.txt"
+trap -p TERM > "$WORK/after_term.txt"
+trap -p INT > "$WORK/after_int.txt"
+trap -p HUP > "$WORK/after_hup.txt"
+"#;
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(success_harness)
+            .arg("rn_d4_harness")
+            .arg(script.as_os_str())
+            .arg(work.as_os_str())
+            .output()
+            .expect("run the extracted gossip-mint function under bash");
+        assert!(
+            output.status.success(),
+            "a stubbed successful mint must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls = std::fs::read_to_string(work.join("calls.log")).unwrap_or_default();
+        assert!(
+            calls.contains("chown root:wheel"),
+            "the mint must take root ownership of the keys dir: {calls}"
+        );
+        let keys_dir_str = work.join("keys").display().to_string();
+        assert!(
+            calls.contains(&format!("chown rustynetd:rustynetd {keys_dir_str}")),
+            "the keys dir must be handed back to the service account: {calls}"
+        );
+        assert!(
+            calls.contains(&format!(
+                "chown rustynetd:rustynetd {keys_dir_str}/gossip.signing.secret"
+            )),
+            "the minted secret must be handed to the service account: {calls}"
+        );
+        // D4 core: the caller's traps SURVIVE the mint exactly as they were armed.
+        // Compared against the listing taken just BEFORE the mint rather than a
+        // fixed marker: bash cannot trap a signal that was ignored when the shell
+        // started, and a test process run as a background job (INT, QUIT) or under
+        // `nohup` (HUP) inherits exactly that. There the listing is `trap -- ''
+        // SIG` both before and after (unchanged is the correct outcome), while
+        // the old `trap - EXIT TERM INT HUP` still changes every armed signal.
+        for signal in ["exit", "term", "int", "hup"] {
+            let before = std::fs::read_to_string(work.join(format!("before_{signal}.txt")))
+                .unwrap_or_default();
+            let after = std::fs::read_to_string(work.join(format!("after_{signal}.txt")))
+                .unwrap_or_default();
+            assert_eq!(
+                after, before,
+                "the prior {signal} trap must be exactly as armed after the mint (old code \
+                 cleared it with `trap -`)"
+            );
+        }
+        // EXIT can never be inherited as ignored, so it is always armed here: keeps
+        // the comparison above from passing vacuously when every signal was ignored.
+        let armed_exit = std::fs::read_to_string(work.join("before_exit.txt")).unwrap_or_default();
+        assert!(
+            armed_exit.contains("prior_exit_fired"),
+            "harness sanity: the prior EXIT trap must be armed before the mint: {armed_exit:?}"
+        );
+        // And the restored EXIT trap actually fires when the harness exits.
+        assert!(
+            work.join("prior_exit_fired").exists(),
+            "the restored prior EXIT trap must fire at script exit"
+        );
+        let _ = std::fs::remove_file(&script);
+
+        // Failure path: every mint attempt fails → the function must exit
+        // non-zero, hand the keys dir back, and the caller's EXIT trap must
+        // still fire (the old code disarmed it before exiting).
+        let work_f = std::env::temp_dir().join(format!("rn_d4_fail_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_f);
+        std::fs::create_dir_all(&work_f).expect("fail work dir");
+        let failure_harness =
+            success_harness.replace("sudo() { return 0; }", "sudo() { return 1; }") + "\nexit 3\n";
+        let script_f = write_temp_file("rn_d4_bootstrap_fail_", ".sh", BOOTSTRAP_SCRIPT.as_bytes())
+            .expect("write a copy of the bootstrap script");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(failure_harness.as_str())
+            .arg("rn_d4_harness_fail")
+            .arg(script_f.as_os_str())
+            .arg(work_f.as_os_str())
+            .output()
+            .expect("run the failing mint under bash");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "an exhausted mint must abort the script"
+        );
+        let calls = std::fs::read_to_string(work_f.join("calls.log")).unwrap_or_default();
+        assert!(
+            calls.contains("chown rustynetd:rustynetd"),
+            "the keys dir must be handed back even when the mint fails: {calls}"
+        );
+        assert!(
+            work_f.join("prior_exit_fired").exists(),
+            "the caller's prior EXIT trap must fire on the mint-failure exit (old code \
+             clobbered it)"
+        );
+        let _ = std::fs::remove_file(&script_f);
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&work_f);
     }
 
     /// The gossip mint must be wired into BOTH main branches of the bootstrap

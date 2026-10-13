@@ -29,8 +29,8 @@ mod live_lab_support;
 use std::path::PathBuf;
 
 use live_lab_support::{
-    LiveLabContext, LiveLabPlatform, Logger, daemon_unit_log_argv, repo_root, run_cargo_ops,
-    stat_mode_argv, wg_encrypted_key_paths,
+    LiveLabContext, LiveLabPlatform, Logger, MACOS_UNIFIED_LOG_WINDOW, daemon_unit_log_argv,
+    repo_root, run_cargo_ops, stat_mode_argv, wg_encrypted_key_paths,
 };
 
 fn main() {
@@ -168,15 +168,31 @@ fn run() -> Result<(), String> {
     let daemon_rejected = !daemon_active_after_bad_mode;
 
     // Check the daemon unit log for custody rejection lines.
+    // D3 (review macos-harness-b): every chunk is allow-failure, so all of
+    // them can come back empty (transport/permission trouble, fresh guest).
+    // That is a COLLECTION failure, not "no rejection logged" — the stage
+    // must say so with its own distinct message instead of reporting a
+    // missing custody rejection, and it must fail closed: no new pass path.
+    logger.line(format!(
+        "[key-custody] collecting daemon log lines (platform {}; unified-log window fixed at \
+         {MACOS_UNIFIED_LOG_WINDOW} on macos; tail chunks honour the lines argument)",
+        platform.as_str()
+    ))?;
     let mut journal_snippet = String::new();
+    let mut chunk_line_counts: Vec<usize> = Vec::new();
     for chunk in daemon_unit_log_argv(platform, "50", false)? {
         let chunk_output = ctx
             .capture_root_allow_failure(&target_host, &chunk)
             .unwrap_or_default();
+        chunk_line_counts.push(chunk_output.lines().count());
         journal_snippet.push_str(&chunk_output);
         if !journal_snippet.ends_with('\n') {
             journal_snippet.push('\n');
         }
+    }
+    if let Some(gap) = custody_log_collection_gap(&platform, &chunk_line_counts) {
+        logger.line(format!("[key-custody] FAIL {gap}"))?;
+        return Err(gap);
     }
     let custody_log_found = journal_snippet.contains("custody")
         || journal_snippet.contains("permission")
@@ -283,6 +299,35 @@ fn run() -> Result<(), String> {
 
 fn pass_fail(ok: bool) -> &'static str {
     if ok { "pass" } else { "fail" }
+}
+
+/// D3 (review macos-harness-b): the named gap when EVERY daemon-log chunk
+/// came back empty. `chunk_line_counts` holds one entry per
+/// [`daemon_unit_log_argv`] chunk, in collection order. `Some` ⇒ the caller
+/// must fail the run with this DISTINCT message: an empty collection is a
+/// collection failure, indistinguishable from "the daemon never rejected
+/// anything" only when the stage lies about it. The pass/fail verdicts stay
+/// exactly as strict as before — this only ever converts a would-be pass (or
+/// an ambiguous fail) into a named failure, never the reverse.
+fn custody_log_collection_gap(
+    platform: &LiveLabPlatform,
+    chunk_line_counts: &[usize],
+) -> Option<String> {
+    if chunk_line_counts.iter().sum::<usize>() > 0 {
+        return None;
+    }
+    let per_chunk = chunk_line_counts
+        .iter()
+        .enumerate()
+        .map(|(idx, count)| format!("chunk {idx} collected {count} lines"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "key custody log collection returned nothing on platform {}: {per_chunk} — no \
+         rejection evidence could be collected, which is not the same as no rejection \
+         having been logged (fail closed; D3)",
+        platform.as_str()
+    ))
 }
 
 // ─── Per-platform daemon control plane ─────────────────────────────────────
@@ -525,6 +570,45 @@ mod tests {
         assert!(err.contains("in-memory/DPAPI"), "{err}");
         assert!(stat_mode_argv(LiveLabPlatform::Windows, "C:\\key.enc").is_err());
         assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "50", false).is_err());
+    }
+
+    /// D3 (review macos-harness-b): when ALL daemon-log chunks come back
+    /// empty the stage must name a log-collection gap — a distinct message —
+    /// instead of reading the absence of evidence as "no rejection logged".
+    #[test]
+    fn empty_log_collection_is_a_named_gap_not_a_missing_rejection() {
+        for platform in [LiveLabPlatform::Linux, LiveLabPlatform::MacOs] {
+            let chunk_counts = if platform == LiveLabPlatform::MacOs {
+                vec![0, 0, 0]
+            } else {
+                vec![0]
+            };
+            let gap =
+                custody_log_collection_gap(&platform, &chunk_counts).expect("must name the gap");
+            assert!(
+                gap.contains("log collection returned nothing"),
+                "the gap message must be the distinct collection wording: {gap}"
+            );
+            assert!(
+                gap.contains(platform.as_str()),
+                "the gap message must name the platform: {gap}"
+            );
+            for (idx, count) in chunk_counts.iter().enumerate() {
+                assert!(
+                    gap.contains(&format!("chunk {idx} collected {count} lines")),
+                    "the gap message must name each chunk's count: {gap}"
+                );
+            }
+            assert!(
+                gap.contains("not the same as no rejection"),
+                "the gap must distinguish collection failure from rejection evidence: {gap}"
+            );
+        }
+        // Positive control: collected log lines never trip the gap.
+        assert!(custody_log_collection_gap(&LiveLabPlatform::MacOs, &[0, 7, 2]).is_none());
+        assert!(custody_log_collection_gap(&LiveLabPlatform::Linux, &[50]).is_none());
+        // No chunks at all is still an empty collection.
+        assert!(custody_log_collection_gap(&LiveLabPlatform::Linux, &[]).is_some());
     }
 
     #[test]

@@ -1623,6 +1623,23 @@ provision_gossip_signing_secret() {
   # between here and the hand-back below (the daemon could no longer traverse
   # to ANY key material): restore it on every exit path we can catch. SIGKILL
   # cannot be trapped; the next bootstrap re-runs this function and heals it.
+  #
+  # D4 (review macos-harness-b): save any traps the caller already armed
+  # (bash 3.2-compatible `trap -p`) BEFORE arming ours, and restore them on
+  # every path out of this function, so the mint window can no longer
+  # silently disarm an earlier cleanup trap (e.g. an enrollment tmpfile
+  # cleanup) if a future reorder ever nests the two windows.
+  local rn_prior_exit rn_prior_term rn_prior_int rn_prior_hup
+  rn_prior_exit="$(trap -p EXIT)"
+  rn_prior_term="$(trap -p TERM)"
+  rn_prior_int="$(trap -p INT)"
+  rn_prior_hup="$(trap -p HUP)"
+  rn_restore_saved_traps() {
+    if [[ -n "${rn_prior_exit}" ]]; then eval "${rn_prior_exit}"; else trap - EXIT; fi
+    if [[ -n "${rn_prior_term}" ]]; then eval "${rn_prior_term}"; else trap - TERM; fi
+    if [[ -n "${rn_prior_int}" ]]; then eval "${rn_prior_int}"; else trap - INT; fi
+    if [[ -n "${rn_prior_hup}" ]]; then eval "${rn_prior_hup}"; else trap - HUP; fi
+  }
   trap 'chown rustynetd:rustynetd "${KEYS_DIR}"' EXIT
   trap 'exit 143' TERM
   trap 'exit 130' INT
@@ -1647,11 +1664,12 @@ provision_gossip_signing_secret() {
   done
   if [[ "${gossip_minted}" -ne 1 ]]; then
     chown rustynetd:rustynetd "${KEYS_DIR}"
+    rn_restore_saved_traps
     echo "[bootstrap] rustynetd key init-gossip failed after 3 attempts" >&2
     exit 1
   fi
   chown rustynetd:rustynetd "${KEYS_DIR}"
-  trap - EXIT TERM INT HUP
+  rn_restore_saved_traps
   # Custody: the daemon (uid rustynetd) loads this blob at start and its
   # secret-file guard requires an owner-only blob owned by the daemon.
   chown rustynetd:rustynetd "${secret_path}"
