@@ -3080,6 +3080,24 @@ exit 1
         );
     }
 
+    /// F1 (review macos-nits-r2): single source of truth for the stub lines the
+    /// call-matrix harness assembles for the two production functions it replaces.
+    /// BOTH the harness format string and the byte-pin guard below derive from
+    /// these consts, so an editing accident in either place fails the pin instead
+    /// of shipping a corrupted stub. (The shipped stub once carried a duplicated
+    /// trailing fragment that bash lexed into a garbage command inside the
+    /// function body.)
+    const PROVISION_STUB_LINE: &str =
+        "provision_enrollment_secret() { echo provision >> \"$CALLS_FILE\"; }";
+    const SECURE_REMOVE_STUB_LINE: &str =
+        "secure_remove_file() { rm -f \"$1\"; echo \"remove:$1\" >> \"$CALLS_FILE\"; }";
+    /// The tail fragment whose duplication was the historical corruption. The
+    /// guard counts it in the CONST ITSELF against this fixed literal, so the
+    /// pin stays fail-closed even if the stub const above is the thing that
+    /// got edited. (No `echo ` prefix: the historical accident appended the
+    /// bare fragment.)
+    const SECURE_REMOVE_STUB_TAIL: &str = "\"remove:$1\" >> \"$CALLS_FILE\"; }";
+
     /// D1 behavioural witness: run the EXTRACTED `manage_enrollment_secret` function
     /// under bash with `provision_enrollment_secret`/`secure_remove_file` stubbed to
     /// record their calls, for every node role, and assert the call matrix. A widened
@@ -3096,24 +3114,63 @@ exit 1
         let secret_path = keys.join("enrollment.secret");
         let calls_path = dir.path().join("calls");
         let harness_path = dir.path().join("harness.sh");
-        // N2 (review macos-nits): the assembled harness must be well formed
-        // BEFORE any matrix cell runs — an editing accident in these format
-        // strings must fail loudly here, not as a baffling per-cell error.
-        // (The shipped stub once carried a duplicated trailing fragment that
-        // bash lexed into a garbage command inside the function body.)
+        // N2 (review macos-nits) / F1 (review macos-nits-r2): the assembled
+        // harness must be well formed BEFORE any matrix cell runs — an editing
+        // accident in these stubs must fail loudly here, not as a baffling
+        // per-cell error. The old guard counted the stub HEADER
+        // (`secure_remove_file() {`) == 1, but the historical corruption
+        // duplicated the stub's TAIL (`…; }"remove:$1" >> "$CALLS_FILE"; }`),
+        // leaving the header at exactly 1 — that guard failed open on the very
+        // class it exists to catch (mutant M5 re-added it and passed). Three
+        // independent pins now:
+        //  (a) the stub consts each carry their recorder tail exactly once
+        //      (counted against a fixed literal — catches editing the const),
+        //  (b) each stub appears exactly once in the harness as a WHOLE line
+        //      byte-for-byte equal to its const (catches editing the format
+        //      string around the interpolation),
+        //  (c) below, after `bash -n`: sourcing the stubs under bash is clean —
+        //      no stderr noise, status 0 from every stub called once (the M5
+        //      corruption made the stub itself exit 127 with a "command not
+        //      found", which the call matrix never sees: it ignores stderr).
         let harness = format!(
             "#!/bin/bash\nset -u\nKEYS_DIR={keys:?}\nCALLS_FILE={calls_path:?}\n\
-             provision_enrollment_secret() {{ echo provision >> \"$CALLS_FILE\"; }}\n\
-             secure_remove_file() {{ rm -f \"$1\"; echo \"remove:$1\" >> \"$CALLS_FILE\"; }}\n\
+             {PROVISION_STUB_LINE}\n\
+             {SECURE_REMOVE_STUB_LINE}\n\
              {function}\n\
              DAEMON_NODE_ROLE=\"$1\" manage_enrollment_secret\n"
         );
         assert_eq!(
-            harness.matches("secure_remove_file() {").count(),
+            SECURE_REMOVE_STUB_LINE
+                .matches(SECURE_REMOVE_STUB_TAIL)
+                .count(),
             1,
-            "the secure_remove_file stub must be defined exactly once (duplicated fragment \
-             would corrupt the function body): {harness}"
+            "the secure_remove_file stub tail must appear exactly once (the historical \
+             corruption duplicated it): {SECURE_REMOVE_STUB_LINE}"
         );
+        for (stub_line, stub_header, stub_name) in [
+            (
+                PROVISION_STUB_LINE,
+                "provision_enrollment_secret() {",
+                "provision_enrollment_secret",
+            ),
+            (
+                SECURE_REMOVE_STUB_LINE,
+                "secure_remove_file() {",
+                "secure_remove_file",
+            ),
+        ] {
+            let hits: Vec<&str> = harness
+                .lines()
+                .filter(|l| l.contains(stub_header))
+                .collect();
+            assert_eq!(
+                hits,
+                vec![stub_line],
+                "{stub_name} stub must appear exactly once, byte-for-byte as its const (a \
+                 duplicated tail fragment corrupts the function body while the header still \
+                 counts 1): {harness}"
+            );
+        }
         std::fs::write(&harness_path, harness.as_bytes()).expect("write harness");
         let syntax = std::process::Command::new("/bin/bash")
             .arg("-n")
@@ -3124,6 +3181,32 @@ exit 1
             syntax.status.success(),
             "the assembled harness must be syntactically valid bash: {}",
             String::from_utf8_lossy(&syntax.stderr)
+        );
+        let stub_probe = format!(
+            "#!/bin/bash\nset -u\nKEYS_DIR={keys:?}\nCALLS_FILE={calls_path:?}\n\
+             {PROVISION_STUB_LINE}\n\
+             {SECURE_REMOVE_STUB_LINE}\n\
+             mkdir -p \"$KEYS_DIR\"\n\
+             touch \"$KEYS_DIR/probe\"\n\
+             provision_enrollment_secret || exit 91\n\
+             secure_remove_file \"$KEYS_DIR/probe\" || exit 92\n\
+             [ ! -e \"$KEYS_DIR/probe\" ] || exit 93\n\
+             exit 0\n"
+        );
+        let probe_path = dir.path().join("stub_probe.sh");
+        std::fs::write(&probe_path, stub_probe.as_bytes()).expect("write stub probe");
+        let probe = std::process::Command::new("/bin/bash")
+            .arg(&probe_path)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run the stub probe under bash");
+        let probe_stderr = String::from_utf8_lossy(&probe.stderr);
+        assert!(
+            probe.status.success() && probe.stderr.is_empty(),
+            "the stubs must source cleanly under bash: every stub returns 0 when called \
+             once, with no stderr noise (status {:?}, stderr {probe_stderr:?})",
+            probe.status.code(),
         );
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&harness_path, std::fs::Permissions::from_mode(0o700))
@@ -4074,9 +4157,72 @@ trap -p HUP > "$WORK/after_hup.txt"
             "the restored EXIT trap must fire at script exit (no-prior-trap run)"
         );
         let _ = std::fs::remove_file(&script_n);
+
+        // F3 (review macos-nits-r2): a caller with NO traps AT ALL — not even
+        // EXIT — is the exact arbitrary-caller class D4 protects, and the only
+        // harness context that reaches the restore helper's `trap -` ELSE
+        // branches: every cell above arms EXIT, so the else-EXIT arm was
+        // unreachable and mutant M11 (`else trap - EXIT` → `else :`) survived
+        // the whole suite. Non-vacuity comes from the mint's own observable
+        // effects (the recorded chown hand-back calls plus a successful exit),
+        // NOT from a caller-trap touch — there is none to touch.
+        let work_t = std::env::temp_dir().join(format!("rn_d4_notraps_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_t);
+        std::fs::create_dir_all(&work_t).expect("no-traps-at-all work dir");
+        let no_traps_harness = success_harness
+            .replace("trap 'touch \"$WORK/prior_exit_fired\"' EXIT\n", "")
+            .replace("trap 'touch \"$WORK/prior_term_fired\"' TERM\n", "")
+            .replace("trap 'touch \"$WORK/prior_int_fired\"' INT\n", "")
+            .replace("trap 'touch \"$WORK/prior_hup_fired\"' HUP\n", "");
+        let script_t = write_temp_file(
+            "rn_d4_bootstrap_notraps_",
+            ".sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+        )
+        .expect("write a copy of the bootstrap script");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(no_traps_harness.as_str())
+            .arg("rn_d4_harness_notraps")
+            .arg(script_t.as_os_str())
+            .arg(work_t.as_os_str())
+            .output()
+            .expect("run the no-traps-at-all mint under bash");
+        assert!(
+            output.status.success(),
+            "a stubbed successful mint must succeed with no caller traps at all: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let calls_t = std::fs::read_to_string(work_t.join("calls.log")).unwrap_or_default();
+        let keys_dir_t = work_t.join("keys").display().to_string();
+        assert!(
+            calls_t.contains("chown root:wheel")
+                && calls_t.contains(&format!("chown rustynetd:rustynetd {keys_dir_t}")),
+            "the no-traps-at-all cell must observe the mint's own chown calls (non-vacuity \
+             is the mint's behaviour, not a trap touch): {calls_t}"
+        );
+        // The restore helper's `trap -` else-branches must leave NOTHING armed:
+        // every after-listing is empty — or carries only the inherited
+        // ignored-at-start marker (`trap -- '' SIG<X>`), which bash cannot reset
+        // and which is not a caller trap either (a test process run as a
+        // background job ignores SIGINT, a nohup run ignores SIGHUP).
+        for signal in ["exit", "term", "int", "hup"] {
+            let after_t = std::fs::read_to_string(work_t.join(format!("after_{signal}.txt")))
+                .unwrap_or_default();
+            let sig_name = format!("SIG{}", signal.to_ascii_uppercase());
+            assert!(
+                after_t
+                    .lines()
+                    .all(|l| l.trim().is_empty() || l.contains(&format!("trap -- '' {sig_name}"))),
+                "with no caller traps at all the mint must leave no {signal} trap armed \
+                 (the restore helper's `trap -` else-branch must have run): {after_t:?}"
+            );
+        }
+        let _ = std::fs::remove_file(&script_t);
         let _ = std::fs::remove_dir_all(&work);
         let _ = std::fs::remove_dir_all(&work_f);
         let _ = std::fs::remove_dir_all(&work_n);
+        let _ = std::fs::remove_dir_all(&work_t);
     }
 
     /// The gossip mint must be wired into BOTH main branches of the bootstrap
