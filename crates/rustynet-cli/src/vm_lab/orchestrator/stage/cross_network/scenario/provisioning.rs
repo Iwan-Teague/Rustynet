@@ -762,6 +762,15 @@ pub fn install_traversal_bundle(
 
 // ───────────────────────────── role enforcement ─────────────────────────────
 
+/// Lab-only freshness-window overrides forwarded to `e2e-enforce-host`; the
+/// same three values `adapter::linux_install::build_enforce_script` sets for
+/// every other lab enforce pass.
+const LAB_FRESHNESS_ENV: [&str; 3] = [
+    "RUSTYNET_AUTO_TUNNEL_MAX_AGE_SECS=86400",
+    "RUSTYNET_TRAVERSAL_MAX_AGE_SECS=86400",
+    "RUSTYNET_DNS_ZONE_MAX_AGE_SECS=86400",
+];
+
 /// `live_lab_enforce_host`: `rustynet ops e2e-enforce-host`.
 ///
 /// The shell prefixed `env RUSTYNET_BACKEND=…` when that variable was set in
@@ -790,9 +799,17 @@ pub fn enforce_host(
         None => None,
     };
 
-    let mut argv: Vec<&str> = Vec::new();
+    // The standard orchestrator's enforce script (`build_enforce_script`) passes
+    // the lab freshness windows to `e2e-enforce-host`, which bakes them into the
+    // unit via install-systemd. This path re-installs the units on a node many
+    // minutes after the baseline distributed its dns-zone bundle (TTL <= 300 s)
+    // and nothing here re-issues that bundle, so without the same lab window
+    // the daemon reports `dns_alarm_state=error` /
+    // `dns_zone_bundle_is_stale` and `signed_state_healthy` fails the stage
+    // (katana-xnet-61). Production leaves these unset (300 s / 120 s defaults).
+    let mut argv: Vec<&str> = vec!["env"];
+    argv.extend_from_slice(&LAB_FRESHNESS_ENV);
     if let Some(assignment) = backend_assignment.as_deref() {
-        argv.push("env");
         argv.push(assignment);
     }
     argv.extend_from_slice(&[
