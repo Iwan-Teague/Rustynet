@@ -595,21 +595,72 @@ pub const DAEMON_SOCKET_ATTEMPTS: u32 = 20;
 /// `live_lab_wait_for_daemon_socket`'s default inter-attempt sleep.
 pub const DAEMON_SOCKET_SLEEP_SECS: u64 = 2;
 
-/// Wait for the daemon control socket to exist — `live_lab_wait_for_daemon_socket`
-/// with its shell defaults of 20 attempts, 2 seconds apart.
+/// Readiness core behind [`wait_for_daemon_socket`], parameterised for tests:
+/// retry BOTH probes under ONE `attempts` budget. Each iteration checks the
+/// socket file (cheap) and, only once it exists, runs the `status` round trip;
+/// success is the round trip's exit 0 — whatever posture the daemon reports
+/// (including fail-closed) is payload data, not a readiness failure. A
+/// `test -S` check alone cannot prove readiness: after a `systemctl restart`
+/// the OLD socket file lingers until the new daemon binds, so the next IPC
+/// call hits `connect … failed: Connection refused` (katana-xnet-148). The
+/// final error names the stage that was still failing when the budget ran out.
+fn wait_for_daemon_socket_with(
+    runner: &dyn NetLeafRunner,
+    attempts: u32,
+    sleep: std::time::Duration,
+) -> Result<(), String> {
+    let attempts = attempts.max(1);
+    let socket_assignment = format!("RUSTYNET_DAEMON_SOCKET={DAEMON_SOCKET}");
+    let status_argv: Vec<&str> = vec![
+        "env",
+        socket_assignment.as_str(),
+        REMOTE_RUSTYNET_BIN,
+        "status",
+    ];
+    let mut file_stage = true;
+    let mut last_error = String::from("no attempt completed");
+    for attempt in 1..=attempts {
+        let outcome: Result<(), String> = match run_root(runner, &["test", "-S", DAEMON_SOCKET]) {
+            Ok(()) => match run_root(runner, &status_argv) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    file_stage = false;
+                    Err(err)
+                }
+            },
+            Err(err) => Err(err),
+        };
+        if let Err(err) = outcome {
+            last_error = err;
+        }
+        if attempt < attempts {
+            std::thread::sleep(sleep);
+        }
+    }
+    let stage = if file_stage {
+        format!("socket file never appeared after {attempts} attempts")
+    } else {
+        format!(
+            "socket file present but the daemon did not answer status after {attempts} attempts"
+        )
+    };
+    Err(format!("{stage}: {last_error}"))
+}
+
+/// Wait for the daemon control socket to be ANSWERED —
+/// `live_lab_wait_for_daemon_socket` with its shell defaults of 20 attempts,
+/// 2 seconds apart.
 ///
 /// The shell branched here on a Windows named-pipe spelling of the socket path.
 /// That branch is dropped: every cross-network scenario host is a Linux guest
 /// (the stage resolves them from the Linux cross-network topology),
 /// so the named-pipe arm was unreachable from these eight validators.
 pub fn wait_for_daemon_socket(runner: &dyn NetLeafRunner) -> Result<(), String> {
-    retry_root(
+    wait_for_daemon_socket_with(
         runner,
-        &["test", "-S", DAEMON_SOCKET],
         DAEMON_SOCKET_ATTEMPTS,
         std::time::Duration::from_secs(DAEMON_SOCKET_SLEEP_SECS),
     )
-    .map_err(|err| format!("daemon control socket did not appear: {err}"))
 }
 
 /// The paths whose PRESENCE means the node holds plaintext passphrase

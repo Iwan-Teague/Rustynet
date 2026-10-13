@@ -713,6 +713,65 @@ impl Logger {
     }
 }
 
+/// The daemon-readiness IPC probe, as an argv: point the CLI at the daemon
+/// socket with `RUSTYNET_DAEMON_SOCKET` and ask for `status`. A `test -S`
+/// socket-file check alone cannot prove readiness — after a `systemctl
+/// restart` the OLD socket file lingers until the new daemon binds, so the
+/// next IPC call hits `connect … failed: Connection refused` (katana-xnet-148).
+/// Only a completed round trip proves the daemon is listening.
+fn daemon_status_probe_argv(socket_path: &str) -> Vec<String> {
+    vec![
+        "env".to_owned(),
+        format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
+        REMOTE_RUSTYNET_BIN.to_owned(),
+        "status".to_owned(),
+    ]
+}
+
+/// Shared-budget readiness wait: retry BOTH probes under ONE `attempts`
+/// budget. Each iteration checks the socket file (cheap) and, only once it
+/// exists, runs the `status` round trip; success is the round trip's exit 0 —
+/// whatever posture the daemon reports (including fail-closed) is payload
+/// data, not a readiness failure. The final error names the stage that was
+/// still failing when the budget ran out, so a caller can tell a socket that
+/// never appeared from a socket file the daemon never answered.
+fn wait_for_daemon_socket_ready(
+    attempts: u32,
+    mut socket_present: impl FnMut() -> Result<(), String>,
+    mut daemon_answers_status: impl FnMut() -> Result<(), String>,
+    mut sleep_between_attempts: impl FnMut(),
+) -> Result<(), String> {
+    let attempts = attempts.max(1);
+    let mut file_stage = true;
+    let mut last_error = String::from("no attempt completed");
+    for attempt in 1..=attempts {
+        let outcome: Result<(), String> = match socket_present() {
+            Ok(()) => match daemon_answers_status() {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    file_stage = false;
+                    Err(err)
+                }
+            },
+            Err(err) => Err(err),
+        };
+        if let Err(err) = outcome {
+            last_error = err;
+        }
+        if attempt < attempts {
+            sleep_between_attempts();
+        }
+    }
+    let stage = if file_stage {
+        format!("socket file never appeared after {attempts} attempts")
+    } else {
+        format!(
+            "socket file present but the daemon did not answer status after {attempts} attempts"
+        )
+    };
+    Err(format!("{stage}: {last_error}"))
+}
+
 #[derive(Debug, Clone)]
 pub struct LiveLabContext {
     pub root_dir: PathBuf,
@@ -1247,7 +1306,14 @@ impl LiveLabContext {
         attempts: u32,
         sleep_secs: u64,
     ) -> Result<(), String> {
-        self.retry_root(target, &["test", "-S", socket_path], attempts, sleep_secs)
+        let status_argv = daemon_status_probe_argv(socket_path);
+        let status_argv: Vec<&str> = status_argv.iter().map(String::as_str).collect();
+        wait_for_daemon_socket_ready(
+            attempts,
+            || self.run_root(target, &["test", "-S", socket_path]),
+            || self.run_root(target, &status_argv),
+            || sleep(Duration::from_secs(sleep_secs)),
+        )
     }
 
     pub fn verify_sudo(&self, target: &str) -> Result<(), String> {
@@ -1675,11 +1741,176 @@ pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabContext, LiveLabPlatform, cli_invocation_parse_failure,
-        enforce_linux_only_until_validator_lands, env_flag_truthy, known_hosts_lookup_host,
-        resolved_known_hosts_candidates, resolved_target_address_from_ssh_g,
-        scp_failure_is_transient, strip_host_port, target_port,
+        LiveLabContext, LiveLabPlatform, REMOTE_RUSTYNET_BIN, cli_invocation_parse_failure,
+        daemon_status_probe_argv, enforce_linux_only_until_validator_lands, env_flag_truthy,
+        known_hosts_lookup_host, resolved_known_hosts_candidates,
+        resolved_target_address_from_ssh_g, scp_failure_is_transient, strip_host_port, target_port,
+        wait_for_daemon_socket_ready,
     };
+
+    /// The probe must be a full IPC round trip: `env` assignment first, the
+    /// pinned absolute binary (sudo does not inherit PATH), then `status`.
+    #[test]
+    fn daemon_status_probe_argv_pins_env_var_binary_and_subcommand() {
+        assert_eq!(
+            daemon_status_probe_argv("/run/rustynet/rustynetd.sock"),
+            vec![
+                "env".to_owned(),
+                "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock".to_owned(),
+                "/usr/local/bin/rustynet".to_owned(),
+                "status".to_owned(),
+            ]
+        );
+        assert_eq!(
+            daemon_status_probe_argv("/run/rustynet/rustynetd.sock")[2],
+            REMOTE_RUSTYNET_BIN,
+            "the probe binary must be the deployed-guest constant"
+        );
+    }
+
+    /// Stale-socket window: `test -S` succeeds immediately on the lingering
+    /// file, the first two `status` round trips hit `Connection refused`, the
+    /// third succeeds — the wait must return Ok on exactly that probe.
+    #[test]
+    fn wait_for_daemon_socket_ready_succeeds_once_the_daemon_answers_status() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(0usize);
+        let result = wait_for_daemon_socket_ready(
+            5,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {
+                let mut count = status_probes.borrow_mut();
+                *count += 1;
+                if *count <= 2 {
+                    Err(
+                        "connect /run/rustynet/rustynetd.sock failed: Connection refused"
+                            .to_owned(),
+                    )
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                *sleeps.borrow_mut() += 1;
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "expected Ok once the daemon answers status: {result:?}"
+        );
+        assert_eq!(*file_probes.borrow(), 3);
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "the IPC round trip must run every iteration until it succeeds"
+        );
+        assert_eq!(
+            *sleeps.borrow(),
+            2,
+            "sleep between attempts only, never after the last"
+        );
+    }
+
+    /// A daemon that never answers must exhaust the ONE shared budget with
+    /// exactly `attempts` round trips (not `attempts` per stage) and the error
+    /// must name the status stage, the budget, and carry the guest's stderr.
+    #[test]
+    fn wait_for_daemon_socket_ready_names_the_status_stage_when_the_daemon_never_answers() {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            3,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {
+                *status_probes.borrow_mut() += 1;
+                Err("connect /run/rustynet/rustynetd.sock failed: Connection refused".to_owned())
+            },
+            || {
+                *sleeps.borrow_mut() += 1;
+            },
+        )
+        .expect_err("a daemon that never answers must fail the wait");
+        assert!(
+            err.contains("socket file present but the daemon did not answer status"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 3 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert!(
+            err.contains("Connection refused"),
+            "the guest's own stderr must be carried: {err}"
+        );
+        assert_eq!(*file_probes.borrow(), 3);
+        assert_eq!(
+            *status_probes.borrow(),
+            3,
+            "one shared budget: exactly `attempts` round trips, not 2×attempts"
+        );
+        assert_eq!(*sleeps.borrow(), 2, "sleep between attempts only");
+    }
+
+    /// While the socket file is absent no IPC round trip may be issued, and
+    /// the error must name the file stage.
+    #[test]
+    fn wait_for_daemon_socket_ready_names_the_file_stage_and_skips_status_until_the_socket_appears()
+    {
+        let file_probes = std::cell::RefCell::new(0usize);
+        let status_probes = std::cell::RefCell::new(0usize);
+        let err = wait_for_daemon_socket_ready(
+            4,
+            || {
+                *file_probes.borrow_mut() += 1;
+                Err("remote command failed on host-a: no such file".to_owned())
+            },
+            || {
+                *status_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {},
+        )
+        .expect_err("a socket that never appears must fail the wait");
+        assert!(
+            err.contains("socket file never appeared"),
+            "the failed stage must be named: {err}"
+        );
+        assert!(
+            err.contains("after 4 attempts"),
+            "the attempts budget must be named: {err}"
+        );
+        assert_eq!(*file_probes.borrow(), 4);
+        assert_eq!(
+            *status_probes.borrow(),
+            0,
+            "no IPC round trip may be issued while the socket file is absent"
+        );
+    }
+
+    /// A zero budget is clamped to one attempt rather than looping zero times.
+    #[test]
+    fn wait_for_daemon_socket_ready_treats_a_zero_budget_as_one_attempt() {
+        let status_probes = std::cell::RefCell::new(0usize);
+        let result = wait_for_daemon_socket_ready(
+            0,
+            || Ok(()),
+            || {
+                *status_probes.borrow_mut() += 1;
+                Ok(())
+            },
+            || {},
+        );
+        assert!(result.is_ok());
+        assert_eq!(*status_probes.borrow(), 1);
+    }
 
     /// HARNESS-VERBS. Three stages drove `rustynet ops` subcommands that the
     /// parser does not have. Every call site used an allow-failure helper that
