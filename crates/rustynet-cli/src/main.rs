@@ -9978,6 +9978,51 @@ fn enforce_refresh_assignment_authority_gate(
     }
 }
 
+/// ORDERING INVARIANT for `execute_ops_refresh_assignment`: the pair-skip
+/// decision (TTL gate, then authority gate) MUST run BEFORE either half of the
+/// (traversal bundle, assignment bundle+verifier) pair is refreshed. When this
+/// returns `Some(message)` NEITHER half may be touched: the traversal verifier
+/// key is not rotated and the traversal watermark is not removed. Refreshing
+/// the traversal half and only then skipping the assignment half leaves a
+/// freshly signed traversal bundle under a verifier key the KEPT assignment
+/// does not match; the daemon fail-closes on that mismatch (QH-04,
+/// katana-xnet-169). Both gates run against disk state only.
+///
+/// Read-only contract: never writes, removes, or rotates anything; every
+/// failure of a gate check is loud in the returned message.
+fn assignment_pair_refresh_skip(
+    bundle_path: &Path,
+    verifier_key_path: &Path,
+    signing_secret_path: &Path,
+    signing_secret_passphrase_path: &Path,
+    now_unix: u64,
+    min_remaining_secs: u64,
+) -> Result<Option<String>, String> {
+    if bundle_path.exists()
+        && let Some(current_expires_at) =
+            read_bundle_u64_field_optional(bundle_path, "expires_at_unix")?
+        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
+    {
+        let remaining_secs = current_expires_at.saturating_sub(now_unix);
+        return Ok(Some(format!(
+            "[assignment-refresh] current assignment expires in {remaining_secs}s; skipping refresh of both halves (traversal bundle not re-signed).",
+        )));
+    }
+
+    if let Some(mut skip_message) = enforce_refresh_assignment_authority_gate(
+        verifier_key_path,
+        signing_secret_path,
+        signing_secret_passphrase_path,
+    )? {
+        skip_message.push_str(
+            " The traversal half is skipped with it: both halves of the pair are refreshed or neither.",
+        );
+        return Ok(Some(skip_message));
+    }
+
+    Ok(None)
+}
+
 /// Defaults the refresh unit exports (`rustynetd-assignment-refresh.service`
 /// `Environment=`), mirrored so the forced-refresh decision reads the SAME
 /// verifier key and signing secret that `ops refresh-assignment` will read.
@@ -10260,35 +10305,32 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         &signing_secret_passphrase_path,
         "assignment signing secret passphrase file",
     )?;
+
+    // ORDERING INVARIANT: both skip gates (TTL, then authority) run BEFORE
+    // either half of the (traversal, assignment) pair is refreshed. A skip
+    // returned here skips BOTH halves: the traversal verifier key is not
+    // rotated and the traversal watermark is not removed. Refreshing the
+    // traversal half and only then skipping the assignment half would leave a
+    // traversal bundle signed under a key the kept assignment does not match;
+    // the daemon fail-closes on that mismatch (QH-04, katana-xnet-169).
+    let now_unix = unix_now();
+    if let Some(skip_message) = assignment_pair_refresh_skip(
+        bundle_path.as_path(),
+        verifier_key_path.as_path(),
+        signing_secret_path.as_path(),
+        signing_secret_passphrase_path.as_path(),
+        now_unix,
+        min_remaining_secs,
+    )? {
+        return Ok(skip_message);
+    }
+
     refresh_local_traversal_bundle_from_specs(
         target_node_id.as_str(),
         nodes_spec.as_str(),
         allow_spec.as_str(),
         daemon_group.as_str(),
     )?;
-
-    let now_unix = unix_now();
-    if bundle_path.exists()
-        && let Some(current_expires_at) =
-            read_bundle_u64_field_optional(&bundle_path, "expires_at_unix")?
-        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
-    {
-        let remaining_secs = current_expires_at.saturating_sub(now_unix);
-        return Ok(format!(
-            "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
-        ));
-    }
-
-    // The node-local refresh must never replace an assignment verifier key
-    // that belongs to a different authority: skip loudly instead, leaving
-    // both the bundle and the verifier key byte-identical on disk.
-    if let Some(skip_message) = enforce_refresh_assignment_authority_gate(
-        verifier_key_path.as_path(),
-        signing_secret_path.as_path(),
-        signing_secret_passphrase_path.as_path(),
-    )? {
-        return Ok(skip_message);
-    }
 
     let bundle_group_gid = group_gid_required(daemon_group.as_str())?;
 
@@ -23462,13 +23504,14 @@ mod tests {
         ForcedRefreshAssignmentPlan, MembershipCommand, MembershipEvidenceSummary,
         MembershipOperation, OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE, OpsCommand,
         PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, Phase6ProbeMetadataView, RoleCapability,
-        apply_forced_refresh_assignment_plan, assignment_refresh_authority_decision,
-        assignment_refresh_effective_path, build_membership_audit_replay_json,
-        build_membership_evidence_diff_json, classify_cli_error, command_supports_json_render,
-        consume_enrollment_token_locked, contains_ip_rule_lookup_table, detect_tampered_log,
-        encrypted_secret_permission_policy, enforce_refresh_assignment_authority_gate, execute,
-        execute_macos_relay_service_action, execute_ops, extract_json_flag, finalize_role_audit,
-        force_now_report, forced_refresh_assignment_plan, forced_refresh_outcome, help_text,
+        apply_forced_refresh_assignment_plan, assignment_pair_refresh_skip,
+        assignment_refresh_authority_decision, assignment_refresh_effective_path,
+        build_membership_audit_replay_json, build_membership_evidence_diff_json,
+        classify_cli_error, command_supports_json_render, consume_enrollment_token_locked,
+        contains_ip_rule_lookup_table, detect_tampered_log, encrypted_secret_permission_policy,
+        enforce_refresh_assignment_authority_gate, execute, execute_macos_relay_service_action,
+        execute_ops, extract_json_flag, finalize_role_audit, force_now_report,
+        forced_refresh_assignment_plan, forced_refresh_outcome, help_text,
         is_interface_absent_detail, is_managed_disconnect_nft_table, launchd_xml_escape,
         load_dns_zone_records_manifest, load_signing_key, local_assignment_authority_verdict,
         local_assignment_authority_verdict_with, managed_dns_resolver_server_arg,
@@ -27951,10 +27994,11 @@ mod tests {
         );
     }
 
-    /// Wiring witness: the authority gate sits before every file creation and
-    /// publish in `execute_ops_refresh_assignment`. (A behavioural test needs
-    /// root; this pins the ordering of the source so a refactor cannot move a
-    /// write in front of the gate unnoticed.)
+    /// Wiring witness: the pair-skip decision (TTL + authority gates) sits
+    /// before every file creation and publish in
+    /// `execute_ops_refresh_assignment`. (A behavioural test needs root; this
+    /// pins the ordering of the source so a refactor cannot move a write in
+    /// front of the gates unnoticed.)
     #[test]
     fn refresh_assignment_runs_the_authority_gate_before_any_write() {
         let source = include_str!("main.rs");
@@ -27962,17 +28006,44 @@ mod tests {
             .find("fn execute_ops_refresh_assignment() -> Result<String, String> {")
             .expect("function present");
         let body = &source[start..];
-        let gate = body
-            .find("enforce_refresh_assignment_authority_gate(")
-            .expect("gate call present");
+        let decision = body
+            .find("assignment_pair_refresh_skip(")
+            .expect("pair-skip decision call present");
         let temp = body
             .find("create_secure_temp_file(")
             .expect("temp file creation present");
         let publish = body
             .find("publish_file_with_owner_mode(")
             .expect("publish present");
-        assert!(gate < temp, "the gate must precede temp-file creation");
-        assert!(gate < publish, "the gate must precede the publish");
+        assert!(
+            decision < temp,
+            "the decision must precede temp-file creation"
+        );
+        assert!(decision < publish, "the decision must precede the publish");
+    }
+
+    /// Wiring witness for the ordering invariant: the traversal half of the
+    /// pair must not be refreshed before the pair-skip decision has run. A
+    /// skip that only skips the assignment half leaves a traversal bundle
+    /// signed under a key the kept assignment does not match (QH-04,
+    /// katana-xnet-169).
+    #[test]
+    fn refresh_assignment_decides_pair_skip_before_touching_the_traversal_half() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn execute_ops_refresh_assignment() -> Result<String, String> {")
+            .expect("function present");
+        let body = &source[start..];
+        let decision = body
+            .find("assignment_pair_refresh_skip(")
+            .expect("pair-skip decision call present");
+        let traversal = body
+            .find("refresh_local_traversal_bundle_from_specs(")
+            .expect("traversal refresh call present");
+        assert!(
+            decision < traversal,
+            "the pair-skip decision must precede the traversal refresh"
+        );
     }
 
     #[test]
@@ -28103,6 +28174,260 @@ mod tests {
 
         assert!(decision.is_none(), "absent pub must proceed");
         assert!(!pub_path.exists(), "the gate must not create the pub");
+    }
+
+    /// Fixed "now" for deterministic pair-skip decisions.
+    #[cfg(unix)]
+    const PAIR_SKIP_TEST_NOW: u64 = 1_700_000_000;
+    #[cfg(unix)]
+    const PAIR_SKIP_TEST_MIN_REMAINING: u64 = 180;
+
+    #[cfg(unix)]
+    fn pair_skip_test_bundle(expires_at_unix: u64) -> String {
+        format!("version=1\nnode_id=client-1\nexpires_at_unix={expires_at_unix}\n")
+    }
+
+    #[cfg(unix)]
+    struct PairSkipTraversalFixture {
+        verifier_path: PathBuf,
+        bundle_path: PathBuf,
+        watermark_path: PathBuf,
+        verifier_bytes: Vec<u8>,
+        bundle_bytes: Vec<u8>,
+        watermark_bytes: Vec<u8>,
+    }
+
+    /// Traversal-half fixture: the artifacts
+    /// `refresh_local_traversal_bundle_from_specs` would rotate/remove. The
+    /// pair-skip decision must leave every one of them byte-identical/in
+    /// place.
+    #[cfg(unix)]
+    fn write_pair_skip_traversal_fixture(dir: &Path) -> PairSkipTraversalFixture {
+        let verifier_path = dir.join("traversal.verifier");
+        let bundle_path = dir.join("traversal.bundle");
+        let watermark_path = dir.join("traversal.watermark");
+        let verifier_bytes = b"traversal verifier sentinel v1\n".to_vec();
+        let bundle_bytes = b"traversal bundle sentinel v1\n".to_vec();
+        let watermark_bytes = b"traversal watermark sentinel v1\n".to_vec();
+        fs::write(&verifier_path, &verifier_bytes).expect("write traversal verifier fixture");
+        fs::write(&bundle_path, &bundle_bytes).expect("write traversal bundle fixture");
+        fs::write(&watermark_path, &watermark_bytes).expect("write watermark fixture");
+        PairSkipTraversalFixture {
+            verifier_path,
+            bundle_path,
+            watermark_path,
+            verifier_bytes,
+            bundle_bytes,
+            watermark_bytes,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_pair_skip_traversal_untouched(fixture: &PairSkipTraversalFixture) {
+        assert_eq!(
+            fs::read(&fixture.verifier_path).expect("read traversal verifier"),
+            fixture.verifier_bytes,
+            "the traversal verifier key must not be rotated by a skip"
+        );
+        assert_eq!(
+            fs::read(&fixture.bundle_path).expect("read traversal bundle"),
+            fixture.bundle_bytes,
+            "the traversal bundle must not be rewritten by a skip"
+        );
+        assert_eq!(
+            fs::read(&fixture.watermark_path).expect("read traversal watermark"),
+            fixture.watermark_bytes,
+            "the traversal watermark must not be removed by a skip"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_ttl_skip_reports_both_halves_and_touches_nothing() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before =
+            pair_skip_test_bundle(PAIR_SKIP_TEST_NOW + PAIR_SKIP_TEST_MIN_REMAINING + 10);
+        fs::write(&bundle_path, &bundle_before).expect("write fresh bundle fixture");
+
+        // Absent pub and signing secret: the TTL gate must short-circuit
+        // before the authority gate needs any of them.
+        let pub_path = dir.path().join("assignment.pub");
+        let traversal = write_pair_skip_traversal_fixture(dir.path());
+
+        let decision = assignment_pair_refresh_skip(
+            bundle_path.as_path(),
+            pub_path.as_path(),
+            dir.path().join("absent.signing.secret").as_path(),
+            dir.path().join("absent.passphrase").as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("a fresh bundle must be a skip, not an error");
+
+        let message = decision.expect("a still-fresh assignment must skip the refresh");
+        assert!(
+            message.contains("skipping refresh of both halves"),
+            "the skip must name both halves: {message}"
+        );
+        assert!(
+            message.contains("traversal bundle not re-signed"),
+            "the skip must be loud about the traversal half: {message}"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after skip"),
+            bundle_before.as_bytes(),
+            "the assignment bundle must stay byte-identical"
+        );
+        assert!(!pub_path.exists(), "the skip must not create the pub");
+        assert_pair_skip_traversal_untouched(&traversal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_ttl_boundary_is_strict_and_stale_bundle_proceeds() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let pub_path = dir.path().join("assignment.pub");
+
+        // Boundary: expires_at == now + min_remaining is NOT still fresh
+        // (strict >), so the refresh proceeds.
+        let boundary_path = dir.path().join("boundary.assignment");
+        fs::write(
+            &boundary_path,
+            pair_skip_test_bundle(PAIR_SKIP_TEST_NOW + PAIR_SKIP_TEST_MIN_REMAINING),
+        )
+        .expect("write boundary bundle fixture");
+        let boundary = assignment_pair_refresh_skip(
+            boundary_path.as_path(),
+            pub_path.as_path(),
+            dir.path().join("absent.signing.secret").as_path(),
+            dir.path().join("absent.passphrase").as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("boundary must fall through to the authority gate");
+        assert!(
+            boundary.is_none(),
+            "expires_at == now+min_remaining must proceed, got: {boundary:?}"
+        );
+
+        // A stale bundle also proceeds (absent pub = first install).
+        let stale_path = dir.path().join("stale.assignment");
+        fs::write(
+            &stale_path,
+            pair_skip_test_bundle(PAIR_SKIP_TEST_NOW + PAIR_SKIP_TEST_MIN_REMAINING - 1),
+        )
+        .expect("write stale bundle fixture");
+        let stale = assignment_pair_refresh_skip(
+            stale_path.as_path(),
+            pub_path.as_path(),
+            dir.path().join("absent.signing.secret").as_path(),
+            dir.path().join("absent.passphrase").as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("a stale bundle must fall through, not error");
+        assert!(stale.is_none(), "a stale bundle must proceed: {stale:?}");
+    }
+
+    /// THE negative test: a foreign authority must skip BOTH halves. Before
+    /// the fix the traversal half was refreshed first, so a skip left a
+    /// rotated traversal verifier + watermark removal under a KEPT foreign
+    /// assignment — the daemon fail-closed (QH-04, katana-xnet-169).
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_foreign_authority_leaves_both_halves_untouched() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        // Near-expiry assignment bundle: the acting window in which the tick
+        // fires, so the skip decision is reached.
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = pair_skip_test_bundle(1_234_567_890);
+        fs::write(&bundle_path, &bundle_before).expect("write near-expiry bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        let foreign_pub = format!("{}\n", "cd".repeat(32));
+        assert_ne!(
+            foreign_pub.trim(),
+            super::ops_e2e::assignment_verifier_key_hex(&secret_bytes),
+            "fixture pub must differ from the local secret's verifier key"
+        );
+        fs::write(&pub_path, &foreign_pub).expect("write foreign pub fixture");
+
+        let traversal = write_pair_skip_traversal_fixture(dir.path());
+
+        let decision = assignment_pair_refresh_skip(
+            bundle_path.as_path(),
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        )
+        .expect("a parseable foreign pub must be a skip, not an error");
+
+        let message = decision.expect("a foreign authority must skip the refresh");
+        assert!(
+            message.contains("belongs to a different authority; not re-issuing"),
+            "the skip must stay loud about the authority: {message}"
+        );
+        assert!(
+            message.contains("both halves of the pair are refreshed or neither"),
+            "the skip must name the traversal half too: {message}"
+        );
+
+        // Assignment half untouched.
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after skip"),
+            foreign_pub.as_bytes(),
+            "the verifier key must stay byte-identical"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after skip"),
+            bundle_before.as_bytes(),
+            "the assignment bundle must stay byte-identical"
+        );
+        // Traversal half untouched (the fix: it used to be refreshed first).
+        assert_pair_skip_traversal_untouched(&traversal);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_refresh_skip_fails_closed_on_unparseable_pub_and_touches_nothing() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = pair_skip_test_bundle(1_234_567_890);
+        fs::write(&bundle_path, &bundle_before).expect("write near-expiry bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        fs::write(&pub_path, "not-hex-garbage\n").expect("write unparseable pub fixture");
+
+        let traversal = write_pair_skip_traversal_fixture(dir.path());
+
+        let result = assignment_pair_refresh_skip(
+            bundle_path.as_path(),
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+            PAIR_SKIP_TEST_NOW,
+            PAIR_SKIP_TEST_MIN_REMAINING,
+        );
+
+        let err = result.expect_err("an unparseable pub must fail closed");
+        assert!(!err.is_empty(), "the failure must explain itself: {err}");
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after failure"),
+            bundle_before.as_bytes(),
+            "the assignment bundle must stay byte-identical"
+        );
+        assert_pair_skip_traversal_untouched(&traversal);
     }
 
     #[cfg(unix)]
