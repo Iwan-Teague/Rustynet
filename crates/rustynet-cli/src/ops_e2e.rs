@@ -8513,8 +8513,8 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
                 .expect("exit entry");
             assert_eq!(
                 exit_entry.capabilities.as_deref(),
-                Some(&[RoleCapability::ExitServer][..]),
-                "{name}: exit entry must carry exactly exit_server"
+                Some(&[RoleCapability::Anchor, RoleCapability::ExitServer][..]),
+                "{name}: exit entry must carry exactly anchor and exit_server"
             );
             for other in nodes
                 .iter()
@@ -8527,6 +8527,96 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
                 );
             }
         }
+    }
+
+    /// katana-xnet-14/-16/-37: the client's bundle names the RELAY as its
+    /// `exit_node`, so the relay must clear the same exit-provider check the
+    /// final exit does. Spelled without the capability, the guest issuer
+    /// refuses with `exit node katana-entry-1-bootstrap lacks exit_server
+    /// capability` and the stage fails all eleven checks during issuance. Both
+    /// exit providers are enforced as `admin`, which additionally requires
+    /// `anchor` at runtime. End-to-end pin: the real guest parser and the real
+    /// issuer must accept this `NODES_SPEC` and sign all three bundles.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn relay_chain_node_specs_issue_with_both_exit_providers() {
+        use crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::{
+            NodeSpec, nodes_spec,
+        };
+        use crate::vm_lab::orchestrator::stage::cross_network::scenario::relay_remote_exit::{
+            CHAIN_EXIT_NODE_CAPABILITIES, CHAIN_RELAY_NODE_CAPABILITIES,
+        };
+        use rustynet_control::roles::RoleCapability;
+
+        let rendered = nodes_spec(&[
+            NodeSpec::new(
+                "katana-exit-1-bootstrap",
+                "192.168.123.222",
+                51820,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("exit spec")
+            .with_capabilities(&CHAIN_EXIT_NODE_CAPABILITIES),
+            NodeSpec::new(
+                "katana-entry-1-bootstrap",
+                "192.168.122.57",
+                51820,
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            )
+            .expect("relay spec")
+            .with_capabilities(&CHAIN_RELAY_NODE_CAPABILITIES),
+            NodeSpec::new(
+                "katana-client-1-bootstrap",
+                "192.168.122.45",
+                51820,
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .expect("client spec"),
+        ])
+        .expect("nodes spec");
+        let nodes = parse_generic_nodes(&rendered)
+            .expect("relay chain nodes spec must parse with the parser");
+
+        let relay_capabilities = nodes
+            .iter()
+            .find(|node| node.node_id == "katana-entry-1-bootstrap")
+            .and_then(|node| node.capabilities.as_deref())
+            .expect("the relay is an exit provider and must carry its capabilities");
+        assert_eq!(
+            relay_capabilities,
+            &CHAIN_RELAY_NODE_CAPABILITIES[..],
+            "the relay must carry exactly anchor, client and exit_server"
+        );
+        assert!(
+            relay_capabilities.contains(&RoleCapability::ExitServer),
+            "the client's bundle names the relay as its exit node"
+        );
+
+        let allow_pairs = parse_generic_allow_specs(concat!(
+            "katana-client-1-bootstrap|katana-entry-1-bootstrap;",
+            "katana-entry-1-bootstrap|katana-client-1-bootstrap;",
+            "katana-client-1-bootstrap|katana-exit-1-bootstrap;",
+            "katana-exit-1-bootstrap|katana-client-1-bootstrap;",
+            "katana-entry-1-bootstrap|katana-exit-1-bootstrap;",
+            "katana-exit-1-bootstrap|katana-entry-1-bootstrap",
+        ))
+        .expect("allow pairs");
+        let assignments = parse_generic_assignment_specs(concat!(
+            "katana-exit-1-bootstrap|-;",
+            "katana-entry-1-bootstrap|katana-exit-1-bootstrap;",
+            "katana-client-1-bootstrap|katana-entry-1-bootstrap",
+        ))
+        .expect("assignments");
+
+        let (_assignment_pub, bundles) = issue_assignment_bundle_artifacts(
+            &[21u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            assignments.as_slice(),
+            300,
+        )
+        .expect("both exit providers carry exit_server, so the chain must issue");
+        assert_eq!(bundles.len(), 3, "one bundle per chain node");
     }
 
     #[test]

@@ -26,9 +26,11 @@
 
 use std::time::Duration;
 
+use rustynet_control::roles::RoleCapability;
+
 use super::host::ScenarioHost;
 use super::provisioning::{
-    self, AllowSpec, AssignmentsSpec, EXIT_NODE_CAPABILITIES, EnvFile, LabContext, NodeSpec, during,
+    self, AllowSpec, AssignmentsSpec, EnvFile, LabContext, NodeSpec, during,
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
@@ -71,6 +73,28 @@ const STEADY_STATE_CHECKS: &[&str] = &[
 /// The `sleep 5` that lets both advertised routes converge before evidence is
 /// captured. Sampling before it turns slow convergence into a false failure.
 const POST_ADVERTISE_SETTLE: Duration = Duration::from_secs(5);
+
+/// Capabilities the FINAL exit must carry in `NODES_SPEC`.
+///
+/// It provides exit service to the relay, so `exit_server` is mandatory or
+/// `validate_assignment_exit_provider` refuses the relay's bundle; and it is
+/// enforced as `admin`, which the daemon requires `anchor` for.
+pub const CHAIN_EXIT_NODE_CAPABILITIES: [RoleCapability; 2] =
+    [RoleCapability::Anchor, RoleCapability::ExitServer];
+
+/// Capabilities the RELAY must carry in `NODES_SPEC`.
+///
+/// This chain is the one case where a node that is not the final exit is itself
+/// an exit provider: the client's bundle names the relay as its `exit_node`, so
+/// the relay needs `exit_server` for the same reason the final exit does. It
+/// also consumes the final exit's traffic, so it keeps `client`, and it is
+/// enforced as `admin`, so it needs `anchor`. These are the sets
+/// `live_linux_two_hop_test` already signs for a two-hop chain.
+pub const CHAIN_RELAY_NODE_CAPABILITIES: [RoleCapability; 3] = [
+    RoleCapability::Anchor,
+    RoleCapability::Client,
+    RoleCapability::ExitServer,
+];
 
 /// Remote path of the assignment issuance env file.
 const ISSUE_ENV_PATH: &str = "/tmp/rn_issue_cross_network_relay.env";
@@ -296,13 +320,14 @@ fn provision(
                 WIREGUARD_PORT,
                 exit_pub_hex,
             )?
-            .with_capabilities(&EXIT_NODE_CAPABILITIES),
+            .with_capabilities(&CHAIN_EXIT_NODE_CAPABILITIES),
             NodeSpec::new(
                 relay.node_id.as_str(),
                 &relay.address,
                 WIREGUARD_PORT,
                 relay_pub_hex,
-            )?,
+            )?
+            .with_capabilities(&CHAIN_RELAY_NODE_CAPABILITIES),
             NodeSpec::new(
                 client.node_id.as_str(),
                 &client.address,

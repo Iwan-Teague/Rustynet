@@ -266,7 +266,16 @@ pub fn collect_pubkey_hex(runner: &dyn NetLeafRunner) -> Result<String, String> 
 /// entry nodes carry no extra capability: their [`NodeSpec`] stays
 /// capability-free, keeps the issuer's `[Client]` default, and therefore
 /// renders byte-identical to the old three-field entry.
-pub const EXIT_NODE_CAPABILITIES: [RoleCapability; 1] = [RoleCapability::ExitServer];
+///
+/// The exit node also carries `Anchor`: the cross-network scenarios enforce it
+/// as `admin` (the only role that can advertise the default route,
+/// `daemon.rs:11398` `route_advertise_requires_exit_serving_activation`), and
+/// `admin` requires the `anchor` capability in the signed assignment bundle
+/// (`daemon.rs:2301` `required_membership_capabilities`). Without `anchor`,
+/// the daemon fail-closes the assignment refresh with "assignment target
+/// intent lacks required local capability anchor" (katana-xnet-14/16/37).
+pub const EXIT_NODE_CAPABILITIES: [RoleCapability; 2] =
+    [RoleCapability::Anchor, RoleCapability::ExitServer];
 
 /// One entry of `NODES_SPEC`:
 /// `<node-id>|<addr>:<port>|<pubkey-hex>[|<capabilities-csv>]`.
@@ -1158,16 +1167,16 @@ mod tests {
     }
 
     /// Golden wire form for the direct remote-exit topology: the exit entry
-    /// grows exactly `|exit_server`. This is the katana-xnet-1 root-cause-A
-    /// witness: on HEAD `with_capabilities` does not exist, so the exit entry
-    /// can only render three-field and the issuer refuses every assignment.
+    /// grows exactly `|anchor,exit_server`. The `anchor` capability is required
+    /// because the exit is enforced as `admin` and `admin` requires `anchor`
+    /// in the signed assignment bundle.
     #[test]
-    fn exit_spec_carries_exit_server_capability() {
+    fn exit_spec_carries_anchor_and_exit_server_capabilities() {
         let spec = nodes_spec(&[exit_node(), client_node()]).expect("spec");
         assert_eq!(
             spec,
             format!(
-                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|exit_server;\
+                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|anchor,exit_server;\
                  katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
             )
         );
@@ -1181,7 +1190,7 @@ mod tests {
         assert_eq!(
             spec,
             format!(
-                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|exit_server;\
+                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|anchor,exit_server;\
                  katana-entry-1-bootstrap|192.168.122.57:51820|{ENTRY_PUB};\
                  katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
             )

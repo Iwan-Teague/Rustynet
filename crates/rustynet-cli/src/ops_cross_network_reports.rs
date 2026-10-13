@@ -2283,21 +2283,34 @@ fn collect_matrix_paths(
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    let entries = fs::read_dir(&base_dir).map_err(|err| {
-        format!(
-            "list artifact directory failed ({}): {err}",
-            base_dir.display()
-        )
-    })?;
+    collect_json_paths(&base_dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Scenario stages write their reports one directory level down, at
+/// `<artifact-dir>/<suite>/<suite>_report.json`, or
+/// `<suite>_<profile>_report.json` for profile index > 0 (see
+/// `stage_report_path_for_idx` in the orchestrator stage module), while
+/// the phase10 harness writes the same filenames flat into the artifact
+/// dir. Walk recursively so both layouts resolve; callers filter by
+/// `REPORT_SPECS` suite name, so unrelated JSON files are ignored.
+fn collect_json_paths(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|err| format!("list artifact directory failed ({}): {err}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("read directory entry failed: {err}"))?;
         let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+        let file_type = entry
+            .file_type()
+            .map_err(|err| format!("read directory entry type failed: {err}"))?;
+        if file_type.is_dir() {
+            collect_json_paths(&path, out)?;
+        } else if path.extension().and_then(|value| value.to_str()) == Some("json") {
             out.push(path);
         }
     }
-    out.sort();
-    Ok(out)
+    Ok(())
 }
 
 pub fn default_required_nat_profiles() -> Vec<String> {
@@ -3412,6 +3425,30 @@ mod tests {
             &default_required_nat_profiles(),
         )
         .expect("complete canonical reports should validate");
+    }
+
+    #[test]
+    fn collect_matrix_paths_finds_reports_nested_under_suite_dirs() {
+        let temp_dir = TempDir::create().expect("temp dir");
+        let suite_dir = temp_dir.path().join("cross_network_direct_remote_exit");
+        fs::create_dir_all(&suite_dir).expect("create suite dir");
+        let nested = suite_dir.join("cross_network_direct_remote_exit_report.json");
+        fs::write(&nested, "{}\n").expect("write nested report");
+        let nested_profile =
+            suite_dir.join("cross_network_direct_remote_exit_baseline_lan_report.json");
+        fs::write(&nested_profile, "{}\n").expect("write nested per-profile report");
+
+        let paths =
+            collect_matrix_paths(&[], Some(temp_dir.path().to_path_buf())).expect("collect paths");
+
+        assert!(
+            paths.iter().any(|path| path == &nested),
+            "nested suite report must be discovered, got: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|path| path == &nested_profile),
+            "nested per-profile report must be discovered, got: {paths:?}"
+        );
     }
 
     #[test]
