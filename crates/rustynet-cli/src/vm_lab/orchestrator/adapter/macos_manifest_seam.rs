@@ -82,9 +82,12 @@ const PREBUILT_ARTIFACT_NAMES: [&str; 3] = ["rustynetd", "rustynet-cli", "rustyn
 /// [`seam_target_triple_for_arch`] refuses any other host arch instead.
 pub(crate) const LAB_SEAM_TARGET_TRIPLE: &str = "aarch64-apple-darwin";
 
-/// D5: resolve the manifest triple for the seam's host, refusing (named
-/// error) when the host arch is not aarch64. Split from
-/// [`seam_target_triple`] so the refusal is unit-testable on any host.
+/// D5: resolve the manifest triple for the seam's host arch, refusing (named
+/// error) when the arch is not aarch64. Pure in the host arch, so the guard
+/// is unit-testable on any host; the production entry point
+/// ([`LabManifestSeam::run`]) threads `std::env::consts::ARCH` through
+/// [`LabManifestSeam::run_with_arch`] into this guard, so a non-aarch64
+/// build host still refuses to sign lab manifests.
 fn seam_target_triple_for_arch(host_arch: &str) -> Result<&'static str, AdapterError> {
     if host_arch == "aarch64" {
         Ok(LAB_SEAM_TARGET_TRIPLE)
@@ -97,11 +100,6 @@ fn seam_target_triple_for_arch(host_arch: &str) -> Result<&'static str, AdapterE
             ),
         })
     }
-}
-
-/// The manifest triple for THIS host (`std::env::consts::ARCH`).
-fn seam_target_triple() -> Result<&'static str, AdapterError> {
-    seam_target_triple_for_arch(std::env::consts::ARCH)
 }
 
 /// Seeds older than this are leftovers from a SIGKILLed/`process::exit`ed
@@ -352,7 +350,8 @@ pub(crate) struct LabManifestSeam {
 
 impl LabManifestSeam {
     /// Create the seed and sign the manifest(s) for exactly the artifacts
-    /// about to be shipped. The source archive is ALWAYS signed (staged as
+    /// about to be shipped, keying the D5 arch guard on THIS host
+    /// (`std::env::consts::ARCH`). The source archive is ALWAYS signed (staged as
     /// `rn_source.tar.gz`, the name `install_daemon` transfers and the
     /// bootstrap verifies by) — the guest bootstrap verifies the archive
     /// before every build path, prebuilt or not. When `prebuilt_binaries`
@@ -365,6 +364,28 @@ impl LabManifestSeam {
         source_archive: &Path,
         prebuilt_binaries: &[PathBuf],
     ) -> Result<Self, AdapterError> {
+        Self::run_with_arch(
+            report_dir,
+            source_archive,
+            prebuilt_binaries,
+            std::env::consts::ARCH,
+        )
+    }
+
+    /// [`Self::run`] with the build-host arch injected. Production callers
+    /// must go through [`Self::run`] (which keys on `std::env::consts::ARCH`);
+    /// tests pass the pinned lab arch explicitly so both the signing path
+    /// and the D5 refusal are exercised on every host arch, Linux CI
+    /// included.
+    fn run_with_arch(
+        report_dir: &Path,
+        source_archive: &Path,
+        prebuilt_binaries: &[PathBuf],
+        host_arch: &str,
+    ) -> Result<Self, AdapterError> {
+        // Resolve the D5 guard FIRST: a non-aarch64 build host is refused
+        // before any signing material is minted or the archive is staged.
+        let triple = seam_target_triple_for_arch(host_arch)?;
         let (seed_path, _seed_hex) = mint_throwaway_seed(report_dir)?;
         let seed_guard = ThrowawaySeedGuard {
             seed_path: seed_path.clone(),
@@ -373,11 +394,7 @@ impl LabManifestSeam {
         let run_dir = seam_run_dir(report_dir)?;
         let staged = stage_source_archive(&run_dir, source_archive)?;
         let source_manifest_path = create_lab_manifest(
-            &[format!(
-                "rn_source.tar.gz:{}:{}",
-                seam_target_triple()?,
-                staged.display()
-            )],
+            &[format!("rn_source.tar.gz:{}:{}", triple, staged.display())],
             &seed_path,
             run_dir.join("release-manifest.json"),
         )?;
@@ -385,7 +402,7 @@ impl LabManifestSeam {
             None
         } else {
             Some(create_lab_manifest(
-                &prebuilt_artifact_specs(prebuilt_binaries)?,
+                &prebuilt_artifact_specs(prebuilt_binaries, triple)?,
                 &seed_path,
                 run_dir.join("prebuilt-release-manifest.json"),
             )?)
@@ -449,9 +466,12 @@ fn stage_source_archive(run_dir: &Path, source_archive: &Path) -> Result<PathBuf
 /// file must be named exactly `rustynetd`, `rustynet-cli`, or
 /// `rustynet-relay`, and all three must be present — the guest bootstrap
 /// hard-fails if any of the three is missing from RN_PREBUILT_DIR, so a
-/// subset would only move the failure to the guest.
-fn prebuilt_artifact_specs(binaries: &[PathBuf]) -> Result<Vec<String>, AdapterError> {
-    let triple = seam_target_triple()?;
+/// subset would only move the failure to the guest. `triple` is the
+/// D5-resolved manifest triple (see [`seam_target_triple_for_arch`]).
+fn prebuilt_artifact_specs(
+    binaries: &[PathBuf],
+    triple: &str,
+) -> Result<Vec<String>, AdapterError> {
     let mut specs = Vec::with_capacity(binaries.len());
     for bin in binaries {
         let name =
@@ -672,7 +692,7 @@ mod tests {
         // create a tiny fake archive
         let arch = report.join("src.tar.gz");
         std::fs::write(&arch, b"pretend-archive").unwrap();
-        let seam = LabManifestSeam::run(&report, &arch, &[]).unwrap();
+        let seam = LabManifestSeam::run_with_arch(&report, &arch, &[], "aarch64").unwrap();
         let seed_dir = report.join("lab-release-seed");
         let seeds_before: Vec<_> = std::fs::read_dir(&seed_dir).unwrap().collect();
         assert_eq!(seeds_before.len(), 1, "exactly one throwaway seed exists");
@@ -717,14 +737,94 @@ mod tests {
         }
     }
 
+    /// D5 guard direction (a): with the pinned arch injected, the seam
+    /// SIGNS, and the manifest it writes carries exactly the pinned
+    /// `aarch64-apple-darwin` triple. Runs on every host, Linux CI included.
+    #[test]
+    fn seam_signs_for_aarch64_with_pinned_triple() {
+        let report = tmpdir("sign-aarch64");
+        let archive = report.join("src.tar.gz");
+        std::fs::write(&archive, b"pretend-archive-bytes").unwrap();
+        let seam = LabManifestSeam::run_with_arch(&report, &archive, &[], "aarch64")
+            .expect("aarch64 is the pinned lab fleet arch; the seam must sign here");
+        let json = std::fs::read_to_string(seam.manifest_host_path()).unwrap();
+        assert!(
+            json.contains("\"target\": \"aarch64-apple-darwin\""),
+            "source manifest must pin the aarch64 triple: {json}"
+        );
+        assert!(
+            !json.contains("x86_64"),
+            "no x86_64 triple may appear: {json}"
+        );
+        std::fs::remove_dir_all(&report).unwrap();
+    }
+
+    /// D5 guard direction (b): every non-aarch64 arch ("x86_64", "arm", "")
+    /// is REFUSED with the exact named error, both at the triple guard and
+    /// end to end before any signing material exists. This keeps the guard
+    /// tested on every host, including an x86_64 Linux CI runner.
+    #[test]
+    fn seam_refuses_non_aarch64_arch_exact() {
+        for host_arch in ["x86_64", "arm", ""] {
+            let expected_message = format!(
+                "lab manifest seam: this host is '{host_arch}' but every lab manifest triple is pinned to '{LAB_SEAM_TARGET_TRIPLE}' (the lab fleet is aarch64-macOS-only); signing here would mislabel the artifacts — refuse instead (fail closed; D5)"
+            );
+            match seam_target_triple_for_arch(host_arch) {
+                Ok(triple) => panic!("arch '{host_arch}' must be refused, got triple {triple}"),
+                Err(AdapterError::Protocol { message }) => {
+                    assert_eq!(message, expected_message, "refusal text changed");
+                }
+                Err(other) => panic!("expected AdapterError::Protocol, got {other:?}"),
+            }
+            // End to end: the run refuses at the guard, before minting any
+            // signing material.
+            let report = tmpdir("refuse-non-aarch64");
+            let archive = report.join("src.tar.gz");
+            std::fs::write(&archive, b"x").unwrap();
+            match LabManifestSeam::run_with_arch(&report, &archive, &[], host_arch) {
+                Ok(_) => panic!("arch '{host_arch}' must be refused end to end"),
+                Err(AdapterError::Protocol { message }) => {
+                    assert_eq!(message, expected_message);
+                }
+                Err(other) => panic!("expected AdapterError::Protocol, got {other:?}"),
+            }
+            assert!(
+                !report.join("lab-release-seed").exists(),
+                "the refusal must happen before any seed is minted"
+            );
+            std::fs::remove_dir_all(&report).unwrap();
+        }
+    }
+
+    /// The production entry keys the D5 guard on THIS host's arch: `run`
+    /// must behave exactly like `run_with_arch(std::env::consts::ARCH)`. On
+    /// a non-aarch64 build host (Linux CI) this test fails if the
+    /// production wrapper hard-codes "aarch64" instead of the host arch.
+    #[test]
+    fn production_run_keys_on_this_host_arch() {
+        let report = tmpdir("prod-arch");
+        let archive = report.join("src.tar.gz");
+        std::fs::write(&archive, b"x").unwrap();
+        let injected =
+            LabManifestSeam::run_with_arch(&report, &archive, &[], std::env::consts::ARCH).is_ok();
+        let production = LabManifestSeam::run(&report, &archive, &[]).is_ok();
+        assert_eq!(
+            production, injected,
+            "run() must key on std::env::consts::ARCH"
+        );
+        std::fs::remove_dir_all(&report).unwrap();
+    }
+
     /// D5: the artifact specs carry exactly the pinned triple — the
     /// mislabelled hardcoded string is gone from both manifest paths. The
     /// pinned triple is resolved through the PURE arch-keyed
-    /// [`seam_target_triple_for_arch`], not [`seam_target_triple`]: the
-    /// latter keys on `std::env::consts::ARCH`, i.e. the BUILD host's arch,
-    /// so a test that unwraps it would fail on every non-aarch64 build host
-    /// (N1, review macos-nits). The refusal such hosts get in production is
-    /// covered by `seam_triple_refuses_a_non_aarch64_host_arch` above.
+    /// [`seam_target_triple_for_arch`]: production keys the guard on
+    /// `std::env::consts::ARCH` (the BUILD host's arch) inside
+    /// [`LabManifestSeam::run`], so a test that unwrapped the production
+    /// entry would fail on every non-aarch64 build host (N1, review
+    /// macos-nits). Tests instead inject the arch via
+    /// [`LabManifestSeam::run_with_arch`]; the refusal such hosts get in
+    /// production is covered by `seam_refuses_non_aarch64_arch_exact` below.
     #[test]
     fn prebuilt_specs_carry_the_pinned_lab_triple() {
         let triple = seam_target_triple_for_arch("aarch64")
@@ -734,7 +834,7 @@ mod tests {
             .iter()
             .map(|name| PathBuf::from(format!("/tmp/fake-target-dir/{name}")))
             .collect();
-        for spec in prebuilt_artifact_specs(&bins).expect("specs") {
+        for spec in prebuilt_artifact_specs(&bins, triple).expect("specs") {
             assert!(
                 spec.contains(":aarch64-apple-darwin:"),
                 "every spec must carry the pinned triple: {spec}"
@@ -751,8 +851,8 @@ mod tests {
         // produces): the second must never overwrite the first's signed manifest,
         // or the first guest receives a manifest whose signature does not match
         // its env-pinned key.
-        let seam_a = LabManifestSeam::run(&report, &arch, &[]).unwrap();
-        let seam_b = LabManifestSeam::run(&report, &arch, &[]).unwrap();
+        let seam_a = LabManifestSeam::run_with_arch(&report, &arch, &[], "aarch64").unwrap();
+        let seam_b = LabManifestSeam::run_with_arch(&report, &arch, &[], "aarch64").unwrap();
         let path_a = seam_a.manifest_host_path().to_path_buf();
         let path_b = seam_b.manifest_host_path().to_path_buf();
         assert_ne!(
@@ -828,7 +928,7 @@ mod tests {
         let arch = report.join("src.tar.gz");
         std::fs::write(&arch, b"pretend-archive-bytes").unwrap();
 
-        let seam = LabManifestSeam::run(&report, &arch, &[]).unwrap();
+        let seam = LabManifestSeam::run_with_arch(&report, &arch, &[], "aarch64").unwrap();
         let manifest = seam.manifest_host_path().to_path_buf();
         // The guest's source verify reads every manifest artifact from its
         // private staging dir; mirror that with the seam run dir, which holds
@@ -931,7 +1031,7 @@ mod tests {
         let report = tmpdir("append");
         let arch = report.join("src.tar.gz");
         std::fs::write(&arch, b"x").unwrap();
-        let seam = LabManifestSeam::run(&report, &arch, &[]).unwrap();
+        let seam = LabManifestSeam::run_with_arch(&report, &arch, &[], "aarch64").unwrap();
         let out = append_lab_manifest_env("ROLE=Validator\n".to_owned(), Some(&seam)).unwrap();
         assert!(out.contains("RUSTYNET_RELEASE_MANIFEST=/tmp/rn_release_manifest.json\n"));
         assert!(out.contains("RUSTYNET_RELEASE_PINNED_KEY_HEX="));
@@ -954,7 +1054,7 @@ mod tests {
             std::fs::write(&p, b"elf-bytes").unwrap();
             paths.push(p);
         }
-        let seam = LabManifestSeam::run(&report, &arch, &paths).unwrap();
+        let seam = LabManifestSeam::run_with_arch(&report, &arch, &paths, "aarch64").unwrap();
         let out = append_lab_manifest_env("ROLE=Validator\n".to_owned(), Some(&seam)).unwrap();
         assert!(
             out.contains("RN_PREBUILT_RELEASE_MANIFEST=/tmp/rn_prebuilt_release_manifest.json\n")
@@ -969,7 +1069,7 @@ mod tests {
         let report = tmpdir("prebuilt");
         let bin = report.join("evil-binary");
         std::fs::write(&bin, b"MZ").unwrap();
-        assert!(prebuilt_artifact_specs(&[bin]).is_err());
+        assert!(prebuilt_artifact_specs(&[bin], LAB_SEAM_TARGET_TRIPLE).is_err());
         std::fs::remove_dir_all(&report).unwrap();
     }
 
@@ -985,7 +1085,7 @@ mod tests {
             std::fs::write(report.join(name), b"elf-bytes").unwrap();
         }
         let paths = vec![report.join("rustynetd"), report.join("rustynet-cli")];
-        let err = LabManifestSeam::run(&report, &arch, &paths);
+        let err = LabManifestSeam::run_with_arch(&report, &arch, &paths, "aarch64");
         assert!(
             err.is_err(),
             "a prebuilt set missing rustynet-relay must be refused host-side"
@@ -1004,7 +1104,7 @@ mod tests {
             std::fs::write(&p, b"elf-bytes").unwrap();
             paths.push(p);
         }
-        let seam = LabManifestSeam::run(&report, &arch, &paths).unwrap();
+        let seam = LabManifestSeam::run_with_arch(&report, &arch, &paths, "aarch64").unwrap();
         let source_manifest = seam.manifest_host_path().to_path_buf();
         let prebuilt_manifest = seam
             .prebuilt_manifest_host_path()
