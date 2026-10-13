@@ -1478,6 +1478,28 @@ impl fmt::Debug for PeerEngineState {
 
 #[cfg(test)]
 mod tests {
+
+    /// Serializes the tests that drive the engine's tunnel timers: boringtun's
+    /// `mock-instant` clock is a process-global `AtomicU64`, and with cargo's
+    /// default parallel test threads one test's `advance_engine_clock` could
+    /// otherwise land inside another test's establish-to-tick window and fire
+    /// that test's rekey or keepalive branches early (a 121s rekey advance
+    /// landing inside the 1.1s keepalive window of
+    /// `shared_scratch_roundtrips_...` turns its expected 32-byte keepalive
+    /// into a 148-byte handshake initiation). Every boringtun timer decision
+    /// is a relative duration, so while the lease is held a test sees only its
+    /// own advances and stays deterministic.
+    static MOCK_CLOCK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII lease on [`MOCK_CLOCK_TEST_LOCK`], taken as the first statement of
+    /// each clock-driving test. Poisoning is collapsed so a panicking test
+    /// cannot cascade lock failures into its successors.
+    fn mock_clock_test_lease() -> std::sync::MutexGuard<'static, ()> {
+        MOCK_CLOCK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     use super::{AllowedIpNetwork, UserspaceEngine};
     use base64::Engine as _;
     use base64::prelude::BASE64_STANDARD;
@@ -1488,6 +1510,7 @@ mod tests {
     fn peer_path_quality_hysteresis_and_rfc6298_tracking() {
         use super::PeerPathQuality;
         use rustynet_backend_api::PathHealth;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let mut quality = PeerPathQuality::default();
         assert_eq!(quality.health(), PathHealth::Unknown, "zero evidence");
@@ -1524,6 +1547,7 @@ mod tests {
     fn inbound_dispatch_uses_receiver_index_independent_of_source_address() {
         use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
         use std::net::SocketAddr;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -1605,6 +1629,7 @@ mod tests {
     #[test]
     fn outbound_peer_selection_prefers_longest_prefix_over_exit_default_route() {
         use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -1666,6 +1691,7 @@ mod tests {
     #[test]
     fn peer_path_quality_accessor_dedupes_by_handshake_advance() {
         use rustynet_backend_api::{NodeId, PathHealth, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -1741,6 +1767,7 @@ mod tests {
     #[test]
     fn reconfiguring_an_identical_peer_is_unchanged_and_keeps_the_session() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(7);
         let node_id = NodeId::new("peer-a").expect("node id");
         let config = PeerConfig {
@@ -1794,6 +1821,7 @@ mod tests {
     #[test]
     fn peer_config_carries_its_keepalive_into_the_engine() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(13);
         let config = PeerConfig {
             node_id: NodeId::new("peer-ka").expect("node id"),
@@ -1827,6 +1855,7 @@ mod tests {
     #[test]
     fn endpoint_only_change_moves_the_peer_and_keeps_its_session() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(11);
         let node_id = NodeId::new("peer-roam").expect("node id");
         let at = |port: u16| PeerConfig {
@@ -1871,6 +1900,7 @@ mod tests {
     #[test]
     fn changed_peer_material_still_reports_replaced() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let base = |pubkey: u8, port: u16, cidr: &str| PeerConfig {
             node_id: NodeId::new("peer-b").expect("node id"),
             endpoint: SocketEndpoint {
@@ -1930,6 +1960,7 @@ mod tests {
     #[test]
     fn preshared_key_change_classifies_as_replaced_not_unchanged_or_moved() {
         use rustynet_backend_api::PresharedKey;
+        let _mock_clock_guard = mock_clock_test_lease();
         let node_id = NodeId::new("peer-psk").expect("node id");
 
         // Fresh peer with a PSK: plain Added (nothing to classify yet).
@@ -1997,6 +2028,7 @@ mod tests {
     /// classification — S5 must be inert unless a PSK actually changes.
     #[test]
     fn psk_none_workload_keeps_pre_s5_dispositions_and_classifies_nothing() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let node_id = NodeId::new("peer-none").expect("node id");
         let mut engine = fresh_engine(6);
 
@@ -2058,6 +2090,7 @@ mod tests {
     fn preshared_key_rebuild_records_loud_classification() {
         use super::PresharedKeyRekeyChange;
         use rustynet_backend_api::PresharedKey;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let mut engine = fresh_engine(7);
         let node_id = NodeId::new("peer-f9").expect("node id");
@@ -2188,6 +2221,7 @@ mod tests {
     #[test]
     fn preshared_key_debug_redacts_every_encoding() {
         use rustynet_backend_api::{PeerConfig, PresharedKey, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let bytes: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(13).wrapping_add(7));
         let psk = PresharedKey::new(zeroize::Zeroizing::new(bytes));
@@ -2262,6 +2296,7 @@ mod tests {
     /// never the bytes, and the default configure path is None.
     #[test]
     fn engine_peer_state_debug_reports_psk_presence_only() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(5);
         let node_id = NodeId::new("peer-presence").expect("node id");
         engine
@@ -2323,6 +2358,7 @@ mod tests {
     fn preshared_key_reaches_tunnel_construction_and_gates_handshake() {
         use boringtun::noise::{Tunn, TunnResult};
         use boringtun::x25519::{PublicKey, StaticSecret};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let psk: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(11));
 
@@ -2491,6 +2527,7 @@ mod tests {
 
     #[test]
     fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_high_then_low() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let shared_endpoint: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)), 51820);
         let mut engine = fresh_engine(11);
@@ -2523,6 +2560,7 @@ mod tests {
 
     #[test]
     fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_low_then_high() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let shared_endpoint: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 51)), 51820);
         let mut engine = fresh_engine(12);
@@ -2554,6 +2592,7 @@ mod tests {
 
     #[test]
     fn duplicate_endpoint_removal_of_winner_promotes_next_lowest_node_id() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let shared_endpoint: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 52)), 51820);
         let mut engine = fresh_engine(13);
@@ -2626,6 +2665,7 @@ mod tests {
 
     #[test]
     fn update_peer_endpoint_moves_peer_between_reverse_index_entries() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let endpoint_1: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 60)), 51820);
         let endpoint_2: SocketAddr =
@@ -2664,6 +2704,7 @@ mod tests {
 
     #[test]
     fn reconfiguring_existing_peer_at_new_endpoint_unlinks_the_old_endpoint() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let endpoint_1: SocketAddr =
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 70)), 51820);
         let endpoint_2: SocketAddr =
@@ -2696,6 +2737,7 @@ mod tests {
     // `reject_round_trip_target` check and inbound dispatch both stand on.
     #[test]
     fn endpoint_index_agrees_with_linear_scan_reference_under_random_mutations() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x5E);
 
         // Deterministic xorshift64* PRNG: no external rand dependency, and a
@@ -2814,6 +2856,7 @@ mod tests {
     #[test]
     fn stale_receiver_index_after_rebuild_is_not_attributed() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x61);
         let node_id = NodeId::new("peer-rebuild").expect("node id");
         let config = |pubkey: u8| PeerConfig {
@@ -2901,6 +2944,7 @@ mod tests {
 
     #[test]
     fn removed_peer_receiver_index_entry_is_gone() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x62);
         let node_id = configure_peer_at(
             &mut engine,
@@ -2945,6 +2989,7 @@ mod tests {
 
     #[test]
     fn duplicate_tunnel_index_collision_refusal_is_a_clean_no_op() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x63);
         let peer_a = configure_peer_at(
             &mut engine,
@@ -3017,6 +3062,7 @@ mod tests {
     // assertion — because a panic kills the engine's worker thread.
     #[test]
     fn receiver_index_dispatch_never_panics_on_divergence() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x65);
         let node_id = configure_peer_at(
             &mut engine,
@@ -3087,6 +3133,7 @@ mod tests {
 
     #[test]
     fn receiver_index_agrees_with_peer_states_under_random_mutations() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let mut engine = fresh_engine(0x66);
 
         // Same deterministic xorshift64* PRNG as the endpoint-index fuzz: a
@@ -3194,6 +3241,7 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_accepts_and_masks_ipv4_network() {
+        let _mock_clock_guard = mock_clock_test_lease();
         // Host bits below the prefix must be masked off: 100.64.5.5/10 is the
         // 100.64.0.0/10 network.
         let net = AllowedIpNetwork::parse("100.64.5.5/10").expect("valid v4 CIDR");
@@ -3205,6 +3253,7 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_accepts_host_routes_and_ipv6() {
+        let _mock_clock_guard = mock_clock_test_lease();
         AllowedIpNetwork::parse("10.0.0.1/32").expect("v4 host route");
         AllowedIpNetwork::parse("2001:db8::1/128").expect("v6 host route");
         let v6 = AllowedIpNetwork::parse("2001:db8::/32").expect("valid v6 CIDR");
@@ -3223,16 +3272,19 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_rejects_missing_prefix_separator() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("100.64.0.0", "must be valid CIDR strings");
     }
 
     #[test]
     fn allowed_ip_parse_rejects_invalid_network_address() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("not-an-ip/24", "invalid network address");
     }
 
     #[test]
     fn allowed_ip_parse_rejects_non_numeric_prefix() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("10.0.0.0/ab", "invalid prefix length");
         // Out of u8 range also fails the numeric parse, not the bound check.
         assert_parse_rejects("10.0.0.0/256", "invalid prefix length");
@@ -3240,11 +3292,13 @@ mod tests {
 
     #[test]
     fn allowed_ip_parse_rejects_oversized_ipv4_prefix() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("10.0.0.0/33", "IPv4 prefix length must be <= 32");
     }
 
     #[test]
     fn allowed_ip_parse_rejects_oversized_ipv6_prefix() {
+        let _mock_clock_guard = mock_clock_test_lease();
         assert_parse_rejects("2001:db8::/129", "IPv6 prefix length must be <= 128");
     }
 
@@ -3252,6 +3306,7 @@ mod tests {
 
     #[test]
     fn from_private_key_file_loads_valid_32_byte_key() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
         std::fs::write(&path, BASE64_STANDARD.encode([7u8; 32])).expect("write key");
@@ -3260,6 +3315,7 @@ mod tests {
 
     #[test]
     fn from_private_key_file_tolerates_trailing_whitespace() {
+        let _mock_clock_guard = mock_clock_test_lease();
         // Keys are commonly written with a trailing newline; it must be trimmed.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -3270,6 +3326,7 @@ mod tests {
 
     #[test]
     fn from_private_key_file_rejects_missing_file() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("absent.key");
         let err = UserspaceEngine::from_private_key_file(&path).expect_err("missing file");
@@ -3279,6 +3336,7 @@ mod tests {
 
     #[test]
     fn from_private_key_file_rejects_invalid_base64() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
         std::fs::write(&path, "!!! not base64 !!!").expect("write");
@@ -3293,6 +3351,7 @@ mod tests {
 
     #[test]
     fn from_private_key_file_rejects_wrong_key_length() {
+        let _mock_clock_guard = mock_clock_test_lease();
         // A well-formed base64 blob that decodes to 16 bytes, not 32.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -3363,6 +3422,7 @@ mod tests {
     fn dispatch_sends_outbound_ciphertext_immediately_and_returns_no_plaintext() {
         use boringtun::noise::TunnResult;
         use boringtun::noise::errors::WireGuardError;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let node_id = NodeId::new("sender").expect("node id");
         let mut recorded = Vec::new();
@@ -3417,6 +3477,7 @@ mod tests {
     #[test]
     fn dispatch_returns_borrowed_inbound_plaintext_without_touching_sink() {
         use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let node_id = NodeId::new("sender").expect("node id");
         let mut recorded = Vec::new();
@@ -3472,6 +3533,7 @@ mod tests {
     #[test]
     fn drive_inbound_result_flushes_deferred_plaintext_after_the_follow_up_drain() {
         use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let endpoint = remote_addr();
         let mut engine = fresh_engine(3);
@@ -3521,6 +3583,7 @@ mod tests {
     fn drive_inbound_result_with_initial_err_emits_nothing_and_stays_ok() {
         use boringtun::noise::TunnResult;
         use boringtun::noise::errors::WireGuardError;
+        let _mock_clock_guard = mock_clock_test_lease();
 
         let endpoint = remote_addr();
         let mut engine = fresh_engine(4);
@@ -3556,6 +3619,7 @@ mod tests {
     /// stale bytes from the previous writer's message.
     #[test]
     fn initiate_handshake_reuses_engine_scratch_with_byte_identical_output() {
+        let _mock_clock_guard = mock_clock_test_lease();
         let endpoint_x = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 80)), 51820);
         let endpoint_y = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81)), 51820);
         let mut engine = fresh_engine(9);
@@ -3672,19 +3736,14 @@ mod tests {
         packet
     }
 
-    /// Advance the clock boringtun's timers read. With the forwarded
-    /// `boringtun-mock-instant` feature (always on under the workspace gate)
-    /// that is the mock clock, which a sleep can never move; otherwise it is
-    /// wall time.
+    /// Advance the clock boringtun's timers read. Every build of this
+    /// module is a test build, and test builds always have boringtun's
+    /// `mock-instant` feature on (dev-dependency unification; the workspace
+    /// gate reaches the same state with `--all-features`), so this moves the
+    /// frozen mock clock — which no real sleep could move — and never
+    /// blocks.
     fn advance_engine_clock(by: std::time::Duration) {
-        #[cfg(feature = "boringtun-mock-instant")]
-        {
-            boringtun::mock_instant::MockClock::advance(by);
-        }
-        #[cfg(not(feature = "boringtun-mock-instant"))]
-        {
-            std::thread::sleep(by);
-        }
+        boringtun::mock_instant::MockClock::advance(by);
     }
 
     /// Pops a single ciphertext event, returning its payload.
@@ -3710,6 +3769,7 @@ mod tests {
     fn shared_scratch_roundtrips_handshake_then_variable_length_frames() {
         use boringtun::noise::{Tunn, TunnResult};
         use boringtun::x25519::{PublicKey, StaticSecret};
+        let _mock_clock_guard = mock_clock_test_lease();
 
         // The engine's static key is `[seed; 32]` (see `fresh_engine`); derive
         // its public key and build a real counterpart tunnel around a peer key
@@ -3859,5 +3919,531 @@ mod tests {
             TunnResult::Done => {}
             other => panic!("counterpart must accept the keepalive, got {other:?}"),
         }
+    }
+
+    /// The sender index of a handshake message: bytes 4..8, little endian
+    /// (boringtun handshake.rs writes `sender_index.copy_from_slice(
+    /// &local_index.to_le_bytes())` for both initiation and response, and a
+    /// response's sender index is the responder's session index).
+    fn handshake_sender_index(payload: &[u8]) -> u32 {
+        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+    }
+
+    /// The receiver index of a transport (data) packet: bytes 4..8, little
+    /// endian. Despite the field's name, boringtun's sender writes the
+    /// COUNTERPART's session index there — `format_packet_data` puts
+    /// `self.sending_index` (the index the peer assigned to the shared
+    /// session) in the receiver-index slot, and the receiving peer drops any
+    /// data packet whose receiver index is not its own session index. So a
+    /// data frame names exactly one session on the receiving side, and after
+    /// a rekey a frame must name the NEW session, never the old one.
+    fn data_receiver_index(payload: &[u8]) -> u32 {
+        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]])
+    }
+
+    /// The transport counter word of a data packet: bytes 8..16, little
+    /// endian — `format_packet_data` writes message type (4), receiver
+    /// index (4), then the counter (8) before the payload (boringtun
+    /// session.rs). The counter is `sending_key_counter.fetch_add(1)`, so
+    /// it observes the value BEFORE the increment: a fresh keypair's first
+    /// sealed frame carries counter 0 (`Session::new` seeds
+    /// `sending_key_counter` at 0), and every later frame counts up from
+    /// there.
+    fn data_counter_word(payload: &[u8]) -> u64 {
+        u64::from_le_bytes([
+            payload[8],
+            payload[9],
+            payload[10],
+            payload[11],
+            payload[12],
+            payload[13],
+            payload[14],
+            payload[15],
+        ])
+    }
+
+    /// Engine + a real boringtun counterpart with one completed, engine-
+    /// initiated session. This is the fixture for the AUDIT-025 rekey
+    /// regression tests: the engine is the initiator (only the initiator
+    /// rekeys after `REKEY_AFTER_TIME`), and the counterpart is a plain
+    /// `Tunn`, so the rekey handshake and the post-rekey traffic are proven
+    /// against unmodified boringtun, not against the engine's own view.
+    struct RekeyFixture {
+        endpoint: SocketAddr,
+        node_id: NodeId,
+        engine: UserspaceEngine,
+        counterpart: boringtun::noise::Tunn,
+        sink: RecordingSink,
+        counterpart_buf: Vec<u8>,
+    }
+
+    impl RekeyFixture {
+        fn new() -> Self {
+            use boringtun::x25519::{PublicKey, StaticSecret};
+
+            // Same shape as `shared_scratch_roundtrips_...`: the engine's
+            // static key is `[seed; 32]` (see `fresh_engine`); the
+            // counterpart holds the matching secret for the configured peer
+            // public key, so the three-message handshake completes for real.
+            let engine_secret = StaticSecret::from([9u8; 32]);
+            let engine_public = PublicKey::from(&engine_secret);
+            let peer_secret = StaticSecret::from([0x66; 32]);
+            let peer_public_bytes = *PublicKey::from(&peer_secret).as_bytes();
+
+            let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 90)), 51820);
+            let mut engine = fresh_engine(9);
+            let node_id = NodeId::new("peer-x").expect("node id");
+            engine
+                .configure_peer(&rustynet_backend_api::PeerConfig {
+                    node_id: node_id.clone(),
+                    endpoint: rustynet_backend_api::SocketEndpoint {
+                        addr: endpoint.ip(),
+                        port: endpoint.port(),
+                    },
+                    public_key: peer_public_bytes,
+                    allowed_ips: vec!["100.64.8.0/24".to_owned()],
+                    // No persistent keepalive: the rekey tests must see the
+                    // timer tick produce a handshake initiation, not a
+                    // keepalive, and nothing else.
+                    persistent_keepalive_secs: None,
+                    preshared_key: None,
+                })
+                .expect("peer configures");
+            let counterpart =
+                boringtun::noise::Tunn::new(peer_secret, engine_public, None, None, 0, None);
+            Self {
+                endpoint,
+                node_id,
+                engine,
+                counterpart,
+                sink: RecordingSink::default(),
+                counterpart_buf: vec![0u8; 65_567],
+            }
+        }
+
+        /// Runs one full three-message handshake to completion: the engine
+        /// initiates, the counterpart responds, and the engine processes the
+        /// response (plus the post-handshake empty transport packet). Returns
+        /// `(engine_sender_index, counterpart_session_index)`: the engine's
+        /// sender index from its initiation, and the counterpart's session
+        /// index from the response's sender-index field, which is the value
+        /// the engine will put in every data frame's receiver-index slot.
+        fn establish_session(&mut self, transport_generation: u64) -> (u32, u32) {
+            use boringtun::noise::TunnResult;
+
+            let observed = self
+                .engine
+                .initiate_handshake(&self.node_id, transport_generation, false, &mut self.sink)
+                .expect("initiation never errors");
+            assert_eq!(
+                observed, None,
+                "an initiation starts but does not complete a handshake"
+            );
+            let initiation = pop_ciphertext(&mut self.sink, "handshake initiation");
+            assert_eq!(initiation.len(), 148, "msg1 is a fixed-size message");
+
+            let response: Vec<u8> =
+                match self
+                    .counterpart
+                    .decapsulate(None, &initiation, &mut self.counterpart_buf)
+                {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("counterpart must answer the initiation, got {other:?}"),
+                };
+            assert_eq!(
+                response.len(),
+                92,
+                "msg2 is a fixed-size message (HANDSHAKE_RESP_SZ)"
+            );
+            let (observed_peer, _observed_at) = self
+                .engine
+                .process_inbound_ciphertext(
+                    self.endpoint,
+                    remote_addr(),
+                    &response,
+                    transport_generation,
+                    &mut self.sink,
+                )
+                .expect("msg2 never errors")
+                .expect("msg2 completes the session; the handshake timestamps");
+            assert_eq!(
+                observed_peer, self.node_id,
+                "the completed handshake is peer-x's"
+            );
+            let ack = pop_ciphertext(&mut self.sink, "post-handshake empty transport packet");
+            assert_eq!(ack.len(), 32, "the ack is a bare empty transport packet");
+            assert_eq!(
+                data_counter_word(&ack),
+                0,
+                "the fresh keypair's first outbound frame is the handshake-completion \
+                 keepalive and must carry counter 0 (session.rs seeds the counter at 0)"
+            );
+            match self
+                .counterpart
+                .decapsulate(None, &ack, &mut self.counterpart_buf)
+            {
+                TunnResult::Done => {}
+                other => panic!("counterpart must accept the ack, got {other:?}"),
+            }
+            assert!(
+                self.sink.events.is_empty(),
+                "a completed handshake must leave no events, got {:?}",
+                self.sink.events
+            );
+            (
+                handshake_sender_index(&initiation),
+                handshake_sender_index(&response),
+            )
+        }
+
+        /// One runtime-style timer tick at the CURRENT mock instant, with no
+        /// clock movement of its own. This must interleave with
+        /// `advance_engine_clock`: boringtun stamps every timer from
+        /// `timers[TimeCurrent]`, and that field is refreshed ONLY inside
+        /// `update_timers` (boringtun timers.rs). Without a tick between the
+        /// clock advance and the data send, `data_packet_sent` would still
+        /// carry the stale establishment instant and the strict
+        /// `session_established < data_packet_sent` ordering in the rekey
+        /// condition could never hold.
+        fn tick_timers(&mut self, transport_generation: u64) {
+            // The tick's return reports the session's LAST completed
+            // handshake (a live session always reports it — see the
+            // keepalive note in `shared_scratch_roundtrips_...`), not this
+            // tick's emission, so only the sink events matter here.
+            let _ = self
+                .engine
+                .update_peer_timers(transport_generation, &mut self.sink)
+                .expect("timer tick never errors");
+            assert!(
+                self.sink.events.is_empty(),
+                "a mid-session tick must emit nothing (no keepalive is configured), got {:?}",
+                self.sink.events
+            );
+        }
+
+        /// Injects one frame into the engine and returns (plaintext,
+        /// ciphertext). Sending data is a precondition of the rekey:
+        /// boringtun's on-send rekey fires only when a data packet was sent
+        /// after the session was established (boringtun timers.rs,
+        /// `session_established < data_packet_sent`).
+        fn send_frame(
+            &mut self,
+            payload_len: usize,
+            transport_generation: u64,
+        ) -> (Vec<u8>, Vec<u8>) {
+            let plaintext = ipv4_packet_for_peer(payload_len);
+            self.engine
+                .inject_plaintext_packet(&plaintext, transport_generation, &mut self.sink)
+                .expect("frame with a matching allowed_ip never errors");
+            let ciphertext = pop_ciphertext(&mut self.sink, "data frame");
+            (plaintext, ciphertext)
+        }
+
+        /// Decrypts a frame on the counterpart, proving that ciphertext was
+        /// sealed with a session key the counterpart actually shares.
+        fn counterpart_decrypts_frame(&mut self, ciphertext: &[u8]) -> Vec<u8> {
+            use boringtun::noise::TunnResult;
+
+            match self
+                .counterpart
+                .decapsulate(None, ciphertext, &mut self.counterpart_buf)
+            {
+                TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+                other => panic!("counterpart must decrypt the frame, got {other:?}"),
+            }
+        }
+
+        /// Sends one data frame FROM the counterpart TO the engine and
+        /// returns the plaintext. The engine's authenticated receipt of this
+        /// frame is the load-bearing step of the REKEY_AFTER_TIME witness:
+        /// boringtun stamps `TimeLastPacketReceived` (the authenticated
+        /// inbound marker) with the current `TimeCurrent` and CLEARS
+        /// `want_handshake` on receipt (timers.rs `timer_tick`), which kills
+        /// the KEEPALIVE+REKEY_TIMEOUT initiation branch for every later
+        /// tick of this helper (`data_packet_sent > aut_packet_received` is
+        /// false — both carry the same +1s stamp — and the flag is clear).
+        fn counterpart_sends_frame_to_engine(
+            &mut self,
+            payload_len: usize,
+            transport_generation: u64,
+        ) -> Vec<u8> {
+            use boringtun::noise::TunnResult;
+
+            let plaintext = ipv4_packet_for_peer(payload_len);
+            let outbound = match self
+                .counterpart
+                .encapsulate(&plaintext, &mut self.counterpart_buf)
+            {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("counterpart must seal the return frame, got {other:?}"),
+            };
+            let (observed_peer, _observed_at) = self
+                .engine
+                .process_inbound_ciphertext(
+                    self.endpoint,
+                    remote_addr(),
+                    &outbound,
+                    transport_generation,
+                    &mut self.sink,
+                )
+                .expect("return frame never errors")
+                .expect("the return frame names the live peer-x session");
+            assert_eq!(observed_peer, self.node_id, "the return frame is peer-x's");
+            match self.sink.events.pop() {
+                Some(SinkEvent::Plaintext(decrypted)) => assert_eq!(
+                    decrypted, plaintext,
+                    "the engine must surface the counterpart's frame byte-identically"
+                ),
+                other => panic!("engine must surface the decrypted return frame, got {other:?}"),
+            }
+            assert!(
+                self.sink.events.is_empty(),
+                "receiving the return frame must emit nothing else, got {:?}",
+                self.sink.events
+            );
+            plaintext
+        }
+
+        /// Ages the session past `REKEY_AFTER_TIME` (boringtun timers.rs:19,
+        /// 120s) and walks the rekey handshake to completion: the +122s tick
+        /// must emit a NEW handshake initiation (fresh sender index = fresh
+        /// ephemeral keypair), the counterpart must answer it, and the
+        /// engine must complete the second session. Returns
+        /// `(engine_sender_index, counterpart_session_index)` for the NEW
+        /// session, with the same meaning as `establish_session`.
+        ///
+        /// The tick is a REKEY_AFTER_TIME (on-send) witness BY CONSTRUCTION,
+        /// not just a "some timer rekeyed" witness. The caller has already
+        /// carried one frame each way: the engine sent at the +1s stamp
+        /// (`data_packet_sent` = 1s, `want_handshake` set) and this helper
+        /// first has the COUNTERPART return a frame, so the engine's
+        /// `aut_packet_received` (= `TimeLastPacketReceived`) moves to the
+        /// same +1s stamp and `want_handshake` is cleared (timers.rs
+        /// `timer_tick`). At both ticks below the KEEPALIVE+REKEY_TIMEOUT
+        /// branch (timers.rs, `data_packet_sent > aut_packet_received && …
+        /// && want_handshake`) is dead twice over (the strict > is false and
+        /// the flag is clear), the on-receive branch needs 165s
+        /// (REJECT_AFTER_TIME - KEEPALIVE_TIMEOUT - REKEY_TIMEOUT), and no
+        /// persistent keepalive is configured — so the initiation this
+        /// helper asserts can ONLY come from the on-send branch
+        /// (`session_established < data_packet_sent && now -
+        /// session_established >= REKEY_AFTER_TIME`). Mutating that
+        /// condition — the threshold or the strict ordering — makes both
+        /// ticks emit nothing and the assertions below fail loudly.
+        ///
+        /// This is also the behavioural witness for the AUDIT-025 fix chain
+        /// runtime.rs `poll_peer_timers` → engine.rs `update_peer_timers` →
+        /// `Tunn::update_timers`: with that chain cut (e.g. an early return
+        /// in `update_peer_timers`, recorded in the patch report) both ticks
+        /// emit nothing and the `pop_ciphertext` below fails loudly.
+        fn age_past_rekey_after_time_and_rekey(&mut self, old_sender_index: u32) -> (u32, u32) {
+            use boringtun::noise::TunnResult;
+
+            // Return traffic: clears `want_handshake` and moves the engine's
+            // authenticated-inbound stamp to the +1s mark (see doc above).
+            self.counterpart_sends_frame_to_engine(48, 1);
+
+            // Negative control at +100s past establishment, below
+            // REKEY_AFTER_TIME: a healthy session must tick to NOTHING (no
+            // initiation, no keepalive — none is configured). Whatever fires
+            // here would poison the +122s initiation as a witness.
+            advance_engine_clock(std::time::Duration::from_secs(99));
+            self.tick_timers(1);
+
+            // +22s more: 122s past establishment — past REKEY_AFTER_TIME
+            // (120s), below every other threshold (165s on-receive, 540s
+            // expiry). Only the on-send branch can fire now.
+            advance_engine_clock(std::time::Duration::from_secs(22));
+            // The tick's return reports the session's LAST completed
+            // handshake (the live session-1 — see `tick_timers`), not this
+            // tick's emission; the rekey initiation itself is the single
+            // ciphertext event popped below.
+            let _ = self
+                .engine
+                .update_peer_timers(1, &mut self.sink)
+                .expect("timer tick never errors");
+            let initiation = pop_ciphertext(&mut self.sink, "rekey handshake initiation");
+            assert_eq!(
+                initiation.len(),
+                148,
+                "the rekey initiation is a fixed-size handshake message"
+            );
+            assert_eq!(
+                initiation[0], 1u8,
+                "the rekey message carries the handshake-initiation type byte"
+            );
+            assert_ne!(
+                handshake_sender_index(&initiation),
+                old_sender_index,
+                "the rekey must negotiate a NEW keypair (fresh sender index)"
+            );
+
+            let response: Vec<u8> =
+                match self
+                    .counterpart
+                    .decapsulate(None, &initiation, &mut self.counterpart_buf)
+                {
+                    TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                    other => panic!("counterpart must answer the rekey initiation, got {other:?}"),
+                };
+            assert_eq!(
+                response.len(),
+                92,
+                "the rekey response is a fixed-size message (HANDSHAKE_RESP_SZ)"
+            );
+            let (observed_peer, _observed_at) = self
+                .engine
+                .process_inbound_ciphertext(
+                    self.endpoint,
+                    remote_addr(),
+                    &response,
+                    1,
+                    &mut self.sink,
+                )
+                .expect("rekey response never errors")
+                .expect("the rekey response completes the new session");
+            assert_eq!(
+                observed_peer, self.node_id,
+                "the rekeyed session is peer-x's"
+            );
+            let ack = pop_ciphertext(&mut self.sink, "post-rekey empty transport packet");
+            assert_eq!(ack.len(), 32, "the ack is a bare empty transport packet");
+            assert_eq!(
+                data_counter_word(&ack),
+                0,
+                "the NEW keypair's counter must start over at 0: its first outbound \
+                 frame is the handshake-completion keepalive (session.rs seeds every \
+                 fresh keypair's counter at 0 — nothing may carry the old counter over)"
+            );
+            match self
+                .counterpart
+                .decapsulate(None, &ack, &mut self.counterpart_buf)
+            {
+                TunnResult::Done => {}
+                other => panic!("counterpart must accept the post-rekey ack, got {other:?}"),
+            }
+            assert!(
+                self.sink.events.is_empty(),
+                "the completed rekey must leave no events, got {:?}",
+                self.sink.events
+            );
+            (
+                handshake_sender_index(&initiation),
+                handshake_sender_index(&response),
+            )
+        }
+    }
+
+    /// AUDIT-025 regression, rekey initiation: after `REKEY_AFTER_TIME` on an
+    /// engine-initiated session that has carried data, `update_peer_timers`
+    /// must make the engine emit a new handshake initiation and the
+    /// counterpart must complete it (session 2 established and acknowledged).
+    /// Deterministic: boringtun runs on the mock clock under the workspace
+    /// gate (`boringtun-mock-instant`), moved by `advance_engine_clock`; no
+    /// sleeps.
+    #[test]
+    fn rekey_after_time_emits_new_initiation_and_counterpart_completes_it() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        let (first_session_index, _counterpart_index_1) = fixture.establish_session(1);
+
+        // One real frame on session 1, on a later mock instant so boringtun
+        // strictly orders data_packet_sent after session_established: tick
+        // first (refreshing boringtun's TimeCurrent), then send.
+        advance_engine_clock(std::time::Duration::from_secs(1));
+        fixture.tick_timers(1);
+        let (frame, ciphertext) = fixture.send_frame(64, 1);
+        assert_eq!(
+            fixture.counterpart_decrypts_frame(&ciphertext),
+            frame,
+            "session-1 traffic must flow before the rekey"
+        );
+        assert!(
+            fixture.sink.events.is_empty(),
+            "frame send must leave no events, got {:?}",
+            fixture.sink.events
+        );
+
+        // The helper now runs the branch-faithful protocol: the
+        // counterpart returns one frame (+1s stamp, `want_handshake`
+        // cleared), the +100s tick must emit NOTHING, and the +122s tick —
+        // where only the on-send REKEY_AFTER_TIME branch can fire — must
+        // emit the rekey initiation, which the counterpart completes.
+        fixture.age_past_rekey_after_time_and_rekey(first_session_index);
+    }
+
+    /// AUDIT-025 regression, keypair replacement: the rekey must REPLACE the
+    /// established session, not merely add traffic. Data frames address the
+    /// session via the transport receiver-index field, which carries the
+    /// counterpart's session index; after the new handshake completes, the
+    /// engine's subsequent frames must name the NEW session's index (never
+    /// the old one) and the counterpart must still decrypt them
+    /// byte-identically — traffic keeps flowing across the rekey.
+    #[test]
+    fn rekeyed_session_replaces_keypair_and_traffic_still_flows() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        let (first_session_index, counterpart_index_1) = fixture.establish_session(1);
+
+        advance_engine_clock(std::time::Duration::from_secs(1));
+        fixture.tick_timers(1);
+        let (_frame_1, ciphertext_1) = fixture.send_frame(64, 1);
+        assert_eq!(
+            data_counter_word(&ciphertext_1),
+            1,
+            "the OLD keypair's counter must be > 0 before the rekey (exact value 1: \
+             the handshake-completion keepalive consumed counter 0 — boringtun \
+             formats it with `format_packet_data(&[])` on response receipt — and \
+             this frame fetched counter 1)"
+        );
+        assert_eq!(
+            data_receiver_index(&ciphertext_1),
+            counterpart_index_1,
+            "session-1 frames must address the counterpart's session-1 index: \
+             a transport packet's receiver-index field names the RECEIVING \
+             peer's session (boringtun writes its sending-side view of the \
+             peer's index there)"
+        );
+
+        let (_, counterpart_index_2) =
+            fixture.age_past_rekey_after_time_and_rekey(first_session_index);
+        assert_ne!(
+            counterpart_index_2, counterpart_index_1,
+            "the rekey must mint a NEW session index on the counterpart too"
+        );
+
+        // Post-rekey traffic is sealed with the NEW session and still
+        // decrypts on the counterpart (which moved to the rekeyed session
+        // when it processed initiation/response).
+        let (frame_2, ciphertext_2) = fixture.send_frame(80, 1);
+        assert_eq!(
+            data_counter_word(&ciphertext_2),
+            1,
+            "the FIRST data frame under the NEW keypair must carry counter 1: the \
+             counter RESTARTED for the new keypair (its completion keepalive \
+             consumed counter 0, asserted in the rekey helper) instead of carrying \
+             the old keypair's count over — a rekey must mint a keypair whose \
+             counter space starts at 0"
+        );
+        assert_eq!(
+            data_receiver_index(&ciphertext_2),
+            counterpart_index_2,
+            "post-rekey frames must address the counterpart's NEW session index"
+        );
+        assert_ne!(
+            data_receiver_index(&ciphertext_2),
+            counterpart_index_1,
+            "the old session's index must not be reused for post-rekey traffic"
+        );
+        assert_eq!(
+            fixture.counterpart_decrypts_frame(&ciphertext_2),
+            frame_2,
+            "traffic must still flow on the rekeyed session"
+        );
+        assert!(
+            fixture.sink.events.is_empty(),
+            "post-rekey frame send must leave no events, got {:?}",
+            fixture.sink.events
+        );
     }
 }
