@@ -388,7 +388,7 @@ else
   case "${lines_var}" in ''|*[!0-9]*) {lines_var}=0; {reason_var}=unparseable_capture_tally ;; esac
 fi
 if [ -z "${reason_var}" ]; then
-  tcpdump_err_lines="$(grep -Evc '^(dropped privs to |listening on |tcpdump: verbose output suppressed, use -v\[v\]\.\.\. for full protocol decode$|[0-9]+ packets (captured|received by filter|dropped by kernel))' {error_path} 2>/dev/null || true)"
+  tcpdump_err_lines="$(grep -Evc '^(dropped privs to |listening on |tcpdump: verbose output suppressed, use -v\[v\]\.\.\. for full protocol decode$|[0-9]+ packets? (captured|received by filter|dropped by kernel)$)' {error_path} 2>/dev/null || true)"
   case "$tcpdump_err_lines" in ''|*[!0-9]*) tcpdump_err_lines=0 ;; esac
   if [ "$tcpdump_err_lines" != "0" ]; then
     {reason_var}=tcpdump_error_file_nonempty
@@ -1800,6 +1800,35 @@ mod tests {
             "benign tcpdump stderr must not be an error: {out}"
         );
         assert!(out.contains("leak_check=pass"), "{out}");
+
+        // tcpdump pluralises the tallies: a single packet reaching the filter
+        // prints `1 packet received by filter` (katana-xnet-209 failed
+        // chaos_daemon_fault on exactly this line with zero captured lines).
+        let singular = "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\n\
+                        listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n\
+                        0 packets captured\n1 packet received by filter\n0 packets dropped by kernel\n";
+        let (out, exited_3) = run_tally(singular);
+        assert!(
+            !exited_3,
+            "singular tcpdump tally lines must not be an error: {out}"
+        );
+        assert!(out.contains("leak_check=pass"), "{out}");
+
+        // The tally alternative is end-anchored: a singular tally with a junk
+        // tail or an unknown noun is a real error, not a banner.
+        for junk in [
+            "1 packet captured; evil",
+            "1 packet vanished",
+            "1 packet received by filter extra",
+        ] {
+            let body = format!(
+                "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\n\
+                 listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n{junk}\n"
+            );
+            let (out, exited_3) = run_tally(&body);
+            assert!(exited_3, "`{junk}` must fail closed: {out}");
+            assert!(out.contains("reason=tcpdump_error_file_nonempty"), "{out}");
+        }
 
         let broken = "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\n\
                       listening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n\

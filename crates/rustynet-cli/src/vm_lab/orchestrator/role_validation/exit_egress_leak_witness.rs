@@ -1603,13 +1603,17 @@ fn is_benign_tcpdump_stderr_line(line: &str) -> bool {
         return false;
     }
     let first = toks[0];
-    if first.is_empty() || !first.bytes().all(|b| b.is_ascii_digit()) || toks[1] != "packets" {
+    // tcpdump pluralises the tally: `1 packet received by filter`.
+    if first.is_empty()
+        || !first.bytes().all(|b| b.is_ascii_digit())
+        || (toks[1] != "packets" && toks[1] != "packet")
+    {
         return false;
     }
     match toks[2] {
-        "captured" => true,
-        "received" => toks.len() >= 5 && toks[3] == "by" && toks[4] == "filter",
-        "dropped" => toks.len() >= 5 && toks[3] == "by" && toks[4] == "kernel",
+        "captured" => toks.len() == 3,
+        "received" => toks.len() == 5 && toks[3] == "by" && toks[4] == "filter",
+        "dropped" => toks.len() == 5 && toks[3] == "by" && toks[4] == "kernel",
         _ => false,
     }
 }
@@ -4479,6 +4483,31 @@ mod tests {
         assert!(!is_benign_tcpdump_stderr_line(
             "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode; extra"
         ));
+    }
+
+    // tcpdump pluralises its tallies: one packet reaching the filter prints
+    // `1 packet received by filter` (katana-xnet-209 tripped the chaos
+    // daemon-fault whitelist on that line). A non-numeric count or a wrong
+    // noun stays an error.
+    #[test]
+    fn tcpdump_singular_tally_lines_are_benign_but_malformed_ones_are_not() {
+        for line in [
+            "1 packet captured",
+            "1 packet received by filter",
+            "1 packet dropped by kernel",
+            "12:00:20.000000 1 packet captured",
+        ] {
+            assert!(is_benign_tcpdump_stderr_line(line), "{line}");
+        }
+        for line in [
+            "x packet captured",
+            "1 packet captured extra",
+            "1 packet received by filter extra",
+            "1 packet vanished",
+            "1 packet received by wire",
+        ] {
+            assert!(!is_benign_tcpdump_stderr_line(line), "{line}");
+        }
     }
 
     // Run lenovo-u16l: on a bridged LAN tcpdump (promiscuous) also sees other
