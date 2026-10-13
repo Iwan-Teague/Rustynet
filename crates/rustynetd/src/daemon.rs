@@ -14915,6 +14915,9 @@ fn run_preflight_checks(config: &DaemonConfig) -> Result<(), DaemonError> {
 
     validate_trust_evidence_permissions(&config.trust_evidence_path)?;
     validate_trust_verifier_key_permissions(&config.trust_verifier_key_path)?;
+    if config.trust_watermark_path.exists() {
+        validate_trust_watermark_permissions(&config.trust_watermark_path)?;
+    }
     if config.membership_snapshot_path.exists() {
         validate_membership_snapshot_permissions(&config.membership_snapshot_path)?;
         if config.membership_log_path.exists() {
@@ -15888,9 +15891,21 @@ fn load_remote_ops_access_token_verifying_key(path: &Path) -> Result<VerifyingKe
 }
 
 fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBootstrapError> {
-    if !path.exists() {
-        return Ok(None);
+    // A missing watermark is the legitimate TOFU starting state; every other
+    // stat failure (EACCES, ELOOP, EIO, ...) must fail closed instead of
+    // reading as "no watermark has ever been established".
+    match fs::metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(TrustBootstrapError::Io(format!(
+                "trust watermark stat({}): {err}",
+                path.display()
+            )));
+        }
     }
+    validate_trust_watermark_permissions(path)
+        .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
 
     let content = read_text_artifact_bounded(path, "trust watermark", MAX_BOOTSTRAP_ARTIFACT_BYTES)
         .map_err(TrustBootstrapError::Io)?;
@@ -15912,13 +15927,21 @@ fn load_trust_watermark(path: &Path) -> Result<Option<TrustWatermark>, TrustBoot
         }
         match key {
             "version" => {
-                version = value.parse::<u8>().ok();
+                version = Some(value.parse::<u8>().map_err(|err| {
+                    TrustBootstrapError::InvalidFormat(format!("invalid watermark version: {err}"))
+                })?);
             }
             "updated_at_unix" => {
-                updated_at_unix = value.parse::<u64>().ok();
+                updated_at_unix = Some(value.parse::<u64>().map_err(|err| {
+                    TrustBootstrapError::InvalidFormat(format!(
+                        "invalid watermark updated_at_unix: {err}"
+                    ))
+                })?);
             }
             "nonce" => {
-                nonce = value.parse::<u64>().ok();
+                nonce = Some(value.parse::<u64>().map_err(|err| {
+                    TrustBootstrapError::InvalidFormat(format!("invalid watermark nonce: {err}"))
+                })?);
             }
             "payload_digest_sha256" => {
                 payload_digest = Some(decode_hex_to_fixed::<32>(value)?);
@@ -15956,14 +15979,64 @@ fn persist_trust_watermark(
     watermark: TrustWatermark,
 ) -> Result<(), TrustBootstrapError> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|err| {
-            TrustBootstrapError::Io(format!("create_dir_all({}): {}", parent.display(), err))
-        })?;
+        // The parent may be shared with the other trust artifacts (on macOS
+        // trust/ also holds the evidence and the verifier key), so an
+        // existing directory is only VERIFIED here — never chmodded. Missing
+        // parents are created with 0700 from the first instant (unix).
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .map_err(|err| TrustBootstrapError::Io(err.to_string()))?;
+            use std::os::unix::fs::DirBuilderExt;
+            match fs::metadata(parent) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() {
+                        return Err(TrustBootstrapError::Io(format!(
+                            "watermark parent directory is not a directory: {}",
+                            parent.display()
+                        )));
+                    }
+                    let mode = metadata.permissions().mode();
+                    if mode & 0o022 != 0 {
+                        return Err(TrustBootstrapError::Io(format!(
+                            "watermark parent directory {} is writable by group or other: mode {:o}",
+                            parent.display(),
+                            mode & 0o777
+                        )));
+                    }
+                    let owner_uid = metadata.uid();
+                    let expected_uid = Uid::effective().as_raw();
+                    if owner_uid != expected_uid {
+                        return Err(TrustBootstrapError::Io(format!(
+                            "watermark parent directory {} owner uid mismatch: expected {expected_uid}, got {owner_uid}",
+                            parent.display()
+                        )));
+                    }
+                }
+                Err(err) if err.kind() == ErrorKind::NotFound => {
+                    fs::DirBuilder::new()
+                        .recursive(true)
+                        .mode(0o700)
+                        .create(parent)
+                        .map_err(|err| {
+                            TrustBootstrapError::Io(format!(
+                                "create_dir_all({}): {}",
+                                parent.display(),
+                                err
+                            ))
+                        })?;
+                }
+                Err(err) => {
+                    return Err(TrustBootstrapError::Io(format!(
+                        "watermark parent stat({}): {err}",
+                        parent.display()
+                    )));
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(parent).map_err(|err| {
+                TrustBootstrapError::Io(format!("create_dir_all({}): {}", parent.display(), err))
+            })?;
         }
     }
     let payload = format!(
@@ -18341,6 +18414,13 @@ fn validate_remote_ops_token_verifier_key_permissions(path: &Path) -> Result<(),
 #[cfg(not(target_os = "linux"))]
 fn validate_trust_verifier_key_permissions(path: &Path) -> Result<(), DaemonError> {
     validate_file_security(path, "trust verifier key", 0o022, true)
+}
+
+/// The watermark is the anti-rollback anchor, so it gets the same owner /
+/// mode / no-symlink / parent scrutiny as every other trust artifact. It
+/// holds no secret, but "not secret" is not "not security-critical".
+fn validate_trust_watermark_permissions(path: &Path) -> Result<(), DaemonError> {
+    validate_file_security(path, "trust watermark", 0o022, true)
 }
 
 #[cfg(not(windows))]
@@ -27900,6 +27980,304 @@ mod tests {
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
+    /// F2: `Path::exists()` collapsed every stat error (EACCES, ELOOP, EIO,
+    /// ...) into Ok(None) = "no watermark has ever been established", which
+    /// silently skipped the anti-rollback comparison. Only a genuine
+    /// NotFound may read as absent; everything else must fail closed.
+    #[cfg(unix)]
+    #[test]
+    fn load_trust_watermark_unreadable_parent_directory_fails_closed() {
+        if nix::unistd::Uid::effective().is_root() {
+            return; // root traverses mode-000 directories; the precondition cannot be staged.
+        }
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-unreadable-parent");
+        let sealed_dir = test_dir.join("sealed");
+        std::fs::create_dir_all(&sealed_dir).expect("sealed dir should create");
+        let watermark_path = sealed_dir.join("trust.watermark");
+        std::fs::write(&watermark_path, "version=2\nupdated_at_unix=1\nnonce=1\n")
+            .expect("watermark should be written");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sealed_dir, std::fs::Permissions::from_mode(0o000))
+                .expect("sealed dir permissions should be set");
+        }
+        let err = load_trust_watermark(&watermark_path).expect_err(
+            "a stat failure behind an unreadable parent must fail closed, not read as absent",
+        );
+        assert!(
+            matches!(err, super::TrustBootstrapError::Io(_)),
+            "expected Io failure, got: {err:?}"
+        );
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&sealed_dir, std::fs::Permissions::from_mode(0o700))
+                .expect("sealed dir permissions should be restored for cleanup");
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F1: the watermark is the only trust artifact with no owner/mode/
+    /// symlink validation. A symlinked watermark must be refused at
+    /// preflight, like every sibling artifact.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_symlinked_trust_watermark() {
+        let test_dir = secure_test_dir("rustynetd-preflight-watermark-symlink");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        let real_watermark = test_dir.join("elsewhere.watermark");
+        std::fs::write(&real_watermark, "version=2\nupdated_at_unix=1\nnonce=1\n")
+            .expect("real watermark should be written");
+        std::os::unix::fs::symlink(&real_watermark, &trust_watermark_path)
+            .expect("watermark symlink should be created");
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            traversal_bundle_path: test_dir.join("missing.traversal.bundle"),
+            traversal_verifier_key_path: test_dir.join("missing.traversal.verifier.pub"),
+            traversal_watermark_path: test_dir.join("traversal.watermark"),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let err = run_preflight_checks(&config)
+            .expect_err("preflight must refuse a symlinked trust watermark");
+        let message = err.to_string();
+        assert!(
+            message.contains("trust watermark must not be a symlink"),
+            "unexpected error: {message}"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(real_watermark);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F1: a group-writable watermark lets any group member rewrite the
+    /// anti-rollback anchor; preflight must refuse it.
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_group_writable_trust_watermark() {
+        let test_dir = secure_test_dir("rustynetd-preflight-watermark-group-writable");
+        let state_path = test_dir.join("daemon.state");
+        let trust_path = test_dir.join("trust.evidence");
+        let trust_verifier_path = test_dir.join("trust.verifier.pub");
+        let trust_watermark_path = test_dir.join("trust.watermark");
+        let membership_snapshot_path = test_dir.join("membership.snapshot");
+        let membership_log_path = test_dir.join("membership.log");
+        let membership_watermark_path = test_dir.join("membership.watermark");
+        write_trust_file(&trust_path, &trust_verifier_path, 1);
+        write_membership_files(
+            &membership_snapshot_path,
+            &membership_log_path,
+            "daemon-local",
+        );
+        std::fs::write(
+            &trust_watermark_path,
+            "version=2\nupdated_at_unix=1\nnonce=1\n",
+        )
+        .expect("watermark should be written");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &trust_watermark_path,
+                std::fs::Permissions::from_mode(0o620),
+            )
+            .expect("watermark permissions should be set");
+        }
+
+        let config = DaemonConfig {
+            state_path: state_path.clone(),
+            trust_evidence_path: trust_path.clone(),
+            trust_verifier_key_path: trust_verifier_path.clone(),
+            trust_watermark_path: trust_watermark_path.clone(),
+            membership_snapshot_path: membership_snapshot_path.clone(),
+            membership_log_path: membership_log_path.clone(),
+            membership_watermark_path: membership_watermark_path.clone(),
+            gossip_watermark_path: None,
+            gossip_signing_secret_path: None,
+            gossip_signing_secret_passphrase_path: None,
+            enrollment_secret_path: None,
+            enrollment_ledger_path: None,
+            traversal_bundle_path: test_dir.join("missing.traversal.bundle"),
+            traversal_verifier_key_path: test_dir.join("missing.traversal.verifier.pub"),
+            traversal_watermark_path: test_dir.join("traversal.watermark"),
+            auto_tunnel_enforce: false,
+            backend_mode: DaemonBackendMode::InMemory,
+            ..DaemonConfig::default()
+        };
+        let err = run_preflight_checks(&config)
+            .expect_err("preflight must refuse a group-writable trust watermark");
+        let message = err.to_string();
+        assert!(
+            message.contains("trust watermark has insecure permissions"),
+            "unexpected error: {message}"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(trust_path);
+        let _ = std::fs::remove_file(trust_verifier_path);
+        let _ = std::fs::remove_file(trust_watermark_path);
+        let _ = std::fs::remove_file(membership_snapshot_path);
+        let _ = std::fs::remove_file(membership_log_path);
+        let _ = std::fs::remove_file(membership_watermark_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F1: the load path (used by fetch_trust, load_verified_trust and the
+    /// CLI verify command, none of which run the full preflight) must also
+    /// refuse a watermark that fails the sibling-artifact security check.
+    #[cfg(unix)]
+    #[test]
+    fn load_trust_watermark_rejects_insecure_watermark_file() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-load-insecure");
+        let watermark_path = test_dir.join("trust.watermark");
+        std::fs::write(&watermark_path, "version=2\nupdated_at_unix=1\nnonce=1\n")
+            .expect("watermark should be written");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&watermark_path, std::fs::Permissions::from_mode(0o620))
+                .expect("watermark permissions should be set");
+        }
+        let err = load_trust_watermark(&watermark_path)
+            .expect_err("a group-writable watermark must fail closed on load");
+        let message = err.to_string();
+        assert!(
+            message.contains("trust watermark") && message.contains("insecure permissions"),
+            "error must name the artifact and the reason, got: {message}"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F3: persist must not chmod a pre-existing parent (on macOS trust/
+    /// also holds the evidence and the verifier key); it may only verify it.
+    #[test]
+    fn persist_trust_watermark_preserves_existing_parent_mode() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-persist-parent-mode");
+        let parent = test_dir.join("state");
+        std::fs::create_dir_all(&parent).expect("parent should create");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o750))
+                .expect("parent mode should be set");
+        }
+        let watermark_path = parent.join("trust.watermark");
+        let expected = TrustWatermark {
+            updated_at_unix: 5,
+            nonce: 6,
+            payload_digest: Some([0x11u8; 32]),
+        };
+        persist_trust_watermark(&watermark_path, expected)
+            .expect("persist into an existing 0750 parent should succeed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&parent)
+                .expect("parent metadata should be readable")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o750,
+                "persist must not chmod a pre-existing parent directory"
+            );
+        }
+        assert_eq!(
+            load_trust_watermark(&watermark_path)
+                .expect("watermark should load")
+                .expect("watermark should exist"),
+            expected
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F3: a pre-existing parent that is writable by group/other must fail
+    /// closed with a path-named error instead of being silently chmodded.
+    #[cfg(unix)]
+    #[test]
+    fn persist_trust_watermark_rejects_shared_parent_directory() {
+        let test_dir = secure_test_dir("rustynetd-trust-watermark-shared-parent");
+        let parent = test_dir.join("shared");
+        std::fs::create_dir_all(&parent).expect("parent should create");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777))
+                .expect("parent mode should be set");
+        }
+        let watermark_path = parent.join("trust.watermark");
+        let err = persist_trust_watermark(
+            &watermark_path,
+            TrustWatermark {
+                updated_at_unix: 5,
+                nonce: 6,
+                payload_digest: Some([0x22u8; 32]),
+            },
+        )
+        .expect_err("persist must fail closed on a group/other-writable parent");
+        let message = err.to_string();
+        assert!(
+            message.contains(&parent.display().to_string()),
+            "error must name the parent path, got: {message}"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// F7: `.ok()` on the numeric fields turned "invalid" into "missing";
+    /// the loader must name the offending field and stay fail-closed.
+    #[test]
+    fn load_trust_watermark_reports_invalid_numeric_field() {
+        let cases: &[(&str, &str)] = &[
+            ("version", "version=two\nupdated_at_unix=1\nnonce=1\n"),
+            (
+                "updated_at_unix",
+                "version=2\nupdated_at_unix=soon\nnonce=1\n",
+            ),
+            ("nonce", "version=2\nupdated_at_unix=1\nnonce=many\n"),
+        ];
+        for (field, payload) in cases {
+            let test_dir = secure_test_dir("rustynetd-trust-watermark-invalid-field");
+            let watermark_path = test_dir.join("trust.watermark");
+            std::fs::write(&watermark_path, payload).expect("invalid watermark should be written");
+            let err = load_trust_watermark(&watermark_path)
+                .expect_err("invalid numeric field must fail closed naming the field");
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("invalid watermark {field}")),
+                "expected 'invalid watermark {field}' in: {message}"
+            );
+            let _ = std::fs::remove_dir_all(test_dir);
+        }
+    }
+
     /// QH-26 pin: the retired `tls13_valid` key must be REJECTED, never
     /// silently ignored. A writer that still believes the key is enforced
     /// must fail loudly rather than have its claim dropped (DA-01,
@@ -28687,6 +29065,17 @@ mod tests {
         let membership_dir = state_root.join("membership");
         std::fs::create_dir_all(&trust_dir).expect("trust dir should create");
         std::fs::create_dir_all(&membership_dir).expect("membership dir should create");
+        // persist_trust_watermark no longer chmods a pre-existing parent (it
+        // verifies instead), so stage the reviewed 0700 posture here — the
+        // same thing the installer does before the daemon ever runs.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [&trust_dir, &membership_dir] {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                    .expect("state-root subdirectory permissions should be set");
+            }
+        }
 
         // Missing watermark fails closed: the loader must report absent
         // (Ok(None)) — never synthesize a watermark — so the consumer
