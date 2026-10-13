@@ -583,6 +583,11 @@ fn build_enforce_script(
     )
 }
 
+/// The public key the relay is pinned to: the traversal (endpoint-hint)
+/// verifier, which relay session tokens are signed under. See
+/// [`deploy_relay_service`].
+const LINUX_RELAY_TOKEN_VERIFIER_SOURCE: &str = "/etc/rustynet/traversal.pub";
+
 /// Install script for the relay verifier public key under the product
 /// custody directory.
 ///
@@ -611,10 +616,16 @@ fn linux_relay_verifier_install_script() -> String {
 ///
 ///   1. The relay `--verifier-key`: `rustynet-relay` loads it as raw 32 bytes,
 ///      and its systemd unit fail-closes (`ExecStartPre`) if the file is absent.
-///      We derive it from the assignment authority public key the orchestrator
-///      already distributed to this node as `/etc/rustynet/assignment.pub` (hex)
-///      — the same control-plane verifier the relay must trust, and a PUBLIC key
-///      (never secret), so it is safe to read, decode, and re-place. Decoding to
+///      We derive it from the TRAVERSAL (endpoint-hint) authority public key the
+///      orchestrator already distributed to this node as
+///      `/etc/rustynet/traversal.pub` (hex). Relay session tokens are signed
+///      with the endpoint-hint key (`ControlPlaneCore::issue_relay_session_token`)
+///      and the daemons verify them against the same file, so that is the key
+///      the relay must trust. It is NOT the assignment verifier: the two are
+///      domain-separated keys for one signing secret, and a relay pinned to
+///      `assignment.pub` rejects every token (HP-3 provisioning design, B5).
+///      A PUBLIC key (never secret), so it is safe to read, decode, and
+///      re-place. Decoding to
 ///      raw bytes happens in Rust (fail-closed on a short / non-hex key); the
 ///      bytes are shipped via scp + `install` so no data is ever interpolated
 ///      into a shell string and the guest needs no `xxd`.
@@ -624,24 +635,25 @@ fn linux_relay_verifier_install_script() -> String {
 ///      `scripts/systemd/rustynet-relay.service` relative to the source root the
 ///      bootstrap extracted to (`$HOME/Rustynet`), so it runs with that cwd.
 ///
-/// Fail-closed throughout: a missing assignment key, a malformed key, or a
+/// Fail-closed throughout: a missing traversal key, a malformed key, or a
 /// failed install all surface as `Err`.
 pub fn deploy_relay_service(conn: &NodeConnection) -> Result<(), AdapterError> {
     let short_timeout = Duration::from_secs(30);
 
-    // 1. Read the already-distributed assignment authority pubkey (hex). It
-    //    lives at /etc/rustynet/assignment.pub (placed by
-    //    distribute_verifier_key(Assignment) during DistributeAssignments).
+    // 1. Read the already-distributed traversal (endpoint-hint) authority
+    //    pubkey (hex). It lives at /etc/rustynet/traversal.pub (placed by
+    //    distribute_verifier_key(Traversal) during DistributeTraversal) and is
+    //    the key relay session tokens verify under.
     //    /etc/rustynet is 0750 root:rustynetd, so read it with sudo -n.
-    let assignment_hex = ssh::run_remote(
+    let traversal_hex = ssh::run_remote(
         conn,
-        "sudo -n cat /etc/rustynet/assignment.pub",
+        &format!("sudo -n cat {LINUX_RELAY_TOKEN_VERIFIER_SOURCE}"),
         short_timeout,
     )?;
 
     // 2. Decode hex -> raw 32 bytes (fail-closed); the relay --verifier-key
     //    loader requires exactly 32 raw bytes.
-    let verifier_bytes = decode_assignment_pubkey_hex(&assignment_hex)
+    let verifier_bytes = decode_assignment_pubkey_hex(&traversal_hex)
         .map_err(|message| AdapterError::Protocol { message })?;
 
     // 3. Ship the raw verifier key to the host and install it at the unit's
@@ -979,6 +991,37 @@ mod relay_deploy_hygiene_tests {
         assert!(
             removal < install,
             "the stale override must be removed BEFORE the unit is installed"
+        );
+    }
+
+    /// B5 pin: the relay is pinned to the traversal (endpoint-hint) verifier,
+    /// the key relay session tokens are signed under, never `assignment.pub`
+    /// (a different, domain-separated key). Mutation caught: pointing the read
+    /// back at assignment.pub goes RED here.
+    #[test]
+    fn deploy_pins_the_relay_to_the_traversal_verifier_not_the_assignment_one() {
+        assert_eq!(
+            super::LINUX_RELAY_TOKEN_VERIFIER_SOURCE,
+            "/etc/rustynet/traversal.pub"
+        );
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_install.rs"))
+            .expect("linux_install.rs implementation slice must parse");
+        let start = source
+            .find("pub fn deploy_relay_service(")
+            .expect("relay deploy fn must exist");
+        let body = &source[start..];
+        let end = body[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("LINUX_RELAY_TOKEN_VERIFIER_SOURCE"),
+            "the relay verifier must be read from the token-verifier constant"
+        );
+        assert!(
+            !body.contains("assignment.pub\""),
+            "the relay must not be pinned to the assignment verifier"
         );
     }
 

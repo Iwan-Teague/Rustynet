@@ -39,10 +39,12 @@ const REPORTED_SKIPS_FILENAME: &str = "relay_deploy.reported_skips.json";
 ///
 /// # What it does per Linux Relay node
 ///
-///   1. Derives the relay `--verifier-key` (raw 32 bytes) from the assignment
-///      authority public key the orchestrator already distributed to the node
-///      as `/etc/rustynet/assignment.pub` (hex). That is a PUBLIC verifier key,
-///      never secret; reusing it avoids minting/distributing new trust material.
+///   1. Derives the relay `--verifier-key` (raw 32 bytes) from the traversal
+///      (endpoint-hint) authority public key the orchestrator already
+///      distributed to the node as `/etc/rustynet/traversal.pub` (hex): relay
+///      session tokens are signed under that key, not the assignment key. That
+///      is a PUBLIC verifier key, never secret; reusing it avoids
+///      minting/distributing new trust material.
 ///   2. Installs it at the unit's fail-closed-checked path
 ///      (`/etc/rustynet/relay-verifier.pub`, mode 0644).
 ///   3. Installs + enables + starts `rustynet-relay.service` via the shared
