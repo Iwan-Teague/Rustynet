@@ -1003,6 +1003,56 @@ pub fn collect_artifacts(conn: &NodeConnection, dst: &std::path::Path) -> Result
     Ok(())
 }
 
+/// The exact argv of the best-effort conntrack flush below, as separate
+/// tokens (u48-r1): the guest's conntrack table must be cleared between runs
+/// because lab guests are NOT rebooted — run u48-r1's `exit_egress_leak_witness`
+/// failed on a stuck ESTABLISHED entry (192.168.122.31 -> 192.168.122.1:53,
+/// last packet at the END of the previous run) that no cleanup step removed.
+/// The witness itself stays unchanged and fails closed; this flush is what
+/// makes its capture-start snapshot clean in the first place.
+pub(crate) const LINUX_CONNTRACK_FLUSH_ARGV: [&str; 4] = ["sudo", "-n", "conntrack", "-F"];
+
+/// Build the validated-argv form of [`LINUX_CONNTRACK_FLUSH_ARGV`] through the
+/// module's privileged-argv seam (`ValidatedArg` + `RemoteCommand::from_args`),
+/// the same way every other `sudo -n` reset in this file is built.
+fn conntrack_flush_command() -> Result<ssh::RemoteCommand, AdapterError> {
+    let args = LINUX_CONNTRACK_FLUSH_ARGV
+        .iter()
+        .map(|token| ValidatedArg::cli_token(token))
+        .collect::<Result<Vec<_>, _>>()?;
+    ssh::RemoteCommand::from_args("linux cleanup conntrack flush", &args)
+}
+
+/// Classify a conntrack-flush outcome into a one-line note. NEVER an error:
+/// katana guests ship without the `conntrack` binary (exit 127) and any
+/// dispatch failure is equally tolerated — the flush is hygiene for the NEXT
+/// run's capture-start snapshot, never a stage-verdict input.
+fn conntrack_flush_note(outcome: &Result<String, AdapterError>) -> String {
+    match outcome {
+        Ok(_) => "conntrack table flushed".to_owned(),
+        Err(AdapterError::Command {
+            exit_code: Some(127),
+            ..
+        }) => "conntrack binary absent on guest; nothing to flush".to_owned(),
+        Err(e) => format!("conntrack flush skipped (best-effort): {e}"),
+    }
+}
+
+/// Best-effort conntrack flush for the Linux cleanup stage. Runs AFTER the
+/// daemon-stop wait (so no live run and no live daemon can be disturbed: the
+/// next daemon only starts at the next bootstrap, well after this) and BEFORE
+/// the fallible state-file purge, so the purge keeps its last-word position.
+/// Established TCP flows (including our own SSH session) survive a table
+/// flush — conntrack only forgets, it does not reset — and the next packet on
+/// each flow re-creates the entry, so this cannot break the cleanup itself.
+fn flush_conntrack_table_best_effort(conn: &NodeConnection) {
+    let outcome = match conntrack_flush_command() {
+        Ok(cmd) => ssh::run_remote(conn, cmd.as_str(), SHORT_TIMEOUT),
+        Err(e) => Err(e),
+    };
+    eprintln!("[cleanup] conntrack: {}", conntrack_flush_note(&outcome));
+}
+
 /// Remove runtime state files, leaving the installation intact.
 pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> {
     // Disable + stop the ENTIRE rustynet systemd footprint and WAIT until no
@@ -1056,6 +1106,12 @@ pub fn cleanup_runtime_state(conn: &NodeConnection) -> Result<(), AdapterError> 
         LINUX_NFT_KILLSWITCH_RESET_COMMAND,
         Duration::from_secs(30),
     );
+    // u48-r1: clear the guest's conntrack table so a stuck ESTABLISHED entry
+    // from THIS run (e.g. tcp/53 to the host DNS resolver) cannot survive into
+    // the next run's capture-start conntrack snapshot. Best-effort by design:
+    // guests without the binary are the norm (katana), see
+    // [`flush_conntrack_table_best_effort`].
+    flush_conntrack_table_best_effort(conn);
     // Tear down any residual `rustynet*` WireGuard/TUN interface a crashed daemon
     // left up. Runs AFTER the daemon-stop wait above so nothing re-creates the
     // device mid-delete; a stale interface still carrying the mesh CIDR would
@@ -2558,6 +2614,118 @@ table ip other_nat {
         assert!(
             cmd.contains("echo now_unix=$(date +%s)"),
             "status query must emit the guest clock (now_unix) for freshness: {cmd}"
+        );
+    }
+
+    // ── u48-r1: best-effort conntrack flush between runs ────────────────────
+
+    /// The flush must be EXACTLY `sudo -n conntrack -F`, argv-token for
+    /// argv-token, rendered through the module's validated-argv seam. Mutation
+    /// caught: any token change (a different flag, a dropped `sudo`, a renamed
+    /// binary) flips this test red.
+    #[test]
+    fn conntrack_flush_argv_is_exact() {
+        assert_eq!(
+            LINUX_CONNTRACK_FLUSH_ARGV,
+            ["sudo", "-n", "conntrack", "-F"]
+        );
+        let cmd = conntrack_flush_command().expect("validated argv must build");
+        // shell_quote single-quotes every token, so the rendered sink form is
+        // exactly the four quoted tokens joined by spaces.
+        assert_eq!(cmd.as_str(), "'sudo' '-n' 'conntrack' '-F'");
+    }
+
+    /// Exit 127 = the binary does not exist on the guest (katana ships
+    /// without it). The note must name the absence and stay a ONE-line note —
+    /// never an error the stage could observe. Mutation caught: removing the
+    /// exit-127 arm demotes absence to a generic "skipped" note.
+    #[test]
+    fn conntrack_flush_tolerates_exit_127_as_absence() {
+        let absent = Err(AdapterError::Command {
+            exit_code: Some(127),
+            stderr: "sh: conntrack: command not found".to_owned(),
+        });
+        let note = conntrack_flush_note(&absent);
+        assert!(note.contains("absent"), "{note}");
+        assert!(!note.contains('\n'), "note must be one line: {note}");
+    }
+
+    /// Any other dispatch failure (SSH spawn failure, timeout, remote
+    /// non-zero) is likewise tolerated as a note, and success says "flushed".
+    /// Neither path may carry error semantics: the function's return type is a
+    /// String, so a stage failure is unrepresentable here.
+    #[test]
+    fn conntrack_flush_tolerates_dispatch_errors_and_reports_success() {
+        let dispatch = Err(AdapterError::Ssh {
+            message: "SSH spawn failed for exit-1: timeout".to_owned(),
+        });
+        let note = conntrack_flush_note(&dispatch);
+        assert!(note.contains("skipped"), "{note}");
+        assert!(note.contains("best-effort"), "{note}");
+        assert!(!note.contains('\n'), "note must be one line: {note}");
+        let ok = Ok(String::new());
+        assert!(conntrack_flush_note(&ok).contains("flushed"));
+    }
+
+    /// Ordering is load-bearing: the flush runs AFTER the daemon-stop wait
+    /// (a live daemon could re-create entries mid-flush) and BEFORE both the
+    /// interface reset and the fallible state-file purge, which must keep its
+    /// last-word position. It also necessarily precedes the next run's daemon
+    /// start (bootstrap), so it can never disturb a live run. Mutation caught:
+    /// moving the call after the purge, or deleting it entirely, flips this
+    /// test red.
+    #[test]
+    fn conntrack_flush_is_ordered_after_daemon_stop_and_before_the_purge() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
+        let body = source
+            .split_once("pub fn cleanup_runtime_state")
+            .expect("cleanup_runtime_state must exist")
+            .1;
+        let flush_at = body
+            .find("flush_conntrack_table_best_effort(conn)")
+            .expect("the conntrack flush must be invoked in cleanup");
+        let stop_at = body
+            .find("systemctl disable --now")
+            .expect("units must be stopped first");
+        let iface_at = body
+            .find("LINUX_INTERFACE_RESET_COMMAND")
+            .expect("interface reset must be invoked");
+        let purge_at = body
+            .find("sudo -n rm -rf /run/rustynet")
+            .expect("state purge must be invoked");
+        assert!(stop_at < flush_at, "flush must follow the daemon stop");
+        assert!(
+            flush_at < iface_at,
+            "flush must precede the interface reset"
+        );
+        assert!(flush_at < purge_at, "flush must precede the state purge");
+    }
+
+    /// The flush belongs to the LINUX cleanup only. The macOS and Windows
+    /// cleanups must not issue any conntrack command (different platforms,
+    /// different tooling: pf/utun and PowerShell respectively). Mutation
+    /// caught: adding a conntrack flush to a non-Linux cleanup flips this red.
+    #[test]
+    fn conntrack_flush_is_linux_only() {
+        // Self-source pins MUST route through implementation_source_slice (the
+        // source-pin meta-test enforces it): a raw full-file include_str! of
+        // this file can be satisfied by the asserting text itself.
+        let linux = crate::vm_lab::implementation_source_slice(include_str!("linux_traffic.rs"))
+            .expect("linux_traffic.rs implementation slice must parse");
+        assert!(
+            linux.contains("LINUX_CONNTRACK_FLUSH_ARGV"),
+            "linux cleanup must carry the flush"
+        );
+        let macos = include_str!("macos_traffic.rs");
+        assert!(
+            !macos.contains("conntrack"),
+            "macos cleanup must not issue conntrack commands"
+        );
+        let windows = include_str!("windows_traffic.rs");
+        assert!(
+            !windows.contains("conntrack"),
+            "windows cleanup must not issue conntrack commands"
         );
     }
 }

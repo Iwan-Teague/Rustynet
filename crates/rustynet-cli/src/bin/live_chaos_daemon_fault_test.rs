@@ -2053,6 +2053,19 @@ mod tests {
         std::fs::write(&systemctl, systemctl_body).expect("systemctl");
         let stat = bin.join("stat");
         std::fs::write(&stat, stat_body).expect("stat");
+        // ETXTBSY audit (2026-10, load-flake review): the fake binaries are
+        // written with `std::fs::write`, which opens, writes and DROPS the
+        // File — the write handle is closed before this function proceeds,
+        // and std::fs opens files with O_CLOEXEC, so even a concurrent fork
+        // in another test thread cannot carry the descriptor past an exec.
+        // Each call also uses a UNIQUE directory (pid + a process-wide SEQ
+        // counter below), so no two invocations ever write the same path, and
+        // the exec'd interpreter is `sh` — the fake binaries are only exec'd
+        // by that shell, long after their write handles closed. There is
+        // therefore no write-then-exec race here, and no spawn retry is
+        // needed; if this audit is ever invalidated (a hand-rolled writer
+        // that keeps the handle open), ETXTBSY would surface as a spawn/exec
+        // failure inside the `sh` below.
         for tool in [&systemctl, &stat] {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(tool).expect("stat tool").permissions();
@@ -2092,6 +2105,11 @@ mod tests {
     // Replay: is-active NEVER flips, inode NEVER changes. The old logic
     // printed `recovered=true` here; the new fragment must print
     // `fault_observed=false` / `recovered=false` (fail closed), bounded.
+    // Bounded arithmetic: observe_timeout=1 polls is-active/inode once (~1s),
+    // the recovery loop is fenced at start_unix+1 and is never even entered
+    // (fault_observed=false), so the whole fragment finishes in ~2s — far
+    // under the 20s bound asserted below. The deadline stays SMALL on purpose:
+    // this never-recovers case must not quietly grow a bigger window.
     #[test]
     fn kill_fault_window_stale_active_and_stale_socket_never_recovers() {
         let systemctl = "#!/bin/sh\ncase \"$1\" in\n  is-active) exit 0 ;;\n  kill) exit 0 ;;\n  *) exit 0 ;;\nesac\n";
@@ -2114,6 +2132,21 @@ mod tests {
     // The healthy path: the fault lands (is-active flips false), the daemon
     // restarts (active again) and binds a FRESH socket (inode changes).
     // Recovery must be observed as true within the deadline.
+    //
+    // Deadline widened 5 -> 30 (2026-10, load flake): the fake `systemctl
+    // kill` schedules the reactivation in a background subshell after
+    // `sleep 1`, and the recovery loop is fenced at start_unix + deadline,
+    // where start_unix precedes the kill itself. Under a loaded test host
+    // (composed gates run these tests alongside other work) the subshell's
+    // single `sleep 1` plus fork/file-write latency once blew the whole 5s
+    // budget, yielding fault_observed=true / recovered=false with 0/6
+    // failures in isolation. The deadline bounds only WHEN recovery must be
+    // observed, never WHAT recovery requires: the fragment still demands
+    // is-active + an existing socket + a FRESH inode, so widening it does not
+    // weaken what this test proves — it only stops the host's load from
+    // standing in for a real recovery failure. The passing path still returns
+    // in ~2s (the loop breaks at the first fresh-socket poll); only a run
+    // that is already failing ever consumes the full 30s.
     #[test]
     fn kill_fault_window_observes_fault_and_recovers_on_fresh_socket() {
         // Fake systemctl: `kill -s KILL <svc>` deactivates, a background
@@ -2125,7 +2158,7 @@ mod tests {
             systemctl,
             stat,
             "printf '1\\n' > \"$RDY_KILLFW_DIR/active\"",
-            5,
+            30,
             3,
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -2140,6 +2173,11 @@ mod tests {
     // socket inode NEVER changes (stale socket). Recovery requires a fresh
     // inode, so this must read fault_observed=true, recovered=false. A weaker
     // recovery condition (active + socket present) would print recovered=true.
+    // This is a never-recovers case: the deadline stays SMALL (3) — widening
+    // it could not flip the outcome (recovery needs an inode change that never
+    // comes) but would only grow the ~4s worst case (observe=3 + recovery
+    // loop fenced at start_unix+3, ~1s polls) for no benefit, and the case
+    // must stay visibly bounded like its katana-u26 sibling above.
     #[test]
     fn kill_fault_window_active_again_but_stale_inode_not_recovered() {
         let systemctl = "#!/bin/sh\nif [ \"$1\" = \"kill\" ]; then\n  printf '0\\n' > \"$RDY_KILLFW_DIR/active\"\n  ( sleep 1; printf '1\\n' > \"$RDY_KILLFW_DIR/active\" ) &\n  exit 0\nfi\nif [ \"$1\" = \"is-active\" ]; then\n  if [ -f \"$RDY_KILLFW_DIR/active\" ] && [ \"$(cat \"$RDY_KILLFW_DIR/active\")\" = \"1\" ]; then exit 0; fi\n  exit 1\nfi\nexit 0\n";
@@ -2160,10 +2198,15 @@ mod tests {
     // exits 0 throughout. The inode alone must prove the fault landed
     // (fault_observed=true) and the fresh inode proves recovery. An
     // is-active-only observation would print fault_observed=false here.
+    // Deadline widened 5 -> 30 for the same load-flake reason as the
+    // fresh-socket case above: this is a recovery case (it must observe
+    // recovered=true), and the widened budget costs nothing on the passing
+    // path — the fake restart is instantaneous, so the recovery loop breaks
+    // on its first poll regardless of the deadline.
     #[test]
     fn kill_fault_window_fast_restart_observed_by_inode_only() {
         let systemctl = "#!/bin/sh\nif [ \"$1\" = \"kill\" ]; then\n  printf '777777\\n' > \"$RDY_INO\"\n  exit 0\nfi\nexit 0\n";
-        let (out, dir) = run_kill_fault_window(systemctl, FAKE_STAT, "", 5, 3);
+        let (out, dir) = run_kill_fault_window(systemctl, FAKE_STAT, "", 30, 3);
         let _ = std::fs::remove_dir_all(&dir);
         assert!(out.contains("fault_observed=true"), "{out}");
         assert!(out.contains("recovered=true"), "{out}");
