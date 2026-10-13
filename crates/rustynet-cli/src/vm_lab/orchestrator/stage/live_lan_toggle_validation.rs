@@ -4,6 +4,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
+use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment;
 use crate::vm_lab::orchestrator::stage::{
     OrchestrationStage, StageFanout, StageId, desktop_platform_tag, resolve_ssh_user,
 };
@@ -165,6 +166,31 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
                         "postcondition violated after LAN toggle: {e}"
                     ));
                 }
+                // xnet-186: the postcondition PROVED the daemon holds the
+                // promoted blind_exit role; reconcile the orchestrator's
+                // static role snapshot so every later stage that mints
+                // capabilities from ctx.assignments (refresh_signed_bundles
+                // et al) sees the role the node actually holds. A snapshot
+                // that cannot legally hold this promotion fails the stage
+                // closed instead of minting a mismatched bundle later.
+                match reconcile_promoted_role_snapshot(
+                    &mut ctx.assignments,
+                    &blind_exit_params.alias,
+                ) {
+                    Ok(previous_role) => {
+                        // Best-effort pointer line; the reconcile itself
+                        // already succeeded.
+                        let _ = append_stage_evidence_line(
+                            &ctx.report_dir,
+                            self.name(),
+                            &format!(
+                                "role_snapshot_reconciled alias={} from={} to={}",
+                                blind_exit_params.alias, previous_role, PROMOTED_BLIND_EXIT_ROLE
+                            ),
+                        );
+                    }
+                    Err(e) => return StageOutcome::Failed(e),
+                }
                 StageOutcome::Passed
             }
             Ok(output) => StageOutcome::Failed(
@@ -242,6 +268,52 @@ fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Result<Resol
 
 fn ssh_params_for_role(ctx: &OrchestrationContext, label: &str) -> Result<ResolvedParams, String> {
     alias_matching_label(ctx, label)
+}
+
+/// xnet-186 root-cause fix: the LAN-toggle scenario legitimately promotes its
+/// chosen aux/extra node to the `blind_exit` daemon role, but the
+/// orchestrator's `ctx.assignments` snapshot kept the static `aux` role.
+/// Every later stage that mints bundle capabilities from that snapshot —
+/// notably `refresh_signed_bundles` via `build_bundle_env` — then shipped
+/// `client`-only capabilities to a node the daemon had already promoted to
+/// `blind_exit`, and rustynetd's
+/// `validate_auto_tunnel_role_membership_alignment` fail-closed the node
+/// PERMANENTLY (the refresh swap's health gate timed out with
+/// `restricted_safe_mode=true`).
+///
+/// Reconcile the snapshot to the role the postcondition just PROVED live.
+/// Only an `aux`/`extra` snapshot may promote (the scenario's own contract —
+/// see [`BLIND_EXIT_CANDIDATE_LABELS`]); a snapshot in any other role means
+/// the harness disagrees with itself, so the stage fails closed instead of
+/// papering over it. A snapshot already carrying `blind_exit` is a no-op
+/// (idempotent). Every other assignment is left untouched.
+///
+/// `pub(crate)` so the refresh stage's tests can pin the full xnet-186 loop
+/// (reconcile → mint → capability CSV).
+pub(crate) fn reconcile_promoted_role_snapshot(
+    assignments: &mut [NodeRoleAssignment],
+    alias: &str,
+) -> Result<String, String> {
+    let assignment = assignments
+        .iter_mut()
+        .find(|a| a.alias == alias)
+        .ok_or_else(|| {
+            format!("role snapshot reconcile: no assignment for promoted node {alias}")
+        })?;
+    match assignment.role {
+        NodeRole::BlindExit => Ok(NodeRole::BlindExit.as_str().to_owned()),
+        NodeRole::Aux | NodeRole::Extra => {
+            let previous = assignment.role.as_str().to_owned();
+            assignment.role = NodeRole::BlindExit;
+            Ok(previous)
+        }
+        ref other => Err(format!(
+            "role snapshot reconcile for {alias}: snapshot role {} is neither aux \
+             nor extra; refusing to reconcile it to {}",
+            other.as_str(),
+            PROMOTED_BLIND_EXIT_ROLE
+        )),
+    }
 }
 
 /// LAN-toggle promotes its third node to the `blind_exit` daemon role. An
@@ -1000,5 +1072,156 @@ mod tests {
         assert!(line.contains("\"alias\":\"n1\""));
         assert!(line.contains("\"healthy\":false"));
         assert!(line.contains("FailClosed"));
+    }
+
+    // ── xnet-186: role-snapshot reconcile ─────────────────────────────
+
+    use crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment as TestNodeRoleAssignment;
+
+    fn snap_assignment(alias: &str, role: NodeRole) -> TestNodeRoleAssignment {
+        TestNodeRoleAssignment {
+            alias: alias.to_owned(),
+            role,
+        }
+    }
+
+    /// The xnet-186 fix itself: an aux snapshot promotes to blind_exit and
+    /// every other assignment stays exactly as it was.
+    #[test]
+    fn reconcile_promotes_aux_snapshot_and_leaves_other_entries_untouched() {
+        let mut assignments = vec![
+            snap_assignment("exit-1", NodeRole::Exit),
+            snap_assignment("aux-1", NodeRole::Aux),
+            snap_assignment("client-1", NodeRole::Client),
+        ];
+        let previous = super::reconcile_promoted_role_snapshot(&mut assignments, "aux-1")
+            .expect("an aux snapshot must promote");
+        assert_eq!(previous, "aux");
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|a| a.alias == "aux-1")
+                .unwrap()
+                .role,
+            NodeRole::BlindExit
+        );
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|a| a.alias == "exit-1")
+                .unwrap()
+                .role,
+            NodeRole::Exit
+        );
+        assert_eq!(
+            assignments
+                .iter()
+                .find(|a| a.alias == "client-1")
+                .unwrap()
+                .role,
+            NodeRole::Client
+        );
+    }
+
+    /// `extra` is the scenario's second candidate label (see
+    /// BLIND_EXIT_CANDIDATE_LABELS) and must promote the same way.
+    #[test]
+    fn reconcile_promotes_extra_snapshot_too() {
+        let mut assignments = vec![snap_assignment("extra-1", NodeRole::Extra)];
+        let previous = super::reconcile_promoted_role_snapshot(&mut assignments, "extra-1")
+            .expect("an extra snapshot must promote");
+        assert_eq!(previous, "extra");
+        assert_eq!(assignments[0].role, NodeRole::BlindExit);
+    }
+
+    /// The snapshot contract: only aux/extra may promote. A snapshot in any
+    /// other role means the harness disagrees with itself — the stage must
+    /// fail CLOSED (never silently mint capabilities for a role the snapshot
+    /// forbids), and the offending entry must stay untouched.
+    #[test]
+    fn reconcile_rejects_non_aux_extra_snapshots_fail_closed() {
+        for role in [
+            NodeRole::Client,
+            NodeRole::Exit,
+            NodeRole::Entry,
+            NodeRole::Relay,
+        ] {
+            let mut assignments = vec![snap_assignment("n1", role.clone())];
+            let err = super::reconcile_promoted_role_snapshot(&mut assignments, "n1")
+                .expect_err("a non-aux/extra snapshot must fail the stage closed");
+            assert!(
+                err.contains(&format!("snapshot role {}", role.as_str())),
+                "the rejection must name the snapshot role: {err}"
+            );
+            assert_eq!(
+                assignments[0].role, role,
+                "a rejected reconcile must leave the snapshot untouched"
+            );
+        }
+    }
+
+    /// Idempotence: a snapshot already carrying blind_exit reconciles as a
+    /// no-op success (the live role was still re-proven by the postcondition
+    /// before this runs).
+    #[test]
+    fn reconcile_is_a_noop_when_the_snapshot_already_holds_blind_exit() {
+        let mut assignments = vec![snap_assignment("aux-1", NodeRole::BlindExit)];
+        let previous = super::reconcile_promoted_role_snapshot(&mut assignments, "aux-1")
+            .expect("an already-reconciled snapshot is a success");
+        assert_eq!(previous, "blind_exit");
+        assert_eq!(assignments[0].role, NodeRole::BlindExit);
+    }
+
+    /// A promoted alias with no snapshot entry is a harness bug: fail closed
+    /// naming the alias, never silently succeed.
+    #[test]
+    fn reconcile_names_a_missing_alias() {
+        let mut assignments = vec![snap_assignment("other", NodeRole::Aux)];
+        let err = super::reconcile_promoted_role_snapshot(&mut assignments, "aux-1")
+            .expect_err("a missing snapshot entry must fail the stage closed");
+        assert!(err.contains("aux-1"), "{err}");
+    }
+
+    /// Pin: the reconcile runs ONLY on the success path, AFTER the mesh
+    /// postcondition proved the live blind_exit role and BEFORE the stage
+    /// declares Passed. Reconciling without proof would mint capabilities
+    /// for a role the node does not hold (the exact inverse of xnet-186).
+    #[test]
+    fn snapshot_reconcile_follows_the_postcondition_and_precedes_passed() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!(
+            "live_lan_toggle_validation.rs"
+        ))
+        .expect("live_lan_toggle_validation.rs implementation slice must parse");
+        let execute_start = source
+            .find("fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {")
+            .expect("execute() must exist");
+        let execute_body = &source[execute_start..];
+        let postcondition = execute_body
+            .find("verify_mesh_postcondition(ctx, &blind_exit_params.alias")
+            .expect("the postcondition call must exist");
+        let reconcile = execute_body
+            .find("reconcile_promoted_role_snapshot(\n                    &mut ctx.assignments")
+            .expect("the snapshot reconcile call must exist");
+        let passed = execute_body
+            .find("StageOutcome::Passed")
+            .expect("the Passed arm must exist");
+        assert!(
+            postcondition < reconcile && reconcile < passed,
+            "the snapshot reconcile must follow the postcondition ({postcondition}) and \
+             precede Passed ({passed}); found at {reconcile}"
+        );
+        // Review R2 (glm-review-xnet-w12-role-snapshot-sync): the Err arm at
+        // the call site is the fail-closed half of the fix. A later edit that
+        // ignores the reconcile error (`let _ = reconcile...`) would keep every
+        // unit test green, so pin the arm itself, searched AFTER the reconcile
+        // offset (the same needle appears in execute()'s earlier arms).
+        let err_arm = execute_body[reconcile..]
+            .find("Err(e) => return StageOutcome::Failed(e),")
+            .map(|offset| reconcile + offset)
+            .expect("the reconcile Err arm must fail the stage closed");
+        assert!(
+            err_arm < passed,
+            "a failed reconcile must fail the stage ({err_arm}) before Passed ({passed})"
+        );
     }
 }
