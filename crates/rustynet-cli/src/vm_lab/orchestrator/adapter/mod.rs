@@ -5,6 +5,7 @@ pub mod ios;
 pub mod linux;
 pub mod linux_install;
 pub mod linux_membership;
+pub mod linux_relay_tokens;
 pub mod linux_traffic;
 pub mod macos;
 pub mod macos_exit_traffic;

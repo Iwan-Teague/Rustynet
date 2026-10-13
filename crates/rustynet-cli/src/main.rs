@@ -1571,6 +1571,10 @@ enum OpsCommand {
         config: ops_e2e::E2eIssueTraversalBundlesFromEnvConfig,
     },
     #[cfg(feature = "vm-lab")]
+    E2eIssueRelaySessionTokensFromEnv {
+        config: ops_e2e::E2eIssueRelaySessionTokensFromEnvConfig,
+    },
+    #[cfg(feature = "vm-lab")]
     E2eIssueDnsZoneBundlesFromEnv {
         config: ops_e2e::E2eIssueDnsZoneBundlesFromEnvConfig,
     },
@@ -5871,6 +5875,17 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
             },
         }),
         #[cfg(feature = "vm-lab")]
+        "e2e-issue-relay-session-tokens-from-env" => {
+            Ok(OpsCommand::E2eIssueRelaySessionTokensFromEnv {
+                config: ops_e2e::E2eIssueRelaySessionTokensFromEnvConfig {
+                    env_file: parser.required_path("--env-file")?,
+                    issue_dir: parser
+                        .optional_path("--issue-dir")
+                        .unwrap_or_else(|| PathBuf::from("/run/rustynet/relay-token-issue")),
+                },
+            })
+        }
+        #[cfg(feature = "vm-lab")]
         "e2e-issue-dns-zone-bundles-from-env" => Ok(OpsCommand::E2eIssueDnsZoneBundlesFromEnv {
             config: ops_e2e::E2eIssueDnsZoneBundlesFromEnvConfig {
                 env_file: parser.required_path("--env-file")?,
@@ -9632,6 +9647,10 @@ fn execute_ops(command: OpsCommand) -> Result<String, String> {
         #[cfg(feature = "vm-lab")]
         OpsCommand::E2eIssueTraversalBundlesFromEnv { config } => {
             ops_e2e::execute_ops_e2e_issue_traversal_bundles_from_env(config)
+        }
+        #[cfg(feature = "vm-lab")]
+        OpsCommand::E2eIssueRelaySessionTokensFromEnv { config } => {
+            ops_e2e::execute_ops_e2e_issue_relay_session_tokens_from_env(config)
         }
         #[cfg(feature = "vm-lab")]
         OpsCommand::E2eIssueDnsZoneBundlesFromEnv { config } => {
@@ -21233,6 +21252,7 @@ fn help_text() -> String {
         "  ops e2e-issue-assignments --exit-node-id <id> --client-node-id <id> --exit-endpoint <host:port> --client-endpoint <host:port> --exit-pubkey-hex <hex> --client-pubkey-hex <hex> [--artifact-dir <absolute-path>]",
         "  ops e2e-issue-assignment-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-traversal-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
+        "  ops e2e-issue-relay-session-tokens-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  ops e2e-issue-dns-zone-bundles-from-env --env-file <absolute-path> [--issue-dir <absolute-path>]",
         "  Windows UTM targets use PowerShell helper scripts for access bootstrap, repo sync, build, and diagnostics; the Windows bootstrap-phase surface is only partially implemented on the current branch, and install/restart/verify/all must not be treated as runtime-capable proof; the Linux live-lab setup/run/orchestrate/iterate, suite, and diagnose wrappers are intentionally fail-closed for Windows targets before any live_linux_* stage runs; Linux UTM targets continue to use the existing shell path.",
     ]);
@@ -26803,6 +26823,16 @@ mod tests {
         ]);
         assert!(format!("{traversal_from_env:?}").contains("E2eIssueTraversalBundlesFromEnv"));
 
+        let relay_tokens_from_env = parse_command(&[
+            "ops".to_owned(),
+            "e2e-issue-relay-session-tokens-from-env".to_owned(),
+            "--env-file".to_owned(),
+            "/tmp/rn-relay-tokens.env".to_owned(),
+            "--issue-dir".to_owned(),
+            "/run/rustynet/relay-token-issue".to_owned(),
+        ]);
+        assert!(format!("{relay_tokens_from_env:?}").contains("E2eIssueRelaySessionTokensFromEnv"));
+
         let dns_zone_from_env = parse_command(&[
             "ops".to_owned(),
             "e2e-issue-dns-zone-bundles-from-env".to_owned(),
@@ -29614,6 +29644,7 @@ mod tests {
             "install-macos-relay",
             "e2e-issue-assignment-bundles-from-env",
             "e2e-issue-traversal-bundles-from-env",
+            "e2e-issue-relay-session-tokens-from-env",
             "e2e-issue-dns-zone-bundles-from-env",
             // cross-network scenario validators
             // (vm_lab/orchestrator/stage/cross_network/scenario/)

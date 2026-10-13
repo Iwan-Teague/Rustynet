@@ -538,6 +538,74 @@ pub trait NodeAdapter: Send + Sync + std::fmt::Debug {
         env_content: &str,
         local_out_dir: &Path,
     ) -> Result<(), AdapterError>;
+
+    // ── Relay session token spool (HP-3 provisioning) ─────────────
+
+    /// Mint short-lived relay session tokens on THIS node (the one that holds
+    /// the assignment signing secret: the exit guest) through
+    /// `ops e2e-issue-relay-session-tokens-from-env`, and copy the token files
+    /// plus the public verifier key into `local_out_dir`. Same custody as
+    /// [`Self::issue_bundles_to_dir`]: the signing secret and its passphrase
+    /// never leave the node. Default: unsupported (fail closed).
+    fn issue_relay_tokens_to_dir(
+        &self,
+        _env_content: &str,
+        _local_out_dir: &Path,
+    ) -> Result<(), AdapterError> {
+        Err(self.relay_token_spool_unsupported())
+    }
+
+    /// Create this node's preissued relay-token spool directory and point the
+    /// daemon at it (`RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR` in the daemon's
+    /// environment file). Takes effect at the next daemon restart; does NOT
+    /// restart anything. Default: unsupported (fail closed).
+    fn prepare_relay_token_spool(&self) -> Result<(), AdapterError> {
+        Err(self.relay_token_spool_unsupported())
+    }
+
+    /// Purge expired tokens from this node's spool and install `token_files`
+    /// (local paths of `*.relay-token` files). Returns the node's own clock and
+    /// the resulting spool size. Default: unsupported (fail closed).
+    fn install_relay_token_spool(
+        &self,
+        _token_files: &[std::path::PathBuf],
+    ) -> Result<RelayTokenSpoolReport, AdapterError> {
+        Err(self.relay_token_spool_unsupported())
+    }
+
+    /// Undo [`Self::prepare_relay_token_spool`]: remove the daemon environment
+    /// line FIRST, then the spool directory (so the daemon is never left
+    /// pointing at a missing directory, which makes it refuse to start). Does
+    /// NOT restart the daemon. Default: unsupported (fail closed).
+    fn teardown_relay_token_spool(&self) -> Result<(), AdapterError> {
+        Err(self.relay_token_spool_unsupported())
+    }
+
+    /// This node's own clock in unix seconds, for the relay<->minter skew check
+    /// (the relay enforces token expiry on ITS clock). Default: unsupported.
+    fn node_clock_unix(&self) -> Result<u64, AdapterError> {
+        Err(self.relay_token_spool_unsupported())
+    }
+
+    /// Shared error for the relay-token-spool defaults above.
+    fn relay_token_spool_unsupported(&self) -> AdapterError {
+        AdapterError::UnsupportedPlatform {
+            platform: self.platform(),
+            message: "the preissued relay token spool is implemented for the Linux adapter only"
+                .to_owned(),
+        }
+    }
+}
+
+/// What installing a token batch into a node's spool observed. The node's own
+/// clock is returned so the caller can fail closed on clock skew between the
+/// minting node and this node (the daemon rejects tokens issued too far in its
+/// future, and a token is useless once half its lifetime has gone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayTokenSpoolReport {
+    pub node_now_unix: u64,
+    /// `*.relay-token` files in the spool after the purge and install.
+    pub spool_files: usize,
 }
 
 /// The §4.7 node-identity challenge gate applied before any typed role

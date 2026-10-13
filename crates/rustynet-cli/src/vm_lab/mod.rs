@@ -14700,6 +14700,12 @@ fn validate_linux_relay_uninstall_output(output: &str) -> Result<(), String> {
 /// stage's own env-file override consistent with it.
 const RELAY_FORWARD_TEST_DATA_PORT_RANGE: &str = "40000-49999";
 const RELAY_FORWARD_TEST_HEALTH_PORT: u16 = 4501;
+/// The relay's configured label (`RUSTYNET_RELAY_ID`, at most 16 ASCII bytes).
+/// ONE value for the relay service env file, the relay session tokens bound to
+/// it and (patch 4) the relay candidate in the signed traversal bundles: the
+/// token's `relay_id` must be the canonical form of the label the relay and the
+/// candidate carry, or the relay rejects the hello.
+pub(crate) const RELAY_FORWARD_TEST_RELAY_ID: &str = "relay-local";
 const RELAY_FORWARD_TEST_NFT_TABLE: &str = "hp3_relay_forward_test";
 const RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS: u64 = 90;
 const RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS: u64 = 5;
@@ -15026,6 +15032,100 @@ pub(crate) fn relay_forward_test_backend_gate(status_line: &str) -> Result<(), S
     }
 }
 
+/// How often the token spool is topped up while HP-3 waits for a relay-routed
+/// session. A token lives at most 120 s (`MAX_RELAY_SESSION_TOKEN_TTL_SECS`) and
+/// the client refreshes about 15 s before expiry, consuming one file each time;
+/// the owner's bound is "at least every 100 s". 90 s plus the 5 s poll
+/// granularity keeps the worst-case spacing under 100 s.
+pub(crate) const RELAY_TOKEN_REFILL_INTERVAL: Duration = Duration::from_secs(90);
+// Interval plus one 5 s status poll must stay under the owner's 100 s bound.
+const _: () = assert!(
+    RELAY_TOKEN_REFILL_INTERVAL.as_secs() + RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS <= 100
+);
+/// A token minted on the exit guest must not be from the future of the node it
+/// is installed on by more than this (the daemon rejects tokens issued more
+/// than 90 s ahead of its own clock; 30 s leaves margin for the copy)...
+pub(crate) const RELAY_TOKEN_MAX_FUTURE_SKEW_SECS: u64 = 30;
+/// ...nor may more than this much of its life be gone by the time the install
+/// finishes (half of the 120 s lifetime).
+pub(crate) const RELAY_TOKEN_MAX_INSTALL_AGE_SECS: u64 = 60;
+
+/// True when a top-up is due: `since_last_top_up` has reached the refill
+/// interval. Pure so the schedule is unit-testable without a clock.
+pub(crate) fn relay_token_refill_due(since_last_top_up: Duration) -> bool {
+    since_last_top_up >= RELAY_TOKEN_REFILL_INTERVAL
+}
+
+/// Clock-skew verdict between the node that minted a token (`issued_at_unix`,
+/// the exit guest's clock) and the node that installed it (`node_now_unix`, read
+/// on the node itself in the same call). Fails closed: a token from the future
+/// would be rejected by the daemon, and a token that is already old is not worth
+/// installing. Names the skew so the cause is a clock, not "relay timeout".
+pub(crate) fn relay_token_clock_skew_verdict(
+    issued_at_unix: u64,
+    node_now_unix: u64,
+) -> Result<(), String> {
+    if issued_at_unix > node_now_unix.saturating_add(RELAY_TOKEN_MAX_FUTURE_SKEW_SECS) {
+        return Err(format!(
+            "relay token minter clock is {}s ahead of the peer (limit {}s); the daemon would \
+             reject the token as issued in its future",
+            issued_at_unix - node_now_unix,
+            RELAY_TOKEN_MAX_FUTURE_SKEW_SECS
+        ));
+    }
+    if node_now_unix > issued_at_unix.saturating_add(RELAY_TOKEN_MAX_INSTALL_AGE_SECS) {
+        return Err(format!(
+            "relay token was {}s old when installed (limit {}s); the minter clock is behind the \
+             peer or the install stalled",
+            node_now_unix - issued_at_unix,
+            RELAY_TOKEN_MAX_INSTALL_AGE_SECS
+        ));
+    }
+    Ok(())
+}
+
+/// Token source for the two HP-3 peers (preissued spool, never the daemon-local
+/// issuer). Implemented by the orchestrator stage, which owns the adapters: the
+/// exit guest's adapter mints (it already holds the signing secret and its
+/// passphrase), the peers' adapters host the spool. `None` at the call site
+/// keeps the legacy behaviour: no relay client, the stage times out.
+pub(crate) trait RelayForwardTokenSpool {
+    /// Create the spool and daemon env on both peers and install the first
+    /// batch. `expected_verifier_hex` is the peers' traversal verifier key; the
+    /// minter's public key MUST equal it or nothing is installed (never
+    /// re-mint under another key to make it match). Takes effect at the peers'
+    /// next daemon restart.
+    fn prepare(&mut self, expected_verifier_hex: &str) -> Result<(), String>;
+    /// Called on every wait poll; mints and installs a fresh batch when
+    /// [`relay_token_refill_due`] says so. Fail closed on any error.
+    fn top_up_if_due(&mut self) -> Result<(), String>;
+    /// Remove the spool and daemon env line from both peers (the caller
+    /// restarts the daemons afterwards).
+    fn teardown(&mut self) -> Result<(), String>;
+    /// One line for the stage summary (counts and fingerprints only).
+    fn summary(&self) -> String;
+}
+
+/// The "no token source" spool: every operation is a no-op, so callers with no
+/// adapters to mint with (the legacy inventory-wide chain) keep the old
+/// behaviour -- no relay client on the peers, and HP-3 times out as before.
+pub(crate) struct NoRelayTokenSpool;
+
+impl RelayForwardTokenSpool for NoRelayTokenSpool {
+    fn prepare(&mut self, _expected_verifier_hex: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn top_up_if_due(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn teardown(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    fn summary(&self) -> String {
+        "no relay token spool configured".to_owned()
+    }
+}
+
 /// Where each peer's daemon reads the verifier it checks relay session tokens
 /// (and traversal bundles) against: `RUSTYNET_TRAVERSAL_VERIFIER_KEY` in
 /// `scripts/systemd/rustynetd.service`. The file holds the hex-encoded
@@ -15117,6 +15217,12 @@ pub(crate) fn relay_verifier_pairing_verdict(
     ))
 }
 
+/// The pre-flight's result: the (shared) verifier key and the summary line.
+pub(crate) struct RelayKeyPairing {
+    pub(crate) verifier_hex: String,
+    pub(crate) summary: String,
+}
+
 /// Reads the three verifier keys over SSH and applies
 /// [`relay_verifier_pairing_verdict`]. Read-only: nothing on any host changes.
 fn relay_forward_test_key_pairing_preflight(
@@ -15125,7 +15231,7 @@ fn relay_forward_test_key_pairing_preflight(
     receiver_target: &RemoteTarget,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
-) -> Result<String, String> {
+) -> Result<RelayKeyPairing, String> {
     let read_key = |target: &RemoteTarget,
                     script: String,
                     marker: &str,
@@ -15166,11 +15272,18 @@ fn relay_forward_test_key_pairing_preflight(
         "HP3_RELAY_VERIFIER_HEX",
         "relay verifier key",
     )?;
-    relay_verifier_pairing_verdict(
+    let summary = relay_verifier_pairing_verdict(
         sender_hex.as_str(),
         receiver_hex.as_str(),
         relay_hex.as_str(),
-    )
+    )?;
+    Ok(RelayKeyPairing {
+        verifier_hex: normalize_relay_forward_test_key_hex(
+            sender_hex.as_str(),
+            "sender traversal verifier",
+        )?,
+        summary,
+    })
 }
 
 /// True if `capture_text` (a `tcpdump -A` ASCII capture) contains the
@@ -15190,7 +15303,7 @@ fn relay_forward_test_capture_contains_marker(capture_text: &str, marker: &str) 
 fn build_relay_forward_test_provision_script(relay_lan_ip: &str) -> String {
     format!(
         "cat <<'EOF' | sudo tee /etc/default/rustynet-relay > /dev/null\n\
-         RUSTYNET_RELAY_ID=relay-local\n\
+         RUSTYNET_RELAY_ID={RELAY_FORWARD_TEST_RELAY_ID}\n\
          RUSTYNET_RELAY_BIND={relay_lan_ip}:4500\n\
          RUSTYNET_RELAY_VERIFIER_KEY=/etc/rustynet/relay-verifier.pub\n\
          RUSTYNET_RELAY_REPLAY_STORE=/var/lib/rustynet-relay/relay.replay\n\
@@ -15382,6 +15495,7 @@ fn wait_for_relay_forward_test_relay_routing(
     receiver_target: &RemoteTarget,
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
+    token_spool: &mut dyn RelayForwardTokenSpool,
 ) -> Result<(String, String), String> {
     let script = build_relay_forward_test_status_script();
     let deadline = Instant::now() + Duration::from_secs(RELAY_FORWARD_TEST_TRAVERSAL_TIMEOUT_SECS);
@@ -15389,6 +15503,12 @@ fn wait_for_relay_forward_test_relay_routing(
     let mut last_receiver_status: String;
 
     loop {
+        // Keep the spool stocked: a token lives 120 s and an expired matching
+        // token blocks the daemon's spool scan, so a wait longer than one
+        // lifetime needs fresh tokens. A failed top-up fails the wait closed.
+        token_spool
+            .top_up_if_due()
+            .map_err(|err| format!("relay token spool top-up: {err}"))?;
         last_sender_status = run_relay_forward_test_script(
             sender_target,
             ssh_identity_file,
@@ -15453,6 +15573,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
     expected_managed_peers: u64,
+    token_spool: &mut dyn RelayForwardTokenSpool,
 ) -> Result<String, String> {
     // The caller owns topology election: the `--node` orchestrator stage
     // elects from the run's role assignments
@@ -15535,7 +15656,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     // in `relay-verifier.pub`, the peers verify the same tokens with
     // `traversal.pub`. If those are not ONE key no token can ever work, so fail
     // here with both fingerprints instead of timing out 90 s later.
-    let key_pairing_summary = relay_forward_test_key_pairing_preflight(
+    let key_pairing = relay_forward_test_key_pairing_preflight(
         relay_target,
         sender_target,
         receiver_target,
@@ -15543,6 +15664,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         known_hosts_path,
     )
     .map_err(|err| format!("pre-flight: key pairing: {err}"))?;
+    let key_pairing_summary = key_pairing.summary.clone();
 
     // 1. Ensure the relay is provisioned with a routable bind and running.
     // No cleanup is needed for this step regardless of outcome: widening the
@@ -15597,6 +15719,15 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     // that: no exit from the closure, of any kind, can skip the
     // `cleanup_relay_forward_test` call below it.
     let result: Result<String, String> = (|| -> Result<String, String> {
+        // 2b. Relay token source (preissued spool): create it on both peers,
+        // point their daemons at it and install the first batch BEFORE the
+        // restarts below, so each daemon builds its relay client at start-up.
+        // Runs inside the always-cleaned-up region: a half-prepared spool is
+        // torn down by the cleanup below on every exit path.
+        token_spool
+            .prepare(key_pairing.verifier_hex.as_str())
+            .map_err(|err| format!("relay token spool: {err}"))?;
+
         // 3. Force a relay-only path between sender and receiver.
         let sender_block = run_relay_forward_test_script(
             sender_target,
@@ -15648,6 +15779,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
             receiver_target,
             ssh_identity_file,
             known_hosts_path,
+            &mut *token_spool,
         )?;
 
         // 5. Send real marked traffic while the relay captures its own wire.
@@ -15750,8 +15882,9 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
             ));
         }
 
+        let spool_summary = token_spool.summary();
         Ok(format!(
-            "relay forwarding proof passed (chain invoked against {relay_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; key pairing: {key_pairing_summary}; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
+            "relay forwarding proof passed (chain invoked against {relay_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; key pairing: {key_pairing_summary}; {spool_summary}; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
             relay_target.label,
             sender_target.label,
             receiver_target.label,
@@ -15786,6 +15919,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         ssh_identity_file,
         known_hosts_path,
         expected_managed_peers,
+        &mut *token_spool,
     );
     fold_relay_forward_cleanup_result(result, cleanup)
 }
@@ -15827,8 +15961,16 @@ fn cleanup_relay_forward_test(
     ssh_identity_file: &Path,
     known_hosts_path: Option<&Path>,
     expected_managed_peers: u64,
+    token_spool: &mut dyn RelayForwardTokenSpool,
 ) -> Result<(), String> {
     let mut failures: Vec<String> = Vec::new();
+    // Spool and daemon env line go FIRST (env line before directory, inside the
+    // adapter), so the daemon restarts below come up without a relay client and
+    // never point at a missing directory. A teardown failure is reported, and
+    // the restarts still run: the spool only ever disappears after its env line.
+    if let Err(err) = token_spool.teardown() {
+        failures.push(format!("relay token spool teardown: {err}"));
+    }
     for target in [sender_target, receiver_target] {
         if let Err(err) = run_relay_forward_test_script(
             target,
@@ -27129,6 +27271,9 @@ fn run_linux_orchestration_stages_with_options(
                 ssh_identity_file,
                 known_hosts_path,
                 expected_managed_peers,
+                // The legacy inventory-wide chain has no orchestrator adapters
+                // to mint with; it keeps the no-relay-client behaviour.
+                &mut NoRelayTokenSpool,
             )
         })();
         match relay_forwards_result {
@@ -51366,6 +51511,135 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             .find("build_relay_forward_test_provision_script(")
             .expect("provisioning present");
         assert!(gate < provision, "the gate must precede relay provisioning");
+    }
+
+    #[test]
+    fn relay_token_refill_is_due_at_the_interval_and_never_beyond_100_seconds() {
+        use std::time::Duration;
+        assert!(!super::relay_token_refill_due(Duration::from_secs(0)));
+        assert!(!super::relay_token_refill_due(Duration::from_secs(89)));
+        assert!(super::relay_token_refill_due(Duration::from_secs(90)));
+        assert!(super::relay_token_refill_due(Duration::from_secs(500)));
+        // Worst case between top-ups = interval + one status poll.
+        assert!(
+            super::RELAY_TOKEN_REFILL_INTERVAL.as_secs()
+                + super::RELAY_FORWARD_TEST_TRAVERSAL_POLL_INTERVAL_SECS
+                <= 100
+        );
+    }
+
+    #[test]
+    fn relay_token_clock_skew_verdict_bounds_both_directions() {
+        let now = 1_791_000_000;
+        assert!(super::relay_token_clock_skew_verdict(now, now).is_ok());
+        assert!(super::relay_token_clock_skew_verdict(now - 5, now).is_ok());
+        assert!(super::relay_token_clock_skew_verdict(now - 60, now).is_ok());
+        assert!(super::relay_token_clock_skew_verdict(now + 30, now).is_ok());
+        let ahead = super::relay_token_clock_skew_verdict(now + 31, now).expect_err("future");
+        assert!(ahead.contains("ahead of the peer"), "{ahead}");
+        let old = super::relay_token_clock_skew_verdict(now - 61, now).expect_err("stale");
+        assert!(old.contains("old when installed"), "{old}");
+        // Arithmetic must not wrap on adversarial values.
+        assert!(super::relay_token_clock_skew_verdict(u64::MAX, 0).is_err());
+        assert!(super::relay_token_clock_skew_verdict(0, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn relay_id_is_one_value_for_the_service_and_the_tokens() {
+        assert_eq!(super::RELAY_FORWARD_TEST_RELAY_ID, "relay-local");
+        let script = super::build_relay_forward_test_provision_script("192.168.0.202");
+        assert!(script.contains("RUSTYNET_RELAY_ID=relay-local"), "{script}");
+        // The systemd unit's own default is the same label.
+        let unit = include_str!("../../../../scripts/systemd/rustynet-relay.service");
+        assert!(unit.contains("Environment=RUSTYNET_RELAY_ID=relay-local"));
+        assert!(
+            rustynet_control::canonical_relay_id_from_label(super::RELAY_FORWARD_TEST_RELAY_ID)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn token_spool_is_prepared_inside_the_cleaned_up_region_before_any_firewall_or_restart() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("pub(crate) fn exercise_linux_relay_forwards_frame(")
+            .expect("exercise fn present");
+        let body = &source[start..];
+        let result_closure = body
+            .find("let result: Result<String, String> = (||")
+            .expect("cleaned-up region");
+        let prepare = body
+            .find(".prepare(key_pairing.verifier_hex")
+            .expect("prepare wired");
+        let block = body
+            .find("build_relay_forward_test_block_script(receiver")
+            .expect("nft block");
+        let restart = body
+            .find("build_relay_forward_test_daemon_restart_script()")
+            .expect("restart");
+        let cleanup = body
+            .find("cleanup_relay_forward_test(")
+            .expect("cleanup call");
+        assert!(
+            result_closure < prepare,
+            "prepare must be inside the closure"
+        );
+        assert!(
+            prepare < block && prepare < restart,
+            "prepare before disruption"
+        );
+        assert!(restart < cleanup, "cleanup runs after the closure");
+    }
+
+    #[test]
+    fn cleanup_tears_the_spool_down_before_it_restarts_the_daemons() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("fn cleanup_relay_forward_test(")
+            .expect("cleanup fn present");
+        let body = &source[start..];
+        let teardown = body.find("token_spool.teardown()").expect("teardown wired");
+        let restart = body
+            .find("build_relay_forward_test_daemon_restart_script()")
+            .expect("restart wired");
+        assert!(
+            teardown < restart,
+            "env line and spool go before the restart"
+        );
+    }
+
+    #[test]
+    fn the_wait_loop_tops_the_spool_up_every_poll_and_fails_closed() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("fn wait_for_relay_forward_test_relay_routing(")
+            .expect("wait fn present");
+        let body = &source[start..];
+        let top_up = body.find("token_spool").expect("top-up wired");
+        let first_status = body
+            .find("\"rustynet status (sender)\"")
+            .expect("status poll");
+        assert!(
+            top_up < first_status,
+            "stock the spool before each status poll"
+        );
+        assert!(
+            body.contains("relay token spool top-up: {err}"),
+            "errors must propagate"
+        );
+    }
+
+    #[test]
+    fn the_no_op_spool_changes_nothing_for_callers_without_adapters() {
+        use super::RelayForwardTokenSpool;
+        let mut spool = super::NoRelayTokenSpool;
+        assert!(spool.prepare("anything").is_ok());
+        assert!(spool.top_up_if_due().is_ok());
+        assert!(spool.teardown().is_ok());
+        assert!(spool.summary().contains("no relay token spool"));
     }
 
     const HP3_KEY_A: &str = "6de3f8ac16da4a256943c79868453734958718dbff06224785b443ed218a2401";

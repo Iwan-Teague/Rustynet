@@ -6,9 +6,11 @@ use crate::vm_lab::DaemonProbeOp;
 use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::adapter::linux_install;
 use crate::vm_lab::orchestrator::adapter::linux_membership;
+use crate::vm_lab::orchestrator::adapter::linux_relay_tokens;
 use crate::vm_lab::orchestrator::adapter::linux_traffic;
 use crate::vm_lab::orchestrator::adapter::node_adapter::MeshClientNatSession;
 use crate::vm_lab::orchestrator::adapter::node_adapter::NodeAdapter;
+use crate::vm_lab::orchestrator::adapter::node_adapter::RelayTokenSpoolReport;
 use crate::vm_lab::orchestrator::adapter::node_adapter::SshConnectionParams;
 use crate::vm_lab::orchestrator::adapter::ssh;
 use crate::vm_lab::orchestrator::connection::NodeConnection;
@@ -339,6 +341,38 @@ impl NodeAdapter for LinuxNodeAdapter {
             env_content,
             local_out_dir,
         )
+    }
+
+    fn issue_relay_tokens_to_dir(
+        &self,
+        env_content: &str,
+        local_out_dir: &std::path::Path,
+    ) -> Result<(), AdapterError> {
+        linux_relay_tokens::issue_relay_tokens_to_dir(
+            &self.conn,
+            linux_install::LINUX_RUSTYNET_PATH,
+            env_content,
+            local_out_dir,
+        )
+    }
+
+    fn prepare_relay_token_spool(&self) -> Result<(), AdapterError> {
+        linux_relay_tokens::prepare_relay_token_spool(&self.conn)
+    }
+
+    fn install_relay_token_spool(
+        &self,
+        token_files: &[std::path::PathBuf],
+    ) -> Result<RelayTokenSpoolReport, AdapterError> {
+        linux_relay_tokens::install_relay_token_spool(&self.conn, token_files)
+    }
+
+    fn teardown_relay_token_spool(&self) -> Result<(), AdapterError> {
+        linux_relay_tokens::teardown_relay_token_spool(&self.conn)
+    }
+
+    fn node_clock_unix(&self) -> Result<u64, AdapterError> {
+        linux_relay_tokens::node_clock_unix(&self.conn)
     }
 }
 

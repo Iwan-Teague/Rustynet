@@ -134,6 +134,10 @@ signal-hook = { version = "0.3", default-features = false, optional = true }
 # (resolver 2 never unifies dev-dependency features into a normal build), so a
 # shipped `rustynetd` is unaffected.
 rustynetd = { path = "../rustynetd", features = ["lab-substrate"] }
+# TEST-ONLY (HP-3 provisioning): the relay-token issuer is checked against the
+# daemon's real preissued-spool reader, which takes this crate's `NodeId`. An
+# in-tree path crate already in the build graph (rustynetd depends on it).
+rustynet-backend-api = { path = "../rustynet-backend-api" }
 
 [lints]
 workspace = true

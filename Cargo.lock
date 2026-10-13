@@ -1551,6 +1551,7 @@ dependencies = [
  "nix 0.29.0",
  "rand",
  "rustynet-advisor",
+ "rustynet-backend-api",
  "rustynet-control",
  "rustynet-crypto",
  "rustynet-dns-zone",

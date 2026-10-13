@@ -31,8 +31,10 @@ use rand::{TryRngCore, rngs::OsRng};
 use rustynet_control::roles::{RoleCapability, role_capability_csv};
 use rustynet_control::{
     AutoTunnelBundleRequest, ControlPlaneCore, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
-    EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType, NodeMetadata,
+    EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
+    MAX_RELAY_SESSION_TOKEN_TTL_SECS, NodeMetadata, RelaySessionTokenRequest,
     SignedDnsZoneBundleRequest, SignedTraversalCoordinationRecord, TraversalCoordinationRecord,
+    relay_session_token_to_wire,
 };
 use rustynet_policy::{PolicyRule, PolicySet, Protocol, RuleAction};
 use zeroize::Zeroize;
@@ -103,6 +105,12 @@ pub struct E2eIssueAssignmentBundlesFromEnvConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct E2eIssueTraversalBundlesFromEnvConfig {
+    pub env_file: PathBuf,
+    pub issue_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2eIssueRelaySessionTokensFromEnvConfig {
     pub env_file: PathBuf,
     pub issue_dir: PathBuf,
 }
@@ -3172,6 +3180,249 @@ pub fn execute_ops_e2e_issue_assignment_bundles_from_env(
     Ok(format!(
         "e2e assignment bundle issuance complete: env_file={} issue_dir={}",
         config.env_file.display(),
+        config.issue_dir.display()
+    ))
+}
+
+/// File extension of a preissued relay session token. MUST equal the extension
+/// the daemon's spool reader accepts (`PREISSUED_RELAY_TOKEN_EXTENSION` in
+/// `rustynetd/src/relay_client.rs`); the pin test below asserts the literal.
+pub(crate) const RELAY_TOKEN_FILE_EXTENSION: &str = "relay-token";
+/// Verifier-key witness the relay-token issuer writes next to the tokens: the
+/// hex endpoint-hint PUBLIC key the tokens verify under.
+pub(crate) const RELAY_TOKEN_VERIFIER_FILE: &str = "rn-relay-token.pub";
+/// Hard bounds on one issuance run. The daemon's spool holds at most 128 files
+/// (`PREISSUED_RELAY_TOKEN_MAX_FILES`); one run stays far below that so a few
+/// generations can coexist before the expired ones are purged.
+const RELAY_TOKEN_ISSUE_MAX_PAIRS: usize = 8;
+const RELAY_TOKEN_ISSUE_MAX_PER_PAIR: u64 = 8;
+
+/// One parsed relay-token issuance request (the env file's decoded content).
+#[derive(Debug, PartialEq, Eq)]
+struct RelayTokenIssueRequest {
+    nodes_spec: String,
+    allow_spec: String,
+    relay_label: String,
+    /// Directed `(node_id, peer_node_id)` pairs: the node that will PRESENT the
+    /// token, and the peer the relay session is for.
+    pairs: Vec<(String, String)>,
+    tokens_per_pair: u64,
+    ttl_secs: u64,
+}
+
+#[derive(Debug)]
+struct IssuedRelayTokenFile {
+    file_name: String,
+    wire: String,
+}
+
+#[derive(Debug)]
+struct IssuedRelayTokenArtifacts {
+    verifier_key_hex: String,
+    tokens: Vec<IssuedRelayTokenFile>,
+}
+
+/// Decodes and bounds the relay-token env file. Every key is REQUIRED -- no
+/// defaults, so a writer cannot silently mint tokens with a lifetime or count
+/// it did not choose (the same rule `TRAVERSAL_TTL_SECS` learned the hard way).
+///
+/// ```text
+/// NODES_SPEC / ALLOW_SPEC      as for the traversal issuer
+/// RELAY_ID                     relay label, <= 16 ASCII bytes (e.g. relay-local)
+/// RELAY_TOKEN_PAIRS            node_id|peer_node_id;...  (directed, <= 8)
+/// RELAY_TOKENS_PER_PAIR        1..=8
+/// RELAY_TOKEN_TTL_SECS         1..=120 (the product maximum)
+/// ```
+fn parse_relay_token_issue_request(
+    values: &BTreeMap<String, String>,
+) -> Result<RelayTokenIssueRequest, String> {
+    let label = "relay token env file";
+    let nodes_spec = env_required_value(values, "NODES_SPEC", label)?;
+    let allow_spec = env_required_value(values, "ALLOW_SPEC", label)?;
+    ensure_safe_spec("nodes-spec", nodes_spec.as_str())?;
+    ensure_safe_spec("allow-spec", allow_spec.as_str())?;
+    let relay_label = env_required_value(values, "RELAY_ID", label)?;
+    ensure_safe_token("relay-id", relay_label.as_str())?;
+    rustynet_control::canonical_relay_id_from_label(relay_label.as_str())
+        .map_err(|err| format!("RELAY_ID invalid: {err}"))?;
+
+    let pairs_spec = env_required_value(values, "RELAY_TOKEN_PAIRS", label)?;
+    ensure_safe_spec("relay-token-pairs", pairs_spec.as_str())?;
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for entry in pairs_spec.split(';') {
+        let trimmed = entry.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some((node_id, peer_node_id)) = trimmed.split_once('|') else {
+            return Err(format!(
+                "invalid RELAY_TOKEN_PAIRS entry {trimmed:?}; expected node_id|peer_node_id"
+            ));
+        };
+        ensure_safe_token("relay-token node-id", node_id)?;
+        ensure_safe_token("relay-token peer-node-id", peer_node_id)?;
+        if node_id == peer_node_id {
+            return Err(format!(
+                "RELAY_TOKEN_PAIRS entry {trimmed:?} names the same node twice"
+            ));
+        }
+        let pair = (node_id.to_owned(), peer_node_id.to_owned());
+        if pairs.contains(&pair) {
+            return Err(format!(
+                "RELAY_TOKEN_PAIRS lists {trimmed:?} more than once"
+            ));
+        }
+        pairs.push(pair);
+    }
+    if pairs.is_empty() || pairs.len() > RELAY_TOKEN_ISSUE_MAX_PAIRS {
+        return Err(format!(
+            "RELAY_TOKEN_PAIRS must list 1..={RELAY_TOKEN_ISSUE_MAX_PAIRS} directed pairs (got {})",
+            pairs.len()
+        ));
+    }
+
+    let tokens_per_pair = env_required_value(values, "RELAY_TOKENS_PER_PAIR", label)?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid RELAY_TOKENS_PER_PAIR: {err}"))?;
+    if tokens_per_pair == 0 || tokens_per_pair > RELAY_TOKEN_ISSUE_MAX_PER_PAIR {
+        return Err(format!(
+            "RELAY_TOKENS_PER_PAIR must be 1..={RELAY_TOKEN_ISSUE_MAX_PER_PAIR} (got {tokens_per_pair})"
+        ));
+    }
+    let ttl_secs = env_required_value(values, "RELAY_TOKEN_TTL_SECS", label)?
+        .parse::<u64>()
+        .map_err(|err| format!("invalid RELAY_TOKEN_TTL_SECS: {err}"))?;
+    if ttl_secs == 0 || ttl_secs > MAX_RELAY_SESSION_TOKEN_TTL_SECS {
+        return Err(format!(
+            "RELAY_TOKEN_TTL_SECS must be 1..={MAX_RELAY_SESSION_TOKEN_TTL_SECS} (got {ttl_secs})"
+        ));
+    }
+    Ok(RelayTokenIssueRequest {
+        nodes_spec,
+        allow_spec,
+        relay_label,
+        pairs,
+        tokens_per_pair,
+        ttl_secs,
+    })
+}
+
+/// Mints the requested tokens through `ControlPlaneCore::issue_relay_session_token`
+/// (the one in-tree issuer: it enforces the 120 s cap, distinct node/peer and the
+/// ALLOW policy) and self-verifies every token under the endpoint-hint verifier
+/// before returning it. Each token is bound to exactly one
+/// `(node, peer, relay id)` triple. File names sort chronologically
+/// (`{issued:010}-{pair:02}-{seq:02}`; deliberately no nonce bytes, which are
+/// the relay's anti-replay key and would otherwise show up in argv and `ls`),
+/// so the daemon's sorted spool scan consumes the oldest token first.
+fn issue_relay_session_token_artifacts(
+    signing_secret: &[u8],
+    nodes: &[GenericTraversalNodeSpec],
+    allow_pairs: &[GenericTraversalAllowSpec],
+    request: &RelayTokenIssueRequest,
+    issued_at_unix: u64,
+) -> Result<IssuedRelayTokenArtifacts, String> {
+    let core = control_plane_core_from_generic_specs(signing_secret, nodes, allow_pairs)?;
+    let verifier_key_hex = core.endpoint_hint_verifier_key_hex();
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&core.endpoint_hint_verifying_key)
+        .map_err(|err| format!("endpoint-hint verifier key invalid: {err}"))?;
+    let mut tokens = Vec::new();
+    for (pair_index, (node_id, peer_node_id)) in request.pairs.iter().enumerate() {
+        for seq in 0..request.tokens_per_pair {
+            let token = core
+                .issue_relay_session_token(RelaySessionTokenRequest {
+                    node_id: node_id.clone(),
+                    peer_node_id: peer_node_id.clone(),
+                    relay_id: request.relay_label.clone(),
+                    requested_at_unix: issued_at_unix,
+                    ttl_secs: request.ttl_secs,
+                })
+                .map_err(|err| {
+                    format!("issue relay token {node_id} -> {peer_node_id} failed: {err}")
+                })?;
+            token
+                .verify_signature(&verifying_key)
+                .map_err(|err| format!("self-verify of relay token failed: {err}"))?;
+            tokens.push(IssuedRelayTokenFile {
+                file_name: format!(
+                    "{issued_at_unix:010}-{pair_index:02}-{seq:02}.{RELAY_TOKEN_FILE_EXTENSION}"
+                ),
+                wire: relay_session_token_to_wire(&token),
+            });
+        }
+    }
+    Ok(IssuedRelayTokenArtifacts {
+        verifier_key_hex,
+        tokens,
+    })
+}
+
+/// `ops e2e-issue-relay-session-tokens-from-env`: mint short-lived, one-use
+/// relay session tokens for the preissued token spool
+/// (`RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR`) of the named nodes. Runs where the
+/// assignment signing secret already lives (the exit guest, through the same
+/// adapter path as the bundle issuers) and needs the same decrypted passphrase
+/// workspace. Writes token files (0600) and the public verifier key into
+/// `--issue-dir`; token contents are bearer credentials for at most 120 s and
+/// are never logged or put in argv.
+pub fn execute_ops_e2e_issue_relay_session_tokens_from_env(
+    config: E2eIssueRelaySessionTokensFromEnvConfig,
+) -> Result<String, String> {
+    ensure_running_as_root()?;
+    let env_values = load_simple_env_file(config.env_file.as_path(), "relay token env file")?;
+    let request = parse_relay_token_issue_request(&env_values)?;
+    let nodes = parse_generic_nodes(request.nodes_spec.as_str())?;
+    if nodes.len() < 2 {
+        return Err("relay token issue requires at least two nodes in NODES_SPEC".to_owned());
+    }
+    let allow_pairs = parse_generic_allow_specs(request.allow_spec.as_str())?;
+    prepare_clean_issue_dir(config.issue_dir.as_path(), "relay token issue dir")?;
+
+    let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("relay-token")?;
+    let result = (|| -> Result<usize, String> {
+        ensure_regular_file(
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
+            "assignment signing secret",
+        )?;
+        let signing_secret = crate::secret_material::load_assignment_signing_secret(
+            Path::new(ASSIGNMENT_SIGNING_SECRET_PATH),
+            passphrase_path.as_path(),
+        )?;
+        let artifacts = issue_relay_session_token_artifacts(
+            signing_secret.as_slice(),
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            &request,
+            unix_now(),
+        )?;
+        for token in &artifacts.tokens {
+            let path = config.issue_dir.join(&token.file_name);
+            fs::write(path.as_path(), token.wire.as_bytes())
+                .map_err(|err| format!("write relay token failed ({}): {err}", path.display()))?;
+            set_unix_mode(path.as_path(), 0o600)?;
+        }
+        let verifier_path = config.issue_dir.join(RELAY_TOKEN_VERIFIER_FILE);
+        fs::write(
+            verifier_path.as_path(),
+            format!("{}\n", artifacts.verifier_key_hex).as_bytes(),
+        )
+        .map_err(|err| {
+            format!(
+                "write relay token verifier key failed ({}): {err}",
+                verifier_path.display()
+            )
+        })?;
+        set_unix_mode(verifier_path.as_path(), 0o600)?;
+        Ok(artifacts.tokens.len())
+    })();
+    secure_remove_file(passphrase_path.as_path());
+    let _ = fs::remove_dir_all(work_dir);
+    let count = result?;
+
+    // Counts and the directory only: never a token, nonce or signature.
+    Ok(format!(
+        "e2e relay session token issuance complete: tokens={count} ttl_secs={} issue_dir={}",
+        request.ttl_secs,
         config.issue_dir.display()
     ))
 }
@@ -8438,6 +8689,269 @@ mod tests {
             traversal_verifier_key_hex(&secret),
             "assignment and endpoint-hint verifiers must be domain-separated"
         );
+    }
+
+    const RELAY_TOKEN_TEST_NODES: &str = "node-a|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f|client;\
+node-b|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100|client;\
+node-c|192.168.64.26:51820|0f0e0d0c0b0a090807060504030201000f0e0d0c0b0a09080706050403020100|client";
+
+    fn relay_token_test_env(extra: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut values = BTreeMap::new();
+        for (key, value) in [
+            ("NODES_SPEC", RELAY_TOKEN_TEST_NODES),
+            ("ALLOW_SPEC", "node-a|node-b;node-b|node-a;node-a|node-c"),
+            ("RELAY_ID", "relay-local"),
+            ("RELAY_TOKEN_PAIRS", "node-a|node-b;node-b|node-a"),
+            ("RELAY_TOKENS_PER_PAIR", "3"),
+            ("RELAY_TOKEN_TTL_SECS", "120"),
+        ] {
+            values.insert(key.to_owned(), value.to_owned());
+        }
+        for (key, value) in extra {
+            if value.is_empty() {
+                values.remove(*key);
+            } else {
+                values.insert((*key).to_owned(), (*value).to_owned());
+            }
+        }
+        values
+    }
+
+    fn issue_relay_tokens_for_test(
+        values: &BTreeMap<String, String>,
+        now: u64,
+    ) -> Result<super::IssuedRelayTokenArtifacts, String> {
+        let request = super::parse_relay_token_issue_request(values)?;
+        let nodes = parse_generic_nodes(request.nodes_spec.as_str())?;
+        let allow = parse_generic_allow_specs(request.allow_spec.as_str())?;
+        super::issue_relay_session_token_artifacts(&[7u8; 32], &nodes, &allow, &request, now)
+    }
+
+    /// The spool reader only looks at this extension; a drift here silently
+    /// makes the daemon ignore every minted token.
+    #[test]
+    fn relay_token_file_extension_matches_the_daemon_spool_reader() {
+        assert_eq!(super::RELAY_TOKEN_FILE_EXTENSION, "relay-token");
+        let daemon_source = include_str!("../../rustynetd/src/relay_client.rs");
+        assert!(
+            daemon_source
+                .contains("const PREISSUED_RELAY_TOKEN_EXTENSION: &str = \"relay-token\";")
+        );
+    }
+
+    #[test]
+    fn relay_tokens_are_bound_to_one_triple_verify_and_expire_in_ttl() {
+        let now = 1_791_000_000;
+        let artifacts = issue_relay_tokens_for_test(&relay_token_test_env(&[]), now)
+            .expect("tokens should issue");
+        assert_eq!(artifacts.tokens.len(), 6, "2 pairs x 3 tokens");
+        assert_eq!(
+            artifacts.verifier_key_hex,
+            traversal_verifier_key_hex(&[7u8; 32]),
+            "tokens verify under the traversal (endpoint-hint) key"
+        );
+        assert_ne!(
+            artifacts.verifier_key_hex,
+            assignment_verifier_key_hex(&[7u8; 32])
+        );
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+            &decode_hex_32(&artifacts.verifier_key_hex).expect("verifier hex"),
+        )
+        .expect("verifier key");
+        let relay_id =
+            rustynet_control::canonical_relay_id_from_label("relay-local").expect("relay id");
+        let mut nonces = std::collections::BTreeSet::new();
+        for token in &artifacts.tokens {
+            let parsed = rustynet_control::parse_relay_session_token_wire(&token.wire)
+                .expect("canonical wire");
+            parsed.verify_signature(&verifying_key).expect("signature");
+            assert!(
+                (parsed.node_id.as_str(), parsed.peer_node_id.as_str()) == ("node-a", "node-b")
+                    || (parsed.node_id.as_str(), parsed.peer_node_id.as_str())
+                        == ("node-b", "node-a"),
+                "only the two requested directed pairs may be minted"
+            );
+            assert_eq!(parsed.relay_id, relay_id);
+            assert_eq!(parsed.issued_at_unix, now);
+            assert_eq!(parsed.ttl_secs(), 120);
+            assert!(nonces.insert(parsed.nonce), "nonces must be unique");
+            assert!(
+                token.file_name.ends_with(".relay-token"),
+                "{}",
+                token.file_name
+            );
+            assert!(
+                token.file_name.starts_with("1791000000-"),
+                "{}",
+                token.file_name
+            );
+        }
+        let mut names: Vec<_> = artifacts
+            .tokens
+            .iter()
+            .map(|t| t.file_name.clone())
+            .collect();
+        let sorted = {
+            let mut copy = names.clone();
+            copy.sort();
+            copy
+        };
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), 6, "file names must be unique");
+        assert_eq!(names, sorted);
+    }
+
+    /// F3 (witness gap): the minted files are fed through the daemon's REAL
+    /// `PreissuedRelaySessionTokenIssuer`, not a literal extension pin. Accepts
+    /// under the traversal key; refuses under the assignment key, when expired,
+    /// and when the file mode is 0644.
+    fn spool_dir_with_minted_tokens(issued_at: u64) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "rn-relay-spool-test-{}-{}",
+            std::process::id(),
+            super::unique_suffix()
+        ));
+        fs::create_dir_all(&dir).expect("spool dir");
+        super::set_unix_mode(&dir, 0o700).expect("0700");
+        let artifacts =
+            issue_relay_tokens_for_test(&relay_token_test_env(&[]), issued_at).expect("mint");
+        for token in &artifacts.tokens {
+            let path = dir.join(&token.file_name);
+            fs::write(&path, token.wire.as_bytes()).expect("write token");
+            super::set_unix_mode(&path, 0o600).expect("0600");
+        }
+        (dir, artifacts.verifier_key_hex)
+    }
+
+    fn real_spool_issue(dir: &std::path::Path, verifier_hex: &str) -> Result<(), String> {
+        use rustynetd::relay_client::{PreissuedRelaySessionTokenIssuer, RelaySessionTokenIssuer};
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&decode_hex_32(verifier_hex)?)
+            .map_err(|e| e.to_string())?;
+        let issuer = PreissuedRelaySessionTokenIssuer::new(dir.to_path_buf(), key)
+            .map_err(|e| e.to_string())?;
+        let node = rustynet_backend_api::NodeId::new("node-a").map_err(|e| e.to_string())?;
+        let peer = rustynet_backend_api::NodeId::new("node-b").map_err(|e| e.to_string())?;
+        let relay_id = rustynet_control::canonical_relay_id_from_label("relay-local")?;
+        issuer
+            .issue_token(&node, &peer, relay_id, 120)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_real_daemon_spool_reader_accepts_minted_tokens_under_the_traversal_key() {
+        let (dir, verifier) = spool_dir_with_minted_tokens(crate::secret_material::unix_now());
+        // Seed [7;32] is the test secret: the traversal verifier is what the
+        // daemon is configured with (RUSTYNET_TRAVERSAL_VERIFIER_KEY).
+        assert_eq!(verifier, traversal_verifier_key_hex(&[7u8; 32]));
+        real_spool_issue(&dir, &verifier).expect("accepted under the traversal key");
+        // One-use: the consumed file is gone, the other 2 node-a tokens remain.
+        let left = fs::read_dir(&dir).expect("ls").count();
+        assert_eq!(left, 5, "one of six tokens consumed");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_real_daemon_spool_reader_rejects_tokens_under_the_assignment_key() {
+        // B5 end to end: the key the lab used to pin the relay to.
+        let (dir, _) = spool_dir_with_minted_tokens(crate::secret_material::unix_now());
+        let err = real_spool_issue(&dir, &assignment_verifier_key_hex(&[7u8; 32]))
+            .expect_err("assignment key must not verify relay tokens");
+        assert!(err.contains("signature invalid"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_real_daemon_spool_reader_rejects_expired_and_loose_mode_tokens() {
+        let (dir, verifier) =
+            spool_dir_with_minted_tokens(crate::secret_material::unix_now().saturating_sub(1000));
+        let err = real_spool_issue(&dir, &verifier).expect_err("expired token must be refused");
+        assert!(err.contains("expired"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+
+        let (dir, verifier) = spool_dir_with_minted_tokens(crate::secret_material::unix_now());
+        for entry in fs::read_dir(&dir).expect("ls") {
+            super::set_unix_mode(&entry.expect("entry").path(), 0o644).expect("loosen");
+        }
+        let err = real_spool_issue(&dir, &verifier).expect_err("0644 token must be refused");
+        assert!(err.contains("permissions too broad"), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn relay_token_file_names_sort_chronologically_across_top_ups() {
+        let env = relay_token_test_env(&[]);
+        let older = issue_relay_tokens_for_test(&env, 1_791_000_000).expect("older");
+        let newer = issue_relay_tokens_for_test(&env, 1_791_000_100).expect("newer");
+        let oldest_new = newer
+            .tokens
+            .iter()
+            .map(|t| t.file_name.clone())
+            .min()
+            .unwrap();
+        let newest_old = older
+            .tokens
+            .iter()
+            .map(|t| t.file_name.clone())
+            .max()
+            .unwrap();
+        assert!(
+            newest_old < oldest_new,
+            "the daemon consumes the first sorted match, so older must sort first"
+        );
+    }
+
+    #[test]
+    fn relay_token_request_requires_every_key_and_bounds_ttl_count_and_pairs() {
+        for key in [
+            "NODES_SPEC",
+            "ALLOW_SPEC",
+            "RELAY_ID",
+            "RELAY_TOKEN_PAIRS",
+            "RELAY_TOKENS_PER_PAIR",
+            "RELAY_TOKEN_TTL_SECS",
+        ] {
+            assert!(
+                super::parse_relay_token_issue_request(&relay_token_test_env(&[(key, "")]))
+                    .is_err(),
+                "{key} must be required (no silent default)"
+            );
+        }
+        for (key, value) in [
+            ("RELAY_TOKEN_TTL_SECS", "0"),
+            ("RELAY_TOKEN_TTL_SECS", "121"),
+            ("RELAY_TOKEN_TTL_SECS", "600"),
+            ("RELAY_TOKEN_TTL_SECS", "abc"),
+            ("RELAY_TOKENS_PER_PAIR", "0"),
+            ("RELAY_TOKENS_PER_PAIR", "9"),
+            ("RELAY_ID", "this-relay-id-is-far-too-long"),
+            ("RELAY_TOKEN_PAIRS", "node-a|node-a"),
+            ("RELAY_TOKEN_PAIRS", "node-a|node-b;node-a|node-b"),
+            ("RELAY_TOKEN_PAIRS", "node-a"),
+            ("RELAY_TOKEN_PAIRS", "a|b;b|a;a|c;c|a;b|c;c|b;a|d;d|a;e|f"),
+        ] {
+            assert!(
+                super::parse_relay_token_issue_request(&relay_token_test_env(&[(key, value)]))
+                    .is_err(),
+                "{key}={value} must be refused"
+            );
+        }
+        super::parse_relay_token_issue_request(&relay_token_test_env(&[(
+            "RELAY_TOKEN_TTL_SECS",
+            "120",
+        )]))
+        .expect("the 120 s product maximum is allowed");
+    }
+
+    #[test]
+    fn relay_tokens_are_refused_for_pairs_policy_does_not_allow_or_unknown_nodes() {
+        let denied = relay_token_test_env(&[("RELAY_TOKEN_PAIRS", "node-b|node-c")]);
+        let err = issue_relay_tokens_for_test(&denied, 1_791_000_000)
+            .expect_err("a pair outside ALLOW_SPEC must not get a token");
+        assert!(err.contains("denied by policy"), "{err}");
+        let unknown = relay_token_test_env(&[("RELAY_TOKEN_PAIRS", "node-a|node-z")]);
+        assert!(issue_relay_tokens_for_test(&unknown, 1_791_000_000).is_err());
     }
 
     #[test]
