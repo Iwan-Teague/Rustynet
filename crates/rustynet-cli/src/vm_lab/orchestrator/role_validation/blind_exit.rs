@@ -57,10 +57,12 @@ pub(crate) fn parse_header_node_role(status: &str) -> Option<String> {
 
 /// Bounded daemon-role readiness window shared by the post-restore poll
 /// (`exit_demotion_residue`) and the enrollment admin-role precondition
-/// (`live_enrollment_restart_validation`): `rustynet role set` restarts
-/// `rustynetd.service` on Linux, so the daemon IPC needs a bounded poll
-/// before its role can be asserted (same shape as the `validate_admin_issue`
-/// poll).
+/// (`live_enrollment_restart_validation`): the daemon IPC can be briefly
+/// unavailable while a stage restarts the daemon, so its role needs a
+/// bounded poll before it can be asserted (same shape as the
+/// `validate_admin_issue` poll). `rustynet role set` itself does NOT restart
+/// the daemon (katana-xnet-146): it reports the LIVE role, which a persisted
+/// env-file change does not move until the next daemon start.
 pub(crate) const DAEMON_ROLE_POLL_MAX_ATTEMPTS: usize = 4;
 pub(crate) const DAEMON_ROLE_POLL_RETRY_DELAY: std::time::Duration =
     std::time::Duration::from_secs(3);
@@ -90,9 +92,9 @@ pub(crate) fn run_daemon_status_sudoed(
 /// Poll, bounded, for the daemon to report `expected_role` as its primary
 /// role through the sudo-wrapped status seam. Transient outcomes (transport
 /// errors, non-zero exits, bodies whose readable role does not yet match —
-/// the daemon is mid-restart right after `role set`) are retried until the
-/// window closes. `context` names the caller in the final error, which must
-/// name the last error so a timeout is diagnosable.
+/// the daemon may be mid-restart) are retried until the window closes.
+/// `context` names the caller in the final error, which must name the last
+/// error so a timeout is diagnosable.
 pub(crate) fn poll_daemon_node_role(
     shell: &dyn RemoteShellHost,
     platform: VmGuestPlatform,

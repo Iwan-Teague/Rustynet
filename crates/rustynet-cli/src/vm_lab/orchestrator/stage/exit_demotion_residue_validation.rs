@@ -22,14 +22,21 @@ const REPORTED_SKIPS_FILENAME: &str = "exit_demotion_residue_validation.reported
 /// [`exit_demotion_residue_runtime_implemented`].
 ///
 /// Side-effect: demotes the Linux exit to client through the public CLI
-/// surface (`rustynet role set client`), then restores the node to its
-/// recorded pre-demotion PRIMARY role through the same seam before
+/// surface (`rustynet role set client`), then restores the node before
 /// returning — a restore failure fails the stage, since an exit left
-/// demoted poisons every later admin-only stage. The restore re-establishes
-/// the primary role only, not the exit-serving posture (advertise / NAT are
-/// deliberately not re-run; later exit stages re-assert serving). The
-/// two-phase capture (before + after snapshot) provides the anti-vacuous
-/// "was serving exit" guard.
+/// demoted poisons every later admin-only stage. The demotion outlives the
+/// stage in two places, so BOTH are recorded before any demotion command and
+/// BOTH are restored and verified: the daemon's LIVE primary role (public
+/// CLI + the bounded `node_role=` poll) and the PERSISTED role line in
+/// `/etc/default/rustynetd` (argv-only `sudo -n sed` rewrite, read back
+/// through the same `grep` as the record). `role set` alone cannot restore
+/// the persisted line: it plans from the live preset, and a daemon that
+/// still reports `admin` plans a no-op (katana-xnet-146). An unrecordable
+/// persisted line (absent / several / garbled) fails the stage BEFORE the
+/// demotion. The restore re-establishes the primary role only, not the
+/// exit-serving posture (advertise / NAT are deliberately not re-run; later
+/// exit stages re-assert serving). The two-phase capture (before + after
+/// snapshot) provides the anti-vacuous "was serving exit" guard.
 pub struct ExitDemotionResidueValidationStage;
 
 impl OrchestrationStage for ExitDemotionResidueValidationStage {
