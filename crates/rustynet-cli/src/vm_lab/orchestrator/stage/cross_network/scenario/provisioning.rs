@@ -473,22 +473,33 @@ impl EnvFile {
 
 /// Re-spell an issuer-grammar `NODES_SPEC` for `assignment-refresh.env`.
 ///
-/// The two consumers disagree on the optional fields. The e2e issuer
-/// (`parse_generic_nodes`, used for the initial bundles) reads
-/// `node|endpoint|key[|capabilities_csv]`; the on-node `rustynet ops
-/// refresh-assignment` (`parse_assignment_nodes`, `main.rs`) reads
-/// `node|endpoint|key[|owner|hostname|os|tags_csv|capabilities_csv]`. Handing the
-/// refresher the issuer spelling makes it take `anchor,exit_server` as the node's
-/// OWNER and default its capabilities to `[client]`, so the first timer tick that
-/// really regenerates the bundle mints one without `anchor`/`exit_server` and the
-/// admin daemon (or the client's issuer check) rejects it: "assignment target
-/// intent lacks required local capability anchor" on the exit, "exit node ... lacks
-/// exit_server capability in --nodes" on the client (katana-xnet-69: node_network_
-/// switch, remote_exit_dns, failback_roaming). The scenarios only looked fine
-/// while the freshly installed bundle was still young enough for the refresher to
-/// skip regeneration. Entries without capabilities are left untouched (both
-/// parsers default them to `[client]`); capability tokens go through the closed
-/// `RoleCapability` parser.
+/// ONE string is read by TWO parsers inside `rustynet ops refresh-assignment`
+/// (`main.rs::execute_ops_refresh_assignment`):
+///
+/// The traversal re-sign (`local_traversal_refresh_env_body` ->
+/// `ops_e2e::parse_generic_nodes`) reads `node|endpoint|key[|capabilities_csv]`:
+/// the 4th field is the capabilities and any further fields are ignored;
+///
+/// The assignment re-issue (`parse_assignment_nodes`) reads
+/// `node|endpoint|key[|owner|hostname|os|tags_csv|capabilities_csv]`: the 4th
+/// field is the OWNER, the 8th the capabilities, and an absent 8th defaults to
+/// `[client]`.
+/// Handing it the issuer spelling `...|anchor,exit_server` makes the assignment
+/// side take the capabilities as an owner and mint a `[client]` bundle (the exit
+/// then refuses it: "lacks required local capability anchor"; katana-xnet-69).
+/// The first fix here (`id|id|linux||caps`, katana-xnet-71) satisfied the
+/// assignment parser but the traversal parser then rejected the node id sitting
+/// in its capabilities slot ("unknown role capability <node-id>"). The spelling
+/// both accept is the project convention every other lab writer already uses
+/// (`vm_lab/mod.rs`, `live_linux_exit_handoff_test`, `live_linux_two_hop_test`,
+/// `live_linux_lan_toggle_test`): `node|endpoint|key|caps||||caps`, i.e. the
+/// capabilities in BOTH slots; hostname/os/tags stay empty so they default to the
+/// node id / `linux` / none. (The assignment parser therefore records the
+/// capability text as the node's owner label, as it already does for those
+/// writers.) Entries without capabilities are left untouched (both parsers
+/// default them to `[client]`). Capability tokens go through the closed
+/// `RoleCapability` parser and are written canonically; other arities, unknown
+/// tokens or an empty spec are errors, never silent defaults.
 pub fn refresh_nodes_spec(generic: &str) -> Result<String, String> {
     let mut entries = Vec::new();
     for entry in generic.split(';').filter(|entry| !entry.is_empty()) {
@@ -501,10 +512,8 @@ pub fn refresh_nodes_spec(generic: &str) -> Result<String, String> {
                 if parsed.is_empty() {
                     entries.push(format!("{id}|{endpoint}|{key}"));
                 } else {
-                    entries.push(format!(
-                        "{id}|{endpoint}|{key}|{id}|{id}|linux||{}",
-                        rustynet_control::roles::role_capability_csv(&parsed)
-                    ));
+                    let caps = rustynet_control::roles::role_capability_csv(&parsed);
+                    entries.push(format!("{id}|{endpoint}|{key}|{caps}||||{caps}"));
                 }
             }
             other => {
@@ -1544,7 +1553,7 @@ mod tests {
 
     /// The refresher must see the node's capabilities in ITS field position.
     #[test]
-    fn refresh_spec_moves_capabilities_to_the_refresh_parsers_last_field() {
+    fn refresh_spec_carries_capabilities_in_both_parsers_slots() {
         let generic = format!(
             "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|anchor,exit_server;\
              katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
@@ -1552,8 +1561,8 @@ mod tests {
         assert_eq!(
             refresh_nodes_spec(&generic).expect("convert"),
             format!(
-                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|katana-exit-1-bootstrap|\
-                 katana-exit-1-bootstrap|linux||anchor,exit_server;\
+                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|anchor,exit_server||||\
+                 anchor,exit_server;\
                  katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
             )
         );
@@ -1564,7 +1573,7 @@ mod tests {
         let spec = |tail: &str| format!("n1|192.0.2.1:51820|{EXIT_PUB}{tail}");
         let converted = refresh_nodes_spec(&spec("|exit_server,client")).expect("convert");
         assert!(
-            converted.ends_with("|linux||client,exit_server"),
+            converted.ends_with("|client,exit_server||||client,exit_server"),
             "{converted}"
         );
         assert_eq!(
@@ -1580,17 +1589,23 @@ mod tests {
         assert!(refresh_nodes_spec(";").is_err());
     }
 
-    /// The refresh env a scenario installs must carry the refresh grammar.
+    /// The refresh env a scenario installs must carry the dual-slot spelling.
     #[test]
-    fn assignment_refresh_env_uses_the_refresh_grammar() {
+    fn assignment_refresh_env_uses_the_dual_slot_spelling() {
         let generic =
             format!("katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|anchor,exit_server");
         let env = super::assignment_refresh_env("katana-exit-1-bootstrap", &generic, "a|b", None)
             .expect("env")
             .render();
-        assert!(env.contains("|linux||anchor,exit_server"), "{env}");
         assert!(
-            !env.contains(&format!("{EXIT_PUB}|anchor,exit_server")),
+            env.contains("|anchor,exit_server||||anchor,exit_server"),
+            "{env}"
+        );
+        // Exactly the capabilities-in-both-slots entry, nothing after it.
+        assert!(
+            env.contains(&format!(
+                "{EXIT_PUB}|anchor,exit_server||||anchor,exit_server\"\n"
+            )),
             "{env}"
         );
     }

@@ -27171,6 +27171,96 @@ mod tests {
         assert!(!cleared.contains("RUSTYNET_ASSIGNMENT_LAN_BLOCK_ROUTES="));
     }
 
+    /// ONE `RUSTYNET_ASSIGNMENT_NODES` string is read by BOTH parsers inside
+    /// `ops refresh-assignment`. The scenario writer's spelling must survive both:
+    /// the assignment re-issue keeps the node's capabilities (a missing `anchor`
+    /// is the katana-xnet-69 failure) and the traversal re-sign still gets
+    /// node/endpoint/key and rejects nothing (katana-xnet-71 failure: the node id
+    /// landed in its capabilities slot).
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn one_refresh_nodes_string_satisfies_both_refresh_parsers() {
+        use rustynet_control::roles::RoleCapability;
+        const EXIT_KEY: &str = "a027ba9bddef7d18ac62b75cdeadfefa78a9594425b82c3257db1ec7a837ba44";
+        const CLIENT_KEY: &str = "c4eace2659e82189b72a7171385ed48b787ecb3e4a5930c14c867bbe04506240";
+        let issuer_spelling = format!(
+            "exit-1|192.168.123.222:51820|{EXIT_KEY}|exit_server,anchor;\
+             client-1|192.168.122.45:51820|{CLIENT_KEY}"
+        );
+        let nodes = super::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::refresh_nodes_spec(
+            &issuer_spelling,
+        )
+        .expect("scenario refresh spelling");
+
+        // Consumer 1: assignment re-issue (`parse_assignment_nodes`).
+        let assignment = super::parse_assignment_nodes(&nodes).expect("assignment parser");
+        assert_eq!(assignment.len(), 2);
+        let exit = &assignment[0];
+        assert_eq!(exit.node_id, "exit-1");
+        assert_eq!(exit.endpoint, "192.168.123.222:51820");
+        assert_eq!(exit.os, "linux");
+        assert_eq!(exit.hostname, "exit-1");
+        assert!(exit.tags.is_empty());
+        assert_eq!(
+            exit.capabilities,
+            vec![RoleCapability::Anchor, RoleCapability::ExitServer]
+        );
+        // The convention records the capability text as the owner label.
+        assert_eq!(exit.owner, "anchor,exit_server");
+        let client = &assignment[1];
+        assert_eq!(client.capabilities, vec![RoleCapability::Client]);
+        assert_eq!(client.owner, "client-1");
+        // ... and the whole refresh preflight accepts it, including the
+        // exit-provider check that needs exit_server on the exit.
+        let allow =
+            super::parse_assignment_allow_pairs("client-1|exit-1;exit-1|client-1").expect("allow");
+        super::validate_assignment_issue_config(&assignment, &allow, "client-1", Some("exit-1"))
+            .expect("client may exit via the exit: exit_server survived the refresh spelling");
+        super::validate_assignment_issue_config(&assignment, &allow, "exit-1", None)
+            .expect("exit target");
+
+        // Consumer 2: traversal re-sign (`local_traversal_refresh_env_body` ->
+        // issuer parser). The body is validated exactly as the service does.
+        let env_body = super::local_traversal_refresh_env_body(
+            "client-1",
+            &nodes,
+            "client-1|exit-1;exit-1|client-1",
+        )
+        .expect("traversal refresh env body");
+        let nodes_line = env_body
+            .lines()
+            .find_map(|line| line.strip_prefix("NODES_SPEC=\""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("NODES_SPEC line");
+        let traversal = super::ops_e2e::parse_generic_nodes_for_tests(nodes_line)
+            .expect("traversal issuer parser must accept the same string");
+        assert_eq!(traversal.len(), 2);
+        assert_eq!(traversal[0].0, "exit-1");
+        assert_eq!(traversal[0].1, "192.168.123.222:51820");
+        assert_eq!(hex_of(&traversal[0].2), EXIT_KEY);
+        assert_eq!(
+            traversal[0].3,
+            Some(vec![RoleCapability::Anchor, RoleCapability::ExitServer])
+        );
+        assert_eq!(traversal[1].0, "client-1");
+        assert_eq!(hex_of(&traversal[1].2), CLIENT_KEY);
+        assert_eq!(traversal[1].3, None);
+
+        // The previous spellings must stay rejected by the consumer they break.
+        let issuer_only = format!("exit-1|192.168.123.222:51820|{EXIT_KEY}|anchor,exit_server");
+        let lost = super::parse_assignment_nodes(&issuer_only).expect("parses, but loses caps");
+        assert_eq!(lost[0].capabilities, vec![RoleCapability::Client]);
+        let node_id_in_caps = format!(
+            "exit-1|192.168.123.222:51820|{EXIT_KEY}|exit-1|exit-1|linux||anchor,exit_server"
+        );
+        assert!(super::ops_e2e::parse_generic_nodes_for_tests(&node_id_in_caps).is_err());
+    }
+
+    #[cfg(feature = "vm-lab")]
+    fn hex_of(bytes: &[u8; 32]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     #[test]
     fn local_traversal_refresh_config_uses_assignment_env_specs() {
         let env = concat!(

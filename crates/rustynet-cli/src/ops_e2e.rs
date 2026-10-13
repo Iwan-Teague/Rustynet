@@ -5489,6 +5489,31 @@ fn parse_generic_nodes(encoded: &str) -> Result<Vec<GenericTraversalNodeSpec>, S
     Ok(nodes)
 }
 
+/// `(node_id, endpoint, public_key, capabilities)` of one parsed issuer-grammar node.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) type ParsedGenericNodeForTests = (String, String, [u8; 32], Option<Vec<RoleCapability>>);
+
+/// Test seam for the cross-consumer refresh-spec test in `main.rs`: the issuer
+/// grammar parser's result as plain values.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn parse_generic_nodes_for_tests(
+    encoded: &str,
+) -> Result<Vec<ParsedGenericNodeForTests>, String> {
+    Ok(parse_generic_nodes(encoded)?
+        .into_iter()
+        .map(|node| {
+            (
+                node.node_id,
+                node.endpoint,
+                node.public_key,
+                node.capabilities,
+            )
+        })
+        .collect())
+}
+
 fn parse_generic_allow_specs(encoded: &str) -> Result<Vec<GenericTraversalAllowSpec>, String> {
     let mut pairs = Vec::new();
     for entry in encoded.split(';') {
