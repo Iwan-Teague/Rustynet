@@ -8423,6 +8423,23 @@ mod tests {
         assert!(body.contains("RUSTYNET_ASSIGNMENT_EXIT_NODE_ID=\"exit-49\""));
     }
 
+    /// HP-3 provisioning finding (key pairing): for one signing secret the
+    /// assignment verifier and the traversal (endpoint-hint) verifier are
+    /// DIFFERENT keys (domain-separated seeds). Relay session tokens are signed
+    /// with the endpoint-hint key, so a relay installed with `assignment.pub`
+    /// (as `deploy_relay_service` does) cannot verify them. The relay must be
+    /// given the traversal verifier; this pins that the two differ, so nobody
+    /// "fixes" the pre-flight by comparing against the assignment key.
+    #[test]
+    fn assignment_and_traversal_verifier_keys_differ_for_one_secret() {
+        let secret = [3u8; 32];
+        assert_ne!(
+            assignment_verifier_key_hex(&secret),
+            traversal_verifier_key_hex(&secret),
+            "assignment and endpoint-hint verifiers must be domain-separated"
+        );
+    }
+
     #[test]
     fn remote_sudo_prompt_is_non_empty() {
         let prompt = REMOTE_SUDO_PROMPT.to_owned();

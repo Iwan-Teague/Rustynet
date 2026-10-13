@@ -14968,6 +14968,153 @@ pub(crate) fn rustynet_status_health(
     Ok(())
 }
 
+/// Where each peer's daemon reads the verifier it checks relay session tokens
+/// (and traversal bundles) against: `RUSTYNET_TRAVERSAL_VERIFIER_KEY` in
+/// `scripts/systemd/rustynetd.service`. The file holds the hex-encoded
+/// endpoint-hint ed25519 public key. Relay session tokens are signed with the
+/// endpoint-hint key (`ControlPlaneCore::issue_relay_session_token`), and the
+/// preissued-spool issuer verifies each spool token against this same file
+/// (`load_relay_client` in `rustynetd/src/daemon.rs`).
+const RELAY_FORWARD_TEST_PEER_VERIFIER_PATH: &str = "/etc/rustynet/traversal.pub";
+/// Where the relay service reads its raw 32-byte token verifier
+/// (`RUSTYNET_RELAY_VERIFIER_KEY`, `scripts/systemd/rustynet-relay.service`).
+const RELAY_FORWARD_TEST_RELAY_VERIFIER_PATH: &str = "/etc/rustynet/relay-verifier.pub";
+
+/// Reads a peer's token verifier key (hex) without echoing anything but the
+/// public key. `tr` strips the trailing newline so the marker line is exact.
+fn build_relay_forward_test_peer_verifier_script() -> String {
+    format!(
+        "key=$(sudo -n cat {RELAY_FORWARD_TEST_PEER_VERIFIER_PATH} 2>/dev/null | tr -d ' \\r\\n'); \
+         if [ -n \"$key\" ]; then echo \"HP3_PEER_VERIFIER_HEX=$key\"; else echo HP3_KEY_UNREADABLE=1; fi"
+    )
+}
+
+/// Reads the relay's installed verifier (raw bytes) as hex via `od`, which is
+/// POSIX coreutils: the guests are not guaranteed to carry `xxd`.
+fn build_relay_forward_test_relay_verifier_script() -> String {
+    format!(
+        "key=$(sudo -n od -An -v -tx1 {RELAY_FORWARD_TEST_RELAY_VERIFIER_PATH} 2>/dev/null | tr -d ' \\r\\n'); \
+         if [ -n \"$key\" ]; then echo \"HP3_RELAY_VERIFIER_HEX=$key\"; else echo HP3_KEY_UNREADABLE=1; fi"
+    )
+}
+
+/// Pulls `marker=<value>` out of a script's output (first matching line).
+fn relay_forward_test_marker_value<'a>(output: &'a str, marker: &str) -> Option<&'a str> {
+    let prefix = format!("{marker}=");
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+}
+
+/// Validates a 32-byte ed25519 public key in hex (64 hex digits) and returns it
+/// lowercased. Fail closed on any other shape: a truncated or non-hex read must
+/// never compare equal to anything.
+fn normalize_relay_forward_test_key_hex(raw: &str, what: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.len() != 64 || !trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{what} is not a 32-byte ed25519 public key in hex (got {} characters)",
+            trimmed.len()
+        ));
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// HP-3 key-pairing verdict. The relay can only admit a session token the
+/// peers can also verify, so three keys must be ONE key: the sender's and the
+/// receiver's traversal verifier (the key that verifies their bundles and
+/// spooled tokens) and the relay's installed verifier. A mismatch means every
+/// token would be rejected by the relay, so the stage fails before it mutates
+/// anything. PUBLIC keys only; the summary carries a 16-hex-digit fingerprint.
+/// Never re-issue under a different key to make this pass.
+pub(crate) fn relay_verifier_pairing_verdict(
+    sender_peer_hex: &str,
+    receiver_peer_hex: &str,
+    relay_hex: &str,
+) -> Result<String, String> {
+    let sender =
+        normalize_relay_forward_test_key_hex(sender_peer_hex, "sender traversal verifier")?;
+    let receiver =
+        normalize_relay_forward_test_key_hex(receiver_peer_hex, "receiver traversal verifier")?;
+    let relay = normalize_relay_forward_test_key_hex(relay_hex, "relay verifier key")?;
+    if sender != receiver {
+        return Err(format!(
+            "the two peers hold different traversal verifier keys (sender {}, receiver {}); \
+             one token cannot be verified by both",
+            &sender[..16],
+            &receiver[..16]
+        ));
+    }
+    if relay != sender {
+        return Err(format!(
+            "the relay's installed verifier key ({}) is not the peers' traversal verifier key ({}); \
+             the relay would reject every relay session token the peers present",
+            &relay[..16],
+            &sender[..16]
+        ));
+    }
+    Ok(format!(
+        "relay verifier key == peers' traversal verifier key (fingerprint {})",
+        &relay[..16]
+    ))
+}
+
+/// Reads the three verifier keys over SSH and applies
+/// [`relay_verifier_pairing_verdict`]. Read-only: nothing on any host changes.
+fn relay_forward_test_key_pairing_preflight(
+    relay_target: &RemoteTarget,
+    sender_target: &RemoteTarget,
+    receiver_target: &RemoteTarget,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let read_key = |target: &RemoteTarget,
+                    script: String,
+                    marker: &str,
+                    label: &str|
+     -> Result<String, String> {
+        let output = run_relay_forward_test_script(
+            target,
+            ssh_identity_file,
+            known_hosts_path,
+            script.as_str(),
+            label,
+        )?;
+        relay_forward_test_marker_value(output.as_str(), marker)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "could not read the verifier key on {} ({label}); a missing or unreadable key \
+                     fails closed",
+                    target.label
+                )
+            })
+    };
+    let sender_hex = read_key(
+        sender_target,
+        build_relay_forward_test_peer_verifier_script(),
+        "HP3_PEER_VERIFIER_HEX",
+        "peer verifier key (sender)",
+    )?;
+    let receiver_hex = read_key(
+        receiver_target,
+        build_relay_forward_test_peer_verifier_script(),
+        "HP3_PEER_VERIFIER_HEX",
+        "peer verifier key (receiver)",
+    )?;
+    let relay_hex = read_key(
+        relay_target,
+        build_relay_forward_test_relay_verifier_script(),
+        "HP3_RELAY_VERIFIER_HEX",
+        "relay verifier key",
+    )?;
+    relay_verifier_pairing_verdict(
+        sender_hex.as_str(),
+        receiver_hex.as_str(),
+        relay_hex.as_str(),
+    )
+}
+
 /// True if `capture_text` (a `tcpdump -A` ASCII capture) contains the
 /// plaintext marker anywhere. Used as the ciphertext-only negative
 /// assertion: this MUST be false for the stage to pass.
@@ -15317,6 +15464,20 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         }
     }
 
+    // Key-pairing pre-flight (HP-3 provisioning design, patch 1). Read-only and
+    // before any mutation: the relay verifies relay session tokens with the key
+    // in `relay-verifier.pub`, the peers verify the same tokens with
+    // `traversal.pub`. If those are not ONE key no token can ever work, so fail
+    // here with both fingerprints instead of timing out 90 s later.
+    let key_pairing_summary = relay_forward_test_key_pairing_preflight(
+        relay_target,
+        sender_target,
+        receiver_target,
+        ssh_identity_file,
+        known_hosts_path,
+    )
+    .map_err(|err| format!("pre-flight: key pairing: {err}"))?;
+
     // 1. Ensure the relay is provisioned with a routable bind and running.
     // No cleanup is needed for this step regardless of outcome: widening the
     // relay's bind is durable infrastructure setup, not test-scoped state, so
@@ -15524,7 +15685,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         }
 
         Ok(format!(
-            "relay forwarding proof passed (chain invoked against {relay_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
+            "relay forwarding proof passed (chain invoked against {relay_alias}): relay={} sender={} receiver={}; frames {frames_before}->{frames_after}; bytes {bytes_before}->{bytes_after}; ciphertext-only: marker absent from relay capture; key pairing: {key_pairing_summary}; sender status confirmed relay-routed ({sender_status_field:?}); receiver status confirmed relay-routed ({receiver_status_field:?})",
             relay_target.label,
             sender_target.label,
             receiver_target.label,
@@ -51061,6 +51222,121 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(script.contains("RUSTYNET_RELAY_PORT_RANGE=40000-49999"));
         assert!(script.contains("RUSTYNET_RELAY_HEALTH_BIND=127.0.0.1:4501"));
         assert!(script.contains("install-systemd-relay"));
+    }
+
+    const HP3_KEY_A: &str = "6de3f8ac16da4a256943c79868453734958718dbff06224785b443ed218a2401";
+    const HP3_KEY_B: &str = "39bed1c58c6a91b934fca46426f7f60e3fe2bd4ae8054ccf7f04580456651d2d";
+
+    #[test]
+    fn relay_verifier_pairing_accepts_one_key_everywhere_case_insensitively() {
+        let summary = super::relay_verifier_pairing_verdict(
+            HP3_KEY_A,
+            &HP3_KEY_A.to_ascii_uppercase(),
+            &format!("{HP3_KEY_A}\n"),
+        )
+        .expect("one key on all three hosts must pair");
+        assert!(summary.contains(&HP3_KEY_A[..16]), "{summary}");
+        assert!(
+            !summary.contains(HP3_KEY_A),
+            "the summary must carry a fingerprint, not the whole key: {summary}"
+        );
+    }
+
+    #[test]
+    fn relay_verifier_pairing_rejects_a_relay_key_the_peers_do_not_use() {
+        // The live defect this pre-flight exists for: deploy_relay_service
+        // installs assignment.pub, the peers verify with traversal.pub.
+        let err = super::relay_verifier_pairing_verdict(HP3_KEY_A, HP3_KEY_A, HP3_KEY_B)
+            .expect_err("a relay verifier that is not the peers' key must fail");
+        assert!(err.contains(&HP3_KEY_B[..16]), "{err}");
+        assert!(err.contains(&HP3_KEY_A[..16]), "{err}");
+        assert!(err.contains("reject"), "{err}");
+    }
+
+    #[test]
+    fn relay_verifier_pairing_rejects_peers_with_different_keys() {
+        let err = super::relay_verifier_pairing_verdict(HP3_KEY_A, HP3_KEY_B, HP3_KEY_A)
+            .expect_err("peers that disagree cannot share one token");
+        assert!(err.contains("different traversal verifier keys"), "{err}");
+    }
+
+    #[test]
+    fn relay_verifier_pairing_fails_closed_on_malformed_keys() {
+        for bad in [
+            "",
+            "abcd",
+            &HP3_KEY_A[..63],
+            &format!("{HP3_KEY_A}00"),
+            &format!("{}zz", &HP3_KEY_A[..62]),
+        ] {
+            assert!(
+                super::relay_verifier_pairing_verdict(bad, HP3_KEY_A, HP3_KEY_A).is_err(),
+                "sender {bad:?}"
+            );
+            assert!(
+                super::relay_verifier_pairing_verdict(HP3_KEY_A, bad, HP3_KEY_A).is_err(),
+                "receiver {bad:?}"
+            );
+            assert!(
+                super::relay_verifier_pairing_verdict(HP3_KEY_A, HP3_KEY_A, bad).is_err(),
+                "relay {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_forward_test_key_read_scripts_read_only_the_public_verifiers() {
+        let peer = super::build_relay_forward_test_peer_verifier_script();
+        assert!(
+            peer.contains("sudo -n cat /etc/rustynet/traversal.pub"),
+            "{peer}"
+        );
+        assert!(peer.contains("HP3_PEER_VERIFIER_HEX="), "{peer}");
+        let relay = super::build_relay_forward_test_relay_verifier_script();
+        assert!(
+            relay.contains("sudo -n od -An -v -tx1 /etc/rustynet/relay-verifier.pub"),
+            "{relay}"
+        );
+        assert!(relay.contains("HP3_RELAY_VERIFIER_HEX="), "{relay}");
+        for script in [&peer, &relay] {
+            assert!(!script.contains("xxd"), "guests need no xxd: {script}");
+            assert!(
+                !script.contains("signing"),
+                "the pre-flight must never touch signing material: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_forward_test_marker_value_reads_the_first_matching_line() {
+        let out = "noise\nHP3_PEER_VERIFIER_HEX=abc\nHP3_PEER_VERIFIER_HEX=def\n";
+        assert_eq!(
+            super::relay_forward_test_marker_value(out, "HP3_PEER_VERIFIER_HEX"),
+            Some("abc")
+        );
+        assert_eq!(
+            super::relay_forward_test_marker_value("HP3_KEY_UNREADABLE=1", "HP3_PEER_VERIFIER_HEX"),
+            None
+        );
+    }
+
+    #[test]
+    fn key_pairing_preflight_runs_before_any_relay_mutation() {
+        // The pre-flight is read-only and must precede relay provisioning (and
+        // therefore the nft block and daemon restarts that need cleanup).
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let fn_start = source
+            .find("pub(crate) fn exercise_linux_relay_forwards_frame(")
+            .expect("exercise fn present");
+        let body = &source[fn_start..];
+        let preflight = body
+            .find("relay_forward_test_key_pairing_preflight(")
+            .expect("key pairing pre-flight must be wired in");
+        let provision = body
+            .find("build_relay_forward_test_provision_script(")
+            .expect("provisioning present");
+        assert!(preflight < provision, "pre-flight must come first");
     }
 
     #[test]
