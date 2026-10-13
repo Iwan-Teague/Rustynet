@@ -1165,12 +1165,8 @@ mod tests {
     #[test]
     fn missing_source_archive_is_rejected() {
         let report = tmpdir("missing");
-        let seam_err = LabManifestSeam::run_with_arch(
-            &report,
-            &report.join("nope.tar.gz"),
-            &[],
-            "aarch64",
-        );
+        let seam_err =
+            LabManifestSeam::run_with_arch(&report, &report.join("nope.tar.gz"), &[], "aarch64");
         assert!(seam_err.is_err());
         std::fs::remove_dir_all(&report).unwrap();
     }
