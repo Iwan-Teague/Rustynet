@@ -405,6 +405,91 @@ mod tests {
         );
     }
 
+    /// The exact Linux argv the poll issues through `run_daemon_status_sudoed`
+    /// (blind_exit.rs:77): the sudo-wrapped daemon status seam — the
+    /// root-owned 0600 socket is unreachable unsudoed on Linux guests.
+    fn sudoed_status_argv() -> Vec<&'static str> {
+        vec![
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "/usr/local/bin/rustynet",
+            "status",
+        ]
+    }
+
+    fn poll_body(body: &str) -> RemoteExitStatus {
+        RemoteExitStatus {
+            code: 0,
+            stdout: body.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    /// Mutation witness (review M4) at the POLL SITE: `poll_daemon_node_role`
+    /// must judge the header role only. A roleless header followed by an
+    /// INDENTED peers block that carries the expected role must never satisfy
+    /// the poll: the bounded window has to close with the named failure
+    /// (which echoes the status body so a timeout is diagnosable) instead of
+    /// adopting the peer's role.
+    #[test]
+    fn poll_site_ignores_indented_peer_role_when_header_has_none() {
+        let status = "node_id=self-1 state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=exit state=ExitActive\n";
+        let shell = MockShellHost::new();
+        shell.program_default_run_response(poll_body(status));
+        let err = poll_daemon_node_role(&shell, VmGuestPlatform::Linux, "exit", "witness")
+            .expect_err("an indented peer's node_role must never satisfy the role poll");
+        assert!(
+            err.contains("does not report node_role=exit"),
+            "failure must name the expected role: {err}"
+        );
+        assert!(
+            err.contains("node_id=self-1"),
+            "failure must echo the status body: {err}"
+        );
+    }
+
+    /// The poll-site comparison is EXACT: a header that reports a different
+    /// role must not satisfy the poll even though a header role is present.
+    #[test]
+    fn poll_site_requires_exact_expected_header_role() {
+        let status = "node_id=self-1 node_role=client state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=exit state=ExitActive\n";
+        let shell = MockShellHost::new();
+        shell.program_default_run_response(poll_body(status));
+        let err = poll_daemon_node_role(&shell, VmGuestPlatform::Linux, "exit", "witness")
+            .expect_err("a wrong header role must never satisfy the role poll");
+        assert!(err.contains("does not report node_role=exit"), "{err}");
+    }
+
+    /// The success path at the poll site: a header that already carries the
+    /// expected role satisfies the poll on the FIRST sample — no retry may
+    /// burn the delay budget — through the sudo-wrapped seam, and the
+    /// indented peers block is ignored even on success.
+    #[test]
+    fn poll_site_accepts_header_role_without_retrying() {
+        let status = "node_id=self-1 node_role=exit state=ExitActive\n\
+                      peers:\n  node_id=peer-1 node_role=client state=Ready\n";
+        let shell = MockShellHost::new();
+        shell.program_default_run_response(poll_body(status));
+        poll_daemon_node_role(&shell, VmGuestPlatform::Linux, "exit", "witness")
+            .expect("a header carrying the expected role must satisfy the poll");
+        let log = shell.run_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "the first satisfying sample must end the poll"
+        );
+        let argv: Vec<&str> = log[0].argv.iter().map(String::as_str).collect();
+        assert_eq!(
+            argv,
+            sudoed_status_argv(),
+            "the poll must use the sudo-wrapped seam"
+        );
+    }
+
     fn program_status(shell: &MockShellHost, role_line: &str, code: i32) {
         // Register the status response under every per-OS program name so the
         // helper stays platform-agnostic — validate_blind_exit_runtime resolves

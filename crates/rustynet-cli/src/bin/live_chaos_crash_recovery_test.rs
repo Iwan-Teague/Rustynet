@@ -2587,6 +2587,78 @@ mod tests {
         );
     }
 
+    /// Mutation witness (review F2): the guest grades mesh convergence with
+    /// the REMOTE script's status-half awk, not with the Rust
+    /// `status_field`, so the awk `val()` must carry the same first-match
+    /// contract on duplicate keys — the lowered duplicate decides wherever
+    /// it sits — and the key must be compared whole. Executes the extracted
+    /// program with the host awk (POSIX awk; the guest awk families are
+    /// broader, not narrower).
+    #[test]
+    fn status_half_awk_resolves_duplicate_keys_first_match() {
+        let script = render_remote_crash_script(
+            &parse(&["--dry-run"]).expect("dry-run config should parse"),
+        );
+        let program = extract_status_half_awk(&script);
+        let grade = |input: &str| -> String {
+            use std::io::Write as _;
+            use std::process::{Command, Stdio};
+            let mut child = Command::new("awk")
+                .arg("-v")
+                .arg(format!("now={POLL_NOW_UNIX}"))
+                .arg("-v")
+                .arg(format!("start={RECOVERY_START_UNIX}"))
+                .arg(&program)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("host awk must be able to run the status-half evaluator");
+            child
+                .stdin
+                .as_mut()
+                .expect("awk stdin")
+                .write_all(input.as_bytes())
+                .expect("write the status line into awk");
+            let out = child.wait_with_output().expect("wait for awk");
+            assert!(
+                out.status.success(),
+                "awk exited {:?}: {}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        // Baseline: the healthy line grades true through the real evaluator.
+        assert_eq!(grade(&healthy_status_line()), "true");
+        // First match wins: the lowered duplicate decides wherever it sits.
+        let lowered_then_healthy = format!("path_live_peer_count=0 {}", healthy_status_line());
+        assert_eq!(grade(&lowered_then_healthy), "false");
+        let healthy_then_lowered = format!("{} path_live_peer_count=0", healthy_status_line());
+        assert_eq!(grade(&healthy_then_lowered), "true");
+        // The key is compared whole: a near-miss key must not be read as the
+        // live count even when it sits first carrying a zero.
+        let near_miss_then_healthy = format!("path_live_peer_countx=0 {}", healthy_status_line());
+        assert_eq!(grade(&near_miss_then_healthy), "true");
+    }
+
+    /// Extracts the status-half awk program (the single-quoted program after
+    /// `awk -v now=`) from the rendered remote crash script so the witness
+    /// above executes the exact evaluator the guest runs.
+    fn extract_status_half_awk(script: &str) -> String {
+        let marker = r#"status_half="$(printf '%s\n' "$mesh_status_line" | awk -v now="$poll_now_unix" -v start="$start_unix" '"#;
+        let start = script
+            .find(marker)
+            .expect("status_half awk marker missing from the rendered script")
+            + marker.len();
+        let rest = &script[start..];
+        let end = rest
+            .find('\'')
+            .expect("status_half awk program terminator missing");
+        rest[..end].to_string()
+    }
+
     #[test]
     fn status_field_first_match_wins_on_duplicate_keys() {
         // D4: pin the first-match semantics — a duplicate key must not
