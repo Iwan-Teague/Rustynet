@@ -22,8 +22,9 @@
 //! daemon starts.  This table survives daemon teardown because
 //! `disconnect-cleanup` only removes the daemon's generation-rotated
 //! `rustynet_g<N>` tables; `rustynet_boot` is left intact until the
-//! next ExecStartPre reinstalls it (idempotent) or a manual `nft delete
-//! table inet rustynet_boot` removes it.
+//! next ExecStartPre reinstalls it in place (idempotent `add` +
+//! flush-under-policy-drop, so the filter window is never opened) or a
+//! manual `nft delete table inet rustynet_boot` removes it.
 //!
 //! The purpose is to provide an SSH recovery path when the daemon fails
 //! to start or is in fail-closed mode.  If `RUSTYNET_FAIL_CLOSED_SSH_ALLOW`
@@ -208,9 +209,12 @@ impl BootTraversalEndpoint {
 }
 
 /// Install a minimal pre-protective boot-time killswitch table
-/// (`inet rustynet_boot`) before the daemon starts.  The table is
-/// always deleted and recreated so each ExecStartPre call is
-/// idempotent.
+/// (`inet rustynet_boot`) before the daemon starts.  The install is
+/// in-place and idempotent: the table and base chain are re-asserted
+/// with `add` (never deleted), the chain is flushed while its
+/// `policy drop` is already in force, and only then are the accept
+/// rules re-added.  At no point is an ExecStartPre call left without
+/// an output filter (fail closed).
 ///
 /// The table installs:
 /// - loopback accept
@@ -299,8 +303,10 @@ pub fn install_linux_boot_killswitch(
     )
 }
 
-/// The boot chain's rules as an ordered nft argv sequence, WITHOUT the table
-/// create/chain-add statements. Every rule body is byte-identical to the
+/// The boot chain's rules as an ordered nft argv sequence, WITHOUT the
+/// install prelude (the table add / policy-drop chain add / chain flush;
+/// see `boot_killswitch_install_prelude`). Every rule body is
+/// byte-identical to the
 /// previous exec-as-you-build implementation; the ONLY reason this is a pure
 /// builder now is that the substrate-transit install must splice the transit
 /// rules into the MIDDLE of the sequence instead of appending them (see
@@ -413,10 +419,174 @@ fn boot_killswitch_rule_argvs(
     rules
 }
 
-/// Linux-only executor for the ordered boot argv sequence: recreate the boot
-/// table, add the base chain, then exec each rule argv in order. Any nft
-/// failure aborts the install (fail closed), exactly like the previous
-/// exec-as-you-build path.
+/// The install prelude as an ordered nft argv sequence, BEFORE any rule:
+/// [1] idempotent `add table` (creates the table if absent, no-op if
+/// present), [2] idempotent `add chain` that re-asserts the output hook
+/// with `policy drop` (an existing chain with different attributes makes
+/// this step fail -> abort), [3] `flush chain` executed while the policy
+/// drop is already in force, so the chain drops everything until the
+/// accept rules are re-added.  The replacement is therefore fail closed:
+/// there is no moment without an output filter, and the install path
+/// never contains a `delete` step.
+///
+/// Cross-platform on purpose: the prelude tests pin this sequence on
+/// every OS, while the nft exec that consumes it is Linux-only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn boot_killswitch_install_prelude() -> Vec<Vec<String>> {
+    fn owned(argv: &[&str]) -> Vec<String> {
+        argv.iter().map(|s| (*s).to_owned()).collect()
+    }
+    vec![
+        owned(&["add", "table", "inet", BOOT_KILLSWITCH_TABLE]),
+        owned(&[
+            "add",
+            "chain",
+            "inet",
+            BOOT_KILLSWITCH_TABLE,
+            "killswitch",
+            "{",
+            "type",
+            "filter",
+            "hook",
+            "output",
+            "priority",
+            "0",
+            ";",
+            "policy",
+            "drop",
+            ";",
+            "}",
+        ]),
+        owned(&[
+            "flush",
+            "chain",
+            "inet",
+            BOOT_KILLSWITCH_TABLE,
+            "killswitch",
+        ]),
+    ]
+}
+
+/// The full ordered install sequence: prelude first, then the chain
+/// rules.  Composing here (instead of interleaving) keeps a single
+/// hardened path: rules can never run before the policy-drop chain is
+/// in place, and the whole list is replayable by the injectable
+/// executor below.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn boot_killswitch_full_install_argv_sequence(rule_argvs: &[Vec<String>]) -> Vec<Vec<String>> {
+    let mut full = boot_killswitch_install_prelude();
+    full.extend(rule_argvs.iter().cloned());
+    full
+}
+
+/// The destructive nft verbs the boot install guard refuses.  The delete
+/// verb is spelled with `concat!` ON PURPOSE: the source-pin test forbids a
+/// quoted `delete` literal anywhere in the impl (outside comments), and
+/// this constant is a runtime COMPARISON token, not the construction of a
+/// delete argv.  Runtime spelling is what the guard inspects, so a
+/// split-string re-introduction produces the identical token and cannot
+/// bypass it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const NFT_DELETE_VERB: &str = concat!("del", "ete");
+/// See `NFT_DELETE_VERB`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const NFT_DESTROY_VERB: &str = "destroy";
+
+/// Cross-platform runtime guard for the boot install path: decide whether
+/// an nft argv uses a destructive verb that must never run during a boot
+/// install.  The verb is the first token after an optional program token
+/// (`nft` or a path ending in `/nft`) and any leading options.  Refused:
+/// `delete`, `destroy`, and every `flush` target except `chain` (the
+/// install only ever wants `flush chain`; `flush table` / `flush ruleset`
+/// would widen the blast radius beyond the boot chain).  This backs the
+/// source-pin literal grep with a RUNTIME token inspection, so a delete
+/// re-introduced with a split source string cannot bypass it (pinned by
+/// the `boot_install_guard_*` tests).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn nft_argv_is_forbidden(argv: &[String]) -> bool {
+    let mut idx = 0;
+    if matches!(argv.first(), Some(t) if t == "nft" || t.ends_with("/nft")) {
+        idx = 1;
+    }
+    while matches!(argv.get(idx), Some(t) if t.starts_with('-')) {
+        idx += 1;
+    }
+    let verb = argv.get(idx).map(String::as_str);
+    if verb == Some(NFT_DELETE_VERB) || verb == Some(NFT_DESTROY_VERB) {
+        return true;
+    }
+    if verb == Some("flush") {
+        return argv.get(idx + 1).map(String::as_str) != Some("chain");
+    }
+    false
+}
+
+/// Cross-platform executor for the full ordered boot install argv
+/// sequence (prelude + rules): run every argv through the injectable
+/// runner in order.  Before ANY runner invocation each argv passes the
+/// runtime guard `nft_argv_is_forbidden`: a destructive verb aborts the
+/// install with an error naming the offending argv, and the runner is
+/// never invoked for it.  The first runner error then aborts the install
+/// (fail closed): later steps are never attempted, so a half-installed
+/// state always keeps at least the `policy drop` filter.  The runner
+/// decides how argvs are executed (Linux spawns `nft` argv-only; tests
+/// record or fail on demand).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn run_boot_killswitch_argv_sequence<F>(argvs: &[Vec<String>], mut runner: F) -> Result<(), String>
+where
+    F: FnMut(&[String]) -> Result<(), String>,
+{
+    for argv in argvs {
+        if nft_argv_is_forbidden(argv) {
+            return Err(format!(
+                "boot install refused a destructive nft argv: {argv:?}"
+            ));
+        }
+        runner(argv)?;
+    }
+    Ok(())
+}
+
+/// Cross-platform: does this argv target `add chain`?  That is the one
+/// nft step whose failure usually means the existing boot chain has
+/// different attributes than the ones the install re-asserts.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_add_chain_argv(argv: &[String]) -> bool {
+    argv.first().map(String::as_str) == Some("add")
+        && argv.get(1).map(String::as_str) == Some("chain")
+}
+
+/// Cross-platform: the operator-facing remedy attached to an `add chain`
+/// mismatch.  The installer never deletes anything itself; it names the
+/// manual remedy verbatim (the source pin asserts this text stays).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn add_chain_mismatch_remedy(err: &str) -> String {
+    format!(
+        "{err}; the existing boot chain may have different attributes; \
+         fix manually with `nft delete table inet rustynet_boot` and then \
+         restart the unit (the installer itself never deletes the table)"
+    )
+}
+
+/// Cross-platform: the executor's whole per-step error mapping — attach
+/// the remedy ONLY to `add chain` failures and pass every other error
+/// through verbatim.  Hoisted out of the cfg(linux) closure so both
+/// polarities are unit-tested on every OS and the Linux body has no
+/// condition of its own to rot (review R4/M11).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn map_boot_install_step_error(argv: &[String], err: String) -> String {
+    if is_add_chain_argv(argv) {
+        add_chain_mismatch_remedy(&err)
+    } else {
+        err
+    }
+}
+
+/// Linux-only executor for the ordered boot argv sequence: re-assert the
+/// boot table and base chain in place (idempotent `add`), flush the
+/// chain while `policy drop` is in force, then exec each rule argv in
+/// order. Any nft failure aborts the install (fail closed), exactly like
+/// the previous exec-as-you-build path.
 #[cfg(target_os = "linux")]
 fn install_boot_killswitch_rule_sequence(rule_argvs: &[Vec<String>]) -> Result<(), String> {
     // Argv-only helper: no shell construction, args are separate tokens.
@@ -436,36 +606,11 @@ fn install_boot_killswitch_rule_sequence(rule_argvs: &[Vec<String>]) -> Result<(
         Ok(())
     }
 
-    // Always recreate: flush any stale boot table first (ignore if absent).
-    let _ = std::process::Command::new("nft")
-        .args(["delete", "table", "inet", BOOT_KILLSWITCH_TABLE])
-        .output();
-
-    nft(&["add", "table", "inet", BOOT_KILLSWITCH_TABLE])?;
-    nft(&[
-        "add",
-        "chain",
-        "inet",
-        BOOT_KILLSWITCH_TABLE,
-        "killswitch",
-        "{",
-        "type",
-        "filter",
-        "hook",
-        "output",
-        "priority",
-        "0",
-        ";",
-        "policy",
-        "drop",
-        ";",
-        "}",
-    ])?;
-    for argv in rule_argvs {
+    let full = boot_killswitch_full_install_argv_sequence(rule_argvs);
+    run_boot_killswitch_argv_sequence(&full, |argv| {
         let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-        nft(&refs)?;
-    }
-    Ok(())
+        nft(&refs).map_err(|err| map_boot_install_step_error(argv, err))
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -1918,5 +2063,386 @@ table inet rustynetfoo {
             .map(|argv| argv.first().map(String::as_str).unwrap_or(""))
             .collect();
         assert_eq!(flat, ["oifname", "t1", "t2", "ct", "oifname"]);
+    }
+
+    // ---- boot install prelude: in-place, fail-closed replacement -----------
+
+    /// Every optional rule at once: ssh allow + cidrs, wg listen port,
+    /// traversal endpoints. Guards the "no delete anywhere" claim for the
+    /// widest install the builder can produce.
+    fn full_optional_boot_rules() -> Vec<Vec<String>> {
+        let cidrs: Vec<BootSshCidr> = ["192.168.64.0/24", "10.44.0.0/16"]
+            .iter()
+            .map(|c| BootSshCidr::parse(c).expect("valid boot ssh cidr"))
+            .collect();
+        let endpoints: Vec<BootTraversalEndpoint> = ["74.125.250.129:19302", "[2001:db8::1]:19302"]
+            .iter()
+            .map(|a| BootTraversalEndpoint::parse(a).expect("valid traversal endpoint"))
+            .collect();
+        boot_killswitch_rule_argvs("rustynet0", true, &cidrs, Some(51820), &endpoints)
+    }
+
+    #[test]
+    fn boot_install_prelude_is_add_then_policy_drop_chain_then_flush() {
+        let prelude = super::boot_killswitch_install_prelude();
+        assert_eq!(
+            prelude.len(),
+            3,
+            "prelude = add table, add chain, flush chain"
+        );
+
+        // [1] idempotent table add.
+        assert_eq!(
+            prelude[0],
+            [
+                "add".to_owned(),
+                "table".to_owned(),
+                "inet".to_owned(),
+                super::BOOT_KILLSWITCH_TABLE.to_owned()
+            ],
+            "step 1 must add the table in place: {:#?}",
+            prelude[0]
+        );
+
+        // [2] chain add that re-asserts the output hook with policy drop.
+        assert_eq!(
+            &prelude[1][..2],
+            ["add", "chain"],
+            "step 2 must add the chain in place: {:#?}",
+            prelude[1]
+        );
+        assert!(
+            prelude[1].contains(&super::BOOT_KILLSWITCH_TABLE.to_owned())
+                && prelude[1].contains(&"killswitch".to_owned()),
+            "chain add must target the boot killswitch chain: {:#?}",
+            prelude[1]
+        );
+        for token in [
+            "type", "filter", "hook", "output", "priority", "policy", "drop",
+        ] {
+            assert!(
+                prelude[1].iter().any(|t| t == token),
+                "chain add must carry `{token}`: {:#?}",
+                prelude[1]
+            );
+        }
+        // Adjacent-token pins: `priority` must be exactly `0` and `policy`
+        // exactly `drop`, as ADJACENT pairs (a presence check alone let a
+        // `priority 0` -> `priority 10` drift mutant survive every test).
+        for pair in [("priority", "0"), ("policy", "drop")] {
+            assert!(
+                prelude[1]
+                    .windows(2)
+                    .any(|w| w[0] == pair.0 && w[1] == pair.1),
+                "chain add must carry the adjacent pair `{} {}`: {:#?}",
+                pair.0,
+                pair.1,
+                prelude[1]
+            );
+        }
+
+        // [3] flush runs after the policy-drop chain exists.
+        assert_eq!(
+            &prelude[2][..3],
+            ["flush", "chain", "inet"],
+            "step 3 must flush the chain: {:#?}",
+            prelude[2]
+        );
+        assert_eq!(prelude[2][3], super::BOOT_KILLSWITCH_TABLE);
+        assert_eq!(prelude[2][4], "killswitch");
+
+        // No argv anywhere in the full install (prelude + all optional rules)
+        // may contain a delete step.
+        let full = super::boot_killswitch_full_install_argv_sequence(&full_optional_boot_rules());
+        for argv in &full {
+            assert!(
+                !argv.iter().any(|t| t == "delete"),
+                "install path must never delete: {argv:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn boot_install_policy_drop_chain_is_added_before_flush() {
+        let full = super::boot_killswitch_full_install_argv_sequence(&full_optional_boot_rules());
+        let add_chain_at = full
+            .iter()
+            .position(|argv| argv.first().map(String::as_str) == Some("add"))
+            .expect("prelude must add the chain");
+        let flush_at = full
+            .iter()
+            .position(|argv| argv.first().map(String::as_str) == Some("flush"))
+            .expect("prelude must flush the chain");
+        assert!(
+            add_chain_at < flush_at,
+            "the policy-drop chain must exist BEFORE the flush so the flush \
+             happens under drop (fail closed); got add at {add_chain_at}, flush at {flush_at}"
+        );
+    }
+
+    #[test]
+    fn boot_install_executor_composes_prelude_first_then_rules() {
+        let rules = boot_killswitch_rule_argvs("rustynet0", false, &[], Some(51820), &[]);
+        let prelude = super::boot_killswitch_install_prelude();
+        let full = super::boot_killswitch_full_install_argv_sequence(&rules);
+        assert!(
+            full.len() == prelude.len() + rules.len()
+                && full[..prelude.len()] == prelude[..]
+                && full[prelude.len()..] == rules[..],
+            "the full install sequence must be prelude followed by the rules \
+             (prelude can never trail the rules)"
+        );
+    }
+
+    #[test]
+    fn boot_install_executor_runs_every_step_in_order() {
+        let rules = full_optional_boot_rules();
+        let full = super::boot_killswitch_full_install_argv_sequence(&rules);
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        super::run_boot_killswitch_argv_sequence(&full, |argv| {
+            seen.push(argv.to_vec());
+            Ok(())
+        })
+        .expect("recording runner never fails");
+        assert_eq!(seen, full, "executor must replay every argv in order");
+    }
+
+    #[test]
+    fn boot_install_executor_aborts_at_first_failing_step() {
+        let full = super::boot_killswitch_full_install_argv_sequence(&full_optional_boot_rules());
+        for k in 0..full.len() {
+            let mut seen = 0usize;
+            let mut called = 0usize;
+            let err = super::run_boot_killswitch_argv_sequence(&full, |_argv| {
+                called += 1;
+                if seen == k {
+                    Err(format!("injected failure at step {k}"))
+                } else {
+                    seen += 1;
+                    Ok(())
+                }
+            })
+            .expect_err("a failing step must abort the install");
+            assert_eq!(seen, k, "no step after the first failure may run (k={k})");
+            assert_eq!(
+                called,
+                k + 1,
+                "exactly k+1 runner invocations for a failure at step k — a retry \
+                 would invoke the failing step twice (k={k})"
+            );
+            assert_eq!(
+                err,
+                format!("injected failure at step {k}"),
+                "the runner's error must be returned verbatim (k={k})"
+            );
+        }
+        // And no step in the sequence is ever a delete, so the abort can
+        // never leave the table absent.
+        for argv in &full {
+            assert!(
+                !argv.iter().any(|t| t == "delete"),
+                "fail-closed install must never delete: {argv:#?}"
+            );
+        }
+    }
+
+    // ---- R1: the boot install runtime guard ---------------------------------
+
+    #[test]
+    fn boot_install_guard_refuses_destructive_verbs_without_running_them() {
+        let owned =
+            |argv: &[&str]| -> Vec<String> { argv.iter().map(|s| (*s).to_owned()).collect() };
+        // `concat!("del", "ete")` is the review's M9 shape: a split source
+        // string that yields the same whole runtime token.
+        let evil: Vec<Vec<String>> = vec![
+            owned(&["delete", "table", "inet", super::BOOT_KILLSWITCH_TABLE]),
+            owned(&[
+                "delete",
+                "chain",
+                "inet",
+                super::BOOT_KILLSWITCH_TABLE,
+                "killswitch",
+            ]),
+            owned(&["destroy", "table", "inet", super::BOOT_KILLSWITCH_TABLE]),
+            owned(&["flush", "table", "inet", super::BOOT_KILLSWITCH_TABLE]),
+            owned(&["flush", "ruleset"]),
+            owned(&[
+                concat!("del", "ete"),
+                "table",
+                "inet",
+                super::BOOT_KILLSWITCH_TABLE,
+            ]),
+            // The verb is still recognized after a program token + options.
+            owned(&[
+                "nft",
+                "-a",
+                "delete",
+                "table",
+                "inet",
+                super::BOOT_KILLSWITCH_TABLE,
+            ]),
+        ];
+        for argv in &evil {
+            let mut calls = 0usize;
+            let err = super::run_boot_killswitch_argv_sequence(std::slice::from_ref(argv), |_| {
+                calls += 1;
+                Ok(())
+            })
+            .expect_err("the guard must refuse a destructive nft verb");
+            assert_eq!(
+                calls, 0,
+                "the runner must NEVER be invoked for a refused argv: {argv:?}"
+            );
+            for token in argv {
+                assert!(
+                    err.contains(token.as_str()),
+                    "guard error must name the offending argv (missing `{token}`): {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn boot_install_guard_allows_flush_chain_and_real_sequence_unchanged() {
+        let owned =
+            |argv: &[&str]| -> Vec<String> { argv.iter().map(|s| (*s).to_owned()).collect() };
+        // `flush chain` is the only flush shape the install uses and the
+        // only one the guard allows.
+        let flush_chain = owned(&[
+            "flush",
+            "chain",
+            "inet",
+            super::BOOT_KILLSWITCH_TABLE,
+            "killswitch",
+        ]);
+        let mut calls = 0usize;
+        super::run_boot_killswitch_argv_sequence(&[flush_chain], |_| {
+            calls += 1;
+            Ok(())
+        })
+        .expect("`flush chain` must pass the guard");
+        assert_eq!(calls, 1);
+
+        // The real install sequence passes the guard unchanged: every step
+        // reaches the runner, in order, unmodified.
+        let full = super::boot_killswitch_full_install_argv_sequence(&full_optional_boot_rules());
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        super::run_boot_killswitch_argv_sequence(&full, |argv| {
+            seen.push(argv.to_vec());
+            Ok(())
+        })
+        .expect("the real install sequence must pass the guard unchanged");
+        assert_eq!(
+            seen, full,
+            "the guard must not rewrite, reorder or drop any real step"
+        );
+    }
+
+    // ---- R4: the add-chain remedy mapping is cross-platform -----------------
+
+    #[test]
+    fn boot_install_add_chain_remedy_maps_only_add_chain_failures() {
+        let prelude = super::boot_killswitch_install_prelude();
+        let chain_argv = &prelude[1];
+        assert!(
+            super::is_add_chain_argv(chain_argv),
+            "prelude step 2 must be recognized as `add chain`: {chain_argv:?}"
+        );
+
+        // Polarity 1: a failing `add chain` step gains the remedy.
+        let base = "nft add chain failed (exit 1)".to_owned();
+        let mapped = super::map_boot_install_step_error(chain_argv, base.clone());
+        assert_ne!(mapped, base, "an add-chain failure must gain the remedy");
+        assert!(
+            mapped.starts_with(base.as_str())
+                && mapped.contains("`nft delete table inet rustynet_boot`")
+                && mapped.contains("never deletes the table"),
+            "the remedy must keep the original error and name the manual \
+             remedy verbatim: {mapped}"
+        );
+
+        // Polarity 2: every other failing argv passes through verbatim.
+        let flush_argv = &prelude[2];
+        assert!(!super::is_add_chain_argv(flush_argv));
+        assert_eq!(
+            super::map_boot_install_step_error(flush_argv, base.clone()),
+            base,
+            "a non-chain failure must pass through verbatim"
+        );
+        let rule_argvvs =
+            super::boot_killswitch_rule_argvs("rustynet0", false, &[], Some(51820), &[]);
+        let rule_argv = rule_argvvs.first().expect("at least one rule argv");
+        assert!(
+            !super::is_add_chain_argv(rule_argv),
+            "a rule argv is not `add chain`: {rule_argv:?}"
+        );
+        assert_eq!(
+            super::map_boot_install_step_error(rule_argv, base.clone()),
+            base,
+            "a rule failure must pass through verbatim"
+        );
+    }
+
+    /// Source pin: the install path (everything before the test module,
+    /// comments excluded) must not construct a delete argv, the Linux
+    /// executor must keep exactly ONE process spawn (the single argv-only
+    /// `nft` helper — a second spawn could run verbs the runtime guard
+    /// never inspects), and it must route through the prelude-composing
+    /// sequence.  A re-introduced `delete table` step or a bypass of the
+    /// prelude fails this test.  The impl/test split is anchored to the
+    /// real test-module DECLARATION: a `#[cfg(test)]` mention inside a
+    /// comment used to truncate the guarded region silently, and a stray
+    /// occurrence before the declaration now fails loudly instead.
+    #[test]
+    fn boot_install_source_pins_no_delete_and_prelude_composition() {
+        let source = include_str!("linux_killswitch_boot.rs");
+        const TEST_MODULE_DECL: &str = "\n#[cfg(test)]\nmod tests";
+        let split_at = source
+            .find(TEST_MODULE_DECL)
+            .expect("test module declaration must exist");
+        let impl_text = &source[..split_at];
+        assert_eq!(
+            source[..split_at + TEST_MODULE_DECL.len()]
+                .matches("#[cfg(test)]")
+                .count(),
+            1,
+            "the test-module declaration must be the only `#[cfg(test)]` up to \
+             the split (an earlier stray occurrence would have truncated the \
+             guarded region silently)"
+        );
+        for (idx, line) in impl_text.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue; // comments may discuss the manual remedy
+            }
+            assert!(
+                !line.contains("\"delete\""),
+                "install path must never build a delete argv (line {}): {line}",
+                idx + 1
+            );
+        }
+        let executor_text = impl_text
+            .split("fn install_boot_killswitch_rule_sequence")
+            .nth(1)
+            .expect("the Linux executor must exist")
+            .split("\nfn ")
+            .next()
+            .expect("the executor must be followed by a top-level item");
+        assert_eq!(
+            executor_text.matches("Command::new").count(),
+            1,
+            "the install executor must keep exactly one process spawn (the \
+             argv-only `nft` helper); a second spawn could run destructive \
+             verbs the runtime guard never inspects"
+        );
+        assert!(
+            impl_text.contains("boot_killswitch_full_install_argv_sequence(rule_argvs)"),
+            "the Linux executor must compose prelude + rules through the \
+             shared full-sequence builder"
+        );
+        assert!(
+            impl_text.contains("nft delete table inet rustynet_boot"),
+            "the add-chain failure error must name the manual remedy verbatim"
+        );
     }
 }
