@@ -184,8 +184,11 @@ impl OrchestrationStage for LiveLanToggleValidationStage {
                             &ctx.report_dir,
                             self.name(),
                             &format!(
-                                "role_snapshot_reconciled alias={} from={} to={}",
-                                blind_exit_params.alias, previous_role, PROMOTED_BLIND_EXIT_ROLE
+                                "{} alias={} from={} to={}",
+                                ROLE_SNAPSHOT_RECONCILED_LINE_PREFIX,
+                                blind_exit_params.alias,
+                                previous_role,
+                                PROMOTED_BLIND_EXIT_ROLE
                             ),
                         );
                     }
@@ -324,7 +327,13 @@ pub(crate) fn reconcile_promoted_role_snapshot(
 /// exit's entry peer and fails every later handshake-liveness stage
 /// (katana-u37-anchor-b78). Aux/extra nodes carry client-only memberships
 /// and promote cleanly via the blind_exit warn-and-continue path.
-const BLIND_EXIT_CANDIDATE_LABELS: &[&str] = &["aux", "extra"];
+pub(crate) const BLIND_EXIT_CANDIDATE_LABELS: &[&str] = &["aux", "extra"];
+
+/// Prefix of the best-effort evidence line this stage appends to its stage log
+/// after promoting a node's role snapshot; the run-matrix validator parses
+/// these lines back to tolerate the documented aux/extra -> blind_exit
+/// promotion. Shared so the writer and the parser cannot drift apart.
+pub(crate) const ROLE_SNAPSHOT_RECONCILED_LINE_PREFIX: &str = "role_snapshot_reconciled";
 
 fn find_blind_exit(ctx: &OrchestrationContext) -> Result<ResolvedParams, String> {
     for label in BLIND_EXIT_CANDIDATE_LABELS {
@@ -380,7 +389,7 @@ const POSTCONDITION_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// (`live_linux_lan_toggle_test` enforces the blind-exit host into the
 /// `blind_exit` daemon role); the postcondition requires the promoted node
 /// to still hold it after cleanup.
-const PROMOTED_BLIND_EXIT_ROLE: &str = "blind_exit";
+pub(crate) const PROMOTED_BLIND_EXIT_ROLE: &str = "blind_exit";
 
 /// Single evidence lines are capped (the chaos binary's precedent) so a
 /// pathological daemon status cannot flood the stage log.
