@@ -99,6 +99,24 @@ struct AssignmentRefreshConfig<'a> {
     exit_node_id: &'a str,
     client_node_id: &'a str,
     blind_exit_node_id: &'a str,
+    /// When true the CLIENT signs (and installs the verifier key of) its OWN
+    /// assignment instead of receiving the exit-signed one.
+    ///
+    /// `rustynet ops apply-lan-access-coupling` makes the node re-issue its
+    /// assignment with the node-local signing secret (the LAN routes live in
+    /// that re-issued bundle), so the node under test must be its own
+    /// assignment authority while the coupling is exercised. An exit-signed
+    /// `assignment.pub` on the client belongs to ANOTHER authority: the refresh
+    /// service rightly refuses to re-issue (katana-xnet-82 gate), and before
+    /// the coupling learned to respect that it deleted the client's only
+    /// bundle (katana-xnet-149). The exit and the blind-exit keep the
+    /// exit-signed bundles, and `run()` re-installs the client's exit-signed
+    /// pair (`client_self_signed: false`) before the stage ends so later
+    /// stages find the lab's usual authority.
+    client_self_signed: bool,
+    /// Where the client's OWN verifier key is captured when
+    /// `client_self_signed` is set.
+    client_assign_pub_local: &'a Path,
 }
 
 #[derive(Clone, Copy)]
@@ -404,6 +422,7 @@ fn run() -> Result<(), String> {
     issue_assignment_bundles_from_env(&ctx, &exit_host, &issue_env, "/tmp/rn_issue_lan.env")?;
 
     let assign_pub_local = ctx.work_dir.join("assignment.pub");
+    let client_assign_pub_local = ctx.work_dir.join("assignment-client.pub");
     let exit_assignment_local = ctx.work_dir.join("assignment-exit");
     let client_assignment_local = ctx.work_dir.join("assignment-client");
     let blind_exit_assignment_local = ctx.work_dir.join("assignment-blind-exit");
@@ -614,6 +633,11 @@ fn run() -> Result<(), String> {
             exit_node_id: exit_node_id.as_str(),
             client_node_id: client_node_id.as_str(),
             blind_exit_node_id: blind_exit_node_id.as_str(),
+            // The first refresh (below, inside the armed bundle-swap fence)
+            // hands the client its OWN assignment authority for the
+            // LAN-coupling phases; see `AssignmentRefreshConfig`.
+            client_self_signed: true,
+            client_assign_pub_local: client_assign_pub_local.as_path(),
         },
         traversal: traversal_refresh,
         dns: DnsRefreshConfig {
@@ -858,7 +882,18 @@ fn run() -> Result<(), String> {
         )
         .unwrap_or_default();
 
-    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
+    // The client-side LAN-coupling phases are over: hand the client back to
+    // the lab's usual assignment authority (the exit) so the stages after this
+    // one find the exit-signed state they expect. This is the last artifact
+    // refresh, and it sits inside the still-armed bundle-swap fence.
+    let signed_state_refresh_restore = SignedStateRefreshConfig {
+        assignment: AssignmentRefreshConfig {
+            client_self_signed: false,
+            ..signed_state_refresh.assignment
+        },
+        ..signed_state_refresh
+    };
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)?;
     let blind_exit_denied_status =
         if apply_lan_access_expect_denied(&ctx, platform, &blind_exit_host, true, LAN_TEST_CIDR)? {
             "pass"
@@ -1839,6 +1874,33 @@ fn refresh_assignment_bundles(
         ),
         config.blind_exit_assignment_local,
     )?;
+    if config.client_self_signed {
+        // The client signs its OWN assignment (see `AssignmentRefreshConfig::
+        // client_self_signed`): issue on the client with its node-local
+        // signing secret and replace the exit-signed client bundle captured
+        // above, together with the verifier key that goes with it.
+        issue_assignment_bundles_from_env(
+            ctx,
+            config.client_host,
+            config.env_local,
+            "/tmp/rn_issue_lan.env",
+        )?;
+        capture_remote_file(
+            ctx,
+            config.client_host,
+            "/run/rustynet/assignment-issue/rn-assignment.pub",
+            config.client_assign_pub_local,
+        )?;
+        capture_remote_file(
+            ctx,
+            config.client_host,
+            &format!(
+                "/run/rustynet/assignment-issue/rn-assignment-{}.assignment",
+                config.client_node_id
+            ),
+            config.client_assignment_local,
+        )?;
+    }
     install_assignment_bundle(
         ctx,
         config.exit_host,
@@ -1848,7 +1910,11 @@ fn refresh_assignment_bundles(
     install_assignment_bundle(
         ctx,
         config.client_host,
-        config.assign_pub_local,
+        if config.client_self_signed {
+            config.client_assign_pub_local
+        } else {
+            config.assign_pub_local
+        },
         config.client_assignment_local,
     )?;
     install_assignment_bundle(
@@ -2536,6 +2602,84 @@ mod tests {
             last_install < first_enforce,
             "the blind-exit assignment must be installed before enforce_host \
              flips the role, so the daemon first boots already aligned"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_client_signs_its_own_assignment_while_the_coupling_runs() {
+        // katana-xnet-149 root cause: `ops apply-lan-access-coupling` makes the
+        // node re-issue its assignment with the NODE-LOCAL signing secret. With
+        // the exit's verifier key on the client the refresh service refuses to
+        // re-issue (assignment.pub belongs to another authority), so the node
+        // under test must be its own assignment authority while the coupling
+        // runs, and the lab's usual exit-signed pair must be restored before
+        // the stage ends. Parsing this file's own source makes the ordering
+        // claim fail loudly on any regression.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+
+        let config = run_body
+            .find("let signed_state_refresh = SignedStateRefreshConfig {")
+            .expect("run() must build the main signed-state refresh config");
+        let self_signed = config
+            + run_body[config..]
+                .find("client_self_signed: true")
+                .expect("the main refresh config must make the client sign its own assignment");
+        let first_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger")
+            .expect("run() must drive refresh_signed_state_artifacts");
+        let first_coupling = run_body
+            .find("apply_lan_access(")
+            .expect("run() must drive the LAN coupling");
+        assert!(
+            self_signed < first_refresh && first_refresh < first_coupling,
+            "the client must already be self-signed (via the first refresh) when the first \
+             LAN coupling runs"
+        );
+
+        let last_coupling = run_body
+            .rfind("apply_lan_access(")
+            .expect("run() must drive the LAN coupling");
+        let restore_config = run_body
+            .find("client_self_signed: false")
+            .expect("run() must build a restore config that returns the client to the exit");
+        let restore_refresh = run_body
+            .rfind("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)")
+            .expect("run() must refresh with the restore config");
+        let release = run_body
+            .find("bundle_swap_fence.release()")
+            .expect("run() must release the fence on the success path");
+        assert!(
+            last_coupling < restore_config && restore_config < restore_refresh,
+            "the exit-signed client pair is restored only after the last client coupling"
+        );
+        assert!(
+            restore_refresh < release,
+            "the restore must happen inside the armed bundle-swap fence"
+        );
+
+        // The helper issues on the CLIENT (its own signing secret) and installs
+        // the client's OWN verifier key with the client's bundle.
+        let helper_start = source
+            .find("\nfn refresh_assignment_bundles(")
+            .expect("refresh_assignment_bundles must exist");
+        let helper_end = source[helper_start..]
+            .find("\nfn refresh_traversal_bundles(")
+            .map(|offset| helper_start + offset)
+            .expect("refresh_assignment_bundles must end before the traversal refresh");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("if config.client_self_signed {"));
+        assert!(
+            helper.matches("issue_assignment_bundles_from_env(").count() >= 2,
+            "the self-signed branch must issue a second set on the client host"
+        );
+        assert!(
+            helper.contains("config.client_assign_pub_local"),
+            "the client's own verifier key must be captured and installed with its bundle"
         );
     }
 
