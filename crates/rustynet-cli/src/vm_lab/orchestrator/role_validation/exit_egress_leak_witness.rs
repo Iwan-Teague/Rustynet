@@ -538,11 +538,14 @@ fn is_exit_local_addr(addr: &str, local_addrs: &[String], egress_addr: &str) -> 
     addr == egress_addr || addr.starts_with("127.") || local_addrs.iter().any(|a| a == addr)
 }
 
-/// Informational only: the host's DNS-shaped sockets (`ss -tnpH state all
+/// Informational, plus one fail-closed verdict gate: the host's DNS-shaped
+/// sockets (`ss -tnpH state all
 /// '( dport = :53 or dport = :853 )'`, argv-only) — records what the host's
 /// own resolver had in flight (e.g. systemd-resolved SYN-SENT to a public
-/// resolver). Errors are tolerated and recorded; this field never changes
-/// the verdict.
+/// resolver). Errors are tolerated and recorded. The CAPTURE-START snapshot
+/// additionally gates the W1 orphaned-entry relief: an errored or truncated
+/// snapshot keeps every pre-existing entry blocking (fail closed); the
+/// capture-end snapshot stays informational.
 fn gather_dns_sockets(shell: &dyn RemoteShellHost) -> String {
     let argv = [
         "sudo",
@@ -1091,9 +1094,21 @@ pub struct LeakWitnessReport {
     /// Informational (round-3): `sudo -n ss -tnpH state all '( dport = :53
     /// or dport = :853 )'` output at capture start and capture end — the
     /// host's own DNS-shaped sockets (systemd-resolved SYN-SENT etc.).
-    /// Recorded verbatim-but-bounded, NO pass/fail semantics.
+    /// Recorded verbatim-but-bounded. The capture-START snapshot additionally
+    /// gates the W1 orphaned-entry relief (an errored or truncated snapshot
+    /// denies relief, fail closed); the capture-end snapshot has NO
+    /// pass/fail semantics.
     pub capture_start_dns_sockets: String,
     pub capture_end_dns_sockets: String,
+    /// Audit trail for the orphaned-entry relief in
+    /// [`append_capture_start_failures`] (the katana-xnet-190/193 flake): one
+    /// line per pre-existing host-origin tcp/53|853 entry retired from the
+    /// standalone capture-start failure because a USABLE capture-start ss
+    /// snapshot carries NO socket owning its local endpoint and the capture
+    /// itself carries no host-origin tcp/53|853 packet. An entry here never
+    /// downgrades or retires a leak failure — the in-window checks are
+    /// untouched; relief is impossible on any truncated or errored snapshot.
+    pub pre_existing_conn_reliefs: Vec<String>,
     /// W2 order findings that are NON-FATAL (informational): order violations
     /// on accepts that do not carry an explicit
     /// `ct state established[,related] accept` match. Empty on the real
@@ -2625,7 +2640,8 @@ pub fn run_linux_exit_egress_leak_witness(
     // FIN whose 4-tuple matches it is labelled as pre-existing instead of
     // silently attributed to the killswitch.
     let capture_start = gather_capture_start_evidence(&*shell, &killswitch_table);
-    // Informational: the host's own DNS-shaped sockets at window open.
+    // The host's own DNS-shaped sockets at window open: relief evidence for
+    // W1 (see `gather_dns_sockets`), never a standalone failure source.
     let capture_start_dns_sockets = gather_dns_sockets(&*shell);
 
     let mut probe_exit_codes = Vec::new();
@@ -2785,12 +2801,15 @@ pub fn run_linux_exit_egress_leak_witness(
         enabled,
         snapshot_carries_icmp_entries,
     ));
+    let mut pre_existing_conn_reliefs = Vec::new();
     append_capture_start_failures(
         &mut failures,
+        &mut pre_existing_conn_reliefs,
         &capture_start,
         &capture_stdout,
         &egress_addr,
         &scan.forwarded_dns_tcp,
+        &capture_start_dns_sockets,
     );
 
     Ok(LeakWitnessReport {
@@ -2808,6 +2827,7 @@ pub fn run_linux_exit_egress_leak_witness(
         capture_end_conntrack: capture_end.blob,
         capture_start_dns_sockets,
         capture_end_dns_sockets,
+        pre_existing_conn_reliefs,
         dns_rule_order_findings: killswitch_posture.order_findings,
         forwarded_dns_tcp: scan.forwarded_dns_tcp,
         positive_control,
@@ -2826,16 +2846,43 @@ pub fn run_linux_exit_egress_leak_witness(
 ///   an entry whose ORIGINAL source is a foreign address is a masqueraded
 ///   client flow — normal tunneled traffic, never a killswitch concern;
 ///   without local-address ground truth every entry stays a concern);
+/// * ORPHANED-ENTRY RELIEF (katana-xnet-190/193 flake): a host-origin entry
+///   whose owning socket is provably GONE at window open is retired from
+///   that standalone failure. Relief requires ALL of: (a) a
+///   conntrack-or-`/proc` capture-start snapshot that answered every query
+///   (`conntrack_all_answered` — the pure ss fallback path is the SAME
+///   source as the socket listing, so it can never prove orphaning); (b) an
+///   UNTRUNCATED conntrack snapshot (`conntrack_truncated` false — relief
+///   may never reason over evidence that was cut short); (c) a usable
+///   capture-start ss socket snapshot (no recorded exit or transport error,
+///   no truncation); (d) NO host-origin tcp/53|853 packet anywhere in
+///   the capture itself; and (e) KNOWN local addresses (`local_addrs`
+///   non-empty — with an unusable address listing the keep-all host-origin
+///   filter counts possibly-foreign rows, and the ss snapshot only ever
+///   lists exit-netns sockets, so the no-owning-socket proof would be
+///   vacuous for them).
+///   With (c) showing no socket on the entry's local endpoint (any state,
+///   plain or bracketed form) the tracked flow has no host endpoint left to
+///   originate packets — e.g. a resolver socket closed after the killswitch
+///   armed, whose FIN the drop rule ate so conntrack stayed ESTABLISHED —
+///   and the entry cannot shadow the verdict. Every unmet condition keeps
+///   the failure; relief only ever retires the standalone W1 line, never a
+///   leak failure, and each relieved entry is recorded in
+///   `pre_existing_conn_reliefs` for audit;
 /// * a leaked host tcp/53 packet whose 4-tuple matches a pre-existing flow
 ///   relabels that leak failure `egress leak (pre-existing connection): ...`
 ///   — still a failure. Packets already attributed to forwarded client flows
 ///   (W3b) are excluded from the relabel entirely: they are not leaks.
+///   (A relieved entry can never reach the relabel: condition (d) denies
+///   relief whenever any host-origin tcp/53|853 packet exists.)
 fn append_capture_start_failures(
     failures: &mut Vec<String>,
+    relief_notes: &mut Vec<String>,
     evidence: &CaptureStartEvidence,
     capture_stdout: &str,
     egress_addr: &str,
     forwarded_dns_tcp: &[ForwardedDnsPacket],
+    capture_start_dns_sockets: &str,
 ) {
     let host_origin_preexisting: Vec<&PreExistingTcpDnsConn> = evidence
         .pre_existing_tcp_dns
@@ -2845,7 +2892,37 @@ fn append_capture_start_failures(
                 || is_exit_local_addr(&conn.local_addr, &evidence.local_addrs, egress_addr)
         })
         .collect();
-    if !host_origin_preexisting.is_empty() {
+    // Relief preconditions, evaluated once. Every one of them is fail-closed:
+    // an unusable or truncated snapshot (either side), an unknown local
+    // address set, or any host-origin tcp/53|853 packet on the wire keeps
+    // EVERY entry blocking.
+    let relief_allowed = !evidence.local_addrs.is_empty()
+        && evidence.conntrack_all_answered
+        && !evidence.conntrack_truncated
+        && ss_socket_snapshot_usable(capture_start_dns_sockets)
+        && !capture_has_host_origin_tcp_dns_packet(capture_stdout, egress_addr, forwarded_dns_tcp);
+    let mut blocking = 0usize;
+    for conn in &host_origin_preexisting {
+        let orphaned =
+            relief_allowed && !socket_line_carries_local_endpoint(capture_start_dns_sockets, conn);
+        if orphaned {
+            relief_notes.push(format!(
+                "pre-existing host-origin tcp/53|853 conntrack entry {}:{}->{}:{} relieved: no \
+                 socket in the usable capture-start ss snapshot owns local endpoint {}:{} \
+                 (orphaned entry — its owning socket is gone), the conntrack snapshot answered \
+                 and is untruncated, and the capture carries no host-origin tcp/53|853 packet",
+                conn.local_addr,
+                conn.local_port,
+                conn.remote_addr,
+                conn.remote_port,
+                conn.local_addr,
+                conn.local_port
+            ));
+        } else {
+            blocking += 1;
+        }
+    }
+    if blocking > 0 {
         failures.push(PRE_EXISTING_TCP_DNS_FAILURE.to_owned());
     }
     if leaked_tcp53_tuple_matches_preexisting(
@@ -2862,6 +2939,51 @@ fn append_capture_start_failures(
                 failures[pos].replacen("egress leak:", "egress leak (pre-existing connection):", 1);
         }
     }
+}
+
+/// True when the recorded ss snapshot is a usable capture: no recorded
+/// exit/transport error and no truncation. Relief may only ever reason over
+/// a complete socket listing, never over a partial one.
+fn ss_socket_snapshot_usable(sockets: &str) -> bool {
+    !sockets.contains("[ss -tnpH exited")
+        && !sockets.contains("[ss -tnpH transport error")
+        && !sockets.contains(CAPTURE_TRUNCATION_MARKER)
+}
+
+/// True when any socket line in the snapshot carries the entry's local
+/// endpoint as `addr:port` (plain or bracketed IPv6 form) — the entry still
+/// has a live socket on that endpoint (or at minimum an endpoint collision we
+/// cannot rule out), so it is NOT relieved. Matching against ANY state
+/// (the snapshot is `ss ... state all`) and either endpoint position is
+/// deliberate: ambiguity keeps the failure.
+fn socket_line_carries_local_endpoint(sockets: &str, conn: &PreExistingTcpDnsConn) -> bool {
+    let plain = format!("{}:{}", conn.local_addr, conn.local_port);
+    let bracketed = format!("[{}]:{}", conn.local_addr, conn.local_port);
+    sockets
+        .lines()
+        .any(|line| line.contains(&plain) || line.contains(&bracketed))
+}
+
+/// True when the capture carries ANY host-origin (egress-sourced, not
+/// W3b-attributed) tcp packet to port 53 or [`WITNESS_DOT_PORT`]: such a
+/// packet keeps the pre-existing-connection question live on the wire, so
+/// no entry may be relieved.
+fn capture_has_host_origin_tcp_dns_packet(
+    capture_stdout: &str,
+    egress_addr: &str,
+    forwarded_dns_tcp: &[ForwardedDnsPacket],
+) -> bool {
+    capture_stdout.lines().any(|line| {
+        let Some((src_ip, _src_port, _dst_ip, dst_port)) = parse_v4_packet_endpoints(line) else {
+            return false;
+        };
+        src_ip == egress_addr
+            && matches!(dst_port, Some(53) | Some(WITNESS_DOT_PORT))
+            && line_transport(line) == LineTransport::Tcp
+            && !forwarded_dns_tcp
+                .iter()
+                .any(|packet| packet.packet_line == line)
+    })
 }
 
 /// True when any leaked host-origin tcp/53 packet line in the capture carries
@@ -3521,6 +3643,289 @@ mod tests {
     // W1: a leaked host tcp/53 FIN whose 4-tuple matches a pre-existing
     // capture-start entry is labelled `egress leak (pre-existing connection)`
     // — still a failure, never a downgrade.
+    // ── W1 orphaned-entry relief (katana-xnet-190/193 flake) ─────────────
+
+    /// The REAL katana-xnet-190 shape: conntrack unusable (exit 1 on every
+    /// query — not 127), the `/proc/net/nf_conntrack` fallback carrying ONE
+    /// established host-origin tcp/53 entry (the real line, addresses
+    /// substituted) whose owning socket is already gone, and the capture-end
+    /// snapshot clean. Tests below program the ss socket snapshot per case.
+    fn program_conntrack_exit1(mock: &MockShellHost) {
+        for (proto, dport) in [("tcp", "53"), ("tcp", "853"), ("udp", "53")] {
+            mock.program_run_response(
+                &[
+                    "sudo",
+                    "-n",
+                    "conntrack",
+                    "-L",
+                    "-p",
+                    proto,
+                    "--dport",
+                    dport,
+                ],
+                exit_code(1, ""),
+            );
+        }
+    }
+
+    fn orphan_proc_fallback() -> String {
+        format!(
+            "ipv4     2 tcp      6 431325 ESTABLISHED src={TEST_EGRESS_ADDR} dst=192.0.2.1 \
+             sport=48796 dport=53 src=192.0.2.1 dst={TEST_EGRESS_ADDR} sport=53 dport=48796 \
+             [ASSURED] mark=0 zone=0 use=2\n\
+             ipv4     2 icmp     1 4 src=100.95.194.56 dst=100.77.8.80 type=8 code=0 id=719 \
+             src=100.77.8.80 dst=100.95.194.56 type=0 code=0 id=719 mark=0 zone=0 use=2\n"
+        )
+    }
+
+    /// The real run-190 informational ss listing: ONLY a fresh SYN-SENT
+    /// systemd-resolve attempt (port 59686) — NO socket on the orphaned
+    /// entry's endpoint 48796.
+    fn resolved_syn_sent_only() -> String {
+        format!(
+            "SYN-SENT 0      1      {TEST_EGRESS_ADDR}:59686 192.0.2.1:53 \
+             users:((\"systemd-resolve\",pid=5893,fd=28))\n"
+        )
+    }
+
+    fn program_dns_sockets(mock: &MockShellHost, response: RemoteExitStatus) {
+        mock.program_run_response(
+            &[
+                "sudo",
+                "-n",
+                "ss",
+                "-tnpH",
+                "state",
+                "all",
+                "( dport = :53 or dport = :853 )",
+            ],
+            response,
+        );
+    }
+
+    fn program_orphan_scenario(mock: &MockShellHost, sockets: RemoteExitStatus, capture: &str) {
+        program_setup(mock, true);
+        program_capture_start_nft_listing(mock, &nft_table_ok());
+        program_boot_table(mock, None);
+        program_conntrack_exit1(mock);
+        mock.program_run_response(
+            &["sudo", "-n", "cat", "/proc/net/nf_conntrack"],
+            exit_ok(&orphan_proc_fallback()),
+        );
+        program_w3_clean(mock);
+        program_capture(mock, capture, &tcpdump_stderr_ok());
+        program_dns_sockets(mock, sockets);
+    }
+
+    // THE FLAKE: the entry is present at capture start but its socket is
+    // provably gone (real evidence: conntrack ESTABLISHED 48796, ss shows
+    // only a fresh SYN-SENT 59686), nothing leaked in-window. Relief retires
+    // the standalone failure and the witness passes. On the pre-relief code
+    // this FAILS: the presence check alone fails the verdict.
+    #[test]
+    fn orphaned_preexisting_entry_with_no_owning_socket_passes_the_witness() {
+        let mock = Arc::new(MockShellHost::new());
+        program_orphan_scenario(&mock, exit_ok(&resolved_syn_sent_only()), &clean_capture());
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            !report
+                .failures
+                .iter()
+                .any(|f| *f == PRE_EXISTING_TCP_DNS_FAILURE),
+            "{:?}",
+            report.failures
+        );
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+    }
+
+    // The relief is auditable: the relieved entry lands in
+    // `pre_existing_conn_reliefs` with its endpoint named.
+    #[test]
+    fn orphan_relief_is_recorded_in_the_report() {
+        let mock = Arc::new(MockShellHost::new());
+        program_orphan_scenario(&mock, exit_ok(&resolved_syn_sent_only()), &clean_capture());
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert_eq!(report.pre_existing_conn_reliefs.len(), 1);
+        assert!(
+            report.pre_existing_conn_reliefs[0].contains("48796"),
+            "{:?}",
+            report.pre_existing_conn_reliefs
+        );
+        assert!(report.pre_existing_conn_reliefs[0].contains("no socket"));
+    }
+
+    // A socket still owning the entry's local endpoint (any position, any
+    // state) keeps the failure — the flow may still originate packets.
+    #[test]
+    fn orphan_relief_denied_when_socket_still_owns_the_endpoint() {
+        let mock = Arc::new(MockShellHost::new());
+        let sockets = format!(
+            "{}ESTAB 0 0 {TEST_EGRESS_ADDR}:48796 192.0.2.1:53\n",
+            resolved_syn_sent_only()
+        );
+        program_orphan_scenario(&mock, exit_ok(&sockets), &clean_capture());
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| *f == PRE_EXISTING_TCP_DNS_FAILURE),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    // ANY host-origin tcp/53|853 packet in the capture (here: an unknown
+    // 4-tuple, still a plain leak) denies the relief entirely.
+    #[test]
+    fn orphan_relief_denied_when_capture_carries_host_origin_tcp_dns() {
+        let mock = Arc::new(MockShellHost::new());
+        let mut capture = clean_capture();
+        capture.push_str(&format!(
+            "12:00:12.803670 IP {TEST_EGRESS_ADDR}.40004 > 192.0.2.53.53: Flags [F.], seq 1, \
+             ack 1, win 507, length 0\n"
+        ));
+        program_orphan_scenario(&mock, exit_ok(&resolved_syn_sent_only()), &capture);
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| *f == PRE_EXISTING_TCP_DNS_FAILURE),
+            "{:?}",
+            report.failures
+        );
+    }
+
+    // An unusable socket snapshot (recorded exit marker) denies the relief:
+    // absence of a socket line is only meaningful over a complete listing.
+    #[test]
+    fn orphan_relief_denied_when_socket_snapshot_unusable() {
+        let mock = Arc::new(MockShellHost::new());
+        program_orphan_scenario(&mock, exit_code(1, ""), &clean_capture());
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| *f == PRE_EXISTING_TCP_DNS_FAILURE),
+            "{:?}",
+            report.failures
+        );
+        assert!(report.pre_existing_conn_reliefs.is_empty());
+    }
+
+    // A TRUNCATED conntrack snapshot denies the relief even though the entry
+    // itself was parsed before the cut: relief never reasons over shortened
+    // evidence.
+    #[test]
+    fn orphan_relief_denied_when_conntrack_snapshot_truncated() {
+        let mock = Arc::new(MockShellHost::new());
+        let mut proc_text = orphan_proc_fallback();
+        for id in 100..1120 {
+            proc_text.push_str(&format!(
+                "ipv4     2 icmp     1 29 ESTABLISHED src=100.95.194.56 dst=100.77.8.80 \
+                 type=8 code=0 id={id} src=100.77.8.80 dst=100.95.194.56 type=0 code=0 \
+                 id={id} mark=0 zone=0 use=2\n"
+            ));
+        }
+        program_setup(&mock, true);
+        program_capture_start_nft_listing(&mock, &nft_table_ok());
+        program_boot_table(&mock, None);
+        program_conntrack_exit1(&mock);
+        mock.program_run_response(
+            &["sudo", "-n", "cat", "/proc/net/nf_conntrack"],
+            exit_ok(&proc_text),
+        );
+        program_w3_clean(&mock);
+        program_capture(&mock, &clean_capture(), &tcpdump_stderr_ok());
+        program_dns_sockets(&mock, exit_ok(&resolved_syn_sent_only()));
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            report
+                .capture_start_conntrack
+                .contains(CAPTURE_TRUNCATION_MARKER),
+            "{:?}",
+            report.capture_start_conntrack
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| *f == PRE_EXISTING_TCP_DNS_FAILURE),
+            "{:?}",
+            report.failures
+        );
+        assert!(report.pre_existing_conn_reliefs.is_empty());
+    }
+
+    // Entries whose ONLY source is the ss-fallback path (conntrack AND /proc
+    // both unusable) are never relieved: the "socket snapshot" would be the
+    // same tool seconds later, not independent evidence.
+    #[test]
+    fn orphan_relief_denied_when_preexisting_evidence_is_ss_fallback_only() {
+        let mock = Arc::new(MockShellHost::new());
+        program_setup(&mock, true);
+        program_capture_start_nft_listing(&mock, &nft_table_ok());
+        program_boot_table(&mock, None);
+        program_conntrack_missing(&mock);
+        mock.program_run_response(
+            &["sudo", "-n", "cat", "/proc/net/nf_conntrack"],
+            exit_code(1, ""),
+        );
+        mock.program_run_response(
+            &[
+                "ss",
+                "-Htn",
+                "state",
+                "established",
+                "( dport = :53 or dport = :853 )",
+            ],
+            exit_ok(&format!(
+                "ESTAB 0 0 {TEST_EGRESS_ADDR}:48796 192.0.2.1:53\n"
+            )),
+        );
+        program_w3_clean(&mock);
+        program_capture(&mock, &clean_capture(), &tcpdump_stderr_ok());
+        program_dns_sockets(&mock, exit_ok(&resolved_syn_sent_only()));
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| *f == PRE_EXISTING_TCP_DNS_FAILURE),
+            "{:?}",
+            report.failures
+        );
+        assert!(report.pre_existing_conn_reliefs.is_empty());
+    }
+
+    // The exit's local addresses are UNKNOWN (`ip -4 -o addr show` fails):
+    // the keep-all host-origin filter then counts possibly FOREIGN rows
+    // (masqueraded client flows) as host-origin, and the ss snapshot only
+    // ever lists exit-netns sockets — the no-owning-socket proof would be
+    // vacuous for them. Relief is denied until the address ground truth is
+    // known. On the pre-fix relief this FAILS: the orphan relief fires.
+    #[test]
+    fn orphan_relief_denied_when_local_addrs_unknown() {
+        let mock = Arc::new(MockShellHost::new());
+        // Programmed BEFORE the scenario so the mock FIFO consumes the
+        // failure (the same argv is otherwise answered successfully by
+        // `program_w3_clean`).
+        mock.program_run_response(&["ip", "-4", "-o", "addr", "show"], exit_code(1, ""));
+        program_orphan_scenario(&mock, exit_ok(&resolved_syn_sent_only()), &clean_capture());
+        let report = run_witness(&mock).expect("setup must succeed");
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|f| *f == PRE_EXISTING_TCP_DNS_FAILURE),
+            "{:?}",
+            report.failures
+        );
+        assert!(report.pre_existing_conn_reliefs.is_empty());
+    }
+
     #[test]
     fn leaked_fin_matching_preexisting_entry_is_labelled_preexisting() {
         let mock = Arc::new(MockShellHost::new());

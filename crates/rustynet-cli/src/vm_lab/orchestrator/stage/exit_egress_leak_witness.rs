@@ -251,6 +251,7 @@ fn verdict_json_bytes(report: &LeakWitnessReport, client_alias: &str) -> Result<
         "capture_end_conntrack": report.capture_end_conntrack,
         "capture_start_dns_sockets": report.capture_start_dns_sockets,
         "capture_end_dns_sockets": report.capture_end_dns_sockets,
+        "pre_existing_conn_reliefs": report.pre_existing_conn_reliefs,
         "dns_rule_order_findings": report.dns_rule_order_findings,
         "forwarded_dns_tcp": forwarded_dns_tcp,
         "positive_control": {
@@ -424,6 +425,7 @@ mod tests {
                     .to_owned(),
             capture_start_dns_sockets: "[ss -tnpH transport error: not exercised]".to_owned(),
             capture_end_dns_sockets: "[ss -tnpH transport error: not exercised]".to_owned(),
+            pre_existing_conn_reliefs: Vec::new(),
             dns_rule_order_findings: Vec::new(),
             forwarded_dns_tcp: vec![ForwardedDnsPacket {
                 packet_line:
@@ -514,6 +516,7 @@ mod tests {
         assert!(s.contains("\"capture_end_conntrack\""), "{s}");
         assert!(s.contains("\"capture_start_dns_sockets\""), "{s}");
         assert!(s.contains("\"capture_end_dns_sockets\""), "{s}");
+        assert!(s.contains("\"pre_existing_conn_reliefs\""), "{s}");
         assert!(s.contains("\"dns_rule_order_findings\""), "{s}");
         assert!(s.contains("TIME_WAIT src=10.6.0.2"), "{s}");
         assert!(s.contains("\"forwarded_dns_tcp\""), "{s}");
