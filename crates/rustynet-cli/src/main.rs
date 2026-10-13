@@ -10073,9 +10073,10 @@ impl ForcedAssignmentRefresh {
 ///
 /// Two properties an operator relies on (and the tests pin):
 /// - If the kept bundle still carries LAN routes, DISABLE-LAN keeps failing
-///   AFTER the daemon restart: the daemon re-derives `lan_access=off` from the
-///   kept bundle and rejects the mismatch, so LAN stays ON until the authority
-///   re-issues the bundle. Only a fresh bundle from the authority clears it.
+///   AFTER the daemon restart: the daemon re-derives `lan_access=on` from the
+///   kept bundle (it still grants LAN routes) and rejects the off request, so
+///   LAN stays ON until the authority re-issues the bundle. Only a fresh
+///   bundle from the authority clears it.
 /// - ENABLE-LAN on a kept bundle whose daemon is already `lan_access=on`
 ///   succeeds WITHOUT comparing the requested routes to the granted ones: the
 ///   daemon simply observes the desired state already holding.
