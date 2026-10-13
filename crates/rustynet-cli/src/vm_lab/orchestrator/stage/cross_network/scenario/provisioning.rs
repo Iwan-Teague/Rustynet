@@ -471,6 +471,56 @@ impl EnvFile {
     }
 }
 
+/// Re-spell an issuer-grammar `NODES_SPEC` for `assignment-refresh.env`.
+///
+/// The two consumers disagree on the optional fields. The e2e issuer
+/// (`parse_generic_nodes`, used for the initial bundles) reads
+/// `node|endpoint|key[|capabilities_csv]`; the on-node `rustynet ops
+/// refresh-assignment` (`parse_assignment_nodes`, `main.rs`) reads
+/// `node|endpoint|key[|owner|hostname|os|tags_csv|capabilities_csv]`. Handing the
+/// refresher the issuer spelling makes it take `anchor,exit_server` as the node's
+/// OWNER and default its capabilities to `[client]`, so the first timer tick that
+/// really regenerates the bundle mints one without `anchor`/`exit_server` and the
+/// admin daemon (or the client's issuer check) rejects it: "assignment target
+/// intent lacks required local capability anchor" on the exit, "exit node ... lacks
+/// exit_server capability in --nodes" on the client (katana-xnet-69: node_network_
+/// switch, remote_exit_dns, failback_roaming). The scenarios only looked fine
+/// while the freshly installed bundle was still young enough for the refresher to
+/// skip regeneration. Entries without capabilities are left untouched (both
+/// parsers default them to `[client]`); capability tokens go through the closed
+/// `RoleCapability` parser.
+pub fn refresh_nodes_spec(generic: &str) -> Result<String, String> {
+    let mut entries = Vec::new();
+    for entry in generic.split(';').filter(|entry| !entry.is_empty()) {
+        let fields: Vec<&str> = entry.split('|').collect();
+        match fields.as_slice() {
+            [_, _, _] => entries.push(entry.to_owned()),
+            [id, endpoint, key, caps] => {
+                let parsed = rustynet_control::roles::parse_role_capability_csv(caps)
+                    .map_err(|err| format!("node {id}: invalid capabilities {caps:?}: {err}"))?;
+                if parsed.is_empty() {
+                    entries.push(format!("{id}|{endpoint}|{key}"));
+                } else {
+                    entries.push(format!(
+                        "{id}|{endpoint}|{key}|{id}|{id}|linux||{}",
+                        rustynet_control::roles::role_capability_csv(&parsed)
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "unexpected NODES_SPEC entry with {} fields: {entry:?}",
+                    other.len()
+                ));
+            }
+        }
+    }
+    if entries.is_empty() {
+        return Err("NODES_SPEC is empty".to_owned());
+    }
+    Ok(entries.join(";"))
+}
+
 /// The `assignment-refresh.env` key set, in the shell's order.
 ///
 /// `RUSTYNET_ASSIGNMENT_EXIT_NODE_ID` is present only when the node routes
@@ -482,9 +532,10 @@ pub fn assignment_refresh_env(
     exit_node_id: Option<&str>,
 ) -> Result<EnvFile, String> {
     validate_node_id(target_node_id)?;
+    let refresh_nodes = refresh_nodes_spec(nodes_spec)?;
     let mut env = EnvFile::new()
         .set("RUSTYNET_ASSIGNMENT_TARGET_NODE_ID", target_node_id)?
-        .set("RUSTYNET_ASSIGNMENT_NODES", nodes_spec)?
+        .set("RUSTYNET_ASSIGNMENT_NODES", &refresh_nodes)?
         .set("RUSTYNET_ASSIGNMENT_ALLOW", allow_spec)?
         .set(
             "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
@@ -1486,6 +1537,61 @@ mod tests {
                 .any(|c| c.contains("install -m 0640 -o root -g rustynetd")
                     && c.ends_with(DNS_ZONE_BUNDLE_PATH)),
             "{calls:#?}"
+        );
+    }
+
+    use super::refresh_nodes_spec;
+
+    /// The refresher must see the node's capabilities in ITS field position.
+    #[test]
+    fn refresh_spec_moves_capabilities_to_the_refresh_parsers_last_field() {
+        let generic = format!(
+            "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|anchor,exit_server;\
+             katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
+        );
+        assert_eq!(
+            refresh_nodes_spec(&generic).expect("convert"),
+            format!(
+                "katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|katana-exit-1-bootstrap|\
+                 katana-exit-1-bootstrap|linux||anchor,exit_server;\
+                 katana-client-1-bootstrap|192.168.122.45:51820|{CLIENT_PUB}"
+            )
+        );
+    }
+
+    #[test]
+    fn refresh_spec_canonicalises_and_refuses_unknown_or_malformed_input() {
+        let spec = |tail: &str| format!("n1|192.0.2.1:51820|{EXIT_PUB}{tail}");
+        let converted = refresh_nodes_spec(&spec("|exit_server,client")).expect("convert");
+        assert!(
+            converted.ends_with("|linux||client,exit_server"),
+            "{converted}"
+        );
+        assert_eq!(
+            refresh_nodes_spec(&spec("|")).expect("empty caps stay 3-field"),
+            spec("")
+        );
+        assert!(refresh_nodes_spec(&spec("|not_a_capability")).is_err());
+        assert!(
+            refresh_nodes_spec(&spec("|a|b|c|d")).is_err(),
+            "5 fields are not issuer grammar"
+        );
+        assert!(refresh_nodes_spec("").is_err());
+        assert!(refresh_nodes_spec(";").is_err());
+    }
+
+    /// The refresh env a scenario installs must carry the refresh grammar.
+    #[test]
+    fn assignment_refresh_env_uses_the_refresh_grammar() {
+        let generic =
+            format!("katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|anchor,exit_server");
+        let env = super::assignment_refresh_env("katana-exit-1-bootstrap", &generic, "a|b", None)
+            .expect("env")
+            .render();
+        assert!(env.contains("|linux||anchor,exit_server"), "{env}");
+        assert!(
+            !env.contains(&format!("{EXIT_PUB}|anchor,exit_server")),
+            "{env}"
         );
     }
 
