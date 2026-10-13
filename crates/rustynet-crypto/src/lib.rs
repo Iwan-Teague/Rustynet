@@ -28,8 +28,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
-    apply_protected_dacl_to_path, create_new_file_with_sddl, dpapi_protect, dpapi_unprotect,
-    inspect_file_sddl, WindowsDpapiScope,
+    WindowsDpapiScope, apply_protected_dacl_to_path, create_new_file_with_sddl, dpapi_protect,
+    dpapi_unprotect, inspect_file_sddl,
 };
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
@@ -3123,8 +3123,8 @@ pub fn validate_key_custody_permissions(
 #[cfg(all(test, unix))]
 mod unix_custody_tests {
     use super::{
-        evaluate_unix_custody_metadata, CryptoError, KeyCustodyPermissionPolicy,
-        UnixCustodyMetadata,
+        CryptoError, KeyCustodyPermissionPolicy, UnixCustodyMetadata,
+        evaluate_unix_custody_metadata,
     };
 
     const ME: u32 = 501;
@@ -3558,13 +3558,13 @@ mod tests {
     }
 
     use super::{
+        AlgorithmPolicy, CryptoAlgorithm, CryptoError, Ed25519SigningProvider, KeyCustodyManager,
+        KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair, SigningProvider,
+        SigningProviderKind, SigningProviderPolicy, WINDOWS_KEY_CUSTODY_FILE_SDDL,
         create_provider_attestation, decode_encrypted_blob_v0, decode_encrypted_blob_v1,
         decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
         sddl_ace_principals, try_generate_key_custody_material, validate_signing_provider_policy,
-        verify_provider_attestation, windows_key_custody_sddl_is_hardened, AlgorithmPolicy,
-        CryptoAlgorithm, CryptoError, Ed25519SigningProvider, KeyCustodyManager,
-        KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair, SigningProvider,
-        SigningProviderKind, SigningProviderPolicy, WINDOWS_KEY_CUSTODY_FILE_SDDL,
+        verify_provider_attestation, windows_key_custody_sddl_is_hardened,
     };
     use ed25519_dalek::SigningKey;
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
@@ -3573,9 +3573,10 @@ mod tests {
     // them as unused.
     #[cfg(unix)]
     use super::{
-        read_encrypted_key_file, read_encrypted_key_file_inner, v0_envelope_fallback_decodes_total,
-        v0_envelope_reads_total, v0_envelope_upgrade_failures_total,
-        validate_key_custody_permissions, write_encrypted_key_file, OsStoreFallbackPolicy,
+        OsStoreFallbackPolicy, read_encrypted_key_file, read_encrypted_key_file_inner,
+        v0_envelope_fallback_decodes_total, v0_envelope_reads_total,
+        v0_envelope_upgrade_failures_total, validate_key_custody_permissions,
+        write_encrypted_key_file,
     };
 
     #[test]

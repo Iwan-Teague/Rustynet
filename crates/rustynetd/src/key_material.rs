@@ -52,15 +52,15 @@ use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(any(target_os = "macos", windows))]
 use rustynet_crypto::OsStoreFallbackPolicy;
+use rustynet_crypto::{
+    KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore, write_encrypted_key_file,
+};
 #[cfg(target_os = "macos")]
 use rustynet_crypto::{
     load_macos_generic_password, store_macos_generic_password_system_keychain_owned,
 };
-use rustynet_crypto::{
-    write_encrypted_key_file, KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore,
-};
 #[cfg(windows)]
-use rustynet_windows_native::{dpapi_protect, dpapi_unprotect, WindowsDpapiScope};
+use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect, dpapi_unprotect};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -1248,7 +1248,7 @@ pub fn generate_wireguard_keypair() -> Result<(Zeroizing<Vec<u8>>, String), Stri
 
 #[cfg(test)]
 mod generate_wireguard_keypair_contract_tests {
-    use super::{generate_wireguard_keypair, Zeroizing};
+    use super::{Zeroizing, generate_wireguard_keypair};
 
     /// AQ-115/F2 compile-time contract: the private half of the generated
     /// keypair is `Zeroizing<Vec<u8>>`, so it is wiped on drop on every path
@@ -2292,12 +2292,12 @@ mod tests {
         );
     }
 
-    #[cfg(not(windows))]
-    use super::resolve_passphrase_source_from_env;
     #[cfg(all(unix, not(target_os = "macos")))]
     use super::DEFAULT_PASSPHRASE_CREDENTIAL_NAME;
+    #[cfg(not(windows))]
+    use super::resolve_passphrase_source_from_env;
     #[cfg(target_os = "macos")]
-    use super::{normalize_macos_keychain_account, MACOS_PASSPHRASE_KEYCHAIN_SERVICE};
+    use super::{MACOS_PASSPHRASE_KEYCHAIN_SERVICE, normalize_macos_keychain_account};
     use super::{remove_file_if_present, validate_binary_path};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -2963,7 +2963,7 @@ mod tests {
     fn dpapi_protect_stub_returns_err_on_non_windows() {
         // Verify the non-Windows stub always returns Err so the cfg(windows) branch
         // cannot silently appear on non-Windows builds and mask a missing guard.
-        use rustynet_windows_native::{dpapi_protect, WindowsDpapiScope};
+        use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect};
         let result = dpapi_protect(
             b"test-value",
             WindowsDpapiScope::LocalMachine,
