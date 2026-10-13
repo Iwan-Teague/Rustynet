@@ -862,7 +862,8 @@ fn run_ported_scenario_profile(
     // the orchestrator process was given. Overriding it here would let this
     // stage stamp a commit the run was not actually pinned to.
     let host = scenario::host::LocalScenarioHost::new(repo_root())
-        .with_known_hosts_file(Some(topology.client.known_hosts.clone()));
+        .with_known_hosts_file(Some(topology.client.known_hosts.clone()))
+        .with_ssh_identity_file(Some(topology.client.identity_file.clone()));
 
     let (suite, outcome) = match kind {
         CrossNetworkStageKind::DirectRemoteExit => (

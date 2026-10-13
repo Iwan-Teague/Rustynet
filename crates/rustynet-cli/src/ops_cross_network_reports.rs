@@ -882,6 +882,13 @@ impl CrossNetworkSshTrustSummaryView {
     }
 }
 
+/// Test seam: the stage tests round-trip the summary the scenarios write
+/// through the REAL validator instead of re-spelling its format.
+#[cfg(test)]
+pub(crate) fn validate_ssh_trust_summary_for_tests(path: &Path) -> Vec<String> {
+    validate_ssh_trust_summary_artifact(path)
+}
+
 fn validate_ssh_trust_summary_artifact(path: &Path) -> Vec<String> {
     // X2: Phase A typed view migration. The SSH trust summary now
     // flows through `CrossNetworkSshTrustSummaryView::from_key_value`,
