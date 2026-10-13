@@ -601,6 +601,145 @@ impl Default for PrivilegedHelperConfig {
     }
 }
 
+/// What the privileged helper's serve loop should do after `listener.accept()`
+/// fails. A transient accept error must not end the root helper: systemd
+/// restarts it on failure, but repeated quick exits trip `StartLimitBurst`
+/// (scripts/systemd/rustynetd-privileged-helper.service) and leave the
+/// privileged path dead until a manual `systemctl reset-failed`.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptErrorAction {
+    /// Loop again immediately (interrupted syscall, client reset its pending
+    /// connection before accept, listener not ready).
+    Retry,
+    /// Resource pressure or an in-flight connection the kernel dropped:
+    /// pause for a bounded, doubling interval, then loop again.
+    Backoff,
+    /// Everything else: return the error and let systemd restart the helper.
+    Fatal,
+}
+
+#[cfg(not(windows))]
+const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(50);
+#[cfg(not(windows))]
+const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+/// Give up (and let systemd restart the helper with fresh descriptors) after
+/// this many consecutive failed accepts with no successful accept in between,
+/// so a persistent error storm cannot spin the helper forever either.
+#[cfg(not(windows))]
+const MAX_CONSECUTIVE_ACCEPT_FAILURES: u32 = 100;
+
+/// Pure classifier for accept errors: no I/O, no sleeping, fully table-tested.
+#[cfg(not(windows))]
+fn classify_accept_error(err: &std::io::Error) -> AcceptErrorAction {
+    match err.kind() {
+        std::io::ErrorKind::Interrupted
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::TimedOut => AcceptErrorAction::Retry,
+        _ => match err.raw_os_error() {
+            Some(code) => match nix::errno::Errno::from_raw(code) {
+                nix::errno::Errno::EMFILE
+                | nix::errno::Errno::ENFILE
+                | nix::errno::Errno::ENOBUFS
+                | nix::errno::Errno::ENOMEM
+                | nix::errno::Errno::ECONNRESET
+                | nix::errno::Errno::EPROTO => AcceptErrorAction::Backoff,
+                _ => AcceptErrorAction::Fatal,
+            },
+            None => AcceptErrorAction::Fatal,
+        },
+    }
+}
+
+/// Retry bookkeeping for the serve loop: how many consecutive accepts have
+/// failed (reset on every success) and the current backoff interval.
+#[cfg(not(windows))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcceptRetryState {
+    consecutive_failures: u32,
+    backoff: Duration,
+}
+
+#[cfg(not(windows))]
+impl AcceptRetryState {
+    const fn fresh() -> Self {
+        Self {
+            consecutive_failures: 0,
+            backoff: Duration::ZERO,
+        }
+    }
+
+    fn note_success(self) -> Self {
+        Self::fresh()
+    }
+}
+
+#[cfg(not(windows))]
+const fn accept_failure_cap_reached(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_ACCEPT_FAILURES
+}
+
+/// Pure counter for the consecutive-failure cap: a successful accept resets
+/// the count, a failed one bumps it (saturating, so it cannot overflow).
+#[cfg(not(windows))]
+const fn next_accept_failure_count(previous: u32, accept_succeeded: bool) -> u32 {
+    if accept_succeeded {
+        0
+    } else {
+        previous.saturating_add(1)
+    }
+}
+
+/// Pure backoff schedule: 50 ms for the first backoff, doubling, capped at 1 s.
+#[cfg(not(windows))]
+fn next_backoff(previous: Duration) -> Duration {
+    let doubled = if previous.is_zero() {
+        ACCEPT_BACKOFF_INITIAL
+    } else {
+        previous.checked_mul(2).unwrap_or(ACCEPT_BACKOFF_MAX)
+    };
+    doubled.min(ACCEPT_BACKOFF_MAX)
+}
+
+/// Pure accept-failure handler for the serve loop: returns the next retry
+/// state and how long to sleep before the next accept (`Duration::ZERO` = no
+/// sleep), or the error string to return to the caller. Fatal errors return
+/// exactly the message the helper returned before transient-error handling
+/// existed; the cap turns a persistent storm into a restartable failure.
+#[cfg(not(windows))]
+fn handle_accept_error(
+    state: AcceptRetryState,
+    err: &std::io::Error,
+) -> Result<(AcceptRetryState, Duration), String> {
+    match classify_accept_error(err) {
+        AcceptErrorAction::Fatal => {
+            Err(format!("accept privileged helper connection failed: {err}"))
+        }
+        action => {
+            let next = AcceptRetryState {
+                consecutive_failures: next_accept_failure_count(state.consecutive_failures, false),
+                backoff: match action {
+                    AcceptErrorAction::Backoff => next_backoff(state.backoff),
+                    _ => state.backoff,
+                },
+            };
+            if accept_failure_cap_reached(next.consecutive_failures) {
+                return Err(format!(
+                    "accept privileged helper connection failed: {err} \
+                     (giving up after {} consecutive failed accepts; restart to retry)",
+                    next.consecutive_failures
+                ));
+            }
+            let pause = match action {
+                AcceptErrorAction::Backoff => next.backoff,
+                _ => Duration::ZERO,
+            };
+            Ok((next, pause))
+        }
+    }
+}
+
 pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), String> {
     if config.socket_path.as_os_str().is_empty() {
         return Err("privileged helper socket path must not be empty".to_owned());
@@ -699,10 +838,25 @@ pub fn run_privileged_helper(config: PrivilegedHelperConfig) -> Result<(), Strin
             })?;
         }
 
+        // The serve loop survives transient accept errors (ECONNABORTED,
+        // EINTR, EMFILE/ENFILE class): see `classify_accept_error`. Only a
+        // fatal error or the consecutive-failure cap returns from the loop.
+        let mut accept_retry = AcceptRetryState::fresh();
         loop {
-            let (mut stream, _) = listener
-                .accept()
-                .map_err(|err| format!("accept privileged helper connection failed: {err}"))?;
+            let (mut stream, _) = match listener.accept() {
+                Ok(accepted) => {
+                    accept_retry = accept_retry.note_success();
+                    accepted
+                }
+                Err(err) => {
+                    let (next, pause) = handle_accept_error(accept_retry, &err)?;
+                    accept_retry = next;
+                    if !pause.is_zero() {
+                        sleep(pause);
+                    }
+                    continue;
+                }
+            };
             stream
                 .set_read_timeout(Some(config.io_timeout))
                 .map_err(|err| format!("set privileged helper read-timeout failed: {err}"))?;
@@ -7695,6 +7849,177 @@ mod tests {
             assert!(
                 err.contains("unsupported nft add rule argument schema"),
                 "{label}: {err}"
+            );
+        }
+    }
+
+    // Transient-accept-error handling for the serve loop
+    // (`classify_accept_error` + cap + backoff): all pure, all table-tested.
+    mod accept_error_handling {
+        use super::super::{
+            AcceptErrorAction, AcceptRetryState, MAX_CONSECUTIVE_ACCEPT_FAILURES,
+            accept_failure_cap_reached, classify_accept_error, handle_accept_error,
+            next_accept_failure_count, next_backoff,
+        };
+        use nix::errno::Errno;
+        use std::io::{Error, ErrorKind};
+        use std::time::Duration;
+
+        fn raw(err: Errno) -> Error {
+            Error::from_raw_os_error(err as i32)
+        }
+
+        #[test]
+        fn accept_error_classifier_maps_kinds_and_raw_errnos_to_actions() {
+            // Pure-kind errors (no raw OS errno behind them): loop again at once.
+            for kind in [
+                ErrorKind::Interrupted,
+                ErrorKind::ConnectionAborted,
+                ErrorKind::WouldBlock,
+                ErrorKind::TimedOut,
+            ] {
+                assert_eq!(
+                    classify_accept_error(&Error::from(kind)),
+                    AcceptErrorAction::Retry,
+                    "kind {kind:?} must be Retry"
+                );
+            }
+
+            // Resource pressure and kernel-dropped pending connections: pause,
+            // then loop again.
+            for errno in [
+                Errno::EMFILE,
+                Errno::ENFILE,
+                Errno::ENOBUFS,
+                Errno::ENOMEM,
+                Errno::ECONNRESET,
+                Errno::EPROTO,
+            ] {
+                assert_eq!(
+                    classify_accept_error(&raw(errno)),
+                    AcceptErrorAction::Backoff,
+                    "errno {errno:?} must be Backoff"
+                );
+            }
+
+            // Everything else is fatal: the helper exits and systemd restarts it.
+            for err in [
+                Error::from(ErrorKind::PermissionDenied),
+                raw(Errno::EACCES),
+                raw(Errno::EINVAL),
+                raw(Errno::EBADF),
+                raw(Errno::ENOTSOCK),
+                Error::other("synthetic non-os error"),
+            ] {
+                assert_eq!(
+                    classify_accept_error(&err),
+                    AcceptErrorAction::Fatal,
+                    "error {err:?} must be Fatal"
+                );
+            }
+        }
+
+        #[test]
+        fn accept_error_backoff_schedule_doubles_from_50ms_and_caps_at_1s() {
+            assert_eq!(next_backoff(Duration::ZERO), Duration::from_millis(50));
+            assert_eq!(
+                next_backoff(Duration::from_millis(50)),
+                Duration::from_millis(100)
+            );
+            assert_eq!(
+                next_backoff(Duration::from_millis(100)),
+                Duration::from_millis(200)
+            );
+            assert_eq!(
+                next_backoff(Duration::from_millis(200)),
+                Duration::from_millis(400)
+            );
+            assert_eq!(
+                next_backoff(Duration::from_millis(400)),
+                Duration::from_millis(800)
+            );
+            // 800 ms doubles past the cap and must clamp to 1 s, not 1.6 s.
+            assert_eq!(
+                next_backoff(Duration::from_millis(800)),
+                Duration::from_secs(1)
+            );
+            assert_eq!(next_backoff(Duration::from_secs(1)), Duration::from_secs(1));
+            // Doubling must saturate instead of overflowing on absurd input.
+            assert_eq!(next_backoff(Duration::MAX), Duration::from_secs(1));
+        }
+
+        #[test]
+        fn accept_error_failure_cap_trips_at_limit_and_resets_on_success() {
+            let mut count = 0u32;
+            for expected in 1..MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                count = next_accept_failure_count(count, false);
+                assert_eq!(count, expected);
+                assert!(
+                    !accept_failure_cap_reached(count),
+                    "cap must not trip at {count} consecutive failures"
+                );
+            }
+            count = next_accept_failure_count(count, false);
+            assert_eq!(count, MAX_CONSECUTIVE_ACCEPT_FAILURES);
+            assert!(accept_failure_cap_reached(count));
+
+            // A successful accept resets the counter (and only the counter being
+            // zero keeps the helper serving after a storm).
+            count = next_accept_failure_count(count, true);
+            assert_eq!(count, 0);
+            assert!(!accept_failure_cap_reached(count));
+
+            // The bump saturates instead of overflowing.
+            let saturated = next_accept_failure_count(u32::MAX, false);
+            assert_eq!(saturated, u32::MAX);
+            assert!(accept_failure_cap_reached(saturated));
+        }
+
+        #[test]
+        fn accept_error_handler_retries_immediately_backs_off_and_keeps_fatal_message() {
+            // Interrupted: retry immediately, no pause, counter bumped.
+            let interrupted = Error::from(ErrorKind::Interrupted);
+            let (state, pause) =
+                handle_accept_error(AcceptRetryState::fresh(), &interrupted).expect("retry");
+            assert_eq!(state.consecutive_failures, 1);
+            assert_eq!(pause, Duration::ZERO);
+
+            // EMFILE: backoff pauses start at 50 ms and double.
+            let (state, pause) = handle_accept_error(state, &raw(Errno::EMFILE)).expect("retry");
+            assert_eq!(pause, Duration::from_millis(50));
+            let (state, pause) = handle_accept_error(state, &raw(Errno::EMFILE)).expect("retry");
+            assert_eq!(pause, Duration::from_millis(100));
+            assert_eq!(state.consecutive_failures, 3);
+
+            // A successful accept clears the whole retry state.
+            assert_eq!(state.note_success(), AcceptRetryState::fresh());
+
+            // Fatal error: exactly the message the helper returned before this fix.
+            let fatal = raw(Errno::EACCES);
+            let err = handle_accept_error(AcceptRetryState::fresh(), &fatal).expect_err("fatal");
+            assert_eq!(
+                err,
+                format!("accept privileged helper connection failed: {fatal}")
+            );
+
+            // The cap turns a persistent storm into a failure systemd can restart.
+            let mut state = AcceptRetryState::fresh();
+            for _ in 1..MAX_CONSECUTIVE_ACCEPT_FAILURES {
+                let (next, _) = handle_accept_error(state, &interrupted).expect("retry");
+                state = next;
+            }
+            assert_eq!(
+                state.consecutive_failures,
+                MAX_CONSECUTIVE_ACCEPT_FAILURES - 1
+            );
+            let err = handle_accept_error(state, &interrupted).expect_err("cap reached");
+            assert!(
+                err.starts_with("accept privileged helper connection failed: "),
+                "cap error must keep the historic prefix: {err}"
+            );
+            assert!(
+                err.contains("consecutive failed accepts"),
+                "cap error must name the cap: {err}"
             );
         }
     }
