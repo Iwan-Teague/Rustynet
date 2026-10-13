@@ -21,6 +21,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::sync::OnceLock;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(windows)]
@@ -29,6 +33,8 @@ use crate::windows_paths::{
     validate_windows_runtime_acl, validate_windows_runtime_file_path,
     validate_windows_secret_blob_path,
 };
+#[cfg(unix)]
+use nix::fcntl::{Flock, FlockArg};
 #[cfg(unix)]
 use nix::unistd::Uid;
 #[cfg(unix)]
@@ -1294,6 +1300,125 @@ fn scrub_file_contents(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Lock-file name serialising every key-material writer on one key
+/// directory. Lives next to the encrypted key it guards.
+#[cfg(unix)]
+const KEY_WRITE_LOCK_FILE_NAME: &str = ".rustynet-key-write.lock";
+/// Bounded wait for the key-write lock. A few seconds covers a concurrent
+/// init/migrate (file writes are short); anything longer is a stuck writer
+/// and failing fast beats queueing behind it.
+#[cfg(unix)]
+const KEY_WRITE_LOCK_MAX_WAIT: Duration = Duration::from_secs(3);
+#[cfg(unix)]
+const KEY_WRITE_LOCK_POLL_MS: u64 = 10;
+
+/// RAII exclusive lock serialising the key-material writers
+/// (`initialize_encrypted_key_material`, `migrate_existing_private_key_material`)
+/// on one key directory.
+///
+/// Without it, two concurrent invocations can BOTH pass the `exists()` guard
+/// (neither sees the other's files yet) and then interleave the three-file
+/// write, leaving the encrypted key, runtime private key and public key from
+/// DIFFERENT keypairs on disk — a silent gossip-identity mismatch that is
+/// brutal to diagnose (F3, sweep-b01-02-rustynetd-key-material-1174-r2).
+///
+/// Mutual exclusion is an exclusive `flock(2)` on
+/// [`KEY_WRITE_LOCK_FILE_NAME`], mirroring `resilience.rs::acquire_lock`:
+/// the kernel releases the lock when the descriptor closes, including on
+/// process death (crash, SIGKILL), so a lock file stranded by an ungraceful
+/// exit NEVER wedges a later run — the next acquirer opens the leftover file
+/// and its `flock` succeeds. The file is removed on clean release so a
+/// root-run operation cannot leave a lock the unprivileged daemon cannot
+/// open, and a wrong-owned leftover is unlinked and recreated on
+/// `PermissionDenied` (same recovery as resilience.rs).
+#[cfg(unix)]
+struct KeyMaterialWriteLock {
+    path: PathBuf,
+    // The advisory flock is released when this descriptor closes (drop AND
+    // process death); held across the exists-guard and every file write.
+    _flock: Flock<std::fs::File>,
+}
+
+#[cfg(unix)]
+impl KeyMaterialWriteLock {
+    fn acquire(dir: &Path) -> Result<Self, String> {
+        let path = dir.join(KEY_WRITE_LOCK_FILE_NAME);
+        let deadline = Instant::now() + KEY_WRITE_LOCK_MAX_WAIT;
+        loop {
+            // create(true) (NOT create_new): a lock file may legitimately
+            // survive a crash; mutual exclusion comes from the flock below.
+            // O_NOFOLLOW: the lock dir is operator-visible; a swapped symlink
+            // must not redirect the lock (or the flock) elsewhere.
+            let mut options = OpenOptions::new();
+            options.write(true).create(true).mode(0o600);
+            options.custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits());
+            match options.open(&path) {
+                Ok(file) => match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                    Ok(flock) => {
+                        return Ok(Self {
+                            path,
+                            _flock: flock,
+                        });
+                    }
+                    Err((_file, _errno)) => {
+                        // Held by another live descriptor. A dead holder's
+                        // flock is already gone, so only live contention loops.
+                        if Instant::now() >= deadline {
+                            return Err(format!(
+                                "another key operation is in progress (lock file: {})",
+                                path.display()
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(KEY_WRITE_LOCK_POLL_MS));
+                    }
+                },
+                Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+                    // Wrong-owned lock file (e.g. left by a root-run op). We
+                    // own the key directory, so unlink and recreate under our
+                    // own UID.
+                    if fs::remove_file(&path).is_err() || Instant::now() >= deadline {
+                        return Err(format!(
+                            "another key operation is in progress (lock file: {})",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(KEY_WRITE_LOCK_POLL_MS));
+                }
+                Err(err) => {
+                    return Err(format!(
+                        "open key write lock {} failed: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KeyMaterialWriteLock {
+    fn drop(&mut self) {
+        // Remove the lock file on clean release; the flock itself is released
+        // when `_flock` closes. A contender either shares this inode
+        // (flock-excluded until release) or creates a fresh one, which can
+        // only happen after this key operation completed.
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Windows keeps today's behaviour: no cross-process key-write lock. The
+/// service runs under a single ACL-guarded account and unix advisory locks
+/// have no equivalent here; Windows-side serialisation is tracked separately.
+#[cfg(not(unix))]
+struct KeyMaterialWriteLock;
+
+#[cfg(not(unix))]
+impl KeyMaterialWriteLock {
+    fn acquire(_dir: &Path) -> Result<Self, String> {
+        Ok(Self)
+    }
+}
+
 pub fn initialize_encrypted_key_material(
     runtime_private_key_path: &Path,
     encrypted_key_path: &Path,
@@ -1302,6 +1427,13 @@ pub fn initialize_encrypted_key_material(
     explicit_passphrase_path: Option<&Path>,
     force: bool,
 ) -> Result<String, String> {
+    // Serialise concurrent writers BEFORE the exists-guard: two racers must
+    // not both observe "absent" and interleave the three-file write (the
+    // lock is held to the end of this function, across guard and writes).
+    let lock_dir = encrypted_key_path
+        .parent()
+        .ok_or_else(|| "encrypted key path must include parent directory".to_owned())?;
+    let _key_write_lock = KeyMaterialWriteLock::acquire(lock_dir)?;
     if !force
         && (runtime_private_key_path.exists()
             || encrypted_key_path.exists()
@@ -1343,6 +1475,12 @@ pub fn migrate_existing_private_key_material(
     explicit_passphrase_path: Option<&Path>,
     force: bool,
 ) -> Result<String, String> {
+    // Same serialisation as `initialize_encrypted_key_material`: the lock is
+    // held from BEFORE the target-exists guard through every write below.
+    let lock_dir = encrypted_key_path
+        .parent()
+        .ok_or_else(|| "encrypted key path must include parent directory".to_owned())?;
+    let _key_write_lock = KeyMaterialWriteLock::acquire(lock_dir)?;
     if !existing_private_key_path.exists() {
         return Err(format!(
             "existing private key file not found: {}",
@@ -1447,6 +1585,14 @@ fn write_atomic(
     fs::create_dir_all(parent)
         .map_err(|err| format!("create parent directory {} failed: {err}", parent.display()))?;
 
+    // Best-effort stale-temp reap before this write creates its own temp
+    // (unix only): crash-leftover plaintext temps of dead writers linger
+    // forever otherwise (F2, sweep-b01-02-rustynetd-key-material-1174-r2).
+    #[cfg(unix)]
+    if let Some(base_name) = path.file_name() {
+        reap_stale_key_temp_files(parent, base_name);
+    }
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1506,25 +1652,25 @@ fn write_atomic(
         .open(&temp)
         .map_err(|err| format!("create temp key file {} failed: {err}", temp.display()))?;
     if let Err(err) = file.write_all(bytes) {
-        let _ = fs::remove_file(&temp);
-        return Err(format!(
-            "write temp key file {} failed: {err}",
-            temp.display()
+        return Err(failed_temp_write(
+            &temp,
+            format!("write temp key file {} failed: {err}", temp.display()),
         ));
     }
     if let Err(err) = file.sync_all() {
-        let _ = fs::remove_file(&temp);
-        return Err(format!(
-            "sync temp key file {} failed: {err}",
-            temp.display()
+        return Err(failed_temp_write(
+            &temp,
+            format!("sync temp key file {} failed: {err}", temp.display()),
         ));
     }
     if let Err(err) = fs::rename(&temp, path) {
-        let _ = fs::remove_file(&temp);
-        return Err(format!(
-            "rename temp key file {} to {} failed: {err}",
-            temp.display(),
-            path.display()
+        return Err(failed_temp_write(
+            &temp,
+            format!(
+                "rename temp key file {} to {} failed: {err}",
+                temp.display(),
+                path.display()
+            ),
         ));
     }
     // Directory fsync is a no-op on Windows: FlushFileBuffers on a directory
@@ -1548,6 +1694,93 @@ fn temp_path_for(path: &Path) -> PathBuf {
         .unwrap_or(0);
     out.push(format!(".tmp.{}.{}", std::process::id(), stamp));
     PathBuf::from(out)
+}
+
+/// Best-effort temp cleanup for a FAILED atomic key write: return the
+/// original error, appending the unlink error when the temp could not be
+/// removed. Previously the unlink result was swallowed (`let _ =
+/// remove_file`), so a failed write silently left PLAINTEXT key material at
+/// `<path>.tmp.<pid>.<nanos>` with nothing in the error explaining the leak
+/// (F2, sweep-b01-02-rustynetd-key-material-1174-r2).
+fn failed_temp_write(temp: &Path, error: String) -> String {
+    match fs::remove_file(temp) {
+        Ok(()) => error,
+        Err(unlink_err) => format!(
+            "{error}; additionally failed to remove temp key file {}: {unlink_err}",
+            temp.display()
+        ),
+    }
+}
+
+/// Best-effort reap of stale atomic-write temp files for `base_name` in
+/// `dir`: remove `<base>.tmp.<pid>.<nanos>` files whose writing pid is no
+/// longer alive AND whose mtime is older than 60 seconds. Called at the
+/// start of a write so crash leftovers do not accumulate as plaintext key
+/// material at rest (F2; the names are unique per pid+nanos, so a stale
+/// temp never BLOCKS a later write — this is residue hygiene, not a
+/// correctness fix). Never fails the write: every error here is ignored.
+#[cfg(unix)]
+fn reap_stale_key_temp_files(dir: &Path, base_name: &std::ffi::OsStr) {
+    const STALE_TEMP_MIN_AGE_SECS: u64 = 60;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{}.tmp.", base_name.to_string_lossy());
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(rest) = file_name
+            .to_str()
+            .and_then(|name| name.strip_prefix(prefix.as_str()))
+        else {
+            continue;
+        };
+        let Some((pid_text, _nanos)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        // DirEntry::metadata does not follow symlinks; only regular files
+        // (what our writer creates) are ever reaped.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = SystemTime::now().duration_since(modified) else {
+            continue;
+        };
+        if age.as_secs() < STALE_TEMP_MIN_AGE_SECS {
+            continue;
+        }
+        if key_writer_pid_alive(pid) {
+            continue;
+        }
+        let _ = fs::remove_file(entry.path());
+    }
+}
+
+/// Conservative pid liveness for the reaper: only `ESRCH` proves the pid is
+/// gone. `EPERM` (a live pid owned by another user) and every other error
+/// are treated as ALIVE so the reaper can never remove a live writer's
+/// temp. pid 0 would signal the caller's process group, never a real
+/// writer — treated as alive.
+#[cfg(unix)]
+fn key_writer_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    let Ok(raw) = i32::try_from(pid) else {
+        return true;
+    };
+    !matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
+        Err(nix::errno::Errno::ESRCH)
+    )
 }
 
 fn validate_interface_name(value: &str) -> Result<(), String> {
@@ -2612,5 +2845,307 @@ mod tests {
         );
         super::verify_dpapi_startup_self_test()
             .expect("cached DPAPI startup self-test must remain usable");
+    }
+
+    // -----------------------------------------------------------------
+    // Key-material write serialisation (F3) and temp-residue hygiene (F2),
+    // sweep-b01-02-rustynetd-key-material-1174-r2.
+    //
+    // TESTABILITY CONSTRAINT: a full two-thread keypair race through
+    // `initialize_encrypted_key_material` is infeasible unprivileged — it
+    // needs the `wg` binary (root-owned, per `validate_binary_path`) and on
+    // macOS the custody round trip reaches the real Keychain — and tests
+    // must not use `std::env::set_var` (unsafe, edition 2024). The
+    // lock-level concurrency tests below drive `KeyMaterialWriteLock`
+    // directly instead; the writer-integration pin
+    // (`key_material_writers_take_write_lock_before_exists_guard_and_hold_it`)
+    // proves the writers acquire it before the exists() guard and hold it.
+    // -----------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_allows_exactly_one_winner_across_racing_threads() {
+        let dir = unique_test_dir("rn-keylock-race");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::KeyMaterialWriteLock::acquire(&dir)
+                })
+            })
+            .collect();
+        let mut results: Vec<Result<super::KeyMaterialWriteLock, String>> = Vec::new();
+        for handle in handles {
+            results.push(handle.join().expect("racing lock thread must not panic"));
+        }
+        // Count BEFORE dropping anything: every guard must stay ALIVE until
+        // both threads have finished, otherwise a released winner's lock
+        // could be re-acquired by the loser's next poll and the race would
+        // spuriously report two winners.
+        let winners = results.iter().filter(|result| result.is_ok()).count();
+        let loser_errors: Vec<&String> = results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .collect();
+        assert_eq!(winners, 1, "exactly one racing acquirer may win");
+        assert_eq!(loser_errors.len(), 1, "the loser must get an error");
+        assert!(
+            loser_errors[0].contains("another key operation is in progress"),
+            "loser error must name the contention, got: {}",
+            loser_errors[0]
+        );
+        drop(results);
+        // The released winner must not wedge a later acquirer.
+        drop(super::KeyMaterialWriteLock::acquire(&dir).expect("lock free again after release"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_held_by_live_descriptor_fails_bounded_call() {
+        let dir = unique_test_dir("rn-keylock-held");
+        let lock_path = dir.join(super::KEY_WRITE_LOCK_FILE_NAME);
+        let _held = super::KeyMaterialWriteLock::acquire(&dir).expect("initial acquire");
+        let start = std::time::Instant::now();
+        let err = match super::KeyMaterialWriteLock::acquire(&dir) {
+            Ok(_usurper) => panic!("a held lock must refuse a second writer"),
+            Err(err) => err,
+        };
+        let elapsed = start.elapsed();
+        assert!(
+            err.contains("another key operation is in progress"),
+            "error must name the contention, got: {err}"
+        );
+        assert!(
+            err.contains(lock_path.to_str().expect("utf8 path")),
+            "error must name the lock path, got: {err}"
+        );
+        assert!(
+            elapsed < super::KEY_WRITE_LOCK_MAX_WAIT + std::time::Duration::from_secs(5),
+            "the failed acquirer must fail within the bounded wait, took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_succeeds_over_stale_lock_file_without_holder() {
+        // Regression pin: a lock FILE left by a crashed writer (no live
+        // descriptor holds the flock) must not wedge later key operations.
+        let dir = unique_test_dir("rn-keylock-stale");
+        let lock_path = dir.join(super::KEY_WRITE_LOCK_FILE_NAME);
+        std::fs::write(&lock_path, b"pid=999999 ts=1\n").expect("seed stale lock file");
+        let guard = super::KeyMaterialWriteLock::acquire(&dir)
+            .expect("stale lock file must not block a live acquirer");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_material_write_lock_removes_lock_file_on_clean_release() {
+        let dir = unique_test_dir("rn-keylock-release");
+        let lock_path = dir.join(super::KEY_WRITE_LOCK_FILE_NAME);
+        {
+            let _guard =
+                super::KeyMaterialWriteLock::acquire(&dir).expect("acquire should succeed");
+            assert!(
+                lock_path.exists(),
+                "lock file must exist while the guard is held"
+            );
+        }
+        assert!(
+            !lock_path.exists(),
+            "lock file must be removed on clean release"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_temp_write_removes_temp_and_returns_base_error_when_unlink_succeeds() {
+        let dir = unique_test_dir("rn-keytemp-unlink-ok");
+        let temp = dir.join("wireguard.pub.tmp.424242.42");
+        std::fs::write(&temp, b"plaintext-key-bytes").expect("temp fixture should be writable");
+        let err =
+            super::failed_temp_write(&temp, "write temp key file failed: injected".to_owned());
+        assert_eq!(
+            err, "write temp key file failed: injected",
+            "a successful cleanup must return the base error unchanged"
+        );
+        assert!(
+            !temp.exists(),
+            "the temp must be removed on the success path"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_temp_write_reports_unlink_error_when_temp_cannot_be_removed() {
+        // F2 witness: the failure branch must not SWALLOW the unlink error.
+        // A read-only directory makes the unlink of the temp fail; the
+        // returned error must say so (and name the temp path) instead of
+        // silently leaking plaintext key material at rest.
+        use std::os::unix::fs::PermissionsExt;
+        if nix::unistd::Uid::effective().is_root() {
+            // Root can unlink inside a 0o500 directory; the failure cannot
+            // be forced under a root test runner.
+            eprintln!("skipping: unlink failure cannot be forced when running as root");
+            return;
+        }
+        let dir = unique_test_dir("rn-keytemp-unlink-ro");
+        let temp = dir.join("wireguard.pub.tmp.424242.42");
+        std::fs::write(&temp, b"plaintext-key-bytes").expect("temp fixture should be writable");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only directory should be settable");
+        let err =
+            super::failed_temp_write(&temp, "write temp key file failed: injected".to_owned());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore directory permissions");
+        assert!(
+            err.contains("write temp key file failed: injected"),
+            "the base write error must be preserved, got: {err}"
+        );
+        assert!(
+            err.contains("failed to remove temp key file"),
+            "the unlink failure must be appended, got: {err}"
+        );
+        assert!(
+            err.contains(&temp.display().to_string()),
+            "the error must name the leaked temp path, got: {err}"
+        );
+        assert!(temp.exists(), "the temp genuinely could not be removed");
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Spawn a short-lived child, wait() it, and return its now-dead pid:
+    /// a deterministic dead-pid fixture that needs no pid guessing.
+    #[cfg(unix)]
+    fn spawn_and_reap_probe_pid() -> u32 {
+        // /bin/true is Linux; macOS ships /usr/bin/true. Take the first
+        // candidate that exists so the fixture is host-independent.
+        let candidates = ["/usr/bin/true", "/bin/true", "/usr/bin/env"];
+        let binary = candidates
+            .iter()
+            .find(|candidate| std::path::Path::new(candidate).exists())
+            .expect("a true/env binary must exist on unix hosts");
+        let mut child = std::process::Command::new(binary)
+            .spawn()
+            .expect("probe child should spawn");
+        let pid = child.id();
+        let status = child.wait().expect("probe child should be reaped");
+        assert!(status.success(), "probe child should exit cleanly");
+        pid
+    }
+
+    #[cfg(unix)]
+    fn backdate_mtime(path: &std::path::Path, seconds_ago: u64) {
+        use std::fs::FileTimes;
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("temp fixture should be reopenable");
+        file.set_times(FileTimes::new().set_modified(past))
+            .expect("mtime backdating should work");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_stale_key_temp_files_removes_only_dead_pid_aged_temp() {
+        let dir = unique_test_dir("rn-keytemp-reap");
+        let base = "wireguard.pub";
+        let dead_pid = spawn_and_reap_probe_pid();
+
+        // Dead pid + aged: the crash leftover the reaper exists for.
+        let stale = dir.join(format!("{base}.tmp.{dead_pid}.111111111"));
+        std::fs::write(&stale, b"stale-plaintext").expect("stale fixture should be writable");
+        backdate_mtime(&stale, 120);
+
+        // Live pid (this test process) + aged: must NEVER be reaped.
+        let live = dir.join(format!("{base}.tmp.{}.111111111", std::process::id()));
+        std::fs::write(&live, b"live-plaintext").expect("live fixture should be writable");
+        backdate_mtime(&live, 120);
+
+        // Dead pid + fresh: still inside the live writer's 60 s window.
+        let fresh = dir.join(format!("{base}.tmp.{dead_pid}.222222222"));
+        std::fs::write(&fresh, b"fresh-plaintext").expect("fresh fixture should be writable");
+
+        // Foreign base name + aged + dead pid: not ours to reap.
+        let foreign = dir.join(format!("other.pub.tmp.{dead_pid}.111111111"));
+        std::fs::write(&foreign, b"foreign-plaintext").expect("foreign fixture should be writable");
+        backdate_mtime(&foreign, 120);
+
+        super::reap_stale_key_temp_files(&dir, std::ffi::OsStr::new(base));
+
+        assert!(
+            !stale.exists(),
+            "dead-pid temp older than 60s must be reaped"
+        );
+        assert!(live.exists(), "live-pid temp must never be reaped");
+        assert!(fresh.exists(), "fresh temp must be left for its writer");
+        assert!(foreign.exists(), "other base names must be left alone");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn key_writer_pid_alive_treats_own_pid_as_alive_and_dead_probe_as_gone() {
+        assert!(
+            super::key_writer_pid_alive(std::process::id()),
+            "the running test process must be alive"
+        );
+        assert!(
+            super::key_writer_pid_alive(0),
+            "pid 0 must be treated as alive"
+        );
+        let dead = spawn_and_reap_probe_pid();
+        assert!(
+            !super::key_writer_pid_alive(dead),
+            "a reaped child pid must be recognised as gone"
+        );
+    }
+
+    #[test]
+    fn key_material_writers_take_write_lock_before_exists_guard_and_hold_it() {
+        // Writer-integration pin for the key write lock. Writer-level
+        // concurrency tests are infeasible unprivileged (see the block
+        // comment above), so this source pin kills the placement mutants:
+        // the lock acquisition must sit BEFORE the exists() guard and the
+        // guard must never be dropped early, in BOTH writers.
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/key_material.rs"))
+            .expect("key_material source readable");
+        for fn_name in [
+            "initialize_encrypted_key_material",
+            "migrate_existing_private_key_material",
+        ] {
+            let start = body
+                .find(&format!("pub fn {fn_name}("))
+                .unwrap_or_else(|| panic!("writer {fn_name} must remain present"));
+            let rel_end = body[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("writer {fn_name} must have a closing brace"));
+            let window = &body[start..start + rel_end];
+            let lock_at = window
+                .find("KeyMaterialWriteLock::acquire(")
+                .unwrap_or_else(|| panic!("writer {fn_name} must acquire the key write lock"));
+            let guard_at = window
+                .find("if !force")
+                .unwrap_or_else(|| panic!("writer {fn_name} keeps its exists() guard"));
+            assert!(
+                lock_at < guard_at,
+                "{fn_name} must acquire the key write lock BEFORE the exists() guard"
+            );
+            assert!(
+                !window.contains("drop("),
+                "{fn_name} must hold the key write lock across all writes (no early drop)"
+            );
+        }
     }
 }
