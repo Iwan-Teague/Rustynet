@@ -159,6 +159,10 @@ jobs:
           ./scripts/ci/security_regression_gates.sh
           ./scripts/ci/role_auth_matrix_gates.sh
           ./scripts/ci/nas_default_deny_gates.sh
+          # vm-lab-only release-manifest seam must not leak into release
+          # binaries (builds rustynet-cli release, default features, and
+          # scans for seam markers; fails closed).
+          ./scripts/ci/vm_lab_seam_release_hygiene_gate.sh
 
   debian13:
     name: Debian 13 build+security

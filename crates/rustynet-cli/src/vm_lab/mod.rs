@@ -1927,6 +1927,20 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// Allow-listed by [`parse_linux_backend`]; macOS/Windows guests are
     /// unaffected. `None` (the default) leaves the env byte-identical.
     pub linux_backend: Option<String>,
+    /// `--lab-throwaway-release-manifest`: LAB-ONLY macOS seam. When true,
+    /// each macOS `--node` install mints a throwaway per-run Ed25519 seed
+    /// under the report dir (0600, deleted when the install ends), signs
+    /// release manifest(s) covering exactly the artifacts shipped (the
+    /// source archive, plus a second manifest for host-cross prebuilt binaries), scp's them to the guest,
+    /// and injects `RUSTYNET_RELEASE_MANIFEST` +
+    /// `RUSTYNET_RELEASE_PINNED_KEY_HEX` so the guest's signed-release
+    /// verification passes against lab-built artifacts. The guest's
+    /// verification logic is untouched; refused for workdir installs
+    /// (guest-side tar cannot be host-signed). `false` (the default)
+    /// leaves installs byte-identical, and release builds never enable
+    /// `vm-lab` — enforced by
+    /// `scripts/ci/vm_lab_seam_release_hygiene_gate.sh`.
+    pub lab_throwaway_release_manifest: bool,
     /// `--prebuilt-node-binaries <alias>=<dir>` (repeatable): ship Mac-built
     /// x86_64 Linux binaries to those `--node` aliases instead of building on
     /// the guest (for nodes that cannot compile, and orchestrator hosts with no
@@ -3834,6 +3848,8 @@ pub fn execute_ops_vm_lab_diagnose(config: VmLabDiagnoseConfig) -> Result<String
         platform,
         conn,
         entry.rustynet_src_dir.clone(),
+        // vm_lab_diagnose is a read-only probe: never the lab manifest seam.
+        false,
     )
     .map_err(|err| {
         format!(
@@ -16453,6 +16469,32 @@ fn exercise_macos_admin_issue_live(
     ))
 }
 
+/// Shell prelude for the macOS stages that act on the plain `com.rustynet.daemon` job
+/// (role transition, reboot recovery). `deploy_macos_anchor_profile` takes the node
+/// over to a second launchd job, `com.rustynet.anchor`, whose plist is a copy of the
+/// daemon plist with anchor flags and which RUNS the same daemon on the same state
+/// directory, DNS resolver port and control socket. Nothing later restores the plain
+/// profile, so a restart of `com.rustynet.daemon` collided with the still-running anchor
+/// daemon ("dns resolver bind failed: Address already in use", live macOS run40) and, at
+/// boot, both RunAtLoad plists would start together. This puts the node back on the plain
+/// daemon profile (a no-op when the anchor profile was never deployed) before the stage
+/// acts, and waits until the daemon answers. Contains no braces: it is also embedded in
+/// `format!` scripts.
+const MACOS_PLAIN_DAEMON_PROFILE_PRELUDE: &str = "set -eu; \
+     ANCHOR_PLIST=/Library/LaunchDaemons/com.rustynet.anchor.plist; \
+     if [ -f \"$ANCHOR_PLIST\" ] || sudo launchctl print system/com.rustynet.anchor >/dev/null 2>&1; then \
+       sudo launchctl bootout system/com.rustynet.anchor 2>/dev/null || true; \
+       for _i in $(seq 1 20); do sudo launchctl print system/com.rustynet.anchor >/dev/null 2>&1 || break; sleep 1; done; \
+       sudo rm -f \"$ANCHOR_PLIST\"; \
+       sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
+       for _i in $(seq 1 20); do sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break; sleep 1; done; \
+       sudo launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist; \
+       for _i in $(seq 1 30); do \
+         sudo env RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock /usr/local/bin/rustynet status >/dev/null 2>&1 && break; \
+         sleep 2; \
+       done; \
+     fi; ";
+
 /// Prove a macOS node can transition roles LIVE via the `TransitionKind::
 /// LocalOnly` admin<->client pair (config write + daemon reload, no signed
 /// bundle — `role_presets::validate_transition`) — the first live-lab proof
@@ -16509,55 +16551,70 @@ pub fn exercise_macos_role_transition_live(
     )
     .map_err(|e| format!("pre-transition mesh status check on {macos_alias} failed: {e}"))?;
 
-    let role_transition_script = "set -eu; \
-         RN=/usr/local/bin/rustynet; \
-         CLIENT_PLIST=/Library/LaunchDaemons/com.rustynet.daemon.plist; \
-         test -f \"$CLIENT_PLIST\"; \
-         BEFORE_STATUS=\"$(sudo $RN role status 2>&1)\"; \
-         BEFORE_ROLE=$(echo \"$BEFORE_STATUS\" | awk '/^current role:/{print $3; exit}'); \
-         case \"$BEFORE_ROLE\" in \
-           admin) TARGET=client ;; \
-           client) TARGET=admin ;; \
-           *) echo \"unexpected before-role for LocalOnly admin<->client proof: $BEFORE_ROLE\" >&2; \
-              echo \"$BEFORE_STATUS\" >&2; exit 1 ;; \
-         esac; \
-         if ! SET_OUT=\"$(sudo $RN role set \"$TARGET\" 2>&1)\"; then \
-           echo \"role set $TARGET failed: $SET_OUT\" >&2; exit 1; fi; \
-         sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
-         for _i in $(seq 1 20); do \
-           sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break; \
-           sleep 1; \
-         done; \
-         BOOT_OK=0; BOOT_ERR=''; \
-         for _i in $(seq 1 10); do \
-           if BOOT_ERR=\"$(sudo launchctl bootstrap system \"$CLIENT_PLIST\" 2>&1)\"; then BOOT_OK=1; break; fi; \
-           sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true; \
-           sleep 2; \
-         done; \
-         if [ \"$BOOT_OK\" != 1 ]; then echo \"launchctl bootstrap failed after retries: $BOOT_ERR\" >&2; exit 1; fi; \
-         AFTER_OK=0; AFTER_STATUS=''; \
-         for _i in $(seq 1 30); do \
-           AFTER_STATUS=\"$(sudo $RN role status 2>&1)\" || true; \
-           if echo \"$AFTER_STATUS\" | grep -q \"^current role: $TARGET\"; then AFTER_OK=1; break; fi; \
-           sleep 2; \
-         done; \
-         if [ \"$AFTER_OK\" != 1 ]; then \
-           echo \"daemon did not report $TARGET role after restart (before was $BEFORE_ROLE)\" >&2; \
-           echo \"$AFTER_STATUS\" >&2; \
-           echo '--- diag: rustynetd journal (last 2m) ---' >&2; \
-           sudo log show --last 2m --predicate 'process == \"rustynetd\"' 2>/dev/null | tail -40 >&2 || true; \
-           exit 1; \
-         fi; \
-         if ! REFRESH_OUT=\"$(sudo $RN state refresh 2>&1)\"; then \
-           echo \"state refresh after role transition failed: $REFRESH_OUT\" >&2; exit 1; fi; \
-         echo \"role transition proven: $BEFORE_ROLE -> $TARGET; launchctl bootout+bootstrap reload verified; state refresh ok\"";
+    let role_transition_body = r##"set -eu
+RN=/usr/local/bin/rustynet
+CLIENT_PLIST=/Library/LaunchDaemons/com.rustynet.daemon.plist
+test -f "$CLIENT_PLIST"
+BEFORE_STATUS="$(sudo $RN role status 2>&1)"
+BEFORE_ROLE=$(echo "$BEFORE_STATUS" | awk '/^current role:/{print $3; exit}')
+case "$BEFORE_ROLE" in
+  admin) TARGET=client ;;
+  client) TARGET=admin ;;
+  *) echo "unexpected before-role for LocalOnly admin<->client proof: $BEFORE_ROLE" >&2
+     echo "$BEFORE_STATUS" >&2; exit 1 ;;
+esac
+# One role change = rewrite the plist role, reload the launchd job, wait until the daemon
+# reports the wanted role, refresh state. Run twice (there and back) so the stage proves the
+# round trip AND leaves the node in the role the topology assigned it: the later stages
+# (managed DNS, reboot recovery) are written for that role.
+reload_as() {
+  WANT="$1"
+  if ! SET_OUT="$(sudo $RN role set "$WANT" 2>&1)"; then
+    echo "role set $WANT failed: $SET_OUT" >&2; exit 1
+  fi
+  sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+  for _i in $(seq 1 20); do
+    sudo launchctl print system/com.rustynet.daemon >/dev/null 2>&1 || break
+    sleep 1
+  done
+  BOOT_OK=0; BOOT_ERR=''
+  for _i in $(seq 1 10); do
+    if BOOT_ERR="$(sudo launchctl bootstrap system "$CLIENT_PLIST" 2>&1)"; then BOOT_OK=1; break; fi
+    sudo launchctl bootout system/com.rustynet.daemon 2>/dev/null || true
+    sleep 2
+  done
+  if [ "$BOOT_OK" != 1 ]; then echo "launchctl bootstrap failed after retries: $BOOT_ERR" >&2; exit 1; fi
+  AFTER_OK=0; AFTER_STATUS=''
+  for _i in $(seq 1 30); do
+    AFTER_STATUS="$(sudo $RN role status 2>&1)" || true
+    if echo "$AFTER_STATUS" | grep -q "^current role: $WANT"; then AFTER_OK=1; break; fi
+    sleep 2
+  done
+  if [ "$AFTER_OK" != 1 ]; then
+    echo "daemon did not report $WANT role after restart (before was $BEFORE_ROLE)" >&2
+    echo "$AFTER_STATUS" >&2
+    echo '--- diag: rustynetd journal (last 2m) ---' >&2
+    sudo log show --last 2m --predicate 'process == "rustynetd"' 2>/dev/null | tail -40 >&2 || true
+    exit 1
+  fi
+  if ! REFRESH_OUT="$(sudo $RN state refresh 2>&1)"; then
+    echo "state refresh after role transition failed: $REFRESH_OUT" >&2; exit 1
+  fi
+}
+reload_as "$TARGET"
+reload_as "$BEFORE_ROLE"
+echo "role transition proven: $BEFORE_ROLE -> $TARGET -> $BEFORE_ROLE; launchctl bootout+bootstrap reload verified both ways; state refresh ok"
+"##;
+    // Act on the plain daemon job only: retire a leftover anchor profile first.
+    let role_transition_script =
+        [MACOS_PLAIN_DAEMON_PROFILE_PRELUDE, role_transition_body].concat();
 
     let out = capture_remote_shell_command_for_target(
         &target,
         None,
         Some(ssh_identity_file),
         known_hosts_path,
-        role_transition_script,
+        role_transition_script.as_str(),
         Duration::from_secs(120),
     )
     .map_err(|e| format!("macOS role transition on {macos_alias} failed: {e}"))?;
@@ -16690,9 +16747,10 @@ pub fn exercise_macos_reboot_recovery_with_recovery_actions(
     // 1. Pre-reboot evidence. A single capture proves the backup, its mode,
     //    and the live loopback pinning BEFORE anything is disturbed.
     let pre_reboot_script = format!(
-        "set -eu; \
+        "{MACOS_PLAIN_DAEMON_PROFILE_PRELUDE}\
          ST={STATE_ROOT}/rustynetd.state; \
          BAK=\"$ST.networksetup-dns.failclosed.bak\"; \
+         for _i in $(seq 1 30); do sudo -n test -f \"$BAK\" && break; sleep 2; done; \
          sudo -n test -f \"$BAK\" || {{ echo 'durable networksetup DNS backup missing before reboot' >&2; exit 1; }}; \
           MODE=\"$(sudo -n stat -f %Lp \"$BAK\")\"; \
           case \"$MODE\" in 600|0600) ;; *) echo \"backup mode is $MODE, expected 0600\" >&2; exit 1 ;; esac; \
@@ -16782,8 +16840,9 @@ pub fn exercise_macos_reboot_recovery_with_recovery_actions(
     }
     let node_id = crate::vm_lab::orchestrator::adapter::ssh::parse_status_node_id(&probe_out)
         .ok_or_else(|| {
+            let shown: String = probe_out.chars().take(600).collect();
             format!(
-                "post-reboot `rustynet status` on {macos_alias} carried the daemon-live marker but no parseable node id"
+                "post-reboot `rustynet status` on {macos_alias} carried the daemon-live marker but no parseable node id; probe output (first 600 chars): {shown:?}"
             )
         })?;
 
@@ -47723,6 +47782,72 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     /// whose log carried the M1 recovery line (run 050612, 2026-09-07). Both
     /// recovery evidences — the M1 restore line and the post-reboot marker
     /// retirement token — must be accepted.
+    /// Live macOS run40: after `deploy_macos_anchor_profile` the node runs the
+    /// `com.rustynet.anchor` job; the role-transition and reboot-recovery stages then
+    /// restarted the PLAIN `com.rustynet.daemon` job beside it and it crash-looped on
+    /// "dns resolver bind failed: Address already in use". Both stages must first put the
+    /// node back on the plain daemon profile, in this order: retire the anchor job, then
+    /// (re)start the plain job.
+    /// Live macOS run44: the role-transition stage flipped the node admin<->client and left
+    /// it in the OPPOSITE role, so every later stage ran against a node that no longer
+    /// matched the topology (managed DNS reported `state=absent` on a node that was now
+    /// `--node-role admin`). The stage must prove the round trip and leave the node in its
+    /// original role.
+    #[test]
+    fn macos_role_transition_proves_the_round_trip_and_restores_the_original_role() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let start = source
+            .find("let role_transition_body = r##\"")
+            .expect("role transition body present");
+        let body = &source[start..];
+        let end = body.find("\"##;").expect("body terminator");
+        let body = &body[..end];
+        let there = body
+            .find("reload_as \"$TARGET\"")
+            .expect("transition to the target role");
+        let back = body
+            .find("reload_as \"$BEFORE_ROLE\"")
+            .expect("transition back to the original role");
+        assert!(
+            there < back,
+            "the original role must be restored AFTER the flip"
+        );
+        assert!(
+            body.contains("$BEFORE_ROLE -> $TARGET -> $BEFORE_ROLE"),
+            "the proof summary must state the round trip"
+        );
+    }
+
+    #[test]
+    fn macos_stages_restore_the_plain_daemon_profile_before_acting() {
+        let prelude = super::MACOS_PLAIN_DAEMON_PROFILE_PRELUDE;
+        let anchor_out = prelude
+            .find("launchctl bootout system/com.rustynet.anchor")
+            .expect("prelude retires the anchor job");
+        let anchor_rm = prelude
+            .find("rm -f \"$ANCHOR_PLIST\"")
+            .expect("prelude removes the anchor plist so it cannot start at boot");
+        let daemon_boot = prelude
+            .find("launchctl bootstrap system /Library/LaunchDaemons/com.rustynet.daemon.plist")
+            .expect("prelude starts the plain daemon job");
+        assert!(anchor_out < anchor_rm && anchor_rm < daemon_boot);
+        assert!(
+            !prelude.contains('{') && !prelude.contains('}'),
+            "the prelude is embedded in format! scripts and must contain no braces"
+        );
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        assert!(
+            source.contains("[MACOS_PLAIN_DAEMON_PROFILE_PRELUDE, role_transition_body].concat()"),
+            "the role-transition script must start from the plain daemon profile"
+        );
+        assert!(
+            source.contains("\"{MACOS_PLAIN_DAEMON_PROFILE_PRELUDE}\\"),
+            "the reboot pre-capture script must start from the plain daemon profile"
+        );
+    }
+
     #[test]
     fn macos_reboot_post_probe_enumerates_logs_as_root_and_accepts_both_recovery_lines() {
         let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
@@ -55275,6 +55400,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             allow_dirty: false,
             lab_stun_servers: Vec::new(),
             linux_backend: None,
+            lab_throwaway_release_manifest: false,
             prebuilt_node_binaries: Vec::new(),
             prebuilt_glibc_floor: None,
             skip_stages: Vec::new(),

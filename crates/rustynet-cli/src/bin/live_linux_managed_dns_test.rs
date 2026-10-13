@@ -50,17 +50,9 @@ const SOAK_SSH_RETRY_SLEEP_SECS: u64 = 15;
 /// arguments are a multi-line array literal, so `"-o", "rustynetd"` never
 /// appears on one line and no single-line grep can spot a reversal.
 fn etc_rustynet_install_dir_args() -> [&'static str; 9] {
-    [
-        "install",
-        "-d",
-        "-m",
-        "0750",
-        "-o",
-        "root",
-        "-g",
-        "rustynetd",
-        "/etc/rustynet",
-    ]
+    dns_bundle_install_spec(live_lab_support::LiveLabPlatform::Linux)
+        .expect("linux dns bundle install spec is infallible")
+        .dir_args
 }
 
 fn main() {
@@ -154,7 +146,7 @@ fn run() -> Result<(), String> {
         &config.client_host,
         &[
             "env",
-            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            daemon_socket_env(config.platform)?.as_str(),
             RUSTYNET_CLI,
             "status",
         ],
@@ -171,19 +163,19 @@ fn run() -> Result<(), String> {
     let mut host_by_node = HashMap::new();
     host_by_node.insert(config.signer_node_id.clone(), config.signer_host.clone());
     host_by_node.insert(config.client_node_id.clone(), config.client_host.clone());
-    // The signer and client are always Linux in this validator; each managed
-    // peer carries its own platform parsed from --managed-peer. The platform
-    // map locates per-OS state (assignment bundle) and decides which peers can
-    // accept the Linux-only bundle re-push.
+    // The signer is always Linux in this validator (bundle issuance drives the
+    // Linux-only `/run/rustynet/dns-zone-issue` issue dir and the root-owned
+    // `/etc/rustynet` key custody tree); the CLIENT platform comes from
+    // --platform. Each managed peer carries its own platform parsed from
+    // --managed-peer. The platform map locates per-OS state (socket path,
+    // assignment bundle, trust locations) and decides which peers can accept
+    // the Linux-only bundle re-push.
     let mut platform_by_node: HashMap<String, live_lab_support::LiveLabPlatform> = HashMap::new();
     platform_by_node.insert(
         config.signer_node_id.clone(),
         live_lab_support::LiveLabPlatform::Linux,
     );
-    platform_by_node.insert(
-        config.client_node_id.clone(),
-        live_lab_support::LiveLabPlatform::Linux,
-    );
+    platform_by_node.insert(config.client_node_id.clone(), config.platform);
     for peer in &config.managed_peers {
         host_by_node.insert(peer.node_id.clone(), peer.host.clone());
         platform_by_node.insert(peer.node_id.clone(), peer.platform);
@@ -498,6 +490,7 @@ fn run() -> Result<(), String> {
     install_dns_bundle(
         &ctx,
         &config.client_host,
+        config.platform,
         &verifier_local,
         &valid_bundle_local,
     )?;
@@ -511,10 +504,16 @@ fn run() -> Result<(), String> {
         &nodes_spec,
         &allow_spec,
     )?;
-    restart_managed_dns_stack(&ctx, &config.client_host)?;
+    restart_managed_dns_stack(&ctx, &config.client_host, config.platform)?;
 
-    let dns_inspect_valid =
-        wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
+    let dns_inspect_valid = wait_for_dns_inspect_state(
+        &ctx,
+        &config.client_host,
+        config.platform,
+        Some("valid"),
+        20,
+        2,
+    )?;
     // Split-DNS / resolver-configuration inspection. Per-OS command:
     //   Linux   → `resolvectl status <iface>` (systemd-resolved)
     //   macOS   → `scutil --dns` (the System Configuration resolver list)
@@ -671,8 +670,14 @@ fn run() -> Result<(), String> {
             output_name: "valid-restore.dns-zone",
         },
     )?;
-    let dns_inspect_restored =
-        wait_for_dns_inspect_state(&ctx, &config.client_host, Some("valid"), 20, 2)?;
+    let dns_inspect_restored = wait_for_dns_inspect_state(
+        &ctx,
+        &config.client_host,
+        config.platform,
+        Some("valid"),
+        20,
+        2,
+    )?;
 
     for (node_id, host) in managed_dns_distribution_targets(&host_by_node, &config.client_host) {
         let node_platform = platform_by_node
@@ -684,7 +689,8 @@ fn run() -> Result<(), String> {
         // peers already received correct, signed bundles during the setup
         // distribution stages, and the lab daemon max-age is 86400s, so the
         // bundles stay valid for the whole run. Only the client's resolution is
-        // asserted, and the client + signer are Linux. Skip non-Linux peers.
+        // asserted, and the client keeps its bundle fresh via the restore
+        // steps above regardless of its platform. Skip non-Linux peers.
         if node_platform != live_lab_support::LiveLabPlatform::Linux {
             logger.line(format!(
                 "[managed-dns] skip bundle re-push for non-linux peer {node_id} ({platform}); setup-distributed bundles stay fresh under the 86400s lab window",
@@ -742,14 +748,20 @@ fn run() -> Result<(), String> {
         logger.line(
             format!("[managed-dns] propagating valid managed DNS bundle to {host}").as_str(),
         )?;
-        install_dns_bundle(&ctx, &host, &verifier_local, &peer_bundle_local)?;
+        install_dns_bundle(
+            &ctx,
+            &host,
+            node_platform,
+            &verifier_local,
+            &peer_bundle_local,
+        )?;
         if host == config.client_host {
             continue;
         }
         if host == config.signer_host {
             refresh_signer_trust_evidence(&ctx, &host)?;
         }
-        restart_managed_dns_stack(&ctx, &host)?;
+        restart_managed_dns_stack(&ctx, &host, node_platform)?;
     }
 
     let check_zone_issue_verify = "pass";
@@ -1199,19 +1211,29 @@ fn issue_and_capture_valid_client_bundle(
 fn install_dns_bundle(
     ctx: &LiveLabContext,
     client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
     verifier_local: &Path,
     bundle_local: &Path,
 ) -> Result<(), String> {
-    install_dns_bundle_with_options(ctx, client_host, verifier_local, bundle_local, true)
+    install_dns_bundle_with_options(
+        ctx,
+        client_host,
+        platform,
+        verifier_local,
+        bundle_local,
+        true,
+    )
 }
 
 fn install_dns_bundle_with_options(
     ctx: &LiveLabContext,
     client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
     verifier_local: &Path,
     bundle_local: &Path,
     clear_watermark: bool,
 ) -> Result<(), String> {
+    let spec = dns_bundle_install_spec(platform)?;
     retry_remote_step(
         &format!("install managed DNS bundle on {client_host}"),
         SOAK_SSH_RETRY_ATTEMPTS,
@@ -1219,54 +1241,26 @@ fn install_dns_bundle_with_options(
         || {
             ctx.scp_to(verifier_local, client_host, "/tmp/rn-dns-zone.pub")?;
             ctx.scp_to(bundle_local, client_host, "/tmp/rn-dns-zone.bundle")?;
-            ctx.run_root(client_host, &etc_rustynet_install_dir_args())?;
-            ctx.run_root(
-                client_host,
+            ctx.run_root(client_host, &spec.dir_args)?;
+            ctx.run_root(client_host, &spec.verifier_args)?;
+            ctx.run_root(client_host, &spec.bundle_args)?;
+            let cleanup_args: &[&str] = if clear_watermark {
                 &[
-                    "install",
-                    "-m",
-                    "0644",
-                    "-o",
-                    "root",
-                    "-g",
-                    "root",
+                    "rm",
+                    "-f",
+                    spec.watermark_path,
                     "/tmp/rn-dns-zone.pub",
-                    "/etc/rustynet/dns-zone.pub",
-                ],
-            )?;
-            ctx.run_root(
-                client_host,
-                &[
-                    "install",
-                    "-m",
-                    "0640",
-                    "-o",
-                    "root",
-                    "-g",
-                    "rustynetd",
                     "/tmp/rn-dns-zone.bundle",
-                    "/var/lib/rustynet/rustynetd.dns-zone",
-                ],
-            )?;
-            ctx.run_root(
-                client_host,
-                if clear_watermark {
-                    &[
-                        "rm",
-                        "-f",
-                        "/var/lib/rustynet/rustynetd.dns-zone.watermark",
-                        "/tmp/rn-dns-zone.pub",
-                        "/tmp/rn-dns-zone.bundle",
-                    ]
-                } else {
-                    &[
-                        "rm",
-                        "-f",
-                        "/tmp/rn-dns-zone.pub",
-                        "/tmp/rn-dns-zone.bundle",
-                    ]
-                },
-            )?;
+                ]
+            } else {
+                &[
+                    "rm",
+                    "-f",
+                    "/tmp/rn-dns-zone.pub",
+                    "/tmp/rn-dns-zone.bundle",
+                ]
+            };
+            ctx.run_root(client_host, cleanup_args)?;
             Ok(())
         },
     )
@@ -1329,8 +1323,9 @@ fn refresh_traversal_bundles(
                 // rustynetd` ownership absent on macOS/Windows. Those peers got
                 // valid signed traversal bundles during setup distribution and
                 // the 86400s lab max-age keeps them fresh for the whole run.
-                // Only the Linux client's resolution is asserted, so skip the
-                // re-push to non-Linux peers.
+                // The re-push therefore stays Linux-only even when the CLIENT
+                // is macOS: the client's own traversal bundle was distributed
+                // at setup, and only its resolution is asserted here.
                 if node_platform != live_lab_support::LiveLabPlatform::Linux {
                     logger.line(format!(
                         "[managed-dns] skip bundle re-push for non-linux peer {node_id} ({platform}); setup-distributed bundles stay fresh under the 86400s lab window",
@@ -1438,25 +1433,41 @@ fn install_traversal_bundle(
 /// can never recover. Clear the latch with `reset-failed` before EACH start
 /// attempt so a transient start-limit never aborts the stage.
 ///
+/// On macOS the daemon runs under launchd (`com.rustynet.daemon`). launchd
+/// keeps no systemd-style start-limit latch, so there is nothing to reset:
+/// `launchctl kickstart -k` starts the job (restarting it when loaded), and a
+/// short retry loop absorbs transient kickstart failures.
+///
 /// This only hardens the harness's restart discipline: it does not modify the
-/// production unit, its StartLimit settings, or the daemon's correct
-/// fail-closed rejection of invalid bundles (which is exactly what this stage
-/// asserts).
+/// production unit / job definition, its restart policy, or the daemon's
+/// correct fail-closed rejection of invalid bundles (which is exactly what
+/// this stage asserts).
 fn start_rustynetd_with_reset(
     ctx: &LiveLabContext,
     client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
     attempts: u32,
     sleep_secs: u64,
 ) -> Result<(), String> {
+    if platform != live_lab_support::LiveLabPlatform::Linux {
+        return macos_kickstart(ctx, client_host, DaemonUnit::Daemon, attempts, sleep_secs);
+    }
     let mut last_err = None;
     for attempt in 1..=attempts {
         // Clear any start-limit latch accumulated by the unit's own
         // Restart=on-failure before trying to start again.
         let _ = ctx.run_root_allow_failure(
             client_host,
-            &["systemctl", "reset-failed", "rustynetd.service"],
+            &[
+                "systemctl",
+                "reset-failed",
+                systemd_unit_name(DaemonUnit::Daemon),
+            ],
         );
-        match ctx.run_root(client_host, &["systemctl", "start", "rustynetd.service"]) {
+        match ctx.run_root(
+            client_host,
+            &["systemctl", "start", systemd_unit_name(DaemonUnit::Daemon)],
+        ) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 last_err = Some(err);
@@ -1470,15 +1481,22 @@ fn start_rustynetd_with_reset(
         .unwrap_or_else(|| "start rustynetd.service retry exhausted after reset-failed".to_owned()))
 }
 
-fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<(), String> {
+fn restart_managed_dns_stack(
+    ctx: &LiveLabContext,
+    client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
+) -> Result<(), String> {
+    if platform != live_lab_support::LiveLabPlatform::Linux {
+        return restart_managed_dns_stack_macos(ctx, client_host, platform);
+    }
     ctx.run_root_allow_failure(
         client_host,
         &[
             "systemctl",
             "stop",
-            "rustynetd-managed-dns.service",
-            "rustynetd.service",
-            "rustynetd-privileged-helper.service",
+            systemd_unit_name(DaemonUnit::ManagedDns),
+            systemd_unit_name(DaemonUnit::Daemon),
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
         ],
     )?;
     ctx.run_root_allow_failure(
@@ -1486,14 +1504,18 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
         &[
             "systemctl",
             "reset-failed",
-            "rustynetd.service",
-            "rustynetd-managed-dns.service",
-            "rustynetd-privileged-helper.service",
+            systemd_unit_name(DaemonUnit::Daemon),
+            systemd_unit_name(DaemonUnit::ManagedDns),
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
         ],
     )?;
     ctx.retry_root(
         client_host,
-        &["systemctl", "start", "rustynetd-privileged-helper.service"],
+        &[
+            "systemctl",
+            "start",
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
+        ],
         5,
         2,
     )?;
@@ -1502,12 +1524,12 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
         &[
             "systemctl",
             "is-active",
-            "rustynetd-privileged-helper.service",
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
         ],
         15,
         2,
     )?;
-    start_rustynetd_with_reset(ctx, client_host, 5, 2)?;
+    start_rustynetd_with_reset(ctx, client_host, platform, 5, 2)?;
     ctx.wait_for_daemon_socket(client_host, "/run/rustynet/rustynetd.sock", 20, 2)?;
     ctx.retry_root(
         client_host,
@@ -1523,17 +1545,55 @@ fn restart_managed_dns_stack(ctx: &LiveLabContext, client_host: &str) -> Result<
     )?;
     ctx.retry_root(
         client_host,
-        &["systemctl", "restart", "rustynetd-managed-dns.service"],
+        &[
+            "systemctl",
+            "restart",
+            systemd_unit_name(DaemonUnit::ManagedDns),
+        ],
         5,
         2,
     )?;
     ctx.retry_root(
         client_host,
-        &["systemctl", "is-active", "rustynetd-managed-dns.service"],
+        &[
+            "systemctl",
+            "is-active",
+            systemd_unit_name(DaemonUnit::ManagedDns),
+        ],
         15,
         2,
     )?;
-    wait_for_dns_inspect_state(ctx, client_host, Some("valid"), 20, 2)?;
+    wait_for_dns_inspect_state(ctx, client_host, platform, Some("valid"), 20, 2)?;
+    Ok(())
+}
+
+/// macOS arm of `restart_managed_dns_stack`. Service control goes through
+/// `launchctl` (labels from `macos_launchd_label`, mirroring
+/// `adapter/macos_install.rs`); there is NO dedicated macOS managed-dns job —
+/// the resolver is hosted inside the daemon process, and the daemon was just
+/// restarted, so polling the hosting daemon active replaces the Linux
+/// managed-dns unit restart + `is-active` pair. This is NOT a weakening: the
+/// functional `wait_for_dns_inspect_state(Some("valid"))` assertion at the end
+/// still has to pass through the real per-OS resolver on every platform.
+fn restart_managed_dns_stack_macos(
+    ctx: &LiveLabContext,
+    client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
+) -> Result<(), String> {
+    macos_kickstart(ctx, client_host, DaemonUnit::PrivilegedHelper, 5, 2)?;
+    macos_await_launchd_active(ctx, client_host, DaemonUnit::PrivilegedHelper, 15, 2)?;
+    start_rustynetd_with_reset(ctx, client_host, platform, 5, 2)?;
+    let socket_path = daemon_socket_path(platform)?;
+    ctx.wait_for_daemon_socket(client_host, socket_path, 20, 2)?;
+    let socket_env = daemon_socket_env(platform)?;
+    ctx.retry_root(
+        client_host,
+        &["env", socket_env.as_str(), RUSTYNET_CLI, "state", "refresh"],
+        5,
+        2,
+    )?;
+    macos_await_launchd_active(ctx, client_host, DaemonUnit::Daemon, 15, 2)?;
+    wait_for_dns_inspect_state(ctx, client_host, platform, Some("valid"), 20, 2)?;
     Ok(())
 }
 
@@ -1807,6 +1867,7 @@ fn exercise_invalid_bundle_case(
     install_dns_bundle_with_options(
         validation.dns_issue.ctx,
         &validation.config.client_host,
+        validation.config.platform,
         validation.verifier_local,
         case.bundle_local,
         case.clear_watermark,
@@ -1824,6 +1885,7 @@ fn exercise_invalid_bundle_case(
     let dns_inspect = restart_managed_dns_stack_allow_invalid_dns(
         validation.dns_issue.ctx,
         &validation.config.client_host,
+        validation.config.platform,
     )?;
     // Daemon hosting-state + recent daemon log. Per-OS:
     //   Linux   → `systemctl is-active rustynetd.service` + `journalctl`
@@ -1910,15 +1972,19 @@ fn exercise_invalid_bundle_case(
 fn restart_managed_dns_stack_allow_invalid_dns(
     ctx: &LiveLabContext,
     client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
 ) -> Result<String, String> {
+    if platform != live_lab_support::LiveLabPlatform::Linux {
+        return restart_managed_dns_stack_allow_invalid_dns_macos(ctx, client_host, platform);
+    }
     ctx.run_root_allow_failure(
         client_host,
         &[
             "systemctl",
             "stop",
-            "rustynetd-managed-dns.service",
-            "rustynetd.service",
-            "rustynetd-privileged-helper.service",
+            systemd_unit_name(DaemonUnit::ManagedDns),
+            systemd_unit_name(DaemonUnit::Daemon),
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
         ],
     )?;
     ctx.run_root_allow_failure(
@@ -1926,14 +1992,18 @@ fn restart_managed_dns_stack_allow_invalid_dns(
         &[
             "systemctl",
             "reset-failed",
-            "rustynetd.service",
-            "rustynetd-managed-dns.service",
-            "rustynetd-privileged-helper.service",
+            systemd_unit_name(DaemonUnit::Daemon),
+            systemd_unit_name(DaemonUnit::ManagedDns),
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
         ],
     )?;
     ctx.retry_root(
         client_host,
-        &["systemctl", "start", "rustynetd-privileged-helper.service"],
+        &[
+            "systemctl",
+            "start",
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
+        ],
         5,
         2,
     )?;
@@ -1942,18 +2012,47 @@ fn restart_managed_dns_stack_allow_invalid_dns(
         &[
             "systemctl",
             "is-active",
-            "rustynetd-privileged-helper.service",
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
         ],
         15,
         2,
     )?;
-    ctx.run_root_allow_failure(client_host, &["systemctl", "start", "rustynetd.service"])?;
     ctx.run_root_allow_failure(
         client_host,
-        &["systemctl", "restart", "rustynetd-managed-dns.service"],
+        &["systemctl", "start", systemd_unit_name(DaemonUnit::Daemon)],
+    )?;
+    ctx.run_root_allow_failure(
+        client_host,
+        &[
+            "systemctl",
+            "restart",
+            systemd_unit_name(DaemonUnit::ManagedDns),
+        ],
     )?;
     ctx.wait_for_daemon_socket(client_host, "/run/rustynet/rustynetd.sock", 20, 2)?;
-    wait_for_dns_inspect_state(ctx, client_host, None, 20, 2)
+    wait_for_dns_inspect_state(ctx, client_host, platform, None, 20, 2)
+}
+
+/// macOS arm of `restart_managed_dns_stack_allow_invalid_dns`: same allow-
+/// failure posture as the Linux arm (helper start MUST succeed, daemon start
+/// may legitimately fail closed on the invalid bundle), with launchd control
+/// and the per-OS socket path. No managed-dns unit to restart — the resolver
+/// rides in the daemon.
+fn restart_managed_dns_stack_allow_invalid_dns_macos(
+    ctx: &LiveLabContext,
+    client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
+) -> Result<String, String> {
+    macos_kickstart(ctx, client_host, DaemonUnit::PrivilegedHelper, 5, 2)?;
+    macos_await_launchd_active(ctx, client_host, DaemonUnit::PrivilegedHelper, 15, 2)?;
+    let daemon_target = macos_launchctl_target(DaemonUnit::Daemon)?;
+    let _ = ctx.run_root_allow_failure(
+        client_host,
+        &["/bin/launchctl", "kickstart", "-k", daemon_target.as_str()],
+    );
+    let socket_path = daemon_socket_path(platform)?;
+    ctx.wait_for_daemon_socket(client_host, socket_path, 20, 2)?;
+    wait_for_dns_inspect_state(ctx, client_host, platform, None, 20, 2)
 }
 
 fn restore_valid_bundle_after_invalid_case(
@@ -1986,6 +2085,7 @@ fn restore_valid_bundle_after_invalid_case(
             install_dns_bundle(
                 validation.dns_issue.ctx,
                 &validation.config.client_host,
+                validation.config.platform,
                 validation.verifier_local,
                 restore.valid_bundle_local,
             )?;
@@ -1999,7 +2099,11 @@ fn restore_valid_bundle_after_invalid_case(
                 validation.dns_issue.nodes_spec,
                 validation.dns_issue.allow_spec,
             )?;
-            restart_managed_dns_stack(validation.dns_issue.ctx, &validation.config.client_host)
+            restart_managed_dns_stack(
+                validation.dns_issue.ctx,
+                &validation.config.client_host,
+                validation.config.platform,
+            )
         },
     )
 }
@@ -2034,21 +2138,17 @@ where
 fn wait_for_dns_inspect_state(
     ctx: &LiveLabContext,
     client_host: &str,
+    platform: live_lab_support::LiveLabPlatform,
     expected_state: Option<&str>,
     attempts: u32,
     sleep_secs: u64,
 ) -> Result<String, String> {
+    let socket_env = daemon_socket_env(platform)?;
     let mut last_output = None;
     for attempt in 1..=attempts {
         let output = ctx.capture_root_allow_failure_with_retry(
             client_host,
-            &[
-                "env",
-                "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
-                RUSTYNET_CLI,
-                "dns",
-                "inspect",
-            ],
+            &["env", socket_env.as_str(), RUSTYNET_CLI, "dns", "inspect"],
             SOAK_SSH_RETRY_ATTEMPTS,
             SOAK_SSH_RETRY_SLEEP_SECS,
         )?;
@@ -2651,6 +2751,238 @@ fn macos_launchctl_daemon_active(output: &str) -> bool {
     })
 }
 
+// ─── Per-platform daemon control plane ─────────────────────────────────────
+//
+// Every socket path, service-manager unit, launchd label and trust-tree
+// install location the validator's service-control steps need, keyed on
+// `LiveLabPlatform` instead of hardcoded Linux paths. All pure, so the
+// per-OS routing is unit-testable on the Linux build host (W2-D).
+
+/// Socket the client daemon listens on. Mirrors
+/// `live_lab_bin_support::daemon_socket_path_for_platform`: the macOS launchd
+/// daemon listens on `/private/var/run/...` (`/usr/local/var` is the *state*
+/// root, not the socket dir). Windows fails closed until its validator lands.
+fn daemon_socket_path(platform: LiveLabPlatform) -> Result<&'static str, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok("/run/rustynet/rustynetd.sock"),
+        LiveLabPlatform::MacOs => Ok("/private/var/run/rustynet/rustynetd.sock"),
+        LiveLabPlatform::Windows => Err(
+            "windows managed-dns client validation has no daemon socket path wired up yet"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `env RUSTYNET_DAEMON_SOCKET=<path>` argv fragment for the client host.
+/// Run30 regression witness: this used to hardcode the Linux socket, so every
+/// client status / state-refresh / dns-inspect call failed with
+/// `daemon unreachable: inspect daemon socket failed (/run/rustynet/...)`
+/// against a macOS client.
+fn daemon_socket_env(platform: LiveLabPlatform) -> Result<String, String> {
+    daemon_socket_path(platform).map(|path| format!("RUSTYNET_DAEMON_SOCKET={path}"))
+}
+
+/// The service-manager units the validator's restart steps control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonUnit {
+    Daemon,
+    PrivilegedHelper,
+    ManagedDns,
+}
+
+/// systemd unit name per unit (Linux arm, byte-identical to the pre-wave-3
+/// hardcoded argv).
+fn systemd_unit_name(unit: DaemonUnit) -> &'static str {
+    match unit {
+        DaemonUnit::Daemon => "rustynetd.service",
+        DaemonUnit::PrivilegedHelper => "rustynetd-privileged-helper.service",
+        DaemonUnit::ManagedDns => "rustynetd-managed-dns.service",
+    }
+}
+
+/// launchd label per unit, mirroring `adapter/macos_install.rs`
+/// (`MACOS_SERVICE_LABEL` / `MACOS_PRIVILEGED_HELPER_LABEL`). There is NO
+/// dedicated macOS managed-dns job — the resolver is hosted inside
+/// `com.rustynet.daemon` (see the REVIEW note on
+/// `capture_managed_dns_service_state`) — so the ManagedDns mapping fails
+/// closed instead of guessing a label.
+fn macos_launchd_label(unit: DaemonUnit) -> Result<&'static str, String> {
+    match unit {
+        DaemonUnit::Daemon => Ok("com.rustynet.daemon"),
+        DaemonUnit::PrivilegedHelper => Ok("com.rustynet.privileged-helper"),
+        DaemonUnit::ManagedDns => Err(
+            "macOS hosts the managed resolver inside com.rustynet.daemon; there is no dedicated managed-dns launchd job"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `launchctl` domain target, e.g. `system/com.rustynet.daemon`.
+fn macos_launchctl_target(unit: DaemonUnit) -> Result<String, String> {
+    macos_launchd_label(unit).map(|label| format!("system/{label}"))
+}
+
+/// Everything `install_dns_bundle_with_options` needs to place the verifier +
+/// bundle in the daemon's per-OS trust locations.
+///
+/// Linux values are byte-identical to the pre-wave-3 inline argv (including
+/// the key-custody ordering pinned by
+/// `etc_rustynet_install_dir_is_root_owned_with_rustynetd_group`). macOS
+/// mirrors the setup stage's `stage_and_install` (vm_lab/mod.rs
+/// `distribute_macos_bundles`): 0700 trust dir owned by rustynetd, 0644
+/// verifier, 0640 bundle, under `/usr/local/var/rustynet/trust` — matching
+/// the daemon's macOS state paths (`rustynetd/src/daemon.rs` /
+/// `Install-RustyNetMacosService.sh`). Windows fails closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DnsBundleInstallSpec {
+    dir_args: [&'static str; 9],
+    verifier_args: [&'static str; 9],
+    bundle_args: [&'static str; 9],
+    watermark_path: &'static str,
+}
+
+fn dns_bundle_install_spec(platform: LiveLabPlatform) -> Result<DnsBundleInstallSpec, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(DnsBundleInstallSpec {
+            dir_args: [
+                "install",
+                "-d",
+                "-m",
+                "0750",
+                "-o",
+                "root",
+                "-g",
+                "rustynetd",
+                "/etc/rustynet",
+            ],
+            verifier_args: [
+                "install",
+                "-m",
+                "0644",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "/tmp/rn-dns-zone.pub",
+                "/etc/rustynet/dns-zone.pub",
+            ],
+            bundle_args: [
+                "install",
+                "-m",
+                "0640",
+                "-o",
+                "root",
+                "-g",
+                "rustynetd",
+                "/tmp/rn-dns-zone.bundle",
+                "/var/lib/rustynet/rustynetd.dns-zone",
+            ],
+            watermark_path: "/var/lib/rustynet/rustynetd.dns-zone.watermark",
+        }),
+        LiveLabPlatform::MacOs => Ok(DnsBundleInstallSpec {
+            dir_args: [
+                "install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                "rustynetd",
+                "-g",
+                "rustynetd",
+                "/usr/local/var/rustynet/trust",
+            ],
+            verifier_args: [
+                "install",
+                "-m",
+                "0644",
+                "-o",
+                "rustynetd",
+                "-g",
+                "rustynetd",
+                "/tmp/rn-dns-zone.pub",
+                "/usr/local/var/rustynet/trust/dns-zone.pub",
+            ],
+            bundle_args: [
+                "install",
+                "-m",
+                "0640",
+                "-o",
+                "rustynetd",
+                "-g",
+                "rustynetd",
+                "/tmp/rn-dns-zone.bundle",
+                "/usr/local/var/rustynet/trust/rustynetd.dns-zone",
+            ],
+            watermark_path: "/usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark",
+        }),
+        LiveLabPlatform::Windows => Err(
+            "windows managed-dns client validation has no dns bundle install spec wired up yet"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `launchctl kickstart -k system/<label>` retry loop (macOS service start).
+fn macos_kickstart(
+    ctx: &LiveLabContext,
+    host: &str,
+    unit: DaemonUnit,
+    attempts: u32,
+    sleep_secs: u64,
+) -> Result<(), String> {
+    let target = macos_launchctl_target(unit)?;
+    let mut last_err = None;
+    for attempt in 1..=attempts {
+        match ctx.run_root(
+            host,
+            &["/bin/launchctl", "kickstart", "-k", target.as_str()],
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt < attempts {
+                    sleep(std::time::Duration::from_secs(sleep_secs));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| format!("launchctl kickstart {target} retry exhausted")))
+}
+
+/// Wait until `launchctl print system/<label>` reports the job active.
+///
+/// Unlike systemd's `is-active` (non-zero exit when inactive), `launchctl
+/// print` exits ZERO for a loaded-but-inactive job, so retrying the exit
+/// status alone would "succeed" immediately; the printed state text must be
+/// parsed instead (same heuristic as `macos_launchctl_daemon_active`).
+fn macos_await_launchd_active(
+    ctx: &LiveLabContext,
+    host: &str,
+    unit: DaemonUnit,
+    attempts: u32,
+    sleep_secs: u64,
+) -> Result<(), String> {
+    let target = macos_launchctl_target(unit)?;
+    let mut last_output = None;
+    for attempt in 1..=attempts {
+        let output = ctx.capture_root_allow_failure(host, &["/bin/launchctl", "print", &target])?;
+        if macos_launchctl_daemon_active(output.as_str()) {
+            return Ok(());
+        }
+        last_output = Some(output);
+        if attempt < attempts {
+            sleep(std::time::Duration::from_secs(sleep_secs));
+        }
+    }
+    Err(format!(
+        "launchd job {target} did not become active on {host}: {}",
+        last_output
+            .map(|output| output.trim().to_owned())
+            .filter(|output| !output.is_empty())
+            .unwrap_or_else(|| "empty output".to_owned())
+    ))
+}
+
 fn render_remote_output(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
@@ -2900,23 +3232,24 @@ fn parse_status_field(status: &str, key: &str) -> Option<String> {
 
 fn print_usage() {
     eprintln!(
-        "usage: live_linux_managed_dns_test --ssh-identity-file <path> [options]\n\noptions:\n  --signer-host <user@host>\n  --client-host <user@host>\n  --signer-node-id <id>\n  --client-node-id <id>\n  --managed-peer <node-id|user@host>   (repeatable)\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --log-path <path>\n  --zone-name <name>\n  --dns-interface <name>\n  --dns-bind-addr <ip:port>"
+        "usage: live_linux_managed_dns_test --ssh-identity-file <path> [options]\n\noptions:\n  --signer-host <user@host>\n  --client-host <user@host>\n  --platform <linux|macos|windows>      (client platform, default linux)\n  --signer-node-id <id>\n  --client-node-id <id>\n  --managed-peer <node-id|user@host>   (repeatable)\n  --ssh-allow-cidrs <cidrs>\n  --report-path <path>\n  --log-path <path>\n  --zone-name <name>\n  --dns-interface <name>\n  --dns-bind-addr <ip:port>"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::etc_rustynet_install_dir_args;
     use super::live_lab_support::LiveLabPlatform;
     use super::{
-        Config, ManagedDnsRecordTemplate, ManagedPeerSpec, assignment_bundle_path,
+        Config, DaemonUnit, ManagedDnsRecordTemplate, ManagedPeerSpec, assignment_bundle_path,
+        daemon_socket_env, daemon_socket_path, dns_bundle_install_spec,
         dns_inspect_matches_expected_state, dns_inspect_readback_ready, dns_query_failed_closed,
-        macos_launchctl_daemon_active, macos_scutil_advertises_managed_zone,
+        etc_rustynet_install_dir_args, macos_launchctl_daemon_active, macos_launchctl_target,
+        macos_launchd_label, macos_scutil_advertises_managed_zone,
         managed_dns_distribution_targets, managed_dns_invalid_state_observed,
         managed_dns_replay_records, managed_dns_service_active, os_resolver_answer_contains_ip,
         parse_assignment_authority_scope, parse_managed_peer_spec, parse_status_field,
         resolver_config_advertises_managed_zone, rewrite_bundle_line_value,
-        rewrite_bundle_signature, sorted_node_host_pairs, validate_targets,
+        rewrite_bundle_signature, sorted_node_host_pairs, systemd_unit_name, validate_targets,
         windows_dns_client_lists_loopback_server,
     };
     use std::collections::HashMap;
@@ -2945,6 +3278,206 @@ mod tests {
             ],
             "reversing owner/group here fails every root-run key-custody read \
              under /etc/rustynet"
+        );
+    }
+
+    /// Per-OS daemon socket routing: the macOS launchd daemon listens on
+    /// `/private/var/run/...` (`/usr/local/var` is the state root), Linux keeps
+    /// the systemd socket, and Windows fails closed instead of guessing.
+    #[test]
+    fn daemon_socket_path_routes_per_platform_and_fails_closed_on_windows() {
+        assert_eq!(
+            daemon_socket_path(LiveLabPlatform::Linux),
+            Ok("/run/rustynet/rustynetd.sock"),
+            "linux socket path must stay byte-identical"
+        );
+        assert_eq!(
+            daemon_socket_path(LiveLabPlatform::MacOs),
+            Ok("/private/var/run/rustynet/rustynetd.sock"),
+            "macOS daemon listens on /private/var/run, not /usr/local/var"
+        );
+        assert!(
+            daemon_socket_path(LiveLabPlatform::Windows).is_err(),
+            "windows must fail closed until its validator lands"
+        );
+    }
+
+    /// Run30 regression witness: the first client status capture hardcoded the
+    /// Linux socket, so every client call on macOS failed with
+    /// `daemon unreachable: inspect daemon socket failed
+    /// (/run/rustynet/rustynetd.sock)`. The env fragment must follow
+    /// `--platform`.
+    #[test]
+    fn daemon_socket_env_follows_platform_for_client_invocations() {
+        assert_eq!(
+            daemon_socket_env(LiveLabPlatform::Linux),
+            Ok("RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock".to_owned()),
+            "linux env fragment must stay byte-identical"
+        );
+        assert_eq!(
+            daemon_socket_env(LiveLabPlatform::MacOs),
+            Ok("RUSTYNET_DAEMON_SOCKET=/private/var/run/rustynet/rustynetd.sock".to_owned()),
+            "macOS client invocations must point at the launchd daemon socket"
+        );
+    }
+
+    /// launchd labels mirror `adapter/macos_install.rs`
+    /// (`MACOS_SERVICE_LABEL` / `MACOS_PRIVILEGED_HELPER_LABEL`); the
+    /// managed-DNS unit has NO macOS job because the resolver is hosted inside
+    /// the daemon, so that mapping fails closed.
+    #[test]
+    fn macos_launchd_targets_mirror_adapter_labels_and_fail_closed_for_managed_dns() {
+        assert_eq!(
+            macos_launchd_label(DaemonUnit::Daemon),
+            Ok("com.rustynet.daemon"),
+            "label must match MACOS_SERVICE_LABEL"
+        );
+        assert_eq!(
+            macos_launchd_label(DaemonUnit::PrivilegedHelper),
+            Ok("com.rustynet.privileged-helper"),
+            "label must match MACOS_PRIVILEGED_HELPER_LABEL"
+        );
+        assert_eq!(
+            macos_launchctl_target(DaemonUnit::Daemon),
+            Ok("system/com.rustynet.daemon".to_owned())
+        );
+        assert_eq!(
+            macos_launchctl_target(DaemonUnit::PrivilegedHelper),
+            Ok("system/com.rustynet.privileged-helper".to_owned())
+        );
+        assert!(
+            macos_launchd_label(DaemonUnit::ManagedDns).is_err(),
+            "there is no dedicated macOS managed-dns launchd job; fail closed"
+        );
+    }
+
+    /// Pin the systemd unit names: the Linux arm stays byte-identical to the
+    /// pre-wave-3 hardcoded argv.
+    #[test]
+    fn systemd_unit_names_are_unchanged() {
+        assert_eq!(systemd_unit_name(DaemonUnit::Daemon), "rustynetd.service");
+        assert_eq!(
+            systemd_unit_name(DaemonUnit::PrivilegedHelper),
+            "rustynetd-privileged-helper.service"
+        );
+        assert_eq!(
+            systemd_unit_name(DaemonUnit::ManagedDns),
+            "rustynetd-managed-dns.service"
+        );
+    }
+
+    /// Linux install spec is byte-identical to the legacy inline argv: same
+    /// key-custody dir ordering (`-o root -g rustynetd`), same modes, same
+    /// paths, same watermark.
+    #[test]
+    fn linux_dns_bundle_install_spec_is_byte_identical_with_legacy_paths() {
+        let spec =
+            dns_bundle_install_spec(LiveLabPlatform::Linux).expect("linux spec is infallible");
+        assert_eq!(
+            spec.dir_args,
+            etc_rustynet_install_dir_args(),
+            "linux dir argv must match the pinned key-custody ordering"
+        );
+        assert_eq!(
+            spec.verifier_args,
+            [
+                "install",
+                "-m",
+                "0644",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "/tmp/rn-dns-zone.pub",
+                "/etc/rustynet/dns-zone.pub",
+            ],
+            "verifier is world-readable and root:root under /etc/rustynet"
+        );
+        assert_eq!(
+            spec.bundle_args,
+            [
+                "install",
+                "-m",
+                "0640",
+                "-o",
+                "root",
+                "-g",
+                "rustynetd",
+                "/tmp/rn-dns-zone.bundle",
+                "/var/lib/rustynet/rustynetd.dns-zone",
+            ],
+            "bundle is root:rustynetd 0640 under /var/lib/rustynet"
+        );
+        assert_eq!(
+            spec.watermark_path,
+            "/var/lib/rustynet/rustynetd.dns-zone.watermark"
+        );
+    }
+
+    /// macOS install spec mirrors the setup stage's `stage_and_install`
+    /// (`distribute_macos_bundles`): 0700 trust dir owned by rustynetd, 0644
+    /// verifier, 0640 bundle, under `/usr/local/var/rustynet/trust` — the
+    /// daemon's actual macOS state locations.
+    #[test]
+    fn macos_dns_bundle_install_spec_mirrors_stage_and_install() {
+        let spec =
+            dns_bundle_install_spec(LiveLabPlatform::MacOs).expect("macos spec is infallible");
+        assert_eq!(
+            spec.dir_args,
+            [
+                "install",
+                "-d",
+                "-m",
+                "0700",
+                "-o",
+                "rustynetd",
+                "-g",
+                "rustynetd",
+                "/usr/local/var/rustynet/trust",
+            ],
+            "trust dir must be rustynetd-owned 0700 like stage_and_install"
+        );
+        assert_eq!(
+            spec.verifier_args,
+            [
+                "install",
+                "-m",
+                "0644",
+                "-o",
+                "rustynetd",
+                "-g",
+                "rustynetd",
+                "/tmp/rn-dns-zone.pub",
+                "/usr/local/var/rustynet/trust/dns-zone.pub",
+            ],
+            "verifier is 0644 rustynetd:rustynetd under the trust root"
+        );
+        assert_eq!(
+            spec.bundle_args,
+            [
+                "install",
+                "-m",
+                "0640",
+                "-o",
+                "rustynetd",
+                "-g",
+                "rustynetd",
+                "/tmp/rn-dns-zone.bundle",
+                "/usr/local/var/rustynet/trust/rustynetd.dns-zone",
+            ],
+            "bundle is 0640 rustynetd:rustynetd under the trust root"
+        );
+        assert_eq!(
+            spec.watermark_path,
+            "/usr/local/var/rustynet/trust/rustynetd.dns-zone.watermark"
+        );
+    }
+
+    #[test]
+    fn dns_bundle_install_spec_fails_closed_on_windows() {
+        assert!(
+            dns_bundle_install_spec(LiveLabPlatform::Windows).is_err(),
+            "windows must fail closed until its validator lands"
         );
     }
 

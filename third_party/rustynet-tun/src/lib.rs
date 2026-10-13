@@ -200,6 +200,19 @@ mod imp {
             if result < 0 {
                 return Err(io::Error::last_os_error());
             }
+            if result == 0 {
+                // A live utun socket never yields a zero-length read: even a
+                // header-only frame is 4 bytes. EOF means the control
+                // socket's receive side was shut down (XNU does this to a
+                // descriptor that is closed while still in flight over a
+                // unix socket), after which the kernel can no longer hand
+                // this interface any packet. Fail loudly instead of looking
+                // like an idle tunnel.
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "utun control socket receive side is shut down (read returned EOF)",
+                ));
+            }
             let len = result as usize;
             if len <= UTUN_HEADER_LEN {
                 return Ok(0);
@@ -237,6 +250,42 @@ mod imp {
                 return Err(io::Error::last_os_error());
             }
             Ok((result as usize).saturating_sub(UTUN_HEADER_LEN))
+        }
+
+        /// Reports whether the control socket can still receive packets from
+        /// the kernel. A peek with `MSG_DONTWAIT` returns EAGAIN on a healthy
+        /// idle socket and 0 (EOF) once its receive side has been shut down;
+        /// in that state every packet the kernel routes to the interface fails
+        /// with ENOBUFS (`utun_output - ctl_enqueuembuf failed: 55`).
+        pub fn receive_side_open(&self) -> io::Result<bool> {
+            let mut probe = [0u8; 1];
+            // SAFETY: `self.fd` is a valid open descriptor owned by `self`;
+            // `probe` is a live 1-byte buffer and the length passed matches
+            // it. MSG_PEEK leaves any queued packet in place and
+            // MSG_DONTWAIT guarantees the call cannot block.
+            let result = unsafe {
+                libc::recv(
+                    self.fd,
+                    probe.as_mut_ptr().cast::<libc::c_void>(),
+                    probe.len(),
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if result > 0 {
+                return Ok(true);
+            }
+            if result == 0 {
+                return Ok(false);
+            }
+            let err = io::Error::last_os_error();
+            if matches!(
+                err.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            ) {
+                Ok(true)
+            } else {
+                Err(err)
+            }
         }
 
         pub fn from_raw_fd(fd: RawFd) -> io::Result<Self> {
@@ -476,6 +525,41 @@ mod imp {
                 .recv(&mut buf)
                 .expect("header-only datagram should not error");
             assert_eq!(len, 0);
+            close_peer(peer);
+        }
+
+        #[test]
+        fn recv_reports_eof_when_receive_side_is_shut_down() {
+            use std::os::fd::AsRawFd;
+            let (device, peer) = datagram_socketpair();
+            assert!(
+                device.receive_side_open().expect("peek on a live socket"),
+                "a fresh socket must report an open receive side"
+            );
+            // SAFETY: the device's descriptor is a live socket owned by the
+            // test; shutdown only changes its state.
+            let rc = unsafe { libc::shutdown(device.as_raw_fd(), libc::SHUT_RD) };
+            assert_eq!(rc, 0, "shutdown failed: {}", io::Error::last_os_error());
+            assert!(
+                !device.receive_side_open().expect("peek after shutdown"),
+                "a shut-down receive side must be detected"
+            );
+            let mut buf = [0u8; 64];
+            let err = device
+                .recv(&mut buf)
+                .expect_err("EOF must surface as an error, not as an idle tunnel");
+            assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+            close_peer(peer);
+        }
+
+        #[test]
+        fn receive_side_open_does_not_consume_queued_packets() {
+            let (device, peer) = datagram_socketpair();
+            write_peer_datagram(peer, &[0u8, 0, 0, libc::AF_INET as u8, 0x45, 9]);
+            assert!(device.receive_side_open().expect("peek"));
+            let mut buf = [0u8; 64];
+            let len = device.recv(&mut buf).expect("packet must still be queued");
+            assert_eq!(&buf[..len], &[0x45, 9]);
             close_peer(peer);
         }
 

@@ -942,6 +942,7 @@ mod tests {
             allow_dirty: false,
             lab_stun_servers: Vec::new(),
             linux_backend: None,
+            lab_throwaway_release_manifest: false,
             prebuilt_node_binaries: Vec::new(),
             prebuilt_glibc_floor: None,
             skip_stages: Vec::new(),

@@ -81,6 +81,19 @@ mod ops_cross_network_reports;
 #[cfg(feature = "vm-lab")]
 #[allow(dead_code)]
 mod ops_e2e;
+// Signed release manifest + its ops producer/verifier. Declared here as
+// well as in `main.rs` (the established pattern in this crate) so the
+// vm-lab macOS manifest seam can sign + verify manifests IN-PROCESS
+// instead of shelling out to a `rustynet ops create-release-manifest`
+// subprocess. Still `vm-lab`-gated: the default-feature binary and library
+// carry none of it (RNQ-17), enforced by
+// scripts/ci/vm_lab_seam_release_hygiene_gate.sh.
+#[cfg(feature = "vm-lab")]
+#[allow(dead_code)]
+mod ops_release_manifest;
+#[cfg(feature = "vm-lab")]
+#[allow(dead_code)]
+mod release_manifest;
 // `pub` so the standalone `live_*` stage binaries can call the report writers
 // IN-PROCESS. They used to shell out via `cargo run -p rustynet-cli -- ops …`,
 // which silently built a DEFAULT-feature binary in which these very

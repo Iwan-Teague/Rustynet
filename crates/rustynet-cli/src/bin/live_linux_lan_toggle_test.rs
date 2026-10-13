@@ -1455,6 +1455,11 @@ fn run_lan_access_command(
     }
 
     let enable_flag = if enable { "true" } else { "false" };
+    // Per-OS refresh-env location, matching the shell lab
+    // (live_lab_common.sh assignment_refresh_env_path) and each OS's config
+    // root: /etc/rustynet (Linux), /usr/local/etc/rustynet (macOS bootstrap
+    // CONFIG_ROOT), C:\ProgramData\RustyNet\config (Windows).
+    let env_path = live_lab_support::assignment_refresh_env_path(platform)?;
     let mut args = vec![
         live_lab_support::REMOTE_RUSTYNET_BIN,
         "ops",
@@ -1462,7 +1467,7 @@ fn run_lan_access_command(
         "--enable",
         enable_flag,
         "--env-path",
-        "/etc/rustynet/assignment-refresh.env",
+        env_path,
     ];
     if !lan_routes.is_empty() {
         args.push("--lan-routes");

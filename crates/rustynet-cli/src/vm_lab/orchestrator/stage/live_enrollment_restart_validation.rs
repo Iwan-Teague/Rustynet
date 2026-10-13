@@ -29,6 +29,63 @@ fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
     }
 }
 
+/// Named reported-skip bookkeeping (active_exit precedent): the probe is
+/// Linux-only today (systemd restart choreography, journald, /var/lib state
+/// paths); a topology that assigns a non-Linux admin or enrollee is recorded
+/// here and skipped — never fed to the Linux-only binary, never a silent pass.
+const REPORTED_SKIP_FILENAME: &str = "live_enrollment_restart.reported_skips.json";
+
+/// Pure skip-note serializer (no I/O) so a unit test pins the content.
+fn enrollment_restart_skip_json_bytes(
+    admin_alias: &str,
+    admin_platform: &str,
+    enrollee_alias: &str,
+    enrollee_platform: &str,
+) -> Vec<u8> {
+    let body = serde_json::json!({
+        "stage": "live_enrollment_restart_validation",
+        "reported_skipped_enrollment_restart": [{
+            "admin_alias": admin_alias,
+            "admin_platform": admin_platform,
+            "enrollee_alias": enrollee_alias,
+            "enrollee_platform": enrollee_platform,
+        }],
+        "reason": "the live enrollment-restart probe drives systemd (stop/start/\
+                   reset-failed), journald and the /var/lib/rustynet state layout; no \
+                   launchd/state-root equivalent is wired into the probe yet, so a \
+                   non-Linux admin or enrollee leg is reported-skipped here (named, \
+                   never a silent pass) until that port lands",
+    });
+    serde_json::to_vec_pretty(&body).unwrap_or_default()
+}
+
+/// Write the reported-skip note. Best-effort: a write failure does not change
+/// the stage outcome (the Skipped reason still names the nodes).
+fn write_reported_skip_note(
+    ctx: &OrchestrationContext,
+    admin_alias: &str,
+    admin_platform: &str,
+    enrollee_alias: &str,
+    enrollee_platform: &str,
+) {
+    let path = ctx.report_dir.join(REPORTED_SKIP_FILENAME);
+    let _ = std::fs::write(
+        &path,
+        enrollment_restart_skip_json_bytes(
+            admin_alias,
+            admin_platform,
+            enrollee_alias,
+            enrollee_platform,
+        ),
+    );
+}
+
+/// The probe's Linux-only guard: every node it drives (the enrolling admin on
+/// the exit role, the enrollee on the aux role) must be a Linux guest.
+fn enrollment_restart_supports_platform(platform: crate::vm_lab::VmGuestPlatform) -> bool {
+    matches!(platform, crate::vm_lab::VmGuestPlatform::Linux)
+}
+
 pub struct LiveEnrollmentRestartValidationStage;
 
 impl OrchestrationStage for LiveEnrollmentRestartValidationStage {
@@ -77,6 +134,29 @@ impl OrchestrationStage for LiveEnrollmentRestartValidationStage {
             Ok(p) => p,
             Err(e) => return StageOutcome::Failed(e),
         };
+        // The probe binary drives systemd/journald and the /var/lib state
+        // layout: a non-Linux admin or enrollee is a NAMED reported skip
+        // (never fed to the Linux-only binary, never a silent pass). A
+        // missing exit role above stays a hard fail — that is a topology
+        // defect, not a platform gap.
+        if !enrollment_restart_supports_platform(admin_params.platform)
+            || !enrollment_restart_supports_platform(enrollee_params.platform)
+        {
+            let admin_platform = format!("{:?}", admin_params.platform);
+            let enrollee_platform = format!("{:?}", enrollee_params.platform);
+            write_reported_skip_note(
+                ctx,
+                &admin_params.alias,
+                &admin_platform,
+                &enrollee_params.alias,
+                &enrollee_platform,
+            );
+            return StageOutcome::Skipped(format!(
+                "live enrollment-restart probe is Linux-only (systemd/journald choreography): \
+                 admin={} ({}), enrollee={} ({}) — reported-skipped, never a silent pass",
+                admin_params.alias, admin_platform, enrollee_params.alias, enrollee_platform
+            ));
+        }
         let admin_node_id = node_id_for_alias(ctx, &admin_params.alias);
         let enrollee_node_id = node_id_for_alias(ctx, &enrollee_params.alias);
         let admin_target = format!("{}@{}", admin_params.user, admin_params.host);
@@ -268,6 +348,7 @@ struct ResolvedParams {
     host: String,
     user: String,
     identity_file: PathBuf,
+    platform: crate::vm_lab::VmGuestPlatform,
 }
 
 fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Result<ResolvedParams, String> {
@@ -291,6 +372,7 @@ fn alias_matching_label(ctx: &OrchestrationContext, label: &str) -> Result<Resol
         host: params.host.clone(),
         user,
         identity_file: params.identity_file.clone(),
+        platform: adapter.platform(),
     })
 }
 
@@ -726,5 +808,45 @@ mod tests {
             "the failure must name the missing witness artifact"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn linux_is_the_only_supported_probe_platform() {
+        use crate::vm_lab::VmGuestPlatform;
+        assert!(enrollment_restart_supports_platform(VmGuestPlatform::Linux));
+        for platform in [
+            VmGuestPlatform::Macos,
+            VmGuestPlatform::Windows,
+            VmGuestPlatform::Ios,
+            VmGuestPlatform::Android,
+        ] {
+            assert!(
+                !enrollment_restart_supports_platform(platform),
+                "{platform:?} must be a named reported skip, never fed to the Linux-only probe"
+            );
+        }
+    }
+
+    #[test]
+    fn skip_note_names_both_nodes_platforms_and_the_honest_gap() {
+        let bytes = enrollment_restart_skip_json_bytes("mac-exit", "Macos", "aux-1", "Linux");
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        assert_eq!(parsed["stage"], "live_enrollment_restart_validation");
+        let entry = &parsed["reported_skipped_enrollment_restart"][0];
+        assert_eq!(entry["admin_alias"], "mac-exit");
+        assert_eq!(entry["admin_platform"], "Macos");
+        assert_eq!(entry["enrollee_alias"], "aux-1");
+        assert_eq!(entry["enrollee_platform"], "Linux");
+        let reason = parsed["reason"].as_str().expect("reason string");
+        assert!(reason.contains("systemd"), "{reason}");
+        assert!(reason.contains("never a silent pass"), "{reason}");
+    }
+
+    #[test]
+    fn reported_skip_note_file_name_is_stable() {
+        assert_eq!(
+            REPORTED_SKIP_FILENAME,
+            "live_enrollment_restart.reported_skips.json"
+        );
     }
 }

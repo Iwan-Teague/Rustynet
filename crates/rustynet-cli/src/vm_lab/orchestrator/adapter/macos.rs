@@ -57,6 +57,13 @@ pub struct MacosNodeAdapter {
     /// When present, `install_daemon` builds from this workdir instead
     /// of transferring a source archive.
     workdir: Option<String>,
+    /// LAB-ONLY release-manifest seam (default OFF). When true,
+    /// `install_daemon` signs a throwaway per-run release manifest for the
+    /// artifacts it ships. Mutually exclusive with `workdir`: a guest-side
+    /// tar of a remote workdir cannot be hashed+signed on the host, so the
+    /// adapter refuses the combination instead of silently weakening the
+    /// gate.
+    lab_release_manifest_seam: bool,
 }
 
 impl MacosNodeAdapter {
@@ -65,7 +72,20 @@ impl MacosNodeAdapter {
             alias: alias.into(),
             conn,
             workdir,
+            lab_release_manifest_seam: false,
         }
+    }
+
+    /// LAB-ONLY: enable the throwaway release-manifest seam for this node.
+    /// Ignored by every non-macOS path; refused in combination with a
+    /// remote workdir at install time.
+    pub(crate) fn with_lab_release_manifest_seam(mut self, on: bool) -> Self {
+        self.lab_release_manifest_seam = on;
+        self
+    }
+
+    pub(crate) fn lab_release_manifest_seam(&self) -> bool {
+        self.lab_release_manifest_seam
     }
 }
 
@@ -121,6 +141,15 @@ impl NodeAdapter for MacosNodeAdapter {
         ctx: &OrchestrationContext,
     ) -> Result<InstallReport, AdapterError> {
         if let Some(workdir) = &self.workdir {
+            if self.lab_release_manifest_seam {
+                return Err(AdapterError::Protocol {
+                    message: "lab manifest seam cannot be combined with a remote workdir: \
+                              a guest-side tar of the workdir cannot be hashed and signed on \
+                              the host; clear rustynet_src_dir for this node or disable \
+                              --lab-throwaway-release-manifest"
+                        .to_owned(),
+                });
+            }
             // Pass the fresh source archive even when a workdir is
             // configured: install_daemon_from_workdir will extract it
             // when the workdir is absent on the remote host (cold
@@ -134,7 +163,13 @@ impl NodeAdapter for MacosNodeAdapter {
                 ctx,
             )
         } else {
-            macos_install::install_daemon(&self.conn, &self.alias, source, ctx)
+            macos_install::install_daemon(
+                &self.conn,
+                &self.alias,
+                source,
+                ctx,
+                self.lab_release_manifest_seam,
+            )
         }
     }
 
@@ -188,8 +223,16 @@ impl NodeAdapter for MacosNodeAdapter {
     }
 
     fn collect_gossip_identity(&self) -> Result<GossipIdentity, AdapterError> {
-        // the lab macOS bootstrap scripts never run `key init-gossip`, so no secret exists to export.
-        Ok(GossipIdentity::DeferredPlatform)
+        // The lab bootstrap now mints a gossip signing secret
+        // (`provision_gossip_signing_secret` in Bootstrap-RustyNetMacos.sh,
+        // D4 parity with the Linux path), so the identity is exported and
+        // published exactly like Linux. Fails CLOSED: a node that cannot
+        // prove its gossip identity gets no membership entry claiming one —
+        // never the unaligned-WireGuard-key entry `DeferredPlatform` used to
+        // publish, which is what left run25's exit node with zero gossip
+        // peers.
+        let hex = macos_traffic::collect_gossip_verifying_key(&self.conn)?;
+        Ok(GossipIdentity::Published(hex))
     }
 
     fn collect_node_id(&self) -> Result<NodeId, AdapterError> {

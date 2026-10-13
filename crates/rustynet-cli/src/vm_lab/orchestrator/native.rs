@@ -770,6 +770,7 @@ pub(crate) fn execute_rust_native_orchestration(
             platform,
             conn,
             entry.rustynet_src_dir.clone(),
+            config.lab_throwaway_release_manifest,
         )
         .map_err(|err| {
             format!(

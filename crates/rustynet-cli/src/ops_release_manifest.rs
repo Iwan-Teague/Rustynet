@@ -586,3 +586,63 @@ mod tests {
         (dir, manifest, pin)
     }
 }
+
+/// Tripwire for the lab-only release-manifest seam: with the `vm-lab`
+/// feature OFF (i.e. every default/production build), no seam code may
+/// exist outside `src/vm_lab/`. Scans the crate sources for seam
+/// markers so the seam cannot silently escape the lab-only module
+/// boundary. Marker literals are assembled by concatenation so this
+/// file does not trip itself.
+#[cfg(test)]
+#[cfg(not(feature = "vm-lab"))]
+mod lab_seam_stays_inside_vm_lab {
+    #[test]
+    fn no_lab_manifest_seam_sources_outside_vm_lab() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let markers = [
+            format!("macos_manifest_{}", "seam"),
+            format!("LabManifest{}", "Seam"),
+            format!("mint_{}", "throwaway_seed"),
+            format!("with_lab_release_manifest_{}", "seam"),
+        ];
+        let mut stack = vec![src.clone()];
+        let mut scanned = 0usize;
+        let mut hits: Vec<String> = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src tree").flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if path.is_dir() {
+                    if name == "vm_lab" {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if !name.ends_with(".rs") {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).expect("read rust source");
+                let contents = String::from_utf8_lossy(&bytes);
+                scanned += 1;
+                for marker in &markers {
+                    if contents.contains(marker.as_str()) {
+                        hits.push(format!(
+                            "{} contains lab-seam marker '{}'",
+                            path.display(),
+                            marker
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            scanned > 50,
+            "tripwire scanned only {scanned} sources; src tree changed?"
+        );
+        assert!(
+            hits.is_empty(),
+            "lab-manifest-seam code escaped src/vm_lab in a default build: {hits:?}"
+        );
+    }
+}

@@ -25,6 +25,27 @@ use std::os::unix::net::UnixStream;
 use crate::macos_utun_helper::{RNUF_MAGIC, RNUF_VERSION, validate_utun_interface_name};
 use crate::macos_utun_helper_unsafe::{open_utun_and_send_fd, send_error_response};
 
+/// How long the intrusion check waits for bytes that follow the frame. A
+/// legitimate client writes the whole frame in one `write_all`, so any
+/// trailing bytes are already queued; the client no longer half-closes (it
+/// must stay open until it has received the fd), so this read must time out
+/// rather than wait for EOF.
+const TRAILING_BYTE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `true` when the peer sent bytes after the declared frame. EOF and a
+/// timeout (the current client keeps the stream open) mean "no trailing
+/// bytes". If the timeout cannot be armed the check fails CLOSED (reports
+/// trailing bytes) rather than risking a long blocking read.
+fn trailing_bytes_present(stream: &UnixStream) -> bool {
+    use std::io::Read as _;
+    if stream.set_read_timeout(Some(TRAILING_BYTE_WAIT)).is_err() {
+        return true;
+    }
+    let mut trailing = [0u8; 1];
+    let mut reader = stream;
+    matches!(reader.read(&mut trailing), Ok(n) if n > 0)
+}
+
 /// Handle a single RNUF connection from the daemon.
 ///
 /// Called by `run_privileged_helper` when it detects the `RNUF` magic bytes.
@@ -74,14 +95,10 @@ pub fn handle_utun_open_request(mut stream: UnixStream) -> Result<(), String> {
         .map_err(|e| format!("utun helper received non-UTF-8 interface name: {e}"))?;
 
     // Reject any trailing bytes after the declared name — protocol error.
-    let mut trailing = [0u8; 1];
-    match stream.read(&mut trailing) {
-        Ok(0) | Err(_) => {} // EOF or error: no trailing bytes, expected
-        Ok(_) => {
-            let msg = "utun helper received unexpected trailing bytes in RNUF frame".to_owned();
-            send_error_response(&mut stream, &msg);
-            return Err(msg);
-        }
+    if trailing_bytes_present(&stream) {
+        let msg = "utun helper received unexpected trailing bytes in RNUF frame".to_owned();
+        send_error_response(&mut stream, &msg);
+        return Err(msg);
     }
 
     if let Err(e) = validate_utun_interface_name(interface_name) {
@@ -216,6 +233,68 @@ mod tests {
 
         drop(server);
         let _ = writer.join().unwrap();
+    }
+
+    /// The client no longer half-closes: the intrusion check must return
+    /// promptly on a quiet open connection (timeout), not wait for EOF.
+    #[test]
+    fn trailing_check_times_out_on_quiet_open_connection() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        assert!(!super::trailing_bytes_present(&server));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "trailing check must not wait for client EOF"
+        );
+        drop(client);
+    }
+
+    #[test]
+    fn trailing_check_flags_injected_bytes() {
+        use std::io::Write;
+        let (mut client, server) = UnixStream::pair().unwrap();
+        client.write_all(b"x").unwrap();
+        assert!(super::trailing_bytes_present(&server));
+    }
+
+    #[test]
+    fn trailing_check_accepts_eof_from_half_closing_client() {
+        use std::net::Shutdown;
+        let (client, server) = UnixStream::pair().unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
+        assert!(!super::trailing_bytes_present(&server));
+    }
+
+    /// The helper must keep the in-flight utun fd (and stream) alive until
+    /// the client has closed its end after receiving the fd: closing both
+    /// early makes macOS shut down the utun socket's receive side.
+    #[test]
+    fn receipt_wait_blocks_until_client_closes() {
+        use crate::macos_utun_helper_unsafe::wait_for_client_receipt_within;
+        let (client, server) = UnixStream::pair().unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(client);
+        });
+        let started = std::time::Instant::now();
+        wait_for_client_receipt_within(&server, std::time::Duration::from_secs(5));
+        let waited = started.elapsed();
+        closer.join().unwrap();
+        assert!(
+            waited >= std::time::Duration::from_millis(250),
+            "returned before the client closed: {waited:?}"
+        );
+        assert!(waited < std::time::Duration::from_secs(4));
+    }
+
+    #[test]
+    fn receipt_wait_is_bounded_when_client_never_closes() {
+        use crate::macos_utun_helper_unsafe::wait_for_client_receipt_within;
+        let (client, server) = UnixStream::pair().unwrap();
+        let started = std::time::Instant::now();
+        wait_for_client_receipt_within(&server, std::time::Duration::from_millis(200));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        drop(client);
     }
 
     /// On `open_utun_and_send_fd` failure path, server must send a 0xFF

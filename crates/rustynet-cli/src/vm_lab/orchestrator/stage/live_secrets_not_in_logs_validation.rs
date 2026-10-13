@@ -32,7 +32,24 @@ fn verify_report_artifact(report_dir: &std::path::Path) -> Result<(), String> {
 ///
 /// Same literal as `ENROLLMENT_SECRET_PATH` in the production installer and
 /// the negative-control enrollment replay.
-const ENROLLMENT_SECRET_PATH: &str = "/var/lib/rustynet/keys/enrollment.secret";
+///
+/// Per-OS: the deployed daemon's seeded secret path differs by service
+/// manager — launchd passes `${STATE_ROOT}/keys/enrollment.secret` with
+/// `STATE_ROOT=/usr/local/var/rustynet`
+/// (scripts/bootstrap/macos/Install-RustyNetMacosService.sh +
+/// Bootstrap-RustyNetMacos.sh). The Linux literal is byte-identical to the
+/// pre-port const. Everything else fails closed: probing a guessed path
+/// would forge either custody witness.
+fn enrollment_secret_path_for(platform: VmGuestPlatform) -> Result<&'static str, String> {
+    match platform {
+        VmGuestPlatform::Linux => Ok("/var/lib/rustynet/keys/enrollment.secret"),
+        VmGuestPlatform::Macos => Ok("/usr/local/var/rustynet/keys/enrollment.secret"),
+        other => Err(format!(
+            "secrets-not-in-logs custody witness has no enrollment-secret state path for \
+             platform {other:?} (fail closed)"
+        )),
+    }
+}
 
 pub struct LiveSecretsNotInLogsValidationStage;
 
@@ -77,13 +94,18 @@ impl OrchestrationStage for LiveSecretsNotInLogsValidationStage {
         // carry the secret (seeded by install-systemd for its role), and a
         // client-daemon node must NOT (the bootstrap no longer seeds it
         // unconditionally — a non-admin secret is a production-parity
-        // violation, never absorbed).
+        // violation, never absorbed). Each node is probed at the path its own
+        // deployed daemon was seeded with (Linux /var/lib, macOS /usr/local/var).
         for (params, want_present) in [(&admin_params, true), (&client_params, false)] {
+            let secret_path = match enrollment_secret_path_for(params.platform) {
+                Ok(path) => path,
+                Err(e) => return StageOutcome::Failed(e),
+            };
             match remote_probe(
                 ctx,
                 &params.alias,
                 if want_present { "test -s" } else { "test -e" },
-                ENROLLMENT_SECRET_PATH,
+                secret_path,
             ) {
                 Ok(code) if (code == 0) == want_present => {}
                 Ok(code) => {
@@ -91,6 +113,7 @@ impl OrchestrationStage for LiveSecretsNotInLogsValidationStage {
                         &params.alias,
                         want_present,
                         code,
+                        secret_path,
                     ));
                 }
                 Err(err) => return StageOutcome::Failed(err),
@@ -120,6 +143,16 @@ impl OrchestrationStage for LiveSecretsNotInLogsValidationStage {
             Ok(value) => value,
             Err(err) => return StageOutcome::Failed(err),
         };
+        // The binary must scan the ADMIN node's own log sources: thread the
+        // node's platform tag so it collects launchd/unified-log evidence on a
+        // macOS admin instead of a journald argv that cannot exist there.
+        let admin_platform_tag = match crate::vm_lab::orchestrator::stage::desktop_platform_tag(
+            admin_params.platform,
+            "secrets-not-in-logs validator target",
+        ) {
+            Ok(tag) => tag,
+            Err(err) => return StageOutcome::Failed(err),
+        };
 
         let result = std::process::Command::new("cargo")
             .args([
@@ -136,6 +169,8 @@ impl OrchestrationStage for LiveSecretsNotInLogsValidationStage {
                 identity_file,
                 "--target-host",
                 &admin_target,
+                "--platform",
+                admin_platform_tag,
                 "--report-path",
                 report_path_str,
                 "--log-path",
@@ -178,6 +213,7 @@ struct ResolvedParams {
     user: String,
     identity_file: std::path::PathBuf,
     known_hosts: std::path::PathBuf,
+    platform: VmGuestPlatform,
 }
 
 /// Pure daemon-role selection: the first assignment whose role maps to
@@ -239,6 +275,7 @@ fn ssh_params_for_daemon_role(
         user,
         identity_file: params.identity_file,
         known_hosts: params.known_hosts,
+        platform: adapter.platform(),
     })
 }
 
@@ -268,18 +305,25 @@ fn remote_probe(
 /// The named failure for a violated custody witness: `want_present` is the
 /// ADMIN leg (secret must exist, seeded by install-systemd for the admin
 /// role); `!want_present` is the CLIENT leg (secret must be absent so the
-/// daemon's enrollment IPC stays fail-closed).
-fn enrollment_secret_witness_error(alias: &str, want_present: bool, exit: i32) -> String {
+/// daemon's enrollment IPC stays fail-closed). `path` is the exact path the
+/// probe ran against — the witness names what it actually checked, which
+/// differs per node platform.
+fn enrollment_secret_witness_error(
+    alias: &str,
+    want_present: bool,
+    exit: i32,
+    path: &str,
+) -> String {
     if want_present {
         format!(
-            "admin-daemon node {alias} has NO enrollment secret at {ENROLLMENT_SECRET_PATH} \
+            "admin-daemon node {alias} has NO enrollment secret at {path} \
              (probe exit {exit}); `ops install-systemd` seeds admin-role nodes and the e2e \
              bootstrap no longer seeds unconditionally (AQ-68 lab/production alignment) — \
              the enrollment code path cannot be exercised here (fail closed)"
         )
     } else {
         format!(
-            "non-admin node {alias} CARRIES an enrollment secret at {ENROLLMENT_SECRET_PATH}; \
+            "non-admin node {alias} CARRIES an enrollment secret at {path}; \
              non-admin nodes must stay secretless so the daemon's enrollment IPC stays \
              fail-closed (production-parity custody witness, fail closed)"
         )
@@ -420,13 +464,15 @@ mod tests {
 
     #[test]
     fn custody_witness_errors_name_the_violated_boundary() {
-        let admin_absent = enrollment_secret_witness_error("exit-1", true, 1);
+        let linux_path = enrollment_secret_path_for(VmGuestPlatform::Linux).expect("linux");
+        let admin_absent = enrollment_secret_witness_error("exit-1", true, 1, linux_path);
         assert!(
             admin_absent.contains("admin-daemon node exit-1 has NO enrollment secret"),
             "{admin_absent}"
         );
         assert!(admin_absent.contains("fail closed"), "{admin_absent}");
-        let client_present = enrollment_secret_witness_error("client-1", false, 0);
+        assert!(admin_absent.contains(linux_path), "{admin_absent}");
+        let client_present = enrollment_secret_witness_error("client-1", false, 0, linux_path);
         assert!(
             client_present.contains("non-admin node client-1 CARRIES an enrollment secret"),
             "{client_present}"
@@ -435,5 +481,33 @@ mod tests {
             client_present.contains("production-parity custody witness"),
             "{client_present}"
         );
+    }
+
+    #[test]
+    fn enrollment_secret_paths_match_each_deployed_daemon_seeded_location() {
+        assert_eq!(
+            enrollment_secret_path_for(VmGuestPlatform::Linux).expect("linux"),
+            "/var/lib/rustynet/keys/enrollment.secret",
+            "the Linux path is byte-identical to the pre-port const"
+        );
+        assert_eq!(
+            enrollment_secret_path_for(VmGuestPlatform::Macos).expect("macos"),
+            "/usr/local/var/rustynet/keys/enrollment.secret",
+            "the launchd plist passes ${{STATE_ROOT}}/keys/enrollment.secret with \
+             STATE_ROOT=/usr/local/var/rustynet"
+        );
+    }
+
+    #[test]
+    fn custody_witness_fails_closed_on_platforms_without_a_state_path() {
+        for platform in [
+            VmGuestPlatform::Windows,
+            VmGuestPlatform::Ios,
+            VmGuestPlatform::Android,
+        ] {
+            let err = enrollment_secret_path_for(platform).expect_err("fail closed");
+            assert!(err.contains("fail closed"), "{err}");
+            assert!(err.contains("enrollment-secret state path"), "{err}");
+        }
     }
 }

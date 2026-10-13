@@ -24,6 +24,12 @@ pub const MACOS_RUSTYNET_RELAY_PATH: &str = "/usr/local/bin/rustynet-relay";
 pub const MACOS_SERVICE_LABEL: &str = "com.rustynet.daemon";
 pub const MACOS_STATE_ROOT: &str = "/usr/local/var/rustynet";
 pub const MACOS_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
+/// WireGuard passphrase file minted by the lab bootstrap
+/// (`BOOTSTRAP_DIR` in `Bootstrap-RustyNetMacos.sh`): the same passphrase
+/// encrypts the gossip signing secret, and the daemon's plist env points
+/// `RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE` here.
+pub const MACOS_BOOTSTRAP_DIR: &str = "/usr/local/var/rustynet/bootstrap";
+
 pub const MACOS_DAEMON_SOCKET: &str = "/private/var/run/rustynet/rustynetd.sock";
 /// Privileged-helper launchd label (`Install-RustyNetMacosService.sh`).
 pub const MACOS_PRIVILEGED_HELPER_LABEL: &str = "com.rustynet.privileged-helper";
@@ -61,6 +67,30 @@ static BOOTSTRAP_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh");
 static INSTALL_SERVICE_SCRIPT: &str =
     include_str!("../../../../../../scripts/bootstrap/macos/Install-RustyNetMacosService.sh");
+// The bootstrap script verifies a downloaded/staged release with this helper,
+// which it resolves "next to this script" (`PLIST_SCRIPT_DIR`). It must be
+// uploaded beside `/tmp/rn_macos_bootstrap.sh` or the bootstrap exits with
+// "release verifier helper not executable" (found by the first macOS live run).
+static VERIFY_RELEASE_HELPER: &str =
+    include_str!("../../../../../../scripts/bootstrap/macos/Verify-RustyNetRelease.sh");
+const VERIFY_RELEASE_HELPER_REMOTE: &str = "/tmp/Verify-RustyNetRelease.sh";
+
+/// Upload `Verify-RustyNetRelease.sh` next to the uploaded bootstrap script.
+fn upload_release_verifier_helper(conn: &NodeConnection) -> Result<(), AdapterError> {
+    let helper_tmp = write_temp_file(
+        "rn_macos_verify_release_",
+        ".sh",
+        VERIFY_RELEASE_HELPER.as_bytes(),
+    )?;
+    let result = ssh::scp_to(
+        conn,
+        helper_tmp.as_path(),
+        VERIFY_RELEASE_HELPER_REMOTE,
+        SHORT_TIMEOUT,
+    );
+    let _ = std::fs::remove_file(&helper_tmp);
+    result
+}
 // Phase 23 orchestrator-side wrappers (per-OS dispatch from
 // the retired bash orchestrator's bootstrap_host_worker). Compiled
 // in for tests only so the FNV-1a parity guard and the input-validation
@@ -80,13 +110,47 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(1800);
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(300);
 const SUDO_N: &str = "sudo -n";
 
+/// Post-install verification script. The state root and keys dir are root-owned (0700): an
+/// unprivileged ssh user (the macOS lab guest uses `mac`) gets "Permission denied", and a
+/// bare `test -f` then fails silently with an empty error, so every state check runs as
+/// root. The enrollment secret mints enrollment tokens, so it exists on admin-role nodes
+/// only (the bootstrap's `manage_enrollment_secret`): an admin node must carry it at 0600
+/// and every other node must NOT (live macOS run46: requiring it on a client failed a
+/// correct bootstrap with an empty remote error).
+fn macos_post_install_verify_script(daemon_node_role: &str) -> String {
+    let enrollment_check = if daemon_node_role == "admin" {
+        format!(
+            "sudo -n test -f {MACOS_ENROLLMENT_SECRET_PATH} && \
+             test $(sudo -n stat -f '%Mp%Lp' {MACOS_ENROLLMENT_SECRET_PATH}) = '0600'"
+        )
+    } else {
+        format!("! sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}")
+    };
+    format!(
+        "test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
+         sudo -n test -f {MACOS_KEYS_DIR}/wireguard.pub && \
+         {enrollment_check}"
+    )
+}
+
 /// Bootstrap the daemon on a macOS host. Transfers the source archive and
 /// bootstrap script, runs the bootstrap, waits for the daemon socket.
+///
+/// `lab_throwaway_release_manifest`: LAB-ONLY seam (default OFF). When
+/// true, a throwaway per-run Ed25519 seed is minted under the report dir
+/// (0600, deleted when the install ends), a release manifest signing the
+/// exact artifacts being shipped is produced in-process, scp'd to the
+/// guest, and the bootstrap env is extended with
+/// `RUSTYNET_RELEASE_MANIFEST` / `RUSTYNET_RELEASE_PINNED_KEY_HEX` so the
+/// guest's signed-release verification passes against lab-built artifacts.
+/// The verification logic itself is untouched — see
+/// `macos_manifest_seam` for the threat-model notes.
 pub fn install_daemon(
     conn: &NodeConnection,
     alias: &str,
     source: &SourceArchive,
     ctx: &OrchestrationContext,
+    lab_throwaway_release_manifest: bool,
 ) -> Result<InstallReport, AdapterError> {
     let role = ctx
         .assignments
@@ -126,10 +190,24 @@ pub fn install_daemon(
     // Absent manifest = normal build-on-guest run, unchanged.
     let prebuilt_binaries = host_cross_build::read_host_cross_binaries(&ctx.report_dir, alias)
         .map_err(|message| AdapterError::Protocol { message })?;
+    // LAB-ONLY seam: sign a throwaway manifest for exactly the artifacts
+    // this install ships. The seed guard drops on every exit path below,
+    // deleting the signing material from the host.
+    let seam = if lab_throwaway_release_manifest {
+        Some(super::macos_manifest_seam::LabManifestSeam::run(
+            &ctx.report_dir,
+            source.path(),
+            prebuilt_binaries.as_deref().unwrap_or(&[]),
+        )?)
+    } else {
+        None
+    };
     let mut env_content = build_bootstrap_env(&node_id, &role, ctx)?;
     if prebuilt_binaries.is_some() {
         env_content.push_str("\nRN_PREBUILT_BINARIES=1\nRN_PREBUILT_DIR=/tmp/rn_prebuilt\n");
     }
+    // OFF path must be byte-identical to the pre-seam behaviour.
+    env_content = super::macos_manifest_seam::append_lab_manifest_env(env_content, seam.as_ref())?;
     let env_tmp = write_temp_file("rn_macos_env_", ".env", env_content.as_bytes())?;
 
     ssh::scp_to(
@@ -144,6 +222,7 @@ pub fn install_daemon(
         "/tmp/Install-RustyNetMacosService.sh",
         SHORT_TIMEOUT,
     )?;
+    upload_release_verifier_helper(conn)?;
     ssh::scp_to(
         conn,
         env_tmp.as_path(),
@@ -154,6 +233,27 @@ pub fn install_daemon(
     // files) timed the equivalent Linux transfer out cross-LAN. Use the build
     // budget for the bulk copy, mirroring the second install site below.
     ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
+    // LAB-ONLY seam: ship the signed manifest(s) the bootstrap env points at.
+    if let Some(seam) = &seam {
+        ssh::scp_to(
+            conn,
+            seam.manifest_host_path(),
+            super::macos_manifest_seam::LAB_MANIFEST_GUEST_PATH,
+            SHORT_TIMEOUT,
+        )?;
+        if let Some(prebuilt_manifest) = seam.prebuilt_manifest_host_path() {
+            ssh::scp_to(
+                conn,
+                prebuilt_manifest,
+                super::macos_manifest_seam::LAB_PREBUILT_MANIFEST_GUEST_PATH,
+                SHORT_TIMEOUT,
+            )?;
+        }
+        eprintln!(
+            "[lab-manifest-seam] {alias}: signed throwaway release manifest shipped to {LAB_GUEST}",
+            LAB_GUEST = super::macos_manifest_seam::LAB_MANIFEST_GUEST_PATH,
+        );
+    }
 
     // host-cross: ship the host-built binaries so the bootstrap stages them into
     // the build dir and skips the guest build. Names preserved (rustynetd /
@@ -198,17 +298,15 @@ pub fn install_daemon(
 
     ssh::run_remote(
         conn,
-        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
          sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env",
         BUILD_TIMEOUT,
     )?;
 
-    let verify_script = format!(
-        "test -x {MACOS_RUSTYNETD_PATH} && test -x {MACOS_RUSTYNET_PATH} && \
-         test -f {MACOS_KEYS_DIR}/wireguard.pub && \
-         test -f {MACOS_ENROLLMENT_SECRET_PATH} && \
-         test $(stat -f '%Mp%Lp' {MACOS_ENROLLMENT_SECRET_PATH}) = '0600'",
-    );
+    let daemon_node_role = role
+        .daemon_node_role_for_platform(&VmGuestPlatform::Macos)
+        .map_err(|message| AdapterError::Protocol { message })?;
+    let verify_script = macos_post_install_verify_script(daemon_node_role);
     ssh::run_remote(conn, &verify_script, SHORT_TIMEOUT)?;
 
     // Wait for the daemon socket so the next stage (collect_pubkeys)
@@ -304,6 +402,7 @@ pub fn install_daemon_from_workdir(
         "/tmp/Install-RustyNetMacosService.sh",
         SHORT_TIMEOUT,
     )?;
+    upload_release_verifier_helper(conn)?;
 
     let _ = std::fs::remove_file(&env_tmp);
     let _ = std::fs::remove_file(&script_tmp);
@@ -380,7 +479,7 @@ pub fn install_daemon_from_workdir(
         // binaries, the original root cause of "membership role preflight
         // failed" reappearing after a fix had merged.)
         ssh::scp_to(conn, source.path(), "/tmp/rn_source.tar.gz", BUILD_TIMEOUT)?;
-        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
              sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
             .to_owned()
@@ -388,7 +487,7 @@ pub fn install_daemon_from_workdir(
         // No fresh archive carried, but a workdir exists (e.g. an operator
         // manually synced it). Build from it.
         format!(
-            "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+            "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
              cd '{workdir}' && tar -czf /tmp/rn_source.tar.gz . && \
              echo 'SOURCE_ARCHIVE=/tmp/rn_source.tar.gz' >> /tmp/rn_macos_bootstrap.env && \
              sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
@@ -397,7 +496,7 @@ pub fn install_daemon_from_workdir(
         // No workdir AND no source — last-resort legacy path: rely on
         // SKIP_BUILD=1 so the bootstrap re-runs the service-install
         // phase against whatever binary is already on disk.
-        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh && \
+        "chmod 700 /tmp/rn_macos_bootstrap.sh /tmp/Install-RustyNetMacosService.sh /tmp/Verify-RustyNetRelease.sh && \
              echo 'SKIP_BUILD=1' >> /tmp/rn_macos_bootstrap.env && \
              echo 'SOURCE_ARCHIVE=/dev/null' >> /tmp/rn_macos_bootstrap.env && \
              sudo -n bash /tmp/rn_macos_bootstrap.sh /tmp/rn_macos_bootstrap.env"
@@ -1675,6 +1774,68 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_env_without_seam_has_no_manifest_lines() {
+        let ctx = make_ctx(NodeRole::Client);
+        let env = build_bootstrap_env("mac-node-1", &NodeRole::Client, &ctx).expect("env");
+        assert!(
+            !env.contains("RUSTYNET_RELEASE_MANIFEST="),
+            "lab manifest env must appear only when the seam is on: {env}"
+        );
+        assert!(
+            !env.contains("RUSTYNET_RELEASE_PINNED_KEY_HEX="),
+            "pinned-key env must appear only when the seam is on: {env}"
+        );
+        assert!(
+            !env.contains("RN_PREBUILT_RELEASE_MANIFEST="),
+            "prebuilt manifest override must appear only when the seam is on: {env}"
+        );
+        assert!(
+            !env.contains("SOURCE_ARCHIVE="),
+            "SOURCE_ARCHIVE belongs to the workdir path / seam, not the default env: {env}"
+        );
+    }
+
+    /// Anti-unwiring pin: the lab seam must stay wired end-to-end. If any
+    /// of these strings disappears, the seam silently stopped being
+    /// reachable from the orchestrator (or stopped refusing the workdir
+    /// combination) and this test fails in both the lib and bin compile.
+    #[test]
+    fn lab_manifest_seam_wiring_is_pinned_in_source() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let adapter_dir = manifest_dir.join("src/vm_lab/orchestrator/adapter");
+        let install_src =
+            std::fs::read_to_string(adapter_dir.join("macos_install.rs")).expect("install src");
+        assert!(
+            install_src.contains("if lab_throwaway_release_manifest {"),
+            "install_daemon must gate the seam on the flag"
+        );
+        assert!(
+            install_src.contains("append_lab_manifest_env(env_content, seam.as_ref())"),
+            "install_daemon must thread the seam through append_lab_manifest_env"
+        );
+        assert!(
+            install_src.contains("LAB_MANIFEST_GUEST_PATH"),
+            "install_daemon must scp the signed manifest to the guest path"
+        );
+        assert!(
+            install_src.contains("prebuilt_manifest_host_path")
+                && install_src.contains("LAB_PREBUILT_MANIFEST_GUEST_PATH"),
+            "install_daemon must scp the prebuilt binaries manifest when one was signed"
+        );
+        let macos_src = std::fs::read_to_string(adapter_dir.join("macos.rs")).expect("macos src");
+        assert!(
+            macos_src.contains("lab manifest seam cannot be combined with a remote workdir"),
+            "the adapter must refuse seam+workdir (guest-side tar cannot be host-signed)"
+        );
+        let factory_src =
+            std::fs::read_to_string(adapter_dir.join("factory.rs")).expect("factory src");
+        assert!(
+            factory_src.contains("with_lab_release_manifest_seam(lab_throwaway_release_manifest)"),
+            "node_adapter_for must forward the flag to the macOS adapter"
+        );
+    }
+
+    #[test]
     fn bootstrap_scripts_are_non_empty() {
         assert!(
             !BOOTSTRAP_SCRIPT.is_empty(),
@@ -2714,6 +2875,63 @@ mod tests {
         assert!(MACOS_KEYS_DIR.starts_with(MACOS_STATE_ROOT));
     }
 
+    /// Live macOS run45: the bootstrap seeded the enrollment secret on EVERY node, so a
+    /// non-admin (client) macOS node carried the HMAC key that mints enrollment tokens and
+    /// `live_secrets_not_in_logs_validation` correctly failed it. Only admin nodes get one,
+    /// and a leftover from an earlier admin bootstrap of the same guest is removed.
+    #[test]
+    fn post_install_verify_requires_the_enrollment_secret_on_admin_nodes_only() {
+        let admin = macos_post_install_verify_script("admin");
+        assert!(
+            admin.contains(&format!("sudo -n test -f {MACOS_ENROLLMENT_SECRET_PATH}")),
+            "admin must carry the enrollment secret: {admin}"
+        );
+        assert!(
+            admin.contains("= '0600'"),
+            "admin secret must be 0600: {admin}"
+        );
+        for role in ["client", "blind_exit"] {
+            let script = macos_post_install_verify_script(role);
+            assert!(
+                script.contains(&format!("! sudo -n test -e {MACOS_ENROLLMENT_SECRET_PATH}")),
+                "{role} must be secretless: {script}"
+            );
+            assert!(
+                !script.contains("test -f /usr/local/var/rustynet/keys/enrollment.secret"),
+                "{role} must not require the secret: {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_seeds_the_enrollment_secret_on_admin_nodes_only() {
+        let main_calls = BOOTSTRAP_SCRIPT
+            .matches("\n  manage_enrollment_secret\n")
+            .count();
+        assert_eq!(
+            main_calls, 2,
+            "both main branches must go through the role gate"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT.contains("\n  provision_enrollment_secret\n"),
+            "no main branch may call the unconditional provisioner directly"
+        );
+        let start = BOOTSTRAP_SCRIPT
+            .find("manage_enrollment_secret() {")
+            .expect("role gate defined");
+        let rest = &BOOTSTRAP_SCRIPT[start..];
+        let end = rest.find("\n}\n").expect("role gate closed");
+        let body = &rest[..end];
+        assert!(
+            body.contains("\"${DAEMON_NODE_ROLE:-}\" == \"admin\""),
+            "the gate must key on the admin role: {body}"
+        );
+        assert!(
+            body.contains("secure_remove_file \"${secret_path}\""),
+            "a leftover secret on a non-admin node must be removed: {body}"
+        );
+    }
+
     #[test]
     fn bootstrap_script_provisions_enrollment_secret() {
         assert!(
@@ -3261,6 +3479,182 @@ mod tests {
             INSTALL_SERVICE_SCRIPT
                 .contains("Audited Linux→macOS plist flag parity (HIGH 4 reviewer fold-in)"),
             "install script must keep the audited-omission header intact"
+        );
+    }
+
+    /// The lab macOS bootstrap must mint a gossip signing secret exactly the
+    /// way the Linux bootstrap does (`ops_e2e::execute_ops_e2e_bootstrap_host`
+    /// runs `rustynetd key init-gossip ... --force` there). Run25
+    /// (`gossip_convergence_validation`) showed the macOS path never minted
+    /// one, so the daemon started with gossip dormant, the membership entry
+    /// carried an unaligned WireGuard pubkey, and the exit node registered
+    /// zero gossip peers — the stage failure this test guards against.
+    ///
+    /// The mint must be idempotent (skip when the secret already exists so a
+    /// re-run preserves the published gossip identity), fail closed when the
+    /// WireGuard passphrase file is missing (the same passphrase encrypts the
+    /// gossip secret), lock the blob to the service account (rustynetd 0600 —
+    /// `key_material::validate_secret_file_security` rejects anything else),
+    /// and never print key material.
+    #[test]
+    fn bootstrap_script_provisions_gossip_signing_secret() {
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("provision_gossip_signing_secret() {"),
+            "bootstrap must define provision_gossip_signing_secret"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("key init-gossip"),
+            "bootstrap must run `rustynetd key init-gossip` (D4 parity with the \
+             Linux lab bootstrap); without it the macOS gossip node stays \
+             dormant and peers register nothing"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--gossip-signing-secret \"${secret_path}\""),
+            "init-gossip must be pointed at the canonical secret path"
+        );
+        assert!(
+            BOOTSTRAP_SCRIPT.contains("--passphrase-file \"${passphrase_file}\""),
+            "init-gossip must reuse the WireGuard passphrase file so the daemon's \
+             keychain-first passphrase resolve can decrypt the gossip secret"
+        );
+        let fn_start = BOOTSTRAP_SCRIPT
+            .find("provision_gossip_signing_secret() {")
+            .expect("function present (asserted above)");
+        let fn_end = BOOTSTRAP_SCRIPT[fn_start..]
+            .find("\n}\n")
+            .map(|i| fn_start + i)
+            .expect("function must be closed");
+        let body = &BOOTSTRAP_SCRIPT[fn_start..fn_end];
+        // Always re-mint: the keychain item is bound to the storing binary's
+        // cdhash and bootstrap re-signs rustynetd on every run (live run28:
+        // an idempotent skip left the daemon unable to decrypt the secret).
+        assert!(
+            body.contains("local secret_path=\"${KEYS_DIR}/gossip.signing.secret\""),
+            "the mint must target the canonical KEYS_DIR gossip secret path"
+        );
+        assert!(
+            !body.contains("skipping mint") && !body.contains("if [[ -f \"${secret_path}\" ]]"),
+            "the mint must NOT be skipped when a secret exists: a stale keychain \
+             item bound to the previous binary's cdhash would break the daemon"
+        );
+        assert!(
+            body.contains("--force"),
+            "init-gossip must be forced so the owned keychain item is re-bound"
+        );
+        // Bounded retry for a transient System-keychain failure, never a silent
+        // pass: each failed attempt is logged and exhausting them aborts.
+        assert!(
+            body.contains("init-gossip attempt ${gossip_attempt}/3 failed")
+                && body.contains("key init-gossip failed after 3 attempts"),
+            "the mint must retry a bounded number of times and still fail loudly"
+        );
+        // Fail closed without the passphrase file.
+        let guard = "exit 1";
+        assert!(
+            body.contains("\"${BOOTSTRAP_DIR}/wireguard.passphrase\""),
+            "the mint must read the WireGuard passphrase from the canonical \
+             bootstrap path"
+        );
+        assert!(
+            body.contains(guard),
+            "the mint must fail closed when the passphrase file is missing"
+        );
+        // Service-account custody.
+        assert!(
+            body.contains("chown rustynetd:rustynetd \"${secret_path}\""),
+            "gossip secret must be owned by the service account; \
+             key_material::validate_secret_file_security rejects any other \
+             owner for the daemon's euid"
+        );
+        assert!(
+            body.contains("chmod 0600 \"${secret_path}\""),
+            "gossip secret must be mode 0600"
+        );
+        // Live run27: `key init-gossip` failed its post-write custody check
+        // because the keys directory was owned by the service account. The
+        // directory must be root-owned only for the mint and handed back on
+        // BOTH the success and failure paths.
+        assert!(
+            body.contains("chown root:wheel \"${KEYS_DIR}\""),
+            "the keys directory must be root-owned while root mints (custody \
+             check requires directory owner == writer)"
+        );
+        assert_eq!(
+            body.matches("chown rustynetd:rustynetd \"${KEYS_DIR}\"")
+                .count(),
+            3,
+            "the keys directory must be handed back to the service account on \
+             the failure path, the success path, and the interrupt (EXIT) trap"
+        );
+        // An interrupt between the root chown and the hand-back must not leave
+        // the keys directory root-owned (the daemon could not traverse to any
+        // key material).
+        assert!(
+            body.contains("trap 'chown rustynetd:rustynetd \"${KEYS_DIR}\"' EXIT"),
+            "an EXIT trap must restore the keys directory ownership"
+        );
+        assert!(
+            body.contains("trap - EXIT"),
+            "the trap must be disarmed after the hand-back"
+        );
+        assert!(
+            !BOOTSTRAP_SCRIPT
+                .contains("Idempotent: if the secret already exists it is left untouched"),
+            "the header comment must not contradict the always-re-mint behaviour"
+        );
+    }
+
+    /// The gossip mint must be wired into BOTH main branches of the bootstrap
+    /// (SKIP_BUILD and full build), and it must run BEFORE
+    /// `install_launchd_service`: the install script emits the plist's
+    /// gossip env fragment only when the secret file already exists, so a
+    /// mint after install leaves the daemon dormant until the next reinstall.
+    #[test]
+    fn bootstrap_calls_gossip_mint_in_both_branches_before_service_install() {
+        let count = BOOTSTRAP_SCRIPT
+            .matches("\n  provision_gossip_signing_secret\n")
+            .count();
+        assert_eq!(
+            count, 2,
+            "provision_gossip_signing_secret must be invoked exactly twice \
+             (once per main branch); found {count}"
+        );
+        for call_site in BOOTSTRAP_SCRIPT
+            .match_indices("\n  provision_gossip_signing_secret\n")
+            .map(|(i, _)| i)
+        {
+            assert!(
+                BOOTSTRAP_SCRIPT[call_site..].contains("\n  install_launchd_service\n"),
+                "the gossip mint must precede install_launchd_service so the \
+                 plist renders the gossip env fragment"
+            );
+        }
+    }
+
+    /// The service install script must gate the daemon's gossip env on the
+    /// secret's existence and point both env vars at the canonical paths, so
+    /// a host whose bootstrap minted the secret gets an ACTIVE gossip node
+    /// and one that did not stays explicitly (not silently) dormant.
+    #[test]
+    fn install_service_script_gates_gossip_env_on_secret_presence() {
+        assert!(
+            INSTALL_SERVICE_SCRIPT
+                .contains("if [[ -f \"${STATE_ROOT}/keys/gossip.signing.secret\" ]]; then"),
+            "gossip env fragment must be gated on the secret file existing"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<key>RUSTYNET_GOSSIP_SIGNING_SECRET</key>"),
+            "plist must pass RUSTYNET_GOSSIP_SIGNING_SECRET so the daemon loads \
+             the gossip identity (daemon.rs GOSSIP_SIGNING_SECRET_PATH_ENV)"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("<key>RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE</key>"),
+            "plist must pass RUSTYNET_GOSSIP_SIGNING_SECRET_PASSPHRASE; a \
+             one-sided env pair is a hard daemon startup error"
+        );
+        assert!(
+            INSTALL_SERVICE_SCRIPT.contains("${GOSSIP_ENV_FRAGMENT}"),
+            "the rendered plist must interpolate the gossip env fragment"
         );
     }
 

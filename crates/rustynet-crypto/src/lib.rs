@@ -863,6 +863,19 @@ pub fn store_macos_generic_password(
 ) -> Result<(), CryptoError> {
     validate_macos_keychain_label("service", service)?;
     validate_macos_keychain_label("account", account)?;
+    // A root writer (bootstrap / installer provisioning key custody for the
+    // launchd daemon) always targets the System keychain, never the default
+    // one. `sudo` from a console user's session leaves THAT user's login
+    // keychain as root's default, so the default-first path below silently
+    // stored the gossip signing key in the operator's login keychain, where
+    // the daemon (uid rustynetd, no login session) can never read it: the
+    // daemon then died at start with "gossip signing secret load failed: os
+    // secure store unavailable" (live macOS lab runs 27-29). The daemon only
+    // ever reads the System keychain, and the owned store deletes any prior
+    // item and re-binds it to this binary, so re-minting also works.
+    if nix::unistd::Uid::effective().is_root() {
+        return store_macos_generic_password_system_keychain_owned(service, account, secret);
+    }
     // Default keychain first. Works for an interactive operator/CLI run from
     // a login shell — the user-session keychain is the canonical place for
     // per-user secrets.
@@ -6465,6 +6478,40 @@ mod tests {
         assert!(
             window.contains("store_macos_generic_password_system_keychain("),
             "fallback to System.keychain must be wired (Gap H)"
+        );
+    }
+
+    /// A root writer must store into the System keychain (owned store), never
+    /// the default keychain: under `sudo` from a console user the default is
+    /// that user's login keychain, which the launchd daemon cannot read
+    /// (live macOS lab runs 27-29: gossip key stored in the operator's login
+    /// keychain -> daemon "os secure store unavailable"). The root branch must
+    /// come BEFORE the default-keychain attempt.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn store_macos_generic_password_root_writer_targets_system_keychain_first() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body =
+            std::fs::read_to_string(crate_root.join("src/lib.rs")).expect("crypto source readable");
+        let start = body
+            .find("pub fn store_macos_generic_password(")
+            .expect("store_macos_generic_password must remain present");
+        let next_fn = body[start..]
+            .find("\n#[cfg")
+            .expect("store_macos_generic_password must be followed by another macOS-gated item");
+        let window = &body[start..start + next_fn];
+        let root_at = window
+            .find("nix::unistd::Uid::effective().is_root()")
+            .expect("root branch must exist");
+        let owned_at = window
+            .find("store_macos_generic_password_system_keychain_owned(service, account, secret)")
+            .expect("root branch must use the owned System-keychain store");
+        let default_at = window
+            .find("set_generic_password(service, account, secret)")
+            .expect("default-keychain attempt must remain for non-root callers");
+        assert!(
+            root_at < owned_at && owned_at < default_at,
+            "the root/System-keychain branch must precede the default-keychain attempt"
         );
     }
 

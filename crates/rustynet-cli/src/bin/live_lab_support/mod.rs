@@ -105,6 +105,150 @@ pub const LINUX_ENROLLMENT_SECRET_PATH: &str = "/var/lib/rustynet/keys/enrollmen
 /// Daemon-managed; created on first consume, so its absence means "nothing has
 /// been consumed here yet", not "misconfigured".
 pub const LINUX_ENROLLMENT_LEDGER_PATH: &str = "/var/lib/rustynet/rustynetd.enrollment.ledger";
+
+/// Deployed macOS state paths. The launchd daemon
+/// (`scripts/bootstrap/macos/Install-RustyNetMacosService.sh`) passes
+/// `${STATE_ROOT}/keys/enrollment.secret` and
+/// `${STATE_ROOT}/keys/rustynetd.enrollment.ledger` with
+/// `STATE_ROOT=/usr/local/var/rustynet`
+/// (`scripts/bootstrap/macos/Bootstrap-RustyNetMacos.sh`), so these are the
+/// same daemon-used files the Linux consts are on systemd guests.
+pub const MACOS_ENROLLMENT_SECRET_PATH: &str = "/usr/local/var/rustynet/keys/enrollment.secret";
+pub const MACOS_ENROLLMENT_LEDGER_PATH: &str =
+    "/usr/local/var/rustynet/keys/rustynetd.enrollment.ledger";
+/// Mirrors `rustynetd::macos_key_custody::MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH`
+/// / `MACOS_WG_KEYS_DIR` (the reviewed macOS custody layout: 0600 key file in
+/// a 0700 rustynetd-owned dir).
+pub const MACOS_WG_ENCRYPTED_KEY_PATH: &str = "/usr/local/var/rustynet/keys/wireguard.key.enc";
+pub const MACOS_WG_KEYS_DIR: &str = "/usr/local/var/rustynet/keys";
+/// Per-OS assignment-refresh env paths. Matches
+/// `scripts/e2e/live_lab_common.sh` `assignment_refresh_env_path` exactly:
+/// the macOS bootstrap's CONFIG_ROOT is `/usr/local/etc/rustynet` and the
+/// Windows config root is `C:\ProgramData\RustyNet\config`.
+pub const MACOS_ASSIGNMENT_REFRESH_ENV_PATH: &str =
+    "/usr/local/etc/rustynet/assignment-refresh.env";
+pub const WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH: &str =
+    "C:\\ProgramData\\RustyNet\\config\\assignment-refresh.env";
+
+/// Enrollment-secret path the deployed daemon was seeded with, per OS.
+/// Windows fails closed: no Windows enrollment-secret state path is wired up.
+pub fn enrollment_secret_path(platform: LiveLabPlatform) -> Result<&'static str, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(LINUX_ENROLLMENT_SECRET_PATH),
+        LiveLabPlatform::MacOs => Ok(MACOS_ENROLLMENT_SECRET_PATH),
+        LiveLabPlatform::Windows => Err(
+            "windows live-lab validators have no enrollment-secret state path wired up yet"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Enrollment-ledger path the deployed daemon manages, per OS.
+pub fn enrollment_ledger_path(platform: LiveLabPlatform) -> Result<&'static str, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(LINUX_ENROLLMENT_LEDGER_PATH),
+        LiveLabPlatform::MacOs => Ok(MACOS_ENROLLMENT_LEDGER_PATH),
+        LiveLabPlatform::Windows => Err(
+            "windows live-lab validators have no enrollment-ledger state path wired up yet"
+                .to_owned(),
+        ),
+    }
+}
+
+/// `(encrypted key file, keys dir)` the deployed daemon enforces custody on,
+/// per OS. Windows fails closed: its custody model is in-memory/DPAPI, not a
+/// POSIX key file, so there is no honest mode probe to run.
+pub fn wg_encrypted_key_paths(
+    platform: LiveLabPlatform,
+) -> Result<(&'static str, &'static str), String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok((
+            "/var/lib/rustynet/keys/wireguard.key.enc",
+            "/var/lib/rustynet/keys",
+        )),
+        LiveLabPlatform::MacOs => Ok((MACOS_WG_ENCRYPTED_KEY_PATH, MACOS_WG_KEYS_DIR)),
+        LiveLabPlatform::Windows => Err(
+            "windows key custody is in-memory/DPAPI; no POSIX key file is enforced (fail closed)"
+                .to_owned(),
+        ),
+    }
+}
+
+/// Where `ops apply-lan-access-coupling` writes the refresh env file, per OS.
+pub fn assignment_refresh_env_path(platform: LiveLabPlatform) -> Result<&'static str, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok("/etc/rustynet/assignment-refresh.env"),
+        LiveLabPlatform::MacOs => Ok(MACOS_ASSIGNMENT_REFRESH_ENV_PATH),
+        LiveLabPlatform::Windows => Ok(WINDOWS_ASSIGNMENT_REFRESH_ENV_PATH),
+    }
+}
+
+/// `stat` argv that prints the octal permission bits of `path`, per OS. Both
+/// forms print bare octal digits (`600`, `755`): GNU `--format=%a` on Linux,
+/// BSD `-f %Lp` on macOS.
+pub fn stat_mode_argv(
+    platform: LiveLabPlatform,
+    path: &'static str,
+) -> Result<Vec<&'static str>, String> {
+    match platform {
+        LiveLabPlatform::Linux => Ok(vec!["stat", "--format=%a", path]),
+        LiveLabPlatform::MacOs => Ok(vec!["stat", "-f", "%Lp", path]),
+        LiveLabPlatform::Windows => {
+            Err("windows has no POSIX mode probe for the live-lab custody validator".to_owned())
+        }
+    }
+}
+
+/// Daemon unit-log collection argv, per OS: every chunk's stdout must be
+/// scanned for leaked key material. Linux returns the journald unit log
+/// (byte-identical to the pre-port argv; `--output=short-monotonic` is
+/// appended only when `with_monotonic_output`). macOS returns the unified log
+/// window for the daemon process plus the launchd StandardOut/StandardError
+/// files (`/usr/local/var/log/rustynet/`), because a plain Rust daemon does
+/// not mirror its stderr into the unified log. Windows fails closed.
+pub fn daemon_unit_log_argv(
+    platform: LiveLabPlatform,
+    lines: &'static str,
+    with_monotonic_output: bool,
+) -> Result<Vec<Vec<&'static str>>, String> {
+    match platform {
+        LiveLabPlatform::Linux => {
+            let mut argv = vec!["journalctl", "-u", "rustynetd", "-n", lines, "--no-pager"];
+            if with_monotonic_output {
+                argv.push("--output=short-monotonic");
+            }
+            Ok(vec![argv])
+        }
+        LiveLabPlatform::MacOs => Ok(vec![
+            vec![
+                "/usr/bin/log",
+                "show",
+                "--last",
+                "15m",
+                "--predicate",
+                "process == \"rustynetd\"",
+                "--style",
+                "compact",
+            ],
+            vec![
+                "/usr/bin/tail",
+                "-n",
+                lines,
+                "/usr/local/var/log/rustynet/rustynetd.log",
+            ],
+            vec![
+                "/usr/bin/tail",
+                "-n",
+                lines,
+                "/usr/local/var/log/rustynet/rustynetd-error.log",
+            ],
+        ]),
+        LiveLabPlatform::Windows => Err(
+            "windows live-lab validators have no daemon unit-log collection wired up yet"
+                .to_owned(),
+        ),
+    }
+}
 /// Where a stage points `membership verify --audit-output`. The verb's own
 /// default is CWD-relative, and an SSH command's CWD is the login user's home,
 /// so stages pin it. Inside the root-owned state dir rather than `/tmp` so the
@@ -1785,11 +1929,13 @@ pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
 #[cfg(test)]
 mod tests {
     use super::{
-        LiveLabContext, LiveLabPlatform, REMOTE_RUSTYNET_BIN, cli_invocation_parse_failure,
-        daemon_status_probe_argv, enforce_linux_only_until_validator_lands, env_flag_truthy,
-        known_hosts_lookup_host, resolved_known_hosts_candidates,
-        resolved_target_address_from_ssh_g, scp_failure_is_transient, strip_host_port, target_port,
-        wait_for_daemon_socket_ready, wait_for_daemon_socket_with_runner,
+        LiveLabContext, LiveLabPlatform, REMOTE_RUSTYNET_BIN, assignment_refresh_env_path,
+        cli_invocation_parse_failure, daemon_status_probe_argv, daemon_unit_log_argv,
+        enforce_linux_only_until_validator_lands, enrollment_ledger_path, enrollment_secret_path,
+        env_flag_truthy, known_hosts_lookup_host, resolved_known_hosts_candidates,
+        resolved_target_address_from_ssh_g, scp_failure_is_transient, stat_mode_argv,
+        strip_host_port, target_port, wait_for_daemon_socket_ready,
+        wait_for_daemon_socket_with_runner, wg_encrypted_key_paths,
     };
 
     /// The probe must be a full IPC round trip, bounded in the guest by the
@@ -2516,5 +2662,151 @@ port 22
         let candidates = resolved_known_hosts_candidates("debian@192.168.64.4:2222", resolved)
             .expect("candidates");
         assert_eq!(candidates, vec!["[192.168.64.4]:2222".to_owned()]);
+    }
+
+    #[test]
+    fn enrollment_secret_paths_match_the_deployed_daemon_seeded_locations() {
+        assert_eq!(
+            enrollment_secret_path(LiveLabPlatform::Linux).expect("linux"),
+            "/var/lib/rustynet/keys/enrollment.secret",
+            "the Linux path is byte-identical to the pre-port const"
+        );
+        assert_eq!(
+            enrollment_secret_path(LiveLabPlatform::MacOs).expect("macos"),
+            "/usr/local/var/rustynet/keys/enrollment.secret",
+            "the launchd plist passes ${{STATE_ROOT}}/keys/enrollment.secret"
+        );
+        let err = enrollment_secret_path(LiveLabPlatform::Windows).expect_err("fail closed");
+        assert!(err.contains("windows"), "{err}");
+    }
+
+    #[test]
+    fn enrollment_ledger_paths_match_the_daemon_passed_locations() {
+        assert_eq!(
+            enrollment_ledger_path(LiveLabPlatform::Linux).expect("linux"),
+            "/var/lib/rustynet/rustynetd.enrollment.ledger"
+        );
+        assert_eq!(
+            enrollment_ledger_path(LiveLabPlatform::MacOs).expect("macos"),
+            "/usr/local/var/rustynet/keys/rustynetd.enrollment.ledger"
+        );
+        assert!(enrollment_ledger_path(LiveLabPlatform::Windows).is_err());
+    }
+
+    #[test]
+    fn wg_encrypted_key_paths_match_the_reviewed_custody_layout() {
+        let (linux_key, linux_dir) = wg_encrypted_key_paths(LiveLabPlatform::Linux).expect("linux");
+        assert_eq!(linux_key, "/var/lib/rustynet/keys/wireguard.key.enc");
+        assert_eq!(linux_dir, "/var/lib/rustynet/keys");
+        let (mac_key, mac_dir) = wg_encrypted_key_paths(LiveLabPlatform::MacOs).expect("macos");
+        assert_eq!(
+            mac_key, "/usr/local/var/rustynet/keys/wireguard.key.enc",
+            "mirrors macos_key_custody::MACOS_WG_ENCRYPTED_PRIVATE_KEY_PATH"
+        );
+        assert_eq!(mac_dir, "/usr/local/var/rustynet/keys");
+        let err = wg_encrypted_key_paths(LiveLabPlatform::Windows).expect_err("fail closed");
+        assert!(err.contains("in-memory/DPAPI"), "{err}");
+    }
+
+    #[test]
+    fn assignment_refresh_env_paths_match_the_shell_lab_precedent() {
+        assert_eq!(
+            assignment_refresh_env_path(LiveLabPlatform::Linux).expect("linux"),
+            "/etc/rustynet/assignment-refresh.env"
+        );
+        assert_eq!(
+            assignment_refresh_env_path(LiveLabPlatform::MacOs).expect("macos"),
+            "/usr/local/etc/rustynet/assignment-refresh.env",
+            "matches live_lab_common.sh assignment_refresh_env_path"
+        );
+        assert_eq!(
+            assignment_refresh_env_path(LiveLabPlatform::Windows).expect("windows"),
+            "C:\\ProgramData\\RustyNet\\config\\assignment-refresh.env"
+        );
+    }
+
+    #[test]
+    fn stat_mode_argv_prints_bare_octal_on_both_posix_platforms() {
+        assert_eq!(
+            stat_mode_argv(
+                LiveLabPlatform::Linux,
+                "/var/lib/rustynet/keys/wireguard.key.enc"
+            )
+            .expect("linux"),
+            vec![
+                "stat",
+                "--format=%a",
+                "/var/lib/rustynet/keys/wireguard.key.enc"
+            ],
+            "byte-identical to the pre-port GNU stat argv"
+        );
+        assert_eq!(
+            stat_mode_argv(
+                LiveLabPlatform::MacOs,
+                "/usr/local/var/rustynet/keys/wireguard.key.enc"
+            )
+            .expect("macos"),
+            vec![
+                "stat",
+                "-f",
+                "%Lp",
+                "/usr/local/var/rustynet/keys/wireguard.key.enc"
+            ],
+            "BSD stat -f %Lp prints the same bare-octal shape"
+        );
+        assert!(stat_mode_argv(LiveLabPlatform::Windows, "C:\\key").is_err());
+    }
+
+    #[test]
+    fn daemon_unit_log_argv_linux_is_byte_identical_to_the_pre_port_journalctl() {
+        assert_eq!(
+            daemon_unit_log_argv(LiveLabPlatform::Linux, "500", true).expect("linux"),
+            vec![vec![
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "-n",
+                "500",
+                "--no-pager",
+                "--output=short-monotonic",
+            ]],
+            "the secrets stage's journald argv must not change"
+        );
+        assert_eq!(
+            daemon_unit_log_argv(LiveLabPlatform::Linux, "50", false).expect("linux"),
+            vec![vec![
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "-n",
+                "50",
+                "--no-pager",
+            ]],
+            "the custody stage's journald argv must not change"
+        );
+    }
+
+    #[test]
+    fn daemon_unit_log_argv_macos_scans_unified_log_and_launchd_log_files() {
+        let chunks = daemon_unit_log_argv(LiveLabPlatform::MacOs, "500", true).expect("macos");
+        assert_eq!(chunks.len(), 3, "unified log + stdout + stderr files");
+        assert!(
+            chunks[0].contains(&"/usr/bin/log"),
+            "{:?}",
+            "the unified-log window must target the daemon process"
+        );
+        assert!(
+            chunks[0].contains(&"process == \"rustynetd\""),
+            "predicate must scope to the daemon process"
+        );
+        assert!(
+            chunks[1].contains(&"/usr/local/var/log/rustynet/rustynetd.log"),
+            "launchd StandardOutPath file must be scanned"
+        );
+        assert!(
+            chunks[2].contains(&"/usr/local/var/log/rustynet/rustynetd-error.log"),
+            "launchd StandardErrorPath file must be scanned (a refused start logs there)"
+        );
+        assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "50", false).is_err());
     }
 }

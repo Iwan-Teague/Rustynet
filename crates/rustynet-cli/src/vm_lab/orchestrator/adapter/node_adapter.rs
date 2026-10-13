@@ -750,9 +750,15 @@ fn run_typed_role_validator<T: NodeAdapter + ?Sized>(
                 alias,
             )
         }
-        (RoleValidatorKind::GossipConvergence, VmGuestPlatform::Macos)
-        | (RoleValidatorKind::GossipConvergence, VmGuestPlatform::Windows) => Err(
-            "gossip convergence is unix-only and not minted on these lab platforms; \
+        (RoleValidatorKind::GossipConvergence, VmGuestPlatform::Macos) => {
+            gossip_convergence::validate_macos_gossip_convergence(
+                &*shell,
+                crate::vm_lab::orchestrator::adapter::macos_install::MACOS_RUSTYNET_PATH,
+                alias,
+            )
+        }
+        (RoleValidatorKind::GossipConvergence, VmGuestPlatform::Windows) => Err(
+            "gossip convergence is unix-only and Windows has no gossip transport; \
              the stage reports this as a named skip rather than dispatching"
                 .to_owned(),
         ),

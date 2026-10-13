@@ -337,6 +337,25 @@ impl MacosTunLifecycle for DirectMacosTunLifecycle {
                 "macos userspace-shared utun nonblocking setup failed for {interface_name}: {err}"
             ))
         })?;
+        // Fail closed on a utun control socket that arrived with its receive
+        // side already shut down (macOS does this to a descriptor closed
+        // while in flight over a unix socket): such an interface looks up
+        // but the kernel can never deliver a packet to it.
+        #[cfg(target_os = "macos")]
+        {
+            let open = device.receive_side_open().map_err(|err| {
+                BackendError::internal(format!(
+                    "macos userspace-shared utun receive-side check failed for {interface_name}: {err}"
+                ))
+            })?;
+            if !open {
+                return Err(BackendError::internal(format!(
+                    "macos userspace-shared utun {interface_name} arrived with its receive side shut down \
+                     (descriptor closed in flight by the privileged helper); refusing to run a tunnel that \
+                     cannot receive packets"
+                )));
+            }
+        }
 
         let result = (|| -> Result<(), BackendError> {
             configure_macos_utun_address(&mut *self.runner, interface_name, local.address)?;

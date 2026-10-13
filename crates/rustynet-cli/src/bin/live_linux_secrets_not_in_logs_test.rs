@@ -19,8 +19,8 @@ mod live_lab_support;
 use std::path::PathBuf;
 
 use live_lab_support::{
-    LINUX_ENROLLMENT_SECRET_PATH, LiveLabContext, Logger, REMOTE_RUSTYNET_BIN, repo_root,
-    run_cargo_ops,
+    LiveLabContext, LiveLabPlatform, Logger, REMOTE_RUSTYNET_BIN, daemon_unit_log_argv,
+    enrollment_secret_path, repo_root, run_cargo_ops,
 };
 
 fn main() {
@@ -54,6 +54,7 @@ fn run() -> Result<(), String> {
 
     let mut ssh_identity_file = String::new();
     let mut target_host = String::new();
+    let mut platform = LiveLabPlatform::Linux;
     let mut report_path =
         root_dir.join("artifacts/live_lab/live_linux_secrets_not_in_logs_report.json");
     let mut log_path = root_dir.join("artifacts/live_lab/live_linux_secrets_not_in_logs.log");
@@ -68,6 +69,10 @@ fn run() -> Result<(), String> {
             "--target-host" => {
                 idx += 1;
                 target_host = req(&args, idx, "--target-host")?;
+            }
+            "--platform" => {
+                idx += 1;
+                platform = LiveLabPlatform::parse(req(&args, idx, "--platform")?.as_str())?;
             }
             "--report-path" => {
                 idx += 1;
@@ -106,9 +111,24 @@ fn run() -> Result<(), String> {
     let mut ctx = LiveLabContext::new("rustynet-secrets-not-in-logs", ssh_id.as_path())?;
     ctx.push_sudo_password(&target_host)?;
 
+    // The enrollment-secret path the deployed daemon on THIS target was seeded
+    // with (launchd passes `${STATE_ROOT}/keys/enrollment.secret` on macOS).
+    // Windows fails closed before anything runs.
+    let secret_path = enrollment_secret_path(platform)?;
+
     // ── Stage 1: flush journal cursor ────────────────────────────────────────
-    logger.line("[secrets-log] flushing journal cursor on target")?;
-    let _ = ctx.run_root_allow_failure(&target_host, &["journalctl", "--flush"]);
+    match platform {
+        LiveLabPlatform::Linux => {
+            logger.line("[secrets-log] flushing journal cursor on target")?;
+            let _ = ctx.run_root_allow_failure(&target_host, &["journalctl", "--flush"]);
+        }
+        _ => {
+            logger.line(format!(
+                "[secrets-log] skipping journald flush (linux-only; target platform is {})",
+                platform.as_str()
+            ))?;
+        }
+    }
 
     // ── Stage 2: trigger enrollment activity to exercise key paths ────────────
     // The real verb is `rustynet enrollment mint --secret <path> --ttl <secs>`.
@@ -135,7 +155,7 @@ fn run() -> Result<(), String> {
     // the daemon's own custody posture is untouched.
     logger.line("[secrets-log] triggering enrollment token activity")?;
     let secret_present = ctx
-        .run_root_allow_failure(&target_host, &["test", "-s", LINUX_ENROLLMENT_SECRET_PATH])
+        .run_root_allow_failure(&target_host, &["test", "-s", secret_path])
         .map(|out| out.status.success())
         .unwrap_or(false);
     if secret_present {
@@ -153,7 +173,7 @@ fn run() -> Result<(), String> {
                 "enrollment",
                 "mint",
                 "--secret",
-                LINUX_ENROLLMENT_SECRET_PATH,
+                secret_path,
                 "--ttl",
                 "60",
             ],
@@ -165,29 +185,35 @@ fn run() -> Result<(), String> {
         ))?;
     } else {
         logger.line(format!(
-            "[secrets-log] no enrollment secret at {LINUX_ENROLLMENT_SECRET_PATH} on \
+            "[secrets-log] no enrollment secret at {secret_path} on \
              {target_host} (non-admin node); the enrollment code path is NOT exercised by \
              this run"
         ))?;
     }
     std::thread::sleep(std::time::Duration::from_secs(3));
 
-    // ── Stage 3: collect journal lines ───────────────────────────────────────
-    logger.line("[secrets-log] collecting journal lines from rustynetd")?;
-    let journal = ctx
-        .capture_root_allow_failure(
-            &target_host,
-            &[
-                "journalctl",
-                "-u",
-                "rustynetd",
-                "-n",
-                "500",
-                "--no-pager",
-                "--output=short-monotonic",
-            ],
-        )
-        .unwrap_or_default();
+    // ── Stage 3: collect daemon log lines ────────────────────────────────────
+    // Linux: the journald unit log (unchanged argv). macOS: the unified-log
+    // window for the daemon process PLUS the launchd StandardOut/StandardError
+    // files — a plain Rust daemon does not mirror its stderr into the unified
+    // log, so the files are where a leak would actually appear. Every chunk is
+    // allow-failure (a missing log file is not a custody violation) and every
+    // chunk's lines are scanned identically below.
+    logger.line(format!(
+        "[secrets-log] collecting daemon log lines from rustynetd (platform {})",
+        platform.as_str()
+    ))?;
+    let log_chunks = daemon_unit_log_argv(platform, "500", true)?;
+    let mut journal = String::new();
+    for chunk in &log_chunks {
+        let chunk_output = ctx
+            .capture_root_allow_failure(&target_host, chunk)
+            .unwrap_or_default();
+        journal.push_str(&chunk_output);
+        if !journal.ends_with('\n') {
+            journal.push('\n');
+        }
+    }
 
     let line_count = journal.lines().count();
     logger.line(format!(
@@ -349,7 +375,62 @@ fn print_usage() {
         "usage: live_linux_secrets_not_in_logs_test \
         --ssh-identity-file <path> \
         --target-host <user@host> \
+        [--platform <linux|macos|windows>] \
         [--report-path <path>] \
         [--log-path <path>]"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_platform_is_linux_and_argv_stays_byte_identical() {
+        // The orchestrator's pre-port invocation passed no --platform; every
+        // resolved value must match the historical Linux literals.
+        let secret = enrollment_secret_path(LiveLabPlatform::Linux).expect("linux");
+        assert_eq!(secret, "/var/lib/rustynet/keys/enrollment.secret");
+        let chunks = daemon_unit_log_argv(LiveLabPlatform::Linux, "500", true).expect("linux");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0],
+            vec![
+                "journalctl",
+                "-u",
+                "rustynetd",
+                "-n",
+                "500",
+                "--no-pager",
+                "--output=short-monotonic",
+            ]
+        );
+    }
+
+    #[test]
+    fn macos_platform_resolves_the_launchd_seed_paths_and_log_sources() {
+        let secret = enrollment_secret_path(LiveLabPlatform::MacOs).expect("macos");
+        assert_eq!(secret, "/usr/local/var/rustynet/keys/enrollment.secret");
+        let chunks = daemon_unit_log_argv(LiveLabPlatform::MacOs, "500", true).expect("macos");
+        assert!(chunks.iter().all(|chunk| !chunk.is_empty()));
+    }
+
+    #[test]
+    fn windows_platform_fails_closed_before_any_remote_work() {
+        assert!(enrollment_secret_path(LiveLabPlatform::Windows).is_err());
+        assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "500", true).is_err());
+    }
+
+    #[test]
+    fn platform_parse_accepts_the_documented_tags() {
+        assert_eq!(
+            LiveLabPlatform::parse("macos").expect("macos"),
+            LiveLabPlatform::MacOs
+        );
+        assert_eq!(
+            LiveLabPlatform::parse("linux").expect("linux"),
+            LiveLabPlatform::Linux
+        );
+        assert!(LiveLabPlatform::parse("plan9").is_err());
+    }
 }

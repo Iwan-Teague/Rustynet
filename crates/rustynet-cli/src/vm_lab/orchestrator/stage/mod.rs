@@ -223,6 +223,51 @@ pub(crate) fn exit_only_topology_skip(
     None
 }
 
+/// `Some(message)` when any of the named nodes is not a Linux guest. A stage whose
+/// helper binary is Linux-only (systemd, /var/lib/rustynet, journald) must not be
+/// pointed at a macOS or Windows node: the helper would issue Linux commands to it
+/// (live macOS run38: `live_linux_reboot_recovery_test` "rebooted" a macOS client
+/// that never rebooted, then waited for a boot id that could not change). The stage
+/// reports a NAMED skip instead, never a silent pass and never a misleading fail.
+pub(crate) fn non_linux_node_skip_message(
+    what: &str,
+    nodes: &[(&str, crate::vm_lab::VmGuestPlatform)],
+) -> Option<String> {
+    let offenders: Vec<String> = nodes
+        .iter()
+        .filter(|(_, platform)| *platform != crate::vm_lab::VmGuestPlatform::Linux)
+        .map(|(alias, platform)| format!("{alias} ({platform:?})"))
+        .collect();
+    if offenders.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{what} drives Linux-only helper commands and this topology puts non-Linux node(s) in \
+         its roles: {}; the macOS equivalent is a separate stage (reboot_platform=macos), so \
+         this stage is skipped rather than pointed at them",
+        offenders.join(", ")
+    ))
+}
+
+/// Context wrapper over [`non_linux_node_skip_message`]: resolves each alias's platform
+/// from the adapters and returns the `Skipped` outcome.
+pub(crate) fn non_linux_node_skip(
+    ctx: &crate::vm_lab::orchestrator::context::OrchestrationContext,
+    what: &str,
+    aliases: &[&str],
+) -> Option<crate::vm_lab::orchestrator::error::StageOutcome> {
+    let nodes: Vec<(&str, crate::vm_lab::VmGuestPlatform)> = aliases
+        .iter()
+        .filter_map(|alias| {
+            ctx.adapters
+                .get(*alias)
+                .map(|adapter| (*alias, adapter.platform()))
+        })
+        .collect();
+    non_linux_node_skip_message(what, &nodes)
+        .map(crate::vm_lab::orchestrator::error::StageOutcome::Skipped)
+}
+
 /// A path the orchestrator must hand to a child process as a UTF-8 argv
 /// token. A non-UTF-8 path is a hard error here — the former
 /// `to_str().unwrap_or("<default>")` fallbacks silently pointed a report at the
@@ -893,5 +938,38 @@ mod failure_format_tests {
             summary.len() < STAGE_FAILURE_STREAM_BUDGET * 2,
             "a runaway log must not swallow the summary"
         );
+    }
+}
+
+#[cfg(test)]
+mod non_linux_skip_tests {
+    use super::non_linux_node_skip_message;
+    use crate::vm_lab::VmGuestPlatform;
+
+    #[test]
+    fn all_linux_nodes_are_not_skipped() {
+        let nodes = [
+            ("exit-1", VmGuestPlatform::Linux),
+            ("client-1", VmGuestPlatform::Linux),
+        ];
+        assert!(non_linux_node_skip_message("reboot-recovery validation", &nodes).is_none());
+    }
+
+    #[test]
+    fn a_macos_client_makes_the_stage_skip_and_names_the_node() {
+        let nodes = [
+            ("exit-1", VmGuestPlatform::Linux),
+            ("macos-utm-1", VmGuestPlatform::Macos),
+        ];
+        let message = non_linux_node_skip_message("reboot-recovery validation", &nodes)
+            .expect("a macOS node must produce a skip");
+        assert!(message.contains("macos-utm-1 (Macos)"), "{message}");
+        assert!(!message.contains("exit-1"), "{message}");
+        assert!(message.contains("reboot-recovery validation"), "{message}");
+    }
+
+    #[test]
+    fn an_empty_node_list_is_not_a_skip() {
+        assert!(non_linux_node_skip_message("x", &[]).is_none());
     }
 }

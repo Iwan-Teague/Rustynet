@@ -10,6 +10,7 @@ pub mod linux_traffic;
 pub mod macos;
 pub mod macos_exit_traffic;
 pub mod macos_install;
+pub mod macos_manifest_seam;
 pub mod macos_membership;
 pub mod macos_traffic;
 pub mod node_adapter;
