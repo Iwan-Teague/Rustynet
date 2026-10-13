@@ -28,8 +28,8 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 #[cfg(target_os = "windows")]
 use rustynet_windows_native::{
-    WindowsDpapiScope, apply_protected_dacl_to_path, create_new_file_with_sddl, dpapi_protect,
-    dpapi_unprotect, inspect_file_sddl,
+    apply_protected_dacl_to_path, create_new_file_with_sddl, dpapi_protect, dpapi_unprotect,
+    inspect_file_sddl, WindowsDpapiScope,
 };
 #[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
@@ -1492,7 +1492,8 @@ fn store_in_macos_keychain_create_only(
 
 #[cfg(target_os = "linux")]
 fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<(), CryptoError> {
-    let mut child = Command::new("secret-tool")
+    let tool = resolve_trusted_system_binary("secret-tool")?;
+    let mut child = Command::new(tool)
         .arg("store")
         .arg("--label=Rustynet Key")
         .arg("rustynet-key-id")
@@ -1518,7 +1519,8 @@ fn store_in_linux_secret_service(key_id: &str, key_material: &[u8]) -> Result<()
 
 #[cfg(target_os = "linux")]
 fn load_from_linux_secret_service(key_id: &str) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
-    let output = Command::new("secret-tool")
+    let tool = resolve_trusted_system_binary("secret-tool")?;
+    let output = Command::new(tool)
         .arg("lookup")
         .arg("rustynet-key-id")
         .arg(key_id)
@@ -1553,17 +1555,21 @@ fn lookup_linux_secret_service(key_id: &str) -> OsStoreLookup {
     match load_from_linux_secret_service(key_id) {
         Ok(value) => OsStoreLookup::Found(value),
         Err(_) => {
-            let output = Command::new("secret-tool")
-                .args(["search", "--all", "rustynet-key-id", key_id])
-                .stdin(Stdio::null())
-                .output();
-            let probe = match output {
-                Ok(output) => classify_linux_secret_tool_search(
-                    output.status.success(),
-                    output.stdout.is_empty(),
-                ),
-                Err(_) => LinuxSecretToolProbe::Inconclusive,
-            };
+            let probe = resolve_trusted_system_binary("secret-tool")
+                .ok()
+                .and_then(|tool| {
+                    Command::new(tool)
+                        .args(["search", "--all", "rustynet-key-id", key_id])
+                        .stdin(Stdio::null())
+                        .output()
+                        .ok()
+                })
+                .map_or(LinuxSecretToolProbe::Inconclusive, |output| {
+                    classify_linux_secret_tool_search(
+                        output.status.success(),
+                        output.stdout.is_empty(),
+                    )
+                });
             match probe {
                 // Empty search: only meaningful when a secret service is
                 // actually there to have searched (F2). Checked after the
@@ -1586,7 +1592,7 @@ fn lookup_linux_secret_service(key_id: &str) -> OsStoreLookup {
 /// reply (all `Unavailable` downstream).
 #[cfg(target_os = "linux")]
 fn linux_secrets_name_has_owner() -> Option<bool> {
-    let output = Command::new("dbus-send")
+    let output = Command::new(resolve_trusted_system_binary("dbus-send").ok()?)
         .args([
             "--session",
             "--print-reply",
@@ -1609,6 +1615,117 @@ fn linux_secrets_name_has_owner() -> Option<bool> {
     } else {
         None
     }
+}
+
+/// Fixed search path for the custody helper binaries (KM-1). `PATH` is never
+/// consulted: a caller-controlled or attacker-seeded directory must not be
+/// able to shadow `secret-tool`/`dbus-send`, which receive hex-encoded
+/// private key material or drive the absence proof.
+#[cfg(target_os = "linux")]
+const TRUSTED_SYSTEM_BINARY_DIRECTORIES: [&str; 3] = ["/usr/bin", "/bin", "/usr/local/bin"];
+
+/// Resolve a custody helper binary from [`TRUSTED_SYSTEM_BINARY_DIRECTORIES`]
+/// in order, accepting the first candidate that passes
+/// [`validate_trusted_binary`] for `trusted_uid` 0 (root). Any failure —
+/// missing everywhere, or present but untrusted — collapses to
+/// [`CryptoError::OsStoreUnavailable`], the same outcome as the previous
+/// on-`PATH` spawn failure, so downstream classification is unchanged.
+#[cfg(target_os = "linux")]
+fn resolve_trusted_system_binary(name: &str) -> Result<PathBuf, CryptoError> {
+    for directory in TRUSTED_SYSTEM_BINARY_DIRECTORIES {
+        let candidate = PathBuf::from(directory).join(name);
+        match validate_trusted_binary(&candidate, 0) {
+            Ok(resolved) => return Ok(resolved),
+            Err(_) => continue,
+        }
+    }
+    Err(CryptoError::OsStoreUnavailable)
+}
+
+/// Pure validator for a candidate trusted system binary: canonicalise the
+/// path, require a regular executable file owned by `trusted_uid` that is
+/// not group/other-writable, and require EVERY directory on the canonical
+/// path (up to and including the root) to be owned by `trusted_uid` and not
+/// group/other-writable — no sticky-bit exception, since a writable ancestor
+/// lets any local user race a binary swap between validation and spawn.
+/// Returns the canonical path on success. The error is a plain diagnostic
+/// string; callers map every failure to a single domain error.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_trusted_binary(candidate: &Path, trusted_uid: u32) -> Result<PathBuf, String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|err| format!("cannot canonicalize {}: {err}", candidate.display()))?;
+    let metadata = std::fs::metadata(&resolved)
+        .map_err(|err| format!("cannot stat {}: {err}", resolved.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", resolved.display()));
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o111 == 0 {
+        return Err(format!(
+            "{} is not executable (mode {:o})",
+            resolved.display(),
+            mode & 0o7777
+        ));
+    }
+    if metadata.uid() != trusted_uid {
+        return Err(format!(
+            "{} is owned by uid {}, expected trusted uid {}",
+            resolved.display(),
+            metadata.uid(),
+            trusted_uid
+        ));
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{} is group/other writable (mode {:o})",
+            resolved.display(),
+            mode & 0o7777
+        ));
+    }
+    let ancestors: Vec<&Path> = resolved.ancestors().skip(1).collect();
+    validate_trusted_directory_chain(&ancestors, trusted_uid)?;
+    Ok(resolved)
+}
+
+/// Validate a chain of directories on a trusted-binary path: each must be a
+/// directory owned by `trusted_uid` and not group/other-writable (mode bits
+/// `0o022` clear). List-taking so tests can exercise the chain rule on
+/// directories they actually create — a full to-root walk cannot be satisfied
+/// over tempdirs, whose fixed ancestors are root-owned (and `/tmp` sticky on
+/// Linux).
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_trusted_directory_chain(dirs: &[&Path], trusted_uid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    for dir in dirs {
+        let metadata = std::fs::metadata(dir)
+            .map_err(|err| format!("cannot stat {}: {err}", dir.display()))?;
+        if !metadata.is_dir() {
+            return Err(format!("{} is not a directory", dir.display()));
+        }
+        if metadata.uid() != trusted_uid {
+            return Err(format!(
+                "ancestor directory {} is owned by uid {}, expected trusted uid {}",
+                dir.display(),
+                metadata.uid(),
+                trusted_uid
+            ));
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "ancestor directory {} is group/other writable (mode {:o})",
+                dir.display(),
+                mode & 0o7777
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `secret-tool` has no create-only verb — its `store` subcommand upserts.
@@ -3006,8 +3123,8 @@ pub fn validate_key_custody_permissions(
 #[cfg(all(test, unix))]
 mod unix_custody_tests {
     use super::{
-        CryptoError, KeyCustodyPermissionPolicy, UnixCustodyMetadata,
-        evaluate_unix_custody_metadata,
+        evaluate_unix_custody_metadata, CryptoError, KeyCustodyPermissionPolicy,
+        UnixCustodyMetadata,
     };
 
     const ME: u32 = 501;
@@ -3441,13 +3558,13 @@ mod tests {
     }
 
     use super::{
-        AlgorithmPolicy, CryptoAlgorithm, CryptoError, Ed25519SigningProvider, KeyCustodyManager,
-        KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair, SigningProvider,
-        SigningProviderKind, SigningProviderPolicy, WINDOWS_KEY_CUSTODY_FILE_SDDL,
         create_provider_attestation, decode_encrypted_blob_v0, decode_encrypted_blob_v1,
         decrypt_private_key_envelope, encrypt_private_key_envelope, generate_key_custody_material,
         sddl_ace_principals, try_generate_key_custody_material, validate_signing_provider_policy,
-        verify_provider_attestation, windows_key_custody_sddl_is_hardened,
+        verify_provider_attestation, windows_key_custody_sddl_is_hardened, AlgorithmPolicy,
+        CryptoAlgorithm, CryptoError, Ed25519SigningProvider, KeyCustodyManager,
+        KeyCustodyPermissionPolicy, NoOsSecureStore, NodeKeyPair, SigningProvider,
+        SigningProviderKind, SigningProviderPolicy, WINDOWS_KEY_CUSTODY_FILE_SDDL,
     };
     use ed25519_dalek::SigningKey;
     // The encrypted-key-file custody helpers and the OS-store fallback policy are
@@ -3456,10 +3573,9 @@ mod tests {
     // them as unused.
     #[cfg(unix)]
     use super::{
-        OsStoreFallbackPolicy, read_encrypted_key_file, read_encrypted_key_file_inner,
-        v0_envelope_fallback_decodes_total, v0_envelope_reads_total,
-        v0_envelope_upgrade_failures_total, validate_key_custody_permissions,
-        write_encrypted_key_file,
+        read_encrypted_key_file, read_encrypted_key_file_inner, v0_envelope_fallback_decodes_total,
+        v0_envelope_reads_total, v0_envelope_upgrade_failures_total,
+        validate_key_custody_permissions, write_encrypted_key_file, OsStoreFallbackPolicy,
     };
 
     #[test]
@@ -7576,6 +7692,349 @@ mod atrest_key_lookup_tests {
             MacKeychainProbe::ItemNotFound,
             MacKeychainProbe::ItemNotFound,
         ));
+    }
+}
+
+// KM-1: trusted system binary resolution for the Linux secret-service
+// custody helpers (no PATH spawns).
+#[cfg(all(test, unix))]
+mod trusted_binary_resolution_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A full to-root ancestor walk can NEVER accept a tempdir candidate for
+    // euid: the fixed ancestors of a tempdir are root-owned (and sticky /
+    // group-writable on both macOS /var/folders and Linux /tmp). Acceptance
+    // is therefore exercised end-to-end against root-owned system binaries
+    // with trusted_uid 0, and the ancestor-chain rule directly through the
+    // list-taking validate_trusted_directory_chain.
+
+    fn unique_test_dir(tag: &str) -> PathBuf {
+        let unique = format!(
+            "rustynet-km1-{}-{}",
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).expect("test directory should be created");
+        directory
+    }
+
+    fn effective_uid() -> u32 {
+        nix::unistd::Uid::effective().as_raw()
+    }
+
+    fn root_owned_system_binary() -> PathBuf {
+        for candidate in ["/bin/sh", "/usr/bin/env"] {
+            if let Ok(resolved) = validate_trusted_binary(Path::new(candidate), 0) {
+                return resolved;
+            }
+        }
+        panic!("a root-owned system binary (/bin/sh or /usr/bin/env) should validate");
+    }
+
+    #[test]
+    fn validate_trusted_binary_accepts_root_owned_system_binary() {
+        let resolved = root_owned_system_binary();
+        let canonical = resolved
+            .canonicalize()
+            .expect("resolved path should still exist");
+        assert_eq!(
+            resolved, canonical,
+            "resolver must return the canonical path"
+        );
+        assert!(resolved.is_absolute());
+        assert!(
+            resolved.starts_with("/bin")
+                || resolved.starts_with("/usr/bin")
+                || resolved.starts_with("/usr/local/bin"),
+            "resolved path must come from the fixed trusted directories: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn trusted_directory_chain_accepts_current_user_owned_0o755_directories() {
+        let euid = effective_uid();
+        let outer = unique_test_dir("chain-ok");
+        let inner = outer.join("bin");
+        std::fs::create_dir_all(&inner).expect("inner directory should be created");
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755))
+            .expect("outer mode should be set");
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755))
+            .expect("inner mode should be set");
+        let result = validate_trusted_directory_chain(&[outer.as_path(), inner.as_path()], euid);
+        assert_eq!(result, Ok(()));
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_group_writable_binary() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-gw");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o775))
+            .expect("mode should be set");
+        let canonical = file.canonicalize().expect("file should exist");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a group-writable binary must be rejected");
+        assert!(
+            err.contains("group/other writable") && err.contains("mode 775"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(&canonical.display().to_string()),
+            "error should name the canonical binary path: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_world_writable_binary() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-ww");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o777))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a world-writable binary must be rejected");
+        assert!(
+            err.contains("group/other writable"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_non_executable_file() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-noexec");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("file should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a non-executable file must be rejected");
+        assert!(err.contains("is not executable"), "unexpected error: {err}");
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_binary_owned_by_untrusted_uid() {
+        // trusted_uid = 0 with a file owned by the effective user, pinned by
+        // EXACT message: the ancestor-chain error has a different shape
+        // ("ancestor directory ..."), so only the binary's own owner check
+        // can satisfy this assertion.
+        let euid = effective_uid();
+        let directory = unique_test_dir("bin-foreign");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, 0)
+            .expect_err("a binary owned by another uid must be rejected");
+        assert_eq!(
+            err,
+            format!(
+                "{} is owned by uid {euid}, expected trusted uid 0",
+                file.canonicalize().expect("canonical path").display()
+            ),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn trusted_directory_chain_rejects_group_writable_ancestor_directory() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("anc-gw");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o775))
+            .expect("mode should be set");
+        let err = validate_trusted_directory_chain(&[directory.as_path()], euid)
+            .expect_err("a group-writable ancestor must be rejected");
+        assert!(
+            err.contains("ancestor directory")
+                && err.contains("group/other writable")
+                && err.contains(directory.display().to_string().as_str()),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn trusted_directory_chain_rejects_ancestor_owned_by_untrusted_uid() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("anc-foreign");
+        let err = validate_trusted_directory_chain(&[directory.as_path()], euid + 1)
+            .expect_err("an ancestor owned by another uid must be rejected");
+        assert!(
+            err.contains("ancestor directory") && err.contains("owned by uid"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_directory_candidate() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("is-dir");
+        let err = validate_trusted_binary(&directory, euid)
+            .expect_err("a directory candidate must be rejected");
+        assert!(
+            err.contains("is not a regular file"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_dangling_symlink() {
+        let euid = effective_uid();
+        let directory = unique_test_dir("dangling");
+        let link = directory.join("tool");
+        std::os::unix::fs::symlink(directory.join("missing-target"), &link)
+            .expect("symlink should be created");
+        let err =
+            validate_trusted_binary(&link, euid).expect_err("a dangling symlink must be rejected");
+        assert!(
+            err.contains("cannot canonicalize"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_returns_canonical_target_not_symlink_path() {
+        let target = root_owned_system_binary();
+        let directory = unique_test_dir("symlink");
+        let link = directory.join("tool");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+        let resolved =
+            validate_trusted_binary(&link, 0).expect("symlink to a trusted binary should validate");
+        assert_ne!(
+            resolved, link,
+            "must not return the unresolved symlink path"
+        );
+        assert_eq!(
+            resolved,
+            target.canonicalize().expect("target should exist"),
+            "must return the canonical target path"
+        );
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn validate_trusted_binary_rejects_candidate_beneath_writable_ancestor() {
+        // The candidate itself is clean (owned by euid, mode 0o755) but its
+        // ancestor chain passes through root-owned group/other-writable
+        // directories (the tempdir parents), so the to-root walk must reject
+        // it — this is the exact test that dies when the ancestor walk is
+        // skipped.
+        let euid = effective_uid();
+        let directory = unique_test_dir("anc-walk");
+        let file = directory.join("tool");
+        std::fs::write(&file, b"#!/bin/sh\n").expect("binary should be written");
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        let err = validate_trusted_binary(&file, euid)
+            .expect_err("a candidate beneath a writable ancestor must be rejected");
+        assert!(
+            err.contains("ancestor directory"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+    }
+
+    #[test]
+    fn lib_rs_never_spawns_secret_tool_or_dbus_send_by_bare_name() {
+        let source = include_str!("lib.rs");
+        assert!(
+            !source.contains("Command::new(\"secret-tool\")"),
+            "secret-tool must be spawned only via resolve_trusted_system_binary (KM-1)"
+        );
+        assert!(
+            !source.contains("Command::new(\"dbus-send\")"),
+            "dbus-send must be spawned only via resolve_trusted_system_binary (KM-1)"
+        );
+        // The scan is only meaningful while the resolver remains wired in at
+        // every custody spawn site.
+        assert!(
+            source.contains("resolve_trusted_system_binary(\"secret-tool\")"),
+            "secret-tool spawn must go through resolve_trusted_system_binary"
+        );
+        assert!(
+            source.contains("resolve_trusted_system_binary(\"dbus-send\")"),
+            "dbus-send spawn must go through resolve_trusted_system_binary"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_trusted_system_binary_refuses_when_no_trusted_candidate_exists() {
+        let err = resolve_trusted_system_binary("rustynet-km1-nonexistent-helper")
+            .expect_err("a missing helper must resolve to OsStoreUnavailable");
+        assert_eq!(err, CryptoError::OsStoreUnavailable);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_trusted_system_binary_accepts_root_owned_system_helper() {
+        let resolved = resolve_trusted_system_binary("true")
+            .expect("a root-owned fixed-directory helper should resolve");
+        assert!(
+            resolved.starts_with("/usr/bin")
+                || resolved.starts_with("/bin")
+                || resolved.starts_with("/usr/local/bin"),
+            "resolved path must come from the fixed trusted directories: {resolved:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_trusted_system_binary_never_consults_path() {
+        // A 0o755 shim named like a helper that exists NOWHERE in the fixed
+        // directories is put on PATH; the resolver must ignore PATH entirely
+        // (KM-1) and refuse with OsStoreUnavailable. This kills a PATH-first
+        // resolver and a fallback-to-PATH-after-miss alike, on every host,
+        // regardless of what is installed: either mutant returns the shim's
+        // path instead of the error.
+        let directory = unique_test_dir("path-shadow");
+        let shim = directory.join("rustynet-km1-path-shadow-helper");
+        std::fs::write(&shim, b"#!/bin/sh\n").expect("shim should be written");
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
+            .expect("mode should be set");
+        assert!(shim.is_file() && shim.canonicalize().is_ok());
+        let previous = std::env::var_os("PATH");
+        // SAFETY: test-only, minimal window; PATH is restored before any
+        // assertion, so a failure never leaks the mutated environment.
+        unsafe {
+            std::env::set_var("PATH", &directory);
+        }
+        let resolved = resolve_trusted_system_binary("rustynet-km1-path-shadow-helper");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("PATH", value) },
+            None => unsafe { std::env::remove_var("PATH") },
+        }
+        assert_eq!(
+            resolved,
+            Err(CryptoError::OsStoreUnavailable),
+            "resolver must never fall back to a PATH-resolved candidate"
+        );
+        let _ = std::fs::remove_file(&shim);
+        let _ = std::fs::remove_dir(&directory);
     }
 }
 
