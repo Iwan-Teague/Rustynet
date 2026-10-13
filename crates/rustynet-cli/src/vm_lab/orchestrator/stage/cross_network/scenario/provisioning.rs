@@ -38,7 +38,10 @@ use base64::Engine as _;
 use rustynet_control::roles::{RoleCapability, role_capability_csv};
 
 use super::super::substrate::NetLeafRunner;
-use super::{DAEMON_SOCKET, REMOTE_RUSTYNET_BIN, capture_root, run_root, run_root_allow_failure};
+use super::{
+    DAEMON_SOCKET, REMOTE_RUSTYNET_BIN, capture_root, capture_root_allow_failure, run_root,
+    run_root_allow_failure,
+};
 
 // ───────────────────────────── remote paths ─────────────────────────────
 
@@ -1295,6 +1298,538 @@ pub fn path_arg(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+// ───────────────── relay service + token spool (DESIGN-XNET-RELAY S3) ─────────────────
+//
+// The relay_remote_exit scenario needs the same relay machinery the HP-3
+// adapter builds for its own topology, but over the scenario `NetLeafRunner`
+// seam (argv + sudo -n), not the adapter's ssh `NodeConnection`. These helpers
+// mirror `adapter::linux_relay_tokens` and `adapter::linux_install` step for
+// step — same paths, modes, ordering and failure discipline — and reuse the
+// adapter's `pub(crate)` pure parsers so the semantics cannot drift. Only the
+// transport differs: files cross as single-line base64 through
+// [`write_remote_base64`], commands run through [`run_root`].
+
+/// Where `e2e-issue-relay-session-tokens-from-env` leaves its output. Passed
+/// explicitly (`--issue-dir`); it is also the verb's own default, so an
+/// operator replaying the mint by hand lands in the same directory.
+pub const RELAY_TOKEN_ISSUE_DIR: &str = "/run/rustynet/relay-token-issue";
+/// Remote path of the relay token issuance env file (the scenario's /tmp, in
+/// the pattern of the other issuance env paths).
+pub const RELAY_TOKEN_ISSUE_ENV_PATH: &str = "/tmp/rn_issue_cross_network_relay_tokens.env";
+/// The relay id label this scenario mints tokens for. Matches the
+/// `rustynet-relay.service` default and the HP-3 test relay id.
+pub const RELAY_ID_LABEL: &str = "relay-local";
+/// TCP port the relay service binds (the unit's default, made explicit here).
+pub const RELAY_SERVICE_BIND_PORT: &str = "4500";
+/// The relay service's bind override: the unit reads it via
+/// `EnvironmentFile=-/etc/default/rustynet-relay`, and a STALE file from an
+/// earlier topology crash-loops the unit (EADDRNOTAVAIL), which is why deploy
+/// rewrites it unconditionally.
+pub const RELAY_DEFAULT_ENV_PATH: &str = "/etc/default/rustynet-relay";
+/// Where the relay's token-verifying key is installed (mirrors
+/// `adapter::linux_install`).
+pub const RELAY_VERIFIER_PATH: &str = "/etc/rustynet/relay-verifier.pub";
+/// The systemd unit `ops install-systemd-relay` installs.
+const RELAY_SERVICE_UNIT: &str = "rustynet-relay.service";
+
+// Mirrors of the adapter-private spool paths. Values are pinned by unit tests
+// against the imported constants where those are public.
+const SPOOL_INCOMING_DIR: &str = "/var/lib/rustynet/relay-token-spool/.incoming";
+const DROPIN_DIR: &str = "/etc/systemd/system/rustynetd.service.d";
+const DROPIN_FILE: &str = "/etc/systemd/system/rustynetd.service.d/hp3-relay-token-spool.conf";
+/// Seconds of remaining life below which the purge drops a token (the adapter's
+/// [`linux_relay_tokens::PURGE_MARGIN_SECS`] value).
+const PURGE_MARGIN_SECS: u64 = 10;
+/// The extension the daemon's spool reader accepts.
+const TOKEN_SUFFIX: &str = ".relay-token";
+/// The non-token file the mint also leaves in the issue dir (the verifying
+/// key), skipped when splitting the listing.
+const RELAY_TOKEN_ISSUE_VERIFIER_FILE: &str = "rn-relay-token.pub";
+
+/// Content of the daemon unit drop-in: one `Environment=` line, constant.
+///
+/// Byte-equivalent to the adapter's `linux_relay_tokens::dropin_content`.
+fn relay_spool_dropin_content() -> String {
+    format!("[Service]\nEnvironment={SPOOL_ENV_KEY}={RELAY_TOKEN_SPOOL_DIR}\n")
+}
+
+use crate::vm_lab::orchestrator::adapter::linux_relay_tokens::{
+    MAX_SPOOL_FILES, RELAY_TOKEN_SPOOL_DIR, SPOOL_ENV_KEY, environment_has_spool,
+    parse_expiry_listing, parse_rfc3339_utc_secs, parse_spool_listing, select_purge,
+    select_superseded,
+};
+
+/// `install -d` arguments for the spool directories (adapter's
+/// `cmd_make_spool_dir`): owned by the daemon, private.
+const MAKE_SPOOL_DIR_ARGV: [&str; 8] = [
+    "install",
+    "-d",
+    "-o",
+    "rustynetd",
+    "-g",
+    "rustynetd",
+    "-m",
+    "0700",
+];
+
+/// Read expiries from every spool token with ONE fixed script.
+///
+/// The adapter runs one `grep -F -H expires_at_unix=` over the listed paths and
+/// distinguishes exit 1 (no file has an expiry: purge all) from exit 2 (a file
+/// vanished between list and grep: re-list). Over the scenario seam the same
+/// fail-safe outcome falls out of a per-file `|| true` loop: a consumed file
+/// simply contributes no expiry line and is purged as an absentee, exactly what
+/// the adapter's re-list would decide. `$1` is the spool dir; nothing is
+/// interpolated.
+const READ_SPOOL_EXPIRIES_SCRIPT: &str = "set -eu; for f in \"$1\"/*.relay-token; do \
+[ -f \"$f\" ] || continue; grep -H -F expires_at_unix= \"$f\" || true; done";
+
+/// Create the spool, add the daemon drop-in, reload systemd, and confirm
+/// systemd now resolves the variable for the daemon unit. No restart — the
+/// scenario restarts the daemon itself right after (drop-in first, daemon
+/// second, so the first start already sees the spool).
+pub fn prepare_relay_token_spool(runner: &dyn NetLeafRunner) -> Result<(), String> {
+    let uniq = crate::vm_lab::orchestrator::adapter::unique_temp_token();
+    let tmp_remote = format!("/tmp/rn_hp3_spool_{uniq}.conf");
+    write_remote_text(
+        runner,
+        tmp_remote.as_str(),
+        "0644",
+        &relay_spool_dropin_content(),
+    )?;
+    let steps = (|| -> Result<(), String> {
+        for dir in [RELAY_TOKEN_SPOOL_DIR, SPOOL_INCOMING_DIR] {
+            let mut argv: Vec<&str> = MAKE_SPOOL_DIR_ARGV.to_vec();
+            argv.push(dir);
+            run_root(runner, &argv)?;
+        }
+        run_root(
+            runner,
+            &[
+                "install", "-d", "-o", "root", "-g", "root", "-m", "0755", DROPIN_DIR,
+            ],
+        )?;
+        run_root(
+            runner,
+            &[
+                "install",
+                "-o",
+                "root",
+                "-g",
+                "root",
+                "-m",
+                "0644",
+                tmp_remote.as_str(),
+                DROPIN_FILE,
+            ],
+        )?;
+        run_root(runner, &["systemctl", "daemon-reload"])?;
+        let environment = capture_root(
+            runner,
+            &[
+                "systemctl",
+                "show",
+                "-p",
+                "Environment",
+                "rustynetd.service",
+            ],
+        )?;
+        if !environment_has_spool(&environment) {
+            return Err(
+                "systemd does not resolve the relay token spool variable for the daemon \
+                 unit after the drop-in was installed"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    })();
+    let _ = remove_remote(runner, &[tmp_remote.as_str()]);
+    steps
+}
+
+/// `rustynet ops e2e-issue-relay-session-tokens-from-env`, with an explicit
+/// `--issue-dir`: same security ordering as [`issue_bundles_from_env`] (the env
+/// file names the signing secret, so it is removed best-effort on failure and
+/// its removal is REQUIRED on success).
+pub fn issue_relay_session_tokens_from_env(
+    runner: &dyn NetLeafRunner,
+    env: &EnvFile,
+    remote_env_path: &str,
+) -> Result<(), String> {
+    validate_argv_value("remote env path", remote_env_path)?;
+    write_remote_text(runner, remote_env_path, "0600", &env.render())?;
+    let issued = run_root(
+        runner,
+        &[
+            REMOTE_RUSTYNET_BIN,
+            "ops",
+            "e2e-issue-relay-session-tokens-from-env",
+            "--env-file",
+            remote_env_path,
+            "--issue-dir",
+            RELAY_TOKEN_ISSUE_DIR,
+        ],
+    );
+    if let Err(err) = issued {
+        let _ = remove_remote(runner, &[remote_env_path]);
+        return Err(err);
+    }
+    remove_remote(runner, &[remote_env_path])
+}
+
+/// One issued relay session token: its spool name and base64 payload.
+///
+/// The payload is bearer material, so this type deliberately derives no
+/// `Debug` and is listed in rustynetd's `FORBIDDEN_DEBUG_SECRET_TYPES` to
+/// guard against a future re-introduction.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RelayTokenFile {
+    pub name: String,
+    pub payload_b64: String,
+}
+
+/// `{issued_at:010}-{pair:02}-{seq:02}.relay-token` as its three numbers.
+///
+/// Everything else is refused: the name is the only thing that routes a token
+/// to the right peer's spool, so a malformed name must not be silently
+/// interpolated into a filename.
+pub fn parse_relay_token_name(name: &str) -> Option<(u32, u32, u32)> {
+    let stem = name.strip_suffix(TOKEN_SUFFIX)?;
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return None;
+    }
+    let mut parts = stem.split('-');
+    let issued = parts.next()?.parse::<u32>().ok()?;
+    let pair = parts.next()?.parse::<u32>().ok()?;
+    let seq = parts.next()?.parse::<u32>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    // Shape, not range: 10-2-2 digits as the mint writes them.
+    let widths = (
+        stem.split('-').next()?.len(),
+        stem.split('-').nth(1)?.len(),
+        stem.split('-').nth(2)?.len(),
+    );
+    if widths != (10, 2, 2) {
+        return None;
+    }
+    Some((issued, pair, seq))
+}
+
+/// Read the relay session tokens the mint left in [`RELAY_TOKEN_ISSUE_DIR`].
+///
+/// Only `*.relay-token` files with the exact mint name shape are returned; the
+/// verifying key and any surprise entry are skipped, never installed.
+pub fn read_issued_relay_token_files(
+    runner: &dyn NetLeafRunner,
+) -> Result<Vec<RelayTokenFile>, String> {
+    let listing = capture_root(runner, &["ls", "-1", "--", RELAY_TOKEN_ISSUE_DIR])?;
+    let mut files = Vec::new();
+    for name in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if name == RELAY_TOKEN_ISSUE_VERIFIER_FILE {
+            continue;
+        }
+        if parse_relay_token_name(name).is_none() {
+            return Err(format!(
+                "unexpected entry in {RELAY_TOKEN_ISSUE_DIR}: {name:?} is not a relay token name"
+            ));
+        }
+        let payload_b64 = read_remote_base64(runner, &format!("{RELAY_TOKEN_ISSUE_DIR}/{name}"))?;
+        files.push(RelayTokenFile {
+            name: name.to_owned(),
+            payload_b64,
+        });
+    }
+    if files.is_empty() {
+        return Err(format!(
+            "no relay session tokens were issued into {RELAY_TOKEN_ISSUE_DIR}"
+        ));
+    }
+    Ok(files)
+}
+
+/// Purge expired tokens and install `files` into the spool; then drop every
+/// token that is not in the batch just published.
+///
+/// Ordering mirrors the adapter's `install_relay_token_spool`: clock first (the
+/// purge decision must use the clock the daemon judges expiry on), purge BEFORE
+/// the new batch lands (a failed install must not leave an expired matching
+/// token blocking the daemon), stage → install into `.incoming` → publish by
+/// rename (a token appears in the spool only once fully written), supersede,
+/// and finally the daemon's hard cap of [`MAX_SPOOL_FILES`] entries.
+pub fn install_relay_token_spool(
+    runner: &dyn NetLeafRunner,
+    files: &[RelayTokenFile],
+) -> Result<(), String> {
+    if files.is_empty() {
+        return Err("refusing to install an empty relay token batch".to_owned());
+    }
+    let names = files
+        .iter()
+        .map(|file| {
+            if parse_relay_token_name(&file.name).is_none() {
+                return Err(format!(
+                    "refusing to install {:?}: not a relay token name",
+                    file.name
+                ));
+            }
+            Ok(file.name.clone())
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // 1. The node's own clock, read the same way the adapter reads it.
+    let clock = capture_root(runner, &["date", "-u", "--rfc-3339=seconds"])?;
+    let node_now_unix = parse_rfc3339_utc_secs(&clock).map_err(|e| e.to_string())?;
+
+    // 2. Purge expired/unreadable tokens BEFORE new ones land.
+    let listing = capture_root(runner, &["ls", "-1", "--", RELAY_TOKEN_SPOOL_DIR])?;
+    let present = parse_spool_listing(&listing).map_err(|err| err.to_string())?;
+    if !present.is_empty() {
+        let expiry_listing = capture_root(
+            runner,
+            &[
+                "sh",
+                "-c",
+                READ_SPOOL_EXPIRIES_SCRIPT,
+                "sh",
+                RELAY_TOKEN_SPOOL_DIR,
+            ],
+        )?;
+        let expiries = parse_expiry_listing(&expiry_listing);
+        let expired = select_purge(&present, &expiries, node_now_unix, PURGE_MARGIN_SECS);
+        if !expired.is_empty() {
+            let mut argv = vec!["rm", "-f", "--"];
+            let mut paths = Vec::new();
+            for name in &expired {
+                paths.push(format!("{RELAY_TOKEN_SPOOL_DIR}/{name}"));
+            }
+            for path in &paths {
+                argv.push(path.as_str());
+            }
+            run_root(runner, &argv)?;
+        }
+    }
+
+    // 3. Stage, install into the staging dir, publish by rename.
+    let stage_dir = format!(
+        "/tmp/rn_relay_tok_stage_{}",
+        crate::vm_lab::orchestrator::adapter::unique_temp_token()
+    );
+    run_root(runner, &["mkdir", "-m", "0700", "-p", stage_dir.as_str()])?;
+    let published = (|| -> Result<(), String> {
+        for file in files {
+            write_remote_base64(
+                runner,
+                &format!("{stage_dir}/{}", file.name),
+                "0600",
+                &file.payload_b64,
+            )?;
+            run_root(
+                runner,
+                &[
+                    "install",
+                    "-o",
+                    "rustynetd",
+                    "-g",
+                    "rustynetd",
+                    "-m",
+                    "0600",
+                    &format!("{stage_dir}/{}", file.name),
+                    &format!("{SPOOL_INCOMING_DIR}/{}", file.name),
+                ],
+            )?;
+            run_root(
+                runner,
+                &[
+                    "mv",
+                    "-f",
+                    &format!("{SPOOL_INCOMING_DIR}/{}", file.name),
+                    &format!("{RELAY_TOKEN_SPOOL_DIR}/{}", file.name),
+                ],
+            )?;
+        }
+        Ok(())
+    })();
+    let _ = remove_remote(runner, &[stage_dir.as_str()]);
+    published?;
+
+    // 4. Supersede: only the batch just published stays; then the hard cap.
+    let after_listing = capture_root(runner, &["ls", "-1", "--", RELAY_TOKEN_SPOOL_DIR])?;
+    let after = parse_spool_listing(&after_listing).map_err(|err| err.to_string())?;
+    let superseded = select_superseded(&after, &names);
+    if !superseded.is_empty() {
+        let mut argv = vec!["rm", "-f", "--"];
+        let mut paths = Vec::new();
+        for name in &superseded {
+            paths.push(format!("{RELAY_TOKEN_SPOOL_DIR}/{name}"));
+        }
+        for path in &paths {
+            argv.push(path.as_str());
+        }
+        run_root(runner, &argv)?;
+    }
+    let spool_files = after.len() - superseded.len();
+    if spool_files > MAX_SPOOL_FILES {
+        return Err(format!(
+            "relay token spool holds {spool_files} files, over the daemon's hard cap of \
+             {MAX_SPOOL_FILES}"
+        ));
+    }
+    Ok(())
+}
+
+/// Decode the traversal verifying key (64 hex chars + newline on the guest) into
+/// the 32 raw bytes the relay service expects, as base64 for transit.
+fn relay_verifier_raw_b64(hex_text: &str) -> Result<String, String> {
+    let hex = hex_text.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "traversal verifying key is not 64 hex characters (got {} characters)",
+            hex.len()
+        ));
+    }
+    let mut raw = [0u8; 32];
+    for (index, byte) in raw.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .map_err(|err| format!("traversal verifying key hex is malformed: {err}"))?;
+    }
+    Ok(base64::engine::general_purpose::STANDARD.encode(raw))
+}
+
+/// The `/etc/default/rustynet-relay` bind/id override for this scenario.
+fn relay_default_env_content(relay_label: &str, relay_bind: &str) -> String {
+    format!("RUSTYNET_RELAY_ID={relay_label}\nRUSTYNET_RELAY_BIND={relay_bind}\n")
+}
+
+/// Install + enable + start the relay service, then point it at this scenario's
+/// topology: verifier key from the already-distributed traversal bundle, bind
+/// override in `/etc/default`, restart, and a fail-closed `is-active` gate with
+/// the unit's journal tail on failure.
+///
+/// `src_dir` is the guest's Rustynet source root — `ops install-systemd-relay`
+/// reads the unit template relative to the process cwd (the adapter documents
+/// the same requirement), so the verb runs under `cd "$1"`.
+pub fn deploy_relay_service(
+    runner: &dyn NetLeafRunner,
+    src_dir: &str,
+    relay_bind: &str,
+    relay_label: &str,
+) -> Result<(), String> {
+    validate_argv_value("relay src dir", src_dir)?;
+    validate_argv_value("relay bind", relay_bind)?;
+    if relay_label != RELAY_ID_LABEL {
+        return Err(format!(
+            "relay label must be {RELAY_ID_LABEL} for this scenario (got: {relay_label:?})"
+        ));
+    }
+
+    // 1+2+3. Verifier key: the traversal pub the distribute stage already put
+    // on THIS guest (the exit mints, the relay verifies), decoded hex → raw →
+    // installed 0644.
+    let verifier_hex = read_remote_base64(runner, &format!("{CONFIG_DIR}/traversal.pub"))?;
+    let raw_b64 = relay_verifier_raw_b64(&verifier_hex)?;
+    write_remote_base64(runner, RELAY_VERIFIER_PATH, "0644", &raw_b64)?;
+
+    // 4. A stale /etc/default from an earlier topology crash-loops the unit
+    // (EADDRNOTAVAIL); rewrite it unconditionally instead of trusting it.
+    remove_remote(runner, &[RELAY_DEFAULT_ENV_PATH])?;
+
+    // 5. Install + enable + start, from the source root (cwd-relative unit).
+    run_root(
+        runner,
+        &[
+            "sh",
+            "-c",
+            "set -eu; cd \"$1\"; rustynet ops install-systemd-relay",
+            "sh",
+            src_dir,
+        ],
+    )?;
+    write_remote_text(
+        runner,
+        RELAY_DEFAULT_ENV_PATH,
+        "0644",
+        &relay_default_env_content(relay_label, relay_bind),
+    )?;
+    run_root(runner, &["systemctl", "restart", RELAY_SERVICE_UNIT])?;
+
+    // 6. Fail closed unless the unit is active; carry the journal tail.
+    let active = capture_root(runner, &["systemctl", "is-active", RELAY_SERVICE_UNIT])?;
+    if active != "active" {
+        let journal = capture_root_allow_failure(
+            runner,
+            &[
+                "journalctl",
+                "-u",
+                RELAY_SERVICE_UNIT,
+                "-n",
+                "12",
+                "--no-pager",
+            ],
+        )
+        .unwrap_or_default();
+        return Err(format!(
+            "rustynet-relay service is not active after deploy (is-active: {active:?}): {journal}"
+        ));
+    }
+    Ok(())
+}
+
+/// The unique 198.18.0.0/15 address in `ip -o -4 addr show` output.
+///
+/// The relay transport address is READ from the relay guest (owner decision:
+/// no new CLI flag, no inventory change). Zero or multiple candidates is a hard
+/// error — deploying the relay on a guessed address would mint bundles no peer
+/// can use.
+pub fn unique_ipv4_in_benchmark_prefix(output: &str) -> Result<String, String> {
+    let mut found: Option<String> = None;
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(position) = fields.iter().position(|f| *f == "inet") else {
+            continue;
+        };
+        let Some(cidr) = fields.get(position + 1) else {
+            continue;
+        };
+        let addr = cidr.split('/').next().unwrap_or(cidr);
+        let Ok(parsed) = addr.parse::<std::net::Ipv4Addr>() else {
+            continue;
+        };
+        let octets = parsed.octets();
+        let in_prefix = octets[0] == 198 && (octets[1] == 18 || octets[1] == 19);
+        if !in_prefix {
+            continue;
+        }
+        if let Some(previous) = &found {
+            if previous != addr {
+                return Err(format!(
+                    "multiple 198.18.0.0/15 addresses on the relay guest: {previous} and {addr}"
+                ));
+            }
+            continue;
+        }
+        found = Some(addr.to_owned());
+    }
+    found.ok_or_else(|| {
+        "no 198.18.0.0/15 address found on the relay guest: the relay transport address \
+         cannot be determined"
+            .to_owned()
+    })
+}
+
+/// The relay's transport endpoint, read live from the relay guest.
+pub fn relay_transport_endpoint(runner: &dyn NetLeafRunner) -> Result<String, String> {
+    let addresses = capture_root_allow_failure(runner, &["ip", "-o", "-4", "addr", "show"])?;
+    Ok(format!(
+        "{}:{RELAY_SERVICE_BIND_PORT}",
+        unique_ipv4_in_benchmark_prefix(&addresses)?
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EXIT_NODE_CAPABILITIES, NodeSpec, nodes_spec};
@@ -1607,6 +2142,133 @@ mod tests {
                 "{EXIT_PUB}|anchor,exit_server||||anchor,exit_server\"\n"
             )),
             "{env}"
+        );
+    }
+
+    // ── relay service + spool helpers (DESIGN-XNET-RELAY S3) ──
+
+    /// The drop-in must set exactly the variable the adapter sets, pointing at
+    /// exactly the directory the daemon and adapter agree on.
+    #[test]
+    fn relay_spool_dropin_matches_adapter_contract() {
+        let content = super::relay_spool_dropin_content();
+        assert_eq!(
+            content,
+            format!(
+                "[Service]\nEnvironment={}={}\n",
+                crate::vm_lab::orchestrator::adapter::linux_relay_tokens::SPOOL_ENV_KEY,
+                crate::vm_lab::orchestrator::adapter::linux_relay_tokens::RELAY_TOKEN_SPOOL_DIR
+            )
+        );
+        // The adapter's own verifier accepts this output verbatim.
+        assert!(
+            crate::vm_lab::orchestrator::adapter::linux_relay_tokens::environment_has_spool(
+                &format!(
+                    "Environment={}",
+                    content
+                        .lines()
+                        .find_map(|l| l.strip_prefix("Environment="))
+                        .expect("Environment line")
+                )
+            )
+        );
+    }
+
+    /// Only exact mint names parse; anything else must be refused before it is
+    /// interpolated into a spool filename (pair-split off-by-one guard).
+    #[test]
+    fn parse_relay_token_name_accepts_only_mint_shape() {
+        let ok = "1700000000-01-02.relay-token";
+        assert_eq!(
+            super::parse_relay_token_name(ok),
+            Some((1_700_000_000_u32, 1, 2)),
+            "issued/pair/seq order matters: the pair index routes the file"
+        );
+        assert_eq!(
+            super::parse_relay_token_name("1700000000-00-01.relay-token"),
+            Some((1_700_000_000, 0, 1))
+        );
+        for bad in [
+            "rn-relay-token.pub",
+            "0001700000000-00-01.relay-token", // exactly 10 digits required
+            "170000000-1-01.relay-token",      // issued must be 10 digits
+            "1700000000-1-01.relay-token",     // pair must be 2 digits
+            "1700000000-00.relay-token",       // missing seq
+            "1700000000-00-01-99.relay-token", // extra field
+            "1700000000-00-01.relay-token.backup",
+            "../escape.relay-token",
+            "",
+        ] {
+            assert_eq!(
+                super::parse_relay_token_name(bad),
+                None,
+                "{bad:?} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn relay_verifier_raw_b64_decodes_exactly_32_bytes() {
+        let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        let encoded = super::relay_verifier_raw_b64(&format!("{hex}\n")).expect("decodes");
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("valid base64");
+        assert_eq!(raw.len(), 32);
+        assert_eq!(&raw[..4], &[0x00, 0x01, 0x02, 0x03]);
+        assert_eq!(&raw[28..], &[0x1c, 0x1d, 0x1e, 0x1f]);
+        for bad in ["", "00", "zz", &"a".repeat(63), &format!("{hex}00")] {
+            assert!(super::relay_verifier_raw_b64(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// The bind override must carry the id AND the bind, newline-terminated —
+    /// this is the file whose staleness crash-loops the unit.
+    #[test]
+    fn relay_default_env_content_pins_id_and_bind() {
+        let content = super::relay_default_env_content("relay-local", "198.18.64.5:4500");
+        assert_eq!(
+            content,
+            "RUSTYNET_RELAY_ID=relay-local\nRUSTYNET_RELAY_BIND=198.18.64.5:4500\n"
+        );
+    }
+
+    /// Exactly one 198.18.0.0/15 address wins; zero or two is refused.
+    #[test]
+    fn unique_ipv4_in_benchmark_prefix_picks_the_single_relay_address() {
+        let output = "\
+2: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever
+3: enp0s2    inet 10.0.2.15/24 brd 10.0.2.255 scope global dynamic enp0s2\\       valid_lft 86189sec preferred_lft 86189sec
+4: wg0    inet 198.18.64.5/24 brd 198.18.64.255 scope global wg0\\       valid_lft forever preferred_lft forever
+";
+        assert_eq!(
+            super::unique_ipv4_in_benchmark_prefix(output).expect("unique"),
+            "198.18.64.5"
+        );
+        assert!(
+            super::unique_ipv4_in_benchmark_prefix("2: lo    inet 127.0.0.1/8 scope host lo")
+                .is_err()
+        );
+        let two = "\
+3: a    inet 198.18.64.5/24 scope global a
+4: b    inet 198.19.1.1/24 scope global b
+";
+        assert!(
+            super::unique_ipv4_in_benchmark_prefix(two).is_err(),
+            "two candidate addresses must fail closed"
+        );
+        // Whole /15: 198.18.x and 198.19.x both qualify, nothing else.
+        assert_eq!(
+            super::unique_ipv4_in_benchmark_prefix(
+                "4: wg0    inet 198.19.255.254/24 scope global wg0"
+            )
+            .as_deref(),
+            Ok("198.19.255.254")
+        );
+        assert!(
+            super::unique_ipv4_in_benchmark_prefix("4: wg0    inet 198.20.0.1/24 scope global wg0")
+                .is_err()
         );
     }
 

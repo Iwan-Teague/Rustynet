@@ -3500,6 +3500,16 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
         None => BTreeMap::new(),
     };
 
+    // Optional relay candidate (DESIGN-XNET-RELAY S2), one entry for the
+    // scenario's relay node:
+    //   RELAY_SPEC="relay|relay-local|198.18.64.5:4500"
+    // Absent means "no relay candidate", which is exactly the previous
+    // behaviour, so an existing env file is unaffected.
+    let relay_emission = match env_values.get("RELAY_SPEC") {
+        Some(spec) => parse_relay_spec(spec.as_str(), &endpoints_by_node)?,
+        None => None,
+    };
+
     let verifier_key_output = config.issue_dir.join("rn-traversal.pub");
     let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace("traversal")?;
     let result = (|| -> Result<(), String> {
@@ -3517,6 +3527,7 @@ pub fn execute_ops_e2e_issue_traversal_bundles_from_env(
             allow_pairs.as_slice(),
             ttl_secs,
             &srflx_by_node,
+            relay_emission.as_ref(),
         )?;
         for pair_bundle in &traversal_artifacts.pair_bundles {
             let pair_path = config.issue_dir.join(format!(
@@ -3850,6 +3861,7 @@ pub(crate) fn issue_traversal_bundles_locally(
             allow_pairs.as_slice(),
             bundle_ttl_secs,
             &BTreeMap::new(),
+            None,
         )?;
         for node in &nodes {
             let aggregate = artifacts
@@ -4179,6 +4191,72 @@ fn parse_srflx_spec(
     Ok(out)
 }
 
+/// The single relay emission parsed from `RELAY_SPEC`.
+///
+/// `node_id` is the relay's name in `NODES_SPEC` (kept for validation and for
+/// error messages); `relay_label` becomes every relay candidate's `relay_id`
+/// (the daemon re-derives the canonical 16-byte relay id from the label); and
+/// `endpoint` is the relay's transport address, emitted verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelayCandidateEmission {
+    pub node_id: String,
+    pub relay_label: String,
+    pub endpoint: String,
+}
+
+/// Parse `RELAY_SPEC` -- exactly one `node_id|relay_label|ip:port` entry.
+///
+/// Mirrors `parse_srflx_spec`'s failure discipline: the named node must exist
+/// in `NODES_SPEC`, the endpoint must be a numeric `ip:port`, and every
+/// violation is a hard error rather than a skip, because a bundle that looks
+/// complete while missing the relay candidate leaves cross-site pairs unable
+/// to connect at all. The label must itself be a valid relay label (the same
+/// grammar the daemon enforces via `canonical_relay_id_from_label`), so an
+/// invalid label fails at mint time instead of at every peer afterwards.
+fn parse_relay_spec(
+    spec: &str,
+    endpoints_by_node: &BTreeMap<String, String>,
+) -> Result<Option<RelayCandidateEmission>, String> {
+    let mut emission = None;
+    for entry in spec.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+        let (node_id, rest) = entry.split_once('|').ok_or_else(|| {
+            format!("RELAY_SPEC entry must be `node_id|relay_label|ip:port` (got: {entry})")
+        })?;
+        let (relay_label, endpoint) = rest.split_once('|').ok_or_else(|| {
+            format!("RELAY_SPEC entry must be `node_id|relay_label|ip:port` (got: {entry})")
+        })?;
+        let node_id = node_id.trim();
+        let relay_label = relay_label.trim();
+        let endpoint = endpoint.trim();
+        if !endpoints_by_node.contains_key(node_id) {
+            return Err(format!(
+                "node {node_id} from RELAY_SPEC is missing in NODES_SPEC"
+            ));
+        }
+        if endpoint.parse::<std::net::SocketAddr>().is_err() {
+            return Err(format!(
+                "RELAY_SPEC endpoint for {node_id} must be a numeric ip:port (got: {endpoint})"
+            ));
+        }
+        if let Err(err) = rustynet_control::canonical_relay_id_from_label(relay_label) {
+            return Err(format!(
+                "RELAY_SPEC relay label for {node_id} is invalid: {err}"
+            ));
+        }
+        if emission
+            .replace(RelayCandidateEmission {
+                node_id: node_id.to_owned(),
+                relay_label: relay_label.to_owned(),
+                endpoint: endpoint.to_owned(),
+            })
+            .is_some()
+        {
+            return Err(format!("RELAY_SPEC lists node {node_id} more than once"));
+        }
+    }
+    Ok(emission)
+}
+
 /// Candidate list a peer receives for one target.
 ///
 /// The host candidate outranks the server-reflexive one, which is what ICE
@@ -4192,9 +4270,19 @@ fn parse_srflx_spec(
 /// A reflexive candidate identical to the host address is dropped rather than
 /// duplicated -- the control plane rejects duplicate endpoints in one bundle,
 /// and on a publicly-addressed node the two legitimately coincide.
+///
+/// When a relay emission is supplied (DESIGN-XNET-RELAY S2), every bundle also
+/// carries a relay candidate at the lowest priority: the relay is the last
+/// resort a pair tries, after host and server-reflexive paths. The relay
+/// endpoint belongs to a different node, so it is emitted verbatim without a
+/// host-coincidence drop; if a misconfiguration makes it equal the target's
+/// host address, the control plane's duplicate-endpoint rejection is the
+/// fail-closed backstop. Absent emission means exactly the previous candidate
+/// list -- byte-identical bundles (pinned by the golden test).
 fn traversal_candidates_for_target(
     host_endpoint: &str,
     srflx_endpoint: Option<&String>,
+    relay: Option<&RelayCandidateEmission>,
 ) -> Vec<EndpointHintCandidate> {
     let mut candidates = vec![EndpointHintCandidate {
         candidate_type: EndpointHintCandidateType::Host,
@@ -4210,6 +4298,14 @@ fn traversal_candidates_for_target(
             priority: 800,
         });
     }
+    if let Some(relay) = relay {
+        candidates.push(EndpointHintCandidate {
+            candidate_type: EndpointHintCandidateType::Relay,
+            endpoint: relay.endpoint.clone(),
+            relay_id: Some(relay.relay_label.clone()),
+            priority: 700,
+        });
+    }
     candidates
 }
 
@@ -4219,6 +4315,7 @@ fn issue_traversal_bundle_artifacts(
     allow_pairs: &[GenericTraversalAllowSpec],
     ttl_secs: u64,
     srflx_by_node: &BTreeMap<String, String>,
+    relay: Option<&RelayCandidateEmission>,
 ) -> Result<IssuedTraversalArtifacts, String> {
     let endpoints_by_node = nodes
         .iter()
@@ -4255,6 +4352,7 @@ fn issue_traversal_bundle_artifacts(
                 candidates: traversal_candidates_for_target(
                     target_endpoint,
                     srflx_by_node.get(pair.target_node_id.as_str()),
+                    relay,
                 ),
             })
             .map_err(|err| format!("issue traversal bundle failed: {err}"))?;
@@ -9379,6 +9477,7 @@ client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a0908070
             allow_pairs.as_slice(),
             120,
             &BTreeMap::new(),
+            None,
         )
         .expect("traversal artifacts should issue");
 
@@ -9494,6 +9593,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
             allow_pairs.as_slice(),
             120,
             &BTreeMap::new(),
+            None,
         )
         .expect_err("hostname traversal endpoints must fail closed");
 
@@ -9515,6 +9615,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         let candidates = super::traversal_candidates_for_target(
             "192.168.64.10:51820",
             Some(&"51.186.254.100:39235".to_owned()),
+            None,
         );
         assert_eq!(candidates.len(), 2, "both candidates must be offered");
 
@@ -9535,7 +9636,7 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         );
 
         // No reflexive address known: unchanged from the previous behaviour.
-        let host_only = super::traversal_candidates_for_target("192.168.64.10:51820", None);
+        let host_only = super::traversal_candidates_for_target("192.168.64.10:51820", None, None);
         assert_eq!(host_only.len(), 1);
 
         // A reflexive address equal to the host address must not be duplicated:
@@ -9544,11 +9645,277 @@ client-1|debian-headless-2:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090
         let coincident = super::traversal_candidates_for_target(
             "203.0.113.7:51820",
             Some(&"203.0.113.7:51820".to_owned()),
+            None,
         );
         assert_eq!(
             coincident.len(),
             1,
             "a reflexive candidate identical to the host address must be dropped"
+        );
+    }
+
+    /// The candidate emitter exactly as it existed before RELAY_SPEC support
+    /// (DESIGN-XNET-RELAY S2). The golden tests below pin the new emitter's
+    /// absent-relay output to this function's output, so a RELAY_SPEC-less env
+    /// file must produce byte-identical bundles after the change.
+    fn golden_pre_relay_candidates(
+        host_endpoint: &str,
+        srflx_endpoint: Option<&String>,
+    ) -> Vec<super::EndpointHintCandidate> {
+        let mut candidates = vec![super::EndpointHintCandidate {
+            candidate_type: super::EndpointHintCandidateType::Host,
+            endpoint: host_endpoint.to_owned(),
+            relay_id: None,
+            priority: 900,
+        }];
+        if let Some(srflx) = srflx_endpoint.filter(|value| value.as_str() != host_endpoint) {
+            candidates.push(super::EndpointHintCandidate {
+                candidate_type: super::EndpointHintCandidateType::ServerReflexive,
+                endpoint: srflx.clone(),
+                relay_id: None,
+                priority: 800,
+            });
+        }
+        candidates
+    }
+
+    #[test]
+    fn parse_relay_spec_validates_node_label_and_endpoint() {
+        let endpoints = BTreeMap::from([
+            ("node-a".to_owned(), "192.168.64.4:51820".to_owned()),
+            ("node-b".to_owned(), "192.168.121.26:51820".to_owned()),
+        ]);
+
+        let parsed =
+            super::parse_relay_spec(" node-a | relay-local | 198.18.64.5:4500 ", &endpoints)
+                .expect("well-formed single-entry spec should parse")
+                .expect("spec named a relay");
+        assert_eq!(parsed.node_id, "node-a");
+        assert_eq!(parsed.relay_label, "relay-local");
+        assert_eq!(parsed.endpoint, "198.18.64.5:4500");
+
+        // Absent/empty is the documented "no relay candidate" case.
+        assert!(
+            super::parse_relay_spec("", &endpoints)
+                .expect("empty spec is valid")
+                .is_none()
+        );
+
+        // Unknown node: hard error, never a skip.
+        let err = super::parse_relay_spec("node-z|relay-local|198.18.64.5:4500", &endpoints)
+            .expect_err("unknown node must fail closed");
+        assert!(err.contains("missing in NODES_SPEC"), "got: {err}");
+
+        // Wrong field count: hard error. Two fields fail the shape check; a
+        // fourth field lands in the endpoint slot and fails the ip:port check.
+        let err = super::parse_relay_spec("node-a|198.18.64.5:4500", &endpoints)
+            .expect_err("two-field entry must fail closed");
+        assert!(err.contains("node_id|relay_label|ip:port"), "got: {err}");
+        let err = super::parse_relay_spec("node-a|relay-local|198.18.64.5:4500|extra", &endpoints)
+            .expect_err("four-field entry must fail closed");
+        assert!(err.contains("numeric ip:port"), "got: {err}");
+
+        // Hostname endpoint: hard error, same discipline as SRFLX_SPEC.
+        let err = super::parse_relay_spec("node-a|relay-local|relay.example.test:4500", &endpoints)
+            .expect_err("hostname endpoint must fail closed");
+        assert!(err.contains("numeric ip:port"), "got: {err}");
+
+        // Missing port: hard error.
+        let err = super::parse_relay_spec("node-a|relay-local|198.18.64.5", &endpoints)
+            .expect_err("endpoint without port must fail closed");
+        assert!(err.contains("numeric ip:port"), "got: {err}");
+
+        // Invalid relay labels: hard error at mint time (empty, and the
+        // canonical relay id bound is 16 ASCII bytes).
+        let err = super::parse_relay_spec("node-a||198.18.64.5:4500", &endpoints)
+            .expect_err("empty relay label must fail closed");
+        assert!(err.contains("relay label"), "got: {err}");
+        let err = super::parse_relay_spec(
+            "node-a|way-too-long-relay-label|198.18.64.5:4500",
+            &endpoints,
+        )
+        .expect_err("over-long relay label must fail closed");
+        assert!(err.contains("relay label"), "got: {err}");
+
+        // More than one entry: hard error (a bundle carries one relay).
+        let err = super::parse_relay_spec(
+            "node-a|relay-local|198.18.64.5:4500;node-b|relay-two|198.18.64.6:4500",
+            &endpoints,
+        )
+        .expect_err("multiple entries must fail closed");
+        assert!(err.contains("more than once"), "got: {err}");
+    }
+
+    /// DESIGN-XNET-RELAY S2 golden: with the relay emission ABSENT, the new
+    /// emitter's candidate list equals the pre-change emitter's list field for
+    /// field, and the resulting signed bundles are byte-identical on the wire.
+    #[test]
+    fn traversal_candidates_absent_relay_matches_pre_relay_emission_golden() {
+        let cases: Vec<(&str, Option<&str>)> = vec![
+            ("192.168.64.10:51820", None),
+            ("192.168.64.10:51820", Some("51.186.254.100:39235")),
+            ("203.0.113.7:51820", Some("203.0.113.7:51820")),
+        ];
+        for (host, srflx) in cases {
+            let srflx_owned = srflx.map(str::to_owned);
+            let golden = golden_pre_relay_candidates(host, srflx_owned.as_ref());
+            let actual = super::traversal_candidates_for_target(host, srflx_owned.as_ref(), None);
+            assert_eq!(
+                actual, golden,
+                "absent relay must reproduce the pre-relay candidate list for {host}"
+            );
+        }
+
+        // Byte identity through the real signer: same generated_at and nonce,
+        // same ttl, candidates from golden vs the new emitter with no relay --
+        // the wire bytes must be exactly equal.
+        let nodes = super::parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs = super::parse_generic_allow_specs("client-1|exit-1").expect("pairs");
+        let core = super::control_plane_core_from_generic_specs(
+            &[22u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+        )
+        .expect("core");
+        let generated_at_unix: u64 = 1_700_000_000;
+        let nonce = super::traversal_nonce(generated_at_unix, 0);
+        let build_wire = |candidates: Vec<super::EndpointHintCandidate>| -> String {
+            let bundle = core
+                .signed_endpoint_hint_bundle(super::EndpointHintBundleRequest {
+                    source_node_id: "client-1".to_owned(),
+                    target_node_id: "exit-1".to_owned(),
+                    generated_at_unix,
+                    ttl_secs: 120,
+                    nonce,
+                    candidates,
+                })
+                .expect("bundle should sign");
+            super::ControlPlaneCore::signed_endpoint_hint_bundle_to_wire(&bundle)
+        };
+        let srflx = "51.186.254.100:39235".to_owned();
+        let golden_wire = build_wire(golden_pre_relay_candidates(
+            "192.168.64.22:51820",
+            Some(&srflx),
+        ));
+        let actual_wire = build_wire(super::traversal_candidates_for_target(
+            "192.168.64.22:51820",
+            Some(&srflx),
+            None,
+        ));
+        assert_eq!(
+            golden_wire.as_bytes(),
+            actual_wire.as_bytes(),
+            "RELAY_SPEC absent must leave bundle bytes untouched"
+        );
+        assert!(golden_wire.contains("candidate_count=2"));
+        assert!(!golden_wire.contains("type=relay"));
+    }
+
+    /// DESIGN-XNET-RELAY S2: with an emission present every bundle carries a
+    /// relay candidate at the LOWEST priority, labeled with the relay id.
+    #[test]
+    fn traversal_candidates_relay_emission_appends_lowest_priority_relay_candidate() {
+        let relay = super::RelayCandidateEmission {
+            node_id: "relay".to_owned(),
+            relay_label: "relay-local".to_owned(),
+            endpoint: "198.18.64.5:4500".to_owned(),
+        };
+        let srflx = "51.186.254.100:39235".to_owned();
+        let candidates = super::traversal_candidates_for_target(
+            "192.168.64.10:51820",
+            Some(&srflx),
+            Some(&relay),
+        );
+
+        assert_eq!(candidates.len(), 3, "host, srflx and relay must be offered");
+        assert!(matches!(
+            candidates[0].candidate_type,
+            super::EndpointHintCandidateType::Host
+        ));
+        assert_eq!(candidates[0].priority, 900);
+        assert_eq!(candidates[0].relay_id, None);
+        assert!(matches!(
+            candidates[1].candidate_type,
+            super::EndpointHintCandidateType::ServerReflexive
+        ));
+        assert_eq!(candidates[1].priority, 800);
+        assert_eq!(candidates[1].relay_id, None);
+        assert!(matches!(
+            candidates[2].candidate_type,
+            super::EndpointHintCandidateType::Relay
+        ));
+        assert_eq!(candidates[2].endpoint, "198.18.64.5:4500");
+        assert_eq!(candidates[2].relay_id.as_deref(), Some("relay-local"));
+        assert_eq!(candidates[2].priority, 700);
+        assert!(
+            candidates[0].priority > candidates[1].priority
+                && candidates[1].priority > candidates[2].priority,
+            "relay is the last resort: strictly below host and srflx"
+        );
+
+        // No srflx known: host then relay, still in that order.
+        let host_relay =
+            super::traversal_candidates_for_target("192.168.64.10:51820", None, Some(&relay));
+        assert_eq!(host_relay.len(), 2);
+        assert!(matches!(
+            host_relay[1].candidate_type,
+            super::EndpointHintCandidateType::Relay
+        ));
+    }
+
+    /// End-to-end mint: RELAY_SPEC present puts `type=relay` and the relay id
+    /// into every pair bundle, and changes the wire bytes.
+    #[test]
+    fn traversal_bundle_artifacts_include_relay_candidate_when_spec_present() {
+        let nodes = super::parse_generic_nodes(
+            "exit-1|192.168.64.22:51820|000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f;\
+client-1|192.168.64.24:51820|1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100",
+        )
+        .expect("nodes should parse");
+        let allow_pairs =
+            super::parse_generic_allow_specs("client-1|exit-1;exit-1|client-1").expect("pairs");
+        let relay = super::RelayCandidateEmission {
+            node_id: "relay".to_owned(),
+            relay_label: "relay-local".to_owned(),
+            endpoint: "198.18.64.5:4500".to_owned(),
+        };
+
+        let with_relay = super::issue_traversal_bundle_artifacts(
+            &[22u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            120,
+            &BTreeMap::new(),
+            Some(&relay),
+        )
+        .expect("traversal artifacts should issue");
+        let without_relay = super::issue_traversal_bundle_artifacts(
+            &[23u8; 32],
+            nodes.as_slice(),
+            allow_pairs.as_slice(),
+            120,
+            &BTreeMap::new(),
+            None,
+        )
+        .expect("traversal artifacts should issue");
+
+        for bundle in &with_relay.pair_bundles {
+            assert!(bundle.wire.contains("type=relay"), "got: {}", bundle.wire);
+            assert!(bundle.wire.contains("candidate_count=2"));
+            assert!(bundle.wire.contains("candidate.1.relay_id=relay-local"));
+            assert!(bundle.wire.contains("candidate.1.addr=198.18.64.5"));
+            assert_eq!(bundle.wire.matches("type=relay").count(), 1);
+        }
+        for bundle in &without_relay.pair_bundles {
+            assert!(!bundle.wire.contains("type=relay"));
+        }
+        assert_ne!(
+            with_relay.pair_bundles[0].wire, without_relay.pair_bundles[0].wire,
+            "a relay emission must change the bundle bytes"
         );
     }
 

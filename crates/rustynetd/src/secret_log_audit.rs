@@ -385,6 +385,8 @@ const FORBIDDEN_DEBUG_SECRET_TYPES: &[&str] = &[
     "EnrollmentToken", // crates/rustynetd/src/enrollment_token.rs:104 — bearer token_id+tag, zeroizing Drop :123
     "ConsumedTokenLedger", // crates/rustynetd/src/enrollment_token.rs:363 — keys are consumed token ids (bearer halves)
     "LocalRelaySessionTokenIssuer", // crates/rustynetd/src/relay_client.rs:113 — holds Arc<SigningKey> :114; NO Debug today, listed to guard forward (no reviewed impl)
+    // rustynet-cli (vm_lab scenario provisioning)
+    "RelayTokenFile", // crates/rustynet-cli/src/vm_lab/orchestrator/stage/cross_network/scenario/provisioning.rs:1486 — name+base64 payload of an issued relay session token (bearer material); NO Debug (deliberately), listed to guard forward (no reviewed impl)
     // rustynet-control
     "TokenClaims",             // crates/rustynet-control/src/lib.rs:108 — subject+nonce
     "SignedTokenClaims",       // crates/rustynet-control/src/lib.rs:146 — signature bytes

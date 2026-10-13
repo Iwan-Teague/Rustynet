@@ -30,7 +30,10 @@ use rustynet_control::roles::RoleCapability;
 
 use super::host::ScenarioHost;
 use super::provisioning::{
-    self, AllowSpec, AssignmentsSpec, EnvFile, LabContext, NodeSpec, during,
+    self, AllowSpec, AssignmentsSpec, EnvFile, LabContext, NodeSpec, RELAY_ID_LABEL,
+    RELAY_TOKEN_ISSUE_ENV_PATH, deploy_relay_service, during, install_relay_token_spool,
+    issue_relay_session_tokens_from_env, parse_relay_token_name, prepare_relay_token_spool,
+    read_issued_relay_token_files,
 };
 use super::remote_exit_common::{BypassRun, run_bypass_validator, write_trust_summary};
 use super::{
@@ -194,7 +197,17 @@ fn execute(
         ],
     )?;
 
-    provision(inputs, lab, relay, relay_src_dir)?;
+    let (nodes, allow) = provision(inputs, lab, relay, relay_src_dir)?;
+
+    // Relay session tokens live at most 120 s, so a generation minted during
+    // provisioning may be near expiry by the time evidence is captured. Mint a
+    // fresh generation (superseding the previous one) before the steady-state
+    // captures. The standing ~90 s top-up loop is the wait-loop stage's job,
+    // not this scenario's.
+    during(
+        "refreshing relay session tokens",
+        reissue_relay_token_spools(exit, client, &nodes, &allow),
+    )?;
 
     // ── steady-state evidence ──
     let phase = "capturing relay remote-exit steady-state evidence";
@@ -293,13 +306,15 @@ fn execute(
 }
 
 /// Issue, distribute and enforce the signed state for the three-node chain,
-/// then bring both advertised default routes up.
+/// then bring both advertised default routes up. Returns the `NODES_SPEC` and
+/// `ALLOW_SPEC` strings so the caller can mint further relay-token generations
+/// against the same signed topology.
 fn provision(
     inputs: &ScenarioInputs<'_>,
     lab: &LabContext,
     relay: &ScenarioNode<'_>,
     relay_src_dir: &str,
-) -> Result<(), String> {
+) -> Result<(String, String), String> {
     let client = &inputs.client;
     let exit = &inputs.exit;
 
@@ -418,13 +433,25 @@ fn provision(
         )?;
     }
 
+    // The relay transport address must be known before the traversal bundles
+    // are minted: RELAY_SPEC (DESIGN-XNET-RELAY S2) is baked into every peer's
+    // bundle so the daemon accepts `type=relay` candidates pointing at the
+    // relay's 198.18/15 transport address.
+    let phase = "resolving the relay transport endpoint";
+    let transport_endpoint = during(phase, provisioning::relay_transport_endpoint(relay.runner))?;
+    let relay_spec = format!(
+        "{}|{}|{}",
+        relay.node_id, RELAY_ID_LABEL, transport_endpoint
+    );
+
     let phase = "issuing signed traversal bundles for relay remote-exit topology";
     let traversal_env = during(
         phase,
         EnvFile::new()
             .set("NODES_SPEC", &nodes)?
             .set("ALLOW_SPEC", &allow)?
-            .set("TRAVERSAL_TTL_SECS", "86400"),
+            .set("TRAVERSAL_TTL_SECS", "86400")?
+            .set("RELAY_SPEC", &relay_spec),
     )?;
     during(
         phase,
@@ -454,6 +481,21 @@ fn provision(
         )?;
     }
 
+    // The relay guest now holds /etc/rustynet/traversal.pub (installed with
+    // its traversal bundle), which is the token verifier key the relay service
+    // requires. Deploy the service bound to the transport endpoint minted into
+    // RELAY_SPEC so in-guest candidates and the actual listener agree.
+    let phase = "deploying the relay service";
+    during(
+        phase,
+        deploy_relay_service(
+            relay.runner,
+            relay_src_dir,
+            &transport_endpoint,
+            RELAY_ID_LABEL,
+        ),
+    )?;
+
     let phase = "re-issuing signed dns-zone bundles";
     during(
         phase,
@@ -467,6 +509,18 @@ fn provision(
                 (client.runner, &client.node_id),
             ],
         ),
+    )?;
+
+    // The spool drop-in must be in place BEFORE `enforce_host` (re)starts the
+    // daemon: a daemon that starts without RUSTYNET_RELAY_SESSION_TOKEN_SPOOL_DIR
+    // set will never read the spool, and the relay session then has no local
+    // token source (DESIGN-XNET-RELAY S3).
+    let phase = "preparing relay token spools on client and final exit";
+    during(phase, prepare_relay_token_spool(client.runner))?;
+    during(phase, prepare_relay_token_spool(exit.runner))?;
+    during(
+        phase,
+        reissue_relay_token_spools(exit, client, &nodes, &allow),
     )?;
 
     // The relay runs as `admin`, not a distinct relay role: the shell enforced
@@ -506,6 +560,66 @@ fn provision(
         super::advertise_default_route(relay.runner, lab.pace(super::ROUTE_ADVERTISE_SLEEP)),
     )?;
     lab.sleep(POST_ADVERTISE_SETTLE);
+    Ok((nodes, allow))
+}
+
+/// Mint one generation of relay session tokens on the final exit and install
+/// it into the per-peer spools on the client and the exit.
+///
+/// `RELAY_TOKEN_PAIRS` is written client-first (`client|relay;exit|relay`) so
+/// the mint's pair index doubles as the routing key: every `…-00-….relay-token`
+/// file belongs to the client's spool and every `…-01-…` file to the exit's.
+/// Each install supersedes the previous generation (≤128 files, expired files
+/// purged before the new batch lands).
+fn reissue_relay_token_spools(
+    exit: &ScenarioNode<'_>,
+    client: &ScenarioNode<'_>,
+    nodes: &str,
+    allow: &str,
+) -> Result<(), String> {
+    let phase = "minting relay session tokens";
+    let mint_env = during(
+        phase,
+        EnvFile::new()
+            .set("NODES_SPEC", nodes)?
+            .set("ALLOW_SPEC", allow)?
+            .set("RELAY_ID", RELAY_ID_LABEL)?
+            .set(
+                "RELAY_TOKEN_PAIRS",
+                &format!(
+                    "{}|{};{}|{}",
+                    client.node_id, RELAY_ID_LABEL, exit.node_id, RELAY_ID_LABEL
+                ),
+            )?
+            .set("RELAY_TOKENS_PER_PAIR", "2")?
+            .set("RELAY_TOKEN_TTL_SECS", "120"),
+    )?;
+    during(
+        phase,
+        issue_relay_session_tokens_from_env(exit.runner, &mint_env, RELAY_TOKEN_ISSUE_ENV_PATH),
+    )?;
+    let issued = during(phase, read_issued_relay_token_files(exit.runner))?;
+
+    let phase = "installing relay session tokens into peer spools";
+    let mut client_batch = Vec::new();
+    let mut exit_batch = Vec::new();
+    for file in issued {
+        match parse_relay_token_name(&file.name) {
+            Some((_, 0, _)) => client_batch.push(file),
+            Some((_, 1, _)) => exit_batch.push(file),
+            _ => {
+                return Err(format!(
+                    "relay token {} does not route to a known peer pair",
+                    file.name
+                ));
+            }
+        }
+    }
+    during(
+        phase,
+        install_relay_token_spool(client.runner, &client_batch),
+    )?;
+    during(phase, install_relay_token_spool(exit.runner, &exit_batch))?;
     Ok(())
 }
 
