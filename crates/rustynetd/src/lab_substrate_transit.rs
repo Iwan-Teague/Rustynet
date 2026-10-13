@@ -1605,10 +1605,20 @@ mod tests {
             }
         }
         established(&generation);
-        // Boot table in the boot installer's order: interface-agnostic
-        // WireGuard allows (finding 13), then the installer's transit argv
-        // bodies appended last, table renamed.
+        // Boot table in the boot installer's order: loopback, THEN the
+        // installer's transit argv bodies spliced in BEFORE the
+        // established/related trio (so the boot counters see established
+        // packets, matching the generation table), then the
+        // interface-agnostic WireGuard allows (finding 13). Table renamed.
         base_chain(&boot);
+        if shape.boot_transit {
+            for argv in crate::linux_killswitch_boot::boot_substrate_transit_rule_argvs(&transit) {
+                let mut renamed: Vec<&str> =
+                    vec!["add", "rule", "inet", boot.as_str(), "killswitch"];
+                renamed.extend(argv.iter().skip(5).map(String::as_str));
+                nft_ns(h, &renamed);
+            }
+        }
         established(&boot);
         for port_match in ["dport", "sport"] {
             nft_ns(
@@ -1625,14 +1635,6 @@ mod tests {
                     "accept",
                 ],
             );
-        }
-        if shape.boot_transit {
-            for argv in crate::linux_killswitch_boot::boot_substrate_transit_rule_argvs(&transit) {
-                let mut renamed: Vec<&str> =
-                    vec!["add", "rule", "inet", boot.as_str(), "killswitch"];
-                renamed.extend(argv.iter().skip(5).map(String::as_str));
-                nft_ns(h, &renamed);
-            }
         }
     }
 

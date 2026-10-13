@@ -262,13 +262,12 @@ pub fn boot_established_related_rule_bodies() -> Vec<Vec<String>> {
     crate::phase10::LinuxCommandSystem::established_related_accept_tokens()
 }
 
-pub fn install_linux_boot_killswitch(
-    iface: &str,
-    ssh_allow: bool,
-    ssh_cidrs: &[BootSshCidr],
-    wg_listen_port: Option<u16>,
-    traversal_endpoints: &[BootTraversalEndpoint],
-) -> Result<(), String> {
+/// The interface-name gate shared by both boot installer entry points
+/// (`install_linux_boot_killswitch` and
+/// `install_linux_boot_killswitch_with_substrate_transit`). Runs BEFORE any
+/// nft argv is built: see the full rationale on
+/// `install_linux_boot_killswitch`.
+fn validate_boot_iface_name(iface: &str) -> Result<(), String> {
     if iface.is_empty()
         || iface.len() > 15
         || !iface
@@ -280,6 +279,17 @@ pub fn install_linux_boot_killswitch(
              [A-Za-z0-9_-] (mirrors the runtime dataplane's device-name gate)"
         ));
     }
+    Ok(())
+}
+
+pub fn install_linux_boot_killswitch(
+    iface: &str,
+    ssh_allow: bool,
+    ssh_cidrs: &[BootSshCidr],
+    wg_listen_port: Option<u16>,
+    traversal_endpoints: &[BootTraversalEndpoint],
+) -> Result<(), String> {
+    validate_boot_iface_name(iface)?;
     install_linux_boot_killswitch_inner(
         iface,
         ssh_allow,
@@ -289,14 +299,126 @@ pub fn install_linux_boot_killswitch(
     )
 }
 
-#[cfg(target_os = "linux")]
-fn install_linux_boot_killswitch_inner(
+/// The boot chain's rules as an ordered nft argv sequence, WITHOUT the table
+/// create/chain-add statements. Every rule body is byte-identical to the
+/// previous exec-as-you-build implementation; the ONLY reason this is a pure
+/// builder now is that the substrate-transit install must splice the transit
+/// rules into the MIDDLE of the sequence instead of appending them (see
+/// `install_linux_boot_killswitch_with_substrate_transit`).
+///
+/// Cross-platform on purpose: the splice/order tests pin this sequence on
+/// every OS, while the nft exec that consumes it is Linux-only. The Linux
+/// consumers are cfg-gated, so off-Linux builds legitimately see no caller.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn boot_killswitch_rule_argvs(
     iface: &str,
     ssh_allow: bool,
     ssh_cidrs: &[BootSshCidr],
     wg_listen_port: Option<u16>,
     traversal_endpoints: &[BootTraversalEndpoint],
-) -> Result<(), String> {
+) -> Vec<Vec<String>> {
+    let mut rules: Vec<Vec<String>> = Vec::new();
+    let mut add_rule = |body: Vec<String>| {
+        let mut argv: Vec<String> = ["add", "rule", "inet", BOOT_KILLSWITCH_TABLE, "killswitch"]
+            .iter()
+            .map(|token| (*token).to_owned())
+            .collect();
+        argv.extend(body);
+        rules.push(argv);
+    };
+    add_rule(vec![
+        "oifname".to_owned(),
+        "lo".to_owned(),
+        "accept".to_owned(),
+    ]);
+    // AQ-70/F2: established/related passes through THREE scoped rules so an
+    // established DNS/DoT/DoQ flow is never accepted ahead of the DNS drops
+    // and established IPv6 stays on the policy-drop path. AQ-253: the bodies
+    // ARE the runtime generator's `established_related_accept_tokens`
+    // (`boot_established_related_rule_bodies`), so this boot chain cannot
+    // drift from the daemon's killswitch/forward chains.
+    for rule_tokens in boot_established_related_rule_bodies() {
+        add_rule(rule_tokens);
+    }
+    // Allow outbound through the WireGuard interface.  The iface may not
+    // exist yet at ExecStartPre time, but nftables accepts the rule and
+    // will match it once the interface comes up.
+    add_rule(vec![
+        "oifname".to_owned(),
+        iface.to_owned(),
+        "accept".to_owned(),
+    ]);
+    // Allow outbound UDP to the WireGuard listen port so the daemon's
+    // traversal-probe handshake datagrams can leave the host during the
+    // window where this boot chain hooks `output` alongside the daemon's
+    // generation-rotated chain.  Without this rule, every WG outbound
+    // datagram returns EPERM regardless of the daemon's own ruleset,
+    // because both chains share the `output` hook and `policy drop` in
+    // either chain drops the packet.
+    if let Some(port) = wg_listen_port {
+        let port_str = port.to_string();
+        add_rule(vec![
+            "udp".to_owned(),
+            "dport".to_owned(),
+            port_str.clone(),
+            "accept".to_owned(),
+        ]);
+        // Also match outbound WireGuard by SOURCE port.  The dport rule only
+        // covers peers listening on our own port; a peer reached at its
+        // server-reflexive candidate sits on an arbitrary NAT-mapped port, so
+        // without this the handshake is dropped here and NAT traversal can
+        // never complete.  Every datagram the daemon emits leaves its bound
+        // WireGuard socket with this source port.
+        add_rule(vec![
+            "udp".to_owned(),
+            "sport".to_owned(),
+            port_str,
+            "accept".to_owned(),
+        ]);
+    }
+    // Allow outbound UDP to each configured traversal-bootstrap endpoint.
+    // STUN gathering uses an ephemeral source port toward the server's
+    // destination port, so the `wg_listen_port` rule above does not match
+    // it.  Both chains share the `output` hook, so without this rule the
+    // boot chain's `policy drop` vetoes every STUN datagram even though the
+    // daemon's generation-rotated table explicitly accepts it, and the
+    // daemon can never gather a server-reflexive candidate.  The match is
+    // narrowed to the exact destination address and port so this stays a
+    // pinhole rather than a general UDP egress hole.
+    for endpoint in traversal_endpoints {
+        let port_str = endpoint.port.to_string();
+        add_rule(vec![
+            endpoint.family.to_owned(),
+            "daddr".to_owned(),
+            endpoint.addr.clone(),
+            "udp".to_owned(),
+            "dport".to_owned(),
+            port_str,
+            "accept".to_owned(),
+        ]);
+    }
+    if ssh_allow {
+        for cidr in ssh_cidrs {
+            add_rule(vec![
+                cidr.family.to_owned(),
+                "daddr".to_owned(),
+                cidr.cidr.clone(),
+                "tcp".to_owned(),
+                "dport".to_owned(),
+                "22".to_owned(),
+                "accept".to_owned(),
+            ]);
+        }
+    }
+    rules
+}
+
+/// Linux-only executor for the ordered boot argv sequence: recreate the boot
+/// table, add the base chain, then exec each rule argv in order. Any nft
+/// failure aborts the install (fail closed), exactly like the previous
+/// exec-as-you-build path.
+#[cfg(target_os = "linux")]
+fn install_boot_killswitch_rule_sequence(rule_argvs: &[Vec<String>]) -> Result<(), String> {
     // Argv-only helper: no shell construction, args are separate tokens.
     fn nft(args: &[&str]) -> Result<(), String> {
         let out = std::process::Command::new("nft")
@@ -339,123 +461,28 @@ fn install_linux_boot_killswitch_inner(
         ";",
         "}",
     ])?;
-    nft(&[
-        "add",
-        "rule",
-        "inet",
-        BOOT_KILLSWITCH_TABLE,
-        "killswitch",
-        "oifname",
-        "lo",
-        "accept",
-    ])?;
-    // AQ-70/F2: established/related passes through THREE scoped rules so an
-    // established DNS/DoT/DoQ flow is never accepted ahead of the DNS drops
-    // and established IPv6 stays on the policy-drop path. AQ-253: the bodies
-    // ARE the runtime generator's `established_related_accept_tokens`
-    // (`boot_established_related_rule_bodies`), so this boot chain cannot
-    // drift from the daemon's killswitch/forward chains.
-    for rule_tokens in boot_established_related_rule_bodies() {
-        let mut argv: Vec<&str> = vec!["add", "rule", "inet", BOOT_KILLSWITCH_TABLE, "killswitch"];
-        argv.extend(rule_tokens.iter().map(String::as_str));
-        nft(&argv)?;
-    }
-    // Allow outbound through the WireGuard interface.  The iface may not
-    // exist yet at ExecStartPre time, but nftables accepts the rule and
-    // will match it once the interface comes up.
-    nft(&[
-        "add",
-        "rule",
-        "inet",
-        BOOT_KILLSWITCH_TABLE,
-        "killswitch",
-        "oifname",
-        iface,
-        "accept",
-    ])?;
-    // Allow outbound UDP to the WireGuard listen port so the daemon's
-    // traversal-probe handshake datagrams can leave the host during the
-    // window where this boot chain hooks `output` alongside the daemon's
-    // generation-rotated chain.  Without this rule, every WG outbound
-    // datagram returns EPERM regardless of the daemon's own ruleset,
-    // because both chains share the `output` hook and `policy drop` in
-    // either chain drops the packet.
-    if let Some(port) = wg_listen_port {
-        let port_str = port.to_string();
-        nft(&[
-            "add",
-            "rule",
-            "inet",
-            BOOT_KILLSWITCH_TABLE,
-            "killswitch",
-            "udp",
-            "dport",
-            port_str.as_str(),
-            "accept",
-        ])?;
-        // Also match outbound WireGuard by SOURCE port.  The dport rule only
-        // covers peers listening on our own port; a peer reached at its
-        // server-reflexive candidate sits on an arbitrary NAT-mapped port, so
-        // without this the handshake is dropped here and NAT traversal can
-        // never complete.  Every datagram the daemon emits leaves its bound
-        // WireGuard socket with this source port.
-        nft(&[
-            "add",
-            "rule",
-            "inet",
-            BOOT_KILLSWITCH_TABLE,
-            "killswitch",
-            "udp",
-            "sport",
-            port_str.as_str(),
-            "accept",
-        ])?;
-    }
-    // Allow outbound UDP to each configured traversal-bootstrap endpoint.
-    // STUN gathering uses an ephemeral source port toward the server's
-    // destination port, so the `wg_listen_port` rule above does not match
-    // it.  Both chains share the `output` hook, so without this rule the
-    // boot chain's `policy drop` vetoes every STUN datagram even though
-    // the daemon's generation-rotated table explicitly accepts it, and
-    // the daemon can never gather a server-reflexive candidate.  The
-    // match is narrowed to the exact destination address and port so this
-    // stays a pinhole rather than a general UDP egress hole.
-    for endpoint in traversal_endpoints {
-        let port_str = endpoint.port.to_string();
-        nft(&[
-            "add",
-            "rule",
-            "inet",
-            BOOT_KILLSWITCH_TABLE,
-            "killswitch",
-            endpoint.family,
-            "daddr",
-            endpoint.addr.as_str(),
-            "udp",
-            "dport",
-            port_str.as_str(),
-            "accept",
-        ])?;
-    }
-    if ssh_allow {
-        for cidr in ssh_cidrs {
-            nft(&[
-                "add",
-                "rule",
-                "inet",
-                BOOT_KILLSWITCH_TABLE,
-                "killswitch",
-                cidr.family,
-                "daddr",
-                cidr.cidr.as_str(),
-                "tcp",
-                "dport",
-                "22",
-                "accept",
-            ])?;
-        }
+    for argv in rule_argvs {
+        let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        nft(&refs)?;
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_boot_killswitch_inner(
+    iface: &str,
+    ssh_allow: bool,
+    ssh_cidrs: &[BootSshCidr],
+    wg_listen_port: Option<u16>,
+    traversal_endpoints: &[BootTraversalEndpoint],
+) -> Result<(), String> {
+    install_boot_killswitch_rule_sequence(&boot_killswitch_rule_argvs(
+        iface,
+        ssh_allow,
+        ssh_cidrs,
+        wg_listen_port,
+        traversal_endpoints,
+    ))
 }
 
 /// LAB-ONLY (AQ-256, review finding 1): the boot table's substrate transit
@@ -497,6 +524,30 @@ pub fn boot_substrate_transit_rule_argvs(
 /// (`lab_substrate_transit::load_for_boot_check`), and the WireGuard listen
 /// port it needs is checked here first. With `None` this is exactly
 /// [`install_linux_boot_killswitch`].
+///
+/// ## Rule order: transit rules precede the established/related accepts
+///
+/// The runtime emitter inserts the transit rules ABOVE the
+/// established/related trio in the daemon's generation table (u42-r1
+/// verified), so the transit counters see EVERY packet that matches the
+/// rule shape. The boot installer used to APPEND them below the trio,
+/// which made the boot-table transit counters see only the FIRST packet
+/// of each NEW conntrack flow: the vxlan encapsulation collapses both
+/// directions of a peer pair into ONE bidirectional conntrack flow whose
+/// source-port hash (and therefore match) is fixed, and the persistent
+/// WireGuard keepalive keeps that flow `established` forever, so on the
+/// responder side of a pair the boot counter sits frozen at its
+/// boot-time value (usually 0) no matter how much transit flows. That is
+/// the u42-r1 `security_audit_validation` failure (boot-table counters
+/// frozen on every host while the same rules rose in the generation
+/// table).
+///
+/// Moving the transit rules above the trio is verdict-neutral — every
+/// packet a transit rule accepts was previously accepted by the
+/// established accept instead; only counter visibility changes, matching
+/// the generation-table semantics. The splice point is directly after
+/// the loopback accept so the boot chain keeps its canonical
+/// lo-first shape.
 #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
 pub fn install_linux_boot_killswitch_with_substrate_transit(
     iface: &str,
@@ -506,43 +557,82 @@ pub fn install_linux_boot_killswitch_with_substrate_transit(
     traversal_endpoints: &[BootTraversalEndpoint],
     substrate_transit: Option<&crate::lab_substrate_transit::SubstrateTransit>,
 ) -> Result<(), String> {
-    let transit_argvs = match substrate_transit {
-        None => Vec::new(),
-        Some(transit) => {
-            if wg_listen_port.unwrap_or(0) == 0 {
-                return Err(crate::lab_substrate_transit::rejected(
-                    "linux-killswitch-boot-check was given no --wg-listen-port; the transit \
-                     needs the real WireGuard listen port",
-                ));
-            }
-            boot_substrate_transit_rule_argvs(transit)
-        }
-    };
-    install_linux_boot_killswitch(
+    // Refusal gate FIRST (before any nft exec): a transit install without
+    // the real WireGuard listen port must exit with the boot table untouched.
+    // The argv bodies themselves are computed in
+    // `boot_killswitch_substrate_rule_argv_sequence` below.
+    if substrate_transit.is_some() && wg_listen_port.unwrap_or(0) == 0 {
+        return Err(crate::lab_substrate_transit::rejected(
+            "linux-killswitch-boot-check was given no --wg-listen-port; the transit \
+             needs the real WireGuard listen port",
+        ));
+    }
+    validate_boot_iface_name(iface)?;
+    let rule_argvs = boot_killswitch_substrate_rule_argv_sequence(
         iface,
         ssh_allow,
         ssh_cidrs,
         wg_listen_port,
         traversal_endpoints,
-    )?;
-    for argv in &transit_argvs {
-        // Argv-only, no shell: the underlay name passed the device-name gate
-        // and the peer is a parsed IPv4 address, so nothing here can add nft
-        // grammar to the boot chain.
-        let output = std::process::Command::new("nft")
-            .args(argv)
-            .output()
-            .map_err(|err| format!("nft spawn failed: {err}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "nft {} failed ({}): {}",
-                argv.join(" "),
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+        substrate_transit,
+    );
+    install_boot_killswitch_rule_sequence(&rule_argvs)
+}
+
+/// The substrate boot install's full ordered rule sequence, WITHOUT the table
+/// create/chain-add statements. Pure so the splice order (the fix for the
+/// u42-r1 boot-counter freeze) is unit-testable without executing nft: the
+/// transit argvs sit directly after the loopback accept, BEFORE the
+/// established/related trio.
+#[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+fn boot_killswitch_substrate_rule_argv_sequence(
+    iface: &str,
+    ssh_allow: bool,
+    ssh_cidrs: &[BootSshCidr],
+    wg_listen_port: Option<u16>,
+    traversal_endpoints: &[BootTraversalEndpoint],
+    substrate_transit: Option<&crate::lab_substrate_transit::SubstrateTransit>,
+) -> Vec<Vec<String>> {
+    let transit_argvs = match substrate_transit {
+        None => Vec::new(),
+        Some(transit) => boot_substrate_transit_rule_argvs(transit),
+    };
+    let mut rule_argvs = boot_killswitch_rule_argvs(
+        iface,
+        ssh_allow,
+        ssh_cidrs,
+        wg_listen_port,
+        traversal_endpoints,
+    );
+    if !transit_argvs.is_empty() {
+        splice_argvs_after_loopback(&mut rule_argvs, transit_argvs);
     }
-    Ok(())
+    rule_argvs
+}
+
+/// Insert `extra` argv sequences into `rules` directly after the loopback
+/// accept rule (the boot chain's first rule), before everything else. Pure
+/// and cross-platform so the splice position is unit-testable off-Linux. Its
+/// Linux consumer is feature-gated, so other builds legitimately see no caller.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "lab-substrate")),
+    allow(dead_code)
+)]
+fn splice_argvs_after_loopback(rules: &mut Vec<Vec<String>>, extra: Vec<Vec<String>>) {
+    let is_loopback = |argv: &[String]| {
+        argv.windows(2).any(|pair| {
+            pair.first().map(String::as_str) == Some("oifname")
+                && pair.get(1).map(String::as_str) == Some("lo")
+        }) && argv.last().map(String::as_str) == Some("accept")
+    };
+    let at = rules
+        .iter()
+        .position(|argv| is_loopback(argv))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    for (offset, argv) in extra.into_iter().enumerate() {
+        rules.insert(at + offset, argv);
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1438,7 +1528,7 @@ table inet rustynetfoo {
     }
 
     #[test]
-    fn boot_killswitch_source_contains_wg_listen_port_rule() {
+    fn boot_killswitch_emits_wg_listen_port_rules() {
         // Pin against the regression where the boot chain (which hooks
         // `output` priority 0 alongside the daemon's generation-rotated
         // chain) had no outbound-UDP accept for the WireGuard listen
@@ -1446,24 +1536,37 @@ table inet rustynetfoo {
         // during the pre-`path_live_proven` window returns EPERM from
         // `sendto(2)` because this boot chain's `policy drop` still
         // applies even when the daemon's chain would have accepted.
-        let source = include_str!("linux_killswitch_boot.rs");
-        assert!(
-            source.contains("if let Some(port) = wg_listen_port {"),
-            "install_linux_boot_killswitch_inner must gate the WG-port allow rule on the \
-             wg_listen_port argument so a None caller skips it cleanly"
+        // (Formerly a source-text pin; now the builder's actual output,
+        // which cannot drift from what the chain really programs.)
+        let rules = super::boot_killswitch_rule_argvs("rustynet0", false, &[], Some(51820), &[]);
+        let dport = rules
+            .iter()
+            .position(|argv| argv.windows(3).any(|w| w == ["udp", "dport", "51820"]));
+        let sport = rules
+            .iter()
+            .position(|argv| argv.windows(3).any(|w| w == ["udp", "sport", "51820"]));
+        let (dport, sport) = (
+            dport.expect("dport 51820 rule"),
+            sport.expect("sport 51820 rule"),
         );
+        assert_ne!(dport, sport, "dport and sport are two distinct rules");
+        for at in [dport, sport] {
+            let argv = rules.get(at).expect("positioned rule exists");
+            assert_eq!(
+                argv.last().map(String::as_str),
+                Some("accept"),
+                "the port allows must accept: {argv:?}"
+            );
+        }
+        // The None caller must skip the port rules entirely (the
+        // established/related DNS scoping also matches udp dport, so pin the
+        // exact listen-port shape).
+        let rules = super::boot_killswitch_rule_argvs("rustynet0", false, &[], None, &[]);
         assert!(
-            source.contains("\"udp\","),
-            "install_linux_boot_killswitch_inner must emit an `udp` token in the boot ruleset"
-        );
-        assert!(
-            source.contains("\"dport\","),
-            "install_linux_boot_killswitch_inner must emit a `dport` token in the boot ruleset"
-        );
-        assert!(
-            source.contains("wg_listen_port: Option<u16>"),
-            "install_linux_boot_killswitch* signatures must accept Option<u16> for the \
-             WireGuard listen port so the systemd unit can forward RUSTYNET_WG_LISTEN_PORT"
+            !rules
+                .iter()
+                .any(|argv| argv.windows(3).any(|w| w == ["udp", "dport", "51820"])),
+            "wg_listen_port=None must emit no udp/dport 51820 rule: {rules:#?}"
         );
     }
 
@@ -1490,30 +1593,36 @@ table inet rustynetfoo {
     }
 
     #[test]
-    fn boot_killswitch_source_contains_traversal_endpoint_rule() {
+    fn boot_killswitch_emits_traversal_endpoint_rules() {
         // Pin against the regression this fixes: the traversal-bootstrap
         // allow-list (the STUN servers) was emitted only into the daemon's
         // generation-rotated table, never into this boot chain. Both hook
         // `output` at priority 0, so the boot chain's `policy drop` vetoed
         // every STUN datagram the daemon's table accepted, leaving
         // srflx_candidates permanently 0 and NAT traversal impossible.
-        // Measured on a real two-network lab 2026-07-29.
-        let source = include_str!("linux_killswitch_boot.rs");
-        assert!(
-            source.contains("for endpoint in traversal_endpoints {"),
-            "install_linux_boot_killswitch_inner must emit an allow rule per configured \
-             traversal-bootstrap endpoint"
+        // Measured on a real two-network lab 2026-07-29. (Formerly a
+        // source-text pin; now the builder's actual output.)
+        let endpoints =
+            vec![super::BootTraversalEndpoint::parse("74.125.250.129:19302").expect("endpoint")];
+        let rules = super::boot_killswitch_rule_argvs("rustynet0", false, &[], None, &endpoints);
+        let matches: Vec<_> = rules
+            .iter()
+            .filter(|argv| {
+                argv.windows(3)
+                    .any(|w| w == ["ip", "daddr", "74.125.250.129"])
+            })
+            .collect();
+        assert_eq!(
+            matches.len(),
+            endpoints.len(),
+            "one pinhole per endpoint, exact destination address: {rules:#?}"
         );
-        assert!(
-            source.contains("traversal_endpoints: &[BootTraversalEndpoint]"),
-            "install_linux_boot_killswitch* signatures must accept the traversal endpoints so \
-             the systemd unit can forward RUSTYNET_TRAVERSAL_STUN_SERVERS"
-        );
-        assert!(
-            source.contains("endpoint.addr.as_str()"),
-            "the traversal allow rule must match the exact destination address, keeping it a \
-             pinhole rather than a general UDP egress hole"
-        );
+        for argv in &matches {
+            assert!(
+                argv.windows(3).any(|w| w == ["udp", "dport", "19302"]),
+                "the STUN pinhole must match the endpoint's exact port: {argv:?}"
+            );
+        }
     }
 
     #[test]
@@ -1526,11 +1635,13 @@ table inet rustynetfoo {
         // the handshake datagram was dropped with EPERM and traversal could
         // never complete. Measured on a real two-network lab 2026-07-29:
         // `send_to failed for 51.186.254.100:44883: Operation not permitted`.
-        let source = include_str!("linux_killswitch_boot.rs");
+        let rules = super::boot_killswitch_rule_argvs("rustynet0", false, &[], Some(51820), &[]);
         assert!(
-            source.contains("\"sport\","),
-            "install_linux_boot_killswitch_inner must emit a `sport` match so outbound \
-             WireGuard to a NAT-mapped peer endpoint is permitted"
+            rules
+                .iter()
+                .any(|argv| argv.windows(3).any(|w| w == ["udp", "sport", "51820"])),
+            "the boot chain must emit a `sport` match so outbound WireGuard to a \
+             NAT-mapped peer endpoint is permitted: {rules:#?}"
         );
     }
 
@@ -1633,5 +1744,179 @@ table inet rustynetfoo {
             err.contains("invalid boot killswitch interface name"),
             "{err}"
         );
+    }
+
+    // ---- u42-r1 fix: boot transit counters must see established packets ----
+    //
+    // Root cause of the u42-r1 security_audit_validation failure: the boot
+    // installer APPENDED the substrate transit rules BELOW the
+    // established/related accepts, so a transit counter only ever saw the
+    // FIRST packet of each NEW conntrack flow. The vxlan encapsulation
+    // collapses both directions of a peer pair into ONE bidirectional
+    // conntrack flow (inner WG 51820->51820, outer sport hash fixed per
+    // flow), the persistent WireGuard keepalive keeps it established
+    // forever, and on the responder side of a pair the boot counter sat
+    // frozen at its boot-time value no matter how much transit flowed.
+    // The fix splices the transit argvs directly after the loopback accept,
+    // BEFORE the established trio — matching the runtime emitter's
+    // generation-table order — so the boot counters see every packet,
+    // responder side included.
+
+    /// The loopback rule's index in a boot argv sequence.
+    fn loopback_index(rule_argvs: &[Vec<String>]) -> usize {
+        rule_argvs
+            .iter()
+            .position(|argv| {
+                argv.windows(2).any(|pair| {
+                    pair.first().map(String::as_str) == Some("oifname")
+                        && pair.get(1).map(String::as_str) == Some("lo")
+                }) && argv.last().map(String::as_str) == Some("accept")
+            })
+            .expect("boot chain must have a loopback accept rule")
+    }
+
+    /// The first established/related rule's index in a boot argv sequence.
+    fn first_established_index(rule_argvs: &[Vec<String>]) -> usize {
+        rule_argvs
+            .iter()
+            .position(|argv| {
+                argv.iter()
+                    .any(|token| token.contains("established,related"))
+            })
+            .expect("boot chain must have established/related rules")
+    }
+
+    /// The transit rules' indexes in a boot argv sequence. Two of the three
+    /// callers are Linux-feature-gated, so other builds legitimately see no
+    /// caller.
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "lab-substrate")),
+        allow(dead_code)
+    )]
+    fn transit_indexes(rule_argvs: &[Vec<String>]) -> Vec<usize> {
+        rule_argvs
+            .iter()
+            .enumerate()
+            .filter(|(_, argv)| {
+                argv.iter()
+                    .any(|token| *token == "rustynet_substrate_transit")
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn two_peer_attestation() -> crate::lab_substrate_transit::SubstrateTransit {
+        crate::lab_substrate_transit::parse_attestation(
+            "version=1\noverlay_interface=rustynet-vx0\nunderlay_interface=eth0\n\
+             peer=192.168.0.32\npeer=192.168.122.31\n",
+        )
+        .expect("two-peer test attestation parses")
+    }
+
+    /// THE regression pin: with an active substrate transit the boot chain's
+    /// transit rules sit AFTER the loopback accept and BEFORE the
+    /// established/related trio, contiguous, one per peer. Before the fix
+    /// they were appended at the very end, which froze the responder-side
+    /// boot counters (u42-r1 security_audit_validation FAIL).
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn boot_transit_rules_precede_established_rules() {
+        let transit = two_peer_attestation();
+        let sequence = super::boot_killswitch_substrate_rule_argv_sequence(
+            "rustynet0",
+            false,
+            &[],
+            Some(51820),
+            &[],
+            Some(&transit),
+        );
+        let lo = loopback_index(&sequence);
+        let established = first_established_index(&sequence);
+        let transit_at = transit_indexes(&sequence);
+        assert_eq!(
+            transit_at.len(),
+            transit.peers().len(),
+            "one transit rule per peer: {sequence:#?}"
+        );
+        assert_eq!(
+            transit_at.first().copied(),
+            Some(lo + 1),
+            "the transit rules must start directly after the loopback accept"
+        );
+        assert_eq!(
+            transit_at.last().copied().map(|at| at + 1),
+            Some(established),
+            "the established/related trio must come directly after the transit rules"
+        );
+        for (argv, peer) in transit_at
+            .iter()
+            .filter_map(|&at| sequence.get(at))
+            .zip(transit.peers())
+        {
+            assert!(
+                argv.iter().any(|token| token.as_str() == peer.to_string()),
+                "transit rule must be pinned to its peer address {peer}: {argv:?}"
+            );
+        }
+    }
+
+    /// With no attestation the sequence is exactly the plain boot chain —
+    /// no transit rules spliced in, nothing else moved.
+    #[test]
+    #[cfg(all(target_os = "linux", feature = "lab-substrate"))]
+    fn boot_sequence_without_transit_is_the_plain_chain() {
+        let plain = super::boot_killswitch_rule_argvs("rustynet0", false, &[], Some(51820), &[]);
+        let sequence = super::boot_killswitch_substrate_rule_argv_sequence(
+            "rustynet0",
+            false,
+            &[],
+            Some(51820),
+            &[],
+            None,
+        );
+        assert_eq!(sequence, plain);
+        assert!(
+            transit_indexes(&sequence).is_empty(),
+            "no transit rules without an attestation"
+        );
+    }
+
+    /// The plain boot chain keeps its reviewed order: loopback first, then
+    /// the established/related trio (AQ-70/F2), then the interface and port
+    /// allows. Guards the splice helper against ever reordering the base.
+    #[test]
+    fn boot_chain_base_order_lo_first_then_established() {
+        let rules = super::boot_killswitch_rule_argvs("rustynet0", false, &[], None, &[]);
+        assert_eq!(loopback_index(&rules), 0, "loopback must stay first");
+        assert_eq!(
+            first_established_index(&rules),
+            1,
+            "the established/related trio must directly follow loopback"
+        );
+        assert_eq!(rules.len(), 5, "lo + 3 established + iface allow");
+        let last = rules.last().expect("boot chain is never empty");
+        assert!(
+            last.contains(&"rustynet0".to_owned()),
+            "last rule is the tunnel-interface allow: {last:#?}"
+        );
+    }
+
+    /// The splice helper inserts directly after the loopback rule and
+    /// preserves the rest of the sequence byte-for-byte.
+    #[test]
+    fn splice_argvs_insert_after_loopback_and_preserve_order() {
+        let mut rules = vec![
+            vec!["oifname".to_owned(), "lo".to_owned(), "accept".to_owned()],
+            vec!["ct".to_owned(), "established".to_owned()],
+            vec!["oifname".to_owned(), "rustynet0".to_owned()],
+        ];
+        let extra = vec![vec!["t1".to_owned()], vec!["t2".to_owned()]];
+        super::splice_argvs_after_loopback(&mut rules, extra);
+        let flat: Vec<&str> = rules
+            .iter()
+            .map(|argv| argv.first().map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(flat, ["oifname", "t1", "t2", "ct", "oifname"]);
     }
 }
