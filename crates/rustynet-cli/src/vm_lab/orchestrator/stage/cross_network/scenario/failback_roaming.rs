@@ -63,6 +63,8 @@
 
 use std::time::Duration;
 
+use rustynet_control::roles::RoleCapability;
+
 use super::baseline::{self, BaselinePaths, BaselineScenario};
 use super::endpoint_switch::{self, RoamAlias, SAMPLE_INTERVAL, unix_now};
 use super::host::ScenarioHost;
@@ -106,6 +108,15 @@ pub const DEFAULT_MONITOR_ITERATIONS: u32 = 35;
 /// The `sleep 5` after both advertised routes are re-established, before
 /// post-roam evidence is captured.
 const POST_ADVERTISE_SETTLE: Duration = Duration::from_secs(5);
+
+/// Capabilities the relay carries in the roam re-issuance.
+///
+/// The relay is enforced as `admin` for the roam (see `reissue_for_roam`), and
+/// the daemon requires `anchor` in an admin node's own signed assignment
+/// bundle; it consumes the final exit's traffic, so it keeps `client`. After
+/// the roam nobody exits through the relay, so it needs no `exit_server`.
+const ROAM_RELAY_NODE_CAPABILITIES: [RoleCapability; 2] =
+    [RoleCapability::Anchor, RoleCapability::Client];
 
 /// Remote path of the roam re-issuance env file.
 const ROAM_ISSUE_ENV_PATH: &str = "/tmp/rn_issue_cross_network_roam.env";
@@ -605,7 +616,8 @@ fn reissue_for_roam(
                 &relay.address,
                 WIREGUARD_PORT,
                 relay_pub_hex,
-            )?,
+            )?
+            .with_capabilities(&ROAM_RELAY_NODE_CAPABILITIES),
             NodeSpec::new(
                 client.node_id.as_str(),
                 &client.address,
