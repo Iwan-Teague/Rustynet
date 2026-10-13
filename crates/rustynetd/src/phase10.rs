@@ -1985,6 +1985,29 @@ impl LinuxCommandSystem {
         };
         for peer in transit.peers() {
             let target = IpAddr::V4(*peer);
+            // A transit peer that is also a WireGuard peer endpoint has just
+            // been pinned by `apply_peer_endpoint_bypass_routes`. With the
+            // full-tunnel `ip rule` engaged, resolving it again is answered
+            // from that fresh pin in table 51820 and `resolve_route_for_ip`
+            // would refuse it as a stale pin. The existing pin is the same
+            // `/32` in the same table; accept it only when it already sits on
+            // the attested underlay, otherwise refuse exactly as before.
+            let pinned = format!("{peer}/32");
+            if let Some(existing) = self
+                .expected_peer_endpoint_bypass_routes
+                .iter()
+                .find(|route| route.destination == pinned)
+            {
+                if existing.interface_name == transit.underlay_interface() {
+                    continue;
+                }
+                return Err(SystemError::RouteApplyFailed(format!(
+                    "substrate transit peer {peer} is already pinned via {}, not the attested \
+                     underlay {}; refusing (fail closed, the reconcile loop will retry)",
+                    existing.interface_name,
+                    transit.underlay_interface()
+                )));
+            }
             let route = self.resolve_route_for_ip(target)?;
             if route.interface_name != transit.underlay_interface() {
                 return Err(SystemError::RouteApplyFailed(format!(
@@ -26252,6 +26275,68 @@ Persistent Routes:
             assert!(
                 !log.iter().any(|command| command.contains("route replace")),
                 "nothing may be pinned on a refused resolution: {log:#?}"
+            );
+        }
+
+        /// A transit peer that is ALSO a WireGuard peer endpoint (the cross-network
+        /// scenarios hand out underlay addresses as endpoints, and the vxlan VTEPs
+        /// are those same addresses) is pinned once by the endpoint loop; the
+        /// transit loop must accept that pin instead of re-resolving it, which
+        /// with the full-tunnel rule engaged is answered from the fresh pin in
+        /// table 51820 and refused as stale.
+        #[test]
+        fn transit_peer_that_is_also_a_peer_endpoint_is_pinned_once() {
+            let socket_path = phase10_test_socket_path("aq256dup");
+            let (commands, stop, helper_thread) = spawn_privileged_scripted_helper(
+                &socket_path,
+                vec![
+                    (
+                        "route get 192.168.122.31".to_owned(),
+                        scripted_ok(
+                            "192.168.122.31 via 192.168.0.29 dev enp0s9 src 192.168.0.30 uid 0\n",
+                        ),
+                    ),
+                    (
+                        "route get 192.168.0.32".to_owned(),
+                        scripted_ok("192.168.0.32 dev enp0s9 src 192.168.0.30 uid 0\n"),
+                    ),
+                ],
+            );
+            let mut system = transit_system(&socket_path);
+            let peer = rustynet_backend_api::PeerConfig {
+                node_id: rustynet_backend_api::NodeId::new("exit-1").expect("node id should parse"),
+                public_key: [0u8; 32],
+                endpoint: rustynet_backend_api::SocketEndpoint {
+                    addr: "192.168.122.31".parse::<IpAddr>().expect("valid endpoint"),
+                    port: 51820,
+                },
+                allowed_ips: Vec::new(),
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            };
+            let result = DataplaneSystem::apply_peer_endpoint_bypass_routes(&mut system, &[peer]);
+            let log = commands.lock().expect("command log should lock").clone();
+            stop_helper(&socket_path, stop, helper_thread);
+            result.expect("a transit peer that is also an endpoint must not be refused");
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("route get 192.168.122.31"))
+                    .count(),
+                1,
+                "the shared peer must be resolved exactly once: {log:#?}"
+            );
+            assert_eq!(
+                log.iter()
+                    .filter(|command| command.contains("route replace 192.168.122.31/32"))
+                    .count(),
+                1,
+                "the shared peer must be pinned exactly once: {log:#?}"
+            );
+            assert!(
+                log.iter()
+                    .any(|command| command
+                        == "ip route replace 192.168.0.32/32 dev enp0s9 table 51820"),
+                "the other transit peer is still pinned: {log:#?}"
             );
         }
 
