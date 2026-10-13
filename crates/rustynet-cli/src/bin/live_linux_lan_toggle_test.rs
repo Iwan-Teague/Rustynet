@@ -8,8 +8,8 @@ use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{
-    LiveLabContext, LiveLabPlatform, Logger, ensure_dir_secure, repo_root, write_secure_json,
-    write_secure_text,
+    LiveLabContext, LiveLabPlatform, Logger, ensure_dir_secure, repo_root, shell_single_quote,
+    write_secure_json, write_secure_text,
 };
 use serde_json::json;
 
@@ -371,6 +371,10 @@ fn run() -> Result<(), String> {
         dns_passphrase_remote: None,
         blind_exit_host: blind_exit_host.clone(),
         blind_exit_daemon_stopped: false,
+        client_host: client_host.clone(),
+        client_self_signed: false,
+        exit_assign_pub_local: None,
+        client_exit_assignment_local: None,
     };
 
     for host in [&exit_host, &client_host, &blind_exit_host] {
@@ -450,6 +454,16 @@ fn run() -> Result<(), String> {
         &format!("/run/rustynet/assignment-issue/rn-assignment-{blind_exit_node_id}.assignment"),
         &blind_exit_assignment_local,
     )?;
+    // Dedicated copy of the client's EXIT-SIGNED bundle: the self-signed swap
+    // below overwrites `client_assignment_local` in place, so a mid-stage
+    // failure needs its own pristine file to restore from. The exit verifier
+    // key (`assign_pub_local`) is never overwritten by the self-signed
+    // captures, so cleanup can reference it directly.
+    let client_exit_assignment_local = ctx.work_dir.join("assignment-client-exit-signed");
+    std::fs::copy(&client_assignment_local, &client_exit_assignment_local)
+        .map_err(|err| format!("copy the client's exit-signed assignment bundle: {err}"))?;
+    cleanup.exit_assign_pub_local = Some(assign_pub_local.clone());
+    cleanup.client_exit_assignment_local = Some(client_exit_assignment_local);
     let exit_scope = parse_assignment_authority_scope(
         std::fs::read_to_string(&exit_assignment_local)
             .map_err(|err| err.to_string())?
@@ -633,9 +647,9 @@ fn run() -> Result<(), String> {
             exit_node_id: exit_node_id.as_str(),
             client_node_id: client_node_id.as_str(),
             blind_exit_node_id: blind_exit_node_id.as_str(),
-            // The first refresh (below, inside the armed bundle-swap fence)
-            // hands the client its OWN assignment authority for the
-            // LAN-coupling phases; see `AssignmentRefreshConfig`.
+            // The SECOND refresh (after the negative control below) hands the
+            // client its OWN assignment authority for the LAN-coupling
+            // phases; see `AssignmentRefreshConfig`.
             client_self_signed: true,
             client_assign_pub_local: client_assign_pub_local.as_path(),
         },
@@ -702,7 +716,19 @@ fn run() -> Result<(), String> {
 
     logger
         .line("Issuing and distributing fresh signed traversal bundles for LAN-toggle topology")?;
-    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
+    // Negative-control precondition: the LAN-coupling negative control below
+    // must run while the client still holds the EXIT-SIGNED pair issued by
+    // the exit (it is NOT its own assignment authority), so this first
+    // refresh explicitly keeps the client exit-signed even though the main
+    // config swaps it to self-signed one refresh later.
+    let signed_state_refresh_exit_signed = SignedStateRefreshConfig {
+        assignment: AssignmentRefreshConfig {
+            client_self_signed: false,
+            ..signed_state_refresh.assignment
+        },
+        ..signed_state_refresh
+    };
+    refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_exit_signed)?;
 
     // After enforce_host the daemons come up cold and stay in
     // restricted-safe mode until they ingest fresh signed trust
@@ -717,6 +743,19 @@ fn run() -> Result<(), String> {
     refresh_trust_evidence(&ctx, &exit_host)?;
     refresh_trust_evidence(&ctx, &client_host)?;
     refresh_trust_evidence(&ctx, &blind_exit_host)?;
+
+    // Negative control (review criterion C, exit-signed client): with the
+    // client's installed assignment.pub belonging to the EXIT (so the client
+    // is NOT its own assignment authority), enabling the LAN coupling must be
+    // REFUSED with the kept-bundle explanation and must leave the installed
+    // bundle byte-identical. The daemon must stay out of restricted-safe
+    // mode: the refusal is a deliberate keep, not a reconcile failure.
+    run_lan_coupling_negative_control(&ctx, &logger, platform, &client_host)?;
+    // The refused coupling rewrites the client's node-local refresh env with
+    // a --lan-routes line before the daemon rejects it; restore the env this
+    // test installed so the self-signed swap below starts from the intended
+    // state.
+    install_assignment_refresh_env(&ctx, &client_host, &client_refresh_local)?;
 
     // The traversal coordination records inside each signed bundle have
     // a hard-capped 30-second TTL (MAX_COORDINATION_TTL_SECS in
@@ -738,6 +777,16 @@ fn run() -> Result<(), String> {
     // (daemon.rs:3506-3508). The route advertise that follows then
     // sees a daemon out of restricted-safe.
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;
+    // From here until the restore refresh below, the client runs its OWN
+    // self-signed trust anchor; a mid-stage failure must put the exit-signed
+    // pair back (LanToggleCleanup::drop, best-effort).
+    cleanup.client_self_signed = true;
+    log_reconcile_failures_after_trust_anchor_swap(
+        &ctx,
+        &logger,
+        &client_host,
+        "exit-signed -> self-signed swap",
+    );
 
     logger.line("Advertising default route on exit")?;
     ctx.retry_root(
@@ -894,6 +943,14 @@ fn run() -> Result<(), String> {
         ..signed_state_refresh
     };
     refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)?;
+    // The client is back on the exit-signed pair: drop the cleanup restore.
+    cleanup.client_self_signed = false;
+    log_reconcile_failures_after_trust_anchor_swap(
+        &ctx,
+        &logger,
+        &client_host,
+        "self-signed -> exit-signed restore",
+    );
     let blind_exit_denied_status =
         if apply_lan_access_expect_denied(&ctx, platform, &blind_exit_host, true, LAN_TEST_CIDR)? {
             "pass"
@@ -1035,10 +1092,46 @@ struct LanToggleCleanup {
     dns_passphrase_remote: Option<String>,
     blind_exit_host: String,
     blind_exit_daemon_stopped: bool,
+    client_host: String,
+    /// True while the client's installed trust anchor is its OWN self-signed
+    /// pair: set right after the swap refresh, cleared right after the
+    /// restore refresh. Drives the best-effort exit-signed restore in `drop`.
+    client_self_signed: bool,
+    /// The exit verifier key (never overwritten by the self-signed captures).
+    exit_assign_pub_local: Option<PathBuf>,
+    /// Pristine copy of the client's exit-signed assignment bundle, taken
+    /// before the self-signed swap overwrites the working capture file.
+    client_exit_assignment_local: Option<PathBuf>,
 }
 
 impl Drop for LanToggleCleanup {
     fn drop(&mut self) {
+        // If the failure happened while the client ran its SELF-SIGNED trust
+        // anchor, put the lab's exit-signed pair back best-effort so the next
+        // stage finds the usual assignment authority. Best-effort by design:
+        // Drop cannot fail, and the fence has already dropped at this point
+        // (drop order is reverse declaration), so this restore can race a
+        // resumed node-local refresh timer — a documented residual the timer
+        // self-heals on its next 60s run.
+        if self.client_self_signed {
+            if let (Some(pub_local), Some(bundle_local)) = (
+                self.exit_assign_pub_local.as_deref(),
+                self.client_exit_assignment_local.as_deref(),
+            ) {
+                if let Err(err) = install_assignment_bundle_atomically(
+                    &self.ctx,
+                    &self.client_host,
+                    pub_local,
+                    bundle_local,
+                ) {
+                    eprintln!(
+                        "cleanup: best-effort exit-signed assignment restore on {} failed: {err}",
+                        self.client_host
+                    );
+                }
+            }
+            self.client_self_signed = false;
+        }
         // The atomic blind-exit promotion stopped this daemon so its signed
         // assignment could be installed with no role/intent mismatch window.
         // `enforce_host` normally restarts it, but every earlier error path
@@ -1670,6 +1763,189 @@ fn install_assignment_bundle(
     Ok(())
 }
 
+/// Remote argv steps of the atomic client trust-anchor swap, pinned as consts
+/// so the source-pin tests can assert the exact install/ownership/cleanup
+/// steps without being perturbed by rustfmt.
+const ASSIGNMENT_PUB_INSTALL_ARGS: [&str; 9] = [
+    "install",
+    "-m",
+    "0644",
+    "-o",
+    "rustynetd",
+    "-g",
+    "root",
+    "/tmp/rn-assignment.pub",
+    "/etc/rustynet/assignment.pub",
+];
+const ASSIGNMENT_BUNDLE_INSTALL_ARGS: [&str; 9] = [
+    "install",
+    "-m",
+    "0640",
+    "-o",
+    "root",
+    "-g",
+    "rustynetd",
+    "/tmp/rn-assignment.bundle",
+    "/var/lib/rustynet/rustynetd.assignment",
+];
+const ASSIGNMENT_SWAP_CLEANUP_ARGS: [&str; 5] = [
+    "rm",
+    "-f",
+    "/var/lib/rustynet/rustynetd.assignment.watermark",
+    "/tmp/rn-assignment.pub",
+    "/tmp/rn-assignment.bundle",
+];
+
+/// Install an assignment trust-anchor pair (verifier key + signed bundle) in
+/// ONE remote root shell: dir, pub install, bundle install and stale-watermark
+/// cleanup are chained with `&&` so the daemon can never observe a torn
+/// pub-then-bundle window. Splitting these into separate root commands is
+/// what let the client daemon (whose 60s node-local refresh timer races the
+/// test) reconcile a NEW verifier against the OLD bundle, fail signature
+/// verification and burn its reconcile budget into a permanent restriction.
+/// The watermark is only removed AFTER both halves installed: the refresh
+/// service treats a missing watermark as "bundle still fresh", so removing it
+/// early could tempt a concurrent refresh into a half-swapped state.
+fn install_assignment_bundle_atomically(
+    ctx: &LiveLabContext,
+    target: &str,
+    pubkey_local: &Path,
+    bundle_local: &Path,
+) -> Result<(), String> {
+    ctx.scp_to(pubkey_local, target, "/tmp/rn-assignment.pub")?;
+    ctx.scp_to(bundle_local, target, "/tmp/rn-assignment.bundle")?;
+    let mut script = String::new();
+    let steps: [&[&str]; 4] = [
+        &etc_rustynet_install_dir_args(),
+        &ASSIGNMENT_PUB_INSTALL_ARGS,
+        &ASSIGNMENT_BUNDLE_INSTALL_ARGS,
+        &ASSIGNMENT_SWAP_CLEANUP_ARGS,
+    ];
+    for step in steps {
+        if !script.is_empty() {
+            script.push_str(" && ");
+        }
+        let quoted: Vec<String> = step.iter().map(|arg| shell_single_quote(arg)).collect();
+        script.push_str(&quoted.join(" "));
+    }
+    ctx.run_root(target, &["sh", "-c", &script])?;
+    Ok(())
+}
+
+/// sha256 of a remote file, validated as a real 64-hex digest so a transport
+/// error or an empty capture can never masquerade as "unchanged".
+fn remote_file_sha256(ctx: &LiveLabContext, target: &str, path: &str) -> Result<String, String> {
+    let output = ctx
+        .capture_root(target, &["sha256sum", path])
+        .map_err(|err| format!("sha256sum {path} on {target} failed: {err}"))?;
+    let digest = output
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!(
+            "sha256sum {path} on {target} did not yield a 64-hex digest: {output}"
+        ));
+    }
+    Ok(digest)
+}
+
+const KEPT_BUNDLE_ERROR_MARKER: &str =
+    "the existing assignment bundle was kept because this node is not its own assignment authority";
+
+/// Run the LAN coupling on a node that keeps an external authority's bundle
+/// and REQUIRE the kept-bundle refusal: success is a failure, a failure
+/// without the kept-bundle explanation is a failure too (any other error
+/// means the control observed something else entirely).
+fn apply_lan_access_expect_kept_bundle(
+    ctx: &LiveLabContext,
+    platform: LiveLabPlatform,
+    target: &str,
+    enable: bool,
+    lan_routes: &str,
+) -> Result<(), String> {
+    let output = run_lan_access_command(ctx, platform, target, enable, lan_routes, 20)?;
+    if output.status.success() {
+        return Err(format!(
+            "apply-lan-access-coupling unexpectedly succeeded on {target} while the node keeps an external authority's bundle: {}",
+            summarize_command_output(&output)
+        ));
+    }
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !combined.contains(KEPT_BUNDLE_ERROR_MARKER) {
+        return Err(format!(
+            "apply-lan-access-coupling on {target} failed without the kept-bundle explanation: {combined}"
+        ));
+    }
+    Ok(())
+}
+
+/// Negative control: on the exit-signed client (NOT its own assignment
+/// authority) the LAN-ON coupling must be refused with the kept-bundle text,
+/// must not modify the installed bundle, and must leave the daemon out of
+/// restricted-safe mode (the refusal is a deliberate keep, not a restriction).
+fn run_lan_coupling_negative_control(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    platform: LiveLabPlatform,
+    client_host: &str,
+) -> Result<(), String> {
+    let bundle_remote = "/var/lib/rustynet/rustynetd.assignment";
+    let bundle_sha_before = remote_file_sha256(ctx, client_host, bundle_remote)?;
+    apply_lan_access_expect_kept_bundle(ctx, platform, client_host, true, LAN_TEST_CIDR)
+        .map_err(|err| format!("LAN-ON negative control did not behave as specified: {err}"))?;
+    let bundle_sha_after = remote_file_sha256(ctx, client_host, bundle_remote)?;
+    if bundle_sha_before != bundle_sha_after {
+        return Err(format!(
+            "the negative control's refused coupling must not touch the installed assignment bundle: sha {bundle_sha_before} -> {bundle_sha_after}"
+        ));
+    }
+    let status = ctx
+        .capture_root(
+            client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
+        .unwrap_or_default();
+    if !status.contains("restricted_safe_mode=false") {
+        return Err(format!(
+            "the negative control must leave the client daemon OUT of restricted-safe mode: {status}"
+        ));
+    }
+    logger.line(
+        "Negative control pass: LAN-ON coupling on the exit-signed client was refused with the kept-bundle text, bundle untouched, daemon healthy",
+    )?;
+    Ok(())
+}
+
+/// Log the client's reconcile_failures counter after a trust-anchor swap so a
+/// future run's log shows whether the swap forced the daemon to burn its
+/// reconcile budget (the katana-u23/u40 failure mode). Best-effort and
+/// non-failing by design: diagnostics only.
+fn log_reconcile_failures_after_trust_anchor_swap(
+    ctx: &LiveLabContext,
+    logger: &Logger,
+    client_host: &str,
+    swap: &str,
+) {
+    let status = ctx
+        .capture_root_allow_failure(
+            client_host,
+            &[live_lab_support::REMOTE_RUSTYNET_BIN, "status"],
+        )
+        .unwrap_or_default();
+    let counter = status
+        .lines()
+        .find(|line| line.contains("reconcile_failures"))
+        .map(|line| line.trim().to_owned())
+        .unwrap_or_else(|| "reconcile_failures line absent".to_owned());
+    let _ = logger.line(format!("client reconcile status after {swap}: {counter}"));
+}
+
 fn install_assignment_refresh_env(
     ctx: &LiveLabContext,
     target: &str,
@@ -1912,7 +2188,14 @@ fn refresh_assignment_bundles(
         config.assign_pub_local,
         config.exit_assignment_local,
     )?;
-    install_assignment_bundle(
+    // The client's trust-anchor swap is ATOMIC on the guest: verifier key,
+    // bundle and watermark cleanup land in ONE remote root shell so the
+    // daemon (or its node-local refresh timer) can never reconcile a torn
+    // pub-then-bundle state. The exit and blind-exit installs above keep
+    // their plain form: their pub half is identical across refreshes (same
+    // exit authority) and their daemons' roles are stable, so the torn
+    // window this closes is client-specific.
+    install_assignment_bundle_atomically(
         ctx,
         config.client_host,
         if config.client_self_signed {
@@ -2642,15 +2925,31 @@ mod tests {
             .expect("run() must drive the LAN coupling");
         assert!(
             self_signed < first_refresh && first_refresh < first_coupling,
-            "the client must already be self-signed (via the first refresh) when the first \
+            "the client must be self-signed (via the second refresh) before the first \
              LAN coupling runs"
+        );
+        // The self-signed swap is the SECOND refresh: the first refresh keeps
+        // the client exit-signed for the negative control that precedes it.
+        let swap_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect(
+                "run() must swap the client to its own authority only \
+                 after the exit-signed negative control",
+            );
+        assert!(
+            first_refresh < swap_refresh && swap_refresh < first_coupling,
+            "the self-signed swap must sit between the exit-signed first refresh \
+             and the first LAN coupling"
         );
 
         let last_coupling = run_body
             .rfind("apply_lan_access(")
             .expect("run() must drive the LAN coupling");
+        // rfind: the exit-signed FIRST refresh's config variant above also
+        // spells client_self_signed: false; the restore config is the LAST
+        // such definition.
         let restore_config = run_body
-            .find("client_self_signed: false")
+            .rfind("client_self_signed: false")
             .expect("run() must build a restore config that returns the client to the exit");
         let restore_refresh = run_body
             .rfind("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)")
@@ -2685,6 +2984,302 @@ mod tests {
         assert!(
             helper.contains("config.client_assign_pub_local"),
             "the client's own verifier key must be captured and installed with its bundle"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_client_trust_anchor_swaps_install_both_halves_in_one_remote_shell() {
+        // The torn-swap failure mode: the client's 60s node-local refresh
+        // timer races a pub-then-bundle install done as separate root
+        // commands, the daemon reconciles a NEW verifier against the OLD
+        // bundle, fails signature verification and burns its reconcile budget
+        // into a permanent restriction. The client-side swap must therefore
+        // install both halves (and remove the stale watermark) in ONE remote
+        // shell. Source pins make any split back into separate commands fail
+        // loudly.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+
+        // The atomic helper itself.
+        let helper_start = source
+            .find("const ASSIGNMENT_PUB_INSTALL_ARGS")
+            .expect("atomic install argv consts must exist");
+        let helper_end = source[helper_start..]
+            .find("\nfn remote_file_sha256(")
+            .map(|offset| helper_start + offset)
+            .expect("the atomic install helper must end before remote_file_sha256");
+        let helper = &source[helper_start..helper_end];
+        assert!(helper.contains("const ASSIGNMENT_BUNDLE_INSTALL_ARGS"));
+        assert!(helper.contains("const ASSIGNMENT_SWAP_CLEANUP_ARGS"));
+        assert_eq!(
+            helper.matches("ctx.run_root(").count(),
+            1,
+            "the atomic helper must issue exactly ONE remote root command \
+             (sh -c); a second command re-opens the torn window"
+        );
+        assert!(
+            helper.contains("script.push_str(\" && \")"),
+            "the remote steps must be chained with && so a failed install \
+             aborts the rest of the swap"
+        );
+        assert!(
+            helper.contains("shell_single_quote("),
+            "every remote argv element must be single-quoted before it lands \
+             in the sh -c script"
+        );
+        assert!(
+            !helper.contains("install_assignment_bundle("),
+            "the atomic helper must not recurse into the plain installer"
+        );
+        let first_scp = helper
+            .find("ctx.scp_to(")
+            .expect("the atomic helper must ship both halves first");
+        let shell = helper
+            .find("ctx.run_root(")
+            .expect("the atomic helper must end in exactly one remote shell");
+        assert!(
+            first_scp < shell,
+            "both halves must be shipped to /tmp BEFORE the single swap shell runs"
+        );
+
+        // Only the CLIENT install in refresh_assignment_bundles uses it.
+        let helper_refresh_start = source
+            .find("\nfn refresh_assignment_bundles(")
+            .expect("refresh_assignment_bundles must exist");
+        let helper_refresh_end = source[helper_refresh_start..]
+            .find("\nfn refresh_traversal_bundles(")
+            .map(|offset| helper_refresh_start + offset)
+            .expect("refresh_assignment_bundles must end before the traversal refresh");
+        let refresh_bundles = &source[helper_refresh_start..helper_refresh_end];
+        assert_eq!(
+            refresh_bundles
+                .matches("install_assignment_bundle_atomically(")
+                .count(),
+            1,
+            "exactly the client's trust-anchor swap must be atomic"
+        );
+        assert_eq!(
+            refresh_bundles
+                .matches("install_assignment_bundle(")
+                .count(),
+            2,
+            "the exit and blind-exit installs keep their plain form; only the \
+             client's pub half actually changes mid-run"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_negative_control_runs_on_the_exit_signed_client_before_the_swap() {
+        // Review criterion C, proven not assumed: while the client still
+        // holds the EXIT-signed pair (it is NOT its own assignment
+        // authority), the LAN-ON coupling must be REFUSED with the
+        // kept-bundle text, must leave the installed bundle byte-identical,
+        // and must keep the daemon out of restricted-safe mode. The control
+        // must run BEFORE the self-signed swap (otherwise it proves nothing)
+        // and the coupling it attempted must have its env rewrite restored
+        // before the swap.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let fence = run_body
+            .find("BundleSwapFence::quiesce(")
+            .expect("run() must engage the bundle-swap fence");
+        let exit_variant = run_body
+            .find("let signed_state_refresh_exit_signed = SignedStateRefreshConfig {")
+            .expect("run() must build an explicit exit-signed refresh variant");
+        let exit_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_exit_signed)?;")
+            .expect("run() must first refresh the client EXIT-SIGNED");
+        let control = run_body
+            .find("run_lan_coupling_negative_control(&ctx, &logger, platform, &client_host)?;")
+            .expect("run() must run the negative control on the exit-signed client");
+        let env_restore = run_body
+            .rfind("install_assignment_refresh_env(&ctx, &client_host, &client_refresh_local)?;")
+            .expect("run() must restore the client's refresh env after the control");
+        let main_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect("run() must swap the client self-signed only after the control");
+        let first_coupling = run_body
+            .find("apply_lan_access(")
+            .expect("run() must drive the LAN coupling");
+        assert!(
+            fence < exit_variant
+                && exit_variant < exit_refresh
+                && exit_refresh < control
+                && control < env_restore
+                && env_restore < main_refresh
+                && main_refresh < first_coupling,
+            "ordering: fence -> exit-signed refresh -> negative control -> env \
+             restore -> self-signed swap -> first coupling"
+        );
+
+        // The control function itself must compare bundle digests and demand
+        // a healthy daemon.
+        let control_start = source
+            .find("fn run_lan_coupling_negative_control(")
+            .expect("the negative control must exist");
+        let control_end = source[control_start..]
+            .find("\nfn log_reconcile_failures_after_trust_anchor_swap(")
+            .map(|offset| control_start + offset)
+            .expect("the negative control must end before the reconcile logger");
+        let control_fn = &source[control_start..control_end];
+        assert_eq!(
+            control_fn.matches("remote_file_sha256(").count(),
+            2,
+            "the control must digest the installed bundle before AND after the \
+             refused coupling (via remote_file_sha256)"
+        );
+        let sha_start = source
+            .find("fn remote_file_sha256(")
+            .expect("the digest helper must exist");
+        let sha_end = source[sha_start..]
+            .find("\nconst KEPT_BUNDLE_ERROR_MARKER")
+            .map(|offset| sha_start + offset)
+            .expect("the digest helper must end before the kept-bundle marker");
+        assert!(
+            source[sha_start..sha_end].contains("sha256sum"),
+            "the digest helper must actually run sha256sum on the guest"
+        );
+        assert!(
+            control_fn.contains("bundle_sha_before != bundle_sha_after"),
+            "the control must fail when the refused coupling changed the bundle"
+        );
+        assert!(
+            control_fn.contains("restricted_safe_mode=false"),
+            "the control must demand the daemon stay OUT of restricted-safe mode"
+        );
+
+        // The expectation helper must require the kept-bundle marker text.
+        let expect_start = source
+            .find("fn apply_lan_access_expect_kept_bundle(")
+            .expect("the kept-bundle expectation helper must exist");
+        let expect_end = source[expect_start..]
+            .find("\nfn run_lan_coupling_negative_control(")
+            .map(|offset| expect_start + offset)
+            .expect("the expectation helper must end before the negative control");
+        let expect_fn = &source[expect_start..expect_end];
+        assert!(expect_fn.contains("KEPT_BUNDLE_ERROR_MARKER"));
+        assert!(
+            expect_fn.contains("output.status.success()"),
+            "a SUCCESSFUL coupling on an external-authority node is the \
+             failure this control exists to catch"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_cleanup_restores_the_exit_signed_client_pair_after_a_mid_stage_failure() {
+        // A failure between the self-signed swap and the restore refresh used
+        // to leave the guest client as its own assignment authority (own
+        // verifier key + node-local signing secret): exactly the state the
+        // post-stage stages cannot handle. The cleanup Drop must put the
+        // exit-signed pair back best-effort, driven by a flag that is armed
+        // only while the client really is self-signed.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let struct_start = source
+            .find("struct LanToggleCleanup {")
+            .expect("LanToggleCleanup must exist");
+        let drop_start = source
+            .find("impl Drop for LanToggleCleanup {")
+            .expect("LanToggleCleanup must have a Drop impl");
+        let struct_def = &source[struct_start..drop_start];
+        assert!(struct_def.contains("client_host: String"));
+        assert!(struct_def.contains("client_self_signed: bool"));
+        assert!(struct_def.contains("exit_assign_pub_local: Option<PathBuf>"));
+        assert!(struct_def.contains("client_exit_assignment_local: Option<PathBuf>"));
+
+        let drop_end = source[drop_start..]
+            .find("\nfn apply_lan_access(")
+            .map(|offset| drop_start + offset)
+            .expect("the Drop impl must end before apply_lan_access");
+        let drop_body = &source[drop_start..drop_end];
+        assert!(drop_body.contains("if self.client_self_signed {"));
+        assert!(
+            drop_body.contains("install_assignment_bundle_atomically("),
+            "the restore must be atomic like the swap itself"
+        );
+        assert!(
+            drop_body.contains("self.client_self_signed = false;"),
+            "the Drop must disarm the flag so the restore never double-runs"
+        );
+
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        assert!(
+            run_body.contains("assignment-client-exit-signed"),
+            "run() must snapshot the client's exit-signed bundle for the restore"
+        );
+        let swap_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect("run() must swap the client self-signed");
+        let armed = run_body
+            .find("cleanup.client_self_signed = true;")
+            .expect("run() must arm the cleanup flag right after the swap");
+        let restore_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)?;")
+            .expect("run() must restore the exit-signed pair on the success path");
+        let disarmed = run_body
+            .rfind("cleanup.client_self_signed = false;")
+            .expect("run() must disarm the cleanup flag after the restore");
+        assert!(
+            swap_refresh < armed && armed < restore_refresh && restore_refresh < disarmed,
+            "the cleanup flag must be armed exactly while the client is self-signed"
+        );
+    }
+
+    #[test]
+    fn lan_toggle_logs_client_reconcile_failures_after_each_trust_anchor_swap() {
+        // katana-u23/u40 both showed up as the daemon burning its
+        // reconcile_failures budget during a trust-anchor swap. The swap must
+        // log the client's reconcile_failures counter right after BOTH
+        // directions (exit-signed -> self-signed and back) so a future live
+        // run's log exposes a budget burn immediately. Diagnostics only: the
+        // logger must never fail the stage.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let fn_start = source
+            .find("fn log_reconcile_failures_after_trust_anchor_swap(")
+            .expect("the reconcile logger must exist");
+        let fn_end = source[fn_start..]
+            .find("\nfn install_assignment_refresh_env(")
+            .map(|offset| fn_start + offset)
+            .expect("the reconcile logger must end before install_assignment_refresh_env");
+        let helper = &source[fn_start..fn_end];
+        assert!(
+            helper.contains("capture_root_allow_failure"),
+            "the logger must tolerate a dead daemon: it is diagnostics, not an assertion"
+        );
+        assert!(helper.contains("reconcile_failures"));
+        assert!(
+            !helper.contains("-> Result<"),
+            "the logger must return () so it can never fail the stage"
+        );
+
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let swap_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh)?;")
+            .expect("run() must swap the client self-signed");
+        let log_after_swap = run_body
+            .find("exit-signed -> self-signed swap")
+            .expect("run() must log reconcile state after the self-signed swap");
+        let restore_refresh = run_body
+            .find("refresh_signed_state_artifacts(&ctx, &logger, &signed_state_refresh_restore)?;")
+            .expect("run() must restore the exit-signed pair");
+        let log_after_restore = run_body
+            .rfind("self-signed -> exit-signed restore")
+            .expect("run() must log reconcile state after the restore");
+        assert!(
+            swap_refresh < log_after_swap
+                && log_after_swap < restore_refresh
+                && restore_refresh < log_after_restore,
+            "reconcile logging must bracket BOTH trust-anchor swaps"
         );
     }
 

@@ -10024,7 +10024,7 @@ fn forced_refresh_assignment_plan(
         Ok(None) => Ok(ForcedRefreshAssignmentPlan::RemoveForRegeneration),
         Ok(Some(message)) => Ok(ForcedRefreshAssignmentPlan::KeepExternalAuthority(message)),
         Err(err) => Err(format!(
-            "cannot tell whether this node is its own assignment authority, so the current assignment bundle was NOT removed and nothing was changed: {err}"
+            "cannot tell whether this node is its own assignment authority, so the current assignment bundle and its watermark were NOT removed, and the caller's configuration edits stay in place: {err}"
         )),
     }
 }
@@ -10070,12 +10070,38 @@ impl ForcedAssignmentRefresh {
 /// Say WHY nothing changed when a convergence check fails after a forced
 /// refresh that kept the bundle: the authority, not this node, has to issue
 /// the updated assignment, and the operator should not be left guessing.
+///
+/// Two properties an operator relies on (and the tests pin):
+/// - If the kept bundle still carries LAN routes, DISABLE-LAN keeps failing
+///   AFTER the daemon restart: the daemon re-derives `lan_access=off` from the
+///   kept bundle and rejects the mismatch, so LAN stays ON until the authority
+///   re-issues the bundle. Only a fresh bundle from the authority clears it.
+/// - ENABLE-LAN on a kept bundle whose daemon is already `lan_access=on`
+///   succeeds WITHOUT comparing the requested routes to the granted ones: the
+///   daemon simply observes the desired state already holding.
 fn with_kept_bundle_context(err: String, refresh: &ForcedAssignmentRefresh) -> String {
     match refresh.kept_note() {
         Some(note) => format!(
             "{err}; the existing assignment bundle was kept because this node is not its own assignment authority ({note}) - the authority must issue the updated assignment"
         ),
         None => err,
+    }
+}
+
+/// Attach the forced-refresh plan's context to an error raised by a step that
+/// runs AFTER the plan was applied. When the plan kept the external
+/// authority's bundle the raw error would otherwise read like a plain failure
+/// with no hint that the bundle was deliberately kept and that the authority
+/// must issue the updated assignment; [`with_kept_bundle_context`] supplies
+/// exactly that. When the plan removed the bundle for regeneration there is
+/// nothing to add, so the error is returned unchanged.
+fn with_plan_context(err: String, plan: &ForcedRefreshAssignmentPlan) -> String {
+    match plan {
+        ForcedRefreshAssignmentPlan::RemoveForRegeneration => err,
+        ForcedRefreshAssignmentPlan::KeepExternalAuthority(note) => with_kept_bundle_context(
+            err,
+            &ForcedAssignmentRefresh::KeptExternalAuthority(note.clone()),
+        ),
     }
 }
 
@@ -13856,6 +13882,19 @@ fn execute_ops_set_assignment_refresh_exit_node(
     })
 }
 
+/// Apply the LAN-access coupling on the Linux ops path: rewrite the daemon's
+/// assignment-refresh env so it re-derives `lan_access` from the CURRENT
+/// assignment bundle, then restart the daemon and wait for the desired state.
+///
+/// The coupling is only ever as strong as the bundle on disk:
+/// - On a kept external-authority bundle that still carries LAN routes,
+///   DISABLE-LAN fails AFTER the daemon restart: the daemon re-derives
+///   `lan_access=on` from the kept bundle and refuses the off request, so LAN
+///   stays ON until the authority re-issues a bundle without those routes.
+/// - On a kept bundle whose daemon already runs `lan_access=on`, ENABLE-LAN
+///   succeeds WITHOUT comparing the requested routes to the routes actually
+///   granted by that bundle: the desired state is already holding, and the
+///   authority (not this node) owns what the routes are.
 fn execute_ops_apply_lan_access_coupling(
     enable: bool,
     lan_routes: Vec<String>,
@@ -15317,10 +15356,14 @@ fn force_local_assignment_refresh_now_ops() -> Result<ForcedAssignmentRefresh, S
     let _ = run_systemctl_action("reset-failed", "rustynetd-privileged-helper.service");
     let _ = run_systemctl_action("reset-failed", "rustynetd.service");
     let _ = run_systemctl_action("reset-failed", "rustynetd-assignment-refresh.service");
-    run_systemctl_action("start", "rustynetd-assignment-refresh.service")?;
-    run_systemctl_action("restart", "rustynetd.service")?;
-    wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))?;
-    wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))?;
+    run_systemctl_action("start", "rustynetd-assignment-refresh.service")
+        .map_err(|err| with_plan_context(err, &plan))?;
+    run_systemctl_action("restart", "rustynetd.service")
+        .map_err(|err| with_plan_context(err, &plan))?;
+    wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))
+        .map_err(|err| with_plan_context(err, &plan))?;
+    wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))
+        .map_err(|err| with_plan_context(err, &plan))?;
     Ok(forced_refresh_outcome(plan))
 }
 
@@ -23428,7 +23471,8 @@ mod tests {
         rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, role_coupling_kept_warning,
         to_ipc_command, unix_now, update_node_role_env_file, update_node_role_macos_plist,
         update_node_role_windows_env_file, validate_control_socket_security,
-        with_kept_bundle_context, write_encrypted_key_file, write_json_pretty_file,
+        with_kept_bundle_context, with_plan_context, write_encrypted_key_file,
+        write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -28229,7 +28273,7 @@ mod tests {
             .expect_err("an unparseable verifier key must not become a guess");
         assert!(
             err.contains("NOT removed") && err.contains("unparseable"),
-            "the refusal must say nothing was removed and why: {err}"
+            "the refusal must say the bundle and watermark were NOT removed and why: {err}"
         );
         assert!(corrupt.bundle_and_watermark_are_byte_identical());
 
@@ -28246,6 +28290,104 @@ mod tests {
 
         // The mapping itself: an Err verdict is an Err plan, never a default.
         assert!(forced_refresh_assignment_plan(Err("boom".to_owned())).is_err());
+    }
+
+    /// The refusal must tell the operator precisely what was left in place:
+    /// the assignment bundle AND its watermark were NOT removed, and the
+    /// caller's configuration edits stay in place. The vague "nothing was
+    /// changed" wording is retired on purpose and must not come back.
+    #[cfg(unix)]
+    #[test]
+    fn forced_refresh_refusal_names_the_kept_files_and_the_callers_config_edits() {
+        let corrupt = forced_refresh_node(ForcedRefreshPub::Corrupt);
+        let err = corrupt
+            .plan()
+            .expect_err("an unparseable verifier key must not become a guess");
+        assert!(
+            err.contains("assignment bundle")
+                && err.contains("watermark")
+                && err.contains("NOT removed"),
+            "the refusal must name both kept files with NOT removed: {err}"
+        );
+        assert!(
+            err.contains("stay in place"),
+            "the refusal must say the caller's configuration edits stay in place: {err}"
+        );
+        assert!(
+            !err.contains("nothing was changed"),
+            "the retired vague wording must not return: {err}"
+        );
+    }
+
+    /// `with_plan_context` exists for the steps that run AFTER the plan was
+    /// applied: errors there must explain that the bundle was deliberately
+    /// kept and the authority must issue the update. The Remove arm must stay
+    /// transparent (errors pass through unchanged) so single-authority nodes
+    /// never see kept-bundle noise.
+    #[test]
+    fn plan_context_wraps_only_the_keep_arm_and_matches_the_kept_context_text() {
+        let err = "restart failed".to_owned();
+        let note = "assignment.pub belongs to a different authority; not re-issuing".to_owned();
+
+        let keep = ForcedRefreshAssignmentPlan::KeepExternalAuthority(note.clone());
+        let wrapped = with_plan_context(err.clone(), &keep);
+        assert_eq!(
+            wrapped,
+            with_kept_bundle_context(
+                err.clone(),
+                &ForcedAssignmentRefresh::KeptExternalAuthority(note.clone())
+            ),
+            "the keep arm must produce exactly the kept-bundle context text"
+        );
+        assert!(
+            wrapped.starts_with(&format!("{err}; ")),
+            "the original error must stay the prefix: {wrapped}"
+        );
+        assert!(
+            wrapped.contains("the existing assignment bundle was kept") && wrapped.contains(&note),
+            "the wrapped error must carry the kept-bundle explanation and the note: {wrapped}"
+        );
+
+        let remove = ForcedRefreshAssignmentPlan::RemoveForRegeneration;
+        assert_eq!(
+            with_plan_context(err.clone(), &remove),
+            err,
+            "the remove arm must return the error unchanged"
+        );
+    }
+
+    /// Wiring witness (the helper needs root and systemd): every fallible step
+    /// after the plan was applied must wrap its error with
+    /// `with_plan_context`, so a kept-bundle failure explains itself. Two-line
+    /// needles so the macOS arm's plain `?;` calls cannot match.
+    #[test]
+    fn post_plan_refresh_errors_carry_the_plan_context_on_every_step() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn force_local_assignment_refresh_now_ops() -> Result<ForcedAssignmentRefresh, String> {")
+            .expect("function present");
+        let end = source[start..]
+            .find("\nfn wait_for_runtime_ready_after_restart(")
+            .map(|offset| start + offset)
+            .expect("function end present");
+        let body = &source[start..end];
+        let apply = body
+            .find("apply_forced_refresh_assignment_plan(")
+            .expect("the plan must be applied");
+        for needle in [
+            "run_systemctl_action(\"start\", \"rustynetd-assignment-refresh.service\")\n        .map_err(|err| with_plan_context(err, &plan))?",
+            "run_systemctl_action(\"restart\", \"rustynetd.service\")\n        .map_err(|err| with_plan_context(err, &plan))?",
+            "wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))\n        .map_err(|err| with_plan_context(err, &plan))?",
+            "wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))\n        .map_err(|err| with_plan_context(err, &plan))?",
+        ] {
+            let at = body
+                .find(needle)
+                .unwrap_or_else(|| panic!("post-plan step must wrap its error: {needle:?}"));
+            assert!(
+                at > apply,
+                "the wrapped step must run after the plan is applied: {needle:?}"
+            );
+        }
     }
 
     /// Wiring witness (the helper needs root and systemd): the authority is
