@@ -28,6 +28,7 @@ use std::path::Component;
 use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(unix)]
 use std::time::Duration;
 #[cfg(unix)]
@@ -193,7 +194,16 @@ pub fn store_passphrase_in_os_secure_store(
     }
     #[cfg(windows)]
     {
-        let _ = allow_any_app;
+        // `allow_any_app` is a no-op concept on Windows: DPAPI LocalMachine
+        // blobs are machine-scoped by construction and NTFS ACLs govern read
+        // access. Refuse it like the sibling flags instead of silently
+        // dropping a flag the operator asked for.
+        if allow_any_app {
+            return Err(
+                "Windows passphrase secure-store provisioning does not accept --keychain-allow-any-app: DPAPI LocalMachine blobs are already machine-scoped and NTFS ACLs govern read access"
+                    .to_string(),
+            );
+        }
         if keychain_account.is_some() || keychain_service.is_some() {
             return Err(
                 "Windows passphrase secure-store provisioning does not accept --keychain-account or --keychain-service"
@@ -339,8 +349,6 @@ fn read_windows_explicit_passphrase_source(path: &Path) -> Result<Zeroizing<Stri
 
 #[cfg(windows)]
 fn store_windows_dpapi_passphrase_blob(path: &Path, plaintext: &[u8]) -> Result<(), String> {
-    use std::fs::OpenOptions;
-
     validate_windows_secret_blob_path(path, "passphrase file")?;
     let parent = path.parent().ok_or_else(|| {
         format!(
@@ -368,64 +376,31 @@ fn store_windows_dpapi_passphrase_blob(path: &Path, plaintext: &[u8]) -> Result<
     let mut blob = encode_windows_dpapi_passphrase_blob(protected.as_slice())?;
     protected.zeroize();
 
-    let candidate = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("passphrase"),
-        std::process::id()
-    ));
-    if candidate.exists() {
-        remove_file_if_present(candidate.as_path())?;
-    }
-
-    let write_result = (|| -> Result<(), String> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(candidate.as_path())
-            .map_err(|err| {
-                format!(
-                    "create Windows DPAPI passphrase blob failed ({}): {err}",
-                    candidate.display()
-                )
-            })?;
-        file.write_all(blob.as_slice()).map_err(|err| {
-            format!(
-                "write Windows DPAPI passphrase blob failed ({}): {err}",
-                candidate.display()
-            )
-        })?;
-        file.flush().map_err(|err| {
-            format!(
-                "flush Windows DPAPI passphrase blob failed ({}): {err}",
-                candidate.display()
-            )
-        })?;
-        if path.exists() {
-            remove_file_if_present(path)?;
-        }
-        fs::rename(candidate.as_path(), path).map_err(|err| {
-            format!(
-                "persist Windows DPAPI passphrase blob failed ({} -> {}): {err}",
-                candidate.display(),
-                path.display()
-            )
-        })?;
-        validate_secret_file_security(path, "passphrase file", false)?;
-        // Use local-secret ACL (not runtime ACL) for the post-write check: the blob
-        // may be created during SSH bootstrap where the creating process runs under
-        // the admin user's SSH token (not SYSTEM), so the file owner is the SSH user
-        // rather than BA/SY. DPAPI LocalMachine encryption + NTFS DACL are the
-        // enforced security guarantees; owner identity is checked at startup
-        // by validate_windows_runtime_startup_acls on the containing directories.
-        validate_windows_local_secret_acl(path, "passphrase file")
-    })();
-    if write_result.is_err() {
-        let _ = remove_file_if_present(candidate.as_path());
-    }
+    // Owner/ACL validation runs on the CANDIDATE before the rename, so a blob
+    // that would fail the post-write check never replaces the current one, and
+    // again on the installed file afterwards (defence in depth). If the
+    // post-rename checks fail, `persist_file_with_backup` restores the previous
+    // blob; the passphrase path always ends up holding a good blob.
+    let result = persist_file_with_backup(
+        path,
+        blob.as_slice(),
+        &|candidate: &Path| {
+            validate_secret_file_security(candidate, "passphrase file", false)?;
+            validate_windows_local_secret_acl(candidate, "passphrase file")
+        },
+        &|installed: &Path| {
+            validate_secret_file_security(installed, "passphrase file", false)?;
+            // Use local-secret ACL (not runtime ACL) for the post-write check: the blob
+            // may be created during SSH bootstrap where the creating process runs under
+            // the admin user's SSH token (not SYSTEM), so the file owner is the SSH user
+            // rather than BA/SY. DPAPI LocalMachine encryption + NTFS DACL are the
+            // enforced security guarantees; owner identity is checked at startup
+            // by validate_windows_runtime_startup_acls on the containing directories.
+            validate_windows_local_secret_acl(installed, "passphrase file")
+        },
+    );
     blob.zeroize();
-    write_result
+    result
 }
 
 #[cfg(windows)]
@@ -1839,6 +1814,154 @@ fn write_atomic(
             .map_err(|err| format!("sync parent directory {} failed: {err}", parent.display()))?
     };
     Ok(())
+}
+
+/// Temp-candidate name for [`persist_file_with_backup`]: pid + nanosecond
+/// stamp + a process-local counter. The stamp keeps the name unpredictable to
+/// other local processes and unique across rapid successive calls; the counter
+/// guarantees that two calls within the same clock tick still do not collide.
+/// `create_new` remains the backstop: it fails closed on any residual
+/// collision instead of clobbering the file (and the old code's pre-delete of
+/// a planted or stale candidate is gone with it).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn temp_candidate_path(path: &Path) -> PathBuf {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut out = path.as_os_str().to_os_string();
+    out.push(format!(
+        ".{}.{}.{}.tmp",
+        std::process::id(),
+        stamp,
+        sequence
+    ));
+    PathBuf::from(out)
+}
+
+/// Persist `blob` at `path` so that `path` is never left missing and never
+/// left holding an unvalidated file. Platform-independent so it can be
+/// unit-tested off-Windows: the caller supplies the platform's security
+/// validators as closures.
+///
+/// Sequence: create a fresh temp candidate (`create_new`, unpredictable name),
+/// write + `sync_all` it, validate the CANDIDATE, move any existing `path` to
+/// `<path>.bak`, rename the candidate over `path`, validate the installed
+/// file, and on failure roll back: restore `<path>.bak` over `path` and remove
+/// the candidate. On success the `.bak` is removed.
+///
+/// `fs::rename` replaces an existing destination on every platform
+/// (MOVEFILE_REPLACE_EXISTING on Windows), so the old blob never needs a
+/// pre-delete — and a pre-delete would mean any failure between it and the
+/// rename leaves NO passphrase blob at all, making the encrypted private key
+/// undecryptable. The old copy is kept until the new one is installed and
+/// validated. There is no portable directory sync (Windows cannot
+/// FlushFileBuffers a directory handle without special access), so the last
+/// durable point is the candidate's own `sync_all` before the rename.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn persist_file_with_backup(
+    path: &Path,
+    blob: &[u8],
+    validate_candidate: &dyn Fn(&Path) -> Result<(), String>,
+    validate_installed: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let candidate = temp_candidate_path(path);
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    let backup = PathBuf::from(backup);
+    let mut moved_old_blob = false;
+    let result = (|| -> Result<(), String> {
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(format!(
+                    "temp file {} already exists: a previous attempt crashed before \
+                     cleanup — remove it and retry",
+                    candidate.display()
+                ));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "create temp file {} failed: {err}",
+                    candidate.display()
+                ));
+            }
+        };
+        file.write_all(blob)
+            .map_err(|err| format!("write temp file {} failed: {err}", candidate.display()))?;
+        // `File::flush` is a no-op for std::fs::File; only `sync_all` forces
+        // the bytes to disk before the candidate becomes the live secret.
+        file.sync_all()
+            .map_err(|err| format!("sync temp file {} failed: {err}", candidate.display()))?;
+        validate_candidate(&candidate)?;
+        // Keep the old blob until the new one is in place and validated.
+        if path.exists() {
+            fs::rename(path, &backup).map_err(|err| {
+                format!(
+                    "back up {} to {} failed: {err}",
+                    path.display(),
+                    backup.display()
+                )
+            })?;
+            moved_old_blob = true;
+        }
+        fs::rename(&candidate, path).map_err(|err| {
+            let restore_note = if moved_old_blob {
+                match fs::rename(&backup, path) {
+                    Ok(()) => "; previous blob restored".to_string(),
+                    Err(restore_err) => format!(
+                        "; RESTORING THE PREVIOUS BLOB FAILED ({restore_err}): it is \
+                         still at {} — restore it by hand",
+                        backup.display()
+                    ),
+                }
+            } else {
+                String::new()
+            };
+            format!("persist {} failed: {err}{restore_note}", path.display())
+        })?;
+        if let Err(validate_err) = validate_installed(path) {
+            // Post-rename validation failed. NEVER delete the installed file
+            // here: restore the previous blob over it instead, so the
+            // passphrase path keeps holding a decryptable blob and a retry is
+            // always possible.
+            if moved_old_blob {
+                fs::rename(&backup, path).map_err(|restore_err| {
+                    format!(
+                        "post-rename validation of {} failed ({validate_err}) and restoring \
+                         the previous blob from {} failed too ({restore_err}); the previous \
+                         blob is still at {}",
+                        path.display(),
+                        backup.display(),
+                        backup.display()
+                    )
+                })?;
+            }
+            if moved_old_blob {
+                return Err(format!(
+                    "post-rename validation of {} failed ({validate_err}); previous blob restored",
+                    path.display()
+                ));
+            }
+            return Err(format!(
+                "post-rename validation of {} failed ({validate_err}); no previous blob \
+                 existed and the new blob is still installed",
+                path.display()
+            ));
+        }
+        // Success: the superseded blob is redundant. `remove_file_if_present`
+        // also clears a stale .bak from an earlier interrupted run.
+        remove_file_if_present(&backup)?;
+        Ok(())
+    })();
+    let _ = remove_file_if_present(&candidate);
+    result
 }
 
 fn temp_path_for(path: &Path) -> PathBuf {
@@ -3605,5 +3728,255 @@ mod tests {
                 "{fn_name} must hold the key write lock across all writes (no early drop)"
             );
         }
+    }
+
+    // --- persist_file_with_backup (platform-independent persist sequence) ---
+    //
+    // The Windows DPAPI write path delegates to `persist_file_with_backup`,
+    // which is compiled on every platform so these behaviours are testable
+    // here: rename failure keeps the old blob, candidate-validation failure
+    // keeps the old blob, post-rename validation failure RESTORES the old
+    // blob, success leaves no candidate and no .bak, and successive calls do
+    // not collide on the temp name.
+
+    fn persist_dir_entry_names(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("test dir readable")
+            .map(|entry| {
+                entry
+                    .expect("dir entry readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn persist_accept_all(path: &std::path::Path) -> Result<(), String> {
+        let _ = path;
+        Ok(())
+    }
+
+    #[test]
+    fn persist_success_replaces_atomically_and_leaves_no_residue() {
+        let dir = unique_test_dir("persist-success");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &persist_accept_all,
+            &persist_accept_all,
+        )
+        .expect("persist should succeed");
+        assert_eq!(
+            std::fs::read(&path).expect("blob readable"),
+            b"new-secret",
+            "the new blob must be installed"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate temp file and no .bak may remain after success"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_rename_failure_keeps_old_file_and_removes_candidate() {
+        // `validate_candidate` deletes the candidate it is handed, so the
+        // subsequent rename fails with a missing source. The previous blob
+        // must survive (restored from the .bak) and no residue may remain.
+        let dir = unique_test_dir("persist-rename-failure");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        let delete_candidate = |candidate: &std::path::Path| -> Result<(), String> {
+            std::fs::remove_file(candidate).expect("candidate must exist during validation");
+            Ok(())
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &delete_candidate,
+            &persist_accept_all,
+        )
+        .expect_err("the induced rename failure must surface");
+        assert!(
+            err.contains("persist"),
+            "the error must name the persist failure: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the old blob must survive a rename failure"),
+            b"old-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate and no .bak may remain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_candidate_validation_failure_keeps_old_file() {
+        // The validator rejects the .tmp candidate; the old blob must stay in
+        // place, the candidate must be cleaned up and no .bak may be left.
+        // The rejection only fires for an EXISTING .tmp path, so a mutant that
+        // moves the candidate validation to after the rename (where the
+        // candidate path no longer exists) still fails this test.
+        let dir = unique_test_dir("persist-candidate-failure");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        let reject_existing_tmp = |candidate: &std::path::Path| -> Result<(), String> {
+            if candidate.exists() && candidate.to_string_lossy().contains(".tmp") {
+                Err("candidate security validation failed".to_string())
+            } else {
+                Ok(())
+            }
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &reject_existing_tmp,
+            &persist_accept_all,
+        )
+        .expect_err("the candidate validation failure must surface");
+        assert!(
+            err.contains("candidate security validation"),
+            "the error must come from the candidate validator: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the old blob must survive a failed candidate check"),
+            b"old-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "the failed candidate must be removed and no .bak left"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_post_rename_validation_failure_restores_old_blob() {
+        let dir = unique_test_dir("persist-post-failure");
+        let path = dir.join("secret");
+        std::fs::write(&path, b"old-secret").expect("seed old blob");
+        let reject_installed = |_: &std::path::Path| -> Result<(), String> {
+            Err("post-rename ACL check failed".to_string())
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &persist_accept_all,
+            &reject_installed,
+        )
+        .expect_err("the post-rename validation failure must surface");
+        assert!(
+            err.contains("post-rename"),
+            "the error must name the post-rename validation: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the old blob must be RESTORED, not deleted"),
+            b"old-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate and no .bak may remain after the restore"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_post_rename_failure_without_previous_blob_reports_no_restore() {
+        // First-ever store: no old blob exists at `path`, so nothing can be
+        // restored. The error must NOT claim a restore happened and the
+        // (rejected) new blob stays installed. Kills the mutant that reports
+        // "previous blob restored" unconditionally, and the `if path.exists()`
+        // -> `if true` mutant (the back-up rename would fail first).
+        let dir = unique_test_dir("persist-post-failure-first-store");
+        let path = dir.join("secret");
+        let reject_installed = |_: &std::path::Path| -> Result<(), String> {
+            Err("post-rename ACL check failed".to_string())
+        };
+        let err = super::persist_file_with_backup(
+            &path,
+            b"new-secret",
+            &persist_accept_all,
+            &reject_installed,
+        )
+        .expect_err("the post-rename validation failure must surface");
+        assert!(
+            err.contains("no previous blob existed"),
+            "the error must state that no previous blob existed: {err}"
+        );
+        assert!(
+            !err.contains("previous blob restored"),
+            "the error must not falsely claim a restore: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("the new blob remains installed"),
+            b"new-secret"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no candidate and no .bak may remain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persist_two_calls_do_not_collide_on_temp_name() {
+        let dir = unique_test_dir("persist-collision");
+        let path = dir.join("secret");
+        let first = super::temp_candidate_path(&path);
+        let second = super::temp_candidate_path(&path);
+        assert_ne!(
+            first, second,
+            "successive candidate names must never be identical"
+        );
+        super::persist_file_with_backup(&path, b"one", &persist_accept_all, &persist_accept_all)
+            .expect("first persist should succeed");
+        super::persist_file_with_backup(&path, b"two", &persist_accept_all, &persist_accept_all)
+            .expect("second persist should succeed");
+        assert_eq!(
+            std::fs::read(&path).expect("blob readable"),
+            b"two",
+            "the second call must replace the first blob"
+        );
+        assert_eq!(
+            persist_dir_entry_names(&dir),
+            vec!["secret".to_string()],
+            "no temp residue may accumulate across calls"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn store_passphrase_windows_refuses_allow_any_app() {
+        // The sibling flags are hard-refused on Windows; `allow_any_app` used
+        // to be silently dropped (`let _ = allow_any_app;`). It must be
+        // refused with the flag named, BEFORE the passphrase file is read or
+        // rewritten.
+        let dir = unique_test_dir("persist-windows-allow-any-app");
+        let target = dir.join("passphrase");
+        std::fs::write(&target, "passphrase-bytes").expect("seed passphrase file");
+        let err = super::store_passphrase_in_os_secure_store(&target, None, None, true)
+            .expect_err("--keychain-allow-any-app must be refused on Windows");
+        assert!(
+            err.contains("--keychain-allow-any-app"),
+            "the refusal must name the flag: {err}"
+        );
+        let contents = std::fs::read(&target).expect("passphrase file still readable");
+        assert!(
+            !super::looks_like_windows_dpapi_passphrase_blob(&contents),
+            "the refusal must happen before the file is rewritten"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
