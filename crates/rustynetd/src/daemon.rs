@@ -4963,14 +4963,23 @@ impl DaemonBackend {
 
 /// Memoized result of `compute_runtime_endpoint_fingerprint` (perf: the main
 /// loop asks for the fingerprint every iteration, but its only mutable inputs
-/// are the traversal-hint state — tracked by `traversal_hint_generation` — and,
-/// on Linux, the live default-gateway probe, which is re-probed on every call
-/// because it is external state the fingerprint exists to observe). The cache
-/// is served only when every input provably matches, so the returned string is
-/// byte-identical to a from-scratch recompute.
+/// are the traversal-hint state — tracked by `traversal_hint_generation` —
+/// the local host-candidate address set, and, on Linux, the live
+/// default-gateway probe, which is re-probed on every call because it is
+/// external state the fingerprint exists to observe). The cache is served only
+/// when every input provably matches, so the returned string is byte-identical
+/// to a from-scratch recompute.
 struct RuntimeEndpointFingerprintCache {
     /// `DaemonRuntime::traversal_hint_generation` at compute time.
     traversal_hint_generation: u64,
+    /// The eligible local host-candidate addresses the cached fingerprint was
+    /// computed from (`DaemonRuntime::local_host_candidate_ips`). Compared BY
+    /// VALUE on every lookup rather than through a generation counter:
+    /// `local_host_candidates` has several writers (the endpoint-monitor poll,
+    /// the traversal sync, test seeding), and a counter that one writer forgot
+    /// to bump would serve a stale hash and silently disable address-change
+    /// detection. A value comparison cannot be forgotten.
+    local_host_candidate_ips: Vec<IpAddr>,
     /// The live gateway probe result the cached fingerprint was computed
     /// from. Compared against a fresh probe on every lookup so an external
     /// gateway change (DHCP renew, router failover) still invalidates the
@@ -5169,12 +5178,14 @@ struct DaemonRuntime {
     /// Bumped unconditionally at the top of `refresh_traversal_hint_state`
     /// — the single function that mutates `traversal_hints` /
     /// `traversal_hint_error`, which are the only mutable fingerprint
-    /// inputs besides the live Linux gateway probe (the four remaining
-    /// inputs are set once at construction and never reassigned). Any NEW
-    /// mutation site for those two fields must either live inside
-    /// `refresh_traversal_hint_state` or bump this counter itself;
-    /// otherwise `runtime_endpoint_fingerprint` can serve a stale hash and
-    /// endpoint-change detection silently stops firing.
+    /// inputs that are tracked by a counter (the other mutable inputs are
+    /// the live Linux gateway probe and the eligible local host-candidate
+    /// address set, both re-read and compared by value on every lookup; the
+    /// four remaining inputs are set once at construction and never
+    /// reassigned). Any NEW mutation site for those two fields must either
+    /// live inside `refresh_traversal_hint_state` or bump this counter
+    /// itself; otherwise `runtime_endpoint_fingerprint` can serve a stale
+    /// hash and endpoint-change detection silently stops firing.
     traversal_hint_generation: u64,
     /// Memoized fingerprint (see `RuntimeEndpointFingerprintCache`).
     /// `None` until the first computation.
@@ -6656,16 +6667,26 @@ impl DaemonRuntime {
         }
     }
 
-    /// Pure fingerprint computation. On Linux the caller supplies the live
-    /// default-gateway probe result so the probe runs exactly once per
-    /// lookup — probing here as well as in the memo key would open a
+    /// Pure fingerprint computation over caller-supplied inputs: the live
+    /// default-gateway probe result (Linux) and the eligible local
+    /// host-candidate set.
+    ///
+    /// The caller supplies both so each is read exactly once per lookup -
+    /// probing or re-deriving here as well as in the memo key would open a
     /// window where the cached key and the hashed value came from two
-    /// different probes. Callers outside `runtime_endpoint_fingerprint`
-    /// must pass a probe of `self.egress_interface` taken in the same
-    /// call, or the hash no longer reflects the live route table.
+    /// different snapshots. Callers outside `runtime_endpoint_fingerprint`
+    /// must pass a probe of `self.egress_interface` and
+    /// `self.local_host_candidate_ips()` taken in the same call, or the hash no
+    /// longer reflects the live route table / address set.
+    ///
+    /// The host-candidate block is what makes an ADDRESS-ONLY change visible
+    /// (DHCP renewal, roam to another address behind the same gateway): the
+    /// gateway and egress interface do not move in that case, so without it
+    /// `EndpointMonitor` noticing the new address was discarded here.
     fn compute_runtime_endpoint_fingerprint(
         &self,
         #[cfg(target_os = "linux")] gateway_probe: &Result<Ipv4Addr, String>,
+        local_host_ips: &[IpAddr],
     ) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.local_node_id.as_bytes());
@@ -6679,6 +6700,7 @@ impl DaemonRuntime {
             }
         }
         hasher.update(self.wg_listen_port.to_be_bytes());
+        hash_local_host_candidate_ips(&mut hasher, local_host_ips);
         if let Some(envelope) = self.traversal_hints.as_ref() {
             for bundle in &envelope.bundles {
                 hasher.update(bundle.bundle.source_node_id.as_bytes());
@@ -6708,31 +6730,38 @@ impl DaemonRuntime {
     /// per-candidate string allocations) is skipped whenever no input has
     /// changed. Inputs are matched exactly: the traversal-hint generation
     /// counter (bumped by `refresh_traversal_hint_state`, the sole mutator
-    /// of the hint fields) and, on Linux, a fresh default-gateway probe —
-    /// re-run on EVERY call, never cached, because it reads external state
-    /// (`/proc/net/route`) that this fingerprint exists to observe. A hit
-    /// therefore returns a string byte-identical to a full recompute.
+    /// of the hint fields), the eligible local host-candidate address set
+    /// (compared by value — it has several writers, see
+    /// `RuntimeEndpointFingerprintCache::local_host_candidate_ips`) and, on
+    /// Linux, a fresh default-gateway probe — re-run on EVERY call, never
+    /// cached, because it reads external state (`/proc/net/route`) that this
+    /// fingerprint exists to observe. A hit therefore returns a string
+    /// byte-identical to a full recompute.
     fn runtime_endpoint_fingerprint(&mut self) -> String {
         #[cfg(target_os = "linux")]
         let gateway_probe =
             detect_ipv4_default_gateway_for_interface(self.egress_interface.as_str());
+        let local_host_ips = self.local_host_candidate_ips();
         if let Some(cache) = self.runtime_endpoint_fingerprint_cache.as_ref() {
-            let generation_matches =
-                cache.traversal_hint_generation == self.traversal_hint_generation;
+            let daemon_state_matches = cache.traversal_hint_generation
+                == self.traversal_hint_generation
+                && cache.local_host_candidate_ips == local_host_ips;
             #[cfg(target_os = "linux")]
-            let inputs_match = generation_matches && cache.gateway_probe == gateway_probe;
+            let inputs_match = daemon_state_matches && cache.gateway_probe == gateway_probe;
             #[cfg(not(target_os = "linux"))]
-            let inputs_match = generation_matches;
+            let inputs_match = daemon_state_matches;
             if inputs_match {
                 return cache.fingerprint.clone();
             }
         }
         #[cfg(target_os = "linux")]
-        let fingerprint = self.compute_runtime_endpoint_fingerprint(&gateway_probe);
+        let fingerprint =
+            self.compute_runtime_endpoint_fingerprint(&gateway_probe, &local_host_ips);
         #[cfg(not(target_os = "linux"))]
-        let fingerprint = self.compute_runtime_endpoint_fingerprint();
+        let fingerprint = self.compute_runtime_endpoint_fingerprint(&local_host_ips);
         self.runtime_endpoint_fingerprint_cache = Some(RuntimeEndpointFingerprintCache {
             traversal_hint_generation: self.traversal_hint_generation,
+            local_host_candidate_ips: local_host_ips,
             #[cfg(target_os = "linux")]
             gateway_probe,
             fingerprint: fingerprint.clone(),
@@ -7394,6 +7423,44 @@ impl DaemonRuntime {
         )
     }
 
+    /// The `gossip_hints=` value of the `netcheck` line: the host/reflexive
+    /// candidates this node last SIGNED AND MINTED into its own gossip bundle
+    /// (`self/…`), followed by the candidates last applied from each peer's
+    /// bundle (`<src8>/…`, peers sorted by gossip node id). Read-only
+    /// formatting of in-memory gossip state; it is what lets a lab prove that
+    /// a refreshed hint actually carried a new address and reached a peer,
+    /// instead of inferring it from a counter.
+    ///
+    /// Why `netcheck` and not `status`: the `status` gossip block is
+    /// documented as "no addresses" (`gossip_status_suffix`), while `netcheck`
+    /// already prints this node's own interface addresses
+    /// (`local_host_candidates`). Nothing new is exposed — every address here
+    /// was distributed to every mesh peer inside a signed bundle — and the
+    /// daemon socket is owner-only (0600 in a 0700 directory).
+    ///
+    /// Bounded at the source: at most [`GOSSIP_HINTS_MAX_PEERS`] peers and
+    /// [`GOSSIP_HINTS_MAX_ENTRIES`] entries per list, with a final `more_N`
+    /// token when truncated (a truncated list proves nothing about absence).
+    /// `none` when gossip is not configured at all.
+    fn gossip_hints_summary(&self) -> String {
+        let Some(node) = self.gossip_node.as_ref() else {
+            return "none".to_owned();
+        };
+        let own = node
+            .last_minted_bundle
+            .as_ref()
+            .map(crate::peer_gossip::flatten_endpoints)
+            .unwrap_or_default();
+        let mut entries = vec![format!("self/{}", render_gossip_hint_list(&own))];
+        let mut peers: Vec<(&[u8; 32], &Vec<SocketAddr>)> = node.applied_endpoints.iter().collect();
+        peers.sort_unstable_by_key(|(id, _)| **id);
+        for (id, endpoints) in peers.into_iter().take(GOSSIP_HINTS_MAX_PEERS) {
+            let short = id.get(..4).map(encode_hex).unwrap_or_default();
+            entries.push(format!("{short}/{}", render_gossip_hint_list(endpoints)));
+        }
+        entries.join("+")
+    }
+
     /// Periodic hook: if the local CandidateSet has changed since
     /// the last mint, OR the heartbeat timer has elapsed, mint a
     /// fresh signed bundle and push it to every registered peer.
@@ -7871,8 +7938,9 @@ impl DaemonRuntime {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let gossip_hints = self.gossip_hints_summary();
         format!(
-            "netcheck: path_mode={path_mode} path_reason={path_reason} path_programmed_mode={path_programmed_mode} path_programmed_reason={path_programmed_reason} path_live_proven={path_live_proven} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={path_latest_live_handshake_unix} relay_session_configured={relay_session_configured} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={relay_session_next_expiry_unix} transport_socket_identity_state={transport_socket_identity_state} transport_socket_identity_error={transport_socket_identity_error} transport_socket_identity_label={transport_socket_identity_label} transport_socket_identity_local_addr={transport_socket_identity_local_addr} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} stun_candidate_local_addrs={stun_candidate_local_addrs} stun_transport_port_binding={stun_transport_port_binding} local_host_candidates={local_host_candidates}",
+            "netcheck: path_mode={path_mode} path_reason={path_reason} path_programmed_mode={path_programmed_mode} path_programmed_reason={path_programmed_reason} path_live_proven={path_live_proven} path_programmed_peer_count={} path_live_peer_count={} path_programmed_direct_peers={} path_programmed_relay_peers={} path_live_direct_peers={} path_live_relay_peers={} path_latest_live_handshake_unix={path_latest_live_handshake_unix} relay_session_configured={relay_session_configured} relay_session_state={} relay_session_established_peers={} relay_session_expired_peers={} relay_session_next_expiry_unix={relay_session_next_expiry_unix} transport_socket_identity_state={transport_socket_identity_state} transport_socket_identity_error={transport_socket_identity_error} transport_socket_identity_label={transport_socket_identity_label} transport_socket_identity_local_addr={transport_socket_identity_local_addr} traversal_authority={traversal_authority} traversal_status={traversal_status} traversal_source={source} traversal_target={target} traversal_generated_at_unix={generated_at} traversal_expires_at_unix={expires_at} traversal_age_secs={age_secs} traversal_remaining_secs={remaining_secs} traversal_peer_count={traversal_peer_count} candidate_count={candidate_count} host_candidates={host_candidates} srflx_candidates={srflx_candidates} relay_candidates={relay_candidates} max_candidate_priority={max_candidate_priority} traversal_probe_max_candidates={traversal_probe_max_candidates} traversal_probe_max_pairs={traversal_probe_max_pairs} traversal_probe_rounds={traversal_probe_rounds} traversal_probe_round_spacing_ms={traversal_probe_round_spacing_ms} traversal_probe_relay_switch_after_failures={traversal_probe_relay_switch_after_failures} traversal_probe_handshake_freshness_secs={traversal_probe_handshake_freshness_secs} traversal_probe_reprobe_interval_secs={traversal_probe_reprobe_interval_secs} traversal_probe_result={probe_result} traversal_probe_reason={probe_reason} traversal_probe_attempts={probe_attempts} traversal_probe_endpoint={probe_endpoint} traversal_probe_latest_handshake_unix={probe_handshake_unix} traversal_probe_next_reprobe_unix={probe_next_reprobe_unix} traversal_probe_peer_count={probe_peer_count} traversal_probe_direct_peers={probe_direct_peers} traversal_probe_relay_peers={probe_relay_peers} traversal_preexpiry_refresh_events={traversal_preexpiry_refresh_events} traversal_last_preexpiry_refresh_unix={traversal_last_preexpiry_refresh_unix} traversal_stale_rejections={traversal_stale_rejections} traversal_replay_rejections={traversal_replay_rejections} traversal_future_dated_rejections={traversal_future_dated_rejections} traversal_endpoint_change_events={traversal_endpoint_change_events} traversal_endpoint_fingerprint={traversal_endpoint_fingerprint} traversal_alarm_state={traversal_alarm_state} traversal_alarm_reason={traversal_alarm_reason} dns_alarm_state={dns_alarm_state} dns_alarm_reason={dns_alarm_reason} dns_preexpiry_refresh_events={dns_preexpiry_refresh_events} dns_last_preexpiry_refresh_unix={dns_last_preexpiry_refresh_unix} dns_stale_rejections={dns_stale_rejections} dns_replay_rejections={dns_replay_rejections} dns_future_dated_rejections={dns_future_dated_rejections} traversal_error={traversal_error} stun_candidates={stun_candidates} stun_candidate_local_addrs={stun_candidate_local_addrs} stun_transport_port_binding={stun_transport_port_binding} local_host_candidates={local_host_candidates} gossip_hints={gossip_hints}",
             path_state.programmed_peer_count,
             path_state.live_peer_count,
             path_state.programmed_direct_peers,
@@ -7885,27 +7953,66 @@ impl DaemonRuntime {
         )
     }
 
+    /// Whether `ip`, enumerated on interface `iface`, is a host candidate this
+    /// node probes with (`all_local_candidates`) and whose appearance or
+    /// disappearance counts as an endpoint change (`local_host_candidate_ips`,
+    /// hashed into the endpoint fingerprint). ONE predicate for both, so the
+    /// set the fingerprint watches cannot drift from the set the probe engine
+    /// pairs against remote candidates.
+    ///
+    /// * the interface must be a usable underlay interface (not loopback, not
+    ///   the WG interface, not a macOS virtual/tunnel interface);
+    /// * the address must be a plausible peer endpoint (not unspecified,
+    ///   loopback, multicast, broadcast or link-local);
+    /// * AQ-254(a): third-party overlay addresses (tailscale0's CGNAT
+    ///   `100.64/10` and IPv6 ULA `fd7a:115c:a1e0::/48`, carrier-grade NAT)
+    ///   are kept out unless the operator opted in. The mesh's own WG
+    ///   interfaces are already excluded by the name rule.
+    fn host_candidate_eligible(&self, iface: &str, ip: IpAddr) -> bool {
+        interface_name_is_usable_for_traversal_host_candidate(iface)
+            && ip_is_usable_for_traversal_host_candidate(ip)
+            && crate::dataplane_candidates::overlay_host_advertisable(
+                ip,
+                self.advertise_cgnat_host_candidates,
+            )
+    }
+
+    /// The eligible local host-candidate addresses, both families, in a
+    /// canonical form that cannot change for irrelevant reasons: filtered by
+    /// [`Self::host_candidate_eligible`], IPv4-mapped IPv6 folded to IPv4,
+    /// sorted and de-duplicated. `getifaddrs` order, duplicates across
+    /// interfaces and link-local / loopback / overlay churn therefore never
+    /// move the endpoint fingerprint; only a real change of which addresses
+    /// this node can be reached at does.
+    ///
+    /// Deliberately NOT included: reflexive (srflx) candidates. They are the
+    /// OUTPUT of the refresh an endpoint change triggers (it forces a STUN
+    /// regather), so hashing them would feed the refresh back into its own
+    /// trigger on a symmetric NAT. Ports are not included either: a host
+    /// candidate is `ip:wg_listen_port` and the listen port is hashed already.
+    fn local_host_candidate_ips(&self) -> Vec<IpAddr> {
+        let mut ips: Vec<IpAddr> = self
+            .local_host_candidates
+            .iter()
+            .flat_map(|(iface, addrs)| {
+                addrs
+                    .iter()
+                    .copied()
+                    .filter(move |ip| self.host_candidate_eligible(iface.as_str(), *ip))
+            })
+            .map(|ip| ip.to_canonical())
+            .collect();
+        ips.sort_unstable();
+        ips.dedup();
+        ips
+    }
+
     fn all_local_candidates(&self) -> Vec<ProbeTraversalCandidate> {
         let mut candidates = Vec::new();
         // Host candidates
         for (iface, addrs) in &self.local_host_candidates {
-            if !interface_name_is_usable_for_traversal_host_candidate(iface.as_str()) {
-                continue;
-            }
             for ip in addrs {
-                if !ip_is_usable_for_traversal_host_candidate(*ip) {
-                    continue;
-                }
-                // AQ-254(a): keep third-party overlay addresses
-                // (tailscale0's CGNAT `100.64/10` and IPv6 ULA
-                // `fd7a:115c:a1e0::/48`, carrier-grade NAT) out
-                // of the advertised probe host candidates unless the
-                // operator opted in. The mesh's own WG interfaces are
-                // already excluded by the name rules above.
-                if !crate::dataplane_candidates::overlay_host_advertisable(
-                    *ip,
-                    self.advertise_cgnat_host_candidates,
-                ) {
+                if !self.host_candidate_eligible(iface.as_str(), *ip) {
                     continue;
                 }
 
@@ -12100,6 +12207,74 @@ fn ip_is_usable_for_traversal_host_candidate(ip: IpAddr) -> bool {
         IpAddr::V4(value) => !(value.is_link_local() || value.is_broadcast()),
         IpAddr::V6(value) => !value.is_unicast_link_local(),
     }
+}
+
+/// Domain-separation label of the local-host-candidate block inside the
+/// endpoint fingerprint. A fixed, NUL-terminated ASCII string so the block
+/// can never be confused with the node-id / interface-name text that precedes
+/// it or the hint text that follows it.
+const ENDPOINT_FINGERPRINT_LOCAL_HOSTS_LABEL: &[u8] =
+    b"rustynet:endpoint-fingerprint:local-host-candidates:v1\0";
+
+/// Feed the canonical local host-candidate set (see
+/// `DaemonRuntime::local_host_candidate_ips`: sorted, de-duplicated,
+/// canonical form) into the endpoint fingerprint with unambiguous framing:
+/// the label, a big-endian `u32` count, then per address one family byte (4 or
+/// 6) and the 4 or 16 raw octets. The framing is self-delimiting, so no two
+/// distinct address sets hash the same byte string.
+fn hash_local_host_candidate_ips(hasher: &mut Sha256, ips: &[IpAddr]) {
+    hasher.update(ENDPOINT_FINGERPRINT_LOCAL_HOSTS_LABEL);
+    // The count is bounded by the number of NIC addresses, so the saturating
+    // conversion is an unreachable fail-soft default, not a truncation path.
+    let count = u32::try_from(ips.len()).unwrap_or(u32::MAX);
+    hasher.update(count.to_be_bytes());
+    for ip in ips {
+        match ip {
+            IpAddr::V4(v4) => {
+                hasher.update([4u8]);
+                hasher.update(v4.octets());
+            }
+            IpAddr::V6(v6) => {
+                hasher.update([6u8]);
+                hasher.update(v6.octets());
+            }
+        }
+    }
+}
+
+/// Peer cap of the `gossip_hints=` netcheck value (see
+/// `DaemonRuntime::gossip_hints_summary`).
+const GOSSIP_HINTS_MAX_PEERS: usize = 8;
+/// Per-list entry cap of the `gossip_hints=` netcheck value.
+const GOSSIP_HINTS_MAX_ENTRIES: usize = 8;
+
+/// One `gossip_hints=` list: comma-separated candidates, `none` when empty.
+/// Gossip host candidates travel with port 0 (the bundle carries no per-host
+/// port; the connect path pairs them with the WG listen port), so they print
+/// as a bare address; reflexive candidates keep their `ip:port`. Capped at
+/// [`GOSSIP_HINTS_MAX_ENTRIES`] with a trailing `more_N` token. Built only
+/// from `IpAddr`/`SocketAddr` renderings, so the value can contain neither
+/// whitespace nor `=` and cannot forge another `key=value` token.
+fn render_gossip_hint_list(endpoints: &[SocketAddr]) -> String {
+    if endpoints.is_empty() {
+        return "none".to_owned();
+    }
+    let mut tokens: Vec<String> = endpoints
+        .iter()
+        .take(GOSSIP_HINTS_MAX_ENTRIES)
+        .map(|endpoint| {
+            if endpoint.port() == 0 {
+                endpoint.ip().to_string()
+            } else {
+                endpoint.to_string()
+            }
+        })
+        .collect();
+    let omitted = endpoints.len().saturating_sub(GOSSIP_HINTS_MAX_ENTRIES);
+    if omitted > 0 {
+        tokens.push(format!("more_{omitted}"));
+    }
+    tokens.join(",")
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", all(test, not(windows))))]
@@ -33387,14 +33562,7 @@ mod tests {
             after_change, first,
             "changed hint content must produce a different fingerprint"
         );
-        #[cfg(target_os = "linux")]
-        let expected_fresh = {
-            let gateway_probe =
-                super::detect_ipv4_default_gateway_for_interface(runtime.egress_interface.as_str());
-            runtime.compute_runtime_endpoint_fingerprint(&gateway_probe)
-        };
-        #[cfg(not(target_os = "linux"))]
-        let expected_fresh = runtime.compute_runtime_endpoint_fingerprint();
+        let expected_fresh = fresh_endpoint_fingerprint(&runtime);
         assert_eq!(
             after_change, expected_fresh,
             "the post-invalidation fingerprint must be byte-identical to a from-scratch recompute"
@@ -33412,6 +33580,541 @@ mod tests {
             "losing the traversal hints must change the fingerprint, not serve the cached one"
         );
 
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    // ── endpoint fingerprint: local host-candidate addresses ─────────────────
+    //
+    // An ADDRESS-ONLY network change (DHCP renewal, roam to another address
+    // behind the same gateway) must move the endpoint fingerprint, or
+    // `EndpointMonitor` noticing the new address is discarded by the
+    // fingerprint comparison (the node_network_switch lab failure,
+    // katana-xnet-148/150). These tests drive the production seams only:
+    // `local_host_candidates`, `runtime_endpoint_fingerprint`,
+    // `maybe_trigger_endpoint_change_refresh`.
+
+    fn endpoint_fingerprint_test_runtime(tag: &str) -> (DaemonRuntime, std::path::PathBuf) {
+        let relay_addr: SocketAddr = "203.0.113.71:40071".parse().expect("relay addr");
+        let (mut runtime, test_dir) =
+            build_runtime_with_custom_relay(tag, relay_addr, "relay-eu-1");
+        // Load the signed hints once up front: a later endpoint-change refresh
+        // reloads the identical snapshot (allowed by the watermark), so hint
+        // content is a constant of these tests and only the address set moves.
+        runtime.refresh_traversal_hint_state(false);
+        assert!(
+            runtime.traversal_hints.is_some(),
+            "test precondition: the signed traversal bundle must load"
+        );
+        (runtime, test_dir)
+    }
+
+    /// Replace the host-candidate cache entry for `iface` (the production
+    /// writers overwrite whole snapshots, so a test does the same).
+    fn set_host_addrs(runtime: &mut DaemonRuntime, iface: &str, addrs: &[&str]) {
+        runtime.local_host_candidates.insert(
+            iface.to_owned(),
+            addrs
+                .iter()
+                .map(|addr| addr.parse().expect("test address should parse"))
+                .collect(),
+        );
+    }
+
+    /// A from-scratch fingerprint recompute with the platform's own gateway
+    /// probe, bypassing the memo.
+    fn fresh_endpoint_fingerprint(runtime: &DaemonRuntime) -> String {
+        let local_host_ips = runtime.local_host_candidate_ips();
+        #[cfg(target_os = "linux")]
+        {
+            let gateway_probe =
+                super::detect_ipv4_default_gateway_for_interface(runtime.egress_interface.as_str());
+            runtime.compute_runtime_endpoint_fingerprint(&gateway_probe, &local_host_ips)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            runtime.compute_runtime_endpoint_fingerprint(&local_host_ips)
+        }
+    }
+
+    #[test]
+    fn endpoint_fingerprint_changes_when_a_local_host_address_is_added_and_returns_when_removed() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-add-remove");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        let before = runtime.runtime_endpoint_fingerprint();
+
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.77"],
+        );
+        let with_alias = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(
+            before, with_alias,
+            "an address-only change (new local host address, same gateway) must move the \
+             endpoint fingerprint"
+        );
+
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            before,
+            "removing the address must return the exact original fingerprint: the value is a \
+             deterministic function of the address set"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_memo_is_invalidated_by_a_local_host_address_change() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-memo");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        let first = runtime.runtime_endpoint_fingerprint();
+
+        // Poison the cache: unchanged inputs must be served from it ...
+        if let Some(cache) = runtime.runtime_endpoint_fingerprint_cache.as_mut() {
+            cache.fingerprint = "poisoned-cache-sentinel".to_owned();
+        }
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            "poisoned-cache-sentinel",
+            "unchanged inputs must be served from the cache"
+        );
+
+        // ... but a changed address set must NOT be. A memo that ignored the
+        // address set would keep serving the old hash and silently disable
+        // address-change detection.
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.77"],
+        );
+        let after = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(after, "poisoned-cache-sentinel");
+        assert_ne!(after, first);
+        assert_eq!(
+            after,
+            fresh_endpoint_fingerprint(&runtime),
+            "the post-invalidation fingerprint must be byte-identical to a from-scratch recompute"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn address_only_change_is_counted_once_by_the_endpoint_change_trigger() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-trigger");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+        let seeded = runtime
+            .traversal_last_endpoint_fingerprint
+            .clone()
+            .expect("the first trigger seeds the fingerprint");
+        runtime.traversal_last_endpoint_change_unix = None;
+
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.77"],
+        );
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events + 1,
+            "an address-only change must run the endpoint-change refresh (counter +1)"
+        );
+        assert_ne!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(seeded.as_str()),
+            "the accepted fingerprint must be the new one"
+        );
+        assert!(
+            runtime.traversal_last_endpoint_change_unix.is_some(),
+            "the accepted change records its time for the debounce window"
+        );
+
+        runtime.maybe_trigger_endpoint_change_refresh();
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events + 1,
+            "unchanged state must not be counted again"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// A flapping address cannot cause a refresh storm: inside the stability
+    /// window the change stays PENDING (the accepted fingerprint is not
+    /// overwritten), a flap that resolves itself costs nothing, and once the
+    /// window closes exactly one refresh runs, for the FINAL state.
+    #[test]
+    fn flapping_local_address_is_rate_limited_and_settles_on_the_final_state() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-flap");
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        let baseline_events = runtime.traversal_endpoint_change_events;
+        let seeded = runtime
+            .traversal_last_endpoint_fingerprint
+            .clone()
+            .expect("seeded");
+
+        // A change was accepted just now.
+        runtime.traversal_last_endpoint_change_unix = Some(unix_now());
+        for addr in ["192.168.50.20", "192.168.50.21", "192.168.50.22"] {
+            set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10", addr]);
+            runtime.maybe_trigger_endpoint_change_refresh();
+        }
+        assert_eq!(
+            runtime.traversal_endpoint_change_events, baseline_events,
+            "inside the stability window no further refresh may run"
+        );
+        assert_eq!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(seeded.as_str()),
+            "a deferred change must stay pending, not be recorded as accepted"
+        );
+
+        // The flap resolves itself back to the accepted state: nothing to do.
+        set_host_addrs(&mut runtime, "eth-test", &["192.168.50.10"]);
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(runtime.traversal_endpoint_change_events, baseline_events);
+
+        // It settles on a new address and the window has closed: exactly one
+        // refresh, for the final state.
+        set_host_addrs(
+            &mut runtime,
+            "eth-test",
+            &["192.168.50.10", "192.168.50.99"],
+        );
+        runtime.traversal_last_endpoint_change_unix =
+            Some(unix_now().saturating_sub(super::MIN_ENDPOINT_CHANGE_STABILITY_SECS + 1));
+        runtime.maybe_trigger_endpoint_change_refresh();
+        runtime.maybe_trigger_endpoint_change_refresh();
+        assert_eq!(
+            runtime.traversal_endpoint_change_events,
+            baseline_events + 1,
+            "exactly one refresh after the window closes"
+        );
+        assert_eq!(
+            runtime.traversal_last_endpoint_fingerprint.as_deref(),
+            Some(fresh_endpoint_fingerprint(&runtime).as_str()),
+            "the accepted fingerprint is the final state's, not an intermediate one"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_follows_the_cgnat_advertisement_opt_in() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-cgnat-opt-in");
+        set_host_addrs(&mut runtime, "eth0", &["192.168.50.10"]);
+        let without = runtime.runtime_endpoint_fingerprint();
+        // A tailscale-style CGNAT address is NOT an advertised host candidate
+        // by default (AQ-254a), so it must not move the fingerprint ...
+        set_host_addrs(
+            &mut runtime,
+            "tailscale0",
+            &["100.109.160.10", "fd7a:115c:a1e0::5"],
+        );
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            without,
+            "overlay churn must not trigger endpoint refreshes by default"
+        );
+        // ... and becomes one when the operator opts in.
+        runtime.advertise_cgnat_host_candidates = true;
+        assert_ne!(
+            runtime.runtime_endpoint_fingerprint(),
+            without,
+            "with the explicit opt-in the overlay address is a host candidate and must count"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_is_stable_across_order_duplicates_and_mapped_forms() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-normalisation");
+        runtime.local_host_candidates.clear();
+        set_host_addrs(&mut runtime, "eth0", &["192.168.1.10", "10.0.0.5"]);
+        set_host_addrs(&mut runtime, "eth1", &["172.16.0.9"]);
+        let reference = runtime.runtime_endpoint_fingerprint();
+
+        // Same set: other enumeration order, duplicates, the same address
+        // seen on a second interface, and an IPv4-mapped IPv6 spelling.
+        runtime.local_host_candidates.clear();
+        set_host_addrs(&mut runtime, "eth1", &["172.16.0.9", "172.16.0.9"]);
+        set_host_addrs(&mut runtime, "eth0", &["10.0.0.5", "192.168.1.10"]);
+        set_host_addrs(&mut runtime, "eth7", &["::ffff:192.168.1.10"]);
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            reference,
+            "order, duplicates and mapped spellings of the same address set must not move the \
+             fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_ignores_unusable_addresses_and_interfaces() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-irrelevant");
+        set_host_addrs(&mut runtime, "eth0", &["192.168.1.10"]);
+        let reference = runtime.runtime_endpoint_fingerprint();
+
+        // Address classes that are never a peer endpoint, on the usable
+        // interface: link-local v4/v6, loopback, multicast, broadcast,
+        // unspecified.
+        set_host_addrs(
+            &mut runtime,
+            "eth0",
+            &[
+                "192.168.1.10",
+                "169.254.7.7",
+                "fe80::1",
+                "127.0.0.2",
+                "224.0.0.5",
+                "255.255.255.255",
+                "0.0.0.0",
+                "::1",
+            ],
+        );
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            reference,
+            "link-local / loopback / multicast / broadcast / unspecified churn must not flap \
+             the fingerprint"
+        );
+
+        // Interfaces that are never an underlay path: loopback, the WG
+        // interface, macOS virtual/tunnel interfaces.
+        for iface in ["lo", "lo0", "rustynet0", "utun3", "awdl0", "llw0", "anpi0"] {
+            set_host_addrs(&mut runtime, iface, &["192.168.77.77"]);
+        }
+        assert_eq!(
+            runtime.runtime_endpoint_fingerprint(),
+            reference,
+            "addresses on non-underlay interfaces must not move the fingerprint"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_sees_ipv6_addresses_and_keeps_the_families_apart() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-families");
+        set_host_addrs(&mut runtime, "eth0", &["10.1.2.3"]);
+        let v4_only = runtime.runtime_endpoint_fingerprint();
+
+        set_host_addrs(&mut runtime, "eth0", &["10.1.2.3", "2001:4860:4860::8888"]);
+        let with_global_v6 = runtime.runtime_endpoint_fingerprint();
+        assert_ne!(
+            v4_only, with_global_v6,
+            "a new IPv6 host address is an endpoint change too"
+        );
+
+        // The numerically similar IPv4-compatible IPv6 address is a different
+        // address from 10.1.2.3 and must hash differently (family is framed).
+        set_host_addrs(&mut runtime, "eth0", &["::a01:203"]);
+        assert_ne!(
+            runtime.runtime_endpoint_fingerprint(),
+            v4_only,
+            "an IPv6 address must never hash like the IPv4 address with the same octets"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The fingerprint must watch exactly the host candidates the probe engine
+    /// pairs, so a future edit of one predicate cannot silently desynchronise
+    /// them.
+    #[test]
+    fn fingerprint_address_set_equals_the_probe_host_candidate_set() {
+        let (mut runtime, test_dir) =
+            endpoint_fingerprint_test_runtime("rustynetd-fp-address-probe-set");
+        runtime.local_host_candidates.clear();
+        set_host_addrs(
+            &mut runtime,
+            "eth0",
+            &[
+                "192.168.1.10",
+                "169.254.1.1",
+                "fe80::2",
+                "2001:4860:4860::8888",
+            ],
+        );
+        set_host_addrs(&mut runtime, "lo", &["127.0.0.1"]);
+        set_host_addrs(&mut runtime, "rustynet0", &["100.64.0.7"]);
+        set_host_addrs(&mut runtime, "tailscale0", &["100.109.160.10"]);
+        set_host_addrs(&mut runtime, "br-lab", &["172.20.10.2", "192.168.1.10"]);
+
+        for opted_in in [false, true] {
+            runtime.advertise_cgnat_host_candidates = opted_in;
+            let mut probe: Vec<IpAddr> = runtime
+                .all_local_candidates()
+                .into_iter()
+                .filter(|candidate| candidate.source == crate::traversal::CandidateSource::Host)
+                .map(|candidate| candidate.endpoint.addr.to_canonical())
+                .collect();
+            probe.sort_unstable();
+            probe.dedup();
+            assert_eq!(
+                runtime.local_host_candidate_ips(),
+                probe,
+                "fingerprint set and probe host set diverged (cgnat opt-in = {opted_in})"
+            );
+            assert!(
+                !probe.is_empty(),
+                "the table must keep at least one eligible address, or the equality is vacuous"
+            );
+        }
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    /// The fingerprint is a local, in-process comparison value (printed only
+    /// on the owner-only daemon socket). Pin that no other module can start
+    /// using it - on the wire, in gossip, in logs - without this test being
+    /// edited on purpose.
+    #[test]
+    fn endpoint_fingerprint_is_confined_to_the_daemon_module() {
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        for entry in std::fs::read_dir(&src_dir).expect("rustynetd/src should be readable") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+                continue;
+            }
+            if path.file_name().and_then(|name| name.to_str()) == Some("daemon.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("source file should be readable");
+            if text.contains("endpoint_fingerprint") {
+                offenders.push(path.display().to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the endpoint fingerprint must stay inside daemon.rs and the local IPC lines: {offenders:?}"
+        );
+    }
+
+    fn gossip_hints_test_bundle(
+        key: &SigningKey,
+        candidates: crate::dataplane_candidates::CandidateSet,
+    ) -> crate::peer_gossip::GossipBundle {
+        crate::peer_gossip::mint_bundle_with_timestamp(key, 1, 1_700_000_000, 1, candidates)
+            .expect("test bundle should mint")
+    }
+
+    #[test]
+    fn netcheck_gossip_hints_is_none_without_a_gossip_node() {
+        let (runtime, test_dir) = endpoint_fingerprint_test_runtime("rustynetd-hints-none");
+        assert_eq!(runtime.gossip_hints_summary(), "none");
+        assert!(
+            runtime
+                .netcheck_response_line()
+                .contains(" gossip_hints=none"),
+            "the netcheck line must always carry the field"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn netcheck_gossip_hints_reports_self_then_sorted_peers() {
+        use crate::dataplane_candidates::CandidateSet;
+        let (mut runtime, test_dir) = endpoint_fingerprint_test_runtime("rustynetd-hints-render");
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let mut node = crate::gossip_runtime::GossipNode::new(key.clone(), None)
+            .expect("gossip node should build");
+
+        // Never minted: `self/none`, and an empty peer table adds nothing.
+        runtime.gossip_node = Some(node);
+        assert_eq!(runtime.gossip_hints_summary(), "self/none");
+        node = runtime.gossip_node.take().expect("node present");
+
+        node.last_minted_bundle = Some(gossip_hints_test_bundle(
+            &key,
+            CandidateSet {
+                v4_host: vec![
+                    "192.168.122.45".parse().expect("ip"),
+                    "192.168.122.254".parse().expect("ip"),
+                ],
+                v6_host: vec!["fd00::1".parse().expect("ip")],
+                v4_srflx: vec!["8.8.8.8:51820".parse().expect("sa")],
+                v6_srflx: Vec::new(),
+            },
+        ));
+        // Inserted in reverse id order: the rendering must sort by id.
+        node.applied_endpoints
+            .insert([0xbb; 32], vec!["10.9.9.9:0".parse().expect("sa")]);
+        node.applied_endpoints.insert(
+            [0xaa; 32],
+            vec![
+                "192.168.123.222:0".parse().expect("sa"),
+                "[2001:db8::7]:51820".parse().expect("sa"),
+            ],
+        );
+        runtime.gossip_node = Some(node);
+
+        assert_eq!(
+            runtime.gossip_hints_summary(),
+            "self/192.168.122.45,192.168.122.254,fd00::1,8.8.8.8:51820\
+             +aaaaaaaa/192.168.123.222,[2001:db8::7]:51820\
+             +bbbbbbbb/10.9.9.9"
+        );
+        let line = runtime.netcheck_response_line();
+        assert!(
+            line.ends_with(
+                " gossip_hints=self/192.168.122.45,192.168.122.254,fd00::1,8.8.8.8:51820\
+                 +aaaaaaaa/192.168.123.222,[2001:db8::7]:51820+bbbbbbbb/10.9.9.9"
+            ),
+            "gossip_hints must be the last netcheck field: {line}"
+        );
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn netcheck_gossip_hints_is_bounded_at_the_source() {
+        use crate::dataplane_candidates::CandidateSet;
+        let (mut runtime, test_dir) = endpoint_fingerprint_test_runtime("rustynetd-hints-caps");
+        let key = SigningKey::from_bytes(&[9u8; 32]);
+        let mut node = crate::gossip_runtime::GossipNode::new(key.clone(), None)
+            .expect("gossip node should build");
+        node.last_minted_bundle = Some(gossip_hints_test_bundle(
+            &key,
+            CandidateSet {
+                v4_host: (1u8..=10)
+                    .map(|n| IpAddr::V4(Ipv4Addr::new(10, 0, 0, n)))
+                    .collect(),
+                ..CandidateSet::default()
+            },
+        ));
+        for peer in 0u8..12 {
+            node.applied_endpoints
+                .insert([peer; 32], vec![SocketAddr::from(([10, 1, 0, peer], 0))]);
+        }
+        runtime.gossip_node = Some(node);
+
+        let summary = runtime.gossip_hints_summary();
+        let entries: Vec<&str> = summary.split('+').collect();
+        assert_eq!(
+            entries.len(),
+            1 + super::GOSSIP_HINTS_MAX_PEERS,
+            "self plus at most {} peers: {summary}",
+            super::GOSSIP_HINTS_MAX_PEERS
+        );
+        assert!(
+            entries[0].ends_with(",10.0.0.8,more_2"),
+            "ten entries must be cut to {} plus a more_N marker: {}",
+            super::GOSSIP_HINTS_MAX_ENTRIES,
+            entries[0]
+        );
+        assert!(
+            !summary.contains(char::is_whitespace) && !summary.contains('='),
+            "the value must not be able to split into extra tokens or forge a key=value pair"
+        );
         let _ = std::fs::remove_dir_all(test_dir);
     }
 
