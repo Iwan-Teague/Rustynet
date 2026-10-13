@@ -5642,6 +5642,28 @@ fn materialize_signing_passphrase_workspace(prefix: &str) -> Result<(PathBuf, Pa
     stage_signing_passphrase_leaf(&paths, &format!("{prefix}.passphrase"))
 }
 
+/// Run `body` with the signing-passphrase credential unwrapped into a 0600
+/// file inside a fresh 0700 credentials-workspace, and ALWAYS shred the file
+/// and remove the workspace afterwards (success and failure alike).
+///
+/// This is the same materialize / use / shred shape every bundle-issuance verb
+/// in this module uses (`execute_ops_e2e_issue_traversal_bundles_from_env`
+/// and its siblings). It exists so a CLI-side caller that is NOT running under
+/// the systemd unit's `LoadCredentialEncrypted=` (there is no
+/// `%d/signing_key_passphrase` outside the unit) can still evaluate the SAME
+/// assignment-authority gate the refresh service evaluates, without copying
+/// the unwrap-and-shred sequence.
+pub(crate) fn with_unwrapped_signing_passphrase<T>(
+    prefix: &str,
+    body: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace(prefix)?;
+    let result = body(passphrase_path.as_path());
+    secure_remove_file(passphrase_path.as_path());
+    let _ = fs::remove_dir_all(work_dir);
+    result
+}
+
 fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
     if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err(format!("{label} must be 64 hex characters"));
@@ -7997,6 +8019,52 @@ mod tests {
             !core_body.contains("systemd-creds\""),
             "stage_signing_passphrase_leaf must unwrap via the CredentialUnwrapBackend \
              trait, not by spawning the systemd-creds binary directly"
+        );
+    }
+
+    /// `with_unwrapped_signing_passphrase` hands the CLI-side authority check
+    /// (`force_local_assignment_refresh_now_ops`) a plaintext passphrase file,
+    /// so it must shred that file and drop the workspace on EVERY path, and it
+    /// must go through the shared materializer rather than unwrapping on its
+    /// own. Source pin: the body runs the caller's closure first, then shreds,
+    /// then removes the workspace, and only then returns the closure's result.
+    #[test]
+    fn with_unwrapped_signing_passphrase_always_shreds_and_uses_the_shared_materializer() {
+        let source = include_str!("ops_e2e.rs");
+        let start = source
+            .find("pub(crate) fn with_unwrapped_signing_passphrase<T>(")
+            .expect("with_unwrapped_signing_passphrase must exist");
+        let end = source[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("with_unwrapped_signing_passphrase body must terminate");
+        let body = &source[start..end];
+        let materialize = body
+            .find("materialize_signing_passphrase_workspace(")
+            .expect("must unwrap through the shared materializer");
+        let run_body = body
+            .find("body(passphrase_path.as_path())")
+            .expect("must run the caller's closure with the passphrase file");
+        let shred = body
+            .find("secure_remove_file(passphrase_path.as_path())")
+            .expect("must shred the plaintext passphrase file");
+        let remove_workspace = body
+            .find("remove_dir_all(work_dir)")
+            .expect("must remove the workspace");
+        let result = body
+            .rfind("result")
+            .expect("must return the closure's result");
+        assert!(
+            materialize < run_body && run_body < shred && shred < remove_workspace,
+            "materialize, then use, then shred, then remove the workspace"
+        );
+        assert!(
+            remove_workspace < result,
+            "the closure's result is returned only after the cleanup ran, on success and failure alike"
+        );
+        assert!(
+            !body.contains("systemd-creds"),
+            "no direct credential-backend spawn"
         );
     }
 
