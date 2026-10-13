@@ -3003,6 +3003,41 @@ pub(crate) struct LiveLinuxEndpointHijackReportView {
     pub evidence: LiveLinuxEndpointHijackEvidenceView,
 }
 
+/// The WireGuard peer endpoints the hijack/recovery evidence is judged on.
+///
+/// `wg_output` is `wg show rustynet0 endpoints`. When it has content it is
+/// returned unchanged (kernel backend: exactly the previous behaviour). When it
+/// is empty, the `linux-wireguard-userspace-shared` backend holds WireGuard in
+/// the daemon and kernel `wg` cannot see it, so the daemon's own
+/// `managed_peer_endpoints=` field of `rustynet status` (`node/host:port`
+/// entries joined by `+`, `none` for a peer without an endpoint) is used, one
+/// `host:port` per line. A status that carries no endpoint yields an empty
+/// string, never an invented one; the callers' checks are "the rogue endpoint is
+/// not present", for which the daemon's own list is the honest source.
+// Used by the `live_linux_endpoint_hijack_test` bin via the lib; the main bin
+// compiles this module too and never calls it.
+#[allow(dead_code)]
+pub fn peer_endpoints_with_daemon_fallback(wg_output: &str, status: &str) -> String {
+    if !wg_output.trim().is_empty() {
+        return wg_output.to_owned();
+    }
+    let mut endpoints = Vec::new();
+    for field in status.split_whitespace() {
+        let Some(value) = field.strip_prefix("managed_peer_endpoints=") else {
+            continue;
+        };
+        for entry in value.split('+') {
+            let Some((node_id, endpoint)) = entry.split_once('/') else {
+                continue;
+            };
+            if !node_id.is_empty() && !endpoint.is_empty() && endpoint != "none" {
+                endpoints.push(endpoint.to_owned());
+            }
+        }
+    }
+    endpoints.join("\n")
+}
+
 pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     config: WriteLiveLinuxEndpointHijackReportConfig,
 ) -> Result<String, String> {
@@ -8405,5 +8440,49 @@ mod aq08_6b_differential {
             checked += 1;
         }
         assert!(checked >= 200, "fixture floor: only {checked}");
+    }
+}
+
+#[cfg(test)]
+mod peer_endpoint_fallback_tests {
+    use super::peer_endpoints_with_daemon_fallback;
+
+    #[test]
+    fn kernel_wg_output_is_returned_unchanged() {
+        let wg = "key1\t192.0.2.7:51820\n";
+        assert_eq!(
+            peer_endpoints_with_daemon_fallback(wg, "managed_peer_endpoints=n/10.0.0.1:1"),
+            wg
+        );
+    }
+
+    #[test]
+    fn empty_kernel_output_falls_back_to_the_daemons_managed_endpoints() {
+        let status = "state=ExitActive managed_peer_endpoints=exit/192.168.123.222:51820+relay/192.168.122.57:51820 x=1";
+        assert_eq!(
+            peer_endpoints_with_daemon_fallback("", status),
+            "192.168.123.222:51820\n192.168.122.57:51820"
+        );
+        assert_eq!(
+            peer_endpoints_with_daemon_fallback("  \n", status),
+            "192.168.123.222:51820\n192.168.122.57:51820"
+        );
+    }
+
+    #[test]
+    fn nothing_is_invented_when_the_daemon_has_no_endpoint() {
+        for status in [
+            "",
+            "daemon unreachable: Connection refused",
+            "managed_peer_endpoints=none",
+            "managed_peer_endpoints=exit/none",
+            "managed_peer_endpoints=/1.2.3.4:5",
+        ] {
+            assert_eq!(
+                peer_endpoints_with_daemon_fallback("", status),
+                "",
+                "{status}"
+            );
+        }
     }
 }

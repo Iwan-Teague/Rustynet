@@ -2572,10 +2572,100 @@ fn assert_fresh_wg_handshake(
              {timestamp}, now {now_unix}; the mesh did not re-key within \
              {WG_HANDSHAKE_MAX_AGE_SECS}s)"
         )),
-        None => Err(format!(
+        None => assert_fresh_daemon_handshake(runner, alias, now_unix),
+    }
+}
+
+/// The daemon-reported handshake evidence, used ONLY when kernel `wg` printed
+/// no handshake line at all.
+///
+/// The `linux-wireguard-userspace-shared` backend keeps WireGuard state inside
+/// `rustynetd` (a TUN device, no kernel wg interface), so `wg show all
+/// latest-handshakes` is empty on a perfectly healthy mesh (katana-xnet-66). The
+/// daemon is asked which backend it is and for the freshest live handshake it
+/// itself measured:
+/// - `transport_socket_identity_state=authoritative_backend_shared_transport`
+///   (only a backend that owns the UDP socket reports it) means userspace-shared;
+///   then `path_latest_live_handshake_unix=<unix>` is the evidence and the SAME
+///   [`WG_HANDSHAKE_MAX_AGE_SECS`] rule applies. The daemon only fills that
+///   field from a peer whose handshake it saw fresh, `none` means no live peer.
+/// - `blocked_backend_opaque_socket` means the kernel backend: kernel `wg` was
+///   the authority and it saw nothing, so the original failure stands.
+/// - anything else (or no answer) is an unknown backend and fails closed;
+///   nothing is guessed from the orchestrator's `--linux-backend`.
+///
+/// A stale kernel handshake never reaches this function, so the daemon cannot
+/// rescue a mesh that kernel `wg` shows as not re-keyed.
+fn assert_fresh_daemon_handshake(
+    runner: &dyn NetLeafRunner,
+    alias: &str,
+    now_unix: u64,
+) -> Result<(), String> {
+    let no_handshakes = |detail: &str| {
+        format!(
             "{alias}: wg reports no handshakes at all after the reboot; the mesh did not \
-             re-converge"
-        )),
+             re-converge ({detail})"
+        )
+    };
+    let output = runner
+        .run(&[
+            "sudo",
+            "-n",
+            "env",
+            "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
+            "rustynet",
+            "netcheck",
+        ])
+        .map_err(|err| no_handshakes(&format!("daemon netcheck probe: {err}")))?;
+    if !output.success {
+        return Err(no_handshakes(&format!(
+            "daemon netcheck failed: {}",
+            output.stderr.trim()
+        )));
+    }
+    let field = |key: &str| {
+        output
+            .stdout
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix(key))
+    };
+    match field("transport_socket_identity_state=") {
+        Some("authoritative_backend_shared_transport") => {}
+        Some("blocked_backend_opaque_socket") => {
+            return Err(no_handshakes(
+                "kernel wireguard backend, kernel wg is the authority",
+            ));
+        }
+        other => {
+            return Err(no_handshakes(&format!(
+                "cannot tell which wireguard backend this is (transport_socket_identity_state \
+                 {other:?}); failing closed"
+            )));
+        }
+    }
+    let timestamp = match field("path_latest_live_handshake_unix=") {
+        Some(raw) if !raw.is_empty() && raw.bytes().all(|b| b.is_ascii_digit()) => raw
+            .parse::<u64>()
+            .map_err(|_| no_handshakes("unparseable daemon handshake timestamp"))?,
+        Some("none") => {
+            return Err(no_handshakes(
+                "userspace-shared daemon reports no live peer handshake",
+            ));
+        }
+        other => {
+            return Err(no_handshakes(&format!(
+                "daemon netcheck carries no usable path_latest_live_handshake_unix ({other:?})"
+            )));
+        }
+    };
+    if now_unix.saturating_sub(timestamp) <= WG_HANDSHAKE_MAX_AGE_SECS {
+        Ok(())
+    } else {
+        Err(format!(
+            "{alias}: no fresh wireguard handshake after the reboot (daemon-reported latest \
+             handshake {timestamp}, now {now_unix}; the mesh did not re-key within \
+             {WG_HANDSHAKE_MAX_AGE_SECS}s)"
+        ))
     }
 }
 
@@ -4530,6 +4620,107 @@ mod tests {
         let err = assert_fresh_wg_handshake(&failing, "a", now)
             .expect_err("a failing probe fails closed");
         assert!(err.contains("latest-handshakes failed"), "{err}");
+    }
+
+    fn userspace_runner(netcheck: &str) -> mock::MockLeafRunner {
+        mock::MockLeafRunner {
+            stdout_by_match: vec![("netcheck".to_owned(), netcheck.to_owned())],
+            ..mock::MockLeafRunner::default()
+        }
+    }
+
+    fn netcheck_with(state: &str, handshake: &str) -> String {
+        format!(
+            "netcheck: path_mode=direct_active path_live_proven=true \
+             path_latest_live_handshake_unix={handshake} \
+             transport_socket_identity_state={state} traversal_error=none"
+        )
+    }
+
+    /// katana-xnet-66: userspace-shared keeps WireGuard in the daemon, kernel
+    /// `wg` is empty, and the daemon's own fresh handshake is the evidence, with
+    /// the same freshness bound.
+    #[test]
+    fn the_handshake_gate_accepts_the_daemons_fresh_handshake_for_userspace_shared() {
+        let now = now_unix();
+        let ok = |age: u64| {
+            userspace_runner(&netcheck_with(
+                "authoritative_backend_shared_transport",
+                &(now - age).to_string(),
+            ))
+        };
+        assert_fresh_wg_handshake(&ok(10), "a", now).expect("a 10s-old daemon handshake is fresh");
+        let err = assert_fresh_wg_handshake(&ok(10_000), "a", now)
+            .expect_err("a stale daemon handshake fails");
+        assert!(err.contains("did not re-key"), "{err}");
+    }
+
+    /// No vacuous pass: every shape of missing, unknown or unusable daemon
+    /// evidence fails, and the kernel authority is never overridden.
+    #[test]
+    fn the_daemon_fallback_never_passes_on_absent_or_ambiguous_evidence() {
+        let now = now_unix();
+        let fresh = now.to_string();
+        let cases = [
+            // userspace but no live peer
+            netcheck_with("authoritative_backend_shared_transport", "none"),
+            // userspace but the field is garbage / negative-looking
+            netcheck_with("authoritative_backend_shared_transport", "-5"),
+            netcheck_with("authoritative_backend_shared_transport", "12x"),
+            netcheck_with("authoritative_backend_shared_transport", ""),
+            // kernel backend: kernel wg saw nothing, a daemon stamp is NOT trusted
+            netcheck_with("blocked_backend_opaque_socket", &fresh),
+            // unknown backend states
+            netcheck_with("authoritative_backend_shared_transport_unavailable", &fresh),
+            netcheck_with("not_required", &fresh),
+            // not a netcheck at all
+            String::new(),
+            "path_latest_live_handshake_unix=1".to_owned(),
+        ];
+        for netcheck in cases {
+            let err = assert_fresh_wg_handshake(&userspace_runner(&netcheck), "a", now)
+                .expect_err(&format!("must fail closed: {netcheck:?}"));
+            assert!(err.contains("no handshakes"), "{netcheck:?}: {err}");
+        }
+        // The daemon probe itself failing or being unrunnable fails closed.
+        let failing = mock::MockLeafRunner {
+            fail_on: vec![1],
+            failure_stderr: "connection refused".to_owned(),
+            ..mock::MockLeafRunner::default()
+        };
+        let err = assert_fresh_wg_handshake(&failing, "a", now).expect_err("netcheck failed");
+        assert!(err.contains("daemon netcheck failed"), "{err}");
+        let broken = mock::MockLeafRunner {
+            transport_error_on: vec![1],
+            ..mock::MockLeafRunner::default()
+        };
+        let err = assert_fresh_wg_handshake(&broken, "a", now).expect_err("netcheck unrunnable");
+        assert!(err.contains("daemon netcheck probe"), "{err}");
+    }
+
+    /// The kernel path is untouched: a fresh kernel handshake never consults the
+    /// daemon, and a STALE kernel handshake is not rescued by a fresh daemon one.
+    #[test]
+    fn the_kernel_handshake_path_never_consults_the_daemon() {
+        let now = now_unix();
+        let netcheck = netcheck_with("authoritative_backend_shared_transport", &now.to_string());
+        let kernel = |age: u64| mock::MockLeafRunner {
+            stdout_by_match: vec![
+                (
+                    "latest-handshakes".to_owned(),
+                    format!("rustynet0\tpeer\t{}\n", now - age),
+                ),
+                ("netcheck".to_owned(), netcheck.clone()),
+            ],
+            ..mock::MockLeafRunner::default()
+        };
+        let fresh = kernel(5);
+        assert_fresh_wg_handshake(&fresh, "a", now).expect("fresh kernel handshake");
+        assert_eq!(fresh.recorded().len(), 1, "only the kernel probe ran");
+        let stale = kernel(10_000);
+        assert_fresh_wg_handshake(&stale, "a", now)
+            .expect_err("a stale kernel handshake stays a failure");
+        assert_eq!(stale.recorded().len(), 1, "the daemon must not rescue it");
     }
 
     /// Recovery fails closed on a rebooted node with no runner, on a restart

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{LiveLabContext, Logger, repo_root};
+use rustynet_cli::ops_live_lab_orchestrator::peer_endpoints_with_daemon_fallback;
 
 fn main() {
     if let Err(err) = run() {
@@ -160,8 +161,10 @@ fn run() -> Result<(), String> {
             "netcheck",
         ],
     )?;
-    let baseline_endpoints =
-        ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?;
+    let baseline_endpoints = peer_endpoints_with_daemon_fallback(
+        &ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?,
+        &baseline_status_output,
+    );
 
     if baseline_status_output.contains("state=FailClosed") {
         return Err(
@@ -249,8 +252,10 @@ fn run() -> Result<(), String> {
             "netcheck",
         ],
     )?;
-    let endpoints_after_hijack =
-        ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?;
+    let endpoints_after_hijack = peer_endpoints_with_daemon_fallback(
+        &ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?,
+        &status_after_hijack,
+    );
 
     ctx.run_root(&client_host, &["cp", &backup_path, &assignment_path])?;
     let _ = ctx.run_root_allow_failure(
@@ -282,8 +287,10 @@ fn run() -> Result<(), String> {
             "status",
         ],
     )?;
-    let endpoints_after_recovery =
-        ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?;
+    let endpoints_after_recovery = peer_endpoints_with_daemon_fallback(
+        &ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?,
+        &status_after_recovery,
+    );
 
     logger.block("Baseline status", &baseline_status_output)?;
     logger.block("Baseline netcheck", &baseline_netcheck_output)?;
