@@ -3093,6 +3093,50 @@ pub fn status_reports_fail_closed(status: &str) -> bool {
         .any(|token| token == "state=FailClosed")
 }
 
+/// `AutoTunnelBootstrapError::SignatureInvalid` Display text (rustynetd
+/// `daemon.rs`). Deliberately the full auto-tunnel phrase: trust, traversal,
+/// dns-zone, membership and remote-fetch signature failures all contain the bare
+/// "signature verification failed" and must not tie fail-closed to the assignment bundle.
+const AUTO_TUNNEL_SIGNATURE_FAILURE_TEXT: &str = "auto-tunnel signature verification failed";
+
+/// True when a `rustynet status` line ties the exact `state=FailClosed` token
+/// to a signature verification failure. The daemon records the tampered-bundle
+/// refusal in `bootstrap_error=` (the `restrict_recoverable` path) or in
+/// `last_reconcile_error=`, and the status line renders both fields (`none`
+/// when unset), with the multi-word error text following the field token. The
+/// field name must be the exact whitespace-delimited token prefix, so a
+/// look-alike field such as `xbootstrap_error=` never counts. Without this tie
+/// a fail-closed posture caused by an unrelated error would falsely witness
+/// the hijack reaction.
+// Used by the hijack check above and by the hijack bin via the lib.
+#[allow(dead_code)]
+pub fn status_fail_closed_tied_to_signature_failure(status: &str) -> bool {
+    if !status_reports_fail_closed(status) {
+        return false;
+    }
+    let tokens: Vec<&str> = status.split_whitespace().collect();
+    for (idx, token) in tokens.iter().enumerate() {
+        let head = token
+            .strip_prefix("bootstrap_error=")
+            .or_else(|| token.strip_prefix("last_reconcile_error="));
+        let Some(head) = head else {
+            continue;
+        };
+        let mut value = head.to_owned();
+        for next in tokens.iter().skip(idx + 1) {
+            if next.contains('=') {
+                break;
+            }
+            value.push(' ');
+            value.push_str(next);
+        }
+        if value.contains(AUTO_TUNNEL_SIGNATURE_FAILURE_TEXT) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     config: WriteLiveLinuxEndpointHijackReportConfig,
 ) -> Result<String, String> {
@@ -3121,9 +3165,9 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
 
     let checks = LiveLinuxEndpointHijackChecksView {
         baseline_runtime_secure: pass_or_fail(!config.baseline_status.contains("state=FailClosed")),
-        hijack_drives_fail_closed: pass_or_fail(
-            config.status_after_hijack.contains("state=FailClosed"),
-        ),
+        hijack_drives_fail_closed: pass_or_fail(status_fail_closed_tied_to_signature_failure(
+            &config.status_after_hijack,
+        )),
         restricted_safe_mode_engaged: pass_or_fail(
             config
                 .status_after_hijack
@@ -5376,7 +5420,9 @@ mod tests {
                 baseline_status: "state=ExitActive restricted_safe_mode=false".to_owned(),
                 baseline_netcheck: "path_mode=direct_active".to_owned(),
                 baseline_endpoints: "peer-a=192.168.18.51:51820".to_owned(),
-                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_owned(),
+                status_after_hijack:
+                    "state=FailClosed bootstrap_error=auto-tunnel signature verification failed restricted_safe_mode=true"
+                        .to_owned(),
                 netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
                 endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_owned(),
                 status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
@@ -8574,7 +8620,27 @@ mod peer_endpoint_fallback_tests {
 mod hijack_evidence_honesty_tests {
     use super::*;
 
+    /// F1: the fail-closed posture in the shared fixture is tied to the
+    /// tampered bundle via the daemon's signature-error rendering, so the
+    /// remaining slots (adoption, recovery, source honesty) are what the tests
+    /// below exercise.
     fn write(
+        baseline: &str,
+        after_hijack: &str,
+        after_recovery: &str,
+        source: &str,
+    ) -> (String, serde_json::Value) {
+        write_with_status(
+            "state=FailClosed bootstrap_error=auto-tunnel signature verification failed restricted_safe_mode=true",
+            baseline,
+            after_hijack,
+            after_recovery,
+            source,
+        )
+    }
+
+    fn write_with_status(
+        status_after_hijack: &str,
         baseline: &str,
         after_hijack: &str,
         after_recovery: &str,
@@ -8592,7 +8658,7 @@ mod hijack_evidence_honesty_tests {
                 baseline_status: "state=ExitActive restricted_safe_mode=false".to_owned(),
                 baseline_netcheck: "path_mode=direct_active".to_owned(),
                 baseline_endpoints: baseline.to_owned(),
-                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_owned(),
+                status_after_hijack: status_after_hijack.to_owned(),
                 netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
                 endpoints_after_hijack: after_hijack.to_owned(),
                 status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
@@ -8701,5 +8767,74 @@ mod hijack_evidence_honesty_tests {
             "error [transient_failure (70)]: daemon unreachable: connect failed"
         ));
         assert!(!status_reports_fail_closed(""));
+    }
+
+    /// F1: a fail-closed posture only witnesses the hijack when the daemon's
+    /// own error fields tie it to the tampered bundle's signature.
+    #[test]
+    fn fail_closed_witnesses_the_hijack_only_when_the_error_cites_the_signature() {
+        // Live rendering class: `restrict_recoverable` stores the tampered
+        // bundle refusal in `bootstrap_error` and the multi-word text follows
+        // the field token on the status line.
+        assert!(status_fail_closed_tied_to_signature_failure(
+            "node_id=c1 state=FailClosed bootstrap_error=auto-tunnel signature verification failed"
+        ));
+        // The reconcile path may surface the refusal via `last_reconcile_error`.
+        assert!(status_fail_closed_tied_to_signature_failure(
+            "node_id=c1 state=FailClosed last_reconcile_error=auto-tunnel reconcile failed: auto-tunnel signature verification failed encrypted_key_store=true"
+        ));
+        // Unrelated signature failures (trust, dns zone, traversal) do not tie to the assignment bundle.
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed bootstrap_error=signed trust refresh failed: trust evidence signature verification failed reconcile_attempts=0"
+        ));
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed bootstrap_error=remote traversal fetch failed: signature verification failed: bad reconcile_attempts=0"
+        ));
+        // Live refresh rendering: wrapped message, next key terminates the value.
+        assert!(status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed bootstrap_error=signed assignment refresh failed: auto-tunnel signature verification failed reconcile_attempts=0 reconcile_failures=0"
+        ));
+        // FailClosed without error text (unset fields render `none`) is no witness.
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed restricted_safe_mode=true"
+        ));
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed bootstrap_error=none last_reconcile_error=none"
+        ));
+        // The signature text alone, without the exact FailClosed token, is no witness.
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=ExitActive bootstrap_error=auto-tunnel signature verification failed"
+        ));
+        // Look-alike field names never count.
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed xbootstrap_error=auto-tunnel signature verification failed"
+        ));
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed my_last_reconcile_error=auto-tunnel signature verification failed"
+        ));
+        // The phrase in an unrelated field does not tie the posture to the bundle.
+        assert!(!status_fail_closed_tied_to_signature_failure(
+            "state=FailClosed dns_zone_error=auto-tunnel signature verification failed"
+        ));
+        assert!(!status_fail_closed_tied_to_signature_failure(""));
+    }
+
+    /// Report-level witness: the same FailClosed evidence passes with the
+    /// signature tie and must fail without it (the old substring check let it
+    /// pass on any fail-closed posture).
+    #[test]
+    fn hijack_drives_fail_closed_requires_the_signature_error_tie() {
+        let listed = "192.168.122.57:51820";
+        let (_, tied) = write(listed, "", listed, "daemon_status");
+        assert_eq!(tied["checks"]["hijack_drives_fail_closed"], "pass");
+        let (_, untied) = write_with_status(
+            "state=FailClosed restricted_safe_mode=true",
+            listed,
+            "",
+            listed,
+            "daemon_status",
+        );
+        assert_eq!(untied["checks"]["hijack_drives_fail_closed"], "fail");
+        assert_eq!(untied["status"], "fail");
     }
 }

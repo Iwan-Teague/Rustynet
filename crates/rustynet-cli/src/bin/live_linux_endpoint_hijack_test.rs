@@ -7,7 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{LiveLabContext, Logger, repo_root};
 use rustynet_cli::ops_live_lab_orchestrator::{
-    peer_endpoint_source, peer_endpoints_with_daemon_fallback, status_reports_fail_closed,
+    peer_endpoint_source, peer_endpoints_with_daemon_fallback,
+    status_fail_closed_tied_to_signature_failure, status_reports_fail_closed,
 };
 
 fn main() {
@@ -247,8 +248,11 @@ fn run() -> Result<(), String> {
     // daemon fail-closes by itself on the next reconcile; poke it to re-read
     // (the refresh itself is expected to be refused) and wait for it to say so.
     // Whatever it reports, or that it cannot be reached, is the evidence: nothing
-    // here is assumed.
-    let _ = ctx.run_root_allow_failure(
+    // here is assumed. The refresh outcome is logged (exit/stdout/stderr) so the
+    // evidence survives in the test log; a refusal here is the expected live
+    // result, never an assertion.
+    let refresh_label = "state refresh after tamper (refusal is the expected live result)";
+    match ctx.run_root_allow_failure(
         &client_host,
         &[
             "env",
@@ -257,7 +261,18 @@ fn run() -> Result<(), String> {
             "state",
             "refresh",
         ],
-    );
+    ) {
+        Ok(refresh_output) => logger.block(
+            refresh_label,
+            format!(
+                "exit: {}\nstdout: {}\nstderr: {}",
+                refresh_output.status,
+                String::from_utf8_lossy(&refresh_output.stdout),
+                String::from_utf8_lossy(&refresh_output.stderr),
+            ),
+        )?,
+        Err(refresh_err) => logger.block(refresh_label, format!("invoke failed: {refresh_err}"))?,
+    }
     let mut status_after_hijack = String::new();
     for attempt in 0..HIJACK_FAIL_CLOSED_POLL_ATTEMPTS {
         if attempt > 0 {
@@ -272,7 +287,12 @@ fn run() -> Result<(), String> {
                 "status",
             ],
         )?;
-        if status_reports_fail_closed(&status_after_hijack) {
+        // Poll until the posture is fail-closed AND tied to the tampered bundle:
+        // an earlier, unrelated fail-closed (e.g. a failed remote fetch during
+        // the refresh) must not end the wait before the reconcile loop reports
+        // the signature failure. On timeout the last status falls through and
+        // the report fails honestly.
+        if status_fail_closed_tied_to_signature_failure(&status_after_hijack) {
             break;
         }
     }
@@ -361,6 +381,17 @@ fn run() -> Result<(), String> {
         )?;
 
     if report_status != "pass" {
+        if status_reports_fail_closed(&status_after_hijack)
+            && !status_fail_closed_tied_to_signature_failure(&status_after_hijack)
+        {
+            return Err(format!(
+                "hijack_drives_fail_closed: the daemon reported state=FailClosed but neither \
+                 bootstrap_error= nor last_reconcile_error= cites a signature verification \
+                 failure, so the fail-closed posture cannot be tied to the tampered bundle; \
+                 see {}",
+                report_path.display()
+            ));
+        }
         return Err(format!(
             "endpoint hijack test failed; see {}",
             report_path.display()
