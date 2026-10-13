@@ -1266,3 +1266,62 @@ fn a_pre_existing_persisted_mismatch_is_restored_as_found() {
     assert_eq!(guest.persisted_lines(), env);
     assert_eq!(guest.live_primary(), PrimaryRole::Admin);
 }
+
+// ---- REVIEWER-PROPOSED (appended to the semantic tests file in a private tree) ----
+
+/// Corner: a pre-existing persisted/live mismatch AND a daemon restart inside the
+/// evaluation window (live := persisted = client). The restore's live `role set admin` then
+/// plans client->admin and WRITES `admin` into the env file; the persisted rewrite must run
+/// AFTER it so the recorded (as-found) line wins even though the stage fails on the live role.
+#[test]
+fn rrs_restart_in_window_with_a_pre_existing_mismatch_still_restores_the_recorded_line() {
+    let env: Vec<String> = vec![
+        "RUSTYNET_NODE_ID=katana-exit-1".to_owned(),
+        "RUSTYNET_NODE_ROLE=client".to_owned(),
+    ];
+    let guest = SemanticExitGuest::serving_exit(env.clone()).with_faults(Faults {
+        restart_during_evaluation: true,
+        ..Faults::default()
+    });
+    let err = run_stage(&guest).expect_err("a live role stuck at client must fail the stage");
+    assert!(err.contains("does not report node_role=admin"), "{err}");
+    assert_eq!(
+        guest.persisted_lines(),
+        env,
+        "the recorded line must win over the live role set's own env write"
+    );
+}
+
+/// Corner: the node starts as live `client` with a serving exit NAT table (synthetic), so the
+/// demotion's `role set admin` PROMOTES the persisted role to admin. The restore must put the
+/// recorded `client` line back (the old slice left `admin` persisted: a security-relevant
+/// promotion).
+#[test]
+fn rrs_demotion_that_promotes_the_persisted_role_is_undone() {
+    let env: Vec<String> = vec![
+        "RUSTYNET_NODE_ID=katana-exit-1".to_owned(),
+        "RUSTYNET_NODE_ROLE=client".to_owned(),
+    ];
+    let guest = SemanticExitGuest::serving_exit(env.clone());
+    guest.lock().live_primary = PrimaryRole::Client;
+    let result = run_stage(&guest);
+    assert_eq!(guest.persisted_lines(), env, "result={result:?}");
+}
+
+/// Kills "live restore targets the PERSISTED value": with a pre-existing mismatch the three
+/// `role set` calls must be admin (demote), client (demote), admin (RECORDED LIVE role).
+#[test]
+fn rrs_pre_existing_mismatch_restore_targets_the_recorded_live_role() {
+    let env: Vec<String> = vec![
+        "RUSTYNET_NODE_ID=katana-exit-1".to_owned(),
+        "RUSTYNET_NODE_ROLE=client".to_owned(),
+    ];
+    let guest = SemanticExitGuest::serving_exit(env.clone());
+    run_stage(&guest).expect("the stage proves the demotion residue, not the env consistency");
+    assert_eq!(
+        guest.role_set_targets(),
+        vec!["admin".to_owned(), "client".to_owned(), "admin".to_owned()],
+        "the live restore must target the RECORDED LIVE role, never the persisted value"
+    );
+    assert_eq!(guest.persisted_lines(), env);
+}

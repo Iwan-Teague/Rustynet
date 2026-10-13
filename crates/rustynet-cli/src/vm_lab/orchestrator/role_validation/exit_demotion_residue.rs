@@ -603,6 +603,10 @@ fn demote_to_client(shell: &dyn RemoteShellHost) -> Result<i32, String> {
     Ok(0)
 }
 
+/// `systemctl is-active --quiet rustynetd.service` exits 0 only when the unit is active; any other
+/// exit code (3 = inactive/failed) or a dispatch error means the daemon is NOT running. The earlier
+/// body judged `run_argv(..).is_ok()`, which is true for every exit code, so the evaluator's
+/// "daemon stopped" leg could never fire (found by the 2026-10-11 independent review, D2).
 fn check_daemon_running(shell: &dyn RemoteShellHost) -> bool {
     shell
         .run_argv(
@@ -610,7 +614,8 @@ fn check_daemon_running(shell: &dyn RemoteShellHost) -> bool {
             &[],
             &[],
         )
-        .is_ok()
+        .map(|status| status.is_success())
+        .unwrap_or(false)
 }
 
 /// Merge two `LinuxExitNatLifecycleSnapshot` payloads into the artifact
@@ -857,6 +862,23 @@ mod tests {
             .filter(|call| call.argv.len() == 8 && call.argv[5] == "role" && call.argv[6] == "set")
             .filter_map(|call| call.argv.last().cloned())
             .collect()
+    }
+
+    /// Review D2 (2026-10-11): `systemctl is-active --quiet` exits 3 for an inactive unit and 4 for
+    /// an unknown one; the daemon-running check must read the EXIT CODE (it used to judge only that
+    /// the dispatch itself worked, so a stopped daemon read as running).
+    #[test]
+    fn daemon_running_check_reads_the_exit_code() {
+        let argv = ["systemctl", "is-active", "--quiet", "rustynetd.service"];
+        for (code, running) in [(0, true), (3, false), (4, false), (1, false)] {
+            let mock = MockShellHost::new();
+            mock.program_run_response(&argv, exit_code(code));
+            assert_eq!(
+                check_daemon_running(&mock),
+                running,
+                "exit code {code} must read as running={running}"
+            );
+        }
     }
 
     #[test]
@@ -1628,3 +1650,7 @@ mod tests {
 #[cfg(test)]
 #[path = "exit_demotion_residue_semantic_tests.rs"]
 mod semantic_tests;
+
+#[cfg(test)]
+#[path = "exit_demotion_residue_review_mock_tests.rs"]
+mod review_mock_tests;
