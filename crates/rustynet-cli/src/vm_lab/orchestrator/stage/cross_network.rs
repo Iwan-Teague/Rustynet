@@ -1053,7 +1053,7 @@ fn write_cross_network_scenario_report(
         impairment_profile: options.impairment_profile.clone(),
         check_overrides: outcome.checks.as_report_args(),
         path_status_line: outcome.path_status_line.clone(),
-        path_evidence_report: None,
+        path_evidence_report: outcome.path_evidence_report.as_deref().map(PathBuf::from),
     };
     if let Err(err) =
         crate::ops_cross_network_reports::execute_ops_generate_cross_network_remote_exit_report(

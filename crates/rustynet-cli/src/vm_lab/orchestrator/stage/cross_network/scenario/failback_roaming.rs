@@ -426,6 +426,7 @@ fn execute(
             checks,
             options,
             reconvergence_secs,
+            baseline_ok,
         ));
     }
     if !checks.passed("endpoint_roam_recovery_success") {
@@ -456,8 +457,35 @@ fn failback_failure_summary(
     checks: &Checks,
     options: FailbackRoamingOptions,
     reconvergence_secs: Option<i64>,
+    baseline_ok: bool,
 ) -> String {
     if !checks.passed("failback_reconnect_within_slo") {
+        // `failback_reconnect_within_slo` also folds in the relay baseline and
+        // the topology heuristic (see `execute`), so it can fail with a
+        // reconvergence time well inside the SLO. Reporting that as "exceeded
+        // reconnect SLO (30s), measured=6s" (katana-xnet-73) is false; name the
+        // clause that actually failed. The check verdicts themselves are
+        // unchanged.
+        let within_slo = matches!(
+            reconvergence_secs,
+            Some(secs) if (0..=i64::from(options.recovery_slo_secs)).contains(&secs)
+        );
+        if within_slo && !baseline_ok {
+            return format!(
+                "relay remote-exit baseline did not prove the relayed path to fail back from \
+                 (reconvergence itself took {}s, within the {}s SLO)",
+                reconvergence_secs.unwrap_or(NO_RECONVERGENCE_SECS),
+                options.recovery_slo_secs
+            );
+        }
+        if within_slo && !checks.passed("cross_network_topology_heuristic") {
+            return format!(
+                "client and exit underlay topology did not credibly prove a cross-network \
+                 claim (reconvergence itself took {}s, within the {}s SLO)",
+                reconvergence_secs.unwrap_or(NO_RECONVERGENCE_SECS),
+                options.recovery_slo_secs
+            );
+        }
         return format!(
             "relay-to-direct failback exceeded reconnect SLO ({}s), measured={}s",
             options.recovery_slo_secs,
@@ -1005,27 +1033,65 @@ mod tests {
         let mut checks = Checks::new();
         checks.declare(CHECKS);
         assert_eq!(
-            failback_failure_summary(&checks, options, None),
+            failback_failure_summary(&checks, options, None, true),
             "relay-to-direct failback exceeded reconnect SLO (30s), measured=-1s"
         );
 
         checks.record_bool("failback_reconnect_within_slo", true);
         assert_eq!(
-            failback_failure_summary(&checks, options, Some(7)),
+            failback_failure_summary(&checks, options, Some(7), true),
             "underlay leak detected while reconnecting during relay-to-direct failback"
         );
 
         checks.record_bool("no_underlay_leak_while_reconnecting", true);
         assert_eq!(
-            failback_failure_summary(&checks, options, Some(7)),
+            failback_failure_summary(&checks, options, Some(7), true),
             "signed traversal state became invalid while reconnecting during relay-to-direct \
              failback"
         );
 
         checks.record_bool("signed_state_valid_while_reconnecting", true);
         assert_eq!(
-            failback_failure_summary(&checks, options, Some(7)),
+            failback_failure_summary(&checks, options, Some(7), true),
             "relay-to-direct failback did not reconverge securely"
+        );
+    }
+
+    /// katana-xnet-73: reconvergence took 6 s, the relay baseline failed, and the
+    /// summary claimed "exceeded reconnect SLO (30s), measured=6s". The check
+    /// verdict is unchanged; only the text now names the clause that failed.
+    #[test]
+    fn a_failed_baseline_is_not_reported_as_a_slo_miss() {
+        let options = FailbackRoamingOptions::default();
+        let mut checks = Checks::new();
+        checks.declare(CHECKS);
+        let text = failback_failure_summary(&checks, options, Some(6), false);
+        assert!(
+            text.starts_with("relay remote-exit baseline did not prove"),
+            "{text}"
+        );
+        assert!(text.contains("took 6s, within the 30s SLO"), "{text}");
+        // A genuine SLO miss keeps the original wording.
+        assert_eq!(
+            failback_failure_summary(&checks, options, Some(31), false),
+            "relay-to-direct failback exceeded reconnect SLO (30s), measured=31s"
+        );
+        assert_eq!(
+            failback_failure_summary(&checks, options, Some(-1), true),
+            "relay-to-direct failback exceeded reconnect SLO (30s), measured=-1s"
+        );
+        // Baseline fine, topology not credible, reconvergence in range.
+        checks.record_bool("cross_network_topology_heuristic", false);
+        let text = failback_failure_summary(&checks, options, Some(6), true);
+        assert!(
+            text.starts_with("client and exit underlay topology"),
+            "{text}"
+        );
+        // Nothing wrong with any clause but the time was never measured.
+        checks.record_bool("cross_network_topology_heuristic", true);
+        assert_eq!(
+            failback_failure_summary(&checks, options, None, true),
+            "relay-to-direct failback exceeded reconnect SLO (30s), measured=-1s"
         );
     }
 

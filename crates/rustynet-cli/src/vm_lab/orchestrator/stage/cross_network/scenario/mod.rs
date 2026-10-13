@@ -218,6 +218,12 @@ pub struct ScenarioOutcome {
     /// The client's `netcheck` line, recorded verbatim into the report as
     /// `--path-status-line` where the shell did so.
     pub path_status_line: Option<String>,
+    /// A composed child's report whose `path_evidence` this scenario's report
+    /// adopts, recorded as `--path-evidence-report`. For a scenario that has no
+    /// client `netcheck` of its own (managed DNS runs no commands itself) the
+    /// child baseline's evidence is the path evidence; the old shell passed its
+    /// direct baseline report this way. `path_status_line`, when set, wins.
+    pub path_evidence_report: Option<String>,
     /// Extra artifact paths the scenario produced, recorded as
     /// `--source-artifact`.
     pub source_artifacts: Vec<String>,
@@ -233,6 +239,7 @@ impl ScenarioOutcome {
             failure_summary: String::new(),
             checks,
             path_status_line: None,
+            path_evidence_report: None,
             source_artifacts: Vec::new(),
             log_artifacts: Vec::new(),
         }
@@ -246,6 +253,7 @@ impl ScenarioOutcome {
             failure_summary: summary.into(),
             checks,
             path_status_line: None,
+            path_evidence_report: None,
             source_artifacts: Vec::new(),
             log_artifacts: Vec::new(),
         }
@@ -253,6 +261,11 @@ impl ScenarioOutcome {
 
     pub fn with_path_status_line(mut self, line: impl Into<String>) -> Self {
         self.path_status_line = Some(line.into());
+        self
+    }
+
+    pub fn with_path_evidence_report(mut self, report: impl Into<String>) -> Self {
+        self.path_evidence_report = Some(report.into());
         self
     }
 

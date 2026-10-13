@@ -504,8 +504,31 @@ fn observe_transition(
         // routes through the tunnel, and both ends' signed state is healthy.
         // Anything less is a partial recovery, and stopping on one would let
         // the SLO be met by a client that had not actually finished.
-        if super::client_exit_selected(&client_status, &exit.node_id) && route_ok && signed_ok {
+        //
+        // The time of FIRST full re-convergence is what the SLO measures, so it
+        // is latched once. It must NOT end the observation by itself, though: a
+        // client that never lost its session is "re-converged" at the very first
+        // sample, one second after the alias was applied, before the daemon has
+        // had any chance to notice the new local address. Stopping there froze
+        // the three detection latches at their first-sample values and failed
+        // `endpoint_change_detected` without ever watching for it
+        // (katana-xnet-73: one sample in the monitor log, daemon already listing
+        // the alias in `local_host_candidates`). The window is the SLO the
+        // caller already granted, so the loop now also waits, inside that window,
+        // for the three events; every detection check still needs a positive
+        // observation, none is relaxed.
+        if observed.reconnect_unix.is_none()
+            && super::client_exit_selected(&client_status, &exit.node_id)
+            && route_ok
+            && signed_ok
+        {
             observed.reconnect_unix = Some(sampled_at);
+        }
+        if observed.reconnect_unix.is_some()
+            && observed.endpoint_change_detected
+            && observed.traversal_reissue_triggered
+            && observed.peer_received_updated_endpoint_hint
+        {
             break;
         }
 
@@ -755,6 +778,84 @@ mod tests {
             1,
             "one sample was enough; sampling on must not continue past convergence"
         );
+    }
+
+    /// katana-xnet-73: the client is "re-converged" at the first sample (it never
+    /// lost its session) but the daemon only reports the endpoint change and the
+    /// traversal re-issue on a later sample. Sampling must go on inside the
+    /// window until they are seen, while the reconnect time stays the FIRST
+    /// re-converged sample.
+    #[test]
+    fn a_reconverged_client_keeps_sampling_until_the_three_events_are_seen() {
+        let mut client = converged_client();
+        // Sample 1 reports the old fingerprint and counter, sample 2 the new ones.
+        client
+            .stdout_by_match
+            .retain(|(needle, _)| needle != "rustynet netcheck");
+        client.stdout_seq_by_match.push((
+            "rustynet netcheck".to_owned(),
+            vec![
+                "traversal_error=none traversal_endpoint_fingerprint=before \
+                 traversal_preexpiry_refresh_events=3"
+                    .to_owned(),
+                "traversal_error=none traversal_endpoint_fingerprint=after \
+                 traversal_preexpiry_refresh_events=4"
+                    .to_owned(),
+            ],
+        ));
+        let mut exit = healthy_exit();
+        let observed = observe(
+            &mut client,
+            &mut exit,
+            NodeNetworkSwitchOptions::default(),
+            &before(),
+        )
+        .expect("observe");
+
+        assert!(observed.endpoint_change_detected);
+        assert!(observed.traversal_reissue_triggered);
+        assert!(observed.peer_received_updated_endpoint_hint);
+        assert_eq!(
+            observed.transcript.lines().count(),
+            2,
+            "stopped on the sample that completed the evidence, not before"
+        );
+        let first_sample_unix: u64 = observed
+            .transcript
+            .lines()
+            .next()
+            .and_then(|line| line.split('|').next())
+            .and_then(|stamp| stamp.parse().ok())
+            .expect("first sample timestamp");
+        assert_eq!(
+            observed.reconnect_unix,
+            Some(first_sample_unix),
+            "the reconnect time is the first re-converged sample"
+        );
+    }
+
+    /// The extended observation is bounded by the SLO window and never turns a
+    /// missing detection into a pass.
+    #[test]
+    fn a_reconverged_client_with_no_detection_runs_the_window_and_detects_nothing() {
+        let mut client = converged_client();
+        client
+            .stdout_by_match
+            .retain(|(needle, _)| needle != "rustynet netcheck");
+        client.stdout_by_match.push((
+            "rustynet netcheck".to_owned(),
+            "traversal_error=none traversal_endpoint_fingerprint=before \
+             traversal_preexpiry_refresh_events=3"
+                .to_owned(),
+        ));
+        let mut exit = healthy_exit();
+        let options = NodeNetworkSwitchOptions::new(3).expect("positive slo");
+        let observed = observe(&mut client, &mut exit, options, &before()).expect("observe");
+
+        assert!(!observed.endpoint_change_detected);
+        assert!(!observed.traversal_reissue_triggered);
+        assert_eq!(observed.transcript.lines().count(), 3, "bounded by the SLO");
+        assert!(observed.reconnect_unix.is_some(), "it did re-converge");
     }
 
     #[test]
