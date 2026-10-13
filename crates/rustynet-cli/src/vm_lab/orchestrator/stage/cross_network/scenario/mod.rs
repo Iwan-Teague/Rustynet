@@ -595,6 +595,14 @@ pub const DAEMON_SOCKET_ATTEMPTS: u32 = 20;
 /// `live_lab_wait_for_daemon_socket`'s default inter-attempt sleep.
 pub const DAEMON_SOCKET_SLEEP_SECS: u64 = 2;
 
+/// Guest-side wall-clock bound for ONE status round trip, enforced by the
+/// guests' coreutils `timeout` in [`wait_for_daemon_socket_with`]: a daemon
+/// that accepts but never answers must consume one attempt — `timeout` kills
+/// it with exit 124, an ordinary failed root command — instead of hanging the
+/// stage on the CLI's unbounded Unix IPC read (product-side read timeout is a
+/// separate, not-yet-made decision).
+pub const DAEMON_STATUS_PROBE_TIMEOUT_SECS: &str = "15";
+
 /// Readiness core behind [`wait_for_daemon_socket`], parameterised for tests:
 /// retry BOTH probes under ONE `attempts` budget. Each iteration checks the
 /// socket file (cheap) and, only once it exists, runs the `status` round trip;
@@ -604,6 +612,14 @@ pub const DAEMON_SOCKET_SLEEP_SECS: u64 = 2;
 /// the OLD socket file lingers until the new daemon binds, so the next IPC
 /// call hits `connect … failed: Connection refused` (katana-xnet-148). The
 /// final error names the stage that was still failing when the budget ran out.
+///
+/// Wall-time note: once the socket file exists the status round trip runs on
+/// EVERY iteration, so worst-case wall time grows by up to `attempts` extra
+/// root round trips versus the old file-existence-only wait (20 attempts at
+/// ~1–2 s per round trip ≈ +20–40 s per wait). The probe's
+/// [`DAEMON_STATUS_PROBE_TIMEOUT_SECS`] bound keeps each round trip bounded in
+/// the guest, so a wedged daemon consumes attempts like any other failure
+/// instead of hanging the wait on an unbounded IPC read.
 fn wait_for_daemon_socket_with(
     runner: &dyn NetLeafRunner,
     attempts: u32,
@@ -612,6 +628,8 @@ fn wait_for_daemon_socket_with(
     let attempts = attempts.max(1);
     let socket_assignment = format!("RUSTYNET_DAEMON_SOCKET={DAEMON_SOCKET}");
     let status_argv: Vec<&str> = vec![
+        "timeout",
+        DAEMON_STATUS_PROBE_TIMEOUT_SECS,
         "env",
         socket_assignment.as_str(),
         REMOTE_RUSTYNET_BIN,

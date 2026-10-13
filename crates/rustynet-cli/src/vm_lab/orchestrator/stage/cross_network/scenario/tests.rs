@@ -434,8 +434,9 @@ fn readiness_status_call_count(runner: &MockLeafRunner) -> usize {
 }
 
 /// Exact argv pins: the cheap `test -S` file check first, then the IPC round
-/// trip `env RUSTYNET_DAEMON_SOCKET=<socket> <binary> status` (sudo-wrapped
-/// by the runner like every root argv).
+/// trip `timeout 15 env RUSTYNET_DAEMON_SOCKET=<socket> <binary> status`
+/// (guest coreutils `timeout` bounds one round trip; the runner sudo-wraps
+/// every root argv like it wraps all the others).
 #[test]
 fn daemon_socket_wait_probes_the_file_then_round_trips_status() {
     use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
@@ -450,13 +451,15 @@ fn daemon_socket_wait_probes_the_file_then_round_trips_status() {
             readiness_argv(&[
                 "sudo",
                 "-n",
+                "timeout",
+                "15",
                 "env",
                 "RUSTYNET_DAEMON_SOCKET=/run/rustynet/rustynetd.sock",
                 "rustynet",
                 "status",
             ]),
         ],
-        "file probe then status round trip, exactly one of each on the happy path"
+        "file probe then timeout-bounded status round trip, exactly one of each on the happy path"
     );
 }
 
