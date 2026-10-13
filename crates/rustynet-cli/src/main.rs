@@ -4583,6 +4583,31 @@ fn parse_ops_command(args: &[String]) -> Result<OpsCommand, String> {
                     enable_negative_control: parser.has_flag("--enable-negative-control"),
                     enable_relay_forwarding_validation: parser
                         .has_flag("--enable-relay-forwarding-validation"),
+                    relay_forward_candidate_endpoint: match parser
+                        .value("--relay-forward-candidate-endpoint")
+                    {
+                        Some(raw) => Some(vm_lab::parse_relay_forward_candidate_endpoint(&raw)?),
+                        None => {
+                            // OptionParser demotes a value-less `--flag` or an
+                            // `--flag=value` token to a FLAG and never rejects
+                            // unknown options; without this refusal the
+                            // candidate endpoint would be silently dropped and
+                            // the elected HP-3 validation would run without it
+                            // (same demoted-form hazard the vm-lab-image-catalog
+                            // parse refuses).
+                            for flag in &parser.flags {
+                                if flag.starts_with("--relay-forward-candidate-endpoint") {
+                                    return Err(
+                                        "--relay-forward-candidate-endpoint requires a separate \
+                                         value (a bare or --flag=value token is demoted to a flag \
+                                         and would silently skip the candidate validation)"
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                            None
+                        }
+                    },
                     node_assignments: {
                         let raw = collect_repeated_option_values(&args[1..], "--node");
                         let mut out = Vec::with_capacity(raw.len());
@@ -25826,6 +25851,38 @@ mod tests {
             "exit-1".to_owned(),
         ]);
         assert!(format!("{peer_store_list:?}").contains("PeerStoreList"));
+    }
+
+    /// HP-3: OptionParser demotes a value-less `--flag` or an `--flag=value`
+    /// token to a FLAG and never rejects unknown options (see the
+    /// vm-lab-image-catalog guard). The relay candidate endpoint must never
+    /// silently degrade to `None` that way: the elected validation would run
+    /// without the candidate binding and advertisement and still look green.
+    #[cfg(feature = "vm-lab")]
+    #[test]
+    fn orchestrate_refuses_the_demoted_relay_candidate_endpoint_form() {
+        let parsed = parse_command(&[
+            "ops".to_owned(),
+            "vm-lab-orchestrate-live-lab".to_owned(),
+            "--report-dir".to_owned(),
+            "artifacts/live_lab/orchestrate_demoted_test".to_owned(),
+            "--ssh-identity-file".to_owned(),
+            "/tmp/rustynet_lab_ed25519".to_owned(),
+            "--enable-relay-forwarding-validation".to_owned(),
+            "--relay-forward-candidate-endpoint=198.18.64.5".to_owned(),
+        ]);
+        match parsed {
+            CliCommand::UsageError(message) => {
+                assert!(
+                    message.contains("--relay-forward-candidate-endpoint")
+                        && message.contains("requires a"),
+                    "must name the option and the demoted form: {message}"
+                );
+            }
+            other => {
+                panic!("demoted --relay-forward-candidate-endpoint must be refused, got {other:?}")
+            }
+        }
     }
 
     /// Lab-robot ops parsing lives behind the `vm-lab` feature (RNQ-17);

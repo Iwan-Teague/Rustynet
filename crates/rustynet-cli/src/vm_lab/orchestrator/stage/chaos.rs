@@ -399,6 +399,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let outcome = ChaosDaemonFaultStage.execute(&mut ctx);
         assert!(

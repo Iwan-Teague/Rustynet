@@ -439,6 +439,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         assert!(matches!(
             MembershipInitStage.execute(&mut ctx),
@@ -482,6 +483,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let exit_key = "a".repeat(64);
         let client_key = "b".repeat(64);
@@ -623,6 +625,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         ctx.collected_pubkeys
             .insert("client-1".to_owned(), WireguardPublicKey("b".repeat(64)));
@@ -674,6 +677,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         ctx.node_ids
             .insert("client-1".to_owned(), "client-node-id".to_owned());

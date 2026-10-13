@@ -422,6 +422,7 @@ pub fn guest_refs_for_orchestrate(config: &super::VmLabOrchestrateLiveLabConfig)
         enable_clock_remediation: _,
         enable_negative_control: _,
         enable_relay_forwarding_validation: _,
+        relay_forward_candidate_endpoint: _,
         stage_timeout_secs: _,
         skip_linux_live_suite: _,
         lab_stun_servers: _,

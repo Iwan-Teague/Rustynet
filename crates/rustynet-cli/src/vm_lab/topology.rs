@@ -937,6 +937,7 @@ mod tests {
             enable_clock_remediation: false,
             enable_negative_control: false,
             enable_relay_forwarding_validation: false,
+            relay_forward_candidate_endpoint: None,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,

@@ -1346,6 +1346,7 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let env = build_bootstrap_env("exit-node1-abc123", &NodeRole::Exit, &ctx).expect("env");
         assert!(
@@ -1401,6 +1402,7 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
         assert!(
@@ -1441,6 +1443,7 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let env = build_bootstrap_env("id1", &NodeRole::Client, &ctx).expect("env");
         assert!(
@@ -1504,6 +1507,7 @@ printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         for role in [
             NodeRole::Client,
@@ -2742,6 +2746,7 @@ mod daemon_launch_flag_parity_tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         let err = enforce_daemon(&conn, "debian-9", &ctx)
             .expect_err("enforce without a daemon-reported id must fail closed");

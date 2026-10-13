@@ -17924,7 +17924,12 @@ fn validate_runtime_relay_fleet_descriptor(relay: &RelayFleetNodeDescriptor) -> 
     Ok(())
 }
 
-fn validate_runtime_relay_candidate_endpoint(endpoint: SocketAddr) -> Result<(), String> {
+/// Classifies a runtime relay-candidate endpoint for traversal bundles.
+/// Public so the `--node` orchestrator (rustynet-cli) can apply the exact
+/// same classification at parse/election time as the daemon applies when it
+/// consumes the minted bundle — one source of truth, no duplicated policy.
+/// Visibility only: the classification rules are unchanged.
+pub fn validate_runtime_relay_candidate_endpoint(endpoint: SocketAddr) -> Result<(), String> {
     if endpoint.port() == 0 {
         return Err("relay candidate must not use port 0".to_owned());
     }

@@ -219,6 +219,9 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
             Some(params.known_hosts.as_path()),
             expected_managed_peers,
             &mut token_spool,
+            // The elected candidate endpoint, when supplied: the relay must
+            // bind the very address the traversal bundles advertise.
+            ctx.relay_forward_candidate_endpoint.as_deref(),
         );
         drop(token_spool);
         match exercise_result {
@@ -664,6 +667,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         }
     }
 

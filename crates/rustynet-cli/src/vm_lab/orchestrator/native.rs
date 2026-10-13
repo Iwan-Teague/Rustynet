@@ -63,6 +63,7 @@ pub(crate) fn execute_rust_native_orchestration(
     let enable_clock_remediation = config.enable_clock_remediation;
     let enable_negative_control = config.enable_negative_control;
     let enable_relay_forwarding_validation = config.enable_relay_forwarding_validation;
+    let relay_forward_candidate_endpoint = config.relay_forward_candidate_endpoint.clone();
     let enable_cross_network_suite = !config.skip_cross_network;
     let cross_network_options = orchestrator::stage::cross_network::CrossNetworkOptions::from_cli(
         enable_cross_network_suite,
@@ -94,6 +95,13 @@ pub(crate) fn execute_rust_native_orchestration(
         enable_relay_forwarding_validation,
         skip_live_suite,
         config.linux_backend.as_deref(),
+    )?;
+    // A candidate endpoint only makes sense together with the elected proof:
+    // without it the consuming stage is not in the plan, so refuse instead of
+    // silently ignoring the value.
+    crate::vm_lab::validate_relay_forward_candidate_election(
+        enable_relay_forwarding_validation,
+        relay_forward_candidate_endpoint.as_deref(),
     )?;
     if resume_from_stage.is_some() && rerun_stage.is_some() {
         return Err("--resume-from and --rerun-stage are mutually exclusive".to_owned());
@@ -368,6 +376,10 @@ pub(crate) fn execute_rust_native_orchestration(
     // when the stage really is in this run's plan. A resumed context reloads
     // `false`, the fail-closed direction (the stage grades as a reported skip).
     ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation;
+    // Run-local only (never persisted): the endpoint travels with the
+    // election, so a resumed context reloads `None` and bundle minting stays
+    // byte-identical to the legacy emitter.
+    ctx.relay_forward_candidate_endpoint = relay_forward_candidate_endpoint.clone();
 
     // MAC-D3: the macOS anchor validator stages need the inventory path to
     // resolve SSH targets inside the legacy vm_lab helpers they call. Run-local
@@ -551,6 +563,13 @@ pub(crate) fn execute_rust_native_orchestration(
         && plan_stage_ids.contains(&orchestrator::stage::StageId::MacosRebootRecoveryValidation);
     ctx.relay_forwarding_validation_elected = enable_relay_forwarding_validation
         && plan_stage_ids.contains(&orchestrator::stage::StageId::RefreshSignedBundles);
+    // Tighten the endpoint the same way: when the consuming stage dropped out
+    // of this run's plan, no bundle may carry RELAY_SPEC (the minter checks
+    // the election, but clearing the endpoint here keeps the context
+    // internally consistent — elected=false never coexists with an endpoint).
+    if !ctx.relay_forwarding_validation_elected {
+        ctx.relay_forward_candidate_endpoint = None;
+    }
 
     // b119: resolve the operator's --skip-stage set against THIS run's active
     // plan BEFORE anything runs. A named stage that is not in the plan is a

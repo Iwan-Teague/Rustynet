@@ -1879,6 +1879,13 @@ pub struct VmLabOrchestrateLiveLabConfig {
     /// blocks on two peer daemons and restarts them MID-RUN (QH-64), so only
     /// an explicit operator election carries that disruption.
     pub enable_relay_forwarding_validation: bool,
+    /// `--relay-forward-candidate-endpoint <ipv4>`: the public IPv4 address
+    /// the elected relay binds and the traversal bundles advertise as the
+    /// relay candidate. Only meaningful together with
+    /// `enable_relay_forwarding_validation` (enforced at parse time and
+    /// again before the plan is built); `None` keeps bundle minting
+    /// byte-identical to the legacy emitter.
+    pub relay_forward_candidate_endpoint: Option<String>,
     /// Per-stage watchdog timeout in seconds, forwarded to the bash
     /// orchestrator as `--stage-timeout-secs <N>` when greater than zero.
     /// `0` (the default) disables the watchdog and preserves the historical
@@ -2003,6 +2010,69 @@ pub fn validate_relay_forwarding_backend_pin(
         )),
         _ => Ok(()),
     }
+}
+
+/// Parse `--relay-forward-candidate-endpoint <ipv4>` (the public IPv4 address
+/// the elected relay binds and traversal bundles advertise). Fail closed at
+/// parse time: the value must be a bare numeric IPv4 address — no empty
+/// value, no hostname, no port suffix, no IPv6, no leading zeros — and it
+/// must survive the daemon's own relay-candidate classification
+/// ([`rustynetd::daemon::validate_runtime_relay_candidate_endpoint`]) with
+/// port [`RELAY_FORWARD_TEST_RELAY_BIND_PORT`], so an RFC1918, loopback,
+/// link-local, carrier-grade-NAT, broadcast, multicast or unspecified
+/// address is refused before any host is touched. Returns the trimmed
+/// address string.
+pub fn parse_relay_forward_candidate_endpoint(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let parsed = trimmed.parse::<std::net::Ipv4Addr>().map_err(|_| {
+        format!(
+            "--relay-forward-candidate-endpoint: {trimmed:?} is not a bare numeric IPv4 address \
+             (expected e.g. 198.18.64.5; no hostname, port suffix or IPv6)"
+        )
+    })?;
+    let endpoint = std::net::SocketAddr::new(
+        std::net::IpAddr::V4(parsed),
+        RELAY_FORWARD_TEST_RELAY_BIND_PORT,
+    );
+    rustynetd::daemon::validate_runtime_relay_candidate_endpoint(endpoint).map_err(|err| {
+        format!(
+            "--relay-forward-candidate-endpoint: {trimmed} refused by the daemon's relay-candidate \
+             validator: {err}"
+        )
+    })?;
+    Ok(trimmed.to_owned())
+}
+
+/// Run-start guard pairing the two relay-forwarding selectors: a candidate
+/// endpoint may only be supplied when the run actually elected
+/// `--enable-relay-forwarding-validation` (otherwise the stage that consumes
+/// it is not in the plan and the value could never take effect — refuse
+/// rather than silently ignore).
+pub fn validate_relay_forward_candidate_election(
+    relay_forwarding_validation: bool,
+    candidate: Option<&str>,
+) -> Result<(), String> {
+    if candidate.is_some() && !relay_forwarding_validation {
+        return Err(
+            "--relay-forward-candidate-endpoint requires --enable-relay-forwarding-validation: \
+             without the elected proof the relay-forwards-frame stage is not in this run's plan, \
+             so the candidate endpoint could never be exercised"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Which bind address the relay provision should use: the elected candidate
+/// endpoint when one was supplied (so `RUSTYNET_RELAY_BIND` matches the
+/// `RELAY_SPEC` peers receive — the session can only form if the relay
+/// actually binds the advertised address), otherwise the relay host's own
+/// SSH-resolved address (legacy behaviour, byte-identical env file).
+fn relay_forward_test_provision_bind_ip<'a>(
+    relay_ssh_target: &'a str,
+    candidate: Option<&'a str>,
+) -> &'a str {
+    candidate.unwrap_or(relay_ssh_target)
 }
 
 /// Parse `--lab-stun-servers <ip:port[,ip:port...]>` into validated numeric
@@ -14716,6 +14786,12 @@ fn validate_linux_relay_uninstall_output(output: &str) -> Result<(), String> {
 /// stage's own env-file override consistent with it.
 const RELAY_FORWARD_TEST_DATA_PORT_RANGE: &str = "40000-49999";
 const RELAY_FORWARD_TEST_HEALTH_PORT: u16 = 4501;
+/// The relay's bind port (`RUSTYNET_RELAY_BIND=<ip>:4500` in the provisioned
+/// env file). ONE source for the provision script AND the `RELAY_SPEC` the
+/// traversal bundle minter receives: the candidate endpoint a peer dials must
+/// be the endpoint the relay actually binds, or the relay session can never
+/// form.
+pub(crate) const RELAY_FORWARD_TEST_RELAY_BIND_PORT: u16 = 4500;
 /// The relay's configured label (`RUSTYNET_RELAY_ID`, at most 16 ASCII bytes).
 /// ONE value for the relay service env file, the relay session tokens bound to
 /// it and (patch 4) the relay candidate in the signed traversal bundles: the
@@ -15320,7 +15396,7 @@ fn build_relay_forward_test_provision_script(relay_lan_ip: &str) -> String {
     format!(
         "cat <<'EOF' | sudo tee /etc/default/rustynet-relay > /dev/null\n\
          RUSTYNET_RELAY_ID={RELAY_FORWARD_TEST_RELAY_ID}\n\
-         RUSTYNET_RELAY_BIND={relay_lan_ip}:4500\n\
+         RUSTYNET_RELAY_BIND={relay_lan_ip}:{RELAY_FORWARD_TEST_RELAY_BIND_PORT}\n\
          RUSTYNET_RELAY_VERIFIER_KEY=/etc/rustynet/relay-verifier.pub\n\
          RUSTYNET_RELAY_REPLAY_STORE=/var/lib/rustynet-relay/relay.replay\n\
          RUSTYNET_RELAY_PORT_RANGE={RELAY_FORWARD_TEST_DATA_PORT_RANGE}\n\
@@ -15671,6 +15747,7 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
     known_hosts_path: Option<&Path>,
     expected_managed_peers: u64,
     token_spool: &mut dyn RelayForwardTokenSpool,
+    relay_bind_ip_override: Option<&str>,
 ) -> Result<String, String> {
     // The caller owns topology election: the `--node` orchestrator stage
     // elects from the run's role assignments
@@ -15771,7 +15848,11 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
         relay_target,
         ssh_identity_file,
         known_hosts_path,
-        build_relay_forward_test_provision_script(relay_target.ssh_target.as_str()).as_str(),
+        build_relay_forward_test_provision_script(relay_forward_test_provision_bind_ip(
+            relay_target.ssh_target.as_str(),
+            relay_bind_ip_override,
+        ))
+        .as_str(),
         "relay provisioning",
     )?;
     if !provision_output.contains("HP3_RELAY_UNIT_STATE=active") {
@@ -27414,6 +27495,9 @@ fn run_linux_orchestration_stages_with_options(
                 // The legacy inventory-wide chain has no orchestrator adapters
                 // to mint with; it keeps the no-relay-client behaviour.
                 &mut NoRelayTokenSpool,
+                // Legacy chain: no elected candidate endpoint, the relay
+                // keeps binding its SSH-resolved address.
+                None,
             )
         })();
         match relay_forwards_result {
@@ -51703,6 +51787,91 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
     }
 
     #[test]
+    fn relay_candidate_endpoint_parse_accepts_only_daemon_valid_ipv4() {
+        let ok = super::parse_relay_forward_candidate_endpoint(" 198.18.64.5 ").expect("valid");
+        assert_eq!(ok, "198.18.64.5");
+
+        let rejects: &[&str] = &[
+            "",
+            "   ",
+            "192.168.1.5",
+            "10.0.0.5",
+            "172.16.0.5",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "255.255.255.255",
+            "0.0.0.0",
+            "2001:db8::1",
+            "1.2.3.4:99",
+            "relay.example.test",
+            "198.18.64.5/24",
+            "01.02.03.04",
+        ];
+        for raw in rejects {
+            let err = super::parse_relay_forward_candidate_endpoint(raw)
+                .expect_err(&format!("{raw:?} must be refused"));
+            assert!(
+                err.contains("--relay-forward-candidate-endpoint"),
+                "error must name the flag for {raw:?}, got: {err}"
+            );
+        }
+        // Private/special addresses must be rejected by the DAEMON
+        // classification, not merely by IPv4 syntax: check the message
+        // actually came from that validator for one RFC1918 case.
+        let err = super::parse_relay_forward_candidate_endpoint("192.168.1.5")
+            .expect_err("RFC1918 must be refused");
+        assert!(err.contains("validator"), "got: {err}");
+    }
+
+    #[test]
+    fn relay_candidate_election_guard_demands_the_elected_proof() {
+        assert!(super::validate_relay_forward_candidate_election(true, None).is_ok());
+        assert!(
+            super::validate_relay_forward_candidate_election(true, Some("198.18.64.5")).is_ok()
+        );
+        assert!(super::validate_relay_forward_candidate_election(false, None).is_ok());
+        let err = super::validate_relay_forward_candidate_election(false, Some("198.18.64.5"))
+            .expect_err("endpoint without the election must be refused");
+        assert!(
+            err.contains("--relay-forward-candidate-endpoint")
+                && err.contains("--enable-relay-forwarding-validation"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn relay_provision_bind_ip_prefers_the_elected_candidate() {
+        assert_eq!(
+            super::relay_forward_test_provision_bind_ip("192.168.0.202", None),
+            "192.168.0.202",
+            "no candidate: legacy SSH-resolved bind"
+        );
+        assert_eq!(
+            super::relay_forward_test_provision_bind_ip("192.168.0.202", Some("198.18.64.5")),
+            "198.18.64.5",
+            "elected candidate: the relay must bind the advertised address"
+        );
+    }
+
+    #[test]
+    fn relay_provision_script_binds_the_candidate_at_the_shared_relay_port() {
+        let script = super::build_relay_forward_test_provision_script(
+            super::relay_forward_test_provision_bind_ip("192.168.0.202", Some("198.18.64.5")),
+        );
+        assert!(
+            script.contains(&format!(
+                "RUSTYNET_RELAY_BIND=198.18.64.5:{}",
+                super::RELAY_FORWARD_TEST_RELAY_BIND_PORT
+            )),
+            "provision env must bind the candidate endpoint: {script}"
+        );
+        // One port constant: the bind port matches the legacy literal the
+        // relay unit ships.
+        assert_eq!(super::RELAY_FORWARD_TEST_RELAY_BIND_PORT, 4500);
+    }
+
+    #[test]
     fn backend_gate_runs_in_the_preflight_before_any_relay_mutation() {
         let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
             .expect("mod.rs implementation slice must parse");
@@ -55476,6 +55645,7 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
             enable_clock_remediation: false,
             enable_negative_control: false,
             enable_relay_forwarding_validation: false,
+            relay_forward_candidate_endpoint: None,
             stage_timeout_secs: 0,
             skip_linux_live_suite: false,
             allow_dirty: false,

@@ -5,6 +5,7 @@ use crate::vm_lab::orchestrator::context::OrchestrationContext;
 use crate::vm_lab::orchestrator::error::{BundleKind, StageOutcome};
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
+use crate::vm_lab::{RELAY_FORWARD_TEST_RELAY_BIND_PORT, RELAY_FORWARD_TEST_RELAY_ID};
 
 pub struct DistributeAssignmentsStage {
     max_parallel_node_workers: usize,
@@ -162,6 +163,33 @@ pub(crate) fn build_bundle_env(
         if !srflx_parts.is_empty() {
             lines.push(format!("SRFLX_SPEC={}", srflx_parts.join(";")));
         }
+
+        // RELAY_SPEC (HP-3, --relay-forward-candidate-endpoint): the elected
+        // relay candidate becomes the lowest-priority `type=relay` candidate
+        // in every signed traversal bundle (`ops_e2e.rs` parses
+        // `node_id|relay_label|ip:port`). Emitted ONLY for the traversal
+        // bundle, ONLY when the run elected relay-forwarding validation AND
+        // supplied a candidate endpoint; absent entirely otherwise, so the
+        // flag-off path is byte-identical to the pre-feature env. The
+        // endpoint itself was already validated against the daemon's
+        // relay-candidate classification at parse time; here we only pin
+        // WHICH node the spec names — exactly one relay role assignment must
+        // exist, and it must have a node_id.
+        if ctx.relay_forwarding_validation_elected {
+            if let Some(endpoint) = ctx.relay_forward_candidate_endpoint.as_deref() {
+                let relay_node_id = relay_candidate_node_id(ctx)?;
+                lines.push(format!(
+                    "RELAY_SPEC={relay_node_id}|{RELAY_FORWARD_TEST_RELAY_ID}|{endpoint}:{RELAY_FORWARD_TEST_RELAY_BIND_PORT}"
+                ));
+            }
+        } else if ctx.relay_forward_candidate_endpoint.is_some() {
+            return Err(
+                "relay_forward_candidate_endpoint is set but relay forwarding validation was \
+                 not elected for this run; re-run with --enable-relay-forwarding-validation \
+                 so bundles mint honestly"
+                    .to_owned(),
+            );
+        }
     }
 
     if matches!(kind, BundleKind::Assignment) {
@@ -203,6 +231,35 @@ pub(crate) fn build_bundle_env(
     }
 
     Ok(lines.join("\n") + "\n")
+}
+
+/// Resolve the node_id the RELAY_SPEC names: the run's exactly-one relay
+/// role assignment. Zero relays (no candidate can ever be exercised) and two
+/// or more (no honest way to pick one) both fail closed — the minter never
+/// guesses.
+fn relay_candidate_node_id(ctx: &OrchestrationContext) -> Result<String, String> {
+    let relays: Vec<&crate::vm_lab::orchestrator::role_assignment::NodeRoleAssignment> = ctx
+        .assignments
+        .iter()
+        .filter(|a| a.role == NodeRole::Relay)
+        .collect();
+    match relays.as_slice() {
+        [] => Err(
+            "relay forwarding validation elected a relay candidate endpoint but this run's \
+             assignment set contains no relay role node; RELAY_SPEC cannot be minted"
+                .to_owned(),
+        ),
+        [relay] => ctx
+            .node_ids
+            .get(&relay.alias)
+            .cloned()
+            .ok_or_else(|| format!("no node_id for relay alias '{}'", relay.alias)),
+        _ => Err(
+            "relay forwarding validation expects exactly one relay node in this run's \
+             assignment set; refusing to guess which one RELAY_SPEC should name"
+                .to_owned(),
+        ),
+    }
 }
 
 /// Shared bundle distribution logic used by Assignment, Traversal, and `DnsZone` stages.
@@ -700,6 +757,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         ctx.node_ids
             .insert("exit-1".to_owned(), "exit-node-id-abc".to_owned());
@@ -895,6 +953,7 @@ mod tests {
             macos_role_transition_elected: false,
             macos_reboot_recovery_elected: false,
             relay_forwarding_validation_elected: false,
+            relay_forward_candidate_endpoint: None,
         };
         assert!(matches!(
             DistributeAssignmentsStage::new(
@@ -1010,5 +1069,203 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&first);
         let _ = std::fs::remove_dir_all(&second);
+    }
+
+    // ── RELAY_SPEC (HP-3, --relay-forward-candidate-endpoint) ──────────────
+
+    /// Three-node fixture (exit + client + exactly one relay) on top of the
+    /// two-node base. The base fixture is deliberately left untouched: its
+    /// no-relay shape is what pins the byte-identity golden below.
+    fn make_relay_three_node_ctx() -> OrchestrationContext {
+        let mut ctx = make_two_node_ctx();
+        ctx.assignments.push(NodeRoleAssignment {
+            alias: "relay-1".to_owned(),
+            role: NodeRole::Relay,
+        });
+        ctx.node_ids
+            .insert("relay-1".to_owned(), "relay-node-id-aaa".to_owned());
+        ctx.collected_pubkeys
+            .insert("relay-1".to_owned(), WireguardPublicKey("c".repeat(64)));
+        ctx.endpoints
+            .insert("relay-1".to_owned(), "10.0.0.3:51820".to_owned());
+        ctx.adapters.insert(
+            "relay-1".to_owned(),
+            Box::new(FakePlatformAdapter {
+                alias: "relay-1",
+                platform: VmGuestPlatform::Linux,
+            }),
+        );
+        ctx
+    }
+
+    /// Golden byte-identity: with NO candidate endpoint the traversal env is
+    /// byte-identical whether the election flag is off (legacy run) or on —
+    /// on the SAME assignment set. Both equal the untouched fixture's env.
+    /// RELAY_SPEC must be absent in all variants, mirroring the ops_e2e
+    /// golden (`RELAY_SPEC absent must leave bundle bytes untouched`).
+    #[test]
+    fn traversal_env_without_candidate_endpoint_is_byte_identical_golden() {
+        // Legacy two-node run: flag off vs flag on, no endpoint either way.
+        let two_node_legacy =
+            build_bundle_env(&make_two_node_ctx(), &BundleKind::Traversal).unwrap();
+        let two_node_elected = {
+            let mut ctx = make_two_node_ctx();
+            ctx.relay_forwarding_validation_elected = true;
+            build_bundle_env(&ctx, &BundleKind::Traversal).unwrap()
+        };
+        assert_eq!(
+            two_node_elected.as_bytes(),
+            two_node_legacy.as_bytes(),
+            "elected but endpoint-less two-node run must mint the legacy env byte for byte"
+        );
+        assert!(!two_node_legacy.contains("RELAY_SPEC"));
+
+        // Three-node run (relay present): the endpoint-less env is again
+        // independent of the flag.
+        let three_node_legacy = {
+            let mut ctx = make_relay_three_node_ctx();
+            ctx.relay_forwarding_validation_elected = false;
+            build_bundle_env(&ctx, &BundleKind::Traversal).unwrap()
+        };
+        assert!(!three_node_legacy.contains("RELAY_SPEC"));
+        let three_node_elected_no_endpoint = {
+            let mut ctx = make_relay_three_node_ctx();
+            ctx.relay_forwarding_validation_elected = true;
+            build_bundle_env(&ctx, &BundleKind::Traversal).unwrap()
+        };
+        assert_eq!(
+            three_node_elected_no_endpoint.as_bytes(),
+            three_node_legacy.as_bytes(),
+            "elected but endpoint-less three-node run must mint the legacy env byte for byte"
+        );
+    }
+
+    /// Present path: elected + endpoint mints exactly one RELAY_SPEC line
+    /// naming the relay node, the shared relay label and the endpoint at the
+    /// relay bind port — and that spec parses with the real minter parser
+    /// into the emission the daemon will consume.
+    #[test]
+    fn traversal_env_emits_relay_spec_for_elected_candidate_and_parses_back() {
+        let mut ctx = make_relay_three_node_ctx();
+        ctx.relay_forwarding_validation_elected = true;
+        ctx.relay_forward_candidate_endpoint = Some("198.18.64.5".to_owned());
+        let env = build_bundle_env(&ctx, &BundleKind::Traversal).unwrap();
+        let line = env
+            .lines()
+            .find(|l| l.starts_with("RELAY_SPEC="))
+            .expect("elected run with endpoint must carry RELAY_SPEC");
+        assert_eq!(
+            line,
+            "RELAY_SPEC=relay-node-id-aaa|relay-local|198.18.64.5:4500"
+        );
+
+        // Round-trip through the production parser: build the endpoints map
+        // exactly as the minter does from NODES_SPEC.
+        let nodes_spec = env
+            .lines()
+            .find(|l| l.starts_with("NODES_SPEC="))
+            .expect("NODES_SPEC")
+            .trim_start_matches("NODES_SPEC=");
+        let endpoints: std::collections::BTreeMap<String, String> = nodes_spec
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|entry| {
+                let mut parts = entry.split('|');
+                let node_id = parts.next().expect("node_id").to_owned();
+                let endpoint = parts.next().expect("endpoint").to_owned();
+                (node_id, endpoint)
+            })
+            .collect();
+        let parsed =
+            crate::ops_e2e::parse_relay_spec(line.trim_start_matches("RELAY_SPEC="), &endpoints)
+                .expect("well-formed RELAY_SPEC must parse")
+                .expect("spec named a relay");
+        assert_eq!(parsed.node_id, "relay-node-id-aaa");
+        assert_eq!(parsed.relay_label, "relay-local");
+        assert_eq!(parsed.endpoint, "198.18.64.5:4500");
+    }
+
+    /// Fail-closed: an endpoint without the election is a hard error naming
+    /// the election flag — never a silent skip (the value would otherwise be
+    /// ignored while the operator believes a relay is being exercised).
+    #[test]
+    fn traversal_env_refuses_candidate_endpoint_without_election() {
+        let mut ctx = make_relay_three_node_ctx();
+        ctx.relay_forwarding_validation_elected = false;
+        ctx.relay_forward_candidate_endpoint = Some("198.18.64.5".to_owned());
+        let err = build_bundle_env(&ctx, &BundleKind::Traversal)
+            .expect_err("endpoint without election must fail closed");
+        assert!(
+            err.contains("--enable-relay-forwarding-validation"),
+            "error must name the election flag, got: {err}"
+        );
+    }
+
+    #[test]
+    fn traversal_env_refuses_candidate_endpoint_without_a_relay_node() {
+        let mut ctx = make_two_node_ctx();
+        ctx.relay_forwarding_validation_elected = true;
+        ctx.relay_forward_candidate_endpoint = Some("198.18.64.5".to_owned());
+        let err = build_bundle_env(&ctx, &BundleKind::Traversal)
+            .expect_err("elected endpoint without a relay role must fail closed");
+        assert!(
+            err.contains("no relay role node"),
+            "error must name the missing relay, got: {err}"
+        );
+    }
+
+    #[test]
+    fn traversal_env_refuses_candidate_endpoint_with_two_relay_nodes() {
+        let mut ctx = make_relay_three_node_ctx();
+        ctx.assignments.push(NodeRoleAssignment {
+            alias: "relay-2".to_owned(),
+            role: NodeRole::Relay,
+        });
+        ctx.node_ids
+            .insert("relay-2".to_owned(), "relay-node-id-bbb".to_owned());
+        ctx.collected_pubkeys
+            .insert("relay-2".to_owned(), WireguardPublicKey("d".repeat(64)));
+        ctx.endpoints
+            .insert("relay-2".to_owned(), "10.0.0.4:51820".to_owned());
+        ctx.adapters.insert(
+            "relay-2".to_owned(),
+            Box::new(FakePlatformAdapter {
+                alias: "relay-2",
+                platform: VmGuestPlatform::Linux,
+            }),
+        );
+        ctx.relay_forwarding_validation_elected = true;
+        ctx.relay_forward_candidate_endpoint = Some("198.18.64.5".to_owned());
+        let err = build_bundle_env(&ctx, &BundleKind::Traversal)
+            .expect_err("two relay roles must fail closed");
+        assert!(
+            err.contains("exactly one relay node"),
+            "error must name the ambiguity, got: {err}"
+        );
+    }
+
+    /// Only traversal bundles carry RELAY_SPEC: assignment and dns-zone env
+    /// files stay byte-identical to their legacy form even when the run is
+    /// fully elected with an endpoint.
+    #[test]
+    fn non_traversal_bundle_kinds_never_carry_relay_spec() {
+        for kind in [BundleKind::Assignment, BundleKind::DnsZone] {
+            let mut ctx = make_relay_three_node_ctx();
+            ctx.relay_forwarding_validation_elected = true;
+            ctx.relay_forward_candidate_endpoint = Some("198.18.64.5".to_owned());
+            let env = build_bundle_env(&ctx, &kind).unwrap();
+            assert!(
+                !env.contains("RELAY_SPEC"),
+                "{kind:?} env must never carry RELAY_SPEC, got: {env}"
+            );
+            ctx.relay_forwarding_validation_elected = false;
+            ctx.relay_forward_candidate_endpoint = None;
+            let legacy = build_bundle_env(&ctx, &kind).unwrap();
+            assert_eq!(
+                env.as_bytes(),
+                legacy.as_bytes(),
+                "{kind:?} env with the relay election must stay byte-identical to legacy"
+            );
+        }
     }
 }

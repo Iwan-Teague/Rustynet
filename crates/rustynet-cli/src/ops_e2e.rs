@@ -4213,7 +4213,9 @@ pub(crate) struct RelayCandidateEmission {
 /// to connect at all. The label must itself be a valid relay label (the same
 /// grammar the daemon enforces via `canonical_relay_id_from_label`), so an
 /// invalid label fails at mint time instead of at every peer afterwards.
-fn parse_relay_spec(
+/// `pub(crate)` so the `--node` orchestrator's bundle-env tests can pin the
+/// exact `RELAY_SPEC` this minter will receive.
+pub(crate) fn parse_relay_spec(
     spec: &str,
     endpoints_by_node: &BTreeMap<String, String>,
 ) -> Result<Option<RelayCandidateEmission>, String> {
