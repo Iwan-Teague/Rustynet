@@ -9760,11 +9760,43 @@ fn execute_ops_refresh_trust() -> Result<String, String> {
     )
 }
 
+/// The privilege boundary `ops refresh-signed-trust` runs behind.
+///
+/// `ops refresh-trust` (the Linux-profile-only command) has enforced BOTH
+/// `require_root_execution` AND `enforce_pinned_runtime_binary_custody` since it
+/// was added; `ops refresh-signed-trust` enforced only the first one, and only on
+/// the Linux profile. On Linux the two commands do the same privileged work
+/// (write root-owned signed trust evidence and a root:<daemon group> passphrase
+/// temp file) from the same unit, so custody — the executing binary really being
+/// the pinned, root-owned, non-group/world-writable `/usr/local/bin/rustynet` —
+/// has to hold here too. On the macOS profile neither check applied before and
+/// neither is added now: that profile is driven by the desktop bootstrap and the
+/// e2e worker, which install `/usr/local/bin/rustynet` root-owned 0755 but may
+/// invoke it through a PATH lookup, and adding custody there would be a
+/// behavioural change to a flow that never had it.
+///
+/// Both checks are injected so the whole mapping (profile -> which boundaries
+/// run, and in which order) is unit-testable without root or a pinned binary.
+fn enforce_refresh_signed_trust_privilege_boundary(
+    host_profile: SigningPassphraseHostProfile,
+    mut require_root: impl FnMut() -> Result<(), String>,
+    mut enforce_custody: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    if !matches!(host_profile, SigningPassphraseHostProfile::Linux) {
+        return Ok(());
+    }
+    require_root()?;
+    enforce_custody("trust-refresh")?;
+    Ok(())
+}
+
 fn execute_ops_refresh_signed_trust() -> Result<String, String> {
     let config = signing_passphrase_ops_config_from_env()?;
-    if matches!(config.host_profile, SigningPassphraseHostProfile::Linux) {
-        require_root_execution()?;
-    }
+    enforce_refresh_signed_trust_privilege_boundary(
+        config.host_profile,
+        require_root_execution,
+        enforce_pinned_runtime_binary_custody,
+    )?;
 
     let node_role = env_optional_string("RUSTYNET_NODE_ROLE")?
         .unwrap_or_else(|| "admin".to_owned())
@@ -9813,6 +9845,76 @@ fn execute_ops_refresh_signed_trust() -> Result<String, String> {
     }
 }
 
+/// Future-date tolerance the daemon applies to trust evidence, mirroring
+/// `TrustPolicy::default().max_clock_skew_secs` in `rustynetd`. A record dated
+/// further ahead than this is rejected as future-dated.
+const TRUST_REFRESH_MAX_CLOCK_SKEW_SECS: u64 = 90;
+
+/// The daemon's persisted anti-replay watermark path, resolved the same way the
+/// daemon and the installer resolve it: `RUSTYNET_TRUST_WATERMARK` when the unit
+/// sets it, `rustynetd`'s own per-OS default otherwise. Deriving it from the
+/// trust-evidence path instead would be wrong on macOS, where the two live in
+/// different trees.
+fn trust_watermark_path_for_refresh() -> Result<PathBuf, String> {
+    env_path_or_default(
+        "RUSTYNET_TRUST_WATERMARK",
+        rustynetd::daemon::DEFAULT_TRUST_WATERMARK_PATH,
+    )
+}
+
+/// The watermark's `updated_at_unix`, or `None` when the node has never
+/// persisted one (first issue).
+fn trust_watermark_updated_at_unix(watermark_path: &Path) -> Result<Option<u64>, String> {
+    let body = match fs::read_to_string(watermark_path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "read trust watermark {} failed: {err}",
+                watermark_path.display()
+            ));
+        }
+    };
+    Ok(parse_bundle_u64_field(body.as_str(), "updated_at_unix"))
+}
+
+/// `updated_at_unix` for a freshly issued trust record, latched to the
+/// persisted watermark so a clock step backwards cannot turn the new record into
+/// a replay.
+///
+/// The daemon compares the incoming record against the watermark with
+/// `compare_trust_watermark_generation`, an `(updated_at_unix, nonce)` tuple
+/// compare: `Less` is `ReplayDetected`, and `Equal` is `ReplayDetected` unless
+/// the payload digest matches. With the bare wall clock, a node whose clock steps
+/// backwards below its own watermark has NO issuable timestamp — the record is
+/// either below the watermark (replay) or has to be pushed above
+/// `now + max_clock_skew_secs` (future-dated). Latching one second past the
+/// watermark is what makes the timestamp alone decide the compare; the `+ 1`
+/// matters, because otherwise the tie falls through to the freshly generated
+/// random hex nonce, which sorts below the stored one about half the time.
+///
+/// When even the latched value would fall outside the daemon's future-date
+/// tolerance this FAILS CLOSED rather than issuing: in that state every record
+/// this node could issue is rejected by the daemon and only a clock fix recovers
+/// it, so writing one would destroy the last good trust record for nothing.
+fn trust_record_issue_timestamp(watermark_path: &Path, now_unix: u64) -> Result<u64, String> {
+    let Some(watermark_updated_at_unix) = trust_watermark_updated_at_unix(watermark_path)? else {
+        return Ok(now_unix);
+    };
+    let issued_at_unix = now_unix.max(watermark_updated_at_unix.saturating_add(1));
+    let max_acceptable = now_unix.saturating_add(TRUST_REFRESH_MAX_CLOCK_SKEW_SECS);
+    if issued_at_unix > max_acceptable {
+        return Err(format!(
+            "trust watermark {} records updated_at_unix={watermark_updated_at_unix} but this node's clock reads {now_unix}: \
+             a monotonic trust record would have to be stamped {issued_at_unix}, past the {TRUST_REFRESH_MAX_CLOCK_SKEW_SECS}s \
+             future-date tolerance the daemon enforces, and the record was NOT rewritten. Every trust record this node could \
+             issue right now would be rejected as a replay or as future-dated: fix the node clock first.",
+            watermark_path.display()
+        ));
+    }
+    Ok(issued_at_unix)
+}
+
 fn refresh_trust_record_with_inputs(
     host_profile: SigningPassphraseHostProfile,
     trust_evidence_path: &Path,
@@ -9857,12 +9959,17 @@ fn refresh_trust_record_with_inputs(
         }
     };
 
+    // Compute the latched issue timestamp BEFORE creating the temporary file:
+    // a fail-closed refusal here (unreadable or unrecoverable watermark) must
+    // not leave a root-owned 0600 temporary behind on every unit tick.
+    let issue_timestamp =
+        trust_record_issue_timestamp(trust_watermark_path_for_refresh()?.as_path(), unix_now())?;
     let record_tmp = create_secure_temp_file(target_dir, "rustynetd-trust-record.")?;
     let issue_result = execute_trust(TrustCommand::Issue {
         signing_key_path: trust_signer_key_path.to_path_buf(),
         signing_key_passphrase_path: trust_signing_key_passphrase_path.to_path_buf(),
         output_path: record_tmp.clone(),
-        updated_at_unix: unix_now(),
+        updated_at_unix: issue_timestamp,
         nonce: generate_assignment_nonce(),
     });
     if let Err(err) = issue_result {
@@ -10015,6 +10122,70 @@ fn enforce_refresh_assignment_authority_gate(
 ///
 /// Read-only contract: never writes, removes, or rotates anything; every
 /// failure of a gate check is loud in the returned message.
+/// Decide whether the assignment bundle already on disk is fresh enough to skip
+/// BOTH halves of the pair for, returning the seconds left on it.
+///
+/// Two defects this closes:
+/// * the `exists()`-then-`read_to_string` pair let a concurrent unlink turn a
+///   still-fresh bundle into a hard error. The file is opened ONCE here and a
+///   missing file simply means "no skip".
+/// * the `expires_at_unix` value was read out of UNVERIFIED bundle text, so
+///   anyone who can write the bundle directory (it is `0750 root:rustynetd`,
+///   i.e. the daemon group is writable) could plant a bundle with a far-future
+///   `expires_at_unix` and pin the node on it forever. The gate therefore only
+///   trusts a bundle this node's own root-owned, non-group/world-writable
+///   publisher wrote, and any unreadable or unparseable bundle means "refresh",
+///   never "skip".
+///
+/// What this still does NOT do: verify the bundle's SIGNATURE. That is not
+/// reachable from `rustynet-cli` — `rustynetd`'s public
+/// `verify_signed_assignment_state_artifact` requires the anti-replay watermark
+/// to already exist, which a bundle the daemon has not loaded does not have, so
+/// calling it here would fail on every fresh bundle and re-sign on every tick.
+/// The signature-checking seam belongs in `rustynetd` next to
+/// `load_auto_tunnel_bundle` (follow-up, see the FB-05 report).
+fn assignment_bundle_freshness_skip_seconds(
+    bundle_path: &Path,
+    now_unix: u64,
+    min_remaining_secs: u64,
+) -> Result<Option<u64>, String> {
+    let mut bundle_file = match fs::File::open(bundle_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "read current assignment bundle {} failed: {err}",
+                bundle_path.display()
+            ));
+        }
+    };
+    // Metadata of the OPENED handle, not of the name: a rename after the open
+    // cannot change what was actually read.
+    let metadata = bundle_file.metadata().map_err(|err| {
+        format!(
+            "inspect current assignment bundle {} failed: {err}",
+            bundle_path.display()
+        )
+    })?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Ok(None);
+    }
+    let mut body = String::new();
+    bundle_file.read_to_string(&mut body).map_err(|err| {
+        format!(
+            "read current assignment bundle {} failed: {err}",
+            bundle_path.display()
+        )
+    })?;
+    let Some(current_expires_at) = parse_bundle_u64_field(body.as_str(), "expires_at_unix") else {
+        return Ok(None);
+    };
+    if current_expires_at <= now_unix.saturating_add(min_remaining_secs) {
+        return Ok(None);
+    }
+    Ok(Some(current_expires_at.saturating_sub(now_unix)))
+}
+
 fn assignment_pair_refresh_skip(
     bundle_path: &Path,
     verifier_key_path: &Path,
@@ -10023,12 +10194,9 @@ fn assignment_pair_refresh_skip(
     now_unix: u64,
     min_remaining_secs: u64,
 ) -> Result<Option<String>, String> {
-    if bundle_path.exists()
-        && let Some(current_expires_at) =
-            read_bundle_u64_field_optional(bundle_path, "expires_at_unix")?
-        && current_expires_at > now_unix.saturating_add(min_remaining_secs)
+    if let Some(remaining_secs) =
+        assignment_bundle_freshness_skip_seconds(bundle_path, now_unix, min_remaining_secs)?
     {
-        let remaining_secs = current_expires_at.saturating_sub(now_unix);
         return Ok(Some(format!(
             "[assignment-refresh] current assignment expires in {remaining_secs}s; skipping refresh of both halves (traversal bundle not re-signed).",
         )));
@@ -10203,6 +10371,58 @@ fn assignment_refresh_effective_path(
     Ok(PathBuf::from(default))
 }
 
+/// The env-file body the refresh unit actually runs with, in the precedence
+/// order systemd applies it.
+///
+/// `rustynetd-assignment-refresh.service` loads `EnvironmentFile=-/etc/default/rustynetd`
+/// FIRST and `EnvironmentFile=-/etc/rustynet/assignment-refresh.env` SECOND, and
+/// a later `EnvironmentFile=` overrides an earlier one. The CLI read the refresh
+/// env file ALONE, so a `RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT` (or
+/// `RUSTYNET_ASSIGNMENT_SIGNING_SECRET`) override living in the default file was
+/// invisible here. The verdict then resolved `assignment.pub` to the built-in
+/// default, read it as NotFound, and `forced_refresh_assignment_plan` mapped
+/// `Ok(None)` to `RemoveForRegeneration` — deleting a valid bundle AND its
+/// watermark on a node whose real verifier key was configured one file away.
+/// Both bodies are concatenated default-file-first, and
+/// [`assignment_refresh_env_value`] resolves the last assignment, so the CLI
+/// resolves exactly what the unit resolves.
+///
+/// The default file is OPTIONAL in the unit (`-` prefix), so an absent one is not
+/// an error. A present-but-unreadable one IS: ignoring it is the very miss that
+/// produced the deletion above.
+fn assignment_refresh_effective_env_body(
+    assignment_refresh_env_path: &Path,
+    systemd_env_path: Option<&Path>,
+) -> Result<String, String> {
+    let mut body = String::new();
+    if let Some(systemd_env_path) = systemd_env_path {
+        match fs::read_to_string(systemd_env_path) {
+            Ok(systemd_body) => {
+                body.push_str(systemd_body.as_str());
+                if !body.ends_with('\n') {
+                    body.push('\n');
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "read systemd default env failed ({}): {err}",
+                    systemd_env_path.display()
+                ));
+            }
+        }
+    }
+    ensure_regular_file_no_symlink(assignment_refresh_env_path, "assignment refresh env file")?;
+    let refresh_body = fs::read_to_string(assignment_refresh_env_path).map_err(|err| {
+        format!(
+            "read assignment refresh env failed ({}): {err}",
+            assignment_refresh_env_path.display()
+        )
+    })?;
+    body.push_str(refresh_body.as_str());
+    Ok(body)
+}
+
 /// The refresh authority gate's verdict for THIS node, evaluated from the CLI.
 ///
 /// The CLI is not running under the refresh unit's `LoadCredentialEncrypted=`,
@@ -10214,27 +10434,28 @@ fn assignment_refresh_effective_path(
 fn local_assignment_authority_verdict(
     assignment_refresh_env_path: &Path,
 ) -> Result<Option<String>, String> {
-    local_assignment_authority_verdict_with(assignment_refresh_env_path, |gate| {
-        ops_e2e::with_unwrapped_signing_passphrase("assignment-authority", gate)
-    })
+    // Same resolution the unit and `ops install-systemd` use, so the CLI never
+    // decides the authority from a different file set than the refresh service
+    // would.
+    let systemd_env_path =
+        env_path_or_default("RUSTYNET_SYSTEMD_ENV_PATH", DEFAULT_SYSTEMD_ENV_PATH)?;
+    local_assignment_authority_verdict_with_env_files(
+        assignment_refresh_env_path,
+        Some(systemd_env_path.as_path()),
+        |gate| ops_e2e::with_unwrapped_signing_passphrase("assignment-authority", gate),
+    )
 }
 
-/// [`local_assignment_authority_verdict`] with the credential unwrap injected, so the whole
-/// verdict (path resolution, first-install shortcut, fail-closed reads, the gate call and its
-/// argument order) is exercised by unit tests without systemd-creds.
-fn local_assignment_authority_verdict_with(
+/// [`local_assignment_authority_verdict`] with BOTH env-file paths injected.
+fn local_assignment_authority_verdict_with_env_files(
     assignment_refresh_env_path: &Path,
+    systemd_env_path: Option<&Path>,
     with_passphrase: impl FnOnce(
         &dyn Fn(&Path) -> Result<Option<String>, String>,
     ) -> Result<Option<String>, String>,
 ) -> Result<Option<String>, String> {
-    ensure_regular_file_no_symlink(assignment_refresh_env_path, "assignment refresh env file")?;
-    let env_body = fs::read_to_string(assignment_refresh_env_path).map_err(|err| {
-        format!(
-            "read assignment refresh env failed ({}): {err}",
-            assignment_refresh_env_path.display()
-        )
-    })?;
+    let env_body =
+        assignment_refresh_effective_env_body(assignment_refresh_env_path, systemd_env_path)?;
     let verifier_key_path = assignment_refresh_effective_path(
         env_body.as_str(),
         "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
@@ -10257,6 +10478,24 @@ fn local_assignment_authority_verdict_with(
             passphrase_path,
         )
     })
+}
+
+/// [`local_assignment_authority_verdict_with_env_files`] without the systemd
+/// default env file, so a test can drive the whole verdict (path resolution,
+/// first-install shortcut, fail-closed reads, the gate call and its argument
+/// order) from a single file.
+#[cfg(test)]
+fn local_assignment_authority_verdict_with(
+    assignment_refresh_env_path: &Path,
+    with_passphrase: impl FnOnce(
+        &dyn Fn(&Path) -> Result<Option<String>, String>,
+    ) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    local_assignment_authority_verdict_with_env_files(
+        assignment_refresh_env_path,
+        None,
+        with_passphrase,
+    )
 }
 
 fn execute_ops_refresh_assignment() -> Result<String, String> {
@@ -10374,8 +10613,16 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     ensure_directory_exists(bundle_dir, 0o750, Uid::from_raw(0), bundle_group_gid)?;
     ensure_directory_exists(verifier_dir, 0o750, Uid::from_raw(0), bundle_group_gid)?;
 
-    let bundle_tmp = create_secure_temp_file(bundle_dir, "rustynetd.assignment.tmp.")?;
-    let verifier_tmp = create_secure_temp_file(verifier_dir, "assignment.pub.tmp.")?;
+    let mut bundle_tmp_guard = TempFileCleanupGuard::new(create_secure_temp_file(
+        bundle_dir,
+        "rustynetd.assignment.tmp.",
+    )?);
+    let mut verifier_tmp_guard = TempFileCleanupGuard::new(create_secure_temp_file(
+        verifier_dir,
+        "assignment.pub.tmp.",
+    )?);
+    let bundle_tmp = bundle_tmp_guard.path().to_path_buf();
+    let verifier_tmp = verifier_tmp_guard.path().to_path_buf();
 
     let nodes = parse_assignment_nodes(nodes_spec.as_str())?;
     let allow_pairs = parse_assignment_allow_pairs(allow_spec.as_str())?;
@@ -10386,60 +10633,53 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         exit_node_id.as_deref(),
     )?;
 
-    let issue_result =
-        execute_assignment(AssignmentCommand::Issue(Box::new(AssignmentIssueCommand {
-            signing_secret_path,
-            signing_secret_passphrase_path,
-            target_node_id,
-            output_path: bundle_tmp.clone(),
-            verifier_key_output_path: Some(verifier_tmp.clone()),
-            nodes,
-            allow_pairs,
-            mesh_cidr: "100.64.0.0/10".to_owned(),
-            exit_node_id,
-            lan_routes,
-            generated_at_unix: unix_now(),
-            ttl_secs,
-            nonce: generate_assignment_nonce(),
-        })));
-    if let Err(err) = issue_result {
-        let _ = remove_file_if_present(&bundle_tmp);
-        let _ = remove_file_if_present(&verifier_tmp);
-        return Err(err);
-    }
+    // Every early return between here and the two publishes below unwinds the
+    // guards, which is what keeps a rejected spec or an unreadable issued
+    // bundle from leaving root-owned 0600 temporaries behind.
+    execute_assignment(AssignmentCommand::Issue(Box::new(AssignmentIssueCommand {
+        signing_secret_path,
+        signing_secret_passphrase_path,
+        target_node_id,
+        output_path: bundle_tmp.clone(),
+        verifier_key_output_path: Some(verifier_tmp.clone()),
+        nodes,
+        allow_pairs,
+        mesh_cidr: "100.64.0.0/10".to_owned(),
+        exit_node_id,
+        lan_routes,
+        generated_at_unix: unix_now(),
+        ttl_secs,
+        nonce: generate_assignment_nonce(),
+    })))?;
 
     let generated_at_unix = read_bundle_u64_field_required(&bundle_tmp, "generated_at_unix")?;
     let expires_at_unix = read_bundle_u64_field_required(&bundle_tmp, "expires_at_unix")?;
     if generated_at_unix >= expires_at_unix {
-        let _ = remove_file_if_present(&bundle_tmp);
-        let _ = remove_file_if_present(&verifier_tmp);
         return Err("issued assignment bundle has invalid expiry window".to_owned());
     }
 
-    if let Err(err) = publish_file_with_owner_mode(
+    publish_file_with_owner_mode(
         &bundle_tmp,
         &bundle_path,
         Uid::from_raw(0),
         bundle_group_gid,
         0o640,
         "assignment bundle",
-    ) {
-        let _ = remove_file_if_present(&bundle_tmp);
-        let _ = remove_file_if_present(&verifier_tmp);
-        return Err(err);
-    }
+    )?;
 
-    if let Err(err) = publish_file_with_owner_mode(
+    publish_file_with_owner_mode(
         &verifier_tmp,
         &verifier_key_path,
         Uid::from_raw(0),
         Gid::from_raw(0),
         0o644,
         "assignment verifier key",
-    ) {
-        let _ = remove_file_if_present(&verifier_tmp);
-        return Err(err);
-    }
+    )?;
+
+    // Both halves are published; the temporaries are gone (renamed) or must not
+    // be removed again.
+    bundle_tmp_guard.release();
+    verifier_tmp_guard.release();
 
     Ok(format!(
         "[assignment-refresh] refreshed signed assignment bundle at {} (generated_at_unix={} expires_at_unix={})",
@@ -15532,13 +15772,16 @@ fn refresh_local_traversal_bundle_from_specs(
 fn refresh_local_traversal_bundle_from_assignment_env(
     assignment_refresh_env_path: &Path,
 ) -> Result<(), String> {
-    ensure_regular_file_no_symlink(assignment_refresh_env_path, "assignment refresh env file")?;
-    let assignment_env = fs::read_to_string(assignment_refresh_env_path).map_err(|err| {
-        format!(
-            "read assignment refresh env failed ({}): {err}",
-            assignment_refresh_env_path.display()
-        )
-    })?;
+    // Same file-set precedence as the authority verdict above: the traversal
+    // re-sign reads RUSTYNET_ASSIGNMENT_TARGET_NODE_ID / _NODES / _ALLOW out of
+    // the merged body, so an override in the systemd default file has to reach it
+    // too.
+    let systemd_env_path =
+        env_path_or_default("RUSTYNET_SYSTEMD_ENV_PATH", DEFAULT_SYSTEMD_ENV_PATH)?;
+    let assignment_env = assignment_refresh_effective_env_body(
+        assignment_refresh_env_path,
+        Some(systemd_env_path.as_path()),
+    )?;
     let refresh_config =
         local_traversal_refresh_config_from_assignment_env(assignment_env.as_str())?;
     let daemon_group = env_string_or_default("RUSTYNET_DAEMON_GROUP", "rustynetd")?;
@@ -16205,15 +16448,22 @@ fn rewrite_assignment_refresh_exit_node(body: &str, exit_node_id: Option<&str>) 
     format!("{}\n", rewritten_lines.join("\n"))
 }
 
+/// Resolve `key` out of an assignment-refresh env file body with systemd
+/// `EnvironmentFile=` semantics: when the same key is assigned more than once
+/// the LAST assignment wins. `rustynetd-assignment-refresh.service` layers
+/// `/etc/default/rustynetd` first and `/etc/rustynet/assignment-refresh.env`
+/// second, and systemd applies the later file over the earlier one, so reading
+/// the first match would resolve a value the unit never actually runs with.
 fn assignment_refresh_env_value(body: &str, key: &str) -> Result<Option<String>, String> {
     let prefix = format!("{key}=");
+    let mut resolved: Option<String> = None;
     for line in body.lines() {
         let trimmed = line.trim();
         if let Some(raw_value) = trimmed.strip_prefix(prefix.as_str()) {
-            return parse_env_value(raw_value).map(Some);
+            resolved = Some(parse_env_value(raw_value)?);
         }
     }
-    Ok(None)
+    Ok(resolved)
 }
 
 fn rewrite_assignment_refresh_lan_routes(body: &str, lan_routes: &[String]) -> String {
@@ -16682,6 +16932,91 @@ fn create_secure_temp_directory(dir: &Path, prefix: &str) -> Result<PathBuf, Str
     ))
 }
 
+/// Re-verify a temporary file immediately before it is chowned and renamed
+/// into its published location.
+///
+/// [`create_secure_temp_file`] creates the file `O_EXCL` 0600 and returns the
+/// PATH, dropping the descriptor; every writer then reopens it by name. Between
+/// creation and publish, whoever can write the target directory can replace that
+/// name — and `publish_file_with_owner_mode` would `rename()` the replacement
+/// into place as the published artifact (trust evidence, assignment bundle,
+/// assignment verifier key). This re-check refuses a symlink and refuses a file
+/// that is group- or world-writable, which is what an attacker's replacement has
+/// to be to be useful.
+///
+/// Residual race, stated honestly: `symlink_metadata` and `rename` are two
+/// separate syscalls, so a name can still be swapped between them. Closing that
+/// window needs `O_NOFOLLOW` at open time, which std does not expose (the
+/// `OpenOptionsExt::custom_flags` route needs hardcoded per-OS flag constants).
+/// The window is one syscall wide and the target directories are 0750
+/// root:rustynetd, so this narrows the swap to a race rather than removing it.
+fn ensure_temp_publish_source_is_private_regular_file(
+    source_tmp_path: &Path,
+    label: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(source_tmp_path).map_err(|err| {
+        format!(
+            "inspect {label} source {} failed: {err}",
+            source_tmp_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to publish {label}: temporary source {} is a symlink",
+            source_tmp_path.display()
+        ));
+    }
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "refusing to publish {label}: temporary source {} is not a regular file",
+            source_tmp_path.display()
+        ));
+    }
+    if metadata.mode() & 0o022 != 0 {
+        return Err(format!(
+            "refusing to publish {label}: temporary source {} is group or world writable",
+            source_tmp_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Owns a [`create_secure_temp_file`] path and removes it unless it is
+/// explicitly released. The `?` operators between temp-file creation and
+/// publication would otherwise leak every temporary file a failed run created
+/// (root-owned 0600 litter inside the bundle, verifier and trust directories).
+struct TempFileCleanupGuard {
+    path: PathBuf,
+    released: bool,
+}
+
+impl TempFileCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            released: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    /// The path has been published (renamed away) or intentionally kept: stop
+    /// removing it on drop.
+    fn release(&mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for TempFileCleanupGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = remove_file_if_present(self.path.as_path());
+        }
+    }
+}
+
 fn publish_file_with_owner_mode(
     source_tmp_path: &Path,
     destination_path: &Path,
@@ -16690,6 +17025,7 @@ fn publish_file_with_owner_mode(
     mode: u32,
     label: &str,
 ) -> Result<(), String> {
+    ensure_temp_publish_source_is_private_regular_file(source_tmp_path, label)?;
     chown(source_tmp_path, Some(owner), Some(group)).map_err(|err| {
         format!(
             "set {label} owner {} failed: {err}",
@@ -28478,11 +28814,20 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pair_refresh_skip_ttl_skip_reports_both_halves_and_touches_nothing() {
+        use std::os::unix::fs::MetadataExt as _;
+
         let dir = tempfile::TempDir::new().expect("create temp dir");
         let bundle_path = dir.path().join("rustynetd.assignment");
         let bundle_before =
             pair_skip_test_bundle(PAIR_SKIP_TEST_NOW + PAIR_SKIP_TEST_MIN_REMAINING + 10);
         fs::write(&bundle_path, &bundle_before).expect("write fresh bundle fixture");
+        // The TTL gate trusts only a bundle this node published itself, so the
+        // fixture must be root-owned. A privileged run arranges exactly that;
+        // an unprivileged one cannot, and the stronger contract applies there:
+        // such a bundle must NOT earn the skip (CM-07).
+        let root_owned = fs::metadata(&bundle_path).expect("stat bundle").uid() == 0
+            || std::os::unix::fs::chown(bundle_path.as_path(), Some(0), None).is_ok()
+                && fs::metadata(&bundle_path).expect("stat bundle").uid() == 0;
 
         // Absent pub and signing secret: the TTL gate must short-circuit
         // before the authority gate needs any of them.
@@ -28497,7 +28842,22 @@ mod tests {
             PAIR_SKIP_TEST_NOW,
             PAIR_SKIP_TEST_MIN_REMAINING,
         )
-        .expect("a fresh bundle must be a skip, not an error");
+        .expect("a fresh bundle must be a decision, not an error");
+
+        if !root_owned {
+            assert!(
+                !matches!(decision, Some(ref text) if text.contains("skipping refresh of both halves")),
+                "a bundle this run cannot prove root-owned must not earn the TTL skip: {decision:?}"
+            );
+            assert_eq!(
+                fs::read(&bundle_path).expect("read bundle"),
+                bundle_before.as_bytes(),
+                "the assignment bundle must stay byte-identical"
+            );
+            assert!(!pub_path.exists(), "the gate must not create the pub");
+            assert_pair_skip_traversal_untouched(&traversal);
+            return;
+        }
 
         let message = decision.expect("a still-fresh assignment must skip the refresh");
         assert!(
@@ -31783,5 +32143,693 @@ mod tests {
         use rustynet_control::role_presets::TransitionKind;
         finalize_role_audit(&TransitionKind::SignedMembership, Ok(())).expect("ok stays ok");
         finalize_role_audit(&TransitionKind::Irreversible("x"), Ok(())).expect("ok stays ok");
+    }
+}
+
+/// FB-05 (CM-01..CM-08) — the trust-refresh / assignment-refresh defects and
+/// their enforcement points.
+///
+/// Each test names the defect it pins. The two that matter most as REGRESSIONS
+/// rather than as unit coverage are the wiring witnesses at the end: a correct
+/// helper that nothing calls would leave every other test here green while the
+/// defect stayed live.
+#[cfg(test)]
+mod fb05_trust_refresh_tests {
+    use super::{
+        SigningPassphraseHostProfile, TempFileCleanupGuard,
+        assignment_bundle_freshness_skip_seconds, assignment_refresh_effective_env_body,
+        assignment_refresh_effective_path, assignment_refresh_env_value, create_secure_temp_file,
+        enforce_refresh_signed_trust_privilege_boundary,
+        ensure_temp_publish_source_is_private_regular_file,
+        local_assignment_authority_verdict_with_env_files, trust_record_issue_timestamp,
+    };
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    /// The body of `fn NAME`, for the source-text witnesses below.
+    fn function_body(name: &str) -> String {
+        let source = include_str!("main.rs");
+        let start = source
+            .find(&format!("fn {name}("))
+            .unwrap_or_else(|| panic!("function {name} present"));
+        let offset = source[start..]
+            .find("\nfn ")
+            .unwrap_or_else(|| panic!("function {name} end present"));
+        source[start..start + offset].to_owned()
+    }
+
+    // ----- CM-04: EnvironmentFile= semantics (last assignment wins) -----
+
+    /// CM-04. systemd applies the LAST assignment of a repeated key, so the
+    /// first-match reader resolved a value the unit never runs with. The unit
+    /// layers `/etc/default/rustynetd` before the refresh env file precisely so
+    /// the refresh file overrides it.
+    #[test]
+    fn cm04_env_value_takes_the_last_assignment_like_systemd() {
+        let body = concat!(
+            "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/default/from-default-file\n",
+            "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/from-refresh-file\n",
+        );
+        assert_eq!(
+            assignment_refresh_env_value(body, "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT")
+                .expect("parse"),
+            Some("/etc/rustynet/from-refresh-file".to_owned()),
+            "the later assignment must win, or the CLI resolves a path the unit overrode"
+        );
+    }
+
+    #[test]
+    fn cm04_env_value_still_returns_none_and_rejects_a_bad_last_value() {
+        assert_eq!(
+            assignment_refresh_env_value("OTHER=1\n", "RUSTYNET_ASSIGNMENT_TTL_SECS")
+                .expect("parse"),
+            None,
+            "an absent key is still absent"
+        );
+        // A malformed final assignment must not silently fall back to an earlier
+        // well-formed one: fail closed on the value the unit would use.
+        let err = assignment_refresh_env_value(
+            "RUSTYNET_ASSIGNMENT_TTL_SECS=300\nRUSTYNET_ASSIGNMENT_TTL_SECS=\"$UNCLOSED\n",
+            "RUSTYNET_ASSIGNMENT_TTL_SECS",
+        )
+        .expect_err("a malformed winning assignment must fail closed");
+        assert!(!err.is_empty(), "the refusal must explain itself: {err}");
+    }
+
+    // ----- CM-05: the verdict resolves the SAME env files as the unit -----
+
+    #[test]
+    fn cm05_effective_env_body_layers_default_file_first() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let systemd_env = dir.path().join("rustynetd-default");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        fs::write(
+            &systemd_env,
+            concat!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/overridden.pub\n",
+                "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID=from-default\n",
+            ),
+        )
+        .expect("write default env");
+        fs::write(
+            &refresh_env,
+            "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=/etc/rustynet/wins.pub\n",
+        )
+        .expect("write refresh env");
+
+        let body = assignment_refresh_effective_env_body(
+            refresh_env.as_path(),
+            Some(systemd_env.as_path()),
+        )
+        .expect("merge");
+        assert_eq!(
+            assignment_refresh_effective_path(
+                body.as_str(),
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
+                "/etc/rustynet/assignment.pub",
+            )
+            .expect("resolve"),
+            std::path::PathBuf::from("/etc/rustynet/wins.pub"),
+            "the refresh env file must override the default file, as systemd does"
+        );
+        assert_eq!(
+            assignment_refresh_env_value(body.as_str(), "RUSTYNET_ASSIGNMENT_TARGET_NODE_ID")
+                .expect("resolve"),
+            Some("from-default".to_owned()),
+            "a key only the default file sets must still be visible"
+        );
+    }
+
+    /// The regression this closes: an override living in the default file was
+    /// invisible, so `assignment.pub` resolved to the built-in default, read as
+    /// NotFound, and `forced_refresh_assignment_plan` deleted the bundle AND its
+    /// watermark. The verdict must now return `Ok(Some(..))` (an authority IS
+    /// configured) instead of the first-install `Ok(None)`.
+    #[test]
+    fn cm05_verdict_sees_a_verifier_key_configured_only_in_the_default_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let systemd_env = dir.path().join("rustynetd-default");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        let verifier_key = dir.path().join("assignment.pub");
+        let signing_secret = dir.path().join("assignment.signing.secret");
+        let passphrase = dir.path().join("passphrase");
+
+        fs::write(
+            &systemd_env,
+            format!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT={}\nRUSTYNET_ASSIGNMENT_SIGNING_SECRET={}\n",
+                verifier_key.display(),
+                signing_secret.display()
+            ),
+        )
+        .expect("write default env");
+        fs::write(
+            &refresh_env,
+            "# the refresh file deliberately sets neither key\n",
+        )
+        .expect("write refresh env");
+        fs::write(&verifier_key, "assignment-verifier-key\n").expect("write verifier key");
+        fs::write(&signing_secret, "secret\n").expect("write signing secret");
+        fs::write(&passphrase, "passphrase\n").expect("write passphrase");
+
+        let verdict = local_assignment_authority_verdict_with_env_files(
+            refresh_env.as_path(),
+            Some(systemd_env.as_path()),
+            |gate| gate(passphrase.as_path()),
+        );
+        // The temp signing secret is not real encrypted material, so the gate
+        // stops on that. The point of the assertion is WHICH verdict: an Err
+        // (fail closed) or Ok(Some(..)) (an external authority) both mean the
+        // configured authority was found. Ok(None) — the first-install verdict
+        // `forced_refresh_assignment_plan` maps to RemoveForRegeneration — is
+        // the regression, and only that verdict is forbidden.
+        assert!(
+            !matches!(verdict, Ok(None)),
+            "an authority configured in the default file must NOT read as a first install \
+             (Ok(None) is what deletes the bundle and its watermark): {verdict:?}"
+        );
+    }
+
+    /// The gate closure receives the paths the unit would run with; pin them so
+    /// the merge cannot rot into resolving the wrong files again.
+    #[test]
+    fn cm05_verdict_hands_the_gate_the_merged_paths() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let systemd_env = dir.path().join("rustynetd-default");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        let verifier_key = dir.path().join("assignment.pub");
+        let passphrase = dir.path().join("passphrase");
+        fs::write(
+            &systemd_env,
+            format!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT={}\n",
+                verifier_key.display()
+            ),
+        )
+        .expect("write default env");
+        fs::write(&refresh_env, "\n").expect("write refresh env");
+        fs::write(&verifier_key, "assignment-verifier-key\n").expect("write verifier key");
+
+        let verdict = local_assignment_authority_verdict_with_env_files(
+            refresh_env.as_path(),
+            Some(systemd_env.as_path()),
+            |gate| gate(passphrase.as_path()),
+        );
+        // The gate fails on the unparseable signing secret rather than on a
+        // missing verifier key: proof the DEFAULT path was not used.
+        let err = verdict.expect_err("unusable authority material must fail closed");
+        assert!(
+            !err.contains("/etc/rustynet/assignment.pub"),
+            "the gate must not have been handed the built-in default path: {err}"
+        );
+    }
+
+    /// An absent default env file is normal (the unit's `-` prefix); a present
+    /// but UNREADABLE one must fail closed, because ignoring it is exactly the
+    /// miss that deleted the bundle.
+    #[test]
+    fn cm05_absent_default_env_is_fine_but_unreadable_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let refresh_env = dir.path().join("assignment-refresh.env");
+        fs::write(&refresh_env, "\n").expect("write refresh env");
+
+        assignment_refresh_effective_env_body(
+            refresh_env.as_path(),
+            Some(dir.path().join("definitely-absent").as_path()),
+        )
+        .expect("an absent optional default env must not fail");
+
+        let unreadable = dir.path().join("unreadable-default");
+        fs::create_dir(&unreadable).expect("create directory");
+        let err = assignment_refresh_effective_env_body(
+            refresh_env.as_path(),
+            Some(unreadable.as_path()),
+        )
+        .expect_err("an unreadable default env must fail closed, not be skipped");
+        assert!(
+            err.contains("systemd default env"),
+            "the refusal must name the file it refused to ignore: {err}"
+        );
+    }
+
+    // ----- CM-08 / CM-07: the freshness skip -----
+
+    fn write_bundle(dir: &Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("rustynetd.assignment");
+        fs::write(&path, body).expect("write bundle");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        path
+    }
+
+    /// Give the file away from root when the test runs privileged; a
+    /// non-privileged run already owns it and there is nothing to arrange.
+    fn chown_away_from_root(path: &Path) -> bool {
+        if fs::metadata(path).expect("stat").uid() != 0 {
+            return true;
+        }
+        std::os::unix::fs::chown(path, Some(65_534), Some(65_534)).expect("chown");
+        fs::metadata(path).expect("stat").uid() == 65_534
+    }
+
+    /// CM-08. `exists()` then `read_to_string` was a TOCTOU: a concurrent unlink
+    /// turned a still-fresh bundle into a hard error. A missing file is now
+    /// simply "no skip".
+    #[test]
+    fn cm08_a_missing_bundle_is_no_skip_not_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let absent = dir.path().join("never-existed");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(absent.as_path(), 1_000, 180)
+                .expect("a missing bundle must not be an error"),
+            None,
+            "a missing bundle means refresh, never a hard failure"
+        );
+    }
+
+    /// CM-07. The `expires_at_unix` the gate trusts came out of unverified
+    /// bundle text, so anything able to write the bundle directory could plant a
+    /// far-future expiry and pin the node on it.
+    #[test]
+    fn cm07_an_unowned_or_world_writable_bundle_never_skips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(
+            dir.path(),
+            "expires_at_unix=99999999999\ngenerated_at_unix=1\n",
+        );
+
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o666)).expect("chmod");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "a group/world-writable bundle must never earn a skip"
+        );
+
+        // The bundle directory is 0750 root:<daemon group>, so a compromised
+        // group member can plant the bundle file itself. Only root ownership
+        // marks it as the artifact this node's own refresh published.
+        let chowned = chown_away_from_root(bundle.as_path());
+        fs::set_permissions(&bundle, fs::Permissions::from_mode(0o600)).expect("chmod");
+        if chowned {
+            assert_eq!(
+                assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180)
+                    .expect("read"),
+                None,
+                "a bundle not owned by root must never earn a skip"
+            );
+        } else {
+            assert_eq!(
+                assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180)
+                    .expect("read"),
+                Some(99_999_999_999 - 1_000),
+                "a root-owned bundle this node published is the trusted artifact"
+            );
+        }
+    }
+
+    /// The freshness gate reads through one open handle; anything that is not a
+    /// regular file (a directory swapped in, a FIFO) means refresh, never skip.
+    #[test]
+    fn cm07_a_non_regular_bundle_never_skips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = dir.path().join("rustynetd.assignment");
+        fs::create_dir(&bundle).expect("create directory");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180)
+                .expect("a directory is readable but not a bundle"),
+            None,
+            "only a regular file can be a bundle"
+        );
+    }
+
+    /// A bundle whose expiry cannot be parsed is a bundle whose freshness cannot
+    /// be established: refresh, never skip.
+    #[test]
+    fn cm07_an_unparseable_bundle_never_skips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(dir.path(), "expires_at_unix=not-a-number\n");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "an unparseable expiry must mean refresh"
+        );
+        let bundle = write_bundle(dir.path(), "nothing=useful\n");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "a bundle with no expiry field must mean refresh"
+        );
+    }
+
+    #[test]
+    fn freshness_skip_is_bounded_by_min_remaining() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(dir.path(), "expires_at_unix=1000\n");
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            None,
+            "an already-expiring bundle must not skip"
+        );
+    }
+
+    /// The freshness gate's MAINLINE contract, the mirror of the CM-07 refusals:
+    /// a fresh bundle that this node's own root publisher wrote (uid 0, not
+    /// group/world writable) DOES earn the skip. Arranging uid 0 needs root, so
+    /// on an unprivileged runner this says so loudly and runs nothing rather
+    /// than pretending (FB-05 review finding F2: without this test a
+    /// "never skip" mutant survives every unprivileged test run).
+    #[test]
+    fn a_root_owned_fresh_bundle_still_skips_both_halves_of_the_pair() {
+        if !nix::unistd::Uid::effective().is_root() {
+            eprintln!(
+                "skipping: a root-owned fixture cannot be arranged without root; \
+                 the positive skip contract needs a privileged test run"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = write_bundle(dir.path(), "expires_at_unix=99999999999\n");
+        assert!(std::os::unix::fs::chown(bundle.as_path(), Some(0), None).is_ok());
+        assert_eq!(
+            assignment_bundle_freshness_skip_seconds(bundle.as_path(), 1_000, 180).expect("read"),
+            Some(99_999_999_999 - 1_000),
+            "the root-owned published bundle this gate exists to trust must still earn the skip"
+        );
+    }
+
+    // ----- CM-01: refresh-signed-trust privilege boundary -----
+
+    #[test]
+    fn cm01_linux_profile_enforces_both_root_and_custody_in_order() {
+        let calls: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        enforce_refresh_signed_trust_privilege_boundary(
+            SigningPassphraseHostProfile::Linux,
+            || {
+                calls.borrow_mut().push("root".to_owned());
+                Ok(())
+            },
+            |context| {
+                calls.borrow_mut().push(format!("custody:{context}"));
+                Ok(())
+            },
+        )
+        .expect("linux profile must pass both");
+        let calls = calls.into_inner();
+        assert_eq!(
+            calls,
+            vec!["root".to_owned(), "custody:trust-refresh".to_owned()],
+            "the Linux profile must enforce root AND pinned-binary custody, root first"
+        );
+    }
+
+    /// A refusal at either boundary must stop the command before it writes
+    /// anything, and must not run the second boundary.
+    #[test]
+    fn cm01_a_failed_boundary_short_circuits_the_other() {
+        let mut custody_ran = false;
+        let err = enforce_refresh_signed_trust_privilege_boundary(
+            SigningPassphraseHostProfile::Linux,
+            || Err("not root".to_owned()),
+            |_| {
+                custody_ran = true;
+                Ok(())
+            },
+        )
+        .expect_err("a non-root run must be refused");
+        assert_eq!(err, "not root");
+        assert!(
+            !custody_ran,
+            "custody must not run after the root check refused"
+        );
+    }
+
+    #[test]
+    fn cm01_macos_profile_enforces_neither() {
+        let calls: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+        enforce_refresh_signed_trust_privilege_boundary(
+            SigningPassphraseHostProfile::Macos,
+            || {
+                calls.borrow_mut().push("root".to_owned());
+                Ok(())
+            },
+            |context| {
+                calls.borrow_mut().push(format!("custody:{context}"));
+                Ok(())
+            },
+        )
+        .expect("the macOS profile is unchanged");
+        let calls = calls.into_inner();
+        assert!(
+            calls.is_empty(),
+            "the macOS desktop flow must not gain a boundary it never had: {calls:?}"
+        );
+    }
+
+    // ----- CM-02: monotonic trust-record timestamp -----
+
+    fn write_watermark(dir: &Path, updated_at_unix: u64) -> std::path::PathBuf {
+        let path = dir.join("rustynetd.trust.watermark");
+        fs::write(
+            &path,
+            format!("version=2\nupdated_at_unix={updated_at_unix}\nnonce=abcdef\n"),
+        )
+        .expect("write watermark");
+        path
+    }
+
+    /// CM-02. With the bare wall clock a node whose clock stepped backwards
+    /// issued a record the daemon rejects as a replay. Latch one second past the
+    /// watermark so the `(updated_at_unix, nonce)` tuple compare is decided by
+    /// the timestamp alone.
+    #[test]
+    fn cm02_a_clock_behind_the_watermark_still_advances_the_timestamp() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A 30 s backwards step: inside the daemon's 90 s future-date tolerance,
+        // so the record is issuable and the watermark alone decides the tuple.
+        let watermark = write_watermark(dir.path(), 5_000);
+        let issued = trust_record_issue_timestamp(watermark.as_path(), 4_970)
+            .expect("a backwards clock must still produce an issuable timestamp");
+        assert!(
+            issued > 5_000,
+            "the issued timestamp must be strictly greater than the watermark or the \
+             tuple compare falls through to the fresh random nonce: {issued}"
+        );
+        assert_eq!(issued, 5_001);
+    }
+
+    #[test]
+    fn cm02_a_healthy_clock_keeps_the_wall_clock_and_no_watermark_is_a_first_issue() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let watermark = write_watermark(dir.path(), 5_000);
+        assert_eq!(
+            trust_record_issue_timestamp(watermark.as_path(), 5_030)
+                .expect("a healthy clock is not clamped"),
+            5_030,
+            "the wall clock wins whenever it is already past the watermark"
+        );
+        assert_eq!(
+            trust_record_issue_timestamp(dir.path().join("absent").as_path(), 5_030)
+                .expect("a node with no watermark yet"),
+            5_030,
+            "a first issue has nothing to be monotonic against"
+        );
+    }
+
+    /// When the latch would fall outside the daemon's future-date tolerance,
+    /// EVERY record this node could issue is rejected. Issuing one anyway
+    /// destroys the last good trust record for nothing, so this fails closed.
+    #[test]
+    fn cm02_an_unrecoverable_watermark_fails_closed_without_rewriting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let watermark = write_watermark(dir.path(), 5_000);
+        let err = trust_record_issue_timestamp(watermark.as_path(), 1)
+            .expect_err("a watermark far past the clock must refuse, not write a doomed record");
+        assert!(
+            err.contains("NOT rewritten") && err.contains("fix the node clock"),
+            "the refusal must say the record was kept and what to fix: {err}"
+        );
+    }
+
+    #[test]
+    fn cm02_an_unreadable_watermark_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory where the watermark should be: unreadable-as-a-file for
+        // root and non-root alike, so the negative test does not depend on the
+        // test user being unprivileged.
+        let watermark = dir.path().join("rustynetd.trust.watermark");
+        fs::create_dir(&watermark).expect("create directory");
+        let err = trust_record_issue_timestamp(watermark.as_path(), 5_030)
+            .expect_err("an unreadable watermark must fail closed");
+        assert!(
+            err.contains("trust watermark"),
+            "the refusal must name the watermark: {err}"
+        );
+    }
+
+    // ----- CM-03: temp-file publish source re-verification -----
+
+    /// CM-03. `create_secure_temp_file` drops its descriptor, so a name
+    /// replaced in between creation and publication would be chowned and
+    /// renamed into place as the published artifact.
+    #[test]
+    fn cm03_publish_refuses_a_symlink_swapped_in_for_the_temp_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attacker_target = dir.path().join("attacker-owned");
+        fs::write(&attacker_target, "attacker payload\n").expect("write attacker file");
+        std::os::unix::fs::symlink(attacker_target.as_path(), dir.path().join("swapped"))
+            .expect("plant symlink");
+
+        let err = ensure_temp_publish_source_is_private_regular_file(
+            dir.path().join("swapped").as_path(),
+            "assignment bundle",
+        )
+        .expect_err("a symlink must never be published");
+        assert!(
+            err.contains("symlink"),
+            "the refusal must name the substitution: {err}"
+        );
+    }
+
+    #[test]
+    fn cm03_publish_refuses_a_group_or_world_writable_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tmp = create_secure_temp_file(dir.path(), "publish-source.").expect("temp file");
+        ensure_temp_publish_source_is_private_regular_file(tmp.as_path(), "trust evidence")
+            .expect("a freshly created 0600 temp file must pass its own re-check");
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o666)).expect("chmod");
+        let err =
+            ensure_temp_publish_source_is_private_regular_file(tmp.as_path(), "trust evidence")
+                .expect_err("a world-writable source must not be published");
+        assert!(
+            err.contains("group or world writable"),
+            "the refusal must name the permission: {err}"
+        );
+        assert!(tmp.exists(), "the refusal must not delete the file");
+    }
+
+    // ----- CM-06: temporary files are cleaned up on every early return -----
+
+    #[test]
+    fn cm06_the_temp_guard_removes_an_unpublished_file_and_spares_a_released_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let leaked = create_secure_temp_file(dir.path(), "leaked.").expect("temp file");
+        {
+            let _guard = TempFileCleanupGuard::new(leaked.clone());
+            assert!(leaked.exists(), "still live inside the scope");
+        }
+        assert!(
+            !leaked.exists(),
+            "an early `?` return must not leave a root-owned 0600 temporary behind"
+        );
+
+        let kept = create_secure_temp_file(dir.path(), "published.").expect("temp file");
+        {
+            let mut guard = TempFileCleanupGuard::new(kept.clone());
+            guard.release();
+        }
+        assert!(
+            kept.exists(),
+            "a published temporary must not be removed again by the guard"
+        );
+    }
+
+    // ----- wiring witnesses -----
+
+    /// CM-01 wiring: the boundary helper must be the thing `ops
+    /// refresh-signed-trust` calls, with both real checks.
+    #[test]
+    fn cm01_the_real_command_calls_the_boundary_with_both_real_checks() {
+        let body = function_body("execute_ops_refresh_signed_trust");
+        assert!(
+            body.contains("enforce_refresh_signed_trust_privilege_boundary(")
+                && body.contains("require_root_execution")
+                && body.contains("enforce_pinned_runtime_binary_custody"),
+            "the command must delegate to the boundary helper with BOTH real checks: {body}"
+        );
+    }
+
+    /// CM-02 wiring: the issued record must be stamped with the latched
+    /// timestamp, not the bare wall clock.
+    #[test]
+    fn cm02_the_issued_record_uses_the_latched_timestamp() {
+        let body = function_body("refresh_trust_record_with_inputs");
+        assert!(
+            body.contains("updated_at_unix: issue_timestamp,"),
+            "TrustCommand::Issue must be stamped from trust_record_issue_timestamp: {body}"
+        );
+        assert!(
+            !body.contains("updated_at_unix: unix_now(),"),
+            "a bare unix_now() stamp is the CM-02 defect and must not remain: {body}"
+        );
+        assert!(
+            body.contains("trust_record_issue_timestamp("),
+            "the latch must be computed from the persisted watermark: {body}"
+        );
+    }
+
+    /// CM-05 wiring: the production entry point must resolve the systemd default
+    /// env file too, not just the refresh env file.
+    #[test]
+    fn cm05_the_production_verdict_passes_the_systemd_default_env_path() {
+        let body = function_body("local_assignment_authority_verdict");
+        assert!(
+            body.contains("RUSTYNET_SYSTEMD_ENV_PATH") && body.contains("DEFAULT_SYSTEMD_ENV_PATH"),
+            "the verdict must resolve the unit's default env file: {body}"
+        );
+    }
+
+    /// CM-06 wiring: both temporaries must be owned by a guard, created before
+    /// the first fallible step they protect, and released only once published.
+    #[test]
+    fn cm06_the_refresh_creates_both_temporaries_under_guards() {
+        let body = function_body("execute_ops_refresh_assignment");
+        assert_eq!(
+            body.matches("TempFileCleanupGuard::new(").count(),
+            2,
+            "both temporaries must be owned by a guard: {body}"
+        );
+        assert_eq!(
+            body.matches(".release()").count(),
+            2,
+            "both guards must be released on the published path: {body}"
+        );
+        assert!(
+            body.find("TempFileCleanupGuard::new(") < body.find("parse_assignment_nodes("),
+            "the guards must exist before the first fallible step they protect"
+        );
+    }
+
+    /// CM-03 wiring: every publisher re-verifies its temporary source, so no
+    /// call site can publish a substituted name.
+    #[test]
+    fn cm03_every_publish_re_verifies_its_temporary_source() {
+        let body = function_body("publish_file_with_owner_mode");
+        assert!(
+            body.contains("ensure_temp_publish_source_is_private_regular_file("),
+            "the publish path must re-check the temporary source before chowning and \
+             renaming it into place: {body}"
+        );
+        let helper = function_body("ensure_temp_publish_source_is_private_regular_file");
+        assert!(
+            helper.contains("is_symlink()") && helper.contains("0o022"),
+            "the re-check must refuse a symlink and a group/world-writable source: {helper}"
+        );
+    }
+
+    /// CM-04 wiring: the reader the authority gate uses is the last-assignment
+    /// reader, not a first-match one.
+    #[test]
+    fn cm04_the_authority_gate_uses_the_last_assignment_reader() {
+        let body = function_body("local_assignment_authority_verdict_with_env_files");
+        assert!(
+            !body.contains("assignment_refresh_env_value("),
+            "the merged body must be resolved through assignment_refresh_effective_path: {body}"
+        );
+        assert_eq!(
+            body.matches("assignment_refresh_effective_path(").count(),
+            2,
+            "both authority keys must be resolved from the merged body: {body}"
+        );
     }
 }
