@@ -23,6 +23,7 @@
     )
 )]
 use rustynet_crypto::{KeyCustodyPermissionPolicy, write_encrypted_key_file};
+use rustynet_dns_zone::canonicalize_dns_zone_name;
 use rustynetd::daemon::{
     ANCHOR_BUNDLE_PULL_ADDR_ENV, ANCHOR_BUNDLE_PULL_ALLOW_LAN_ENV,
     ANCHOR_BUNDLE_PULL_TOKEN_PATH_ENV, ANCHOR_ENROLLMENT_ADDR_ENV, ANCHOR_ENROLLMENT_ALLOW_LAN_ENV,
@@ -3590,7 +3591,8 @@ fn parse_daemon_config(args: &[String]) -> Result<DaemonConfig, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "--dns-zone-name requires a value".to_owned())?;
-                config.dns_zone_name = value.clone();
+                config.dns_zone_name = canonicalize_dns_zone_name(value)
+                    .map_err(|err| format!("invalid --dns-zone-name: {err}"))?;
                 index += 2;
             }
             Some("--dns-resolver-bind-addr") => {
@@ -6817,6 +6819,50 @@ mod tests {
             config.dns_resolver_bind_addr,
             DEFAULT_DNS_RESOLVER_BIND_ADDR.parse().unwrap()
         );
+    }
+
+    #[test]
+    fn parse_daemon_config_canonicalises_dns_zone_name() {
+        // b01-12/F1 — the configured zone name is canonicalised at parse
+        // time so it matches the canonical zone name the signed bundle
+        // parser always stores.
+        for typed in ["Zone.Example.", "zone.example"] {
+            let args = vec![
+                "--dns-zone-name".to_owned(),
+                typed.to_owned(),
+                "--dns-resolver-bind-addr".to_owned(),
+                "127.0.0.1:5300".to_owned(),
+            ];
+            let config = parse_daemon_config(&args).expect("config should parse");
+            assert_eq!(
+                config.dns_zone_name, "zone.example",
+                "typed {typed:?} must canonicalise to zone.example"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_daemon_config_rejects_invalid_dns_zone_name() {
+        for (typed, reason) in [
+            ("zone..example", "empty label"),
+            ("zone_example", "invalid characters"),
+            (
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+                "maximum length",
+            ),
+        ] {
+            let args = vec!["--dns-zone-name".to_owned(), typed.to_owned()];
+            let err = parse_daemon_config(&args)
+                .expect_err("an uncanonicalisable zone name must be refused at parse time");
+            assert!(
+                err.contains("--dns-zone-name"),
+                "refusal must name --dns-zone-name for {typed:?}: {err}"
+            );
+            assert!(
+                err.contains(reason),
+                "refusal for {typed:?} should mention {reason:?}: {err}"
+            );
+        }
     }
 
     #[test]

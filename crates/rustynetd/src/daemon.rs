@@ -12751,6 +12751,13 @@ pub fn run_daemon(config: DaemonConfig) -> Result<(), DaemonError> {
     resolve_configured_egress_interface(&mut config)?;
     normalize_windows_dns_resolver_bind_addr(&mut config);
     normalize_windows_key_custody_paths(&mut config);
+    // b01-12/F1 — the signed bundle parser always stores a canonical zone
+    // name (lowercased, trailing dots stripped), so the configured name must
+    // be canonicalised once here; the identity compare in
+    // `load_dns_zone_bundle` then compares canonical against canonical and
+    // stays strict.
+    config.dns_zone_name = canonicalize_dns_zone_name(&config.dns_zone_name)
+        .map_err(|err| DaemonError::InvalidConfig(format!("invalid --dns-zone-name: {err}")))?;
     validate_daemon_config(&config)?;
     #[cfg(windows)]
     {
@@ -16680,6 +16687,13 @@ fn load_dns_zone_bundle(
         local_node_id,
         auto_tunnel,
     } = context;
+    // b01-12/F1 — the bundle side of the identity check below is always
+    // canonical (the wire parser canonicalises `zone_name`), so canonicalise
+    // the configured side too and keep that check a strict
+    // canonical-vs-canonical compare.
+    let expected_zone_name = canonicalize_dns_zone_name(expected_zone_name).map_err(|err| {
+        DnsZoneBootstrapError::InvalidFormat(format!("configured dns zone name is invalid: {err}"))
+    })?;
     if !path.exists() {
         return Err(DnsZoneBootstrapError::Missing);
     }
@@ -24495,6 +24509,56 @@ mod tests {
         );
     }
 
+    /// Like `write_dns_zone_file` but signs the bundle for an explicit zone
+    /// name, so tests can exercise the configured-vs-bundle zone identity
+    /// check with non-default zones.
+    fn write_dns_zone_file_for_zone(
+        path: &Path,
+        verifier_path: &Path,
+        zone_name: &str,
+        subject_node_id: &str,
+    ) {
+        let signing_key = SigningKey::from_bytes(&[31u8; 32]);
+        std::fs::write(
+            verifier_path,
+            format!("{}\n", hex_encode(signing_key.verifying_key().as_bytes())),
+        )
+        .expect("dns zone verifier key should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(verifier_path, std::fs::Permissions::from_mode(0o644))
+                .expect("dns zone verifier key permissions should be secure")
+        };
+
+        let bundle = rustynet_dns_zone::build_signed_dns_zone_bundle(
+            &signing_key,
+            zone_name,
+            subject_node_id,
+            unix_now(),
+            60,
+            7,
+            &[rustynet_dns_zone::DnsZoneRecordInput {
+                label: "app".to_owned(),
+                target_node_id: "node-exit".to_owned(),
+                rr_type: rustynet_dns_zone::DnsRecordType::A,
+                target_addr_kind: rustynet_dns_zone::DnsTargetAddrKind::MeshIpv4,
+                expected_ip: "100.64.0.7".to_owned(),
+                ttl_secs: 60,
+                aliases: Vec::new(),
+            }],
+        )
+        .expect("dns zone bundle should be built");
+        let body = rustynet_dns_zone::render_signed_dns_zone_bundle_wire(&bundle);
+        std::fs::write(path, body).expect("dns zone file should be written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                .expect("dns zone bundle permissions should be secure");
+        }
+    }
+
     fn build_dns_query(name: &str, qtype: u16) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0x1234_u16.to_be_bytes());
@@ -26806,6 +26870,47 @@ mod tests {
         assert!(
             source.contains("fn read_text_artifact_bounded("),
             "`read_text_artifact_bounded` helper must remain present"
+        );
+    }
+
+    #[test]
+    fn run_daemon_rejects_invalid_dns_zone_name_naming_flag() {
+        let config = DaemonConfig {
+            dns_zone_name: "zone..example".to_owned(),
+            ..DaemonConfig::default()
+        };
+        let err = run_daemon(config).expect_err("invalid dns zone name must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--dns-zone-name"),
+            "refusal must name the --dns-zone-name flag: {msg}"
+        );
+        assert!(
+            msg.contains("empty label"),
+            "refusal should carry the canonicaliser reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_daemon_canonicalises_configured_dns_zone_name_instead_of_refusing() {
+        // A mixed-case / trailing-dot configured name is the same zone as its
+        // canonical form; the daemon must accept it and continue validation.
+        // `wg_interface` is emptied so validation stops on a known later
+        // check, proving the zone-name gate did not refuse the input.
+        let config = DaemonConfig {
+            dns_zone_name: "Zone.Example.".to_owned(),
+            wg_interface: String::new(),
+            ..DaemonConfig::default()
+        };
+        let err = run_daemon(config).expect_err("wg gate should stop startup here");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wireguard interface must not be empty"),
+            "non-canonical but valid zone name must pass the zone gate: {msg}"
+        );
+        assert!(
+            !msg.contains("--dns-zone-name"),
+            "zone name gate must not fire for a canonicalisable name: {msg}"
         );
     }
 
@@ -37850,6 +37955,81 @@ mod tests {
 
         let _ = std::fs::remove_file(assignment_path);
         let _ = std::fs::remove_file(assignment_verifier_path);
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_accepts_non_canonical_configured_zone_name() {
+        // b01-12/F1 — the bundle parser always stores a canonical zone name,
+        // so a configured `--dns-zone-name` with mixed case or a trailing dot
+        // must load a bundle whose canonical zone name matches. Before the
+        // fix the raw-vs-canonical compare rejected every such bundle as
+        // InvalidFormat.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-config-canonicalised");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        write_dns_zone_file_for_zone(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "zone.example",
+            "daemon-local",
+        );
+        for expected_zone_name in ["Zone.Example.", "zone.example"] {
+            let envelope = load_dns_zone_bundle(DnsZoneLoadContext {
+                path: &dns_zone_path,
+                verifier_key_path: &dns_zone_verifier_path,
+                max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+                trust_policy: TrustPolicy::default(),
+                previous_watermark: None,
+                expected_zone_name,
+                local_node_id: "daemon-local",
+                auto_tunnel: None,
+            })
+            .unwrap_or_else(|err| {
+                panic!("bundle should load for expected zone {expected_zone_name}: {err}")
+            });
+            assert_eq!(envelope.bundle.zone_name, "zone.example");
+        }
+
+        let _ = std::fs::remove_file(dns_zone_path);
+        let _ = std::fs::remove_file(dns_zone_verifier_path);
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn load_dns_zone_bundle_rejects_different_zone_name_with_mismatch_error() {
+        // A genuinely different configured zone name must still be rejected,
+        // with the zone_name mismatch error rather than acceptance.
+        let test_dir = secure_test_dir("rustynetd-dns-zone-other-zone-mismatch");
+        let dns_zone_path = test_dir.join("dns-zone.bundle");
+        let dns_zone_verifier_path = test_dir.join("dns-zone.verifier.pub");
+        write_dns_zone_file_for_zone(
+            &dns_zone_path,
+            &dns_zone_verifier_path,
+            "zone.example",
+            "daemon-local",
+        );
+        let err = load_dns_zone_bundle(DnsZoneLoadContext {
+            path: &dns_zone_path,
+            verifier_key_path: &dns_zone_verifier_path,
+            max_age_secs: DEFAULT_DNS_ZONE_MAX_AGE_SECS,
+            trust_policy: TrustPolicy::default(),
+            previous_watermark: None,
+            expected_zone_name: "other.example",
+            local_node_id: "daemon-local",
+            auto_tunnel: None,
+        })
+        .expect_err("a genuinely different zone name must still be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("zone_name mismatch"),
+            "expected the zone_name mismatch error, got: {message}"
+        );
+        assert!(message.contains("zone.example"), "message: {message}");
+        assert!(message.contains("other.example"), "message: {message}");
+
         let _ = std::fs::remove_file(dns_zone_path);
         let _ = std::fs::remove_file(dns_zone_verifier_path);
         let _ = std::fs::remove_dir_all(test_dir);
