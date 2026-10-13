@@ -21315,6 +21315,20 @@ mod tests {
 
         // The failure clears: the listener opens and the failure memory resets.
         drop(squatter);
+        // On macOS std creates a listening socket without atomic close-on-exec (socket() runs
+        // first, FIOCLEX afterwards), so a child spawned concurrently by another test thread can
+        // inherit the squatter's fd and keep the port bound after the drop. Wait until a
+        // connect to the port is refused so the precondition 'the port is free' is explicit and a
+        // lingering inherited listener is named instead of failing the assertion below.
+        let free_deadline = Instant::now() + Duration::from_secs(15);
+        while std::net::TcpStream::connect_timeout(&taken, Duration::from_millis(200)).is_ok() {
+            assert!(
+                Instant::now() < free_deadline,
+                "port {taken} still accepting after the squatter was dropped: the listening fd was \
+                 inherited by a concurrently spawned child"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         service.refresh(&config, t0 + Duration::from_secs(200));
         assert!(service.binding.is_some());
         assert!(service.last_bind_failure.is_none());
