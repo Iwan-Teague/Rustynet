@@ -2694,6 +2694,11 @@ fn stop_daemon_for_atomic_promotion(ctx: &LiveLabContext, target: &str) -> Resul
     ctx.run_root(target, &["systemctl", "stop", "rustynetd.service"])
 }
 
+/// The oneshot unit whose ExecStart (`rustynet ops
+/// apply-managed-dns-routing`) failed inside the katana-xnet-174 enforce
+/// burst while the evidence bundle held only systemctl's own hint text.
+const MANAGED_DNS_UNIT: &str = "rustynetd-managed-dns.service";
+
 fn enforce_host(
     ctx: &LiveLabContext,
     target: &str,
@@ -2702,7 +2707,7 @@ fn enforce_host(
     ssh_allow_cidrs: &str,
 ) -> Result<(), String> {
     let src_dir = LiveLabContext::remote_src_dir_for(target);
-    ctx.run_root(
+    let enforce = ctx.run_root(
         target,
         &[
             live_lab_support::REMOTE_RUSTYNET_BIN,
@@ -2717,8 +2722,74 @@ fn enforce_host(
             "--ssh-allow-cidrs",
             ssh_allow_cidrs,
         ],
-    )
-    .map(|_| ())
+    );
+    if let Err(enforce_err) = enforce {
+        // katana-xnet-174: the managed-dns oneshot failed in this burst and
+        // the bundle carried only systemctl's hint text, leaving the exact
+        // failing branch unproven. Attach the failing unit's status and
+        // journal tail to the stage log BEFORE the error propagates. The
+        // capture is best-effort (allow-failure): it never masks or weakens
+        // the enforce error — the stage still fails.
+        capture_enforce_failure_evidence(ctx, target);
+        return Err(enforce_err);
+    }
+    Ok(())
+}
+
+/// The node probes captured into the stage log after an `e2e-enforce-host`
+/// failure: the managed-dns unit's status, the tail of its journal, and the
+/// resolved state of the tunnel link. Diagnosis only — no check is bypassed
+/// and the enforce error still fails the stage.
+fn enforce_failure_evidence_probes() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        (
+            "managed-dns unit status",
+            vec!["systemctl", "status", MANAGED_DNS_UNIT, "--no-pager", "-l"],
+        ),
+        (
+            "managed-dns unit journal tail",
+            vec![
+                "journalctl",
+                "-u",
+                MANAGED_DNS_UNIT,
+                "-n",
+                "50",
+                "--no-pager",
+            ],
+        ),
+        (
+            "resolved tunnel link state",
+            vec!["resolvectl", "status", TUNNEL_IFACE],
+        ),
+    ]
+}
+
+fn capture_enforce_failure_evidence(ctx: &LiveLabContext, target: &str) {
+    capture_enforce_failure_evidence_with(
+        target,
+        &mut |argv| ctx.capture_root_allow_failure(target, argv),
+        &mut |line| eprintln!("{line}"),
+    );
+}
+
+/// Closure-driven so a unit test pins WHICH probes run, that the journal tail
+/// reaches the stage log, and that an unreachable node degrades to per-probe
+/// warnings instead of panicking or masking the enforce error.
+fn capture_enforce_failure_evidence_with(
+    target: &str,
+    capture: &mut dyn FnMut(&[&str]) -> Result<String, String>,
+    emit: &mut dyn FnMut(&str),
+) {
+    for (label, argv) in enforce_failure_evidence_probes() {
+        match capture(&argv) {
+            Ok(output) => emit(&format!(
+                "enforce-failure evidence on {target} [{label}]:\n{output}"
+            )),
+            Err(err) => emit(&format!(
+                "warning: enforce-failure evidence on {target} [{label}] unavailable: {err}"
+            )),
+        }
+    }
 }
 
 fn ensure_daemon_services_ready(ctx: &LiveLabContext, target: &str) -> Result<(), String> {
@@ -3007,6 +3078,134 @@ mod tests {
         assert!(super::validate_ssh_allow_cidrs(super::LAN_TEST_CIDR).is_err());
         assert!(super::validate_ssh_allow_cidrs("192.168.64.0/24").is_ok());
         assert!(super::validate_ssh_allow_cidrs("192.168.64.0/24, 10.0.7.0/24").is_ok());
+    }
+
+    #[test]
+    fn enforce_failure_evidence_captures_unit_status_and_journal_tail_into_stage_log() {
+        // katana-xnet-174: the managed-dns oneshot failed in the enforce
+        // burst and the evidence bundle held only systemctl's hint text, so
+        // the exact failing branch stayed unproven. Every failure must now
+        // capture the unit status, the unit journal tail, and the resolved
+        // link state into the stage log.
+        let mut captured: Vec<Vec<String>> = Vec::new();
+        let mut emitted: Vec<String> = Vec::new();
+        capture_enforce_failure_evidence_with(
+            "katana-client-1",
+            &mut |argv: &[&str]| {
+                captured.push(argv.iter().map(ToString::to_string).collect());
+                if argv[0] == "journalctl" {
+                    Ok(
+                        "Oct 13 02:12:40 systemd[1]: rustynetd-managed-dns.service: \
+                        Main process exited, code=exited, status=1/FAILURE"
+                            .to_owned(),
+                    )
+                } else {
+                    Ok("status-body".to_owned())
+                }
+            },
+            &mut |line: &str| emitted.push(line.to_owned()),
+        );
+        assert_eq!(captured.len(), 3, "all three probes must run");
+        let journal_index = captured
+            .iter()
+            .position(|argv| argv[0] == "journalctl")
+            .expect("the unit journal tail must be among the probes");
+        let journal_argv = &captured[journal_index];
+        assert!(
+            journal_argv.contains(&"rustynetd-managed-dns.service".to_owned()),
+            "the journal probe must target the managed-dns unit: {journal_argv:?}"
+        );
+        assert!(
+            journal_argv.contains(&"--no-pager".to_owned()),
+            "the journal probe must not page: {journal_argv:?}"
+        );
+        let status_index = captured
+            .iter()
+            .position(|argv| argv[0] == "systemctl" && argv[1] == "status")
+            .expect("the unit status must be among the probes");
+        assert!(
+            captured[status_index].contains(&"rustynetd-managed-dns.service".to_owned()),
+            "the status probe must target the managed-dns unit"
+        );
+        assert!(
+            emitted.iter().any(
+                |line| line.contains("enforce-failure evidence on katana-client-1")
+                    && line.contains("rustynetd-managed-dns.service: Main process exited")
+            ),
+            "the captured journal tail must reach the stage log: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_failure_evidence_survives_an_unreachable_node_without_masking() {
+        // A node that cannot be reached for the capture (ssh-level failure)
+        // must degrade to per-probe warnings: never a panic, never a skipped
+        // capture, and the enforce error still propagates unchanged.
+        let mut emitted: Vec<String> = Vec::new();
+        let mut capture_calls = 0usize;
+        capture_enforce_failure_evidence_with(
+            "katana-client-1",
+            &mut |_argv: &[&str]| {
+                capture_calls += 1;
+                Err(format!(
+                    "ssh to katana-client-1 failed (call {capture_calls})"
+                ))
+            },
+            &mut |line: &str| emitted.push(line.to_owned()),
+        );
+        assert_eq!(capture_calls, 3);
+        assert_eq!(emitted.len(), 3);
+        assert!(
+            emitted.iter().all(|line| line.contains("unavailable")
+                && line.contains("ssh to katana-client-1 failed")),
+            "each failed probe must be reported as unavailable: {emitted:?}"
+        );
+    }
+
+    #[test]
+    fn enforce_host_attaches_failure_evidence_before_propagating_the_error() {
+        // Wiring pin: enforce_host must run the evidence capture on its
+        // failure path BEFORE returning the enforce error, so the stage log
+        // always carries the journal tail. Fails against the pre-W10 tree,
+        // where enforce_host mapped the error straight through.
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let start = source
+            .find("\nfn enforce_host(")
+            .expect("enforce_host must exist");
+        let end = source[start..]
+            .find("\nfn ensure_daemon_services_ready(")
+            .expect("ensure_daemon_services_ready must follow enforce_host");
+        let body = &source[start..start + end];
+        let capture_position = body
+            .find("capture_enforce_failure_evidence(")
+            .unwrap_or_else(|| {
+                panic!("enforce_host must capture failure evidence on its error path")
+            });
+        let propagate_position = body
+            .find("return Err(enforce_err)")
+            .expect("enforce_host must propagate the original enforce error unchanged");
+        assert!(
+            capture_position < propagate_position,
+            "the evidence capture must run BEFORE the error propagates"
+        );
+    }
+
+    #[test]
+    fn enforce_failure_evidence_probes_are_fixed_safe_argvs() {
+        // Every probe is a fixed literal argv against the node: no
+        // interpolation of test-controlled strings into root commands.
+        for (_label, argv) in enforce_failure_evidence_probes() {
+            for token in &argv {
+                assert!(
+                    !token.is_empty()
+                        && token
+                            .chars()
+                            .all(|ch| ch.is_ascii_alphanumeric()
+                                || matches!(ch, '-' | '_' | '.' | '/')),
+                    "probe tokens must be fixed safe literals: {token}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3653,7 +3852,8 @@ mod tests {
     }
 
     use super::{
-        AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate, daemon_socket_path,
+        AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate,
+        capture_enforce_failure_evidence_with, daemon_socket_path, enforce_failure_evidence_probes,
         is_macos_utun_iface_name, killswitch_drop_table_present, killswitch_dump_argv,
         killswitch_enforcement_present, lan_probe_argv, macos_killswitch_anchor_present,
         managed_dns_base_records, managed_dns_records_manifest_for_scope,

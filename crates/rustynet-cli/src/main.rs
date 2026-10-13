@@ -11535,6 +11535,19 @@ const DEFAULT_AUTO_TUNNEL_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.as
 use rustynetd::privileged_helper::DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH;
 const DEFAULT_SYSTEMD_ENV_PATH: &str = "/etc/default/rustynetd";
 const MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS: u64 = 20;
+/// Poll cadence of the managed-DNS readiness wait. Both readiness signals
+/// (interface under /sys/class/net, daemon restricted-safe mode) are
+/// re-checked on every tick.
+const MANAGED_DNS_ROUTING_WAIT_TICK: Duration = Duration::from_millis(200);
+/// Transient `resolvectl` failures tolerated after the interface appears
+/// (systemd-resolved may register the freshly recreated link late). A second
+/// consecutive failure is final and fails closed with diagnostics.
+const MANAGED_DNS_ROUTING_RESOLVCTL_RETRIES: u32 = 1;
+const MANAGED_DNS_ROUTING_RESOLVCTL_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// The oneshot unit whose ExecStart runs `apply-managed-dns-routing`; named
+/// in the failure diagnostics so the captured journal tail is attributable.
+const MANAGED_DNS_ROUTING_UNIT: &str = "rustynetd-managed-dns.service";
+const MANAGED_DNS_ROUTING_JOURNAL_TAIL_LINES: &str = "50";
 const DEFAULT_PHASE6_PARITY_RAW_DIR: &str = "artifacts/release/raw";
 const DEFAULT_PHASE6_PARITY_INBOX_DIR: &str = "artifacts/release/inbox";
 const DEFAULT_PHASE6_PARITY_REPORT_PATH: &str = "artifacts/release/platform_parity_report.json";
@@ -11609,43 +11622,66 @@ fn execute_ops_apply_managed_dns_routing() -> Result<String, String> {
 
     ensure_systemd_resolved_active()?;
     let interface = managed_dns_interface_name_from_env()?;
-    // If the interface isn't up yet and the daemon reports restricted-safe mode,
-    // skip DNS configuration.  The daemon is intentionally holding off the tunnel
-    // (e.g. during a live role switch before membership catches up).  The service
-    // will re-run when the daemon exits restriction and brings up the interface.
-    if !Path::new("/sys/class/net")
-        .join(interface.as_str())
-        .exists()
-    {
+    let zone_name = managed_dns_zone_name_from_env()?;
+    let resolver_bind_addr = managed_dns_resolver_bind_addr_from_env()?;
+    let resolver_arg = managed_dns_resolver_server_arg(resolver_bind_addr)?;
+
+    // If the interface isn't up yet and the daemon reports restricted-safe
+    // mode, skip DNS configuration.  The daemon is intentionally holding off
+    // the tunnel (e.g. during a live role switch before membership catches
+    // up).  The service will re-run when the daemon exits restriction and
+    // brings up the interface.  Both readiness signals are re-polled for the
+    // whole wait budget (see `wait_for_managed_dns_routing_readiness`): the
+    // former single sample taken before a path-only wait drove this pass to
+    // spurious failures whenever the freshly restarted daemon answered after
+    // that one sample (katana-xnet-174 `live_lan_toggle_validation`).
+    let mut interface_exists = || {
+        Path::new("/sys/class/net")
+            .join(interface.as_str())
+            .exists()
+    };
+    let mut daemon_restricted_safe_mode = || -> Option<bool> {
         let socket_path = PathBuf::from(DEFAULT_SOCKET_PATH);
-        if let Ok(status) = send_command_with_socket(IpcCommand::Status, socket_path)
-            && status.ok
-            && status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
-                == Some("true")
-        {
+        let status = send_command_with_socket(IpcCommand::Status, socket_path).ok()?;
+        if !status.ok {
+            return None;
+        }
+        Some(
+            status_field(status.message.as_str(), "restricted_safe_mode").as_deref()
+                == Some("true"),
+        )
+    };
+    let mut resolvectl = |args: &[&str]| run_resolvectl_action(args);
+    let mut retry_sleep = || std::thread::sleep(MANAGED_DNS_ROUTING_RESOLVCTL_RETRY_DELAY);
+    let mut capture_diagnostics = || capture_managed_dns_failure_diagnostics(interface.as_str());
+
+    match wait_for_managed_dns_routing_readiness(
+        interface.as_str(),
+        Duration::from_secs(MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS),
+        MANAGED_DNS_ROUTING_WAIT_TICK,
+        &mut interface_exists,
+        &mut daemon_restricted_safe_mode,
+        &mut capture_diagnostics,
+    )? {
+        ManagedDnsRoutingReadiness::DaemonRestrictedSafeMode => {
             return Ok(format!(
                 "managed DNS routing skipped: daemon restricted-safe mode (interface {interface} not yet up)"
             ));
         }
+        ManagedDnsRoutingReadiness::InterfaceReady => {}
     }
-    wait_for_managed_dns_interface(
-        interface.as_str(),
-        Duration::from_secs(MANAGED_DNS_ROUTING_INTERFACE_WAIT_SECS),
-    )?;
-    let zone_name = managed_dns_zone_name_from_env()?;
-    let resolver_bind_addr = managed_dns_resolver_bind_addr_from_env()?;
-    let resolver_arg = managed_dns_resolver_server_arg(resolver_bind_addr)?;
-    let routing_zone = format!("~{zone_name}");
 
-    run_resolvectl_action(&["dns", interface.as_str(), resolver_arg.as_str()])?;
-    run_resolvectl_action(&[
-        "domain",
+    let routing_zone = format!("~{zone_name}");
+    run_managed_dns_resolvectl_sequence(
         interface.as_str(),
         routing_zone.as_str(),
         zone_name.as_str(),
-    ])?;
-    run_resolvectl_action(&["default-route", interface.as_str(), "no"])?;
-    run_resolvectl_action(&["status", interface.as_str()])?;
+        resolver_arg.as_str(),
+        MANAGED_DNS_ROUTING_RESOLVCTL_RETRIES,
+        &mut resolvectl,
+        &mut retry_sleep,
+        &mut capture_diagnostics,
+    )?;
 
     Ok(format!(
         "managed DNS routing applied: interface={interface} zone={zone_name} resolver={resolver_bind_addr}"
@@ -14447,22 +14483,162 @@ fn ensure_systemd_resolved_active() -> Result<(), String> {
     Ok(())
 }
 
-fn wait_for_managed_dns_interface(interface: &str, timeout: Duration) -> Result<(), String> {
-    let interface_path = Path::new("/sys/class/net").join(interface);
+/// Outcome of the bounded managed-DNS readiness wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedDnsRoutingReadiness {
+    /// The managed interface exists; the resolvectl sequence may proceed.
+    InterfaceReady,
+    /// The daemon reports restricted-safe mode; DNS configuration is
+    /// intentionally deferred and the pass exits successfully so the unit
+    /// re-runs when the daemon exits restriction and brings the interface up.
+    DaemonRestrictedSafeMode,
+}
+
+/// Bounded readiness wait for the managed-DNS routing pass.
+///
+/// The enforce pass restarts `rustynetd.service`; the unit's `PartOf` /
+/// `BindsTo` stop the managed-dns oneshot, and the daemon recreates
+/// `rustynet0` asynchronously after it comes back. The former code sampled
+/// `restricted_safe_mode` exactly once before a path-only wait, so a daemon
+/// that answered (or entered restriction) after that one sample drove this
+/// pass to a spurious failure. Every `tick` both readiness signals are
+/// re-checked:
+///
+/// - the managed interface appearing under `/sys/class/net`, or
+/// - an AFFIRMATIVE `restricted_safe_mode=true` from the daemon. The skip is
+///   fail-closed: an unreachable daemon (`None`) or any non-`true` answer
+///   never skips, it keeps waiting.
+///
+/// The wait is bounded by `timeout` (each sleep is capped at the remaining
+/// budget) and a timeout is final: the error carries the injected
+/// diagnostics (unit status + journal tail + link state) and the pass still
+/// FAILS — DNS that never becomes ready never passes silently.
+fn wait_for_managed_dns_routing_readiness(
+    interface: &str,
+    timeout: Duration,
+    tick: Duration,
+    interface_exists: &mut dyn FnMut() -> bool,
+    daemon_restricted_safe_mode: &mut dyn FnMut() -> Option<bool>,
+    capture_diagnostics: &mut dyn FnMut() -> String,
+) -> Result<ManagedDnsRoutingReadiness, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if interface_path.exists() {
-            return Ok(());
+        if interface_exists() {
+            return Ok(ManagedDnsRoutingReadiness::InterfaceReady);
         }
-        if Instant::now() >= deadline {
+        if daemon_restricted_safe_mode() == Some(true) {
+            return Ok(ManagedDnsRoutingReadiness::DaemonRestrictedSafeMode);
+        }
+        let now = Instant::now();
+        if now >= deadline {
             return Err(format!(
-                "managed DNS routing interface did not appear within {}s: {}",
+                "managed DNS routing interface did not appear within {}s: {}; daemon \
+                 restricted-safe mode was never reported during the wait; node diagnostics:\n{}",
                 timeout.as_secs(),
-                interface
+                interface,
+                capture_diagnostics(),
             ));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(tick.min(deadline - now));
     }
+}
+
+/// The resolvectl programming sequence for the managed interface, retried
+/// `retries` times on transient failure (systemd-resolved may not yet have
+/// registered the freshly recreated link when the interface first appears).
+/// Every attempt re-runs the full dns/domain/default-route/status sequence:
+/// the actions are declarative sets, so a partially applied attempt is
+/// completed rather than duplicated. After the final failure the error
+/// carries the injected diagnostics and the pass FAILS CLOSED.
+#[allow(clippy::too_many_arguments)]
+fn run_managed_dns_resolvectl_sequence(
+    interface: &str,
+    routing_zone: &str,
+    zone_name: &str,
+    resolver_arg: &str,
+    retries: u32,
+    resolvectl: &mut dyn FnMut(&[&str]) -> Result<(), String>,
+    retry_sleep: &mut dyn FnMut(),
+    capture_diagnostics: &mut dyn FnMut() -> String,
+) -> Result<(), String> {
+    let mut last_err = None;
+    for attempt in 0..=retries {
+        if attempt > 0 {
+            retry_sleep();
+        }
+        let outcome = resolvectl(&["dns", interface, resolver_arg])
+            .and_then(|_| resolvectl(&["domain", interface, routing_zone, zone_name]))
+            .and_then(|_| resolvectl(&["default-route", interface, "no"]))
+            .and_then(|_| resolvectl(&["status", interface]));
+        match outcome {
+            Ok(()) => return Ok(()),
+            Err(err) => last_err = Some(err),
+        }
+    }
+    let last_err = last_err.expect("the sequence runs at least once");
+    Err(format!(
+        "managed DNS routing resolvectl sequence failed for {interface} after {} \
+         attempt(s): {last_err}; node diagnostics:\n{}",
+        retries + 1,
+        capture_diagnostics(),
+    ))
+}
+
+/// Best-effort diagnostics for a failed managed-DNS routing pass: the
+/// managed-dns unit's status, the tail of its journal, and the resolved link
+/// state. katana-xnet-174's evidence bundle held only systemctl's hint text,
+/// which left the exact failing branch unproven; this text is embedded in
+/// the pass's final error so the next failure is self-diagnosing. A capture
+/// that itself fails is reported inside the returned text and never masks
+/// the primary error.
+fn capture_managed_dns_failure_diagnostics(interface: &str) -> String {
+    let probes = [
+        (
+            format!("systemctl status {MANAGED_DNS_ROUTING_UNIT}"),
+            "systemctl",
+            vec!["status", MANAGED_DNS_ROUTING_UNIT, "--no-pager", "-l"],
+        ),
+        (
+            format!(
+                "journalctl -u {MANAGED_DNS_ROUTING_UNIT} -n {MANAGED_DNS_ROUTING_JOURNAL_TAIL_LINES}"
+            ),
+            "journalctl",
+            vec![
+                "-u",
+                MANAGED_DNS_ROUTING_UNIT,
+                "-n",
+                MANAGED_DNS_ROUTING_JOURNAL_TAIL_LINES,
+                "--no-pager",
+            ],
+        ),
+        (
+            format!("resolvectl status {interface}"),
+            "resolvectl",
+            vec!["status", interface],
+        ),
+    ];
+    probes
+        .into_iter()
+        .map(|(label, program, args)| {
+            let body = match run_command_capture(program, &args) {
+                Ok(output) => {
+                    let exit = if output.status.success() {
+                        "ok"
+                    } else {
+                        "non-zero exit"
+                    };
+                    format!(
+                        "exit={exit}\n{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr),
+                    )
+                }
+                Err(err) => format!("unavailable: {err}"),
+            };
+            format!("--- {label} ---\n{body}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn run_resolvectl_action(args: &[&str]) -> Result<(), String> {
@@ -23526,10 +23702,10 @@ mod tests {
         ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH, AnchorCommand,
         AssignmentRefreshAuthorityDecision, CliCommand,
         DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, ForcedAssignmentRefresh,
-        ForcedRefreshAssignmentPlan, MembershipCommand, MembershipEvidenceSummary,
-        MembershipOperation, OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE, OpsCommand,
-        PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, Phase6ProbeMetadataView, RoleCapability,
-        apply_forced_refresh_assignment_plan, assignment_pair_refresh_skip,
+        ForcedRefreshAssignmentPlan, ManagedDnsRoutingReadiness, MembershipCommand,
+        MembershipEvidenceSummary, MembershipOperation, OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE,
+        OpsCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, Phase6ProbeMetadataView,
+        RoleCapability, apply_forced_refresh_assignment_plan, assignment_pair_refresh_skip,
         assignment_refresh_authority_decision, assignment_refresh_effective_path,
         build_membership_audit_replay_json, build_membership_evidence_diff_json,
         classify_cli_error, command_supports_json_render, consume_enrollment_token_locked,
@@ -23549,8 +23725,9 @@ mod tests {
         render_launchd_plist, required_macos_tunnel_keychain_account,
         required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
         rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, role_coupling_kept_warning,
-        to_ipc_command, unix_now, update_node_role_env_file, update_node_role_macos_plist,
-        update_node_role_windows_env_file, validate_control_socket_security,
+        run_managed_dns_resolvectl_sequence, to_ipc_command, unix_now, update_node_role_env_file,
+        update_node_role_macos_plist, update_node_role_windows_env_file,
+        validate_control_socket_security, wait_for_managed_dns_routing_readiness,
         with_kept_bundle_context, with_plan_context, write_encrypted_key_file,
         write_json_pretty_file,
     };
@@ -29293,6 +29470,261 @@ mod tests {
         )
         .expect_err("ipv6 loopback resolver addr should be rejected");
         assert!(err.contains("IPv4 loopback"));
+    }
+
+    #[test]
+    fn managed_dns_readiness_wait_skips_when_restricted_mode_is_reported_late() {
+        // katana-xnet-174: the enforce pass restarts the daemon and the old
+        // code sampled `restricted_safe_mode` exactly once before a
+        // path-only 20 s wait. Here the daemon answers `false` (or is not
+        // yet answerable) on the first poll and only reports restricted-safe
+        // mode from the second poll on; the wait must return the
+        // skip-success instead of burning the whole budget and failing.
+        let mut interface_polls = 0usize;
+        let mut interface_exists = || {
+            interface_polls += 1;
+            false
+        };
+        let mut daemon_polls = 0usize;
+        let mut daemon_restricted_safe_mode = || {
+            daemon_polls += 1;
+            Some(daemon_polls >= 2)
+        };
+        let mut capture_diagnostics = || "journal tail text".to_owned();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        assert_eq!(
+            outcome,
+            Ok(ManagedDnsRoutingReadiness::DaemonRestrictedSafeMode),
+            "a restricted-safe-mode answer observed mid-wait must produce the skip-success"
+        );
+        assert!(
+            daemon_polls >= 2,
+            "the daemon must be re-polled inside the wait loop, not sampled once"
+        );
+        assert!(interface_polls >= 2);
+    }
+
+    #[test]
+    fn managed_dns_readiness_wait_fails_closed_when_dns_never_becomes_ready() {
+        // An unreachable daemon (None) never authorizes the skip: the wait
+        // must run to its deadline and FAIL, with the captured diagnostics
+        // (unit journal tail) in the error text.
+        let mut interface_exists = || false;
+        let mut daemon_restricted_safe_mode = || None;
+        let mut capture_diagnostics =
+            || "unit status: failed\njournalctl tail: ExecStart failed".to_owned();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(60),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        let err = outcome.expect_err("a DNS that never becomes ready must still FAIL");
+        assert!(
+            err.contains("did not appear within"),
+            "clear failure: {err}"
+        );
+        assert!(err.contains("rustynet0"), "names the interface: {err}");
+        assert!(
+            err.contains("journalctl tail: ExecStart failed"),
+            "the error must carry the captured unit diagnostics: {err}"
+        );
+    }
+
+    #[test]
+    fn managed_dns_readiness_wait_is_bounded_by_its_deadline() {
+        let mut polls = 0usize;
+        let mut interface_exists = || {
+            polls += 1;
+            false
+        };
+        let mut daemon_restricted_safe_mode = || None;
+        let mut capture_diagnostics = || String::new();
+        let started = std::time::Instant::now();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        assert!(outcome.is_err());
+        // ~100 ms / 10 ms tick => a bounded handful of polls, never an
+        // unbounded loop; each sleep is capped at the remaining budget.
+        assert!(
+            polls <= 14,
+            "poll count must be deadline-bounded, got {polls}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must terminate at its deadline"
+        );
+    }
+
+    #[test]
+    fn managed_dns_readiness_interface_ready_takes_precedence_over_restricted_mode() {
+        // The interface check must run BEFORE the restricted-mode probe on
+        // every tick: an up interface plus a restricted-mode answer means the
+        // resolvectl sequence still runs (the skip is only for the
+        // interface-absent case).
+        let mut interface_exists = || true;
+        let mut daemon_restricted_safe_mode = || Some(true);
+        let mut capture_diagnostics = || String::new();
+        let outcome = wait_for_managed_dns_routing_readiness(
+            "rustynet0",
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_millis(10),
+            &mut interface_exists,
+            &mut daemon_restricted_safe_mode,
+            &mut capture_diagnostics,
+        );
+        assert_eq!(
+            outcome,
+            Ok(ManagedDnsRoutingReadiness::InterfaceReady),
+            "an up interface must proceed to DNS configuration even if the daemon reports restriction"
+        );
+    }
+
+    #[test]
+    fn managed_dns_resolvectl_sequence_retries_a_transient_failure_once() {
+        // systemd-resolved may not have registered the freshly recreated
+        // link yet: the first dns call fails, the retry (after the injected
+        // delay) re-runs the FULL sequence and succeeds.
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut first_call_fails = true;
+        let mut resolvectl = |args: &[&str]| {
+            calls.push(args.iter().map(ToString::to_string).collect());
+            if first_call_fails {
+                first_call_fails = false;
+                return Err(format!(
+                    "resolvectl {} failed: Failed to resolve interface",
+                    args.join(" ")
+                ));
+            }
+            Ok(())
+        };
+        let mut retry_sleeps = 0usize;
+        let mut retry_sleep = || retry_sleeps += 1;
+        let mut capture_diagnostics = || "diagnostics".to_owned();
+        let outcome = run_managed_dns_resolvectl_sequence(
+            "rustynet0",
+            "~zone.example",
+            "zone.example",
+            "127.0.0.1:53535",
+            1,
+            &mut resolvectl,
+            &mut retry_sleep,
+            &mut capture_diagnostics,
+        );
+        assert!(
+            outcome.is_ok(),
+            "one transient failure must be retried: {outcome:?}"
+        );
+        assert_eq!(retry_sleeps, 1, "exactly one retry delay, then no more");
+        assert_eq!(
+            calls.len(),
+            5,
+            "the failed first attempt costs one call; the retry reruns all 4 actions"
+        );
+        assert_eq!(
+            calls[1].first().map(String::as_str),
+            Some("dns"),
+            "the retry restarts the full sequence, not just the failed action"
+        );
+    }
+
+    #[test]
+    fn managed_dns_resolvectl_sequence_fails_closed_after_the_single_retry() {
+        let mut attempts = 0usize;
+        let mut resolvectl = |_args: &[&str]| {
+            attempts += 1;
+            Err::<(), String>("resolvectl dns rustynet0 failed: link gone".to_owned())
+        };
+        let mut retry_sleeps = 0usize;
+        let mut retry_sleep = || retry_sleeps += 1;
+        let mut capture_diagnostics = || "journalctl tail: managed-dns ExecStart failed".to_owned();
+        let outcome = run_managed_dns_resolvectl_sequence(
+            "rustynet0",
+            "~zone.example",
+            "zone.example",
+            "127.0.0.1:53535",
+            1,
+            &mut resolvectl,
+            &mut retry_sleep,
+            &mut capture_diagnostics,
+        );
+        let err = outcome.expect_err("persistent resolvectl failure must still FAIL");
+        assert_eq!(attempts, 2, "exactly one retry: bounded, never unbounded");
+        assert_eq!(retry_sleeps, 1);
+        assert!(err.contains("after 2 attempt(s)"), "clear failure: {err}");
+        assert!(
+            err.contains("link gone"),
+            "carries the last action error: {err}"
+        );
+        assert!(
+            err.contains("journalctl tail: managed-dns ExecStart failed"),
+            "carries the captured unit diagnostics: {err}"
+        );
+    }
+
+    #[test]
+    fn managed_dns_apply_pass_waits_for_readiness_and_attaches_diagnostics() {
+        // Source pin for the wiring: the apply pass must drive the
+        // readiness wait (which re-checks restricted-safe mode on every
+        // tick) and the retrying resolvectl sequence, and the readiness wait
+        // must consult the daemon probe inside its loop and embed the
+        // captured diagnostics in its timeout error. The old code sampled
+        // restricted_safe_mode exactly once before a path-only wait and
+        // produced failures without any node diagnostics.
+        let source = include_str!("main.rs");
+        let apply_start = source
+            .find("\nfn execute_ops_apply_managed_dns_routing(")
+            .expect("execute_ops_apply_managed_dns_routing must exist");
+        let apply_end = source[apply_start..]
+            .find("\nfn execute_ops_clear_managed_dns_routing(")
+            .expect("execute_ops_clear_managed_dns_routing must follow the apply pass");
+        let apply_body = &source[apply_start..apply_start + apply_end];
+        assert!(
+            apply_body.contains("wait_for_managed_dns_routing_readiness("),
+            "the apply pass must use the readiness wait (katana-xnet-174)"
+        );
+        assert!(
+            apply_body.contains("run_managed_dns_resolvectl_sequence("),
+            "the apply pass must use the retrying resolvectl sequence"
+        );
+        assert!(
+            !apply_body.contains("fn wait_for_managed_dns_interface"),
+            "the one-shot path-only wait must not be reintroduced inline"
+        );
+        let wait_start = source
+            .find("\nfn wait_for_managed_dns_routing_readiness(")
+            .expect("the readiness wait must exist");
+        let wait_end = source[wait_start..]
+            .find("\n/// The resolvectl programming sequence")
+            .expect("the resolvectl sequence doc must follow the readiness wait");
+        let wait_body = &source[wait_start..wait_start + wait_end];
+        let loop_start = wait_body
+            .find("loop {")
+            .expect("the wait must poll in a loop");
+        let loop_body = &wait_body[loop_start..];
+        assert!(
+            loop_body.contains("daemon_restricted_safe_mode()"),
+            "restricted-safe mode must be re-checked on every tick, not sampled once"
+        );
+        assert!(
+            loop_body.contains("capture_diagnostics()"),
+            "the timeout error must attach the captured node diagnostics"
+        );
     }
 
     #[test]
