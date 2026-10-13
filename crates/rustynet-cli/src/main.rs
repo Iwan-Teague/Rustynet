@@ -9842,6 +9842,121 @@ fn refresh_trust_record_with_inputs(
     ))
 }
 
+/// Outcome of the refresh-assignment authority gate.
+enum AssignmentRefreshAuthorityDecision {
+    /// The on-disk verifier key matches (or is absent): the node-local signing
+    /// secret is the assignment authority, so the refresh proceeds as before.
+    Proceed,
+    /// The on-disk verifier key belongs to a different authority: the refresh
+    /// must not issue, publish, or rewrite anything, and must surface why.
+    SkipExternalAuthority(String),
+}
+
+/// The loud, journal-visible message a skipped external-authority refresh
+/// returns. The systemd oneshot unit must stay successful (an intentionally
+/// skipped refresh is not a failure and must not flap the timer), but the
+/// reason has to be unambiguous in the logs.
+const ASSIGNMENT_REFRESH_EXTERNAL_AUTHORITY_MESSAGE: &str =
+    "assignment.pub belongs to a different authority; not re-issuing";
+
+/// Parse the on-disk assignment verifier key with the same shape rules the
+/// daemon applies when it verifies a bundle (`load_auto_tunnel_verifying_key`
+/// in rustynetd/src/daemon.rs): first non-empty, non-comment line, 64 hex
+/// characters encoding a 32-byte verifying key.
+fn parse_assignment_pub_verifier_key(contents: &str) -> Result<[u8; 32], String> {
+    let key_line = contents
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .ok_or_else(|| "missing verifier key line".to_owned())?;
+    ops_e2e::decode_hex_32(key_line).map_err(|err| format!("invalid verifier key hex: {err}"))
+}
+
+/// Compare the on-disk verifier key against the verifier key of the node-local
+/// signing secret (derived with the same pure helper the issuer uses) and
+/// decide whether the refresh may proceed. katana-xnet-82: a node whose
+/// assignment authority is external (the lab's exit) used to have its trusted
+/// verifier key silently replaced here, leaving a bundle signed by key A next
+/// to the verifier of key B — permanent fail-closed.
+fn assignment_refresh_authority_decision(
+    existing_pub_contents: &str,
+    local_verifier_key_hex: &str,
+) -> Result<AssignmentRefreshAuthorityDecision, String> {
+    let on_disk_key =
+        parse_assignment_pub_verifier_key(existing_pub_contents).map_err(|err| {
+            format!(
+                "[assignment-refresh] existing assignment verifier key is unparseable; failing closed: {err}"
+            )
+        })?;
+    let local_key = ops_e2e::decode_hex_32(local_verifier_key_hex)
+        .map_err(|err| format!("derived local assignment verifier key is invalid: {err}"))?;
+    if on_disk_key == local_key {
+        return Ok(AssignmentRefreshAuthorityDecision::Proceed);
+    }
+    Ok(AssignmentRefreshAuthorityDecision::SkipExternalAuthority(
+        format!(
+            "[assignment-refresh] {ASSIGNMENT_REFRESH_EXTERNAL_AUTHORITY_MESSAGE}; \
+             keeping the existing assignment bundle and verifier key untouched."
+        ),
+    ))
+}
+
+/// Same read bound the daemon applies to the assignment verifier key
+/// (`MAX_BUNDLE_VERIFIER_KEY_BYTES` in rustynetd/src/daemon.rs): an oversized
+/// file fails closed instead of being slurped into memory.
+const ASSIGNMENT_PUB_MAX_BYTES: u64 = 4 * 1024;
+
+fn read_assignment_pub_bounded(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let file = fs::File::open(path)?;
+    let mut buffer = String::new();
+    let read = file
+        .take(ASSIGNMENT_PUB_MAX_BYTES + 1)
+        .read_to_string(&mut buffer)?;
+    if read as u64 > ASSIGNMENT_PUB_MAX_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("exceeds the {ASSIGNMENT_PUB_MAX_BYTES} byte verifier-key bound"),
+        ));
+    }
+    Ok(buffer)
+}
+
+/// Authority gate for `ops refresh-assignment`, run after the freshness skip
+/// and before any issuance or publish:
+/// - verifier key absent -> proceed (first install);
+/// - verifier key parses and matches the local secret's verifier key -> proceed
+///   (single-authority install, byte-for-byte today's behaviour);
+/// - verifier key parses and differs -> Ok(Some(loud skip message)); the
+///   bundle and the verifier key on disk are left byte-identical;
+/// - verifier key unreadable or unparseable -> Err (fail closed, change nothing).
+fn enforce_refresh_assignment_authority_gate(
+    verifier_key_path: &Path,
+    signing_secret_path: &Path,
+    signing_secret_passphrase_path: &Path,
+) -> Result<Option<String>, String> {
+    let existing_pub_contents = match read_assignment_pub_bounded(verifier_key_path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(format!(
+                "[assignment-refresh] existing assignment verifier key at {} cannot be read; failing closed: {err}",
+                verifier_key_path.display()
+            ));
+        }
+    };
+    let signing_secret =
+        load_assignment_signing_secret(signing_secret_path, signing_secret_passphrase_path)?;
+    let local_verifier_key_hex = ops_e2e::assignment_verifier_key_hex(signing_secret.as_slice());
+    match assignment_refresh_authority_decision(
+        existing_pub_contents.as_str(),
+        local_verifier_key_hex.as_str(),
+    )? {
+        AssignmentRefreshAuthorityDecision::Proceed => Ok(None),
+        AssignmentRefreshAuthorityDecision::SkipExternalAuthority(message) => Ok(Some(message)),
+    }
+}
+
 fn execute_ops_refresh_assignment() -> Result<String, String> {
     require_root_execution()?;
     enforce_pinned_runtime_binary_custody("assignment-refresh")?;
@@ -9930,6 +10045,17 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
         return Ok(format!(
             "[assignment-refresh] current assignment expires in {remaining_secs}s; skip refresh.",
         ));
+    }
+
+    // The node-local refresh must never replace an assignment verifier key
+    // that belongs to a different authority: skip loudly instead, leaving
+    // both the bundle and the verifier key byte-identical on disk.
+    if let Some(skip_message) = enforce_refresh_assignment_authority_gate(
+        verifier_key_path.as_path(),
+        signing_secret_path.as_path(),
+        signing_secret_passphrase_path.as_path(),
+    )? {
+        return Ok(skip_message);
     }
 
     let bundle_group_gid = group_gid_required(daemon_group.as_str())?;
@@ -23018,26 +23144,28 @@ mod guest_claim_wiring_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnchorCommand, CliCommand, DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, MembershipCommand,
-        MembershipEvidenceSummary, MembershipOperation, OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE,
-        OpsCommand, PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, Phase6ProbeMetadataView,
-        RoleCapability, build_membership_audit_replay_json, build_membership_evidence_diff_json,
-        classify_cli_error, command_supports_json_render, consume_enrollment_token_locked,
-        contains_ip_rule_lookup_table, detect_tampered_log, execute,
+        AnchorCommand, AssignmentRefreshAuthorityDecision, CliCommand,
+        DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, MembershipCommand, MembershipEvidenceSummary,
+        MembershipOperation, OPS_VERIFY_RELEASE_MANIFEST_USAGE_LINE, OpsCommand,
+        PHASE6_MAX_EVIDENCE_AGE_SECS, Phase6Platform, Phase6ProbeMetadataView, RoleCapability,
+        assignment_refresh_authority_decision, build_membership_audit_replay_json,
+        build_membership_evidence_diff_json, classify_cli_error, command_supports_json_render,
+        consume_enrollment_token_locked, contains_ip_rule_lookup_table, detect_tampered_log,
+        encrypted_secret_permission_policy, enforce_refresh_assignment_authority_gate, execute,
         execute_macos_relay_service_action, execute_ops, extract_json_flag, finalize_role_audit,
         help_text, is_interface_absent_detail, is_managed_disconnect_nft_table, launchd_xml_escape,
         load_dns_zone_records_manifest, load_signing_key, managed_dns_resolver_server_arg,
-        managed_dns_routing_already_absent, parse_bool_value, parse_bundle_u64_field,
-        parse_command, parse_managed_pf_anchors, parse_prior_membership_evidence_body,
-        parse_wireguard_go_pids_from_ps, persist_encrypted_secret_material,
-        phase6_stage_probe_from_source, phase6_sync_platform_probe_from_inbox,
-        phase6_validate_macos_start_contract_text, phase6_validate_platform_parity_report,
-        read_json_value, render_key_value_line_as_json, render_launchd_plist,
-        required_macos_tunnel_keychain_account, required_macos_tunnel_keychain_service,
-        rewrite_assignment_refresh_exit_node, rewrite_assignment_refresh_lan_routes,
-        rewrite_env_key_value, to_ipc_command, unix_now, update_node_role_env_file,
-        update_node_role_macos_plist, update_node_role_windows_env_file,
-        validate_control_socket_security, write_json_pretty_file,
+        managed_dns_routing_already_absent, parse_assignment_pub_verifier_key, parse_bool_value,
+        parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
+        parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
+        persist_encrypted_secret_material, phase6_stage_probe_from_source,
+        phase6_sync_platform_probe_from_inbox, phase6_validate_macos_start_contract_text,
+        phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
+        render_launchd_plist, required_macos_tunnel_keychain_account,
+        required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
+        update_node_role_env_file, update_node_role_macos_plist, update_node_role_windows_env_file,
+        validate_control_socket_security, write_encrypted_key_file, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -27310,6 +27438,339 @@ mod tests {
     #[cfg(feature = "vm-lab")]
     fn hex_of(bytes: &[u8; 32]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    // ── refresh-assignment authority gate (katana-xnet-82) ──────────────────
+    // The guest timer re-issues with the NODE-LOCAL secret and used to rewrite
+    // the node's trusted verifier key even when that key belonged to an
+    // external authority, tearing the {bundle, pub} pair fail-closed. These
+    // tests exercise the real gate against real encrypted-secret fixtures and
+    // assert the on-disk artifacts stay byte-identical whenever it refuses.
+
+    #[cfg(unix)]
+    const GATE_TEST_PASSPHRASE: &str = "aq84 unit test passphrase material";
+
+    #[cfg(unix)]
+    fn write_refresh_gate_secret_fixture(dir: &Path, secret: &[u8]) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let secret_path = dir.join("assignment.signing.secret");
+        let passphrase_path = dir.join("signing_key_passphrase");
+        fs::write(&passphrase_path, GATE_TEST_PASSPHRASE).expect("write passphrase fixture");
+        fs::set_permissions(&passphrase_path, fs::Permissions::from_mode(0o600))
+            .expect("restrict passphrase fixture permissions");
+        write_encrypted_key_file(
+            dir,
+            &secret_path,
+            secret,
+            GATE_TEST_PASSPHRASE,
+            encrypted_secret_permission_policy(&secret_path),
+        )
+        .expect("write encrypted signing secret fixture");
+        (secret_path, passphrase_path)
+    }
+
+    #[test]
+    fn parse_assignment_pub_verifier_key_accepts_daemon_compatible_shapes() {
+        let key_hex = "aa".repeat(32);
+        let expected: [u8; 32] = [0xaa; 32];
+        let truncated = key_hex[..63].to_owned();
+        let too_long = format!("{key_hex}0");
+        let non_hex = format!("{}zz", &key_hex[..62]);
+
+        let with_newline =
+            parse_assignment_pub_verifier_key(format!("{key_hex}\n").as_str()).expect("newline");
+        assert_eq!(with_newline, expected);
+
+        let with_comment_and_blanks = parse_assignment_pub_verifier_key(
+            format!("# written by the authority\n\n  {key_hex}  \n").as_str(),
+        )
+        .expect("comment/blank lines and surrounding whitespace");
+        assert_eq!(with_comment_and_blanks, expected);
+
+        let no_newline = parse_assignment_pub_verifier_key(key_hex.as_str()).expect("no newline");
+        assert_eq!(no_newline, expected);
+
+        for (bad, label) in [
+            ("", "empty"),
+            ("# only a comment\n", "comment-only"),
+            (truncated.as_str(), "truncated"),
+            (too_long.as_str(), "too long"),
+            (non_hex.as_str(), "non-hex"),
+        ] {
+            let err = parse_assignment_pub_verifier_key(bad)
+                .expect_err(&format!("{label} verifier key must be rejected"));
+            assert!(!err.is_empty(), "{label}");
+        }
+    }
+
+    fn authority_gate_scratch_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "rn-authority-gate-{tag}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn authority_gate_fails_closed_when_the_pub_cannot_be_read() {
+        // A DIRECTORY at the verifier-key path: read fails with a non-NotFound
+        // error, which must be Err (fail closed), never "proceed".
+        let dir = authority_gate_scratch_dir("unreadable");
+        let pub_path = dir.join("assignment.pub");
+        fs::create_dir_all(&pub_path).expect("directory in place of the key");
+        let result = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            dir.join("no-such.secret").as_path(),
+            dir.join("no-such.pass").as_path(),
+        );
+        assert!(
+            result.is_err(),
+            "unreadable pub must fail closed: {result:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authority_gate_fails_closed_on_an_oversized_pub() {
+        let dir = authority_gate_scratch_dir("oversized");
+        let pub_path = dir.join("assignment.pub");
+        fs::write(&pub_path, "a".repeat(5 * 1024)).expect("write oversized pub");
+        let result = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            dir.join("no-such.secret").as_path(),
+            dir.join("no-such.pass").as_path(),
+        );
+        let err = result.expect_err("oversized pub must fail closed");
+        assert!(err.contains("byte verifier-key bound"), "got: {err}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn authority_gate_proceeds_when_the_pub_is_absent() {
+        let dir = authority_gate_scratch_dir("absent");
+        let result = enforce_refresh_assignment_authority_gate(
+            dir.join("assignment.pub").as_path(),
+            dir.join("no-such.secret").as_path(),
+            dir.join("no-such.pass").as_path(),
+        );
+        assert_eq!(result, Ok(None), "first install must proceed untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_assignment_pub_verifier_key_matches_daemon_on_uppercase_and_trailing_data() {
+        let upper = "AB".repeat(32);
+        assert!(
+            parse_assignment_pub_verifier_key(&upper).is_ok(),
+            "uppercase hex is accepted"
+        );
+        assert!(
+            parse_assignment_pub_verifier_key(&format!("{} trailing", "ab".repeat(32))).is_err(),
+            "trailing data on the key line is rejected (daemon parity)"
+        );
+        assert!(
+            parse_assignment_pub_verifier_key("# only a comment\n").is_err(),
+            "a file with no key line is rejected"
+        );
+    }
+
+    /// Wiring witness: the authority gate sits before every file creation and
+    /// publish in `execute_ops_refresh_assignment`. (A behavioural test needs
+    /// root; this pins the ordering of the source so a refactor cannot move a
+    /// write in front of the gate unnoticed.)
+    #[test]
+    fn refresh_assignment_runs_the_authority_gate_before_any_write() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn execute_ops_refresh_assignment() -> Result<String, String> {")
+            .expect("function present");
+        let body = &source[start..];
+        let gate = body
+            .find("enforce_refresh_assignment_authority_gate(")
+            .expect("gate call present");
+        let temp = body
+            .find("create_secure_temp_file(")
+            .expect("temp file creation present");
+        let publish = body
+            .find("publish_file_with_owner_mode(")
+            .expect("publish present");
+        assert!(gate < temp, "the gate must precede temp-file creation");
+        assert!(gate < publish, "the gate must precede the publish");
+    }
+
+    #[test]
+    fn assignment_refresh_authority_decision_skips_mismatch_and_proceeds_on_match() {
+        let local_hex = "ab".repeat(32);
+        let foreign_hex = "cd".repeat(32);
+
+        let skip = assignment_refresh_authority_decision(
+            format!("{foreign_hex}\n").as_str(),
+            local_hex.as_str(),
+        )
+        .expect("a parseable foreign pub must be a skip, not an error");
+        let AssignmentRefreshAuthorityDecision::SkipExternalAuthority(message) = skip else {
+            panic!("mismatched pub must skip, not proceed");
+        };
+        assert!(
+            message.contains("belongs to a different authority; not re-issuing"),
+            "skip message must be loud and unambiguous: {message}"
+        );
+
+        let proceed = assignment_refresh_authority_decision(
+            format!("{local_hex}\n").as_str(),
+            local_hex.as_str(),
+        )
+        .expect("a matched pub must not error");
+        assert!(matches!(
+            proceed,
+            AssignmentRefreshAuthorityDecision::Proceed
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_skips_mismatched_pub_without_touching_files() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        // Near-expiry bundle: the acting window in which the timer refresh
+        // fires and used to clobber the externally-managed verifier key.
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = "version=1\nnode_id=client-1\nexpires_at_unix=1234567890\n";
+        fs::write(&bundle_path, bundle_before).expect("write bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        let foreign_pub = format!("{}\n", "cd".repeat(32));
+        assert_ne!(
+            foreign_pub.trim(),
+            super::ops_e2e::assignment_verifier_key_hex(&secret_bytes),
+            "fixture pub must differ from the local secret's verifier key"
+        );
+        fs::write(&pub_path, &foreign_pub).expect("write foreign pub fixture");
+
+        let decision = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("a parseable foreign pub must be a skip, not an error");
+
+        let message = decision.expect("mismatched pub must skip the refresh");
+        assert!(
+            message.contains("belongs to a different authority; not re-issuing"),
+            "unexpected skip message: {message}"
+        );
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after gate"),
+            foreign_pub.as_bytes(),
+            "the verifier key must stay byte-identical"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after gate"),
+            bundle_before.as_bytes(),
+            "the bundle must stay byte-identical"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_proceeds_when_pub_matches_local_secret() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let pub_path = dir.path().join("assignment.pub");
+        let local_pub = format!(
+            "{}\n",
+            super::ops_e2e::assignment_verifier_key_hex(&secret_bytes)
+        );
+        fs::write(&pub_path, &local_pub).expect("write matched pub fixture");
+
+        let decision = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("a matched pub must not error");
+
+        assert!(
+            decision.is_none(),
+            "single-authority installs must proceed exactly as before"
+        );
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after gate"),
+            local_pub.as_bytes()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_proceeds_when_pub_is_absent() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let pub_path = dir.path().join("assignment.pub");
+        assert!(!pub_path.exists(), "fixture must start without a pub");
+
+        let decision = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect("an absent pub is a first install, not an error");
+
+        assert!(decision.is_none(), "absent pub must proceed");
+        assert!(!pub_path.exists(), "the gate must not create the pub");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refresh_authority_gate_fails_closed_on_unparseable_pub() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let secret_bytes: Vec<u8> = (0..48u8).collect();
+        let (secret_path, passphrase_path) =
+            write_refresh_gate_secret_fixture(dir.path(), &secret_bytes);
+
+        let bundle_path = dir.path().join("rustynetd.assignment");
+        let bundle_before = "version=1\nnode_id=client-1\nexpires_at_unix=1234567890\n";
+        fs::write(&bundle_path, bundle_before).expect("write bundle fixture");
+
+        let pub_path = dir.path().join("assignment.pub");
+        let corrupt_pub = "not-a-verifier-key\n";
+        fs::write(&pub_path, corrupt_pub).expect("write corrupt pub fixture");
+
+        let err = enforce_refresh_assignment_authority_gate(
+            pub_path.as_path(),
+            secret_path.as_path(),
+            passphrase_path.as_path(),
+        )
+        .expect_err("an unparseable pub must fail closed");
+
+        assert!(
+            err.contains("unparseable"),
+            "error must say the verifier key is unparseable: {err}"
+        );
+        assert_eq!(
+            fs::read(&pub_path).expect("read pub after gate"),
+            corrupt_pub.as_bytes(),
+            "a failing gate must change nothing"
+        );
+        assert_eq!(
+            fs::read(&bundle_path).expect("read bundle after gate"),
+            bundle_before.as_bytes(),
+            "a failing gate must change nothing"
+        );
     }
 
     #[test]

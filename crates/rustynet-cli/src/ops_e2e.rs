@@ -3687,7 +3687,7 @@ struct TwoNodeTraversalArtifacts {
     client_bundle_wire: String,
 }
 
-fn assignment_verifier_key_hex(signing_secret: &[u8]) -> String {
+pub(crate) fn assignment_verifier_key_hex(signing_secret: &[u8]) -> String {
     ControlPlaneCore::new(signing_secret.to_vec(), PolicySet::default())
         .assignment_verifier_key_hex()
 }
@@ -5649,7 +5649,7 @@ fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
+pub(crate) fn decode_hex_32(value: &str) -> Result<[u8; 32], String> {
     ensure_hex_32("hex", value)?;
     let mut out = [0u8; 32];
     // AQ-08: `ensure_hex_32` guarantees exactly 64 chars, so `chunks_exact(2)`
