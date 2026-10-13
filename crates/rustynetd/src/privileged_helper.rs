@@ -88,6 +88,9 @@ pub const DEFAULT_PRIVILEGED_HELPER_SOCKET_PATH: &str = DEFAULT_WINDOWS_PRIVILEG
 /// timeout, its write timeout, and the `run_privileged_subprocess` execution
 /// watchdog in `handle_request_with_timeout`. So the worst case a well-behaved
 /// client must wait for a response is bounded by this value plus the write.
+/// The exec path additionally bounds its post-exit pipe drain with a fixed
+/// deadline (`SUBPROCESS_DRAIN_DEADLINE`), so the exec worst case grows by
+/// that deadline.
 pub const DEFAULT_PRIVILEGED_HELPER_TIMEOUT_MS: u64 = 2_000;
 
 /// Slack added to the server budget to derive the daemon-side (client) read
@@ -2002,7 +2005,92 @@ pub(crate) fn validate_privileged_program_binary(
             canonical.display()
         ));
     }
+    // Linux: system install dirs are root-owned, so the full ancestor chain
+    // is enforced (sweep-b01-09 F1). macOS: deliberately NOT enforced — the
+    // Homebrew prefix is owned by the installing user, so enforcing here
+    // would refuse the standard Homebrew wireguard-go/wg. Enforcement waits
+    // for an installer that provides root-owned copies of the binaries
+    // (owner decision recorded in the sweep triage CORRECTION for
+    // sweep-b01-09). This is an added check on one platform; nothing
+    // existing is weakened.
+    #[cfg(target_os = "linux")]
+    validate_binary_ancestor_directories(&canonical, 0, label)?;
     Ok(canonical)
+}
+
+/// Ancestor-directory hardening for exec'd binaries (sweep-b01-09 F1). Walks
+/// every ancestor directory of `canonical`, nearest first, up to `/`, and
+/// requires each one to be a directory owned by `trusted_uid` with no
+/// group/other write bit (`mode & 0o022 == 0`; a sticky bit is NOT an
+/// exception here). Without this, an unprivileged user who controls any
+/// ancestor directory can `rename()` a swapped binary over the validated one
+/// between validation and spawn. Pure function: the platform gate lives at
+/// the call site.
+#[cfg(unix)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_binary_ancestor_directories(
+    canonical: &Path,
+    trusted_uid: u32,
+    label: &str,
+) -> Result<(), String> {
+    // The walk is only meaningful on a canonical path (no symlink, `.` or
+    // `..` components): `fs::metadata` follows symlinks, so a symlinked
+    // ancestor would have its TARGET checked rather than the link's parent.
+    // Reject anything lexically non-canonical instead of relying on the
+    // caller; a relative path used to fail only by accident at the empty
+    // path.
+    // `Path::components` silently drops an interior `.` (`/usr/./bin/tool`), so
+    // the raw byte segments are checked as well.
+    let has_dot_segment = canonical
+        .as_os_str()
+        .as_encoded_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|segment| segment == b"." || segment == b"..");
+    if !canonical.is_absolute()
+        || has_dot_segment
+        || canonical.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        })
+    {
+        return Err(format!(
+            "{label} binary ancestor walk requires an absolute canonical path: {}",
+            canonical.display()
+        ));
+    }
+    let mut current = canonical;
+    while let Some(dir) = current.parent() {
+        let metadata = fs::metadata(dir).map_err(|err| {
+            format!(
+                "{label} binary ancestor directory metadata failed: {} ({err})",
+                dir.display()
+            )
+        })?;
+        if !metadata.is_dir() {
+            return Err(format!(
+                "{label} binary ancestor is not a directory: {}",
+                dir.display()
+            ));
+        }
+        let owner_uid = metadata.uid();
+        if owner_uid != trusted_uid {
+            return Err(format!(
+                "{label} binary ancestor directory must be owned by uid {trusted_uid}: {} (uid={owner_uid})",
+                dir.display()
+            ));
+        }
+        let mode = metadata.mode() & 0o777;
+        if mode & 0o022 != 0 {
+            return Err(format!(
+                "{label} binary ancestor directory must not be group/other writable (a sticky bit is not an exception): {} ({mode:03o})",
+                dir.display()
+            ));
+        }
+        current = dir;
+    }
+    Ok(())
 }
 
 // NOTE: a `#[cfg(windows)]` `validate_privileged_program_binary` stub previously
@@ -2013,13 +2101,157 @@ pub(crate) fn validate_privileged_program_binary(
 // Privileged subprocess exec + its output helpers run only inside the unix
 // helper server; Windows never reaches the exec path (IPC fails closed first).
 #[cfg(not(windows))]
+const SUBPROCESS_DRAIN_CAP_BYTES: usize = 1024 * 1024;
+#[cfg(not(windows))]
+const SUBPROCESS_DRAIN_DEADLINE: Duration = Duration::from_secs(2);
+#[cfg(not(windows))]
+const SUBPROCESS_DRAIN_TRUNCATED_MARKER: &[u8] = b"\n...[truncated]";
+
+/// Environment names the privileged child must never inherit (sweep-b01-09
+/// F2): a leaked `LOG_LEVEL` makes wireguard-go log to the helper's
+/// stdout/stderr instead of /dev/null when it daemonizes without `-f`, and
+/// any `WG_*` leak changes the behaviour of the allow-listed wireguard
+/// tools. The helper itself sets neither.
+#[cfg(not(windows))]
+fn is_scrubbable_privileged_env_name(name: &std::ffi::OsStr) -> bool {
+    name == std::ffi::OsStr::new("LOG_LEVEL") || name.as_encoded_bytes().starts_with(b"WG_")
+}
+
+/// Scrub `LOG_LEVEL` and every inherited `WG_*` variable from the child
+/// environment via `Command::env_remove`.
+#[cfg(not(windows))]
+fn scrub_privileged_child_environment(command: &mut Command) {
+    command.env_remove("LOG_LEVEL");
+    let scrubbable: Vec<std::ffi::OsString> = std::env::vars_os()
+        .map(|(name, _)| name)
+        .filter(|name| is_scrubbable_privileged_env_name(name))
+        .collect();
+    for name in scrubbable {
+        command.env_remove(name);
+    }
+}
+
+/// One drained stream: the channel delivering the reader thread's
+/// `(captured bytes, truncated)` outcome. The thread is detached on purpose
+/// (accepted residual: it is never joined beyond the deadline).
+#[cfg(not(windows))]
+type SubprocessDrainOutcome = Result<(Vec<u8>, bool), String>;
+#[cfg(not(windows))]
+type SubprocessDrainChannel = std::sync::mpsc::Receiver<SubprocessDrainOutcome>;
+
+/// Fixed PATH for every privileged child. The child environment is cleared
+/// (`env_clear`) and this is the ONLY variable it receives, so nothing the
+/// helper itself inherited (EnvironmentFile contents, LD_PRELOAD,
+/// LD_LIBRARY_PATH, DYLD_*, RUST_LOG, ...) can reach an allow-listed binary.
+#[cfg(not(windows))]
+const PRIVILEGED_CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Reader thread body for one post-exit pipe: read at most
+/// `SUBPROCESS_DRAIN_CAP_BYTES + 1` bytes, report `(bytes, truncated)`; the
+/// `+ 1` distinguishes an exactly-full capture from a cap hit.
+#[cfg(not(windows))]
+fn drain_privileged_subprocess_output_pipe(
+    pipe: Option<impl std::io::Read + Send + 'static>,
+) -> Option<SubprocessDrainChannel> {
+    let pipe = pipe?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    // `Builder::spawn` returns Err instead of panicking when the OS refuses a
+    // thread (the plain `thread::spawn` panics inside the root helper). On Err
+    // the closure, which owns `tx` and the pipe, is dropped: the receiver
+    // reports Disconnected at once and `collect_drained_stream` marks the
+    // stream truncated, so the failure is visible and fail-closed.
+    let _detached = std::thread::Builder::new()
+        .name("rn-helper-drain".to_owned())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let mut captured = Vec::new();
+            let outcome = match pipe
+                .take(SUBPROCESS_DRAIN_CAP_BYTES as u64 + 1)
+                .read_to_end(&mut captured)
+            {
+                Ok(read_bytes) => {
+                    let truncated = read_bytes > SUBPROCESS_DRAIN_CAP_BYTES;
+                    if truncated {
+                        captured.truncate(SUBPROCESS_DRAIN_CAP_BYTES);
+                    }
+                    Ok((captured, truncated))
+                }
+                Err(err) => Err(err.to_string()),
+            };
+            let _ = tx.send(outcome);
+        });
+    Some(rx)
+}
+
+#[cfg(not(windows))]
+fn append_drain_truncation_marker(mut bytes: Vec<u8>) -> Vec<u8> {
+    bytes.extend_from_slice(SUBPROCESS_DRAIN_TRUNCATED_MARKER);
+    bytes
+}
+
+/// Collect one drained stream by its deadline-bounded channel. Accepted
+/// residuals (sweep-b01-09 F2): a reader thread still parked at the deadline
+/// is abandoned; its handle is NOT joined beyond the deadline, and the thread
+/// stays parked in `read()` until every holder of the pipe's write end exits
+/// — a silent daemonized grandchild parks it for the grandchild's whole
+/// lifetime (it does NOT "finish shortly after"). A non-clean outcome (read
+/// error, deadline, thread-spawn refusal) returns ONLY the truncation marker
+/// on an EMPTY capture: the bytes an abandoned thread already read are lost
+/// with it, so the response never claims completeness it does not have.
+#[cfg(not(windows))]
+fn collect_drained_stream(drained: Option<SubprocessDrainChannel>, deadline: Instant) -> Vec<u8> {
+    let Some(rx) = drained else {
+        return Vec::new();
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    match rx.recv_timeout(remaining) {
+        Ok(Ok((bytes, false))) => bytes,
+        Ok(Ok((bytes, true))) => append_drain_truncation_marker(bytes),
+        Ok(Err(_)) | Err(_) => append_drain_truncation_marker(Vec::new()),
+    }
+}
+
+/// Drain both pipes after the child has been reaped, bounded in total by
+/// `SUBPROCESS_DRAIN_DEADLINE` and per stream by
+/// `SUBPROCESS_DRAIN_CAP_BYTES`. Replaces the unbounded `wait_with_output`:
+/// a grandchild that inherited the pipes (wireguard-go daemonizing without
+/// `-f`) never sends EOF, and waiting for it wedged the helper's sequential
+/// accept loop (sweep-b01-09 F2/F3). This bounds ONLY the post-exit pipe
+/// drain; the child deadline+kill watchdog in `run_privileged_subprocess` is
+/// unchanged and is not replaced or extended by it.
+#[cfg(not(windows))]
+fn drain_privileged_subprocess_output(
+    mut child: std::process::Child,
+    status: ExitStatus,
+) -> Result<std::process::Output, String> {
+    let deadline = Instant::now() + SUBPROCESS_DRAIN_DEADLINE;
+    let stdout_drain = drain_privileged_subprocess_output_pipe(child.stdout.take());
+    let stderr_drain = drain_privileged_subprocess_output_pipe(child.stderr.take());
+    let stdout = collect_drained_stream(stdout_drain, deadline);
+    let stderr = collect_drained_stream(stderr_drain, deadline);
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+#[cfg(not(windows))]
 fn run_privileged_subprocess(
     binary: &Path,
     args: &[String],
     timeout: Duration,
 ) -> Result<std::process::Output, String> {
-    let mut child = Command::new(binary)
-        .args(args)
+    let mut command = Command::new(binary);
+    command.args(args);
+    // Minimal, fixed child environment: clear everything inherited, then set
+    // only PATH. The denylist scrub below stays as defence in depth (it also
+    // documents why LOG_LEVEL / WG_* must never come back).
+    command.env_clear();
+    command.env("PATH", PRIVILEGED_CHILD_PATH);
+    scrub_privileged_child_environment(&mut command);
+    let mut child = command
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -2028,10 +2260,11 @@ fn run_privileged_subprocess(
 
     loop {
         match child.try_wait().map_err(|err| err.to_string())? {
-            Some(_status) => {
-                return child
-                    .wait_with_output()
-                    .map_err(|err| format!("wait for privileged subprocess failed: {err}"));
+            Some(status) => {
+                // The child is reaped, but a grandchild may still hold the
+                // pipes open: drain with a deadline instead of the unbounded
+                // wait_with_output (sweep-b01-09 F2/F3).
+                return drain_privileged_subprocess_output(child, status);
             }
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
@@ -3722,7 +3955,8 @@ mod tests {
         MAX_MESSAGE_BYTES, MAX_PROGRAM_BYTES, PrivilegedCommandOutput, PrivilegedCommandProgram,
         decode_helper_request, encode_helper_request, handle_request, is_anchor_name_token,
         is_nft_token, is_path_token, is_safe_token, peer_uid, read_request, read_response_frame,
-        run_privileged_subprocess, validate_networksetup_args, validate_pfctl_args,
+        run_privileged_subprocess, validate_binary_ancestor_directories,
+        validate_networksetup_args, validate_pfctl_args,
         validate_privileged_helper_socket_security, validate_privileged_program_binary,
         validate_request, validate_sysctl_args, write_request_frame, write_response,
     };
@@ -6941,6 +7175,420 @@ mod tests {
         )
         .expect_err("sleeping subprocess should time out");
         assert!(err.contains("timed out after 50 ms"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_drain_returns_despite_pipe_holding_grandchild() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let unique = format!(
+            "rnh-drain-pid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let pid_path = std::env::temp_dir().join(unique);
+
+        struct KillPidFileOnDrop(PathBuf);
+        impl Drop for KillPidFileOnDrop {
+            fn drop(&mut self) {
+                if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                    let _ = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("kill -9 {} 2>/dev/null", pid.trim()))
+                        .status();
+                }
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = KillPidFileOnDrop(pid_path.clone());
+
+        // The child (sh) exits immediately; the backgrounded `sleep 30`
+        // grandchild inherits stdout/stderr and keeps the pipes open, so a
+        // plain wait-until-EOF blocks for the full 30 s (sweep-b01-09 F2).
+        let script = format!("sleep 30 & echo $! > {}; exit 0", pid_path.display());
+        let start = std::time::Instant::now();
+        let output = run_privileged_subprocess(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), script],
+            Duration::from_secs(10),
+        )
+        .expect("sh should exit immediately even with a pipe-holding grandchild");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "drain must return at the 2 s deadline + slack, took {elapsed:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("...[truncated]"),
+            "deadline-cut stream must be marked truncated: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_caps_captured_output_streams() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let unique = format!(
+            "rnh-cap-pid-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let pid_path = std::env::temp_dir().join(unique);
+
+        struct KillPidFileOnDrop(PathBuf);
+        impl Drop for KillPidFileOnDrop {
+            fn drop(&mut self) {
+                if let Ok(pid) = std::fs::read_to_string(&self.0) {
+                    let _ = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("kill -9 {} 2>/dev/null", pid.trim()))
+                        .status();
+                }
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _guard = KillPidFileOnDrop(pid_path.clone());
+
+        // Backgrounded pipeline: `yes` feeds `head`, which writes 1 MiB +
+        // 4096 bytes to the inherited stdout. The child (sh) has already
+        // exited while more than the 1 MiB capture cap actually flows through
+        // the pipe; `$!` is the pipeline's last member (head), killed by the
+        // guard so nothing outlives the test.
+        let total = 1024 * 1024 + 4096;
+        let script = format!(
+            "yes x | head -c {total} & echo $! > {}; exit 0",
+            pid_path.display()
+        );
+        let start = std::time::Instant::now();
+        let output = run_privileged_subprocess(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), script],
+            Duration::from_secs(10),
+        )
+        .expect("sh should exit immediately after backgrounding the pipeline");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "drain must not wait on the pipeline, took {elapsed:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("...[truncated]"),
+            "cap-hit stream must be marked truncated"
+        );
+        // EXACT length: cap bytes (truncate to the cap, not cap + 1) plus the
+        // fixed truncation marker. A tolerance here let a dropped
+        // `captured.truncate(..)` (cap + 1 bytes + marker) pass.
+        assert_eq!(
+            output.stdout.len(),
+            1024 * 1024 + "\n...[truncated]".len(),
+            "captured stdout must be exactly the cap plus the marker"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_child_env_omits_log_level_and_wg_names() {
+        if !Path::new("/usr/bin/env").exists() {
+            return;
+        }
+        let output =
+            run_privileged_subprocess(Path::new("/usr/bin/env"), &[], Duration::from_secs(10))
+                .expect("env should run");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            assert!(
+                !line.starts_with("LOG_LEVEL="),
+                "LOG_LEVEL must not reach the privileged child env: {line}"
+            );
+            assert!(
+                !line.starts_with("WG_"),
+                "WG_* must not reach the privileged child env: {line}"
+            );
+        }
+    }
+
+    // Tie the literal used in the behavioral tests above to the production
+    // constant; importing the constant itself would keep those tests from
+    // compiling against the base tree as witnesses.
+    const _: () = assert!(super::SUBPROCESS_DRAIN_CAP_BYTES == 1024 * 1024);
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_env_name_scrubber_matches_log_level_and_wg_prefix_only() {
+        let scrubbable =
+            |name: &str| super::is_scrubbable_privileged_env_name(std::ffi::OsStr::new(name));
+        assert!(scrubbable("LOG_LEVEL"));
+        assert!(scrubbable("WG_FOO"));
+        assert!(!scrubbable("WG"));
+        assert!(!scrubbable("LOG_LEVELX"));
+        assert!(!scrubbable("PATH"));
+        assert!(!scrubbable("WGX_FOO"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_scrub_marks_log_level_and_wg_names_for_removal() {
+        let mut command = std::process::Command::new("/bin/true");
+        super::scrub_privileged_child_environment(&mut command);
+        let removed: Vec<std::ffi::OsString> = command
+            .get_envs()
+            .filter_map(|(name, value)| {
+                if value.is_none() {
+                    Some(name.to_os_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(
+            removed
+                .iter()
+                .any(|name| name == std::ffi::OsStr::new("LOG_LEVEL")),
+            "scrub must env_remove LOG_LEVEL, got {removed:?}"
+        );
+        let inherited_wg: Vec<std::ffi::OsString> = std::env::vars_os()
+            .map(|(name, _)| name)
+            .filter(|name| name.as_encoded_bytes().starts_with(b"WG_"))
+            .collect();
+        for name in inherited_wg {
+            assert!(
+                removed.contains(&name),
+                "inherited WG_* variable must be env_remove'd: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_relative_and_dotdot_paths() {
+        let euid = nix::unistd::Uid::current().as_raw();
+        for bad in ["bin/tool", "/usr/bin/../bin/tool", "/usr/./bin/tool"] {
+            let err = validate_binary_ancestor_directories(Path::new(bad), euid, "test")
+                .expect_err("non-canonical path must be rejected before any walk");
+            assert!(err.contains("absolute canonical path"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_other_writable_only_ancestor_0757() {
+        let (tool, root) = write_ancestor_tree("ow", 0o757);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("other-writable ancestor must be rejected");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_returns_small_output_intact_on_both_streams() {
+        if !Path::new("/bin/sh").exists() {
+            return;
+        }
+        let output = run_privileged_subprocess(
+            Path::new("/bin/sh"),
+            &["-c".to_owned(), "echo out; echo err >&2".to_owned()],
+            Duration::from_secs(10),
+        )
+        .expect("sh should run");
+        assert_eq!(output.stdout, b"out\n");
+        assert_eq!(output.stderr, b"err\n");
+        assert!(output.status.success());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn privileged_subprocess_child_env_is_exactly_the_fixed_path() {
+        if !Path::new("/usr/bin/env").exists() {
+            return;
+        }
+        let output =
+            run_privileged_subprocess(Path::new("/usr/bin/env"), &[], Duration::from_secs(10))
+                .expect("env should run");
+        // Independent of whatever the test runner exports: the child sees
+        // PATH and nothing else.
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("PATH={}\n", super::PRIVILEGED_CHILD_PATH)
+        );
+    }
+
+    #[test]
+    fn validate_privileged_program_binary_calls_ancestor_walk_on_linux_with_root_uid() {
+        // Source pin (same style as the clamp-seam census above): the Linux
+        // call site is not reachable from an unprivileged unit test, so pin
+        // its exact gated shape. Needles are assembled from fragments so this
+        // test's own source never contains them verbatim.
+        let source = include_str!("privileged_helper.rs");
+        let call = [
+            "validate_binary_ancestor",
+            "_directories(&canonical, 0, label)?;",
+        ]
+        .concat();
+        // The `Ok(canonical)` tail pins the call INSIDE
+        // `validate_privileged_program_binary`, immediately before the
+        // success return: a call moved after `Ok(canonical)` (unreachable,
+        // silently dead validator) must fail this pin too.
+        let gated = [
+            "#[cfg(target_os = \"linux\")]\n    ",
+            call.as_str(),
+            "\n    Ok(canonical)",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(call.as_str()).count(),
+            1,
+            "exactly one production call site must walk the ancestors with trusted uid 0"
+        );
+        assert!(
+            source.contains(gated.as_str()),
+            "the ancestor walk must stay cfg(target_os = \"linux\")-gated and root-trusting"
+        );
+    }
+
+    /// Creates `<tmp>/rnh-anc-<tag>-<nanos>/base(mode)/bin/tool`; the walk
+    /// order is bin, base, root, then the ambient system ancestors.
+    #[cfg(unix)]
+    fn write_ancestor_tree(tag: &str, base_mode: u32) -> (PathBuf, PathBuf) {
+        let unique = format!(
+            "rnh-anc-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let base = root.join("base");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).expect("ancestor tree should be created");
+        let tool = bin.join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").expect("tool should be written");
+        for dir in [&root, &base, &bin] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("ancestor mode should be set");
+        }
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(base_mode))
+            .expect("base mode should be set");
+        (tool, root)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_accepts_compliant_ancestor_chain() {
+        let euid = nix::unistd::Uid::current().as_raw();
+        let unique = format!(
+            "rnh-anc-ok-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be valid")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(&unique);
+        let base = root.join("base");
+        let bin = base.join("bin");
+        std::fs::create_dir_all(&bin).expect("compliant tree should be created");
+        let tool = bin.join("tool");
+        std::fs::write(&tool, b"#!/bin/sh\nexit 0\n").expect("tool should be written");
+        for dir in [&root, &base, &bin] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))
+                .expect("compliant ancestor mode should be set");
+        }
+
+        // The walk runs to `/`, so on an unprivileged host it eventually hits
+        // a root-owned system ancestor (/tmp, /var/folders, /) and fails
+        // there. The compliant chain created here must pass: any error must
+        // name an ancestor ABOVE this tree, never a path inside it.
+        match validate_binary_ancestor_directories(&tool, euid, "test") {
+            Ok(()) => {}
+            Err(err) => assert!(
+                !err.contains(&unique),
+                "compliant ancestors must not be implicated: {err}"
+            ),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_group_writable_ancestor_0775() {
+        let (tool, root) = write_ancestor_tree("gw", 0o775);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("group-writable ancestor must be rejected");
+        assert!(err.contains("group/other writable"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_world_writable_ancestor_0777() {
+        let (tool, root) = write_ancestor_tree("ww", 0o777);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("world-writable ancestor must be rejected");
+        assert!(err.contains("group/other writable"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_sticky_world_writable_ancestor() {
+        let (tool, root) = write_ancestor_tree("sticky", 0o1777);
+        let euid = nix::unistd::Uid::current().as_raw();
+        let offender = root.join("base");
+        let err = validate_binary_ancestor_directories(&tool, euid, "test")
+            .expect_err("sticky world-writable ancestor must be rejected");
+        assert!(err.contains("a sticky bit is not an exception"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_binary_ancestor_directories_rejects_foreign_owned_ancestor() {
+        let (tool, root) = write_ancestor_tree("own", 0o755);
+        let euid = nix::unistd::Uid::current().as_raw();
+        // Nearest ancestor (bin) is owned by the current euid, so a
+        // different trusted_uid must fail the walk there.
+        let offender = root.join("base").join("bin");
+        let err = validate_binary_ancestor_directories(&tool, euid.wrapping_add(1), "test")
+            .expect_err("ancestor owned by another uid must be rejected");
+        assert!(err.contains("must be owned by uid"), "{err}");
+        assert!(
+            err.contains(offender.to_str().expect("utf-8 temp path")),
+            "error must name the offending ancestor: {err}"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
