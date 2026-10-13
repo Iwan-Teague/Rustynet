@@ -318,7 +318,18 @@ pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str =
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = DEFAULT_WINDOWS_MEMBERSHIP_WATERMARK_PATH;
-#[cfg(not(windows))]
+// The macOS literal must stay equal to the `MACOS_OWNER_SIGNING_KEY_PATH`
+// the macOS tooling seeds (`vm_lab/orchestrator/adapter/macos_install.rs`,
+// mirrored in `ops_e2e.rs`): a flag-less `membership init` must default to
+// the seeded path. That twin is `pub(crate)` inside rustynet-cli's private
+// `vm_lab`/`ops_e2e` modules and so unreachable from here; the literal is
+// duplicated and pinned against drift by
+// `membership_owner_signing_key_default_matches_rustynet_cli_twin_source`
+// (this file's tests) and the mirror test in rustynet-cli's main.rs.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
+    "/usr/local/etc/rustynet/membership.owner.key";
+#[cfg(all(not(windows), not(target_os = "macos")))]
 pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
 #[cfg(windows)]
 pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
@@ -41229,6 +41240,50 @@ mod tests {
         assert_eq!(
             super::DEFAULT_MEMBERSHIP_WATERMARK_PATH,
             "/var/lib/rustynet/membership.watermark"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_membership_owner_signing_key_matches_macos_tools() {
+        // macos_install.rs `MACOS_OWNER_SIGNING_KEY_PATH` and the ops_e2e
+        // genesis driver seed the owner signing key exactly here; the
+        // flag-less `membership init` default must match or the seeded key
+        // is invisible to the daemon.
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/usr/local/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    #[test]
+    fn linux_default_membership_owner_signing_key_is_unchanged() {
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[test]
+    fn membership_owner_signing_key_default_matches_rustynet_cli_twin_source() {
+        // rustynet-cli carries its own copy of this default (a shared
+        // constant is unreachable across the two crates), so pin both arm
+        // DECLARATIONS through the twin's source text — the full decl, not
+        // a bare literal, so the mirror cannot be satisfied by an unrelated
+        // occurrence of the path in a test string.
+        let cli_main = include_str!("../../rustynet-cli/src/main.rs");
+        assert!(
+            cli_main.contains(
+                "const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =\n    \"/usr/local/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynet-cli's macOS owner-signing-key arm must stay equal to this crate's"
+        );
+        assert!(
+            cli_main.contains(
+                "const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = \"/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynet-cli's non-macOS owner-signing-key arm must keep the Linux literal"
         );
     }
 

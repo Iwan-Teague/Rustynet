@@ -11438,6 +11438,17 @@ pub(crate) fn phase6_validate_platform_parity_report(report_path: &Path) -> Resu
 
 const DEFAULT_SIGNING_KEY_PASSPHRASE_CREDENTIAL_BLOB_PATH: &str =
     "/etc/rustynet/credentials/signing_key_passphrase.cred";
+// Same platform split as rustynetd's DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH
+// (crates/rustynetd/src/daemon.rs): on macOS the owner signing key is seeded
+// at /usr/local/etc/rustynet (see
+// vm_lab::orchestrator::adapter::macos_install::MACOS_OWNER_SIGNING_KEY_PATH),
+// so the env-unset default must resolve there too. The rustynetd twin is not
+// reachable across the two crates; the duplicated literals are pinned against
+// drift by default_membership_owner_signing_key_twin_matches_rustynetd_daemon_source.
+#[cfg(target_os = "macos")]
+const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =
+    "/usr/local/etc/rustynet/membership.owner.key";
+#[cfg(not(target_os = "macos"))]
 const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = "/etc/rustynet/membership.owner.key";
 const DEFAULT_MEMBERSHIP_WATERMARK_PATH: &str = "/var/lib/rustynet/membership.watermark";
 const DEFAULT_TRUST_SIGNER_KEY_PATH: &str = "/etc/rustynet/trust-evidence.key";
@@ -23478,6 +23489,48 @@ mod tests {
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
     use std::fs;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_membership_owner_signing_key_pins_macos_path() {
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/usr/local/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn default_membership_owner_signing_key_pins_non_macos_path() {
+        // The CLI twin has no Windows-specific value: Windows keeps the
+        // Linux-conventional literal, exactly as before the macOS arm split.
+        assert_eq!(
+            super::DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH,
+            "/etc/rustynet/membership.owner.key"
+        );
+    }
+
+    #[test]
+    fn default_membership_owner_signing_key_twin_matches_rustynetd_daemon_source() {
+        // Mirror of daemon.rs's
+        // membership_owner_signing_key_default_matches_rustynet_cli_twin_source:
+        // neither copy of the default may drift from the other. Both arm
+        // DECLARATIONS are pinned in full so the mirror cannot be satisfied
+        // by an unrelated occurrence of the path in a test string.
+        let daemon_src = include_str!("../../rustynetd/src/daemon.rs");
+        assert!(
+            daemon_src.contains(
+                "pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str =\n    \"/usr/local/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynetd's macOS owner-signing-key arm must stay equal to this crate's"
+        );
+        assert!(
+            daemon_src.contains(
+                "pub const DEFAULT_MEMBERSHIP_OWNER_SIGNING_KEY_PATH: &str = \"/etc/rustynet/membership.owner.key\";"
+            ),
+            "rustynetd's Linux owner-signing-key arm must keep the Linux literal"
+        );
+    }
 
     #[test]
     fn is_managed_disconnect_nft_table_sweeps_generation_and_gossip_scope_tables() {
