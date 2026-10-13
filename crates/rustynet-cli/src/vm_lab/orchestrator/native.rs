@@ -88,6 +88,13 @@ pub(crate) fn execute_rust_native_orchestration(
     if run_only && iterate_mode {
         return Err("--run-only and --resume-from/--rerun-stage are mutually exclusive".to_owned());
     }
+    // HP-3 needs the userspace-shared backend: refuse an explicit contradicting
+    // pin before any host is touched (the stage re-checks the observed state).
+    crate::vm_lab::validate_relay_forwarding_backend_pin(
+        enable_relay_forwarding_validation,
+        skip_live_suite,
+        config.linux_backend.as_deref(),
+    )?;
     if resume_from_stage.is_some() && rerun_stage.is_some() {
         return Err("--resume-from and --rerun-stage are mutually exclusive".to_owned());
     }

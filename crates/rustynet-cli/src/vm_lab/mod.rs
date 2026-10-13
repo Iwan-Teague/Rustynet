@@ -1959,6 +1959,38 @@ pub fn parse_linux_backend(raw: &str) -> Result<String, String> {
     ))
 }
 
+/// The one Linux backend HP-3 (`relay_forwards_frame_validation`) can run on.
+/// The kernel `linux-wireguard` backend owns an opaque WireGuard socket, so the
+/// daemon reports `transport_socket_identity_state=blocked_backend_opaque_socket`
+/// and never resolves a relay session; only the userspace-shared backend
+/// exposes the authoritative transport a relay session needs.
+pub const HP3_REQUIRED_LINUX_BACKEND: &str = "linux-wireguard-userspace-shared";
+
+/// Run-start guard for `--enable-relay-forwarding-validation`: an explicit
+/// `--linux-backend` pin other than [`HP3_REQUIRED_LINUX_BACKEND`] contradicts
+/// the elected proof, so the run is refused before any host is touched. An
+/// absent pin is allowed here (guest history may already be userspace-shared;
+/// a resumed run carries no pin at all): the stage's own observed-state gate
+/// ([`relay_forward_test_backend_gate`]) is what ultimately decides. A run that
+/// does not execute the live suite never reaches HP-3, so it is not refused.
+pub fn validate_relay_forwarding_backend_pin(
+    relay_forwarding_validation: bool,
+    skip_linux_live_suite: bool,
+    linux_backend: Option<&str>,
+) -> Result<(), String> {
+    if !relay_forwarding_validation || skip_linux_live_suite {
+        return Ok(());
+    }
+    match linux_backend {
+        Some(mode) if mode != HP3_REQUIRED_LINUX_BACKEND => Err(format!(
+            "--enable-relay-forwarding-validation requires --linux-backend {HP3_REQUIRED_LINUX_BACKEND} \
+             (or no --linux-backend pin on guests already running it); got --linux-backend {mode}, \
+             whose kernel socket is opaque to the daemon so no relay session can form"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Parse `--lab-stun-servers <ip:port[,ip:port...]>` into validated numeric
 /// socket addresses. Fail closed at parse time: every entry must parse as a
 /// `SocketAddr` (numeric IP + port). Hostnames (e.g. `stun.example.com:3478`),
@@ -14968,6 +15000,32 @@ pub(crate) fn rustynet_status_health(
     Ok(())
 }
 
+/// Backend gate over a live `rustynet status` line (HP-3 provisioning design,
+/// patch 2): the peer's daemon must report an authoritative shared transport.
+/// The state is the daemon's own verdict (`transport_socket_identity_state`);
+/// anything else fails closed with the observed value, never a skip -- an
+/// elected disruptive stage must not dissolve into a timeout 90 s later.
+pub(crate) fn relay_forward_test_backend_gate(status_line: &str) -> Result<(), String> {
+    const REQUIRED: &str = "authoritative_backend_shared_transport";
+    let state =
+        parse_relay_forward_test_status_field(status_line, "transport_socket_identity_state")
+            .ok_or_else(|| {
+                "status line missing transport_socket_identity_state field".to_owned()
+            })?;
+    match state.as_str() {
+        REQUIRED => Ok(()),
+        "blocked_backend_opaque_socket" => Err(format!(
+            "transport_socket_identity_state=blocked_backend_opaque_socket: the daemon runs the kernel \
+             linux-wireguard backend, which hides its UDP socket, so no relay session can form; \
+             HP-3 requires --linux-backend {HP3_REQUIRED_LINUX_BACKEND}"
+        )),
+        other => Err(format!(
+            "transport_socket_identity_state={other}, expected {REQUIRED} \
+             (HP-3 requires --linux-backend {HP3_REQUIRED_LINUX_BACKEND})"
+        )),
+    }
+}
+
 /// Where each peer's daemon reads the verifier it checks relay session tokens
 /// (and traversal bundles) against: `RUSTYNET_TRAVERSAL_VERIFIER_KEY` in
 /// `scripts/systemd/rustynetd.service`. The file holds the hex-encoded
@@ -15460,6 +15518,14 @@ pub(crate) fn exercise_linux_relay_forwards_frame(
             return Err(format!(
                 "pre-flight: {role} {} daemon is not healthy for a {}-peer assignment set (mutual managed peers required for a relay-routed session): {err}; status: {status}",
                 target.label, expected_managed_peers
+            ));
+        }
+        // Backend gate: both peers must run the userspace-shared backend. Fail
+        // closed here, before anything is mutated, with the daemon's own state.
+        if let Err(err) = relay_forward_test_backend_gate(status.as_str()) {
+            return Err(format!(
+                "pre-flight: backend gate: {role} {}: {err}",
+                target.label
             ));
         }
     }
@@ -51222,6 +51288,84 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         assert!(script.contains("RUSTYNET_RELAY_PORT_RANGE=40000-49999"));
         assert!(script.contains("RUSTYNET_RELAY_HEALTH_BIND=127.0.0.1:4501"));
         assert!(script.contains("install-systemd-relay"));
+    }
+
+    #[test]
+    fn backend_gate_accepts_only_the_authoritative_shared_transport() {
+        let ok = "node_id=n state=Active transport_socket_identity_state=authoritative_backend_shared_transport transport_socket_identity_error=none";
+        super::relay_forward_test_backend_gate(ok).expect("userspace-shared must pass");
+    }
+
+    #[test]
+    fn backend_gate_names_the_observed_state_for_the_kernel_backend() {
+        let blocked =
+            "node_id=n state=Active transport_socket_identity_state=blocked_backend_opaque_socket";
+        let err = super::relay_forward_test_backend_gate(blocked)
+            .expect_err("the kernel backend can never carry a relay session");
+        assert!(err.contains("blocked_backend_opaque_socket"), "{err}");
+        assert!(err.contains("linux-wireguard-userspace-shared"), "{err}");
+    }
+
+    #[test]
+    fn backend_gate_fails_closed_on_unavailable_not_required_and_missing_states() {
+        for state in [
+            "authoritative_backend_shared_transport_unavailable",
+            "not_required",
+            "",
+            "authoritative_backend_shared_transport_extra",
+        ] {
+            let line = format!("state=Active transport_socket_identity_state={state}");
+            assert!(
+                super::relay_forward_test_backend_gate(&line).is_err(),
+                "state {state:?} must not pass"
+            );
+        }
+        let err = super::relay_forward_test_backend_gate("state=Active")
+            .expect_err("a status without the field must not pass");
+        assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn backend_pin_guard_refuses_a_contradicting_pin_and_allows_the_rest() {
+        let hp3 = super::HP3_REQUIRED_LINUX_BACKEND;
+        assert_eq!(hp3, "linux-wireguard-userspace-shared");
+        assert!(super::validate_relay_forwarding_backend_pin(true, false, Some(hp3)).is_ok());
+        // No pin: guest history decides, the stage's observed-state gate backs it up.
+        assert!(super::validate_relay_forwarding_backend_pin(true, false, None).is_ok());
+        let err =
+            super::validate_relay_forwarding_backend_pin(true, false, Some("linux-wireguard"))
+                .expect_err("a kernel pin contradicts the elected proof");
+        assert!(
+            err.contains("--enable-relay-forwarding-validation"),
+            "{err}"
+        );
+        assert!(err.contains(hp3), "{err}");
+        // Not elected, or the live suite (which drops HP-3) is skipped: no constraint.
+        assert!(
+            super::validate_relay_forwarding_backend_pin(false, false, Some("linux-wireguard"))
+                .is_ok()
+        );
+        assert!(
+            super::validate_relay_forwarding_backend_pin(true, true, Some("linux-wireguard"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn backend_gate_runs_in_the_preflight_before_any_relay_mutation() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!("mod.rs"))
+            .expect("mod.rs implementation slice must parse");
+        let fn_start = source
+            .find("pub(crate) fn exercise_linux_relay_forwards_frame(")
+            .expect("exercise fn present");
+        let body = &source[fn_start..];
+        let gate = body
+            .find("relay_forward_test_backend_gate(")
+            .expect("backend gate must be wired in");
+        let provision = body
+            .find("build_relay_forward_test_provision_script(")
+            .expect("provisioning present");
+        assert!(gate < provision, "the gate must precede relay provisioning");
     }
 
     const HP3_KEY_A: &str = "6de3f8ac16da4a256943c79868453734958718dbff06224785b443ed218a2401";
