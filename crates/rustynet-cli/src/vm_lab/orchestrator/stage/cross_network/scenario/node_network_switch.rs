@@ -416,8 +416,12 @@ impl Observation {
     }
 }
 
-/// Apply the alias switch, then sample the transition once a second until the
-/// client has fully re-converged or the window closes.
+/// Apply the alias switch, then sample the transition once a second. Sampling
+/// ends when the client has fully re-converged AND the three detection events
+/// (endpoint change, traversal re-issue, peer endpoint hint) have all been
+/// seen, or when the window (the reconnect SLO, in samples) closes. The time of
+/// the first full re-convergence is latched separately and is what the SLO
+/// measures.
 fn observe_transition(
     client: &ScenarioNode<'_>,
     exit: &ScenarioNode<'_>,

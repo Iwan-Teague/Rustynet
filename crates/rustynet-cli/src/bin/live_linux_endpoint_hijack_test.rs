@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use live_lab_support::{LiveLabContext, Logger, repo_root};
-use rustynet_cli::ops_live_lab_orchestrator::peer_endpoints_with_daemon_fallback;
+use rustynet_cli::ops_live_lab_orchestrator::{
+    peer_endpoint_source, peer_endpoints_with_daemon_fallback, status_reports_fail_closed,
+};
 
 fn main() {
     if let Err(err) = run() {
@@ -57,6 +59,10 @@ fn classify_live_lab_error(message: &str) -> rustynetd::exit_codes::ExitCode {
         ExitCode::GenericFailure
     }
 }
+
+/// How long the live daemon is given to report fail-closed after the tampered
+/// bundle is put in place (one status poll per second).
+const HIJACK_FAIL_CLOSED_POLL_ATTEMPTS: u32 = 30;
 
 fn run() -> Result<(), String> {
     let root_dir = repo_root()?;
@@ -161,10 +167,14 @@ fn run() -> Result<(), String> {
             "netcheck",
         ],
     )?;
-    let baseline_endpoints = peer_endpoints_with_daemon_fallback(
-        &ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?,
-        &baseline_status_output,
-    );
+    let baseline_wg_endpoints =
+        ctx.capture_root_allow_failure(&client_host, &["wg", "show", "rustynet0", "endpoints"])?;
+    // Recorded in the report: which source the endpoint lists come from, so a
+    // list that is empty because the source cannot see peers is not mistaken for
+    // one that was witnessed.
+    let endpoint_source = peer_endpoint_source(&baseline_wg_endpoints);
+    let baseline_endpoints =
+        peer_endpoints_with_daemon_fallback(&baseline_wg_endpoints, &baseline_status_output);
 
     if baseline_status_output.contains("state=FailClosed") {
         return Err(
@@ -230,19 +240,42 @@ fn run() -> Result<(), String> {
             "/var/lib/rustynet/rustynetd.assignment.watermark",
         ],
     );
-    reset_failed_then_restart_rustynetd(&ctx, &client_host)?;
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    ctx.wait_for_daemon_socket(&client_host, &socket_path, 20, 1)?;
-
-    let status_after_hijack = ctx.capture_root_allow_failure(
+    // Observe the reaction of the LIVE daemon. The rewritten bundle no longer
+    // matches its signature, so a restart is refused at startup ("auto tunnel
+    // preflight failed: auto-tunnel signature verification failed", exit 78,
+    // katana-xnet-73) and there would be no daemon left to ask. The running
+    // daemon fail-closes by itself on the next reconcile; poke it to re-read
+    // (the refresh itself is expected to be refused) and wait for it to say so.
+    // Whatever it reports, or that it cannot be reached, is the evidence: nothing
+    // here is assumed.
+    let _ = ctx.run_root_allow_failure(
         &client_host,
         &[
             "env",
             &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
             live_lab_support::REMOTE_RUSTYNET_BIN,
-            "status",
+            "state",
+            "refresh",
         ],
-    )?;
+    );
+    let mut status_after_hijack = String::new();
+    for attempt in 0..HIJACK_FAIL_CLOSED_POLL_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        status_after_hijack = ctx.capture_root_allow_failure(
+            &client_host,
+            &[
+                "env",
+                &format!("RUSTYNET_DAEMON_SOCKET={socket_path}"),
+                live_lab_support::REMOTE_RUSTYNET_BIN,
+                "status",
+            ],
+        )?;
+        if status_reports_fail_closed(&status_after_hijack) {
+            break;
+        }
+    }
     let netcheck_after_hijack = ctx.capture_root_allow_failure(
         &client_host,
         &[
@@ -321,6 +354,7 @@ fn run() -> Result<(), String> {
                 endpoints_after_hijack: endpoints_after_hijack.clone(),
                 status_after_recovery: status_after_recovery.clone(),
                 endpoints_after_recovery: endpoints_after_recovery.clone(),
+                endpoint_source: endpoint_source.to_owned(),
                 captured_at_utc,
                 captured_at_unix: captured_at_unix.parse::<u64>().unwrap_or(0),
             },

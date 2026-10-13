@@ -202,6 +202,11 @@ pub struct WriteLiveLinuxEndpointHijackReportConfig {
     pub endpoints_after_hijack: String,
     pub status_after_recovery: String,
     pub endpoints_after_recovery: String,
+    /// Where the three endpoint lists came from, for the report: `kernel_wg`
+    /// (`wg show` printed peers) or `daemon_status` (the userspace-shared
+    /// backend; see [`peer_endpoints_with_daemon_fallback`]). Empty is treated
+    /// as unknown and recorded as such.
+    pub endpoint_source: String,
     pub captured_at_utc: String,
     pub captured_at_unix: u64,
 }
@@ -2985,6 +2990,15 @@ pub(crate) struct LiveLinuxEndpointHijackEvidenceView {
     pub endpoints_after_hijack: String,
     pub status_after_recovery: String,
     pub endpoints_after_recovery: String,
+    /// `kernel_wg` | `daemon_status` | `unknown`: which source produced the
+    /// endpoint lists above (additive field; absent in older reports).
+    #[serde(default)]
+    pub endpoint_source: String,
+    /// `baseline=<n> after_hijack=<n> after_recovery=<n>`: how many peer
+    /// endpoints each list actually contained, so an empty "not adopted" list is
+    /// distinguishable from a witnessed one (additive field).
+    #[serde(default)]
+    pub observed_endpoint_counts: String,
 }
 
 /// Typed view for the full endpoint-hijack report. Replaces the
@@ -3038,6 +3052,47 @@ pub fn peer_endpoints_with_daemon_fallback(wg_output: &str, status: &str) -> Str
     endpoints.join("\n")
 }
 
+/// Number of peer endpoints in an endpoint list: `wg show ... endpoints`
+/// (`<key>\t<host:port>`) or the one-per-line daemon list. Blank lines and the
+/// literal `(none)` that `wg` prints for an unset endpoint do not count.
+pub fn endpoint_count(list: &str) -> usize {
+    list.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| {
+            line.split_whitespace()
+                .last()
+                .is_some_and(|last| last != "(none)")
+        })
+        .count()
+}
+
+/// Which source produced an endpoint list returned by
+/// [`peer_endpoints_with_daemon_fallback`]: the kernel `wg` output when it had
+/// content, the daemon status otherwise.
+// Same bin/lib dead-code note as above.
+#[allow(dead_code)]
+pub fn peer_endpoint_source(wg_output: &str) -> &'static str {
+    if wg_output.trim().is_empty() {
+        "daemon_status"
+    } else {
+        "kernel_wg"
+    }
+}
+
+/// True when a `rustynet status` line reports the daemon as fail-closed. Used by
+/// the hijack bin to wait for the LIVE daemon to react to a tampered bundle
+/// instead of restarting it (a restart on a bundle with a bad signature is
+/// refused at startup, so no daemon is left to observe). Exact token match, so
+/// `state=FailClosedX` or an error line never counts.
+// Used by the hijack bin via the lib only.
+#[allow(dead_code)]
+pub fn status_reports_fail_closed(status: &str) -> bool {
+    status
+        .split_whitespace()
+        .any(|token| token == "state=FailClosed")
+}
+
 pub fn execute_ops_write_live_linux_endpoint_hijack_report(
     config: WriteLiveLinuxEndpointHijackReportConfig,
 ) -> Result<String, String> {
@@ -3079,10 +3134,18 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
                 .netcheck_after_hijack
                 .contains("path_mode=fail_closed"),
         ),
+        // "Not adopted" is only a claim if the endpoint source can see peers at
+        // all: the healthy baseline must have listed at least one endpoint
+        // (positive control, so an always-empty source such as kernel `wg` on the
+        // userspace-shared backend can never pass this vacuously), and the rogue
+        // address must be absent afterwards. After the hijack the daemon is
+        // fail-closed and its list may legitimately be empty; that is what the
+        // fail-closed checks witness.
         rogue_endpoint_not_adopted: pass_or_fail(
-            !config
-                .endpoints_after_hijack
-                .contains(rogue_endpoint_ip.as_str()),
+            endpoint_count(config.baseline_endpoints.as_str()) > 0
+                && !config
+                    .endpoints_after_hijack
+                    .contains(rogue_endpoint_ip.as_str()),
         ),
         recovery_restores_secure_runtime: pass_or_fail(
             !config.status_after_recovery.contains("state=FailClosed")
@@ -3090,13 +3153,27 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
                     .status_after_recovery
                     .contains("restricted_safe_mode=false"),
         ),
+        // After recovery the daemon is healthy again, so the list must be
+        // non-empty (proving the source works) and must not contain the rogue.
         recovery_keeps_rogue_endpoint_rejected: pass_or_fail(
-            !config
-                .endpoints_after_recovery
-                .contains(rogue_endpoint_ip.as_str()),
+            endpoint_count(config.endpoints_after_recovery.as_str()) > 0
+                && !config
+                    .endpoints_after_recovery
+                    .contains(rogue_endpoint_ip.as_str()),
         ),
     };
     let status = checks.overall_status().to_owned();
+    let observed_endpoint_counts = format!(
+        "baseline={} after_hijack={} after_recovery={}",
+        endpoint_count(config.baseline_endpoints.as_str()),
+        endpoint_count(config.endpoints_after_hijack.as_str()),
+        endpoint_count(config.endpoints_after_recovery.as_str()),
+    );
+    let endpoint_source = match config.endpoint_source.trim() {
+        "kernel_wg" => "kernel_wg".to_owned(),
+        "daemon_status" => "daemon_status".to_owned(),
+        _ => "unknown".to_owned(),
+    };
 
     let report = LiveLinuxEndpointHijackReportView {
         phase: "phase10".to_owned(),
@@ -3114,6 +3191,8 @@ pub fn execute_ops_write_live_linux_endpoint_hijack_report(
             status_after_hijack: config.status_after_hijack,
             netcheck_after_hijack: config.netcheck_after_hijack,
             endpoints_after_hijack: config.endpoints_after_hijack,
+            observed_endpoint_counts,
+            endpoint_source,
             status_after_recovery: config.status_after_recovery,
             endpoints_after_recovery: config.endpoints_after_recovery,
         },
@@ -5157,6 +5236,7 @@ mod tests {
                 endpoints_after_hijack: "peer-a=192.168.18.77:51820".to_owned(),
                 status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
                 endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_owned(),
+                endpoint_source: "kernel_wg".to_owned(),
                 captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
@@ -5195,6 +5275,8 @@ mod tests {
                 endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_owned(),
                 status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
                 endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_owned(),
+                endpoint_source: "kernel_wg".to_owned(),
+                observed_endpoint_counts: "baseline=1 after_hijack=1 after_recovery=1".to_owned(),
             },
         }
     }
@@ -5299,6 +5381,7 @@ mod tests {
                 endpoints_after_hijack: "peer-a=192.168.18.51:51820".to_owned(),
                 status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
                 endpoints_after_recovery: "peer-a=192.168.18.51:51820".to_owned(),
+                endpoint_source: "kernel_wg".to_owned(),
                 captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
                 captured_at_unix: 1_772_983_200,
             },
@@ -8484,5 +8567,139 @@ mod peer_endpoint_fallback_tests {
                 "{status}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod hijack_evidence_honesty_tests {
+    use super::*;
+
+    fn write(
+        baseline: &str,
+        after_hijack: &str,
+        after_recovery: &str,
+        source: &str,
+    ) -> (String, serde_json::Value) {
+        let path = std::env::temp_dir().join(format!(
+            "rustynet-hijack-honesty-{}-{}.json",
+            std::process::id(),
+            baseline.len() * 31 + after_hijack.len() * 7 + after_recovery.len() + source.len()
+        ));
+        let status = execute_ops_write_live_linux_endpoint_hijack_report(
+            WriteLiveLinuxEndpointHijackReportConfig {
+                report_path: path.clone(),
+                rogue_endpoint_ip: "192.168.18.77".to_owned(),
+                baseline_status: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                baseline_netcheck: "path_mode=direct_active".to_owned(),
+                baseline_endpoints: baseline.to_owned(),
+                status_after_hijack: "state=FailClosed restricted_safe_mode=true".to_owned(),
+                netcheck_after_hijack: "path_mode=fail_closed".to_owned(),
+                endpoints_after_hijack: after_hijack.to_owned(),
+                status_after_recovery: "state=ExitActive restricted_safe_mode=false".to_owned(),
+                endpoints_after_recovery: after_recovery.to_owned(),
+                endpoint_source: source.to_owned(),
+                captured_at_utc: "2026-03-21T10:00:00Z".to_owned(),
+                captured_at_unix: 1_772_983_200,
+            },
+        )
+        .expect("write report");
+        let body = fs::read_to_string(&path).expect("read report");
+        let _ = fs::remove_file(&path);
+        (status, serde_json::from_str(&body).expect("json"))
+    }
+
+    /// The healthy case on the userspace backend: endpoints come from the daemon,
+    /// the fail-closed daemon legitimately lists none, and the report says so.
+    #[test]
+    fn a_witnessed_baseline_lets_an_empty_post_hijack_list_pass_and_is_recorded() {
+        let listed = "192.168.122.57:51820\n192.168.123.222:51820";
+        let (status, report) = write(listed, "", listed, "daemon_status");
+        assert_eq!(status, "pass");
+        assert_eq!(report["evidence"]["endpoint_source"], "daemon_status");
+        assert_eq!(
+            report["evidence"]["observed_endpoint_counts"],
+            "baseline=2 after_hijack=0 after_recovery=2"
+        );
+    }
+
+    /// F1: an endpoint source that cannot see peers (empty baseline) must not
+    /// let "the rogue endpoint is absent" pass vacuously.
+    #[test]
+    fn an_empty_baseline_makes_rogue_not_adopted_fail() {
+        let listed = "192.168.122.57:51820";
+        let (status, report) = write("", "", listed, "kernel_wg");
+        assert_eq!(status, "fail");
+        assert_eq!(report["checks"]["rogue_endpoint_not_adopted"], "fail");
+        assert_eq!(
+            report["checks"]["recovery_keeps_rogue_endpoint_rejected"],
+            "pass"
+        );
+    }
+
+    #[test]
+    fn an_empty_recovery_list_cannot_prove_the_rogue_stayed_rejected() {
+        let listed = "192.168.122.57:51820";
+        let (status, report) = write(listed, "", "", "daemon_status");
+        assert_eq!(status, "fail");
+        assert_eq!(
+            report["checks"]["recovery_keeps_rogue_endpoint_rejected"],
+            "fail"
+        );
+    }
+
+    #[test]
+    fn a_rogue_endpoint_after_hijack_or_recovery_still_fails() {
+        let listed = "192.168.122.57:51820";
+        let rogue = "192.168.18.77:51820";
+        let (_, report) = write(listed, rogue, listed, "kernel_wg");
+        assert_eq!(report["checks"]["rogue_endpoint_not_adopted"], "fail");
+        let (_, report) = write(listed, "", rogue, "kernel_wg");
+        assert_eq!(
+            report["checks"]["recovery_keeps_rogue_endpoint_rejected"],
+            "fail"
+        );
+    }
+
+    #[test]
+    fn an_unknown_source_is_recorded_as_unknown_never_invented() {
+        let listed = "192.168.122.57:51820";
+        let (_, report) = write(listed, "", listed, "");
+        assert_eq!(report["evidence"]["endpoint_source"], "unknown");
+        let (_, report) = write(listed, "", listed, "something-else");
+        assert_eq!(report["evidence"]["endpoint_source"], "unknown");
+    }
+
+    #[test]
+    fn endpoint_count_ignores_blank_lines_and_unset_wg_endpoints() {
+        assert_eq!(endpoint_count(""), 0);
+        assert_eq!(endpoint_count("  \n\n"), 0);
+        assert_eq!(endpoint_count("key1\t(none)\n"), 0);
+        assert_eq!(endpoint_count("key1\t192.0.2.7:51820\nkey2\t(none)\n"), 1);
+        assert_eq!(endpoint_count("192.0.2.7:51820\n192.0.2.8:51820"), 2);
+    }
+
+    #[test]
+    fn the_endpoint_source_follows_what_kernel_wg_printed() {
+        assert_eq!(peer_endpoint_source("key\t192.0.2.7:51820\n"), "kernel_wg");
+        assert_eq!(peer_endpoint_source(""), "daemon_status");
+        assert_eq!(peer_endpoint_source("  \n"), "daemon_status");
+    }
+
+    #[test]
+    fn only_an_exact_fail_closed_state_token_counts_as_fail_closed() {
+        assert!(status_reports_fail_closed(
+            "node_id=a state=FailClosed restricted_safe_mode=true"
+        ));
+        assert!(!status_reports_fail_closed(
+            "state=ExitActive restricted_safe_mode=false"
+        ));
+        assert!(!status_reports_fail_closed("state=FailClosedX"));
+        assert!(!status_reports_fail_closed(
+            "last_reconcile_error=state=FailClosed"
+        ));
+        assert!(!status_reports_fail_closed(
+            "error [transient_failure (70)]: daemon unreachable: connect failed"
+        ));
+        assert!(!status_reports_fail_closed(""));
     }
 }
