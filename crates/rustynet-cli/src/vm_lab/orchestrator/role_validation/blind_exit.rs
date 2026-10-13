@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::vm_lab::VmGuestPlatform;
-use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
+use crate::vm_lab::orchestrator::remote_shell::{RemoteExitStatus, RemoteShellHost};
 
 pub fn blind_exit_runtime_implemented(platform: VmGuestPlatform) -> bool {
     matches!(platform, VmGuestPlatform::Linux | VmGuestPlatform::Macos)
@@ -34,6 +34,107 @@ pub(crate) fn daemon_socket_path(platform: VmGuestPlatform) -> &'static str {
         // must stay exhaustive and sensible.
         _ => "/run/rustynet/rustynetd.sock",
     }
+}
+
+/// Parse the daemon's local primary role from a `rustynet status` body.
+///
+/// Only header lines (starting at column 0) are considered: the self status
+/// header precedes the `peers:` block, whose indented per-peer lines carry
+/// their own `node_role=` fields that must never be mistaken for the local
+/// role. Returns `None` when no header line carries `node_role=` so the
+/// caller can fail closed instead of guessing.
+pub(crate) fn parse_header_node_role(status: &str) -> Option<String> {
+    status.lines().find_map(|line| {
+        if line.starts_with(char::is_whitespace) {
+            return None;
+        }
+        line.split_whitespace()
+            .find_map(|field| field.strip_prefix("node_role="))
+            .filter(|role| !role.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+/// Bounded daemon-role readiness window shared by the post-restore poll
+/// (`exit_demotion_residue`) and the enrollment admin-role precondition
+/// (`live_enrollment_restart_validation`): `rustynet role set` restarts
+/// `rustynetd.service` on Linux, so the daemon IPC needs a bounded poll
+/// before its role can be asserted (same shape as the `validate_admin_issue`
+/// poll).
+pub(crate) const DAEMON_ROLE_POLL_MAX_ATTEMPTS: usize = 4;
+pub(crate) const DAEMON_ROLE_POLL_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(3);
+
+/// The `sudo -n env RUSTYNET_DAEMON_SOCKET=… <rustynet> status` seam: on
+/// POSIX guests the daemon chmods its socket parent to 0o700 and the socket
+/// itself to 0o600, lab daemons run as root, and the CLI has no EACCES
+/// fallback — so an unsudoed status query fails on a perfectly healthy node.
+/// Every status seam in the codebase wraps `sudo -n` for exactly this reason
+/// (`capture_root` in live_lab_bin_support, `linux_install.rs`, and the
+/// exit-demotion restore's `run_daemon_cli`).
+pub(crate) fn run_daemon_status_sudoed(
+    shell: &dyn RemoteShellHost,
+    platform: VmGuestPlatform,
+) -> Result<RemoteExitStatus, String> {
+    let socket_env = format!("RUSTYNET_DAEMON_SOCKET={}", daemon_socket_path(platform));
+    let program = rustynet_program(platform);
+    shell
+        .run_argv(
+            &["sudo", "-n", "env", &socket_env, program, "status"],
+            &[],
+            &[],
+        )
+        .map_err(|err| format!("dispatch failed: {err}"))
+}
+
+/// Poll, bounded, for the daemon to report `expected_role` as its primary
+/// role through the sudo-wrapped status seam. Transient outcomes (transport
+/// errors, non-zero exits, bodies whose readable role does not yet match —
+/// the daemon is mid-restart right after `role set`) are retried until the
+/// window closes. `context` names the caller in the final error, which must
+/// name the last error so a timeout is diagnosable.
+pub(crate) fn poll_daemon_node_role(
+    shell: &dyn RemoteShellHost,
+    platform: VmGuestPlatform,
+    expected_role: &str,
+    context: &str,
+) -> Result<(), String> {
+    for attempt in 1..=DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+        match run_daemon_status_sudoed(shell, platform) {
+            Ok(out) if out.code == 0 => {
+                let status = String::from_utf8_lossy(&out.stdout);
+                if parse_header_node_role(&status).as_deref() == Some(expected_role) {
+                    return Ok(());
+                }
+                if attempt >= DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "daemon does not report node_role={expected_role} after \
+                         {DAEMON_ROLE_POLL_MAX_ATTEMPTS} attempts; status={}",
+                        status.trim()
+                    ));
+                }
+            }
+            Ok(out) => {
+                if attempt >= DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "rustynet status exited non-zero after \
+                         {DAEMON_ROLE_POLL_MAX_ATTEMPTS} attempts: {}",
+                        String::from_utf8_lossy(&out.stdout).trim()
+                    ));
+                }
+            }
+            Err(err) => {
+                if attempt >= DAEMON_ROLE_POLL_MAX_ATTEMPTS {
+                    return Err(format!(
+                        "daemon status poll failed after \
+                         {DAEMON_ROLE_POLL_MAX_ATTEMPTS} attempts ({context}): {err}"
+                    ));
+                }
+            }
+        }
+        std::thread::sleep(DAEMON_ROLE_POLL_RETRY_DELAY);
+    }
+    unreachable!("poll loop returns on or before the final attempt")
 }
 
 pub fn validate_blind_exit_runtime(
@@ -267,6 +368,40 @@ pub(crate) fn macos_blind_exit_rules_verdict(rules: &str) -> Result<(), String> 
 mod tests {
     use super::*;
     use crate::vm_lab::orchestrator::remote_shell::{MockShellHost, RemoteExitStatus};
+
+    #[test]
+    fn header_role_parser_ignores_peer_lines_and_fails_closed() {
+        // The self header precedes the indented peers block; a peer's
+        // node_role=client must never be read as the local role.
+        let status = "node_id=self-1 node_role=admin state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=client state=Ready\n";
+        assert_eq!(parse_header_node_role(status).as_deref(), Some("admin"));
+        assert_eq!(
+            parse_header_node_role("node_id=self-1 state=Ready\npeers:\n"),
+            None,
+            "no node_role field must fail closed"
+        );
+        assert_eq!(
+            parse_header_node_role("node_role= state=Ready\n"),
+            None,
+            "an empty node_role must fail closed"
+        );
+    }
+
+    /// Mutation witness (review M4): a header line WITHOUT node_role
+    /// followed by an INDENTED peer line WITH one must parse as None —
+    /// the indent guard is what keeps a peer's role from being adopted
+    /// as the local role when the header carries none.
+    #[test]
+    fn header_parser_ignores_indented_peer_role_when_header_has_none() {
+        let status = "node_id=self-1 state=Ready\n\
+                      peers:\n  node_id=peer-1 node_role=client state=Ready\n";
+        assert_eq!(
+            parse_header_node_role(status),
+            None,
+            "an indented peer's node_role must never be read as the local role"
+        );
+    }
 
     fn program_status(shell: &MockShellHost, role_line: &str, code: i32) {
         // Register the status response under every per-OS program name so the

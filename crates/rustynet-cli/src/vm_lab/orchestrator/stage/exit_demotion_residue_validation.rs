@@ -22,8 +22,14 @@ const REPORTED_SKIPS_FILENAME: &str = "exit_demotion_residue_validation.reported
 /// [`exit_demotion_residue_runtime_implemented`].
 ///
 /// Side-effect: demotes the Linux exit to client through the public CLI
-/// surface (`rustynet role set client`). The two-phase capture (before +
-/// after snapshot) provides the anti-vacuous "was serving exit" guard.
+/// surface (`rustynet role set client`), then restores the node to its
+/// recorded pre-demotion PRIMARY role through the same seam before
+/// returning — a restore failure fails the stage, since an exit left
+/// demoted poisons every later admin-only stage. The restore re-establishes
+/// the primary role only, not the exit-serving posture (advertise / NAT are
+/// deliberately not re-run; later exit stages re-assert serving). The
+/// two-phase capture (before + after snapshot) provides the anti-vacuous
+/// "was serving exit" guard.
 pub struct ExitDemotionResidueValidationStage;
 
 impl OrchestrationStage for ExitDemotionResidueValidationStage {
