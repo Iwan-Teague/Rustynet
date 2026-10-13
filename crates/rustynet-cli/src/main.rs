@@ -10060,8 +10060,11 @@ fn with_kept_bundle_context(err: String, refresh: &ForcedAssignmentRefresh) -> S
 
 /// A path the refresh unit would use: the value in `assignment-refresh.env`
 /// (systemd `EnvironmentFile=` overrides the unit's `Environment=`), else the
-/// process environment, else the unit default. Empty values count as unset,
-/// like `env_optional_string`.
+/// unit's own `Environment=` default. Empty values count as unset, like
+/// `env_optional_string`. The CLI's OWN process environment is deliberately NOT
+/// consulted: the systemd unit never sees it, so honouring it here would let a
+/// stray `RUSTYNET_*` variable in the operator's shell steer the verdict away
+/// from what the unit will actually do.
 fn assignment_refresh_effective_path(
     env_body: &str,
     key: &str,
@@ -10079,7 +10082,7 @@ fn assignment_refresh_effective_path(
         }
         return Ok(path);
     }
-    env_path_or_default(key, default)
+    Ok(PathBuf::from(default))
 }
 
 /// The refresh authority gate's verdict for THIS node, evaluated from the CLI.
@@ -10092,6 +10095,20 @@ fn assignment_refresh_effective_path(
 /// install and needs no secret at all.
 fn local_assignment_authority_verdict(
     assignment_refresh_env_path: &Path,
+) -> Result<Option<String>, String> {
+    local_assignment_authority_verdict_with(assignment_refresh_env_path, |gate| {
+        ops_e2e::with_unwrapped_signing_passphrase("assignment-authority", gate)
+    })
+}
+
+/// [`local_assignment_authority_verdict`] with the credential unwrap injected, so the whole
+/// verdict (path resolution, first-install shortcut, fail-closed reads, the gate call and its
+/// argument order) is exercised by unit tests without systemd-creds.
+fn local_assignment_authority_verdict_with(
+    assignment_refresh_env_path: &Path,
+    with_passphrase: impl FnOnce(
+        &dyn Fn(&Path) -> Result<Option<String>, String>,
+    ) -> Result<Option<String>, String>,
 ) -> Result<Option<String>, String> {
     ensure_regular_file_no_symlink(assignment_refresh_env_path, "assignment refresh env file")?;
     let env_body = fs::read_to_string(assignment_refresh_env_path).map_err(|err| {
@@ -10115,7 +10132,7 @@ fn local_assignment_authority_verdict(
     {
         return Ok(None);
     }
-    ops_e2e::with_unwrapped_signing_passphrase("assignment-authority", |passphrase_path| {
+    with_passphrase(&|passphrase_path| {
         enforce_refresh_assignment_authority_gate(
             verifier_key_path.as_path(),
             signing_secret_path.as_path(),
@@ -10168,7 +10185,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
 
     let signing_secret_path = env_path_or_default(
         "RUSTYNET_ASSIGNMENT_SIGNING_SECRET",
-        "/etc/rustynet/assignment.signing.secret",
+        ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH,
     )?;
     let signing_secret_passphrase_path =
         env_required_path("RUSTYNET_ASSIGNMENT_SIGNING_SECRET_PASSPHRASE_FILE")?;
@@ -10178,7 +10195,7 @@ fn execute_ops_refresh_assignment() -> Result<String, String> {
     )?;
     let verifier_key_path = env_path_or_default(
         "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT",
-        "/etc/rustynet/assignment.pub",
+        ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH,
     )?;
     let ttl_secs = parse_env_u64_with_default("RUSTYNET_ASSIGNMENT_TTL_SECS", 300)?;
     if !(60..=86_400).contains(&ttl_secs) {
@@ -11718,11 +11735,25 @@ fn execute_ops_force_local_assignment_refresh_now() -> Result<String, String> {
     if !cfg!(target_os = "linux") {
         return Err("force-local-assignment-refresh-now is supported on Linux only".to_owned());
     }
-    Ok(match force_local_assignment_refresh_now_ops()? {
+    Ok(force_now_report(&force_local_assignment_refresh_now_ops()?))
+}
+
+/// The `ops force-local-assignment-refresh-now` success line.
+fn force_now_report(refresh: &ForcedAssignmentRefresh) -> String {
+    match refresh {
         ForcedAssignmentRefresh::Applied => "forced local assignment refresh completed".to_owned(),
         ForcedAssignmentRefresh::KeptExternalAuthority(note) => format!(
             "forced local assignment refresh completed without re-issuing; the existing assignment bundle was kept ({note})"
         ),
+    }
+}
+
+/// The role-coupling warning for a forced refresh that kept the bundle.
+fn role_coupling_kept_warning(refresh: &ForcedAssignmentRefresh) -> Option<String> {
+    refresh.kept_note().map(|note| {
+        format!(
+            "existing assignment bundle kept; this node is not its own assignment authority ({note})"
+        )
     })
 }
 
@@ -14066,10 +14097,8 @@ fn execute_ops_apply_role_coupling(
         Ok(refresh) => refresh,
         Err(err) => return Err(format!("forced local assignment refresh failed: {err}")),
     };
-    if let Some(note) = refresh.kept_note() {
-        warnings.push(format!(
-            "existing assignment bundle kept; this node is not its own assignment authority ({note})"
-        ));
+    if let Some(warning) = role_coupling_kept_warning(&refresh) {
+        warnings.push(warning);
     }
 
     if target_role == "client"
@@ -15271,12 +15300,17 @@ fn force_local_assignment_refresh_now_ops() -> Result<ForcedAssignmentRefresh, S
     run_systemctl_action("restart", "rustynetd.service")?;
     wait_for_socket_path(socket_path.as_path(), Duration::from_secs(45))?;
     wait_for_runtime_ready_after_restart(socket_path.as_path(), Duration::from_secs(60))?;
-    Ok(match plan {
+    Ok(forced_refresh_outcome(plan))
+}
+
+/// What the callers are told after the plan ran.
+fn forced_refresh_outcome(plan: ForcedRefreshAssignmentPlan) -> ForcedAssignmentRefresh {
+    match plan {
         ForcedRefreshAssignmentPlan::RemoveForRegeneration => ForcedAssignmentRefresh::Applied,
         ForcedRefreshAssignmentPlan::KeepExternalAuthority(note) => {
             ForcedAssignmentRefresh::KeptExternalAuthority(note)
         }
-    })
+    }
 }
 
 fn wait_for_runtime_ready_after_restart(
@@ -23344,6 +23378,7 @@ mod guest_claim_wiring_tests {
 #[cfg(test)]
 mod tests {
     use super::{
+        ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH,
         ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH, AnchorCommand,
         AssignmentRefreshAuthorityDecision, CliCommand,
         DEFAULT_MACOS_WG_PASSPHRASE_KEYCHAIN_SERVICE, ForcedAssignmentRefresh,
@@ -23356,9 +23391,10 @@ mod tests {
         consume_enrollment_token_locked, contains_ip_rule_lookup_table, detect_tampered_log,
         encrypted_secret_permission_policy, enforce_refresh_assignment_authority_gate, execute,
         execute_macos_relay_service_action, execute_ops, extract_json_flag, finalize_role_audit,
-        forced_refresh_assignment_plan, help_text, is_interface_absent_detail,
-        is_managed_disconnect_nft_table, launchd_xml_escape, load_dns_zone_records_manifest,
-        load_signing_key, local_assignment_authority_verdict, managed_dns_resolver_server_arg,
+        force_now_report, forced_refresh_assignment_plan, forced_refresh_outcome, help_text,
+        is_interface_absent_detail, is_managed_disconnect_nft_table, launchd_xml_escape,
+        load_dns_zone_records_manifest, load_signing_key, local_assignment_authority_verdict,
+        local_assignment_authority_verdict_with, managed_dns_resolver_server_arg,
         managed_dns_routing_already_absent, parse_assignment_pub_verifier_key, parse_bool_value,
         parse_bundle_u64_field, parse_command, parse_managed_pf_anchors,
         parse_prior_membership_evidence_body, parse_wireguard_go_pids_from_ps,
@@ -23367,10 +23403,10 @@ mod tests {
         phase6_validate_platform_parity_report, read_json_value, render_key_value_line_as_json,
         render_launchd_plist, required_macos_tunnel_keychain_account,
         required_macos_tunnel_keychain_service, rewrite_assignment_refresh_exit_node,
-        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, to_ipc_command, unix_now,
-        update_node_role_env_file, update_node_role_macos_plist, update_node_role_windows_env_file,
-        validate_control_socket_security, with_kept_bundle_context, write_encrypted_key_file,
-        write_json_pretty_file,
+        rewrite_assignment_refresh_lan_routes, rewrite_env_key_value, role_coupling_kept_warning,
+        to_ipc_command, unix_now, update_node_role_env_file, update_node_role_macos_plist,
+        update_node_role_windows_env_file, validate_control_socket_security,
+        with_kept_bundle_context, write_encrypted_key_file, write_json_pretty_file,
     };
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
@@ -28271,7 +28307,7 @@ mod tests {
             "\nfn disable_lan_blackhole_routes(",
         );
         assert!(
-            lan.contains("with_kept_bundle_context("),
+            lan.contains(".map_err(|err| with_kept_bundle_context(err, &refresh))"),
             "LAN coupling must explain a lan_access timeout on a kept bundle"
         );
         let role = body_between(
@@ -28279,7 +28315,8 @@ mod tests {
             "\nfn execute_ops_prepare_system_dirs(",
         );
         assert!(
-            role.contains("with_kept_bundle_context(") && role.contains(".kept_note()"),
+            role.contains("with_kept_bundle_context(err, &refresh)")
+                && role.contains("role_coupling_kept_warning(&refresh)"),
             "role coupling must warn about a kept bundle and explain a convergence timeout"
         );
         let force = body_between(
@@ -28287,7 +28324,7 @@ mod tests {
             "\nfn execute_ops_install_trust_material(",
         );
         assert!(
-            force.contains("ForcedAssignmentRefresh::KeptExternalAuthority("),
+            force.contains("force_now_report(&force_local_assignment_refresh_now_ops()?)"),
             "the force command must not report a plain success for a kept bundle"
         );
     }
@@ -28371,6 +28408,187 @@ mod tests {
             local_assignment_authority_verdict(dir.path().join("missing.env").as_path()).is_err(),
             "an unreadable refresh env is an error, never a verdict"
         );
+    }
+
+    // ── reviewer additions: behaviour pins for the forced-refresh verdict plumbing ──────────
+
+    /// The `Environment=` defaults of the refresh unit are the ONLY thing the CLI-side verdict
+    /// mirrors; if the unit file moves, the verdict would read the wrong files.
+    #[test]
+    fn mirrored_refresh_unit_defaults_match_the_service_file() {
+        let unit = include_str!("../../../scripts/systemd/rustynetd-assignment-refresh.service");
+        let value_of = |key: &str| -> String {
+            let prefix = format!("Environment={key}=");
+            unit.lines()
+                .find_map(|line| line.trim().strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("unit must set {key}"))
+                .to_owned()
+        };
+        assert_eq!(
+            value_of("RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT"),
+            ASSIGNMENT_REFRESH_DEFAULT_VERIFIER_KEY_PATH
+        );
+        assert_eq!(
+            value_of("RUSTYNET_ASSIGNMENT_SIGNING_SECRET"),
+            ASSIGNMENT_REFRESH_DEFAULT_SIGNING_SECRET_PATH
+        );
+    }
+
+    #[test]
+    fn forced_refresh_outcome_reports_what_the_plan_did() {
+        assert_eq!(
+            forced_refresh_outcome(ForcedRefreshAssignmentPlan::RemoveForRegeneration),
+            ForcedAssignmentRefresh::Applied
+        );
+        assert_eq!(
+            forced_refresh_outcome(ForcedRefreshAssignmentPlan::KeepExternalAuthority(
+                "note".to_owned()
+            )),
+            ForcedAssignmentRefresh::KeptExternalAuthority("note".to_owned())
+        );
+    }
+
+    #[test]
+    fn kept_bundle_is_never_reported_as_a_plain_success() {
+        let kept = ForcedAssignmentRefresh::KeptExternalAuthority("authority note".to_owned());
+        let report = force_now_report(&kept);
+        assert!(
+            report.contains("without re-issuing") && report.contains("authority note"),
+            "{report}"
+        );
+        assert_eq!(
+            force_now_report(&ForcedAssignmentRefresh::Applied),
+            "forced local assignment refresh completed"
+        );
+        let warning = role_coupling_kept_warning(&kept).expect("a kept bundle must warn");
+        assert!(
+            warning.contains("kept") && warning.contains("authority note"),
+            "{warning}"
+        );
+        assert_eq!(
+            role_coupling_kept_warning(&ForcedAssignmentRefresh::Applied),
+            None
+        );
+    }
+
+    /// An env file wired to a forced-refresh fixture; returns the pieces a verdict test needs.
+    #[cfg(unix)]
+    fn verdict_fixture(pub_kind: ForcedRefreshPub) -> (ForcedRefreshNode, PathBuf) {
+        let node = forced_refresh_node(pub_kind);
+        let env_path = node._dir.path().join("assignment-refresh.env");
+        fs::write(
+            &env_path,
+            format!(
+                "RUSTYNET_ASSIGNMENT_VERIFIER_KEY_OUTPUT=\"{}\"\nRUSTYNET_ASSIGNMENT_SIGNING_SECRET=\"{}\"\n",
+                node.pub_path.display(),
+                node.secret_path.display()
+            ),
+        )
+        .expect("write env fixture");
+        (node, env_path)
+    }
+
+    #[cfg(unix)]
+    fn verdict_for(node: &ForcedRefreshNode, env_path: &Path) -> Result<Option<String>, String> {
+        let passphrase = node.passphrase_path.clone();
+        local_assignment_authority_verdict_with(env_path, |gate| gate(passphrase.as_path()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_is_the_gates_own_answer_for_a_foreign_a_local_and_an_absent_verifier_key() {
+        let (foreign, foreign_env) = verdict_fixture(ForcedRefreshPub::ForeignAuthority);
+        let message = verdict_for(&foreign, &foreign_env)
+            .expect("a parseable foreign key is a decision")
+            .expect("a foreign verifier key must yield the skip message");
+        assert!(
+            message.contains("belongs to a different authority"),
+            "{message}"
+        );
+
+        let (local, local_env) = verdict_fixture(ForcedRefreshPub::LocalAuthority);
+        assert_eq!(
+            verdict_for(&local, &local_env).expect("local key matches"),
+            None
+        );
+
+        let (absent, absent_env) = verdict_fixture(ForcedRefreshPub::Absent);
+        let unwrapped = std::cell::Cell::new(false);
+        let passphrase = absent.passphrase_path.clone();
+        let verdict = local_assignment_authority_verdict_with(absent_env.as_path(), |gate| {
+            unwrapped.set(true);
+            gate(passphrase.as_path())
+        })
+        .expect("no verifier key is a first install");
+        assert_eq!(verdict, None);
+        assert!(
+            !unwrapped.get(),
+            "a first install must not touch the credential at all"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_fails_closed_on_every_unreadable_or_garbage_verifier_key() {
+        // garbage text
+        let (corrupt, corrupt_env) = verdict_fixture(ForcedRefreshPub::Corrupt);
+        let err = verdict_for(&corrupt, &corrupt_env).expect_err("garbage key must not decide");
+        assert!(err.contains("unparseable"), "{err}");
+
+        // a directory where the key should be (open succeeds, read fails: NOT "not found")
+        let (dir_pub, dir_env) = verdict_fixture(ForcedRefreshPub::Absent);
+        fs::create_dir(&dir_pub.pub_path).expect("directory in place of the key");
+        assert!(
+            verdict_for(&dir_pub, &dir_env).is_err(),
+            "an unreadable verifier key must fail closed, not look like a first install"
+        );
+
+        // oversized key
+        let (big, big_env) = verdict_fixture(ForcedRefreshPub::Absent);
+        fs::write(&big.pub_path, "a".repeat(5000)).expect("oversized key");
+        assert!(
+            verdict_for(&big, &big_env).is_err(),
+            "an oversized verifier key must fail closed, not look like a first install"
+        );
+
+        // foreign key but the signing secret is gone: no verdict
+        let (no_secret, no_secret_env) = verdict_fixture(ForcedRefreshPub::ForeignAuthority);
+        fs::remove_file(&no_secret.secret_path).expect("remove secret");
+        assert!(verdict_for(&no_secret, &no_secret_env).is_err());
+    }
+
+    #[test]
+    fn assignment_refresh_effective_path_never_reads_the_process_environment() {
+        let source = include_str!("main.rs");
+        let start = source
+            .find("fn assignment_refresh_effective_path(")
+            .expect("function present");
+        let end = source[start..]
+            .find("\n}\n")
+            .map(|offset| start + offset)
+            .expect("function end present");
+        let body = &source[start..end];
+        for forbidden in [
+            "env_path_or_default(",
+            "env_optional_string(",
+            "std::env::var",
+        ] {
+            assert!(
+                !body.contains(forbidden),
+                "the unit never sees the CLI's process environment; `{forbidden}` would let it steer the verdict"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verdict_refuses_a_symlinked_or_missing_refresh_env_file() {
+        let (node, env_path) = verdict_fixture(ForcedRefreshPub::ForeignAuthority);
+        let link = node._dir.path().join("env-link");
+        std::os::unix::fs::symlink(&env_path, &link).expect("symlink");
+        let err = verdict_for(&node, &link).expect_err("a symlinked env file must be refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(verdict_for(&node, node._dir.path().join("missing.env").as_path()).is_err());
     }
 
     #[test]

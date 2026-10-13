@@ -5657,11 +5657,35 @@ pub(crate) fn with_unwrapped_signing_passphrase<T>(
     prefix: &str,
     body: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
-    let (work_dir, passphrase_path) = materialize_signing_passphrase_workspace(prefix)?;
-    let result = body(passphrase_path.as_path());
-    secure_remove_file(passphrase_path.as_path());
-    let _ = fs::remove_dir_all(work_dir);
-    result
+    with_staged_passphrase(|| materialize_signing_passphrase_workspace(prefix), body)
+}
+
+/// Shreds the staged plaintext passphrase file and removes its workspace when dropped, so the
+/// cleanup also runs when the caller's closure unwinds.
+struct StagedPassphraseGuard {
+    work_dir: PathBuf,
+    passphrase_path: PathBuf,
+}
+
+impl Drop for StagedPassphraseGuard {
+    fn drop(&mut self) {
+        secure_remove_file(self.passphrase_path.as_path());
+        let _ = fs::remove_dir_all(self.work_dir.as_path());
+    }
+}
+
+/// The lifecycle of [`with_unwrapped_signing_passphrase`] with the staging injected, so the
+/// shred-on-every-path contract is testable without systemd-creds.
+fn with_staged_passphrase<T>(
+    stage: impl FnOnce() -> Result<(PathBuf, PathBuf), String>,
+    body: impl FnOnce(&Path) -> Result<T, String>,
+) -> Result<T, String> {
+    let (work_dir, passphrase_path) = stage()?;
+    let guard = StagedPassphraseGuard {
+        work_dir,
+        passphrase_path,
+    };
+    body(guard.passphrase_path.as_path())
 }
 
 fn ensure_hex_32(label: &str, value: &str) -> Result<(), String> {
@@ -8022,14 +8046,11 @@ mod tests {
         );
     }
 
-    /// `with_unwrapped_signing_passphrase` hands the CLI-side authority check
-    /// (`force_local_assignment_refresh_now_ops`) a plaintext passphrase file,
-    /// so it must shred that file and drop the workspace on EVERY path, and it
-    /// must go through the shared materializer rather than unwrapping on its
-    /// own. Source pin: the body runs the caller's closure first, then shreds,
-    /// then removes the workspace, and only then returns the closure's result.
+    /// `with_unwrapped_signing_passphrase` must unwrap through the shared per-platform
+    /// materializer (never spawn a credential backend itself); the shred/cleanup contract is
+    /// pinned BEHAVIOURALLY by the `staged_passphrase_*` tests below.
     #[test]
-    fn with_unwrapped_signing_passphrase_always_shreds_and_uses_the_shared_materializer() {
+    fn with_unwrapped_signing_passphrase_uses_the_shared_materializer_and_the_guarded_lifecycle() {
         let source = include_str!("ops_e2e.rs");
         let start = source
             .find("pub(crate) fn with_unwrapped_signing_passphrase<T>(")
@@ -8039,32 +8060,96 @@ mod tests {
             .map(|offset| start + offset)
             .expect("with_unwrapped_signing_passphrase body must terminate");
         let body = &source[start..end];
-        let materialize = body
-            .find("materialize_signing_passphrase_workspace(")
-            .expect("must unwrap through the shared materializer");
-        let run_body = body
-            .find("body(passphrase_path.as_path())")
-            .expect("must run the caller's closure with the passphrase file");
-        let shred = body
-            .find("secure_remove_file(passphrase_path.as_path())")
-            .expect("must shred the plaintext passphrase file");
-        let remove_workspace = body
-            .find("remove_dir_all(work_dir)")
-            .expect("must remove the workspace");
-        let result = body
-            .rfind("result")
-            .expect("must return the closure's result");
-        assert!(
-            materialize < run_body && run_body < shred && shred < remove_workspace,
-            "materialize, then use, then shred, then remove the workspace"
-        );
-        assert!(
-            remove_workspace < result,
-            "the closure's result is returned only after the cleanup ran, on success and failure alike"
-        );
+        assert!(body.contains("materialize_signing_passphrase_workspace(prefix)"));
+        assert!(body.contains("with_staged_passphrase("));
         assert!(
             !body.contains("systemd-creds"),
             "no direct credential-backend spawn"
+        );
+    }
+
+    fn stage_fake_passphrase(root: &std::path::Path) -> (super::PathBuf, super::PathBuf) {
+        let work_dir = root.join("workspace-1");
+        std::fs::create_dir(&work_dir).expect("create fake workspace");
+        let passphrase_path = work_dir.join("assignment-authority.passphrase");
+        std::fs::write(&passphrase_path, b"correct horse battery staple\n")
+            .expect("write fake passphrase");
+        (work_dir, passphrase_path)
+    }
+
+    #[test]
+    fn staged_passphrase_is_shredded_and_the_workspace_removed_when_the_closure_succeeds() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (work_dir, passphrase_path) = stage_fake_passphrase(root.path());
+        let seen = super::with_staged_passphrase(
+            || Ok((work_dir.clone(), passphrase_path.clone())),
+            |path| {
+                assert!(path.is_file(), "the closure must see the staged file");
+                Ok(path.to_path_buf())
+            },
+        )
+        .expect("closure result is returned");
+        assert_eq!(seen, passphrase_path);
+        assert!(
+            !passphrase_path.exists(),
+            "plaintext passphrase must be gone"
+        );
+        assert!(!work_dir.exists(), "workspace must be gone");
+    }
+
+    #[test]
+    fn staged_passphrase_is_shredded_and_the_workspace_removed_when_the_closure_fails() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (work_dir, passphrase_path) = stage_fake_passphrase(root.path());
+        let err = super::with_staged_passphrase(
+            || Ok((work_dir.clone(), passphrase_path.clone())),
+            |_path| Err::<(), String>("gate failed".to_owned()),
+        )
+        .expect_err("the closure error must be returned unchanged");
+        assert_eq!(err, "gate failed");
+        assert!(
+            !passphrase_path.exists(),
+            "plaintext passphrase must be gone on the error path"
+        );
+        assert!(
+            !work_dir.exists(),
+            "workspace must be gone on the error path"
+        );
+    }
+
+    #[test]
+    fn staged_passphrase_is_shredded_and_the_workspace_removed_when_the_closure_panics() {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let (work_dir, passphrase_path) = stage_fake_passphrase(root.path());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::with_staged_passphrase(
+                || Ok((work_dir.clone(), passphrase_path.clone())),
+                |_path| -> Result<(), String> { panic!("boom") },
+            );
+        }));
+        assert!(outcome.is_err(), "the panic must propagate");
+        assert!(
+            !passphrase_path.exists(),
+            "plaintext passphrase must be gone after a panic"
+        );
+        assert!(!work_dir.exists(), "workspace must be gone after a panic");
+    }
+
+    #[test]
+    fn staged_passphrase_runs_no_closure_when_staging_fails() {
+        let called = std::cell::Cell::new(false);
+        let err = super::with_staged_passphrase(
+            || Err::<(super::PathBuf, super::PathBuf), String>("no credential".to_owned()),
+            |_path| {
+                called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a staging failure must be returned");
+        assert_eq!(err, "no credential");
+        assert!(
+            !called.get(),
+            "the closure must never run without a staged credential"
         );
     }
 
