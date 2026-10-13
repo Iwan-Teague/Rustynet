@@ -760,6 +760,26 @@ const REVIEWED_SECRET_VOCABULARY_TYPE_EXEMPTIONS: &[(&str, &str, &str)] = &[
         "crates/rustynet-llm-gateway/src/session.rs",
         "error enum (decl session.rs:29); Debug carries only static strings, a u64 clock reading, and a &'static str field name; Display prints static verdict text (AQ-141 workspace-scope classification)",
     ),
+    (
+        "NoRelayTokenSpool",
+        "crates/rustynet-cli/src/vm_lab/mod.rs",
+        "unit-struct no-op token-spool marker (HP-3 patch 3); holds no data and mints or stores nothing",
+    ),
+    (
+        "RelayKeyPairing",
+        "crates/rustynet-cli/src/vm_lab/mod.rs",
+        "HP-3 preflight result: a PUBLIC verifier key in hex (read from the relay-verifier.pub / traversal verifier .pub files, never a signing secret) plus a summary naming only a 16-hex-char fingerprint",
+    ),
+    (
+        "RelayTokenSpoolReport",
+        "crates/rustynet-cli/src/vm_lab/orchestrator/adapter/node_adapter.rs",
+        "HP-3 spool install observation: a clock reading and a spool FILE COUNT, no token bytes",
+    ),
+    (
+        "E2eIssueRelaySessionTokensFromEnvConfig",
+        "crates/rustynet-cli/src/ops_e2e.rs",
+        "ops config of two PathBufs (env file, issue dir): paths only, never token bytes (sibling of the traversal and dns-zone issue configs)",
+    ),
 ];
 
 /// Returns true iff a scanner hit on `name` with reason `why` in file
