@@ -18,6 +18,13 @@ use std::io::Write;
 #[cfg(unix)]
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+// `Component` is referenced only by the `#[cfg(not(windows))]` credential-path
+// validators (`is_systemd_credential_path`, and `reject_relative_components`
+// which is further restricted to non-macOS); leaving it in the unconditional
+// import makes it an unused-import warning — a clippy `-D warnings` failure —
+// on windows targets.
+#[cfg(not(windows))]
+use std::path::Component;
 use std::process::{Command, Stdio};
 #[cfg(windows)]
 use std::sync::OnceLock;
@@ -44,15 +51,15 @@ use std::os::unix::fs::OpenOptionsExt;
 
 #[cfg(any(target_os = "macos", windows))]
 use rustynet_crypto::OsStoreFallbackPolicy;
-use rustynet_crypto::{
-    KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore, write_encrypted_key_file,
-};
 #[cfg(target_os = "macos")]
 use rustynet_crypto::{
     load_macos_generic_password, store_macos_generic_password_system_keychain_owned,
 };
+use rustynet_crypto::{
+    write_encrypted_key_file, KeyCustodyManager, KeyCustodyPermissionPolicy, PlatformOsSecureStore,
+};
 #[cfg(windows)]
-use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect, dpapi_unprotect};
+use rustynet_windows_native::{dpapi_protect, dpapi_unprotect, WindowsDpapiScope};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -212,9 +219,23 @@ pub fn store_passphrase_in_os_secure_store(
 #[cfg(not(windows))]
 fn read_passphrase_from_source(source_path: &Path) -> Result<Zeroizing<String>, String> {
     let allow_root_owner = is_systemd_credential_path(source_path);
-    validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
-    let raw = read_bounded_secret_file(source_path, MAX_PASSPHRASE_BYTES, "passphrase file")?;
-    parse_passphrase_bytes(raw, "passphrase file")
+    #[cfg(unix)]
+    {
+        // Validate and read on ONE descriptor: O_NOFOLLOW open + fstat-based
+        // security checks (type, mode mask, owner) + bounded read through the
+        // SAME file. The previous symlink_metadata-then-File::open pair
+        // re-resolved the path for the read, so a symlink swapped into the
+        // slot between the two calls was followed.
+        let file = open_validated_secret_file(source_path, "passphrase file", allow_root_owner)?;
+        let raw = read_bounded_secret_bytes(file, MAX_PASSPHRASE_BYTES, "passphrase file")?;
+        parse_passphrase_bytes(raw, "passphrase file")
+    }
+    #[cfg(not(unix))]
+    {
+        validate_secret_file_security(source_path, "passphrase file", allow_root_owner)?;
+        let raw = read_bounded_secret_file(source_path, MAX_PASSPHRASE_BYTES, "passphrase file")?;
+        parse_passphrase_bytes(raw, "passphrase file")
+    }
 }
 
 /// Reader-generic bounded secret read: consume at most `max_bytes + 1`
@@ -278,7 +299,11 @@ fn parse_passphrase_bytes(
         }
     };
     let trimmed = decoded.trim();
-    if trimmed.len() < 16 {
+    // Count CHARACTERS, not bytes: the contract (and the error text) is a
+    // minimum of 16 characters. `str::len()` counted UTF-8 bytes, so a
+    // multi-byte passphrase could satisfy the byte count while being far
+    // below 16 characters. This only tightens; never loosens.
+    if trimmed.chars().count() < 16 {
         raw.zeroize();
         return Err("passphrase must be at least 16 characters".to_owned());
     }
@@ -793,13 +818,134 @@ fn key_custody_manager(
     Ok(manager)
 }
 
+/// O_NOFOLLOW open shared by every unix check-then-use site in this module:
+/// with `O_NOFOLLOW` a symlink at `path` fails the open itself (ELOOP)
+/// instead of silently resolving to the link target (pattern reused from
+/// anchor_tls::read_tls_file). `O_NONBLOCK` is added so a FIFO (or other
+/// slow-to-open special file) swapped into the slot cannot hang the caller
+/// inside open(2): the pre-patch symlink_metadata gates refused non-regular
+/// files WITHOUT opening, so the O_NOFOLLOW-only open would have regressed
+/// tighten/read/scrub from a clean error into an indefinite block (systemd
+/// start-timeout loop). Same rationale as
+/// lab_substrate_transit::read_attestation_leaf; O_NONBLOCK is a no-op for
+/// the regular files every caller expects.
+#[cfg(unix)]
+fn open_no_follow(path: &Path, label: &str, write: bool) -> Result<fs::File, String> {
+    let mut options = OpenOptions::new();
+    options.read(!write).write(write);
+    options
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(path)
+        .map_err(|err| format!("open {label} {} failed: {err}", path.display()))
+}
+
+/// Parent-directory half of the unix secret-file security check: a
+/// systemd-loaded credential's parent directory must be root- or self-owned
+/// with no world access and no group-write. Inspected by path (a different
+/// inode from the open file descriptor); byte-for-byte the check that used to
+/// live inline in [`validate_secret_file_security`]'s unix arm.
+#[cfg(unix)]
+fn validate_secret_parent_directory(path: &Path, label: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        let parent_meta = fs::symlink_metadata(parent)
+            .map_err(|err| format!("inspect {label} parent directory failed: {err}"))?;
+        if parent_meta.file_type().is_symlink() {
+            return Err(format!("{label} parent directory must not be a symlink"));
+        }
+        let parent_mode = parent_meta.mode() & 0o777;
+        let parent_uid = parent_meta.uid();
+        // systemd materializes credential directories (/run/credentials/<unit>)
+        // as a root-owned, world-inaccessible tmpfs: observed mode 0o550
+        // (dr-xr-x---) on systemd >= 257, with a POSIX ACL granting the
+        // (non-root) service user access. The group r-x bits belong to gid 0
+        // (root), which can already read any file, so they are not an exposure;
+        // world (other) has no access. Demanding strict 0o700 here wrongly
+        // rejected systemd's standard layout and stopped the daemon from
+        // starting under a least-privilege `User=` (regression introduced with
+        // the encrypted-credential hardening). The invariants that actually
+        // matter for a root-owned credential directory are: owned by root (or
+        // by us), no world access, and not group-writable.
+        let parent_owner_ok = parent_uid == 0 || parent_uid == Uid::effective().as_raw();
+        // 0o027 = group-write (0o020) | any world access (0o007). Group
+        // read/execute — needed to traverse a root:root 0o550 directory — is
+        // permitted; world access and group-write are rejected.
+        if !parent_owner_ok || parent_mode & 0o027 != 0 {
+            return Err(format!(
+                "{label} parent directory permissions are too broad: must be \
+                 root- or owner-owned with no world access and no group-write, \
+                 found uid={parent_uid} mode={parent_mode:03o}",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Single-descriptor unix secret-file open: open with `O_NOFOLLOW` (a symlink
+/// at `path` fails the open with ELOOP instead of being followed), then run
+/// the file-level security checks — regular-file type, mode mask, owner —
+/// against `fstat` of the already-open descriptor, plus the parent-directory
+/// check against the parent path. Returns the open file so the caller can
+/// read the EXACT inode that was validated; no second path resolution happens
+/// between validation and use (this closes the symlink_metadata +
+/// File::open check-then-reopen window).
+#[cfg(unix)]
+fn open_validated_secret_file(
+    path: &Path,
+    label: &str,
+    allow_root_owner: bool,
+) -> Result<fs::File, String> {
+    let file = open_no_follow(path, label, false)?;
+    // fstat the OPEN descriptor: this observes exactly the inode the caller
+    // will read, so the type/mode/owner checks cannot race with a later
+    // path swap.
+    let metadata = file
+        .metadata()
+        .map_err(|err| format!("{label} metadata read failed: {err}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("{label} must be a regular file"));
+    }
+    let mode = metadata.mode() & 0o777;
+    let disallowed_mode_mask = if allow_root_owner { 0o037 } else { 0o077 };
+    if mode & disallowed_mode_mask != 0 {
+        let expected = if allow_root_owner {
+            "owner-only or root-owned credential with group-read only"
+        } else {
+            "owner-only"
+        };
+        return Err(format!(
+            "{label} permissions are too broad: expected {expected}, found {mode:03o}",
+        ));
+    }
+    if allow_root_owner {
+        validate_secret_parent_directory(path, label)?;
+    }
+    let owner_uid = metadata.uid();
+    let expected_uid = Uid::effective().as_raw();
+    if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
+        return Err(format!(
+            "{label} owner uid mismatch: expected {expected_uid}, found {owner_uid}"
+        ));
+    }
+    Ok(file)
+}
+
+/// Non-unix secret-file security validation. The unix checks moved to
+/// [`open_validated_secret_file`] + [`validate_secret_parent_directory`],
+/// which validate the OPEN descriptor (O_NOFOLLOW + fstat) instead of a path
+/// that could be swapped between the check and the subsequent open.
+#[cfg(not(unix))]
 fn validate_secret_file_security(
     path: &Path,
     label: &str,
     allow_root_owner: bool,
 ) -> Result<(), String> {
-    #[cfg(unix)]
+    // `allow_root_owner` only gates the unix ownership/mode checks in the
+    // unix open helper; the non-unix paths validate via OS-specific ACLs, so
+    // discard it here.
+    let _ = allow_root_owner;
+    #[cfg(windows)]
     {
+        validate_windows_local_secret_input_path(path, label)?;
         let metadata = fs::symlink_metadata(path)
             .map_err(|err| format!("{label} metadata read failed: {err}"))?;
         if metadata.file_type().is_symlink() {
@@ -808,90 +954,17 @@ fn validate_secret_file_security(
         if !metadata.file_type().is_file() {
             return Err(format!("{label} must be a regular file"));
         }
-        let mode = metadata.mode() & 0o777;
-        let disallowed_mode_mask = if allow_root_owner { 0o037 } else { 0o077 };
-        if mode & disallowed_mode_mask != 0 {
-            let expected = if allow_root_owner {
-                "owner-only or root-owned credential with group-read only"
-            } else {
-                "owner-only"
-            };
-            return Err(format!(
-                "{label} permissions are too broad: expected {expected}, found {mode:03o}",
-            ));
-        }
-        // When the credential source is a systemd-loaded credential
-        // (allow_root_owner=true), also validate the parent directory.
-        // systemd mounts /run/credentials/ as a tmpfs; if the directory
-        // is group- or world-accessible, any local process can read the
-        // credential file regardless of its own permissions.
-        if allow_root_owner && let Some(parent) = path.parent() {
-            let parent_meta = fs::symlink_metadata(parent)
-                .map_err(|err| format!("inspect {label} parent directory failed: {err}"))?;
-            if parent_meta.file_type().is_symlink() {
-                return Err(format!("{label} parent directory must not be a symlink"));
-            }
-            let parent_mode = parent_meta.mode() & 0o777;
-            let parent_uid = parent_meta.uid();
-            // systemd materializes credential directories (/run/credentials/<unit>)
-            // as a root-owned, world-inaccessible tmpfs: observed mode 0o550
-            // (dr-xr-x---) on systemd >= 257, with a POSIX ACL granting the
-            // (non-root) service user access. The group r-x bits belong to gid 0
-            // (root), which can already read any file, so they are not an exposure;
-            // world (other) has no access. Demanding strict 0o700 here wrongly
-            // rejected systemd's standard layout and stopped the daemon from
-            // starting under a least-privilege `User=` (regression introduced with
-            // the encrypted-credential hardening). The invariants that actually
-            // matter for a root-owned credential directory are: owned by root (or
-            // by us), no world access, and not group-writable.
-            let parent_owner_ok = parent_uid == 0 || parent_uid == Uid::effective().as_raw();
-            // 0o027 = group-write (0o020) | any world access (0o007). Group
-            // read/execute — needed to traverse a root:root 0o550 directory — is
-            // permitted; world access and group-write are rejected.
-            if !parent_owner_ok || parent_mode & 0o027 != 0 {
-                return Err(format!(
-                    "{label} parent directory permissions are too broad: must be \
-                     root- or owner-owned with no world access and no group-write, \
-                     found uid={parent_uid} mode={parent_mode:03o}",
-                ));
-            }
-        }
-        let owner_uid = metadata.uid();
-        let expected_uid = Uid::effective().as_raw();
-        if owner_uid != expected_uid && !(allow_root_owner && owner_uid == 0) {
-            return Err(format!(
-                "{label} owner uid mismatch: expected {expected_uid}, found {owner_uid}"
-            ));
-        }
+        validate_windows_local_secret_acl(path, label)?;
+        fs::File::open(path)
+            .map_err(|err| format!("{label} is not readable by the current identity: {err}"))?;
     }
-    #[cfg(not(unix))]
-    {
-        // `allow_root_owner` only gates the unix ownership/mode checks above; the
-        // non-unix paths validate via OS-specific ACLs, so discard it here.
-        let _ = allow_root_owner;
-        #[cfg(windows)]
-        {
-            validate_windows_local_secret_input_path(path, label)?;
-            let metadata = fs::symlink_metadata(path)
-                .map_err(|err| format!("{label} metadata read failed: {err}"))?;
-            if metadata.file_type().is_symlink() {
-                return Err(format!("{label} must not be a symlink"));
-            }
-            if !metadata.file_type().is_file() {
-                return Err(format!("{label} must be a regular file"));
-            }
-            validate_windows_local_secret_acl(path, label)?;
-            fs::File::open(path)
-                .map_err(|err| format!("{label} is not readable by the current identity: {err}"))?;
-        }
 
-        #[cfg(not(windows))]
-        {
-            let metadata =
-                fs::metadata(path).map_err(|err| format!("{label} metadata read failed: {err}"))?;
-            if !metadata.is_file() {
-                return Err(format!("{label} must be a regular file"));
-            }
+    #[cfg(not(windows))]
+    {
+        let metadata =
+            fs::metadata(path).map_err(|err| format!("{label} metadata read failed: {err}"))?;
+        if !metadata.is_file() {
+            return Err(format!("{label} must be a regular file"));
         }
     }
     Ok(())
@@ -948,17 +1021,60 @@ pub(crate) mod passphrase_test_support {
     }
 }
 
+/// Read one credential-path environment value as UTF-8, `var_os`-based. A
+/// value that is not valid UTF-8 is an explicit error, never silently
+/// treated as unset (the previous `.ok()` on `env::var` swallowed it).
+#[cfg(not(windows))]
+fn credential_env_utf8(
+    name: &str,
+    value: Option<&std::ffi::OsStr>,
+) -> Result<Option<String>, String> {
+    match value {
+        None => Ok(None),
+        Some(raw) => raw
+            .to_str()
+            .map(|value| Some(value.to_owned()))
+            .ok_or_else(|| format!("{name} is set but is not valid UTF-8")),
+    }
+}
+
 // Only the `#[cfg(not(windows))]` `read_passphrase_from_source` calls this;
 // Windows resolves its passphrase through the DPAPI blob path instead.
 #[cfg(not(windows))]
 fn resolve_passphrase_source(configured_path: &Path) -> Result<PathBuf, String> {
-    let explicit = std::env::var(PASSPHRASE_CREDENTIAL_PATH_ENV).ok();
+    let explicit = credential_env_utf8(
+        PASSPHRASE_CREDENTIAL_PATH_ENV,
+        std::env::var_os(PASSPHRASE_CREDENTIAL_PATH_ENV).as_deref(),
+    )?;
+    let directory = credential_env_utf8(
+        SYSTEMD_CREDENTIALS_DIRECTORY_ENV,
+        std::env::var_os(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).as_deref(),
+    )?;
     #[cfg(test)]
-    let explicit = passphrase_test_support::current()
-        .map(|path| path.to_string_lossy().into_owned())
-        .or(explicit);
-    let directory = std::env::var(SYSTEMD_CREDENTIALS_DIRECTORY_ENV).ok();
+    let explicit = match passphrase_test_support::current() {
+        Some(path) => credential_env_utf8(PASSPHRASE_CREDENTIAL_PATH_ENV, Some(path.as_os_str()))?,
+        None => explicit,
+    };
     resolve_passphrase_source_from_env(configured_path, explicit.as_deref(), directory.as_deref())
+}
+
+/// Reject relative (`.` / `..`) path components in a resolved credential
+/// source. `Path::exists` and the component-wise `starts_with` do not
+/// resolve them, so `/run/credentials/../../tmp/x` would otherwise reach
+/// `is_systemd_credential_path` and relax the root-owner rule for a path
+/// that actually escapes /run/credentials.
+#[cfg(all(not(windows), not(target_os = "macos")))]
+fn reject_relative_components(path: &Path, origin: &str) -> Result<(), String> {
+    if path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+    {
+        return Err(format!(
+            "passphrase credential path must not contain '.' or '..' path components (from {origin}): {}",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -982,6 +1098,7 @@ fn resolve_passphrase_source_from_env(
     {
         if let Some(explicit) = explicit_credential_path {
             let explicit_path = PathBuf::from(explicit);
+            reject_relative_components(&explicit_path, PASSPHRASE_CREDENTIAL_PATH_ENV)?;
             if explicit_path.exists() {
                 return Ok(explicit_path);
             }
@@ -994,6 +1111,7 @@ fn resolve_passphrase_source_from_env(
 
         if let Some(directory) = credentials_directory {
             let candidate = Path::new(directory).join(DEFAULT_PASSPHRASE_CREDENTIAL_NAME);
+            reject_relative_components(&candidate, SYSTEMD_CREDENTIALS_DIRECTORY_ENV)?;
             if candidate.exists() {
                 return Ok(candidate);
             }
@@ -1021,7 +1139,14 @@ fn resolve_passphrase_source_from_env(
 
 #[cfg(not(windows))]
 fn is_systemd_credential_path(path: &Path) -> bool {
-    path.starts_with("/run/credentials/")
+    // `Path::starts_with` is component-wise and does NOT resolve `..`, so
+    // `/run/credentials/../../tmp/x` would otherwise pass and relax the
+    // root-owner rule for a path that actually escapes /run/credentials.
+    // Refuse any relative path component outright.
+    !path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::CurDir))
+        && path.starts_with("/run/credentials/")
 }
 
 fn key_custody_key_id(encrypted_key_path: &Path) -> String {
@@ -1046,25 +1171,6 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
     if public_key.trim().is_empty() {
         return Err("public key must not be empty".to_owned());
     }
-    // TEMPORARY diagnostic (WindowsTrafficTestMatrixLiveDiagnosis_2026-09-05.md
-    // section 11.3): eprintln! rather than log::, because this is the single
-    // chokepoint every writer of the public-key file funnels through
-    // (key init, rotation prepare-swap, restore_key_backups) and some of
-    // those run as one-shot CLI invocations that may not have the `log`
-    // facade initialized -- eprintln! is captured either way. Public key
-    // only, never the private key. Remove once the stale-key mechanism
-    // (collect_pubkeys' captured value diverging from the daemon's own
-    // derived key within the same process, reproduced 3x) is confirmed and
-    // fixed.
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    eprintln!(
-        "write_public_key: path={} value={} at unix={now_unix}",
-        path.display(),
-        public_key.trim()
-    );
     let value = format!("{}\n", public_key.trim());
     // 0o640 (owner rw, group r, no world): the reviewed key-custody posture for
     // the WireGuard public key (linux_key_custody expects 0o640). World-read is
@@ -1083,20 +1189,26 @@ pub fn write_public_key(path: &Path, public_key: &str) -> Result<(), String> {
 /// pre-existing files at daemon startup. No-op when the file is absent or
 /// already `0o640`; refuses to follow a symlink. World-read is unnecessary even
 /// for a public key, so removing it is always the secure default.
+///
+/// The file is OPENED first (with `O_NOFOLLOW`, so a symlink at the path fails
+/// the open with `ELOOP` instead of being followed) and every validation —
+/// regular-file type and current mode — runs against `fstat` of the
+/// already-open descriptor. The new mode is then applied to the SAME
+/// descriptor (`File::set_permissions` = `fchmod`), so no path-based call
+/// happens after the open and a file swapped into the path between the check
+/// and the chmod cannot be affected.
 #[cfg(unix)]
 pub fn tighten_public_key_permissions(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     if !path.exists() {
         return Ok(());
     }
-    let metadata = fs::symlink_metadata(path)
+    let file = open_no_follow(path, "public key", false)?;
+    // fstat the OPEN descriptor: this observes exactly the inode that the
+    // fchmod below will act on.
+    let metadata = file
+        .metadata()
         .map_err(|err| format!("inspect public key {} failed: {err}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        return Err(format!(
-            "public key {} must not be a symlink",
-            path.display()
-        ));
-    }
     if !metadata.file_type().is_file() {
         return Err(format!(
             "public key {} must be a regular file",
@@ -1106,12 +1218,14 @@ pub fn tighten_public_key_permissions(path: &Path) -> Result<(), String> {
     if metadata.permissions().mode() & 0o777 == 0o640 {
         return Ok(());
     }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o640)).map_err(|err| {
-        format!(
-            "tighten public key {} to 0o640 failed: {err}",
-            path.display()
-        )
-    })
+    // fchmod through the open descriptor — never a second path-based call.
+    file.set_permissions(fs::Permissions::from_mode(0o640))
+        .map_err(|err| {
+            format!(
+                "tighten public key {} to 0o640 failed: {err}",
+                path.display()
+            )
+        })
 }
 
 /// Windows lacks Unix file modes; the custody posture is enforced via ACLs
@@ -1159,7 +1273,7 @@ pub fn generate_wireguard_keypair() -> Result<(Zeroizing<Vec<u8>>, String), Stri
 
 #[cfg(test)]
 mod generate_wireguard_keypair_contract_tests {
-    use super::{Zeroizing, generate_wireguard_keypair};
+    use super::{generate_wireguard_keypair, Zeroizing};
 
     /// AQ-115/F2 compile-time contract: the private half of the generated
     /// keypair is `Zeroizing<Vec<u8>>`, so it is wiped on drop on every path
@@ -1271,32 +1385,73 @@ pub fn remove_file_if_present(path: &Path) -> Result<(), String> {
 }
 
 fn scrub_file_contents(path: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(path)
-        .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(path)
-        .map_err(|err| format!("open {} failed: {err}", path.display()))?;
-    let mut remaining = metadata.len();
-    let zero_block = [0u8; 8192];
-    while remaining > 0 {
-        let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
-        let Some(chunk) = zero_block.get(..chunk_len) else {
-            // Unreachable: chunk_len is std::cmp::min(remaining,
-            // zero_block.len()) immediately above, so it never exceeds
-            // the block length.
-            continue;
-        };
-        file.write_all(chunk)
-            .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
-        remaining -= chunk_len as u64;
+    #[cfg(unix)]
+    {
+        // Open ONCE with O_NOFOLLOW and scrub through that descriptor: the
+        // previous stat-then-reopen-by-path pair followed a symlink swapped
+        // into the slot between the two calls, zeroing and truncating an
+        // ARBITRARY file. With O_NOFOLLOW the swapped symlink fails the open.
+        let mut file = open_no_follow(path, "scrub target", true)?;
+        // fstat the OPEN descriptor: scrub exactly the inode that was opened.
+        let metadata = file
+            .metadata()
+            .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            return Err(format!(
+                "scrub target {} must be a regular file",
+                path.display()
+            ));
+        }
+        let mut remaining = metadata.len();
+        let zero_block = [0u8; 8192];
+        while remaining > 0 {
+            let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
+            let Some(chunk) = zero_block.get(..chunk_len) else {
+                // Unreachable: chunk_len is std::cmp::min(remaining,
+                // zero_block.len()) immediately above, so it never exceeds
+                // the block length.
+                continue;
+            };
+            file.write_all(chunk)
+                .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
+            remaining -= chunk_len as u64;
+        }
+        file.sync_all()
+            .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
+        file.set_len(0)
+            .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
     }
-    file.sync_all()
-        .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
-    file.set_len(0)
-        .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
-    file.sync_all()
-        .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
+    #[cfg(not(unix))]
+    {
+        let metadata = fs::metadata(path)
+            .map_err(|err| format!("inspect file {} failed: {err}", path.display()))?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| format!("open {} failed: {err}", path.display()))?;
+        let mut remaining = metadata.len();
+        let zero_block = [0u8; 8192];
+        while remaining > 0 {
+            let chunk_len = std::cmp::min(remaining, zero_block.len() as u64) as usize;
+            let Some(chunk) = zero_block.get(..chunk_len) else {
+                // Unreachable: chunk_len is std::cmp::min(remaining,
+                // zero_block.len()) immediately above, so it never exceeds
+                // the block length.
+                continue;
+            };
+            file.write_all(chunk)
+                .map_err(|err| format!("scrub write {} failed: {err}", path.display()))?;
+            remaining -= chunk_len as u64;
+        }
+        file.sync_all()
+            .map_err(|err| format!("sync {} failed: {err}", path.display()))?;
+        file.set_len(0)
+            .map_err(|err| format!("truncate {} failed: {err}", path.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync {} after truncate failed: {err}", path.display()))?;
+    }
     Ok(())
 }
 
@@ -1787,6 +1942,16 @@ fn validate_interface_name(value: &str) -> Result<(), String> {
     if value.is_empty() {
         return Err("interface name must not be empty".to_owned());
     }
+    // A leading `-` would be parsed as an OPTION by the `wg`/`ip` argv words
+    // this name is passed to (argument injection). The first character must
+    // be alphanumeric; `-`/`_`/`.` stay legal in later positions.
+    if !value
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+    {
+        return Err("interface name must begin with an alphanumeric character".to_owned());
+    }
     if value.len() > 15 {
         return Err("interface name must be <= 15 characters".to_owned());
     }
@@ -1824,11 +1989,26 @@ fn resolve_binary_path(env_var: &str, default_path: &str, label: &str) -> Result
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(default_path);
-    validate_binary_path(candidate, label)?;
-    Ok(PathBuf::from(candidate))
+    let canonical = validate_binary_path(candidate, label)?;
+    Ok(exec_path_for_validated_binary(canonical, candidate))
 }
 
-fn validate_binary_path(raw_path: &str, label: &str) -> Result<(), String> {
+/// Exec-path selection seam: given the CANONICAL target that passed
+/// [`validate_binary_path`], return the path the caller must exec. The raw
+/// candidate must NEVER be returned: validation-then-use through a symlink
+/// alias means the raw path and the validated target can be different
+/// inodes. Kept as a named step so tests can pin the selection on hosts
+/// without a root-owned wg binary.
+fn exec_path_for_validated_binary(validated_canonical: PathBuf, raw_candidate: &str) -> PathBuf {
+    let _ = raw_candidate;
+    validated_canonical
+}
+
+/// Validate a binary path and return the CANONICAL path to exec: the exact
+/// target whose type/executability/writability/ownership was checked, with
+/// every symlink resolved. Callers must exec the returned path, not the raw
+/// candidate.
+fn validate_binary_path(raw_path: &str, label: &str) -> Result<PathBuf, String> {
     let path = Path::new(raw_path);
     if !path.is_absolute() {
         return Err(format!("{label} binary path must be absolute: {raw_path}"));
@@ -1872,7 +2052,7 @@ fn validate_binary_path(raw_path: &str, label: &str) -> Result<(), String> {
             ));
         }
     }
-    Ok(())
+    Ok(canonical)
 }
 
 pub(crate) fn derive_public_key_from_private_key(private_key: &[u8]) -> Result<String, String> {
@@ -1989,13 +2169,16 @@ mod tests {
         );
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    use super::DEFAULT_PASSPHRASE_CREDENTIAL_NAME;
     #[cfg(not(windows))]
     use super::resolve_passphrase_source_from_env;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    use super::DEFAULT_PASSPHRASE_CREDENTIAL_NAME;
     #[cfg(target_os = "macos")]
-    use super::{MACOS_PASSPHRASE_KEYCHAIN_SERVICE, normalize_macos_keychain_account};
+    use super::{normalize_macos_keychain_account, MACOS_PASSPHRASE_KEYCHAIN_SERVICE};
     use super::{remove_file_if_present, validate_binary_path};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use zeroize::Zeroizing;
 
     fn unique_test_dir(prefix: &str) -> std::path::PathBuf {
@@ -2087,34 +2270,309 @@ mod tests {
         // systemd's standard 0o550 credential directory must be accepted.
         set_parent(0o550);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_ok(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_ok(),
             "root-style 0o550 credential dir (world-inaccessible) must be accepted"
         );
 
         // A strict owner-only 0o700 directory remains valid (backward compatible).
         set_parent(0o700);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_ok(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_ok(),
             "owner-only 0o700 parent dir must remain valid"
         );
 
         // World read/execute on the parent is a real exposure and must be rejected.
         set_parent(0o555);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_err(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_err(),
             "world-accessible parent dir must be rejected"
         );
 
         // Group-write on the parent allows tampering and must be rejected.
         set_parent(0o570);
         assert!(
-            super::validate_secret_file_security(&secret, "passphrase file", true).is_err(),
+            super::open_validated_secret_file(&secret, "passphrase file", true).is_err(),
             "group-writable parent dir must be rejected"
         );
 
         set_parent(0o700);
         let _ = remove_file_if_present(&secret);
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// b01-01 F2 witness: `Path::starts_with` is component-wise and does NOT
+    /// resolve `..`, so `/run/credentials/../../tmp/x` used to pass and relax
+    /// the root-owner rule for a path that actually escapes /run/credentials.
+    /// Relative path components (both `..` and `.`) must be refused outright.
+    #[test]
+    #[cfg(not(windows))]
+    fn is_systemd_credential_path_rejects_relative_components() {
+        assert!(super::is_systemd_credential_path(Path::new(
+            "/run/credentials/rustynet/wg_key_passphrase"
+        )));
+        assert!(!super::is_systemd_credential_path(Path::new(
+            "/run/credentials/../../tmp/escape"
+        )));
+        assert!(!super::is_systemd_credential_path(Path::new(
+            "/run/credentials/../escape"
+        )));
+        assert!(!super::is_systemd_credential_path(Path::new(
+            "/etc/credentials/x"
+        )));
+    }
+
+    /// b01-03 F4 / b01-06 F2 pin: the passphrase is read from ONE
+    /// O_NOFOLLOW descriptor, so a symlink placed at the credential path
+    /// fails the open instead of being followed to an arbitrary target.
+    #[test]
+    #[cfg(unix)]
+    fn read_passphrase_from_source_refuses_symlinked_credential_path() {
+        let dir = unique_test_dir("rn-pass-symlink");
+        let target = dir.join("real-passphrase");
+        std::fs::write(&target, b"sixteen-char-pass\n").expect("write target");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+            .expect("chmod 0o600");
+        let link = dir.join("wg_key_passphrase");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+
+        let result = super::read_passphrase_from_source(&link);
+        assert!(
+            result.is_err(),
+            "symlinked credential path must be refused, not followed"
+        );
+        // The pointed-at file must be untouched and still readable.
+        assert_eq!(
+            std::fs::read(&target).expect("target readable"),
+            b"sixteen-char-pass\n",
+            "refused symlink must not have followed to the target"
+        );
+
+        let _ = remove_file_if_present(&target);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// b01-02 F5 witness: scrubbing must happen through ONE O_NOFOLLOW
+    /// descriptor. The previous stat-then-reopen-by-path pair followed a
+    /// symlink swapped into the slot between the calls, zeroing and
+    /// truncating an ARBITRARY file. With O_NOFOLLOW the symlink fails the
+    /// open and the pointed-at file is untouched.
+    #[test]
+    #[cfg(unix)]
+    fn scrub_file_contents_refuses_symlink_target_without_touching_it() {
+        let dir = unique_test_dir("rn-scrub-symlink");
+        let victim = dir.join("victim");
+        std::fs::write(&victim, b"do-not-scratch-me").expect("write victim");
+        let link = dir.join("slot");
+        std::os::unix::fs::symlink(&victim, &link).expect("symlink");
+
+        let result = super::scrub_file_contents(&link);
+        assert!(result.is_err(), "symlinked scrub target must be refused");
+        assert_eq!(
+            std::fs::read(&victim).expect("victim readable"),
+            b"do-not-scratch-me",
+            "refused scrub must not have followed the symlink to the victim"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Positive scrub control: a regular file is fully zeroed, then
+    /// truncated to zero length, through the same descriptor.
+    #[test]
+    #[cfg(unix)]
+    fn scrub_file_contents_zeroes_and_truncates_regular_file() {
+        let dir = unique_test_dir("rn-scrub-regular");
+        let file = dir.join("secret");
+        std::fs::write(&file, vec![0xA5u8; 20_000]).expect("write secret");
+
+        super::scrub_file_contents(&file).expect("scrub regular file");
+        let meta = std::fs::metadata(&file).expect("metadata after scrub");
+        assert_eq!(meta.len(), 0, "scrubbed file must be truncated to zero");
+        assert_eq!(
+            std::fs::read(&file).expect("read after scrub"),
+            Vec::<u8>::new(),
+            "scrubbed file must be empty"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// b01-02 F6 witness: a leading `-` would be parsed as an OPTION by the
+    /// `wg`/`ip` argv words the name is passed to (argument injection). The
+    /// first character must be alphanumeric; `-`/`_`/`.` stay legal later.
+    #[test]
+    fn validate_interface_name_rejects_leading_dash_and_dot() {
+        for bad in ["-wg0", ".hidden", "_lead"] {
+            let err = super::validate_interface_name(bad)
+                .expect_err("leading non-alphanumeric must be rejected");
+            assert_eq!(
+                err, "interface name must begin with an alphanumeric character",
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+        for good in ["wg0", "0abc", "en0", "wg_0", "a.b-c"] {
+            super::validate_interface_name(good)
+                .unwrap_or_else(|err| panic!("{good:?} must stay valid: {err}"));
+        }
+        super::validate_interface_name("").expect_err("empty must stay rejected");
+    }
+
+    /// b01-03 F8 witness: the minimum-passphrase rule counts CHARACTERS, not
+    /// bytes. 15 three-byte characters are 45 bytes — the byte count passed
+    /// while the stated 16-character contract was violated.
+    #[test]
+    fn parse_passphrase_bytes_minimum_is_characters_not_bytes() {
+        let short_chars_long_bytes: String = "€".repeat(15);
+        let raw = short_chars_long_bytes.into_bytes();
+        assert_eq!(raw.len(), 45, "precondition: more bytes than characters");
+        let err = super::parse_passphrase_bytes(raw, "passphrase file")
+            .expect_err("15 characters must be rejected even at 45 bytes");
+        assert_eq!(err, "passphrase must be at least 16 characters");
+
+        let ok: String = "é".repeat(16);
+        super::parse_passphrase_bytes(ok.into_bytes(), "passphrase file")
+            .expect("16 multi-byte characters must be accepted");
+    }
+
+    /// b01-01 F4 pin: environment credential-path values are read through
+    /// `var_os` and must be valid UTF-8 — a non-UTF-8 value is an explicit
+    /// error, never silently treated as unset (the previous `.ok()` on
+    /// `env::var` swallowed it).
+    #[test]
+    #[cfg(not(windows))]
+    fn credential_env_utf8_rejects_non_utf8_value() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            super::credential_env_utf8("TEST_ENV", None).expect("unset is fine"),
+            None
+        );
+        assert_eq!(
+            super::credential_env_utf8("TEST_ENV", Some(OsStr::new("/run/creds/x")))
+                .expect("utf-8 value is fine"),
+            Some("/run/creds/x".to_owned())
+        );
+        let err = super::credential_env_utf8("TEST_ENV", Some(OsStr::from_bytes(b"/x/\xff\xfe")))
+            .expect_err("non-utf-8 value must be an error");
+        assert!(
+            err.contains("not valid UTF-8"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    /// b01-02 F1 pin: `resolve_binary_path` must exec the CANONICAL path that
+    /// `validate_binary_path` checked, not the raw candidate — validation
+    /// through a symlink alias otherwise checks one inode and execs another.
+    /// Pinned textually (the success path needs a root-owned binary, which a
+    /// test cannot create): the resolver must delegate the exec-path choice
+    /// to `exec_path_for_validated_binary` and must not re-wrap the raw
+    /// candidate.
+    #[test]
+    fn resolve_binary_path_returns_the_validated_canonical_path() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/key_material.rs"))
+            .expect("key_material source readable");
+        let start = body
+            .find("fn resolve_binary_path(")
+            .expect("resolve_binary_path must remain present");
+        let rel_end = body[start..]
+            .find("\n}\n")
+            .expect("resolve_binary_path must have a closing brace");
+        let window = &body[start..start + rel_end + 3];
+        assert!(
+            window.contains("exec_path_for_validated_binary(canonical"),
+            "resolve_binary_path must exec the validated canonical path"
+        );
+        assert!(
+            !window.contains("PathBuf::from(candidate)"),
+            "resolve_binary_path must not return the raw unresolved candidate"
+        );
+        // And the seam itself is identity-on-canonical: never the raw path.
+        assert_eq!(
+            super::exec_path_for_validated_binary(
+                std::path::PathBuf::from("/validated/wg"),
+                "/raw/wg"
+            ),
+            std::path::PathBuf::from("/validated/wg"),
+            "exec path selection must prefer the validated canonical path"
+        );
+    }
+
+    /// b01-01 F3 pin: the temporary diagnostic `eprintln!` in
+    /// `write_public_key` (it logged the public key to stderr on every init,
+    /// rotate and restore) must stay removed. Pinned textually: no behavior
+    /// observable difference is otherwise assertable.
+    #[test]
+    fn write_public_key_has_no_diagnostic_eprintln() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let body = std::fs::read_to_string(crate_root.join("src/key_material.rs"))
+            .expect("key_material source readable");
+        let start = body
+            .find("pub fn write_public_key(")
+            .expect("write_public_key must remain present");
+        let rel_end = body[start..]
+            .find("\n}\n")
+            .expect("write_public_key must have a closing brace");
+        let window = &body[start..start + rel_end + 3];
+        assert!(
+            !window.contains("eprintln!"),
+            "write_public_key must not log key material to stderr"
+        );
+    }
+
+    /// Review pin (glm-review-km1): a FIFO swapped into the public-key slot
+    /// must be REFUSED, not hung on. The pre-patch code rejected non-regular
+    /// files via symlink_metadata BEFORE opening; an O_NOFOLLOW-only open
+    /// blocks forever on a FIFO's read end (systemd start-timeout loop).
+    /// `O_NONBLOCK` makes the open return promptly so the fstat regular-file
+    /// check can refuse it. Mirrors
+    /// `lab_substrate_transit_fifo_swap_cannot_hang_start`; without the
+    /// O_NONBLOCK flag this test times out instead of failing cleanly.
+    #[test]
+    #[cfg(unix)]
+    fn tighten_public_key_permissions_does_not_block_on_fifo() {
+        use std::sync::mpsc;
+        let dir = unique_test_dir("rn-pubkey-fifo");
+        let fifo = dir.join("wireguard.pub");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+            .expect("mkfifo");
+        let (done, finished) = mpsc::channel();
+        let racing = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(super::tighten_public_key_permissions(&racing));
+        });
+        let result = finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("tighten must not block on a swapped-in FIFO");
+        let err = result.expect_err("a FIFO must be refused, not tightened");
+        assert!(
+            err.contains("must be a regular file"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review pin (glm-review-km1): the fstat mode-mask check inside
+    /// `open_validated_secret_file` must fire on the FILE itself, not only on
+    /// the parent directory. The adapted parent-dir test provisions an
+    /// owner-only (0o440) file, so no existing test exercises a too-broad
+    /// FILE mode; this kills the "mode-mask check removed" mutant.
+    #[test]
+    #[cfg(unix)]
+    fn open_validated_secret_file_rejects_too_broad_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_test_dir("rn-pass-too-broad");
+        let secret = dir.join("passphrase");
+        std::fs::write(&secret, b"sixteen-char-pass\n").expect("write secret");
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o644))
+            .expect("chmod 0o644");
+        let err = super::open_validated_secret_file(&secret, "passphrase file", false)
+            .expect_err("world-readable passphrase file must be refused");
+        assert!(
+            err.contains("permissions are too broad"),
+            "unexpected error: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Pin the macOS passphrase custody routing: the cross-binary case
@@ -2382,7 +2840,7 @@ mod tests {
     fn dpapi_protect_stub_returns_err_on_non_windows() {
         // Verify the non-Windows stub always returns Err so the cfg(windows) branch
         // cannot silently appear on non-Windows builds and mask a missing guard.
-        use rustynet_windows_native::{WindowsDpapiScope, dpapi_protect};
+        use rustynet_windows_native::{dpapi_protect, WindowsDpapiScope};
         let result = dpapi_protect(
             b"test-value",
             WindowsDpapiScope::LocalMachine,
