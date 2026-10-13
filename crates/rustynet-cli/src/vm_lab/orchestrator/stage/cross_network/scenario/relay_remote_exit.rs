@@ -454,6 +454,21 @@ fn provision(
         )?;
     }
 
+    let phase = "re-issuing signed dns-zone bundles";
+    during(
+        phase,
+        provisioning::reissue_dns_zone(
+            exit.runner,
+            &nodes,
+            &allow,
+            &[
+                (exit.runner, &exit.node_id),
+                (relay.runner, &relay.node_id),
+                (client.runner, &client.node_id),
+            ],
+        ),
+    )?;
+
     // The relay runs as `admin`, not a distinct relay role: the shell enforced
     // `admin` on both the relay and the final exit, and only the client as
     // `client`.

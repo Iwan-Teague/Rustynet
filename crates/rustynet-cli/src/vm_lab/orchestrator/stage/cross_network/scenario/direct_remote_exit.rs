@@ -437,6 +437,20 @@ fn provision(inputs: &ScenarioInputs<'_>, lab: &LabContext) -> Result<(), String
         provisioning::install_traversal_bundle(client.runner, &traversal_pub, &client_traversal),
     )?;
 
+    let phase = "re-issuing signed dns-zone bundles";
+    during(
+        phase,
+        provisioning::reissue_dns_zone(
+            exit.runner,
+            &nodes,
+            &allow,
+            &[
+                (exit.runner, &exit.node_id),
+                (client.runner, &client.node_id),
+            ],
+        ),
+    )?;
+
     let phase = "enforcing runtime roles";
     during(
         phase,

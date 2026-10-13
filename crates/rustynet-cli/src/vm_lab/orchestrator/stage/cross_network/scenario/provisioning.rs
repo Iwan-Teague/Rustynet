@@ -48,6 +48,9 @@ pub const WG_PUB_KEY_PATH: &str = "/var/lib/rustynet/keys/wireguard.pub";
 pub const ASSIGNMENT_ISSUE_DIR: &str = "/run/rustynet/assignment-issue";
 /// Where `e2e-issue-traversal-bundles-from-env` leaves its output.
 pub const TRAVERSAL_ISSUE_DIR: &str = "/run/rustynet/traversal-issue";
+/// Where `e2e-issue-dns-zone-bundles-from-env` leaves its output (the
+/// subcommand's own default `--issue-dir`).
+pub const DNS_ZONE_ISSUE_DIR: &str = "/run/rustynet/dns-zone-issue";
 /// `rustynet_config_dir linux`.
 pub const CONFIG_DIR: &str = "/etc/rustynet";
 /// `rustynet_state_root linux`.
@@ -66,6 +69,16 @@ pub const TRAVERSAL_PUB_PATH: &str = "/etc/rustynet/traversal.pub";
 pub const TRAVERSAL_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.traversal";
 /// Traversal anti-replay watermark, cleared whenever a fresh bundle lands.
 pub const TRAVERSAL_WATERMARK_PATH: &str = "/var/lib/rustynet/rustynetd.traversal.watermark";
+/// DNS-zone verifying key (matches `adapter::linux_membership`).
+pub const DNS_ZONE_PUB_PATH: &str = "/etc/rustynet/dns-zone.pub";
+/// Signed DNS-zone bundle (matches `adapter::linux_membership`).
+pub const DNS_ZONE_BUNDLE_PATH: &str = "/var/lib/rustynet/rustynetd.dns-zone";
+/// Remote path of the dns-zone issuance env file.
+pub const DNS_ZONE_ISSUE_ENV_PATH: &str = "/tmp/rn_issue_cross_network_dns_zone.env";
+/// Lifetime of a freshly issued dns-zone bundle. The signed-zone builder
+/// hard-caps it at 300 s (`ops_e2e.rs`), and the daemon rejects a bundle once
+/// `now > expires_at_unix` whatever `RUSTYNET_DNS_ZONE_MAX_AGE_SECS` says.
+pub const DNS_ZONE_TTL_SECS: &str = "300";
 /// Staging directory for files being installed into place.
 pub const STAGING_DIR: &str = "/tmp";
 
@@ -555,6 +568,33 @@ pub fn issue_traversal_bundles_from_env(
     )
 }
 
+/// `rustynet ops e2e-issue-dns-zone-bundles-from-env`.
+pub fn issue_dns_zone_bundles_from_env(
+    runner: &dyn NetLeafRunner,
+    env: &EnvFile,
+    remote_env_path: &str,
+) -> Result<(), String> {
+    issue_bundles_from_env(
+        runner,
+        "e2e-issue-dns-zone-bundles-from-env",
+        env,
+        remote_env_path,
+    )
+}
+
+/// Path of an issued dns-zone bundle on the issuing host.
+pub fn issued_dns_zone_path(node_id: &str) -> Result<String, String> {
+    validate_node_id(node_id)?;
+    Ok(format!(
+        "{DNS_ZONE_ISSUE_DIR}/rn-dns-zone-{node_id}.dns-zone"
+    ))
+}
+
+/// Path of the dns-zone verifying key on the issuing host.
+pub fn issued_dns_zone_pub_path() -> String {
+    format!("{DNS_ZONE_ISSUE_DIR}/rn-dns-zone.pub")
+}
+
 /// Path of an issued assignment bundle on the issuing host.
 pub fn issued_assignment_path(node_id: &str) -> Result<String, String> {
     validate_node_id(node_id)?;
@@ -758,6 +798,80 @@ pub fn install_traversal_bundle(
         runner,
         &[TRAVERSAL_WATERMARK_PATH, &staged_pub, &staged_bundle],
     )
+}
+
+/// Install a signed dns-zone bundle and its verifying key, same shape as the
+/// traversal install. The anti-replay watermark is deliberately NOT cleared: a
+/// freshly issued bundle carries a later `generated_at`, which the daemon
+/// accepts against the existing watermark, so replay protection stays intact.
+pub fn install_dns_zone_bundle(
+    runner: &dyn NetLeafRunner,
+    dns_zone_pub_b64: &str,
+    dns_zone_bundle_b64: &str,
+) -> Result<(), String> {
+    let staged_pub = format!("{STAGING_DIR}/rn-dns-zone.pub");
+    let staged_bundle = format!("{STAGING_DIR}/rn-dns-zone.bundle");
+    write_remote_base64(runner, &staged_pub, "0600", dns_zone_pub_b64)?;
+    write_remote_base64(runner, &staged_bundle, "0600", dns_zone_bundle_b64)?;
+    run_root(
+        runner,
+        &[
+            "install",
+            "-m",
+            "0644",
+            "-o",
+            "root",
+            "-g",
+            "root",
+            &staged_pub,
+            DNS_ZONE_PUB_PATH,
+        ],
+    )?;
+    run_root(
+        runner,
+        &[
+            "install",
+            "-m",
+            "0640",
+            "-o",
+            "root",
+            "-g",
+            RUSTYNETD_GROUP,
+            &staged_bundle,
+            DNS_ZONE_BUNDLE_PATH,
+        ],
+    )?;
+    remove_remote(runner, &[&staged_pub, &staged_bundle])
+}
+
+/// Re-issue the signed dns-zone bundles on `issuer` for the topology named by
+/// `nodes_spec`/`allow_spec` and install each node's own bundle.
+///
+/// The baseline `distribute_dns_zone` stage mints one bundle minutes before the
+/// cross-network scenarios run, and the bundle cannot outlive 300 s, so a
+/// scenario that re-installs the daemons and then asserts `dns_alarm_state`
+/// healthy would read `dns_zone_bundle_is_stale` (katana-xnet-62). This is the
+/// same mint-and-install the setup stage and `refresh_signed_bundles` perform
+/// (the existing `e2e-issue-dns-zone-bundles-from-env` verb), scoped to the
+/// scenario's nodes. Call it after the other bundles are installed and before
+/// the `enforce_host` pass that makes the daemon re-read its state.
+pub fn reissue_dns_zone(
+    issuer: &dyn NetLeafRunner,
+    nodes_spec: &str,
+    allow_spec: &str,
+    targets: &[(&dyn NetLeafRunner, &str)],
+) -> Result<(), String> {
+    let env = EnvFile::new()
+        .set("NODES_SPEC", nodes_spec)?
+        .set("ALLOW_SPEC", allow_spec)?
+        .set("DNS_ZONE_TTL_SECS", DNS_ZONE_TTL_SECS)?;
+    issue_dns_zone_bundles_from_env(issuer, &env, DNS_ZONE_ISSUE_ENV_PATH)?;
+    let pub_b64 = read_remote_base64(issuer, &issued_dns_zone_pub_path())?;
+    for (runner, node_id) in targets {
+        let bundle = read_remote_base64(issuer, &issued_dns_zone_path(node_id)?)?;
+        install_dns_zone_bundle(*runner, &pub_b64, &bundle)?;
+    }
+    Ok(())
 }
 
 // ───────────────────────────── role enforcement ─────────────────────────────
@@ -1231,6 +1345,147 @@ mod tests {
         assert_eq!(
             spec,
             format!("katana-exit-1-bootstrap|192.168.123.222:51820|{EXIT_PUB}|client,exit_server")
+        );
+    }
+
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+
+    use super::{
+        DNS_ZONE_BUNDLE_PATH, DNS_ZONE_PUB_PATH, install_dns_zone_bundle, reissue_dns_zone,
+    };
+
+    fn joined(runner: &MockLeafRunner) -> Vec<String> {
+        runner
+            .recorded()
+            .iter()
+            .map(|argv| argv.join(" "))
+            .collect()
+    }
+
+    fn issuer_with_bundles() -> MockLeafRunner {
+        MockLeafRunner {
+            // `base64 -w 0 <path>` answers; any valid base64 payload will do.
+            stdout_by_match: vec![("base64 -w 0".to_owned(), "QUJD".to_owned())],
+            ..MockLeafRunner::default()
+        }
+    }
+
+    /// The re-issue mints on the issuer through the EXISTING dns-zone verb with
+    /// the scenario's own specs and the 300 s cap, reads each node's own
+    /// bundle, and installs verifier key + bundle on that node, without
+    /// touching the anti-replay watermark.
+    #[test]
+    fn reissue_dns_zone_mints_on_the_issuer_and_installs_each_nodes_own_bundle() {
+        let issuer = issuer_with_bundles();
+        let exit = MockLeafRunner::default();
+        let client = MockLeafRunner::default();
+        reissue_dns_zone(
+            &issuer,
+            "NODES",
+            "ALLOW",
+            &[
+                (&exit, "katana-exit-1-bootstrap"),
+                (&client, "katana-client-1-bootstrap"),
+            ],
+        )
+        .expect("reissue");
+
+        let issued = joined(&issuer);
+        assert!(
+            issued
+                .iter()
+                .any(|c| c.contains("rustynet ops e2e-issue-dns-zone-bundles-from-env --env-file")),
+            "{issued:#?}"
+        );
+        // The env file travels as a base64 argument of the write script.
+        use base64::Engine as _;
+        let env_text = issuer
+            .recorded()
+            .iter()
+            .filter_map(|argv| argv.last())
+            .filter_map(|arg| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(arg)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+            })
+            .find(|text| text.contains("NODES_SPEC"))
+            .expect("env file is written");
+        assert!(env_text.contains("NODES_SPEC=\"NODES\""), "{env_text}");
+        assert!(env_text.contains("ALLOW_SPEC=\"ALLOW\""), "{env_text}");
+        assert!(env_text.contains("DNS_ZONE_TTL_SECS=\"300\""), "{env_text}");
+        for node in ["katana-exit-1-bootstrap", "katana-client-1-bootstrap"] {
+            assert!(
+                issued.iter().any(|c| c.contains(&format!(
+                    "base64 -w 0 /run/rustynet/dns-zone-issue/rn-dns-zone-{node}.dns-zone"
+                ))),
+                "{node}: {issued:#?}"
+            );
+        }
+        for target in [&exit, &client] {
+            let calls = joined(target);
+            assert!(
+                calls.iter().any(|c| c.contains(DNS_ZONE_PUB_PATH)),
+                "{calls:#?}"
+            );
+            assert!(
+                calls.iter().any(|c| c.contains(DNS_ZONE_BUNDLE_PATH)),
+                "{calls:#?}"
+            );
+            assert!(
+                !calls.iter().any(|c| c.contains("watermark")),
+                "the replay watermark must stay: {calls:#?}"
+            );
+        }
+        // Each node only ever receives its own bundle: the issuer is read once
+        // per target, so the two reads name different files.
+        let reads: Vec<_> = issued
+            .iter()
+            .filter(|c| c.contains("rn-dns-zone-") && c.contains("base64 -w 0"))
+            .collect();
+        assert_eq!(reads.len(), 2, "{reads:#?}");
+    }
+
+    #[test]
+    fn reissue_dns_zone_fails_closed_when_the_issuer_refuses() {
+        let issuer = MockLeafRunner {
+            fail_on: (0..8).collect(),
+            failure_stderr: "issue failed".to_owned(),
+            ..MockLeafRunner::default()
+        };
+        let exit = MockLeafRunner::default();
+        let err = reissue_dns_zone(
+            &issuer,
+            "NODES",
+            "ALLOW",
+            &[(&exit, "katana-exit-1-bootstrap")],
+        )
+        .expect_err("a failed issuance must not install anything");
+        assert!(!err.is_empty());
+        assert!(
+            exit.recorded().is_empty(),
+            "nothing is installed on failure"
+        );
+    }
+
+    #[test]
+    fn install_dns_zone_bundle_uses_the_daemon_paths_and_modes() {
+        let node = MockLeafRunner::default();
+        install_dns_zone_bundle(&node, "QUJD", "QUJD").expect("install");
+        let calls = joined(&node);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("install -m 0644 -o root -g root")
+                    && c.ends_with(DNS_ZONE_PUB_PATH)),
+            "{calls:#?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("install -m 0640 -o root -g rustynetd")
+                    && c.ends_with(DNS_ZONE_BUNDLE_PATH)),
+            "{calls:#?}"
         );
     }
 

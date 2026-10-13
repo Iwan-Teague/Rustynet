@@ -708,6 +708,25 @@ fn reissue_for_roam(
         )?;
     }
 
+    // The roam restarts every daemon through `enforce_host` below, and the
+    // baseline's dns-zone bundle (300 s lifetime) is older than that by now;
+    // re-issue it for the roam topology so the post-roam signed-state check
+    // does not read `dns_zone_bundle_is_stale`.
+    let phase = "re-issuing signed dns-zone bundles for the roam";
+    during(
+        phase,
+        provisioning::reissue_dns_zone(
+            exit.runner,
+            &nodes,
+            &allow,
+            &[
+                (exit.runner, &exit.node_id),
+                (relay.runner, &relay.node_id),
+                (client.runner, &client.node_id),
+            ],
+        ),
+    )?;
+
     // No traversal bundle is re-issued. The shell did not re-issue one either:
     // the traversal state the relay baseline installed still names the same
     // three nodes, and the roam changes only which endpoint the ASSIGNMENT
