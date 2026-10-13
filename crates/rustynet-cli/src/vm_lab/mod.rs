@@ -15468,6 +15468,7 @@ pub(crate) fn wait_for_vm_lab_node_health(
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut healthy = false;
     let mut unhealthy_reason = String::new();
+    let mut last_status = String::new();
     while !healthy && Instant::now() < deadline {
         match run_relay_forward_test_script(
             target,
@@ -15478,6 +15479,7 @@ pub(crate) fn wait_for_vm_lab_node_health(
         ) {
             Err(err) => unhealthy_reason = err,
             Ok(status) => {
+                last_status = status.clone();
                 if status.contains("HP3_STATUS_UNREACHABLE") {
                     unhealthy_reason = format!("status unreachable: {status}");
                 } else {
@@ -15493,11 +15495,90 @@ pub(crate) fn wait_for_vm_lab_node_health(
         }
     }
     if !healthy {
-        return Err(format!(
-            "daemon did not report a healthy {expected_managed_peers}-peer traversal within {timeout_secs}s: {unhealthy_reason}"
+        return Err(vm_lab_node_health_timeout_error(
+            &target.label,
+            expected_managed_peers,
+            timeout_secs,
+            &unhealthy_reason,
+            &last_status,
         ));
     }
     Ok(())
+}
+
+/// Assembles the timeout failure for [`wait_for_vm_lab_node_health`]. The
+/// node alias and the LAST RAW `rustynet status` line travel with the
+/// refusal reason so a fail-closed stage failure names WHICH daemon was
+/// restricted and shows the exact status the gate rejected. katana-xnet-169
+/// shipped without either: the stage log could not say which node bricked,
+/// and the QH-04 reconcile error had to be inferred. The message keeps the
+/// original `daemon did not report a healthy ...` prefix so existing
+/// failure-digest greps keep matching.
+pub(crate) fn vm_lab_node_health_timeout_error(
+    node_alias: &str,
+    expected_managed_peers: u64,
+    timeout_secs: u64,
+    unhealthy_reason: &str,
+    last_status: &str,
+) -> String {
+    format!(
+        "daemon did not report a healthy {expected_managed_peers}-peer traversal within \
+         {timeout_secs}s (node {node_alias}): {unhealthy_reason}; last raw status: {last_status}"
+    )
+}
+
+#[cfg(test)]
+mod node_health_timeout_error_tests {
+    use super::vm_lab_node_health_timeout_error;
+
+    /// katana-xnet-169 observability gap: the timeout error carried neither
+    /// the node alias nor the raw status line, so "which daemon restricted"
+    /// had to be inferred from stage-loop order. Both must be present, and
+    /// the original failure-digest prefix must survive.
+    #[test]
+    fn vm_lab_node_health_timeout_error_names_node_alias_and_raw_status() {
+        let raw = "node_id=katana-client-1-bootstrap state=FailClosed \
+                   restricted_safe_mode=true traversal_peer_count=1 \
+                   last_reconcile_error=\"traversal authority is missing signed \
+                   traversal state for managed peer katana-entry-1-bootstrap\"";
+        let err = vm_lab_node_health_timeout_error(
+            "katana-client-1-bootstrap",
+            3,
+            120,
+            "restricted_safe_mode=true (fail-closed restriction active)",
+            raw,
+        );
+        assert!(
+            err.starts_with("daemon did not report a healthy 3-peer traversal within 120s"),
+            "failure-digest prefix must survive: {err}"
+        );
+        assert!(err.contains("(node katana-client-1-bootstrap)"), "{err}");
+        assert!(
+            err.contains("last raw status: node_id=katana-client-1-bootstrap"),
+            "the raw status line must travel with the error: {err}"
+        );
+        assert!(
+            err.contains("restricted_safe_mode=true")
+                && err.contains("traversal authority is missing signed traversal state"),
+            "the refusal evidence must be the captured line, not a summary: {err}"
+        );
+    }
+
+    /// A status line the poll never obtained must still be distinguishable
+    /// from a captured-but-unhealthy one: the empty capture stays explicit
+    /// rather than being dropped from the message.
+    #[test]
+    fn vm_lab_node_health_timeout_error_keeps_empty_status_explicit() {
+        let err = vm_lab_node_health_timeout_error(
+            "katana-exit-1",
+            2,
+            90,
+            "status unreachable: HP3_STATUS_UNREACHABLE",
+            "",
+        );
+        assert!(err.contains("(node katana-exit-1)"), "{err}");
+        assert!(err.ends_with("last raw status: "), "{err}");
+    }
 }
 
 /// Polls (bounded, real sleeps between attempts — never a single

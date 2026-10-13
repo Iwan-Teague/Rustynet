@@ -375,6 +375,7 @@ fn run() -> Result<(), String> {
         client_self_signed: false,
         exit_assign_pub_local: None,
         client_exit_assignment_local: None,
+        refresh_env_snapshots: Vec::new(),
     };
 
     for host in [&exit_host, &client_host, &blind_exit_host] {
@@ -504,6 +505,40 @@ fn run() -> Result<(), String> {
         &assign_pub_local,
         &blind_exit_assignment_local,
     )?;
+
+    // W7 toggle-env hygiene: snapshot each participant's pre-toggle
+    // node-local refresh env + timer state BEFORE the toggle installs its
+    // own narrowed env, and keep the snapshots on the cleanup guard so every
+    // exit path (strict success restore below, best-effort Drop backstop)
+    // can undo the install. A capture failure aborts here, before any node
+    // is mutated with the toggle env.
+    logger.line("Capturing pre-toggle node-local assignment-refresh state")?;
+    let refresh_env_snapshots: Vec<RefreshEnvSnapshot> =
+        [&exit_host, &client_host, &blind_exit_host]
+            .into_iter()
+            .map(|host| {
+                capture_refresh_env_snapshot(&ctx, host).map_err(|err| {
+                    format!("capture pre-toggle assignment-refresh state on {host}: {err}")
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+    cleanup.refresh_env_snapshots = refresh_env_snapshots.clone();
+    for snapshot in &refresh_env_snapshots {
+        logger.line(format!(
+            "pre-toggle refresh state on {}: env={}, timer={}",
+            snapshot.host,
+            if snapshot.env_body.is_some() {
+                "present"
+            } else {
+                "absent"
+            },
+            snapshot
+                .timer_is_active_raw
+                .as_deref()
+                .unwrap_or("unknown")
+                .trim(),
+        ))?;
+    }
 
     let exit_refresh_local = ctx.work_dir.join("assignment-refresh-exit.env");
     let client_refresh_local = ctx.work_dir.join("assignment-refresh-client.env");
@@ -1083,6 +1118,23 @@ fn run() -> Result<(), String> {
     // Released only after the full toggle sequence has succeeded; on any
     // earlier error path the armed guard's Drop restores every host instead.
     bundle_swap_fence.release()?;
+    // W7 toggle-env hygiene, success path: STRICT restore of every
+    // participant's pre-toggle node-local refresh env + timer disarm. The
+    // stage must not pass while a narrowed env of its own making is still
+    // installed and the refresh timer is armed: the next stage's full-fleet
+    // pair swap would meet a tick that re-mints a traversal envelope from
+    // the stale spec and the daemon fails closed on the QH-04 pair
+    // invariant (katana-xnet-169). A failed restore fails the stage.
+    logger.line("Restoring pre-toggle node-local assignment-refresh state")?;
+    for snapshot in &cleanup.refresh_env_snapshots {
+        restore_participant_refresh_state(&ctx, snapshot).map_err(|err| {
+            format!(
+                "restore pre-toggle assignment-refresh state on {}: {err}",
+                snapshot.host
+            )
+        })?;
+    }
+    cleanup.refresh_env_snapshots = Vec::new();
     Ok(())
 }
 
@@ -1102,10 +1154,31 @@ struct LanToggleCleanup {
     /// Pristine copy of the client's exit-signed assignment bundle, taken
     /// before the self-signed swap overwrites the working capture file.
     client_exit_assignment_local: Option<PathBuf>,
+    /// Pre-toggle node-local refresh state per participant, captured before
+    /// the toggle installs its own env. Non-empty from the capture point
+    /// until the success-path strict restore clears it; on every error path
+    /// the Drop below restores it best-effort.
+    refresh_env_snapshots: Vec<RefreshEnvSnapshot>,
 }
 
 impl Drop for LanToggleCleanup {
     fn drop(&mut self) {
+        // W7 toggle-env hygiene backstop: on every error path, put each
+        // participant's node-local refresh env back the way it was found
+        // and stop the refresh timer, so no later stage can meet a timer
+        // tick that re-mints a narrowed envelope over a fleet assignment
+        // (the katana-xnet-169 QH-04 fail-closed chain). Best-effort by
+        // design: Drop cannot fail; a failed restore is printed and leaves
+        // the stage's own error as the primary failure.
+        for snapshot in &self.refresh_env_snapshots {
+            if let Err(err) = restore_participant_refresh_state(&self.ctx, snapshot) {
+                eprintln!(
+                    "cleanup: could not restore pre-toggle assignment-refresh state on {}: {err}",
+                    snapshot.host
+                );
+            }
+        }
+        self.refresh_env_snapshots = Vec::new();
         // If the failure happened while the client ran its SELF-SIGNED trust
         // anchor, put the lab's exit-signed pair back best-effort so the next
         // stage finds the usual assignment authority. Best-effort by design:
@@ -1969,6 +2042,167 @@ fn install_assignment_refresh_env(
     )?;
     let _ = ctx.run_root_allow_failure(target, &["rm", "-f", "/tmp/rn-assignment-refresh.env"]);
     Ok(())
+}
+
+/// The node-local assignment-refresh env path `install_assignment_refresh_env`
+/// writes, and the systemd timer the node-local refresh service runs on. The
+/// restore below must target exactly the path the toggle's install wrote.
+const ASSIGNMENT_REFRESH_ENV_REMOTE: &str = "/etc/rustynet/assignment-refresh.env";
+const ASSIGNMENT_REFRESH_TIMER_UNIT: &str = "rustynetd-assignment-refresh.timer";
+
+/// The pre-toggle node-local refresh state of one participant, captured
+/// BEFORE the toggle installs its own env, so every exit path (the strict
+/// success-path restore and the [`LanToggleCleanup`] Drop backstop) can put
+/// the node back the way it was found. katana-xnet-169: the toggle left its
+/// narrowed 3-participant env installed and its timer armed, so the next
+/// stage's full-fleet pair swap met a timer tick that re-minted a traversal
+/// envelope missing the relay and the daemon failed closed on the QH-04
+/// pair invariant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RefreshEnvSnapshot {
+    host: String,
+    /// `ASSIGNMENT_REFRESH_ENV_REMOTE` contents as found. None = the file
+    /// did not exist (or was empty), so restore REMOVES the toggle's env.
+    env_body: Option<String>,
+    /// Raw `systemctl is-active` output for [`ASSIGNMENT_REFRESH_TIMER_UNIT`]
+    /// as found ("active", "inactive", ...). None = the probe could not be
+    /// read (e.g. no systemd on the guest); recorded for the log, never
+    /// guessed.
+    timer_is_active_raw: Option<String>,
+}
+
+impl RefreshEnvSnapshot {
+    /// True only when `systemctl is-active` answered "active" as found. The
+    /// success-path restore makes the timer stop STRICT only in this case:
+    /// a timer that was already stopped or unknown cannot be left armed by
+    /// a failed stop in any way that matters.
+    fn timer_found_active(&self) -> bool {
+        self.timer_is_active_raw
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|state| state == "active")
+    }
+}
+
+/// What restore must do to one participant's env file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RefreshEnvRestoreAction {
+    /// The env existed before the toggle: write the captured bytes back.
+    Reinstall(String),
+    /// No env existed (or it was empty) before the toggle: remove the
+    /// toggle's env. A narrowed env left in place is the katana-xnet-169
+    /// poison; absence is the state the node's next explicit env writer
+    /// (the pair swap's resume path, enforce_host) expects.
+    Remove,
+}
+
+/// Pure decision: which env action restores one participant. Empty/whitespace
+/// captures count as absent (a zero-byte env is not a usable fleet env and
+/// cannot be told apart from a failed cat).
+fn refresh_env_restore_action(snapshot: &RefreshEnvSnapshot) -> RefreshEnvRestoreAction {
+    match snapshot.env_body.as_deref() {
+        Some(body) if !body.trim().is_empty() => {
+            RefreshEnvRestoreAction::Reinstall(body.to_owned())
+        }
+        _ => RefreshEnvRestoreAction::Remove,
+    }
+}
+
+/// The exact argv that disarms the refresh timer. Always executed on the
+/// restore path: a resumed tick would run whatever env is installed against
+/// the toggle's still-installed (narrowed) assignments and mint exactly the
+/// traversal-wider-than-assignment half-pair the daemon must fail closed on.
+/// Every stage that needs the timer re-arms it explicitly (the pair swap's
+/// resume script, enforce_host), so "stopped" is the safe as-left state.
+fn refresh_timer_disarm_argv() -> [&'static str; 3] {
+    ["systemctl", "stop", ASSIGNMENT_REFRESH_TIMER_UNIT]
+}
+
+/// Read one participant's pre-toggle node-local refresh state. The env cat
+/// is STRICT: if the as-found state cannot be read, the toggle aborts
+/// BEFORE installing its own env rather than mutating a node it could not
+/// snapshot (fail-closed capture). The timer probe is advisory and recorded
+/// as None when it fails.
+fn capture_refresh_env_snapshot(
+    ctx: &LiveLabContext,
+    host: &str,
+) -> Result<RefreshEnvSnapshot, String> {
+    let env_body =
+        match ctx.capture_root_allow_failure(host, &["cat", ASSIGNMENT_REFRESH_ENV_REMOTE])? {
+            body if body.trim().is_empty() => None,
+            body => Some(body),
+        };
+    let timer_is_active_raw = match ctx.capture_root_allow_failure(
+        host,
+        &["systemctl", "is-active", ASSIGNMENT_REFRESH_TIMER_UNIT],
+    ) {
+        Ok(raw) => Some(raw),
+        Err(err) => {
+            eprintln!(
+                "warning: could not read the {ASSIGNMENT_REFRESH_TIMER_UNIT} state on {host} \
+                 (recording as unknown): {err}"
+            );
+            None
+        }
+    };
+    Ok(RefreshEnvSnapshot {
+        host: host.to_owned(),
+        env_body,
+        timer_is_active_raw,
+    })
+}
+
+/// Restore one participant's pre-toggle node-local refresh state: env back
+/// (or removed), then the refresh timer disarmed. The timer stop is strict
+/// only when `systemctl is-active` answered "active" as found — that is the
+/// one shape where a failed stop leaves the katana-xnet-169 poison window
+/// (armed timer + env the toggle did not mint) genuinely open; any other
+/// stop failure is warned and swallowed because the timer was not running
+/// as found anyway. Runs on BOTH paths: the strict success-path call in
+/// `run()` and the best-effort [`LanToggleCleanup`] Drop backstop.
+fn restore_participant_refresh_state(
+    ctx: &LiveLabContext,
+    snapshot: &RefreshEnvSnapshot,
+) -> Result<(), String> {
+    let host = snapshot.host.as_str();
+    match refresh_env_restore_action(snapshot) {
+        RefreshEnvRestoreAction::Reinstall(body) => {
+            let local = ctx
+                .work_dir
+                .join(format!("restore-assignment-refresh-{}.env", unix_now()));
+            write_secure_text(&local, &body)?;
+            install_assignment_refresh_env(ctx, host, &local)
+                .map_err(|err| format!("reinstall captured assignment-refresh env: {err}"))?;
+        }
+        RefreshEnvRestoreAction::Remove => {
+            ctx.run_root(host, &["rm", "-f", ASSIGNMENT_REFRESH_ENV_REMOTE])
+                .map_err(|err| format!("remove {ASSIGNMENT_REFRESH_ENV_REMOTE}: {err}"))?;
+        }
+    }
+    match ctx.run_root_allow_failure(host, &refresh_timer_disarm_argv()) {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let err = format!(
+                "systemctl stop {ASSIGNMENT_REFRESH_TIMER_UNIT} failed on {host}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+            if snapshot.timer_found_active() {
+                Err(err)
+            } else {
+                eprintln!("warning: {err} (timer was not active as found; tolerating)");
+                Ok(())
+            }
+        }
+        Err(err) => {
+            let err = format!("systemctl stop {ASSIGNMENT_REFRESH_TIMER_UNIT}: {err}");
+            if snapshot.timer_found_active() {
+                Err(err)
+            } else {
+                eprintln!("warning: {err} (timer was not active as found; tolerating)");
+                Ok(())
+            }
+        }
+    }
 }
 
 fn install_traversal_bundle(
@@ -3810,5 +4044,193 @@ mod tests {
                 index + 1
             );
         }
+    }
+
+    // ── pre-toggle refresh-env snapshot / restore ─────────────────────────
+
+    fn snapshot(host: &str, env: Option<&str>, timer: Option<&str>) -> super::RefreshEnvSnapshot {
+        super::RefreshEnvSnapshot {
+            host: host.to_owned(),
+            env_body: env.map(str::to_owned),
+            timer_is_active_raw: timer.map(str::to_owned),
+        }
+    }
+
+    /// A participant that had a refresh env before the toggle gets the
+    /// captured bytes reinstalled on restore — never removal.
+    #[test]
+    fn restore_action_reinstalls_the_captured_env() {
+        let snap = snapshot(
+            "exit-1",
+            Some("RUSTYNET_ASSIGNMENT_NODES=\"fleet\"\n"),
+            Some("active"),
+        );
+        assert_eq!(
+            super::refresh_env_restore_action(&snap),
+            super::RefreshEnvRestoreAction::Reinstall(
+                "RUSTYNET_ASSIGNMENT_NODES=\"fleet\"\n".to_owned()
+            )
+        );
+    }
+
+    /// katana-xnet-169 kill (mutant: treat a missing as-found env as a
+    /// no-op restore): the toggle's narrowed env must be REMOVED when no
+    /// env existed before the toggle, on every path — otherwise the stage
+    /// leaves the poison in place and the next full-fleet pair swap trips
+    /// the daemon's QH-04 fail-closed invariant.
+    #[test]
+    fn restore_env_action_removes_env_when_none_captured() {
+        assert_eq!(
+            super::refresh_env_restore_action(&snapshot("client-1", None, Some("inactive"))),
+            super::RefreshEnvRestoreAction::Remove
+        );
+        // An empty/whitespace capture is indistinguishable from absent and
+        // must also restore to removal, not to a zero-byte env.
+        assert_eq!(
+            super::refresh_env_restore_action(&snapshot("aux-1", Some("   \n"), None)),
+            super::RefreshEnvRestoreAction::Remove
+        );
+    }
+
+    /// The disarm argv targets the refresh TIMER unit exactly — a mutant
+    /// that stops the wrong unit (service-only, or a misspelled unit) leaves
+    /// the armed-timer poison window open.
+    #[test]
+    fn restore_timer_disarm_argv_targets_the_refresh_timer() {
+        assert_eq!(
+            super::refresh_timer_disarm_argv(),
+            ["systemctl", "stop", "rustynetd-assignment-refresh.timer"]
+        );
+    }
+
+    /// Strict-vs-tolerant stop: only a timer that answered "active" as found
+    /// makes a failed stop an error; every other as-found state tolerates a
+    /// failed stop (there was no armed timer to begin with).
+    #[test]
+    fn timer_found_active_gate_is_exact() {
+        assert!(snapshot("h", None, Some("active")).timer_found_active());
+        assert!(snapshot("h", None, Some("active\n")).timer_found_active());
+        assert!(!snapshot("h", None, Some("inactive")).timer_found_active());
+        assert!(!snapshot("h", None, Some("unknown")).timer_found_active());
+        assert!(!snapshot("h", None, Some("")).timer_found_active());
+        assert!(!snapshot("h", None, None).timer_found_active());
+    }
+
+    /// Restore always covers BOTH halves — env action dispatch AND the timer
+    /// disarm — in that order, on the one path shared by the strict
+    /// success-path call and the Drop backstop. (Mutant: restore the env but
+    /// skip the timer, or stop the timer without touching the env.)
+    #[test]
+    fn restore_covers_env_and_timer_in_order_on_one_shared_path() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        // Scan only the implementation region: this tests module quotes the
+        // restore function's name and would otherwise match itself.
+        let impl_end = source
+            .find("\nmod tests {")
+            .expect("tests module must follow the implementation");
+        let impl_source = &source[..impl_end];
+        let fn_start = impl_source
+            .find("fn restore_participant_refresh_state(")
+            .expect("restore function must exist");
+        let fn_body = &impl_source[fn_start..];
+        let env_action = fn_body
+            .find("refresh_env_restore_action(snapshot)")
+            .expect("restore must dispatch on the captured env");
+        let disarm = fn_body
+            .find("refresh_timer_disarm_argv()")
+            .expect("restore must disarm the refresh timer");
+        assert!(
+            env_action < disarm,
+            "the timer must be disarmed after the env action, never before: {fn_body}"
+        );
+        // One shared path: no second, divergent restore implementation.
+        assert_eq!(
+            impl_source
+                .matches("fn restore_participant_refresh_state(")
+                .count(),
+            1,
+            "restore must have exactly one implementation"
+        );
+    }
+
+    /// The success path restores STRICTLY (a failed restore fails the stage)
+    /// and only then clears the Drop backstop. (Mutant: drop the strict
+    /// restore and rely on the best-effort Drop, which swallows failures and
+    /// would let the stage pass with the poison still installed.)
+    #[test]
+    fn success_path_restores_pre_toggle_state_strictly_before_returning() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let release = run_body
+            .find("bundle_swap_fence.release()")
+            .expect("the success path must release the bundle-swap fence");
+        let strict_restore = run_body[release..]
+            .find("restore_participant_refresh_state(&ctx, snapshot)")
+            .expect("the success path must strictly restore the pre-toggle state after the fence releases");
+        let clear = run_body[release..]
+            .find("cleanup.refresh_env_snapshots = Vec::new()")
+            .expect("the success path must clear the Drop backstop after the strict restore");
+        assert!(
+            strict_restore < clear,
+            "the backstop is cleared only after the strict restore succeeded"
+        );
+        assert!(
+            run_body.contains(".map_err(|err| {\n            format!(\n                \"restore pre-toggle assignment-refresh state on {}"),
+            "a failed restore must fail the stage, not warn"
+        );
+    }
+
+    /// The pre-toggle capture happens BEFORE the toggle installs its own env
+    /// on every participant, and the snapshots land on the cleanup guard.
+    /// (Mutant: capture after the install — the snapshot then holds the
+    /// TOGGLE's env and "restore" reinstalls the poison.)
+    #[test]
+    fn pre_toggle_env_capture_precedes_toggle_env_install() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let run_start = source.find("\nfn run(").expect("run() must exist");
+        let run_end = source
+            .find("struct LanToggleCleanup")
+            .expect("LanToggleCleanup must follow run()");
+        let run_body = &source[run_start..run_end];
+        let capture = run_body
+            .find("capture_refresh_env_snapshot(&ctx, host)")
+            .expect("run() must capture the pre-toggle state");
+        let install = run_body
+            .find("install_assignment_refresh_env(&ctx, &exit_host, &exit_refresh_local)")
+            .expect("run() must install the toggle env");
+        assert!(
+            capture < install,
+            "the as-found snapshot must be taken before the first toggle env install ({capture} >= {install})"
+        );
+        assert!(
+            run_body.contains("cleanup.refresh_env_snapshots = refresh_env_snapshots.clone()"),
+            "the snapshots must arm the cleanup guard's Drop backstop"
+        );
+    }
+
+    /// The Drop backstop restores every snapshot best-effort and is armed
+    /// from the same snapshots the success path consumes — an error path
+    /// between capture and success must hit the restore.
+    #[test]
+    fn cleanup_drop_backstop_restores_the_captured_snapshots() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let drop_start = source
+            .find("impl Drop for LanToggleCleanup")
+            .expect("the cleanup Drop must exist");
+        let drop_body = &source[drop_start..];
+        let backstop = drop_body
+            .find("restore_participant_refresh_state(&self.ctx, snapshot)")
+            .expect("the Drop backstop must restore the pre-toggle state");
+        let client_restore = drop_body
+            .find("install_assignment_bundle_atomically(")
+            .expect("the client's exit-signed restore must follow");
+        assert!(
+            backstop < client_restore,
+            "the env restore runs before the assignment restore: the env poison outlives a wrong assignment"
+        );
     }
 }

@@ -183,6 +183,13 @@ struct RefreshPairWitness {
     node_id: String,
     assignment_sha256: String,
     traversal_sha256: String,
+    /// Raw `rustynet status` line captured AFTER the pair install, resume
+    /// and health gate. This is the timer-tick witness: the node-local
+    /// refresh timer is re-armed by the resume script before this capture,
+    /// so the recorded line shows the restriction/peer-count state the
+    /// daemon settles into once ticks resume on the swapped pair
+    /// (katana-xnet-169 shipped no post-refresh status at all).
+    post_refresh_status: String,
 }
 
 /// Per-node, quiesced assignment+traversal PAIR swap. See the execute()
@@ -397,7 +404,25 @@ fn refresh_assignment_traversal_pair_inner(
                 REFRESH_SWAP_HEALTH_POLL_INTERVAL_SECS,
             )?;
 
-            // 3e. Witness the exact installed bytes.
+            // 3e. Post-refresh status capture: the resume script above
+            //     re-armed rustynetd-assignment-refresh.timer, so this line
+            //     witnesses the state the daemon settles into once
+            //     node-local refresh ticks resume on the swapped pair. It
+            //     is captured AFTER the health gate on purpose: a capture
+            //     taken before the resume would show the quiesced daemon
+            //     and witness nothing about the tick behaviour. Strict: a
+            //     witness this stage cannot collect is a stage failure,
+            //     never an absent record.
+            let post_refresh_status = crate::vm_lab::run_vm_lab_node_script(
+                &target,
+                &params.identity_file,
+                Some(params.known_hosts.as_path()),
+                crate::vm_lab::build_relay_forward_test_status_script().as_str(),
+                "post-refresh node status capture",
+            )
+            .map_err(|e| format!("{alias}: post-refresh status capture failed: {e}"))?;
+
+            // 3f. Witness the exact installed bytes.
             let assignment_path = tmp_dir.join(assignment_bundle_file_name(node_id));
             let traversal_path = tmp_dir.join(traversal_bundle_file_name(node_id));
             let assignment_sha256 =
@@ -415,6 +440,7 @@ fn refresh_assignment_traversal_pair_inner(
                 node_id: node_id.clone(),
                 assignment_sha256,
                 traversal_sha256,
+                post_refresh_status,
             });
         }
         Ok(witnesses)
@@ -458,8 +484,27 @@ fn refresh_assignment_traversal_pair_inner(
     .map_err(|e| format!("traversal bundle evidence write failed: {e}"))?;
 
     // Pair witness: assignment + traversal digests side by side per node —
-    // the on-disk record that the two generations were swapped together.
-    let body = serde_json::json!({
+    // the on-disk record that the two generations were swapped together —
+    // plus the per-node post-refresh status capture.
+    let body = refresh_pair_evidence_body(expected_managed_peers, &witnesses);
+    let encoded = serde_json::to_vec_pretty(&body)
+        .map_err(|e| format!("serializing pair evidence failed: {e}"))?;
+    let path = ctx.report_dir.join(REFRESH_PAIR_EVIDENCE_FILENAME);
+    std::fs::write(&path, encoded)
+        .map_err(|e| format!("writing {REFRESH_PAIR_EVIDENCE_FILENAME} failed: {e}"))?;
+    Ok(())
+}
+
+/// Builds the `refresh_signed_bundles.pair_evidence.json` body: the expected
+/// managed-peer count, the assignment/traversal digest pair per node, and —
+/// the timer-tick witness — each node's post-refresh raw `rustynet status`
+/// line, keyed by alias. Extracted as a pure function so a test can assert
+/// the CAPTURED status travels into the evidence verbatim.
+fn refresh_pair_evidence_body(
+    expected_managed_peers: u64,
+    witnesses: &[RefreshPairWitness],
+) -> serde_json::Value {
+    serde_json::json!({
         "stage": "refresh_signed_bundles",
         "expected_managed_peers": expected_managed_peers,
         "pairs": witnesses
@@ -473,13 +518,16 @@ fn refresh_assignment_traversal_pair_inner(
                 })
             })
             .collect::<Vec<_>>(),
-    });
-    let encoded = serde_json::to_vec_pretty(&body)
-        .map_err(|e| format!("serializing pair evidence failed: {e}"))?;
-    let path = ctx.report_dir.join(REFRESH_PAIR_EVIDENCE_FILENAME);
-    std::fs::write(&path, encoded)
-        .map_err(|e| format!("writing {REFRESH_PAIR_EVIDENCE_FILENAME} failed: {e}"))?;
-    Ok(())
+        "post_refresh_status": witnesses
+            .iter()
+            .map(|w| {
+                (
+                    w.alias.clone(),
+                    serde_json::Value::from(w.post_refresh_status.as_str()),
+                )
+            })
+            .collect::<serde_json::Map<String, serde_json::Value>>(),
+    })
 }
 
 #[cfg(test)]
@@ -782,6 +830,87 @@ mod tests {
         );
         let healthy = "node_id=x state=Active restricted_safe_mode=false traversal_peer_count=4 last_reconcile_error=none";
         assert!(crate::vm_lab::rustynet_status_health(healthy, 4).is_ok());
+    }
+
+    /// The pair evidence must carry the CAPTURED post-refresh status per
+    /// node, verbatim: a fail-closed tick after the resume (exactly the
+    /// katana-xnet-169 shape) must land in the evidence as
+    /// restricted_safe_mode=true with the reconcile error, not be replaced
+    /// by a summary or a hardcoded healthy line.
+    #[test]
+    fn refresh_pair_evidence_body_carries_post_refresh_status_per_node() {
+        let poisoned = "node_id=katana-client-1-bootstrap state=FailClosed \
+             restricted_safe_mode=true traversal_peer_count=1 \
+             last_reconcile_error=\"traversal authority is missing signed traversal \
+             state for managed peer katana-entry-1-bootstrap\"";
+        let witnesses = vec![
+            super::RefreshPairWitness {
+                alias: "katana-client-1".to_owned(),
+                node_id: "client-node-id".to_owned(),
+                assignment_sha256: "a".repeat(64),
+                traversal_sha256: "b".repeat(64),
+                post_refresh_status: poisoned.to_owned(),
+            },
+            super::RefreshPairWitness {
+                alias: "katana-entry-1".to_owned(),
+                node_id: "entry-node-id".to_owned(),
+                assignment_sha256: "c".repeat(64),
+                traversal_sha256: "d".repeat(64),
+                post_refresh_status: "node_id=entry state=Active restricted_safe_mode=false \
+                 traversal_peer_count=3 last_reconcile_error=none"
+                    .to_owned(),
+            },
+        ];
+        let body = super::refresh_pair_evidence_body(3, &witnesses);
+        assert_eq!(body["expected_managed_peers"], 3);
+        assert_eq!(body["pairs"].as_array().map(Vec::len), Some(2));
+        let client_status = body["post_refresh_status"]["katana-client-1"]
+            .as_str()
+            .expect("post_refresh_status must be keyed by alias");
+        assert!(
+            client_status.contains("restricted_safe_mode=true")
+                && client_status.contains("traversal authority is missing signed traversal state"),
+            "the captured poisoned line must travel verbatim: {client_status}"
+        );
+        let entry_status = body["post_refresh_status"]["katana-entry-1"]
+            .as_str()
+            .expect("post_refresh_status must be keyed by alias");
+        assert!(
+            entry_status.contains("restricted_safe_mode=false"),
+            "{entry_status}"
+        );
+        assert!(
+            !poisoned.contains("restricted_safe_mode=false"),
+            "test self-check: the poisoned fixture must stay poisoned"
+        );
+    }
+
+    /// The status capture is the TIMER-TICK witness only if it happens after
+    /// the resume (timer re-armed) and after the health gate: a capture
+    /// taken earlier shows the quiesced daemon and witnesses nothing. Source
+    /// ordering inside the pair-swap body is the fail-loud pin.
+    #[test]
+    fn post_refresh_status_capture_follows_resume_and_health_gate() {
+        let source =
+            crate::vm_lab::implementation_source_slice(include_str!("refresh_signed_bundles.rs"))
+                .expect("refresh_signed_bundles.rs implementation slice must parse");
+        let fn_start = source
+            .find("fn refresh_assignment_traversal_pair_inner(")
+            .expect("pair swap body must exist");
+        let fn_body = &source[fn_start..];
+        let resume = fn_body
+            .find("build_refresh_pair_resume_script()")
+            .expect("resume script call must exist");
+        let health = fn_body
+            .find("wait_for_vm_lab_node_health(")
+            .expect("health gate call must exist");
+        let capture = fn_body
+            .find("\"post-refresh node status capture\"")
+            .expect("post-refresh capture must exist");
+        assert!(
+            resume < health && health < capture,
+            "capture must follow resume ({resume}) and the health gate ({health}); found at {capture}"
+        );
     }
 
     #[derive(Debug)]
