@@ -2160,7 +2160,46 @@ fn capture_refresh_env_snapshot(
 /// stop failure is warned and swallowed because the timer was not running
 /// as found anyway. Runs on BOTH paths: the strict success-path call in
 /// `run()` and the best-effort [`LanToggleCleanup`] Drop backstop.
+/// True when a transport error is an ssh host-key verification failure: the
+/// call ran against a known_hosts context that was missing or had no trusted
+/// entry for the target (katana-xnet-178: the restore ran after the shared
+/// work-dir known_hosts copy was deleted under it). Never a signal to retry
+/// or to weaken checking — a restore that hits this must fail the stage
+/// loudly, naming the cause.
+fn error_is_host_key_verification_failure(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("host key verification failed")
+        || lower.contains("host key is known for")
+        || lower.contains("remote host identification has changed")
+}
+
+/// Name the host-key cause explicitly on a restore error, so the failure
+/// digest records WHY the restore lost ssh trust instead of an unclassified
+/// generic_failure. Points at the exact known_hosts file the harness seeds;
+/// checking stays strict.
+fn name_restore_host_key_cause(ctx: &LiveLabContext, host: &str, error: &str) -> String {
+    format!(
+        "{error}; cause: ssh host-key verification failed for {host}: this restore call did not \
+         see a trusted host entry in the harness known_hosts copy at {} (every toggle call must \
+         share the same seeded known_hosts context; StrictHostKeyChecking stays yes)",
+        ctx.known_hosts_file.display()
+    )
+}
+
 fn restore_participant_refresh_state(
+    ctx: &LiveLabContext,
+    snapshot: &RefreshEnvSnapshot,
+) -> Result<(), String> {
+    restore_participant_refresh_state_inner(ctx, snapshot).map_err(|err| {
+        if error_is_host_key_verification_failure(&err) {
+            name_restore_host_key_cause(ctx, &snapshot.host, &err)
+        } else {
+            err
+        }
+    })
+}
+
+fn restore_participant_refresh_state_inner(
     ctx: &LiveLabContext,
     snapshot: &RefreshEnvSnapshot,
 ) -> Result<(), String> {
@@ -3852,13 +3891,14 @@ mod tests {
     }
 
     use super::{
-        AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate,
+        AssignmentAuthorityScope, LiveLabPlatform, ManagedDnsRecordTemplate, RefreshEnvSnapshot,
         capture_enforce_failure_evidence_with, daemon_socket_path, enforce_failure_evidence_probes,
+        error_is_host_key_verification_failure, install_assignment_refresh_env,
         is_macos_utun_iface_name, killswitch_drop_table_present, killswitch_dump_argv,
         killswitch_enforcement_present, lan_probe_argv, macos_killswitch_anchor_present,
         managed_dns_base_records, managed_dns_records_manifest_for_scope,
-        parse_assignment_authority_scope, route_to_target_argv, route_to_target_uses_tunnel,
-        windows_killswitch_present,
+        parse_assignment_authority_scope, restore_participant_refresh_state, route_to_target_argv,
+        route_to_target_uses_tunnel, windows_killswitch_present,
     };
 
     #[test]
@@ -4431,6 +4471,304 @@ mod tests {
         assert!(
             backstop < client_restore,
             "the env restore runs before the assignment restore: the env poison outlives a wrong assignment"
+        );
+    }
+
+    /// A deterministic ed25519 host key line for the test pinned known_hosts
+    /// file (a real key so even strict tooling parses it).
+    use std::path::{Path, PathBuf};
+
+    use super::live_lab_support::{self, LiveLabContext};
+
+    const TEST_KNOWN_HOSTS_LINE: &str = "192.0.2.10 ssh-ed25519 \
+AAAAC3NzaC1lZDI1NTE5AAAAIHaDU9pi11/BAvWNTqDiDD9hbS2Hl3gnRcKCx6lWl3mS w11-test-vector";
+    /// A TEST-NET target: never routed, so a stray REAL ssh call cannot
+    /// reach anything; the fake transport programs below intercept it first.
+    const TEST_TARGET: &str = "debian@192.0.2.10:22";
+
+    #[cfg(unix)]
+    fn test_set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|err| panic!("set mode {mode:o} on {}: {err}", path.display()));
+    }
+
+    #[cfg(not(unix))]
+    fn test_set_mode(_path: &Path, _mode: u32) {}
+
+    /// A `LiveLabContext` whose ssh/scp client programs are test doubles:
+    /// they refuse EXACTLY like real ssh when the trusted known_hosts copy
+    /// they are pointed at is missing (the katana-xnet-178 failure shape)
+    /// and otherwise record their full argv, one call per `---` block.
+    struct FakeTransport {
+        ctx: LiveLabContext,
+        record: PathBuf,
+        scratch: PathBuf,
+    }
+
+    fn fake_transport_ctx(prefix: &str) -> FakeTransport {
+        let scratch = live_lab_support::test_scratch_dir(prefix).expect("scratch dir");
+        let identity = scratch.join("identity");
+        std::fs::write(&identity, "not-a-real-key\n").expect("write identity");
+        test_set_mode(&identity, 0o600);
+        let pinned = scratch.join("pinned_known_hosts");
+        std::fs::write(&pinned, format!("{TEST_KNOWN_HOSTS_LINE}\n")).expect("write pinned");
+        test_set_mode(&pinned, 0o644);
+        let record = scratch.join("transport-argv.log");
+        let refuse = r#"
+kh=
+for arg in "$@"; do
+  case "$arg" in UserKnownHostsFile=*) kh=${arg#UserKnownHostsFile=} ;; esac
+done
+if [ ! -f "$kh" ]; then
+  echo "No ED25519 host key is known for 192.0.2.10 and you have requested strict checking." >&2
+  echo "Host key verification failed." >&2
+  exit 255
+fi
+{
+  for arg in "$@"; do printf '%s\n' "$arg"; done
+  printf -- '---\n'
+} >> 'RECORD'
+"#;
+        let ssh_program = scratch.join("fake-ssh");
+        std::fs::write(
+            &ssh_program,
+            format!("#!/bin/sh\n{refuse}").replacen(
+                "'RECORD'",
+                &format!("'{}'", record.display()),
+                1,
+            ),
+        )
+        .expect("write fake ssh");
+        test_set_mode(&ssh_program, 0o700);
+        let scp_program = scratch.join("fake-scp");
+        std::fs::write(
+            &scp_program,
+            format!("#!/bin/sh\n{refuse}").replacen(
+                "'RECORD'",
+                &format!("'{}'", record.display()),
+                1,
+            ),
+        )
+        .expect("write fake scp");
+        test_set_mode(&scp_program, 0o700);
+        let ctx = LiveLabContext::with_transport_programs_for_tests(
+            &format!("{prefix}-ctx"),
+            &identity,
+            Some(&pinned),
+            ssh_program,
+            scp_program,
+        )
+        .expect("context with fake transport");
+        FakeTransport {
+            ctx,
+            record,
+            scratch,
+        }
+    }
+
+    fn recorded_calls(record: &Path) -> Vec<Vec<String>> {
+        std::fs::read_to_string(record)
+            .unwrap_or_default()
+            .split("---\n")
+            .filter(|block| !block.trim().is_empty())
+            .map(|block| {
+                block
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn assert_trusted_call(call: &[String], ctx: &LiveLabContext, identity: &Path) {
+        let expected_known_hosts = format!("UserKnownHostsFile={}", ctx.known_hosts_file.display());
+        assert!(
+            call.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == "StrictHostKeyChecking=yes"),
+            "strict host-key checking on every call: {call:?}"
+        );
+        assert!(
+            call.iter().any(|arg| arg == &expected_known_hosts),
+            "every call must trust exactly the seeded work-dir known_hosts copy: {call:?}"
+        );
+        assert!(
+            call.windows(2)
+                .any(|pair| pair[0] == "-i" && pair[1] == identity.display().to_string()),
+            "every call pins the harness identity: {call:?}"
+        );
+    }
+
+    /// THE katana-xnet-178 regression, reproduced offline: the bundle-swap
+    /// fence holds its own ctx CLONE and `release()` consumes it right
+    /// before the restore runs. With the old per-clone Drop, that drop
+    /// deleted the seeded known_hosts copy and the restore then failed on
+    /// every participant with "No ED25519 host key is known ... Host key
+    /// verification failed." The restore must run through the SAME trusted
+    /// ssh options `install_assignment_refresh_env` runs through.
+    #[test]
+    fn restore_after_a_fence_clone_drop_shares_the_install_ssh_options() {
+        let transport = fake_transport_ctx("w11-restore-options");
+        let identity = transport.scratch.join("identity");
+
+        // The fence-shaped clone drop that precedes the restore on the
+        // success path (BundleSwapFence::release consumes its guard).
+        let fence_ctx = transport.ctx.clone();
+        drop(fence_ctx);
+        assert!(
+            transport.ctx.known_hosts_file.is_file(),
+            "the fence clone drop must not delete the shared known_hosts copy"
+        );
+
+        // Install leg: scp push + root shells, argv recorded.
+        let env_local = transport.scratch.join("toggle-refresh.env");
+        std::fs::write(&env_local, "NODE_ID=w11-test\n").expect("write env");
+        install_assignment_refresh_env(&transport.ctx, TEST_TARGET, &env_local)
+            .expect("install runs through the fake transport");
+        let calls_after_install = recorded_calls(&transport.record);
+        assert!(
+            calls_after_install
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("-q")),
+            "install must push the env via the scp transport: {calls_after_install:?}"
+        );
+
+        // Restore leg (env absent as found → strict remove + timer disarm).
+        let snapshot = RefreshEnvSnapshot {
+            host: TEST_TARGET.to_owned(),
+            env_body: None,
+            timer_is_active_raw: Some("inactive".to_owned()),
+        };
+        restore_participant_refresh_state(&transport.ctx, &snapshot)
+            .expect("restore runs through the same trusted context after the fence drop");
+
+        let all_calls = recorded_calls(&transport.record);
+        let restore_calls = all_calls[calls_after_install.len()..].to_vec();
+        assert!(
+            restore_calls.len() >= 4,
+            "restore runs its root gate and the timer disarm through ssh: {restore_calls:?}"
+        );
+        for call in &restore_calls {
+            assert_trusted_call(call, &transport.ctx, &identity);
+        }
+        // Parity with the install leg, call for call.
+        for call in &calls_after_install {
+            assert_trusted_call(call, &transport.ctx, &identity);
+        }
+    }
+
+    /// A failed restore must fail loudly AND name the host-key cause: the
+    /// error carries the target host, the exact ssh refusal, and the
+    /// known_hosts file the call ran against — checking stays strict.
+    #[test]
+    fn restore_failure_names_the_ssh_host_key_cause() {
+        let transport = fake_transport_ctx("w11-restore-cause");
+        std::fs::remove_file(&transport.ctx.known_hosts_file)
+            .expect("remove the seeded known_hosts copy");
+        let snapshot = RefreshEnvSnapshot {
+            host: TEST_TARGET.to_owned(),
+            env_body: None,
+            timer_is_active_raw: Some("inactive".to_owned()),
+        };
+        let err = restore_participant_refresh_state(&transport.ctx, &snapshot)
+            .expect_err("a restore without its trusted context must fail loudly");
+        assert!(
+            err.contains("Host key verification failed"),
+            "the ssh refusal must be carried: {err}"
+        );
+        assert!(
+            err.contains(TEST_TARGET),
+            "the failing host must be named: {err}"
+        );
+        assert!(
+            err.contains("known_hosts"),
+            "the known_hosts context must be named: {err}"
+        );
+        assert!(
+            err.contains(&transport.ctx.known_hosts_file.display().to_string()),
+            "the exact context file must be named: {err}"
+        );
+        assert!(
+            err.contains("StrictHostKeyChecking stays yes"),
+            "the cause text must state that checking is not weakened: {err}"
+        );
+    }
+
+    /// The classifier must match the EXACT stderr shapes the katana-xnet-178
+    /// stage produced on all three participants (and the changed-key shape),
+    /// and must NOT classify ordinary transport failures as host-key ones.
+    #[test]
+    fn host_key_classifier_matches_the_katana_xnet_178_stderr() {
+        let exit = "remote command failed on debian@192.168.123.222:22: No ED25519 host key \
+is known for 192.168.123.222 and you have requested strict checking.  Host key verification \
+failed.";
+        let client = "remote command failed on debian@192.168.122.45:22: No ED25519 host key \
+is known for 192.168.122.45 and you have requested strict checking.  Host key verification \
+failed.";
+        let blind_exit = "remote command failed on debian@192.168.122.114:22: No ED25519 host \
+key is known for 192.168.122.114 and you have requested strict checking.  Host key \
+verification failed.";
+        for stderr in [exit, client, blind_exit] {
+            assert!(
+                error_is_host_key_verification_failure(stderr),
+                "the observed xnet-178 shape must classify as host-key: {stderr}"
+            );
+        }
+        assert!(error_is_host_key_verification_failure(
+            "@@@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@@@"
+        ));
+        assert!(!error_is_host_key_verification_failure(
+            "Could not resolve hostname katana-guest-9: Name or service not known"
+        ));
+        assert!(!error_is_host_key_verification_failure(
+            "Connection refused"
+        ));
+        assert!(!error_is_host_key_verification_failure(
+            "Permission denied (publickey)."
+        ));
+        assert!(!error_is_host_key_verification_failure(""));
+    }
+
+    /// The restore runs after EVERY toggle outcome: the strict success-path
+    /// loop right after the fence release, and the unconditional Drop
+    /// backstop on every error path — each clearing the snapshots exactly
+    /// once so the restore cannot double-run.
+    #[test]
+    fn restore_runs_after_every_toggle_outcome() {
+        let source = include_str!("live_linux_lan_toggle_test.rs");
+        let impl_end = source
+            .find("\nmod tests {")
+            .expect("tests module must follow the implementation");
+        let impl_source = &source[..impl_end];
+        let release = impl_source
+            .find("bundle_swap_fence.release()?;")
+            .expect("the fence must be released on the success path");
+        let success_restore = impl_source[release..]
+            .find("restore_participant_refresh_state(&ctx, snapshot)")
+            .expect("the strict restore loop must run after the fence release");
+        let drop_impl = impl_source
+            .find("impl Drop for LanToggleCleanup")
+            .expect("the cleanup Drop must exist");
+        let backstop_offset = impl_source[drop_impl..]
+            .find("restore_participant_refresh_state(&self.ctx, snapshot)")
+            .expect("the Drop backstop must restore the pre-toggle state");
+        assert!(
+            success_restore > 0 && drop_impl > release,
+            "success-path restore after release, Drop backstop after it in source order"
+        );
+        let drop_head = &impl_source[drop_impl..drop_impl + backstop_offset];
+        assert!(
+            !drop_head.contains("if self."),
+            "the env restore backstop must run on EVERY error path, not behind an outcome \
+             condition: {drop_head}"
+        );
+        assert_eq!(
+            impl_source
+                .matches("refresh_env_snapshots = Vec::new();")
+                .count(),
+            2,
+            "success path and Drop backstop each clear the snapshots exactly once"
         );
     }
 }

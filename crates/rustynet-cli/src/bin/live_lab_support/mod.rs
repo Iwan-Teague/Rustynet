@@ -10,7 +10,8 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -986,7 +987,74 @@ pub struct LiveLabContext {
     pub pinned_known_hosts_file: PathBuf,
     pub work_dir: PathBuf,
     pub known_hosts_file: PathBuf,
+    /// Shared ownership of [`Self::work_dir`]. Contexts are CLONED all over
+    /// the live tests (cleanup guards, RAII fences hold their own copy so
+    /// their Drop paths can still run remote calls); the dir must die only
+    /// with the LAST clone — see [`WorkDirGuard`].
+    work_dir_guard: Arc<WorkDirGuard>,
     verified_hosts: HashSet<String>,
+    /// The ssh/scp client programs the transport runs. Defaults to the real
+    /// OpenSSH client; overridable only through the test constructor so unit
+    /// tests can record the exact argv the harness builds (same escape-hatch
+    /// shape as `LIVE_LAB_UTMCTL_PATH`, but process-safe: no env mutation).
+    transport_programs: TransportPrograms,
+}
+
+/// Owns the unique per-run work dir a [`LiveLabContext`] seeds its
+/// known_hosts copy into. `derive(Clone)` next to an `impl Drop` on the
+/// context itself made EVERY clone's drop delete the shared dir:
+/// katana-xnet-178 consumed the bundle-swap fence in
+/// `BundleSwapFence::release()`, its ctx clone dropped, the seeded
+/// work-dir known_hosts copy vanished, and the W7 restore right after it
+/// failed on every participant with "No ED25519 host key is known ...
+/// Host key verification failed." The dir must die exactly once, with the
+/// last reference, so every remote call — restore included — always sees
+/// the same trusted known_hosts context.
+#[derive(Debug)]
+struct WorkDirGuard {
+    path: PathBuf,
+    explicitly_removed: AtomicBool,
+}
+
+impl WorkDirGuard {
+    /// Immediate, explicit removal requested by [`LiveLabContext::cleanup`].
+    /// Marks the guard so the final drop does not remove again.
+    fn remove_now(&self) {
+        self.explicitly_removed.store(true, Ordering::SeqCst);
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+impl Drop for WorkDirGuard {
+    fn drop(&mut self) {
+        if !self.explicitly_removed.load(Ordering::SeqCst) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// The client programs behind [`LiveLabContext`]'s ssh/scp transport.
+#[derive(Debug, Clone)]
+struct TransportPrograms {
+    ssh: PathBuf,
+    scp: PathBuf,
+}
+
+/// Test-only: a unique scratch dir OUTSIDE any [`LiveLabContext`] work dir,
+/// so artifacts a unit test must read back (recorded argv, fixture files)
+/// survive even a context whose work dir was removed on purpose.
+#[cfg(test)]
+pub(crate) fn test_scratch_dir(prefix: &str) -> Result<PathBuf, String> {
+    create_unique_work_dir(prefix)
+}
+
+impl Default for TransportPrograms {
+    fn default() -> Self {
+        Self {
+            ssh: PathBuf::from("ssh"),
+            scp: PathBuf::from("scp"),
+        }
+    }
 }
 
 /// Bounded transient-retry budget for the local-scp push path in
@@ -1035,6 +1103,43 @@ impl LiveLabContext {
         ssh_identity_file: &Path,
         pinned_known_hosts_file: Option<&Path>,
     ) -> Result<Self, String> {
+        Self::with_transport_programs(
+            prefix,
+            ssh_identity_file,
+            pinned_known_hosts_file,
+            TransportPrograms::default(),
+        )
+    }
+
+    /// Test-only constructor: identical validation and seeding, but the ssh
+    /// and scp client programs come from the caller so a unit test can
+    /// record the exact argv the harness builds and reproduce transport
+    /// failures (missing trusted known_hosts context) without a network.
+    #[cfg(test)]
+    pub(crate) fn with_transport_programs_for_tests(
+        prefix: &str,
+        ssh_identity_file: &Path,
+        pinned_known_hosts_file: Option<&Path>,
+        ssh_program: PathBuf,
+        scp_program: PathBuf,
+    ) -> Result<Self, String> {
+        Self::with_transport_programs(
+            prefix,
+            ssh_identity_file,
+            pinned_known_hosts_file,
+            TransportPrograms {
+                ssh: ssh_program,
+                scp: scp_program,
+            },
+        )
+    }
+
+    fn with_transport_programs(
+        prefix: &str,
+        ssh_identity_file: &Path,
+        pinned_known_hosts_file: Option<&Path>,
+        transport_programs: TransportPrograms,
+    ) -> Result<Self, String> {
         require_local_file_mode(ssh_identity_file, "owner-only", "ssh identity file")?;
         let pinned_known_hosts_file = pinned_known_hosts_file.map_or_else(
             || {
@@ -1056,29 +1161,43 @@ impl LiveLabContext {
         )?;
 
         let root_dir = repo_root()?;
-        let work_dir = create_unique_work_dir(prefix)?;
-        let known_hosts_file = work_dir.join("known_hosts");
-        fs::copy(&pinned_known_hosts_file, &known_hosts_file).map_err(|err| {
-            format!(
+        let work_dir_path = create_unique_work_dir(prefix)?;
+        let work_dir_guard = Arc::new(WorkDirGuard {
+            path: work_dir_path.clone(),
+            explicitly_removed: AtomicBool::new(false),
+        });
+        let known_hosts_file = work_dir_path.join("known_hosts");
+        if let Err(err) = fs::copy(&pinned_known_hosts_file, &known_hosts_file) {
+            // The guard is the only owner so far: dropping it here removes
+            // the just-created dir (the pre-Arc drop-on-construct leak).
+            drop(work_dir_guard);
+            return Err(format!(
                 "failed to seed {} from {}: {err}",
                 known_hosts_file.display(),
                 pinned_known_hosts_file.display()
-            )
-        })?;
+            ));
+        }
         set_path_mode(&known_hosts_file, 0o600)?;
 
         Ok(Self {
             root_dir,
             ssh_identity_file: ssh_identity_file.to_path_buf(),
             pinned_known_hosts_file,
-            work_dir,
+            work_dir: work_dir_path,
             known_hosts_file,
+            work_dir_guard,
             verified_hosts: HashSet::new(),
+            transport_programs,
         })
     }
 
+    /// Explicit, immediate removal of the work dir. Calls on a context whose
+    /// clones are still alive strand THOSE clones without their seeded
+    /// known_hosts copy (strict checking then refuses every connection, by
+    /// design — this is why the live tests release fences instead of calling
+    /// this); the final guard drop is the normal cleanup path.
     pub fn cleanup(&self) {
-        let _ = fs::remove_dir_all(&self.work_dir);
+        self.work_dir_guard.remove_now();
     }
 
     pub fn target_user(target: &str) -> &str {
@@ -1183,33 +1302,43 @@ impl LiveLabContext {
         ))
     }
 
-    fn ssh_command(&self, target: &str) -> Command {
-        let mut command = Command::new("ssh");
-        command.args([
-            "-n",
-            "-o",
+    /// The one source of truth for the ssh/scp transport options every
+    /// remote call in this module runs with. Strict host-key checking is
+    /// pinned to `yes` and the trusted host-key context is always THIS run's
+    /// seeded work-dir copy of the pinned known_hosts file — never the
+    /// user's default file, never an ad-hoc file — so a call built anywhere
+    /// in a live test (capture, install, restore, cleanup backstop) shares
+    /// exactly the same trust as every other call.
+    fn transport_option_argv(&self) -> Vec<std::ffi::OsString> {
+        let mut options: Vec<std::ffi::OsString> = Vec::new();
+        for option in [
             "LogLevel=ERROR",
-            "-o",
             "BatchMode=yes",
-            "-o",
             "StrictHostKeyChecking=yes",
-        ]);
-        command.arg("-o").arg(format!(
-            "UserKnownHostsFile={}",
-            self.known_hosts_file.display()
-        ));
-        command.args([
-            "-o",
+        ] {
+            options.push("-o".into());
+            options.push(option.into());
+        }
+        options.push("-o".into());
+        options.push(format!("UserKnownHostsFile={}", self.known_hosts_file.display()).into());
+        for option in [
             "ConnectTimeout=15",
-            "-o",
             "ServerAliveInterval=60",
-            "-o",
             "ServerAliveCountMax=10",
-            "-o",
             "IdentitiesOnly=yes",
-            "-i",
-        ]);
-        command.arg(&self.ssh_identity_file);
+        ] {
+            options.push("-o".into());
+            options.push(option.into());
+        }
+        options.push("-i".into());
+        options.push(self.ssh_identity_file.clone().into_os_string());
+        options
+    }
+
+    fn ssh_command(&self, target: &str) -> Command {
+        let mut command = Command::new(&self.transport_programs.ssh);
+        command.arg("-n");
+        command.args(self.transport_option_argv());
         if let Some(port) = target_port(target) {
             command.arg("-p").arg(port.to_string());
         }
@@ -1288,34 +1417,9 @@ impl LiveLabContext {
         // so the operation is idempotent.
         let mut last_stderr = String::new();
         for attempt in 1..=SCP_RETRY_ATTEMPTS {
-            let mut command = Command::new("scp");
-            command
-                .arg("-q")
-                .args([
-                    "-o",
-                    "LogLevel=ERROR",
-                    "-o",
-                    "BatchMode=yes",
-                    "-o",
-                    "StrictHostKeyChecking=yes",
-                ])
-                .arg("-o")
-                .arg(format!(
-                    "UserKnownHostsFile={}",
-                    self.known_hosts_file.display()
-                ))
-                .args([
-                    "-o",
-                    "ConnectTimeout=15",
-                    "-o",
-                    "ServerAliveInterval=60",
-                    "-o",
-                    "ServerAliveCountMax=10",
-                    "-o",
-                    "IdentitiesOnly=yes",
-                    "-i",
-                ])
-                .arg(&self.ssh_identity_file);
+            let mut command = Command::new(&self.transport_programs.scp);
+            command.arg("-q");
+            command.args(self.transport_option_argv());
             // scp uses `-P` (capital) for the port; the host must be bare or
             // scp reads `192.168.64.4:22:/path` as host `192.168.64.4` writing
             // to a bogus `22:/path`.
@@ -1623,11 +1727,13 @@ fn render_remote_argv(args: &[&str]) -> Result<String, String> {
     Ok(rendered)
 }
 
-impl Drop for LiveLabContext {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.work_dir);
-    }
-}
+// NOTE: LiveLabContext deliberately has NO Drop. Its work dir is owned by
+// the shared [`WorkDirGuard`] (Arc), so the dir is removed exactly once,
+// when the LAST context clone drops. A per-clone Drop here deleted the
+// seeded known_hosts copy out from under every other clone
+// (katana-xnet-178: `BundleSwapFence::release()` dropped its clone, and the
+// W7 restore right after it failed strict host-key checking on every
+// participant).
 
 fn hosts_contains_hostname(hosts: &str, hostname: &str) -> bool {
     for line in hosts.lines() {
@@ -1944,11 +2050,11 @@ pub const LAB_TRAVERSAL_TTL_SECS: &str = "86400";
 mod tests {
     use super::{
         LiveLabContext, LiveLabPlatform, MACOS_UNIFIED_LOG_WINDOW, REMOTE_RUSTYNET_BIN,
-        assignment_refresh_env_path, cli_invocation_parse_failure, daemon_status_probe_argv,
-        daemon_unit_log_argv, enforce_linux_only_until_validator_lands, enrollment_ledger_path,
-        enrollment_secret_path, env_flag_truthy, known_hosts_lookup_host,
+        assignment_refresh_env_path, cli_invocation_parse_failure, create_unique_work_dir,
+        daemon_status_probe_argv, daemon_unit_log_argv, enforce_linux_only_until_validator_lands,
+        enrollment_ledger_path, enrollment_secret_path, env_flag_truthy, known_hosts_lookup_host,
         resolved_known_hosts_candidates, resolved_target_address_from_ssh_g,
-        scp_failure_is_transient, stat_mode_argv, strip_host_port, target_port,
+        scp_failure_is_transient, set_path_mode, stat_mode_argv, strip_host_port, target_port,
         wait_for_daemon_socket_ready, wait_for_daemon_socket_with_runner, wg_encrypted_key_paths,
     };
 
@@ -2855,5 +2961,120 @@ port 22
         assert_eq!(chunks50[1][2], "50", "tail chunks honour `lines`");
         assert_eq!(chunks50[2][2], "50", "tail chunks honour `lines`");
         assert!(daemon_unit_log_argv(LiveLabPlatform::Windows, "50", false).is_err());
+    }
+
+    /// A deterministic ed25519 host key line for the test pinned known_hosts
+    /// file (`ssh-keygen -F` looks the host up by name, so any well-formed
+    /// line works; this blob is a real key so even strict tooling parses it).
+    const TEST_KNOWN_HOSTS_LINE: &str = "192.0.2.10 ssh-ed25519 \
+AAAAC3NzaC1lZDI1NTE5AAAAIHaDU9pi11/BAvWNTqDiDD9hbS2Hl3gnRcKCx6lWl3mS w11-test-vector";
+
+    fn write_test_identity_and_pinned(
+        dir: &std::path::Path,
+    ) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+        let identity = dir.join("identity");
+        std::fs::write(&identity, "not-a-real-key\n")
+            .map_err(|err| format!("write test identity: {err}"))?;
+        set_path_mode(&identity, 0o600)?;
+        let pinned = dir.join("pinned_known_hosts");
+        std::fs::write(&pinned, format!("{TEST_KNOWN_HOSTS_LINE}\n"))
+            .map_err(|err| format!("write test pinned known_hosts: {err}"))?;
+        set_path_mode(&pinned, 0o644)?;
+        Ok((identity, pinned))
+    }
+
+    /// THE katana-xnet-178 witness: `LiveLabContext` is cloned by cleanup
+    /// guards and RAII fences (the bundle-swap fence holds its own copy and
+    /// `release()` consumes it), so dropping ONE clone must never delete the
+    /// work dir the other clones still ssh out of. With the old per-clone
+    /// `impl Drop`, the clone's drop removed the seeded known_hosts copy and
+    /// every later call — the W7 restore — failed with "No ED25519 host key
+    /// is known ... Host key verification failed."
+    #[test]
+    fn cloned_context_drop_keeps_the_seeded_known_hosts_context() {
+        let holder = create_unique_work_dir("w11-known-hosts-witness").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ctx = LiveLabContext::new_with_pinned_known_hosts(
+            "w11-known-hosts-witness-ctx",
+            &identity,
+            Some(&pinned),
+        )
+        .expect("context");
+        assert!(ctx.known_hosts_file.is_file(), "seeded known_hosts copy");
+
+        let clone = ctx.clone();
+        drop(clone);
+
+        assert!(
+            ctx.known_hosts_file.is_file(),
+            "dropping one clone must not delete the shared known_hosts copy at {}",
+            ctx.known_hosts_file.display()
+        );
+        assert!(
+            ctx.work_dir.is_dir(),
+            "shared work dir must survive a clone drop"
+        );
+
+        // The seeded copy must still carry the pinned entry the strict
+        // transport trusts (byte copy of the pinned file).
+        let seeded =
+            std::fs::read_to_string(&ctx.known_hosts_file).expect("read seeded known_hosts");
+        assert_eq!(seeded, format!("{TEST_KNOWN_HOSTS_LINE}\n"));
+
+        // Explicit cleanup still removes the shared dir exactly once.
+        ctx.cleanup();
+        assert!(
+            !ctx.work_dir.exists(),
+            "explicit cleanup removes the work dir"
+        );
+    }
+
+    /// Every transport option list pins StrictHostKeyChecking to `yes` and
+    /// the trusted host-key context to THIS run's seeded work-dir copy — the
+    /// exact options the restore must share with capture/install.
+    #[test]
+    fn transport_option_argv_pins_strict_checking_to_the_seeded_known_hosts_copy() {
+        let holder = create_unique_work_dir("w11-transport-options").expect("holder dir");
+        let (identity, pinned) = write_test_identity_and_pinned(&holder).expect("test files");
+        let ctx = LiveLabContext::new_with_pinned_known_hosts(
+            "w11-transport-options-ctx",
+            &identity,
+            Some(&pinned),
+        )
+        .expect("context");
+
+        let options = ctx.transport_option_argv();
+        let text: Vec<String> = options
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        let joined = text.join(" ");
+        assert!(
+            text.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == "StrictHostKeyChecking=yes"),
+            "strict checking must stay yes: {joined}"
+        );
+        assert!(
+            !joined.contains("StrictHostKeyChecking=accept-new")
+                && !joined.contains("StrictHostKeyChecking=no"),
+            "checking must never be weakened: {joined}"
+        );
+        let expected_user_known_hosts =
+            format!("UserKnownHostsFile={}", ctx.known_hosts_file.display());
+        assert!(
+            text.iter()
+                .any(|value| value.as_str() == expected_user_known_hosts),
+            "the trusted context must be the seeded work-dir copy, not the default file: {joined}"
+        );
+        assert!(
+            text.windows(2)
+                .any(|pair| pair[0] == "-i" && pair[1] == ctx.ssh_identity_file.to_string_lossy()),
+            "the identity file must be pinned: {joined}"
+        );
+        assert!(
+            text.windows(2)
+                .any(|pair| pair[0] == "-o" && pair[1] == "BatchMode=yes"),
+            "batch mode keeps a broken transport failing fast: {joined}"
+        );
     }
 }
