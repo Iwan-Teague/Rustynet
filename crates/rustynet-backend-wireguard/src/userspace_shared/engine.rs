@@ -429,7 +429,24 @@ impl UserspaceEngine {
             recorded_peer_ciphertext_ingress: Vec::new(),
             recorded_tunnel_plaintext_packets: Vec::new(),
             decrypt_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
-            decrypt_follow_up_scratch: vec![0u8; MAX_DECRYPTED_PACKET_BYTES],
+            // WG-02: the follow-up drain buffer must be sized for the
+            // CIPHERTEXT it carries, not for a decrypted payload. boringtun's
+            // mandatory drain loop (`Tunn::send_queued_packet`, reached here via
+            // `decapsulate(None, &[], follow_up_scratch)`) re-ENCAPSULATES each
+            // queued OUTBOUND plaintext packet, and
+            // `Session::format_packet_data` panics with "The destination buffer
+            // is too small" unless `dst.len() >= src.len() + DATA_OVERHEAD_SZ`
+            // (32). Those queued packets are exactly the ones the outbound path
+            // accepted, which is bounded by MAX_ENCRYPTED_PACKET_BYTES, not by
+            // MAX_DECRYPTED_PACKET_BYTES: at 65 535 the drain buffer is 32 bytes
+            // short for any queued packet of >= 65 504 bytes and the panic kills
+            // the engine's single worker thread. Sizing it as the encrypt bound
+            // (what `encrypt_scratch` already does at the outbound entry point)
+            // restores the invariant both halves share. `decrypt_scratch` stays
+            // at MAX_DECRYPTED_PACKET_BYTES: it receives ciphertext, and
+            // `Session::parse_packet` bounds a plaintext frame by what it
+            // actually decrypted, not by the maximum UDP datagram.
+            decrypt_follow_up_scratch: vec![0u8; MAX_ENCRYPTED_PACKET_BYTES],
             encrypt_scratch: vec![0u8; MAX_ENCRYPTED_PACKET_BYTES],
         })
     }
@@ -3919,6 +3936,150 @@ mod tests {
             TunnResult::Done => {}
             other => panic!("counterpart must accept the keepalive, got {other:?}"),
         }
+    }
+
+    /// WG-02 witness: a maximum-size inner frame handed to the engine while no
+    /// session exists is QUEUED by boringtun, and the mandatory follow-up drain
+    /// inside `process_inbound_ciphertext` re-encapsulates it the moment the
+    /// handshake completes. `Tunn::send_queued_packet` therefore feeds an
+    /// OUTBOUND plaintext frame to `Session::format_packet_data`, whose
+    /// destination buffer must be at least `src.len() + 32` bytes. The drain
+    /// buffer was sized `MAX_DECRYPTED_PACKET_BYTES` (65 535) — exactly 32 bytes
+    /// short of the 65 535-byte frame the TUN read path can deliver — so
+    /// `format_packet_data` hit `panic!("The destination buffer is too small")`
+    /// on the engine's single worker thread and took the whole dataplane down.
+    ///
+    /// The frame length is the ceiling on purpose: `RECV_SCRATCH_BYTES` is
+    /// 65 535, so this is the largest frame any real TUN read can produce, and
+    /// 65 535 + 32 lands exactly on `MAX_ENCRYPTED_PACKET_BYTES` — the fix has
+    /// zero slack, so a future regression that shrinks the drain buffer fails
+    /// here rather than in the field.
+    #[test]
+    fn follow_up_drain_encapsulates_a_max_size_queued_frame_without_panicking() {
+        use boringtun::noise::{Tunn, TunnResult};
+        use boringtun::x25519::{PublicKey, StaticSecret};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let engine_secret = StaticSecret::from([11u8; 32]);
+        let engine_public = PublicKey::from(&engine_secret);
+        let peer_secret = StaticSecret::from([0x5A; 32]);
+        let peer_public_bytes = *PublicKey::from(&peer_secret).as_bytes();
+
+        let endpoint = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81)), 51820);
+        let mut engine = fresh_engine(11);
+        let node_id = NodeId::new("peer-max").expect("node id");
+        engine
+            .configure_peer(&rustynet_backend_api::PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: rustynet_backend_api::SocketEndpoint {
+                    addr: endpoint.ip(),
+                    port: endpoint.port(),
+                },
+                public_key: peer_public_bytes,
+                allowed_ips: vec!["100.64.8.0/24".to_owned()],
+                persistent_keepalive_secs: Some(1),
+                preshared_key: None,
+            })
+            .expect("peer configures");
+        let mut counterpart = Tunn::new(peer_secret, engine_public, None, None, 0, None);
+        let mut sink = RecordingSink::default();
+
+        // (1) A full-size inner frame arrives from the TUN while the tunnel has
+        // no session: boringtun queues it verbatim and answers the call with
+        // the handshake initiation instead of a transport packet.
+        let queued_frame = ipv4_packet_for_peer(super::MAX_DECRYPTED_PACKET_BYTES - 20);
+        assert_eq!(
+            queued_frame.len(),
+            super::MAX_DECRYPTED_PACKET_BYTES,
+            "witness frame must be exactly the largest the TUN read path delivers"
+        );
+        engine
+            .inject_plaintext_packet(&queued_frame, 1, &mut sink)
+            .expect("queueing the frame never errors");
+        let initiation = pop_ciphertext(&mut sink, "handshake initiation");
+        assert_eq!(
+            initiation.len(),
+            148,
+            "no session yet: a handshake, not a frame"
+        );
+
+        // (2) The counterpart answers, so the handshake response reaches an
+        // engine that is still holding the max-size frame in its outbound queue.
+        let mut counterpart_buf = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let response: Vec<u8> =
+            match counterpart.decapsulate(None, &initiation, &mut counterpart_buf) {
+                TunnResult::WriteToNetwork(packet) => packet.to_vec(),
+                other => panic!("counterpart must answer the initiation, got {other:?}"),
+            };
+
+        // This is the call that panicked before the fix: it drives the
+        // follow-up drain, which re-encapsulates `queued_frame` into
+        // `decrypt_follow_up_scratch`.
+        let observed = engine
+            .process_inbound_ciphertext(endpoint, remote_addr(), &response, 1, &mut sink)
+            .expect("completing the handshake and draining the queued frame never errors");
+        let (observed_peer, _observed_at) =
+            observed.expect("msg2 completes the session; the handshake timestamps");
+        assert_eq!(
+            observed_peer, node_id,
+            "the completed handshake is peer-max's"
+        );
+
+        // (3) The drain must have produced a REAL transport packet carrying the
+        // queued frame — not a dropped frame and not a panic.
+        let drained = pop_ciphertext(&mut sink, "drained queued frame");
+        assert_eq!(
+            drained.len(),
+            queued_frame.len() + 32,
+            "the drained queued frame must re-encapsulate at exactly plaintext+32"
+        );
+        let decrypted = match counterpart.decapsulate(None, &drained, &mut counterpart_buf) {
+            TunnResult::WriteToTunnelV4(packet, _) => packet.to_vec(),
+            other => panic!("counterpart must decrypt the drained frame, got {other:?}"),
+        };
+        assert_eq!(
+            decrypted, queued_frame,
+            "the queued max-size frame must survive the drain byte-identical"
+        );
+        // The session's empty transport ack is the only other thing the
+        // handshake response produced; nothing else may be emitted.
+        let ack = pop_ciphertext(&mut sink, "post-handshake empty transport packet");
+        assert_eq!(ack.len(), 32, "the ack is a bare empty transport packet");
+        assert!(
+            sink.events.is_empty(),
+            "completing the handshake must emit exactly the ack and the one drained frame, got {:?}",
+            sink.events
+        );
+    }
+
+    /// The drain buffer's size is a safety invariant, not a tuning knob: it
+    /// must hold `MAX_ENCRYPTED_PACKET_BYTES`, because everything the outbound
+    /// path accepted (up to the TUN read ceiling) is re-encapsulated into it
+    /// once the session comes up. `decrypt_scratch` stays at the decrypted
+    /// bound and must not be "helpfully" raised or the reverse — both are
+    /// asserted here so neither can drift on its own.
+    #[test]
+    fn follow_up_drain_scratch_holds_the_encrypt_ceiling_not_the_decrypt_one() {
+        let engine = fresh_engine(12);
+        assert_eq!(
+            engine.decrypt_follow_up_scratch.len(),
+            super::MAX_ENCRYPTED_PACKET_BYTES,
+            "drain buffer must be sized for ciphertext (queued frames are re-encapsulated)"
+        );
+        assert!(
+            engine.decrypt_follow_up_scratch.len() > super::MAX_DECRYPTED_PACKET_BYTES,
+            "the defect is exactly the gap between the two ceilings"
+        );
+        assert_eq!(
+            engine.decrypt_scratch.len(),
+            super::MAX_DECRYPTED_PACKET_BYTES,
+            "inbound decapsulation buffer stays at the decrypted ceiling"
+        );
+        assert_eq!(
+            engine.encrypt_scratch.len(),
+            super::MAX_ENCRYPTED_PACKET_BYTES,
+            "outbound encapsulation buffer stays at the encrypted ceiling"
+        );
     }
 
     /// The sender index of a handshake message: bytes 4..8, little endian

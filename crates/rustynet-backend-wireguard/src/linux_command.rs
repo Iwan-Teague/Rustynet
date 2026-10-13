@@ -9,8 +9,11 @@
 )]
 
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::net::IpAddr;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use rustynet_backend_api::{
     BackendCapabilities, BackendError, BackendErrorKind, ExitMode, NodeId, PeerConfig, Route,
@@ -98,6 +101,87 @@ pub trait WireguardCommandRunner {
 #[derive(Debug, Default)]
 pub struct LinuxCommandRunner;
 
+/// WG-06: the hard upper bound on how long ONE helper command may block.
+///
+/// Every helper call these runners issue (`ip tuntap add`, `ip address add`,
+/// `ip link set`, `ip route replace`, `ip rule`, `wg set`, `wg show
+/// latest-handshakes`) executes INLINE on the backend's single worker thread:
+/// `DirectTunLifecycle::prepare_and_open` / `reconcile_routes` /
+/// `reconcile_exit_mode` and the `LinuxWireguardBackend` bring-up sequence are
+/// driven from `handle_request` on that one thread. A child that never exits —
+/// a netlink socket wedged under RTNETLINK pressure, a helper waiting on an
+/// entropy or cgroup stall — therefore does not fail one route; it wedges the
+/// whole dataplane AND makes `Runtime::shutdown`'s `join_handle.join()` block
+/// forever, because shutdown cannot complete until the worker returns.
+///
+/// Bounding the wait converts that unbounded hang into an ordinary
+/// `BackendErrorKind::Internal` failure of the specific operation, which is
+/// what the caller's fail-closed path already handles. 10 s is far longer than
+/// any healthy `ip`/`wg` call (milliseconds) and far shorter than the operator
+/// noticing a dead tunnel.
+pub const HELPER_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+// Test-only override of the bound, so a test can drive the REAL
+// `LinuxCommandRunner::run_capture` path — the one production uses — at
+// millisecond scale instead of waiting out a 10 s timeout. Thread-local, so
+// concurrent tests cannot see each other's override.
+#[cfg(test)]
+thread_local! {
+    static TEST_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+// Run `body` with `helper_command_timeout` temporarily set to `timeout`.
+#[cfg(test)]
+fn with_test_timeout<R>(timeout: Duration, body: impl FnOnce() -> R) -> R {
+    TEST_TIMEOUT_OVERRIDE.with(|slot| slot.set(Some(timeout)));
+    let outcome = body();
+    TEST_TIMEOUT_OVERRIDE.with(|slot| slot.set(None));
+    outcome
+}
+
+/// The bound one helper invocation gets. Production always yields the constant;
+/// the override arm exists only so the behavioural tests below exercise the
+/// production call path rather than a parallel one.
+fn helper_command_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(override_timeout) = TEST_TIMEOUT_OVERRIDE.with(std::cell::Cell::take) {
+        return override_timeout;
+    }
+    HELPER_COMMAND_TIMEOUT
+}
+
+/// Poll granularity for the bounded child wait. Matches the house pattern in
+/// `rustynetd::wireguard_go_terminate`.
+const HELPER_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Drain one child pipe to EOF on its own thread.
+///
+/// The bounded wait polls `Child::try_wait`, so the pipes must be drained
+/// concurrently: a helper that writes more than a pipe buffer's worth of stdout
+/// (the `wg show latest-handshakes` output alone is capped at 64 KiB) would
+/// otherwise block in `write(2)` forever and never be observed as exited.
+fn drain_child_pipe<R>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+/// Join a drain thread, degrading to an empty buffer if the reader itself
+/// panicked. A reader thread cannot fail closed in any meaningful way here —
+/// the child's own exit status is the authoritative verdict — so this never
+/// turns a helper result into a panic.
+fn join_child_pipe(handle: thread::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    handle.join().unwrap_or_default()
+}
+
 impl WireguardCommandRunner for LinuxCommandRunner {
     fn run(&mut self, program: &str, args: &[String]) -> Result<(), BackendError> {
         let _ = self.run_capture(program, args)?;
@@ -109,29 +193,79 @@ impl WireguardCommandRunner for LinuxCommandRunner {
         program: &str,
         args: &[String],
     ) -> Result<WireguardCommandOutput, BackendError> {
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .map_err(|err| BackendError::internal(format!("{program} spawn failed: {err}")))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            if stderr.is_empty() {
+        run_capture_within(program, args, helper_command_timeout())
+    }
+}
+
+/// Run one helper command under a hard wall-clock bound, killing the child when
+/// it overruns. Split out from [`LinuxCommandRunner::run_capture`] so the bound
+/// is a parameter the tests can drive without a 10 s wait.
+fn run_capture_within(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<WireguardCommandOutput, BackendError> {
+    // `stdin` is closed off: a helper that reads stdin must see EOF, not
+    // inherit and steal the daemon's own stdin.
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| BackendError::internal(format!("{program} spawn failed: {err}")))?;
+
+    let stdout_pipe = drain_child_pipe(child.stdout.take());
+    let stderr_pipe = drain_child_pipe(child.stderr.take());
+
+    let deadline = Instant::now() + timeout;
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => thread::sleep(HELPER_COMMAND_POLL_INTERVAL),
+            Ok(None) => break None,
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_child_pipe(stdout_pipe);
+                let _ = join_child_pipe(stderr_pipe);
                 return Err(BackendError::internal(format!(
-                    "{program} exited with status {}",
-                    output.status
+                    "{program} wait failed: {err}"
                 )));
             }
+        }
+    };
+
+    let Some(status) = exit else {
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = join_child_pipe(stdout_pipe);
+        let _ = join_child_pipe(stderr_pipe);
+        return Err(BackendError::internal(format!(
+            "{program} timed out after {}ms and was killed",
+            timeout.as_millis()
+        )));
+    };
+
+    let stdout_bytes = join_child_pipe(stdout_pipe);
+    let stderr_bytes = join_child_pipe(stderr_pipe);
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+        if stderr.is_empty() {
             return Err(BackendError::internal(format!(
-                "{program} exited with status {}: {stderr}",
-                output.status
+                "{program} exited with status {status}"
             )));
         }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stdout")))?;
-        let stderr = String::from_utf8(output.stderr)
-            .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stderr")))?;
-        Ok(WireguardCommandOutput { stdout, stderr })
+        return Err(BackendError::internal(format!(
+            "{program} exited with status {status}: {stderr}"
+        )));
     }
+    let stdout = String::from_utf8(stdout_bytes)
+        .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stdout")))?;
+    let stderr = String::from_utf8(stderr_bytes)
+        .map_err(|_| BackendError::internal(format!("{program} produced non-utf8 stderr")))?;
+    Ok(WireguardCommandOutput { stdout, stderr })
 }
 
 #[derive(Debug)]
@@ -1383,6 +1517,95 @@ mod tests {
         )
         .expect_err("malformed timestamp must fail");
         assert_eq!(err.kind, BackendErrorKind::Internal);
+    }
+
+    // ---- WG-06: the helper-command wall-clock bound -----------------------
+    //
+    // These two tests spawn REAL children on purpose. A `RecordingRunner`
+    // fake cannot witness the defect: faking the runner makes the fake's
+    // return value, not the child's overrun, the thing under test, which is
+    // exactly the gap that let the unbounded `Command::output()` ship. The
+    // bound itself is platform-free; only the POSIX helper binaries are not,
+    // so the pair is cfg(unix) and the Windows CI leg skips them.
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_command_bound_kills_an_overrunning_child_instead_of_hanging() {
+        let started = Instant::now();
+        let err = with_test_timeout(Duration::from_millis(200), || {
+            // Through `LinuxCommandRunner::run_capture` itself, not the helper
+            // beneath it: the defect was the runner never bounding its wait.
+            LinuxCommandRunner.run_capture("sleep", &["30".to_owned()])
+        })
+        .expect_err("a helper that overruns its bound must fail the call, not hang the worker");
+
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("timed out") && err.message.contains("killed"),
+            "error must name the timeout and the kill, got: {}",
+            err.message
+        );
+        // The bound, not the child's own 30 s lifetime, decides when we return.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "call returned only after {:?}; the 30 s child outlived the bound",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_command_bound_preserves_fast_child_output_and_exit_status() {
+        // The bound must not change the happy path: a helper that exits inside
+        // the window still yields its stdout and its normal error shape.
+        let ok = LinuxCommandRunner
+            .run_capture("echo", &["ready".to_owned()])
+            .expect("a fast helper must succeed");
+        assert_eq!(ok.stdout.trim(), "ready");
+
+        let err = LinuxCommandRunner
+            .run_capture("false", &[])
+            .expect_err("a non-zero exit must surface");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("exited with status"),
+            "error must keep the exit-status shape, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn helper_command_default_bound_stays_far_below_an_unbounded_wait() {
+        // Pins the production default against a future "just make it big"
+        // edit: the bound exists so a wedged helper cannot hold the single
+        // backend worker thread (and Runtime::shutdown's join) forever.
+        assert!(HELPER_COMMAND_TIMEOUT >= Duration::from_secs(1));
+        assert!(
+            HELPER_COMMAND_TIMEOUT <= Duration::from_secs(30),
+            "default helper bound {}s is too long to bound a wedged `ip`",
+            HELPER_COMMAND_TIMEOUT.as_secs()
+        );
+        // Every helper call the runners issue goes through the bounded path.
+        // Scanned over the production half only: this file's own test module
+        // names the API in prose, which is not an invocation.
+        let source = include_str!("linux_command.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        assert!(
+            !production.contains(".output()"),
+            "no helper invocation may bypass the bounded wait"
+        );
+        assert!(
+            production.contains("run_capture_within(program, args, helper_command_timeout())"),
+            "run_capture must delegate to the bounded path, got a body that calls: {}",
+            production
+                .lines()
+                .find(|line| line.contains("run_capture_within("))
+                .unwrap_or("<none>")
+                .trim()
+        );
     }
 
     // RSA-0044 witnesses: the macOS backend rejects zero-port / unspecified /

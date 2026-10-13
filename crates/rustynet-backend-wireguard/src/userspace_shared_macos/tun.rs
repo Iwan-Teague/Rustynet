@@ -70,6 +70,14 @@ impl MacosTunDevice {
                 ))),
             },
             MacosTunDeviceInner::Test(handle) => {
+                // Test-only panic injection (WG-04): a real panic can be raised
+                // on the runtime's single worker thread, and the worker must
+                // come back as "gone with a cause", not as a silently dead
+                // dataplane. Compiled out of production builds entirely.
+                #[cfg(test)]
+                if let Some(message) = handle.state.take_next_recv_panic() {
+                    panic!("{message}");
+                }
                 if let Some(message) = handle.state.take_next_recv_error() {
                     return Err(BackendError::internal(message));
                 }
@@ -834,12 +842,31 @@ impl MacosTunTestState {
         inner.next_recv_error = Some(message.into());
     }
 
+    /// Test-only: arm a panic in the test TUN receive path (WG-04).
+    #[cfg(test)]
+    pub(crate) fn set_next_recv_panic(&self, message: &'static str) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.next_recv_panic = Some(message);
+    }
+
     fn take_next_recv_error(&self) -> Option<String> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.next_recv_error.take()
+    }
+
+    #[cfg(test)]
+    fn take_next_recv_panic(&self) -> Option<&'static str> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.next_recv_panic.take()
     }
 
     fn record_outbound_packet(&self, packet: Vec<u8>) {
@@ -902,6 +929,11 @@ struct MacosTunTestStateInner {
     queued_inbound_packets: VecDeque<Vec<u8>>,
     recorded_outbound_packets: Vec<Vec<u8>>,
     next_recv_error: Option<String>,
+    /// Test-only: make the next receive PANIC instead of returning an error, so
+    /// a test can prove a panic raised on the runtime's single worker thread is
+    /// contained (WG-04) rather than unwinding straight out of the thread.
+    #[cfg(test)]
+    next_recv_panic: Option<&'static str>,
 }
 
 impl Default for MacosTunTestStateInner {
@@ -929,6 +961,8 @@ impl Default for MacosTunTestStateInner {
             queued_inbound_packets: VecDeque::new(),
             recorded_outbound_packets: Vec::new(),
             next_recv_error: None,
+            #[cfg(test)]
+            next_recv_panic: None,
         }
     }
 }
