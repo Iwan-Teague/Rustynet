@@ -7913,6 +7913,37 @@ mod daemon_socket_ready_tests {
         path.to_str().expect("socket path should be utf-8")
     }
 
+    /// Waits until connecting to `path` is refused, so nothing listens on it.
+    ///
+    /// These tests need a socket file that no process listens on. On macOS,
+    /// std does not create a listening socket with atomic close-on-exec
+    /// (there is no SOCK_CLOEXEC: socket() runs first and FIOCLEX is set
+    /// afterwards), so a child spawned concurrently in that window inherits
+    /// the listener. After the test drops its listener the child keeps the
+    /// socket alive and connect() still succeeds, which would defeat the
+    /// stale-socket precondition. Polling until connect is refused makes the
+    /// precondition explicit; if the inherited listener outlives the bound,
+    /// the failure names the cause instead of failing deep in the assertion.
+    fn wait_until_socket_refuses(path: &Path, timeout: std::time::Duration) -> Result<(), String> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Err(_) => return Ok(()),
+                Ok(_) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "socket still accepting: the listening fd was inherited by a concurrently spawned child ({})",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
+    const SOCKET_REFUSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
     #[test]
     fn rejects_a_socket_file_with_no_listener() {
         // After a restart the previous daemon's socket file is still on disk,
@@ -7927,6 +7958,8 @@ mod daemon_socket_ready_tests {
                 .is_socket(),
             "dropping the listener must leave its socket file behind"
         );
+        wait_until_socket_refuses(&socket_path, SOCKET_REFUSE_TIMEOUT)
+            .expect("stale socket should refuse connections once the listener is dropped");
 
         let err = wait_for_daemon_socket_locally(socket_str(&socket_path), 2, 0)
             .expect_err("a socket file with no listener must not count as ready");
@@ -7953,6 +7986,8 @@ mod daemon_socket_ready_tests {
         let dir = short_socket_test_dir("rebind");
         let socket_path = dir.join(SOCKET_TEST_FILE);
         drop(UnixListener::bind(&socket_path).expect("stale listener should bind"));
+        wait_until_socket_refuses(&socket_path, SOCKET_REFUSE_TIMEOUT)
+            .expect("stale socket should refuse connections once the listener is dropped");
 
         let rebind_started = Arc::new(AtomicBool::new(false));
         let rebind_flag = Arc::clone(&rebind_started);
