@@ -479,6 +479,24 @@ mod tests {
             err.contains("unparseable log_lines_checked"),
             "a non-integer log_lines_checked must be refused: {err}"
         );
+        // N4 (review macos-nits): numeric STRINGS must be refused too — the
+        // gate is u64-typed (`as_u64` only). A lenient regression that adds
+        // a string fallback (`as_u64().or_else(parse)`) would admit the
+        // string-zero pass witness `"log_lines_checked": "0"` (review
+        // survivor MU3) or any other numeric string; both must fail here.
+        write("{\"log_lines_checked\":\"0\",\"status\":\"pass\",\"verdict\":\"clean\"}\n");
+        let err = verdict(verify_report_artifact(&dir));
+        assert!(
+            err.contains("unparseable log_lines_checked"),
+            "a string-zero log_lines_checked must be refused, not admitted as a pass \
+             witness: {err}"
+        );
+        write("{\"log_lines_checked\":\"5\",\"status\":\"pass\",\"verdict\":\"clean\"}\n");
+        let err = verdict(verify_report_artifact(&dir));
+        assert!(
+            err.contains("unparseable log_lines_checked"),
+            "a numeric-string log_lines_checked must be refused: {err}"
+        );
         // Zero — the D1 poison: a "clean" verdict that scanned nothing.
         write("{\"log_lines_checked\":0,\"status\":\"pass\",\"verdict\":\"clean\"}\n");
         let err = verdict(verify_report_artifact(&dir));

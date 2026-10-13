@@ -4350,6 +4350,32 @@ mod tests {
             !report_path.exists(),
             "a refused report must not be written"
         );
+        // N5 (review macos-nits): the writer guard keys on
+        // `overall_status == "pass"`, NOT on the verdict string. A zero-line
+        // report with status=pass and verdict=contaminated must be refused
+        // just the same (review survivor MU2 re-keyed the guard on
+        // `verdict == "clean"` and survived the suite above).
+        let err = execute_ops_write_live_linux_secrets_not_in_logs_report(
+            WriteLiveLinuxSecretsNotInLogsReportConfig {
+                report_path: report_path.clone(),
+                log_lines_checked: 0,
+                suspicious_matches: 0,
+                hex64_matches: 0,
+                hex32_matches: 0,
+                b64_key_matches: 0,
+                verdict: "contaminated".to_owned(),
+                overall_status: "pass".to_owned(),
+            },
+        )
+        .expect_err("status=pass over zero lines must be refused regardless of verdict");
+        assert!(
+            err.contains("log_lines_checked=0") && err.contains("fail closed"),
+            "the refusal must name the impossible pass: {err}"
+        );
+        assert!(
+            !report_path.exists(),
+            "a refused report must not be written (verdict-independent guard)"
+        );
         // Positive control: a real scan with zero suspicious matches writes
         // and passes.
         execute_ops_write_live_linux_secrets_not_in_logs_report(

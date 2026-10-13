@@ -178,22 +178,33 @@ fn run() -> Result<(), String> {
          {MACOS_UNIFIED_LOG_WINDOW} on macos; tail chunks honour the lines argument)",
         platform.as_str()
     ))?;
+    let chunk_outputs: Vec<String> = daemon_unit_log_argv(platform, "50", false)?
+        .iter()
+        .map(|chunk| {
+            ctx.capture_root_allow_failure(&target_host, chunk)
+                .unwrap_or_default()
+        })
+        .collect();
     let mut journal_snippet = String::new();
-    let mut chunk_line_counts: Vec<usize> = Vec::new();
-    for chunk in daemon_unit_log_argv(platform, "50", false)? {
-        let chunk_output = ctx
-            .capture_root_allow_failure(&target_host, &chunk)
-            .unwrap_or_default();
-        chunk_line_counts.push(chunk_output.lines().count());
-        journal_snippet.push_str(&chunk_output);
+    for chunk_output in &chunk_outputs {
+        journal_snippet.push_str(chunk_output);
         if !journal_snippet.ends_with('\n') {
             journal_snippet.push('\n');
         }
     }
-    if let Some(gap) = custody_log_collection_gap(&platform, &chunk_line_counts) {
-        logger.line(format!("[key-custody] FAIL {gap}"))?;
-        return Err(gap);
-    }
+    // N3 (review macos-nits): the collect→counts→collection-gap decision
+    // lives in the pure `chunk_line_counts_of` +
+    // `custody_log_collection_gate` seam below; run() is one-line
+    // delegations plus the FAIL log line. Ok carries the per-chunk
+    // line-count sum; Err is the named gap, logged then returned unchanged.
+    let chunk_line_counts = chunk_line_counts_of(&chunk_outputs);
+    let _collected_lines: usize = match custody_log_collection_gate(&platform, &chunk_line_counts) {
+        Ok(collected_lines) => collected_lines,
+        Err(gap) => {
+            logger.line(format!("[key-custody] FAIL {gap}"))?;
+            return Err(gap);
+        }
+    };
     let custody_log_found = journal_snippet.contains("custody")
         || journal_snippet.contains("permission")
         || journal_snippet.contains("0600")
@@ -301,20 +312,29 @@ fn pass_fail(ok: bool) -> &'static str {
     if ok { "pass" } else { "fail" }
 }
 
-/// D3 (review macos-harness-b): the named gap when EVERY daemon-log chunk
-/// came back empty. `chunk_line_counts` holds one entry per
-/// [`daemon_unit_log_argv`] chunk, in collection order. `Some` ⇒ the caller
-/// must fail the run with this DISTINCT message: an empty collection is a
-/// collection failure, indistinguishable from "the daemon never rejected
-/// anything" only when the stage lies about it. The pass/fail verdicts stay
-/// exactly as strict as before — this only ever converts a would-be pass (or
-/// an ambiguous fail) into a named failure, never the reverse.
-fn custody_log_collection_gap(
+/// N3 (review macos-nits): the per-chunk line counts of the collected log
+/// chunks, in collection order — one entry per [`daemon_unit_log_argv`]
+/// chunk, each the chunk's own `lines().count()`. Pure and unit-tested so a
+/// dropped/corrupted count recording fails loudly (review survivor MU1).
+fn chunk_line_counts_of(chunk_lines: &[String]) -> Vec<usize> {
+    chunk_lines.iter().map(|c| c.lines().count()).collect()
+}
+
+/// D3 (review macos-harness-b) / N3 (review macos-nits): the gate over the
+/// per-chunk collected line counts. `Ok(sum)` is the collected evidence
+/// size and `Err(gap)` the DISTINCT named failure the caller must return:
+/// an empty collection is a collection failure, indistinguishable from "the
+/// daemon never rejected anything" only when the stage lies about it. The
+/// pass/fail verdicts stay exactly as strict as before — this only ever
+/// converts a would-be pass (or an ambiguous fail) into a named failure,
+/// never the reverse.
+fn custody_log_collection_gate(
     platform: &LiveLabPlatform,
     chunk_line_counts: &[usize],
-) -> Option<String> {
-    if chunk_line_counts.iter().sum::<usize>() > 0 {
-        return None;
+) -> Result<usize, String> {
+    let collected: usize = chunk_line_counts.iter().sum();
+    if collected > 0 {
+        return Ok(collected);
     }
     let per_chunk = chunk_line_counts
         .iter()
@@ -322,7 +342,7 @@ fn custody_log_collection_gap(
         .map(|(idx, count)| format!("chunk {idx} collected {count} lines"))
         .collect::<Vec<_>>()
         .join("; ");
-    Some(format!(
+    Err(format!(
         "key custody log collection returned nothing on platform {}: {per_chunk} — no \
          rejection evidence could be collected, which is not the same as no rejection \
          having been logged (fail closed; D3)",
@@ -575,16 +595,20 @@ mod tests {
     /// D3 (review macos-harness-b): when ALL daemon-log chunks come back
     /// empty the stage must name a log-collection gap — a distinct message —
     /// instead of reading the absence of evidence as "no rejection logged".
+    /// N3: composed through the `chunk_line_counts_of` →
+    /// `custody_log_collection_gate` seam exactly as run() drives it
+    /// (all-empty chunks in, named gap out).
     #[test]
     fn empty_log_collection_is_a_named_gap_not_a_missing_rejection() {
         for platform in [LiveLabPlatform::Linux, LiveLabPlatform::MacOs] {
-            let chunk_counts = if platform == LiveLabPlatform::MacOs {
-                vec![0, 0, 0]
+            let chunk_texts: Vec<String> = if platform == LiveLabPlatform::MacOs {
+                vec![String::new(), String::new(), String::new()]
             } else {
-                vec![0]
+                vec![String::new()]
             };
-            let gap =
-                custody_log_collection_gap(&platform, &chunk_counts).expect("must name the gap");
+            let counts = chunk_line_counts_of(&chunk_texts);
+            let gap = custody_log_collection_gate(&platform, &counts)
+                .expect_err("an empty collection must name the gap");
             assert!(
                 gap.contains("log collection returned nothing"),
                 "the gap message must be the distinct collection wording: {gap}"
@@ -593,7 +617,7 @@ mod tests {
                 gap.contains(platform.as_str()),
                 "the gap message must name the platform: {gap}"
             );
-            for (idx, count) in chunk_counts.iter().enumerate() {
+            for (idx, count) in counts.iter().enumerate() {
                 assert!(
                     gap.contains(&format!("chunk {idx} collected {count} lines")),
                     "the gap message must name each chunk's count: {gap}"
@@ -604,11 +628,44 @@ mod tests {
                 "the gap must distinguish collection failure from rejection evidence: {gap}"
             );
         }
-        // Positive control: collected log lines never trip the gap.
-        assert!(custody_log_collection_gap(&LiveLabPlatform::MacOs, &[0, 7, 2]).is_none());
-        assert!(custody_log_collection_gap(&LiveLabPlatform::Linux, &[50]).is_none());
+        // Positive control: collected log lines pass the gate with the chunk
+        // SUM as the Ok value.
+        assert_eq!(
+            custody_log_collection_gate(&LiveLabPlatform::MacOs, &[0, 7, 2]).expect("must pass"),
+            9
+        );
+        assert_eq!(
+            custody_log_collection_gate(&LiveLabPlatform::Linux, &[50]).expect("must pass"),
+            50
+        );
         // No chunks at all is still an empty collection.
-        assert!(custody_log_collection_gap(&LiveLabPlatform::Linux, &[]).is_some());
+        assert!(custody_log_collection_gate(&LiveLabPlatform::Linux, &[]).is_err());
+    }
+
+    /// N3 (review macos-nits): the gate's Ok value is the SUM of the
+    /// per-chunk counts — every chunk contributes, and the counting half of
+    /// the seam records exactly one entry per chunk at that chunk's own line
+    /// count. Kills the dropped-count-recording survivor (review MU1) and a
+    /// sum that ignores trailing chunks.
+    #[test]
+    fn custody_gate_ok_value_is_the_chunk_sum_and_counts_are_per_chunk() {
+        assert_eq!(
+            custody_log_collection_gate(&LiveLabPlatform::Linux, &[0, 1]).expect("one real line"),
+            1,
+            "the Ok value must be the chunk SUM, not a per-chunk max or first-chunk count"
+        );
+        assert_eq!(
+            custody_log_collection_gate(&LiveLabPlatform::MacOs, &[3, 0, 9]).expect("sum"),
+            12,
+            "trailing chunks must contribute to the sum"
+        );
+        let chunks: Vec<String> = vec!["first\ngo".to_owned(), String::new(), "last".to_owned()];
+        assert_eq!(
+            chunk_line_counts_of(&chunks),
+            vec![2, 0, 1],
+            "one count per chunk, each the chunk's own lines().count()"
+        );
+        assert!(chunk_line_counts_of(&[]).is_empty());
     }
 
     #[test]

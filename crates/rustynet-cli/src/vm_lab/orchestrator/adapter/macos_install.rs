@@ -3096,17 +3096,35 @@ exit 1
         let secret_path = keys.join("enrollment.secret");
         let calls_path = dir.path().join("calls");
         let harness_path = dir.path().join("harness.sh");
-        std::fs::write(
-            &harness_path,
-            format!(
-                "#!/bin/bash\nset -u\nKEYS_DIR={keys:?}\nCALLS_FILE={calls_path:?}\n\
-                 provision_enrollment_secret() {{ echo provision >> \"$CALLS_FILE\"; }}\n\
-                 secure_remove_file() {{ rm -f \"$1\"; echo \"remove:$1\" >> \"$CALLS_FILE\"; }}\"remove:$1\" >> \"$CALLS_FILE\"; }}\n\
-                 {function}\n\
-                 DAEMON_NODE_ROLE=\"$1\" manage_enrollment_secret\n"
-            ),
-        )
-        .expect("write harness");
+        // N2 (review macos-nits): the assembled harness must be well formed
+        // BEFORE any matrix cell runs — an editing accident in these format
+        // strings must fail loudly here, not as a baffling per-cell error.
+        // (The shipped stub once carried a duplicated trailing fragment that
+        // bash lexed into a garbage command inside the function body.)
+        let harness = format!(
+            "#!/bin/bash\nset -u\nKEYS_DIR={keys:?}\nCALLS_FILE={calls_path:?}\n\
+             provision_enrollment_secret() {{ echo provision >> \"$CALLS_FILE\"; }}\n\
+             secure_remove_file() {{ rm -f \"$1\"; echo \"remove:$1\" >> \"$CALLS_FILE\"; }}\n\
+             {function}\n\
+             DAEMON_NODE_ROLE=\"$1\" manage_enrollment_secret\n"
+        );
+        assert_eq!(
+            harness.matches("secure_remove_file() {").count(),
+            1,
+            "the secure_remove_file stub must be defined exactly once (duplicated fragment \
+             would corrupt the function body): {harness}"
+        );
+        std::fs::write(&harness_path, harness.as_bytes()).expect("write harness");
+        let syntax = std::process::Command::new("/bin/bash")
+            .arg("-n")
+            .arg(&harness_path)
+            .output()
+            .expect("run bash -n on the assembled harness");
+        assert!(
+            syntax.status.success(),
+            "the assembled harness must be syntactically valid bash: {}",
+            String::from_utf8_lossy(&syntax.stderr)
+        );
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&harness_path, std::fs::Permissions::from_mode(0o700))
             .expect("chmod harness");
@@ -3980,8 +3998,85 @@ trap -p HUP > "$WORK/after_hup.txt"
              clobbered it)"
         );
         let _ = std::fs::remove_file(&script_f);
+
+        // N6 (review macos-nits): a caller with NO traps armed for
+        // INT/TERM/HUP (EXIT alone armed) must get exactly that back: the
+        // mint's own temporary exit-130/143/129 traps must be GONE after the
+        // function returns — the restore helper's `trap - SIGNAL` else-
+        // branches, never exercised by the all-armed harnesses above. The
+        // before/after-listing style is kept deliberately (a test launched
+        // as a background job ignores SIGINT and a nohup run ignores SIGHUP,
+        // and bash cannot trap a signal ignored at process start): the
+        // assertion is `after == before` with EMPTY before listings.
+        let work_n = std::env::temp_dir().join(format!("rn_d4_notrap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&work_n);
+        std::fs::create_dir_all(&work_n).expect("no-prior-trap work dir");
+        let no_prior_trap_harness = success_harness
+            .replace("trap 'touch \"$WORK/prior_term_fired\"' TERM\n", "")
+            .replace("trap 'touch \"$WORK/prior_int_fired\"' INT\n", "")
+            .replace("trap 'touch \"$WORK/prior_hup_fired\"' HUP\n", "");
+        let script_n = write_temp_file(
+            "rn_d4_bootstrap_notrap_",
+            ".sh",
+            BOOTSTRAP_SCRIPT.as_bytes(),
+        )
+        .expect("write a copy of the bootstrap script");
+        let output = Command::new("bash")
+            .arg("-c")
+            .arg(no_prior_trap_harness.as_str())
+            .arg("rn_d4_harness_notrap")
+            .arg(script_n.as_os_str())
+            .arg(work_n.as_os_str())
+            .output()
+            .expect("run the no-prior-trap mint under bash");
+        assert!(
+            output.status.success(),
+            "a stubbed successful mint must succeed with no prior traps: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for signal in ["term", "int", "hup"] {
+            let before = std::fs::read_to_string(work_n.join(format!("before_{signal}.txt")))
+                .unwrap_or_default();
+            let after = std::fs::read_to_string(work_n.join(format!("after_{signal}.txt")))
+                .unwrap_or_default();
+            // Before the mint this listing is EMPTY unless the signal was
+            // ignored at process start (a background job ignores SIGINT, a
+            // nohup run ignores SIGHUP; bash cannot trap those, so the
+            // listing then reads `trap -- '' SIG<X>`). Both are "the caller
+            // had no trap here"; what must NEVER be the before-state is the
+            // mint's own handler.
+            let sig_name = format!("SIG{}", signal.to_ascii_uppercase());
+            assert!(
+                before.is_empty() || before.contains(&format!("trap -- '' {sig_name}")),
+                "harness sanity: the caller armed no {signal} trap before the mint: {before:?}"
+            );
+            assert_eq!(
+                after, before,
+                "with no prior {signal} trap the mint's own temporary trap must be gone \
+                 after the function returns (`trap -` restore, not a no-op)"
+            );
+        }
+        // Non-vacuity: EXIT alone was armed, must survive and fire.
+        let armed_exit_n =
+            std::fs::read_to_string(work_n.join("before_exit.txt")).unwrap_or_default();
+        assert!(
+            armed_exit_n.contains("prior_exit_fired"),
+            "harness sanity: EXIT must be the one armed trap in this run: {armed_exit_n:?}"
+        );
+        let after_exit_n =
+            std::fs::read_to_string(work_n.join("after_exit.txt")).unwrap_or_default();
+        assert_eq!(
+            after_exit_n, armed_exit_n,
+            "the caller's lone EXIT trap must survive the mint unchanged"
+        );
+        assert!(
+            work_n.join("prior_exit_fired").exists(),
+            "the restored EXIT trap must fire at script exit (no-prior-trap run)"
+        );
+        let _ = std::fs::remove_file(&script_n);
         let _ = std::fs::remove_dir_all(&work);
         let _ = std::fs::remove_dir_all(&work_f);
+        let _ = std::fs::remove_dir_all(&work_n);
     }
 
     /// The gossip mint must be wired into BOTH main branches of the bootstrap

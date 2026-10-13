@@ -717,14 +717,19 @@ mod tests {
         }
     }
 
-    /// D5: on the lab fleet (aarch64 macOS) the real host arch resolves, and
-    /// the artifact specs carry exactly the pinned triple — the mislabelled
-    /// hardcoded string is gone from both manifest paths.
+    /// D5: the artifact specs carry exactly the pinned triple — the
+    /// mislabelled hardcoded string is gone from both manifest paths. The
+    /// pinned triple is resolved through the PURE arch-keyed
+    /// [`seam_target_triple_for_arch`], not [`seam_target_triple`]: the
+    /// latter keys on `std::env::consts::ARCH`, i.e. the BUILD host's arch,
+    /// so a test that unwraps it would fail on every non-aarch64 build host
+    /// (N1, review macos-nits). The refusal such hosts get in production is
+    /// covered by `seam_triple_refuses_a_non_aarch64_host_arch` above.
     #[test]
     fn prebuilt_specs_carry_the_pinned_lab_triple() {
-        let triple =
-            seam_target_triple().expect("this host must be aarch64 for the seam to run at all");
-        assert_eq!(triple, "aarch64-apple-darwin");
+        let triple = seam_target_triple_for_arch("aarch64")
+            .expect("aarch64 is the pinned lab fleet arch and must resolve");
+        assert_eq!(triple, LAB_SEAM_TARGET_TRIPLE);
         let bins: Vec<PathBuf> = PREBUILT_ARTIFACT_NAMES
             .iter()
             .map(|name| PathBuf::from(format!("/tmp/fake-target-dir/{name}")))

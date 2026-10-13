@@ -210,31 +210,42 @@ fn run() -> Result<(), String> {
         platform.as_str()
     ))?;
     let log_chunks = daemon_unit_log_argv(platform, "500", true)?;
+    let chunk_outputs: Vec<String> = log_chunks
+        .iter()
+        .map(|chunk| {
+            ctx.capture_root_allow_failure(&target_host, chunk)
+                .unwrap_or_default()
+        })
+        .collect();
     let mut journal = String::new();
-    let mut chunk_line_counts: Vec<usize> = Vec::with_capacity(log_chunks.len());
-    for chunk in &log_chunks {
-        let chunk_output = ctx
-            .capture_root_allow_failure(&target_host, chunk)
-            .unwrap_or_default();
-        let chunk_lines = chunk_output.lines().count();
-        chunk_line_counts.push(chunk_lines);
-        journal.push_str(&chunk_output);
+    for chunk_output in &chunk_outputs {
+        journal.push_str(chunk_output);
         if !journal.ends_with('\n') {
             journal.push('\n');
         }
     }
 
-    // Count what was ACTUALLY collected (sum of the chunks' own line counts),
-    // not the newline-padded merge buffer: padding an empty collection to
-    // "\n" must not read as one scanned line.
-    let line_count: usize = chunk_line_counts.iter().sum();
+    // N3 (review macos-nits): the collect→counts→zero-line-refusal decision
+    // lives in the pure `chunk_line_counts_of` + `secrets_zero_line_gate`
+    // seam below; run() is one-line delegations plus these log lines. The
+    // gate's Ok is the per-chunk line-count SUM — exactly what the report
+    // writes as `log_lines_checked` — and its Err is the named refusal,
+    // logged then returned unchanged. The sum is never the newline-padded
+    // merge buffer's line count: padding an empty collection to "\n" must
+    // not read as one scanned line.
+    let chunk_line_counts = chunk_line_counts_of(&chunk_outputs);
+    let gated = secrets_zero_line_gate(&platform, &chunk_line_counts);
     logger.line(format!(
-        "[secrets-log] collected {line_count} journal lines (per chunk: {chunk_line_counts:?})"
+        "[secrets-log] collected {} journal lines (per chunk: {chunk_line_counts:?})",
+        gated.as_ref().copied().unwrap_or(0)
     ))?;
-    if let Some(refusal) = secrets_zero_line_refusal(&platform, &chunk_line_counts) {
-        logger.line(format!("[secrets-log] FAIL {refusal}"))?;
-        return Err(refusal);
-    }
+    let line_count: usize = match gated {
+        Ok(line_count) => line_count,
+        Err(refusal) => {
+            logger.line(format!("[secrets-log] FAIL {refusal}"))?;
+            return Err(refusal);
+        }
+    };
 
     // ── Stage 4-6: scan for key patterns ─────────────────────────────────────
     let hex64_matches = scan_hex_pattern(&journal, 64);
@@ -301,19 +312,31 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// D1 (review macos-harness-b): the named refusal when a secrets scan read
-/// nothing. `chunk_line_counts` holds one entry per
-/// [`daemon_unit_log_argv`] chunk, in collection order. `Some` ⇒ the caller
-/// must fail the run: `total_suspicious == 0` over zero scanned lines is a
+/// N3 (review macos-nits): the per-chunk line counts of the collected log
+/// chunks, in collection order — one entry per [`daemon_unit_log_argv`]
+/// chunk, each the chunk's own `lines().count()`. Pure and unit-tested so a
+/// dropped/corrupted count recording fails loudly (review survivor MU1).
+fn chunk_line_counts_of(chunk_lines: &[String]) -> Vec<usize> {
+    chunk_lines.iter().map(|c| c.lines().count()).collect()
+}
+
+/// D1 (review macos-harness-b) / N3 (review macos-nits): the zero-line gate
+/// over the per-chunk collected line counts. `Ok(sum)` is the run's real
+/// evidence size — the caller passes it straight through as the report's
+/// `log_lines_checked` — and `Err(refusal)` is the named failure the run
+/// must return: `total_suspicious == 0` over zero scanned lines is a
 /// collection failure, not a clean log, and a pass on it would be
 /// indistinguishable from `sudo -n log show` failing or both launchd log
-/// files being absent on a fresh/rotated guest.
-fn secrets_zero_line_refusal(
+/// files being absent on a fresh/rotated guest. The sum is the SUM of the
+/// per-chunk counts, never the newline-padded merge buffer's line count
+/// (padding an empty collection to "\n" must not read as one scanned line).
+fn secrets_zero_line_gate(
     platform: &LiveLabPlatform,
     chunk_line_counts: &[usize],
-) -> Option<String> {
-    if chunk_line_counts.iter().sum::<usize>() > 0 {
-        return None;
+) -> Result<usize, String> {
+    let line_count: usize = chunk_line_counts.iter().sum();
+    if line_count > 0 {
+        return Ok(line_count);
     }
     let per_chunk = chunk_line_counts
         .iter()
@@ -321,7 +344,7 @@ fn secrets_zero_line_refusal(
         .map(|(idx, count)| format!("chunk {idx} collected {count} lines"))
         .collect::<Vec<_>>()
         .join("; ");
-    Some(format!(
+    Err(format!(
         "secrets-not-in-logs log collection read NOTHING on platform {}: {per_chunk} — a pass \
          is impossible without scanned evidence (fail closed; D1)",
         platform.as_str()
@@ -468,19 +491,23 @@ mod tests {
     fn zero_collected_lines_refuse_a_pass_with_platform_and_per_chunk_counts() {
         // D1: a secrets scan that read nothing must fail with a named error
         // that names the platform and every chunk's collected line count —
-        // never a clean verdict over zero evidence.
+        // never a clean verdict over zero evidence. N3: composed through the
+        // `chunk_line_counts_of` → `secrets_zero_line_gate` seam exactly as
+        // run() drives it (all-empty chunks in, refusal out).
         for platform in [LiveLabPlatform::Linux, LiveLabPlatform::MacOs] {
-            let chunk_counts = if platform == LiveLabPlatform::MacOs {
-                vec![0, 0, 0]
+            let chunk_texts: Vec<String> = if platform == LiveLabPlatform::MacOs {
+                vec![String::new(), String::new(), String::new()]
             } else {
-                vec![0]
+                vec![String::new()]
             };
-            let refusal = secrets_zero_line_refusal(&platform, &chunk_counts).expect("must refuse");
+            let counts = chunk_line_counts_of(&chunk_texts);
+            let refusal =
+                secrets_zero_line_gate(&platform, &counts).expect_err("must refuse the gate");
             assert!(
                 refusal.contains(platform.as_str()),
                 "the refusal must name the platform: {refusal}"
             );
-            for (idx, count) in chunk_counts.iter().enumerate() {
+            for (idx, count) in counts.iter().enumerate() {
                 assert!(
                     refusal.contains(&format!("chunk {idx} collected {count} lines")),
                     "the refusal must name each chunk's collected line count: {refusal}"
@@ -491,11 +518,74 @@ mod tests {
                 "the refusal must state that a pass is impossible: {refusal}"
             );
         }
-        // Positive control: real collected evidence never refuses.
-        assert!(secrets_zero_line_refusal(&LiveLabPlatform::MacOs, &[0, 12, 3]).is_none());
-        assert!(secrets_zero_line_refusal(&LiveLabPlatform::Linux, &[500]).is_none());
+        // Positive control: real collected evidence passes the gate with the
+        // chunk SUM as its Ok value.
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::MacOs, &[0, 12, 3]).expect("must pass"),
+            15
+        );
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::Linux, &[500]).expect("must pass"),
+            500
+        );
         // And an empty slice (no chunks at all) is zero evidence too.
-        assert!(secrets_zero_line_refusal(&LiveLabPlatform::Linux, &[]).is_some());
+        assert!(secrets_zero_line_gate(&LiveLabPlatform::Linux, &[]).is_err());
+    }
+
+    /// N3 (review macos-nits): the gate's Ok value — the number run() writes
+    /// into the report as `log_lines_checked` — is the SUM of the per-chunk
+    /// counts, never the newline-padded merge buffer's line count. Kills the
+    /// padded-merge survivor (review MUb): `["", "x"]` merges to "\nx\n",
+    /// which counts as 2 lines, while the chunk sum is 1; an all-empty
+    /// collection merges to "\n" and would read as 1 phantom line instead of
+    /// the refusal.
+    #[test]
+    fn zero_line_gate_ok_value_is_the_chunk_sum_not_the_padded_merge_count() {
+        // One non-empty chunk among empty ones: Ok must equal the chunk sum.
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::Linux, &[0, 1]).expect("one real line"),
+            1,
+            "log_lines_checked must be the chunk SUM (the padded merge buffer would \
+             count 2 here)"
+        );
+        // The all-empty phantom: sum 0 ⇒ refusal, never Ok(1).
+        assert!(secrets_zero_line_gate(&LiveLabPlatform::MacOs, &[0, 0, 0]).is_err());
+        // Multi-chunk sums: every chunk contributes, in any position.
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::MacOs, &[4, 0, 8]).expect("sum"),
+            12,
+            "the sum must span ALL chunks, not just the first or last"
+        );
+        assert_eq!(
+            secrets_zero_line_gate(&LiveLabPlatform::Linux, &[1, 2, 3]).expect("sum"),
+            6
+        );
+    }
+
+    /// N3 (review macos-nits): the counting half of the seam records exactly
+    /// one entry per chunk, each that chunk's own line count. Kills the
+    /// dropped-count-recording survivor (review MU1): a mutant that never
+    /// records counts (all zeros / empty vec) flips the gate to refuse on
+    /// real evidence, and a padded-merge count corrupts the Ok sum.
+    #[test]
+    fn chunk_line_counts_record_one_entry_per_chunk_at_its_own_line_count() {
+        let chunks: Vec<String> = vec![
+            "a\nb\nc".to_owned(),
+            String::new(),
+            "d\ne\n".to_owned(),
+            "\n".to_owned(),
+        ];
+        assert_eq!(
+            chunk_line_counts_of(&chunks),
+            vec![3, 0, 2, 1],
+            "one count per chunk, each the chunk's own lines().count()"
+        );
+        // No chunks ⇒ no counts (an empty slice is zero evidence downstream).
+        assert!(chunk_line_counts_of(&[]).is_empty());
+        // Trailing newline does not fabricate an extra line; the empty-string
+        // chunk stays 0 (a blank merge pad must not read as evidence).
+        let blanks: Vec<String> = vec![String::new(), String::new()];
+        assert_eq!(chunk_line_counts_of(&blanks), vec![0, 0]);
     }
 
     #[test]
