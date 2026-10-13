@@ -83,6 +83,63 @@ fn a_passing_outcome_has_an_empty_summary() {
     assert_eq!(outcome.failure_summary, "");
 }
 
+// ───────────────────── remote command failure text ─────────────────────
+
+/// The `rustynet` CLI prints `error [code]: ...` on STDOUT. A message built from
+/// stderr alone read "failed on the remote host: " with nothing after it, which
+/// hid the real `apply-role-coupling` failure of every cross-network failback
+/// run from katana-xnet-60 to -150.
+#[test]
+fn a_failed_remote_command_reports_the_cli_error_that_lands_on_stdout() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+    let cli_error = "error [generic_failure (1)]: forced local assignment refresh failed: \
+                     systemctl start rustynetd-assignment-refresh.service failed with status exit status: 1";
+    let runner = MockLeafRunner {
+        fail_on: vec![0],
+        stdout_for: vec![(0, format!("{cli_error}\n  hint: unclassified failure\n"))],
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&runner, &["rustynet", "ops", "apply-role-coupling"])
+        .expect_err("a non-zero exit must fail closed");
+    assert!(
+        err.contains("forced local assignment refresh failed"),
+        "the CLI's stdout error must reach the stage message: {err}"
+    );
+    assert!(!err.ends_with("failed on the remote host: "), "{err}");
+}
+
+#[test]
+fn a_failed_remote_command_keeps_stderr_and_marks_total_silence() {
+    use crate::vm_lab::orchestrator::stage::cross_network::substrate::mock::MockLeafRunner;
+    let with_stderr = MockLeafRunner {
+        fail_on: vec![0],
+        failure_stderr: "ssh: connect to host failed\n".to_owned(),
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&with_stderr, &["true"]).expect_err("must fail");
+    assert!(err.ends_with("ssh: connect to host failed"), "{err}");
+
+    let silent = MockLeafRunner {
+        fail_on: vec![0],
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&silent, &["true"]).expect_err("must fail");
+    assert!(err.contains("no output on stdout or stderr"), "{err}");
+
+    // Both streams: stderr first, stdout appended and clipped.
+    let long_stdout = "x".repeat(5_000);
+    let both = MockLeafRunner {
+        fail_on: vec![0],
+        failure_stderr: "boom".to_owned(),
+        stdout_for: vec![(0, long_stdout)],
+        ..MockLeafRunner::default()
+    };
+    let err = capture_root(&both, &["true"]).expect_err("must fail");
+    assert!(err.contains("boom (stdout: xxx"), "{err}");
+    assert!(err.ends_with("...)"), "a long stdout is clipped: {err}");
+    assert!(err.len() < 1_500, "stdout must be capped: {}", err.len());
+}
+
 // ─────────────────────── netcheck health predicates ───────────────────────
 
 #[test]

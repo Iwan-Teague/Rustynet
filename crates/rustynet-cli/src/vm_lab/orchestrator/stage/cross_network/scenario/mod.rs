@@ -370,8 +370,37 @@ pub fn capture_root(runner: &dyn NetLeafRunner, argv: &[&str]) -> Result<String,
     } else {
         Err(format!(
             "{argv:?} failed on the remote host: {}",
-            output.stderr.trim()
+            remote_failure_detail(&output)
         ))
+    }
+}
+
+/// How much of a failed remote command's stdout is carried into the error.
+const REMOTE_FAILURE_STDOUT_CAP: usize = 1_000;
+
+/// The text that explains a failed remote command.
+///
+/// The `rustynet` CLI prints its `error [code]: ...` line on STDOUT, not
+/// stderr (`main.rs` `println!`). An stderr-only message therefore read
+/// `... failed on the remote host: ` with nothing after it for every failing
+/// `rustynet ops ...` call, which hid the real coupling error behind an empty
+/// string in every cross-network failback run from katana-xnet-60 to -150. So:
+/// stderr first, stdout appended (clipped), and an explicit marker when the
+/// guest said nothing at all.
+fn remote_failure_detail(output: &LeafOutput) -> String {
+    let stderr = output.stderr.trim();
+    let stdout = output.stdout.trim();
+    let stdout_clip: String = stdout.chars().take(REMOTE_FAILURE_STDOUT_CAP).collect();
+    let stdout_text = if stdout.chars().count() > REMOTE_FAILURE_STDOUT_CAP {
+        format!("{stdout_clip}...")
+    } else {
+        stdout_clip
+    };
+    match (stderr.is_empty(), stdout_text.is_empty()) {
+        (false, false) => format!("{stderr} (stdout: {stdout_text})"),
+        (false, true) => stderr.to_owned(),
+        (true, false) => stdout_text,
+        (true, true) => "no output on stdout or stderr".to_owned(),
     }
 }
 
