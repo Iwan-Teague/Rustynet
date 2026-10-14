@@ -21677,7 +21677,7 @@ fn help_text() -> String {
         "  metrics",
         "  dns-test [<domain>]",
         "  state refresh",
-        "  install [--role node|relay|exit|anchor] [--dry-run] [--unattended] [--from-dir <abs> | --build-from-source] [--owner-key-file <abs>] [--owner-key-thumbprint <hex>] [--uninstall]",
+        "  install [--role node|relay|exit|anchor] [--dry-run] [--unattended] [--from-dir <abs> | --build-from-source] [--owner-key-file <abs>] [--owner-key-thumbprint <hex>] [--uninstall [--delete-owner-key --confirm-owner-key-deletion DELETE-OWNER-KEY]]",
         "  operator menu",
         "  exit-node select <node>",
         "  exit-node off",

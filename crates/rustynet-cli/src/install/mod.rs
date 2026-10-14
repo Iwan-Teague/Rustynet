@@ -105,6 +105,9 @@ pub struct InstallRequest {
     pub unattended: bool,
     pub dry_run: bool,
     pub uninstall: bool,
+    /// `--delete-owner-key` (with the typed confirmation): macOS uninstall also
+    /// deletes the owner signing key and its passphrase. Off by default.
+    pub delete_owner_key: bool,
 }
 
 impl InstallRequest {
@@ -121,6 +124,8 @@ impl InstallRequest {
         let mut unattended = false;
         let mut dry_run = false;
         let mut uninstall = false;
+        let mut delete_owner_key = false;
+        let mut confirm_owner_key_deletion: Option<String> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -147,11 +152,21 @@ impl InstallRequest {
                 "--unattended" => unattended = true,
                 "--dry-run" => dry_run = true,
                 "--uninstall" => uninstall = true,
+                "--delete-owner-key" => delete_owner_key = true,
+                "--confirm-owner-key-deletion" => {
+                    confirm_owner_key_deletion =
+                        Some(next_value(args, &mut i, "--confirm-owner-key-deletion")?)
+                }
                 other => return Err(format!("unknown flag for `rustynet install`: {other}")),
             }
             i += 1;
         }
 
+        validate_owner_key_deletion_flags(
+            uninstall,
+            delete_owner_key,
+            confirm_owner_key_deletion.as_deref(),
+        )?;
         if from_dir.is_some() && build_from_source {
             return Err("--from-dir and --build-from-source are mutually exclusive".to_owned());
         }
@@ -173,8 +188,38 @@ impl InstallRequest {
             unattended,
             dry_run,
             uninstall,
+            delete_owner_key,
         })
     }
+}
+
+/// `--delete-owner-key` is a deliberate, destructive opt-in. It is valid only with
+/// `--uninstall`, and only with the exact typed confirmation phrase. Refusing here,
+/// before any host check or mutation, is the fail-closed default.
+fn validate_owner_key_deletion_flags(
+    uninstall: bool,
+    delete_owner_key: bool,
+    confirm: Option<&str>,
+) -> Result<(), String> {
+    if !delete_owner_key && confirm.is_none() {
+        return Ok(());
+    }
+    if !uninstall {
+        return Err(
+            "--delete-owner-key and --confirm-owner-key-deletion are only valid with --uninstall"
+                .to_owned(),
+        );
+    }
+    if !delete_owner_key {
+        return Err("--confirm-owner-key-deletion requires --delete-owner-key".to_owned());
+    }
+    if confirm != Some(uninstall::OWNER_KEY_DELETION_CONFIRMATION) {
+        return Err(format!(
+            "--delete-owner-key requires --confirm-owner-key-deletion {}; the owner key cannot be recovered once deleted",
+            uninstall::OWNER_KEY_DELETION_CONFIRMATION
+        ));
+    }
+    Ok(())
 }
 
 fn require_absolute(value: &str, flag: &str) -> Result<PathBuf, String> {
@@ -211,12 +256,18 @@ pub fn run(req: InstallRequest) -> Result<String, String> {
     let plan = build_plan(&req, &facts, triple);
     let rendered = render_plan(&req, &facts, triple, &plan);
 
-    if req.dry_run {
-        return Ok(rendered);
-    }
     if req.uninstall {
+        let opts = uninstall::UninstallOptions {
+            delete_owner_key: req.delete_owner_key,
+        };
+        if req.dry_run {
+            return match uninstall::dry_run_report(facts.family, opts) {
+                Ok(report) => Ok(format!("{rendered}\n\n{report}")),
+                Err(msg) => Err(format!("{rendered}\n\n{msg}")),
+            };
+        }
         preflight::require_elevation(facts.family)?;
-        return match uninstall::run(facts.family) {
+        return match uninstall::run(facts.family, opts) {
             Ok(msg) => Ok(format!("{rendered}\n\n{msg}")),
             Err(msg) => Err(format!("{rendered}\n\n{msg}")),
         };
@@ -282,7 +333,7 @@ fn build_plan(req: &InstallRequest, facts: &HostFacts, triple: &str) -> Vec<Stri
                 "stop + disable the rustynet service and reverse each `ops install-*`/custody/trust step ({})",
                 service_mechanism(facts.family)
             ),
-            "remove placed binaries + state dirs (owner-only), leaving no residue".to_owned(),
+            "remove placed binaries + runtime state; macOS keeps the owner signing key and its passphrase unless --delete-owner-key is given (see the uninstall report)".to_owned(),
         ];
     }
     let mut steps = Vec::new();
@@ -566,6 +617,7 @@ mod tests {
             unattended: true,
             dry_run: true,
             uninstall: false,
+            delete_owner_key: false,
         };
 
         let linux = build_plan(
@@ -731,6 +783,45 @@ mod tests {
     }
 
     #[test]
+    fn uninstall_owner_key_deletion_needs_uninstall_and_exact_phrase() {
+        let base = ["--uninstall"].map(str::to_owned);
+        let parse = |extra: &[&str]| {
+            let mut argv = base.to_vec();
+            argv.extend(extra.iter().map(|s| (*s).to_owned()));
+            InstallRequest::from_args(&argv)
+        };
+        assert!(!parse(&[]).expect("plain uninstall").delete_owner_key);
+        assert!(
+            InstallRequest::from_args(&["--delete-owner-key".to_owned()]).is_err(),
+            "--delete-owner-key without --uninstall is refused"
+        );
+        assert!(
+            parse(&["--delete-owner-key"]).is_err(),
+            "--delete-owner-key without the typed phrase is refused"
+        );
+        assert!(
+            parse(&[
+                "--delete-owner-key",
+                "--confirm-owner-key-deletion",
+                "delete-owner-key"
+            ])
+            .is_err(),
+            "the phrase is case-sensitive"
+        );
+        assert!(
+            parse(&["--confirm-owner-key-deletion", "DELETE-OWNER-KEY"]).is_err(),
+            "the phrase alone, without --delete-owner-key, is refused"
+        );
+        let opted = parse(&[
+            "--delete-owner-key",
+            "--confirm-owner-key-deletion",
+            "DELETE-OWNER-KEY",
+        ])
+        .expect("exact phrase accepted");
+        assert!(opted.delete_owner_key && opted.uninstall);
+    }
+
+    #[test]
     fn uninstall_plan_is_reversal_only() {
         let req = InstallRequest {
             role: InstallRole::Node,
@@ -743,6 +834,7 @@ mod tests {
             unattended: false,
             dry_run: false,
             uninstall: true,
+            delete_owner_key: false,
         };
         let plan = build_plan(
             &req,
