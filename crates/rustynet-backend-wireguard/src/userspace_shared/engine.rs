@@ -399,18 +399,43 @@ impl UserspaceEngine {
                 decoded_private_key.len()
             )));
         }
+        let mut private_key_bytes = Zeroizing::new([0u8; 32]);
+        private_key_bytes.copy_from_slice(&decoded_private_key);
+        drop(decoded_private_key);
+        let source = path.display().to_string();
+        Self::from_validated_private_key(&private_key_bytes, &source)
+    }
+
+    /// Bytes entry point for 32-byte static key material that is already in
+    /// memory and never touches disk. It runs the same refusal and key
+    /// derivation as [`Self::from_private_key_file`], both through
+    /// [`Self::from_validated_private_key`], so the two cannot diverge. The
+    /// owned `Zeroizing` argument is borrowed, not moved, so the one buffer is
+    /// wiped in place when this function returns.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_private_key_bytes(
+        private_key: Zeroizing<[u8; 32]>,
+    ) -> Result<Self, BackendError> {
+        Self::from_validated_private_key(&private_key, "in-memory key bytes")
+    }
+
+    /// Shared tail of both constructors. `source` is a plain label naming
+    /// where the key came from; it appears only in the refusal message, and
+    /// the key bytes are never formatted.
+    fn from_validated_private_key(
+        private_key: &Zeroizing<[u8; 32]>,
+        source: &str,
+    ) -> Result<Self, BackendError> {
         // CRY-06 convention (mirrors rustynet-crypto's WeakMaterial rejects):
         // an all-zero static private key is a publicly derivable identity that
         // a blank or corrupted key file would mint. Refuse it instead of
         // bringing up a tunnel an attacker can impersonate.
-        if decoded_private_key.iter().all(|&byte| byte == 0) {
+        if private_key.iter().all(|&byte| byte == 0) {
             return Err(BackendError::internal(format!(
-                "userspace-shared private key is degenerate (all zeros) for {}; refusing to load weak key material",
-                path.display()
+                "userspace-shared private key is degenerate (all zeros) for {source}; refusing to load weak key material"
             )));
         }
-        let mut private_key_bytes: [u8; 32] = [0u8; 32];
-        private_key_bytes.copy_from_slice(&decoded_private_key);
+        let mut private_key_bytes: [u8; 32] = **private_key;
 
         let local_static_private = StaticSecret::from(private_key_bytes);
         private_key_bytes.zeroize();
@@ -3380,6 +3405,132 @@ mod tests {
             "got {:?}",
             err.message
         );
+    }
+
+    // ---- from_private_key_bytes: parity, known answer, redaction ----
+
+    /// Decodes a 64-character lowercase hex string into 32 bytes (test-only).
+    fn hex32(hex: &str) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for (slot, pair) in out.iter_mut().zip(hex.as_bytes().chunks(2)) {
+            let pair = std::str::from_utf8(pair).expect("ascii hex");
+            *slot = u8::from_str_radix(pair, 16).expect("hex byte");
+        }
+        out
+    }
+
+    /// RFC 7748 section 6.1, Alice: private scalar and X25519(a, 9) public key.
+    const RFC7748_ALICE_PRIVATE_HEX: &str =
+        "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+    const RFC7748_ALICE_PUBLIC_HEX: &str =
+        "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
+
+    #[test]
+    fn from_private_key_bytes_matches_rfc7748_known_answer_for_both_constructors() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let secret = zeroize::Zeroizing::new(hex32(RFC7748_ALICE_PRIVATE_HEX));
+        let expected = boringtun::x25519::PublicKey::from(hex32(RFC7748_ALICE_PUBLIC_HEX));
+        let from_bytes = UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new(*secret))
+            .expect("bytes key must load");
+        assert_eq!(
+            from_bytes.local_static_public, expected,
+            "bytes constructor must derive the RFC 7748 Alice public key"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("alice.key");
+        std::fs::write(&path, BASE64_STANDARD.encode(*secret)).expect("write key");
+        let from_file = UserspaceEngine::from_private_key_file(&path).expect("file key");
+        assert_eq!(
+            from_file.local_static_public, expected,
+            "file constructor must derive the RFC 7748 Alice public key"
+        );
+    }
+
+    #[test]
+    fn from_private_key_bytes_derives_same_public_key_as_file_loader() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg-parity.key");
+        let secrets: [[u8; 32]; 2] = [[0x42u8; 32], std::array::from_fn(|i| (i as u8) + 1)];
+        for secret in secrets {
+            std::fs::write(&path, BASE64_STANDARD.encode(secret)).expect("write key");
+            let from_file = UserspaceEngine::from_private_key_file(&path).expect("file key");
+            let from_bytes =
+                UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new(secret))
+                    .expect("bytes key must load");
+            assert_eq!(
+                from_bytes.local_static_public, from_file.local_static_public,
+                "bytes and file constructors must derive the same public key"
+            );
+        }
+    }
+
+    #[test]
+    fn from_private_key_bytes_rejects_all_zero_secret_like_file_loader() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("zero.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([0u8; 32])).expect("write key");
+        let file_err =
+            UserspaceEngine::from_private_key_file(&path).expect_err("all-zero file key");
+        let bytes_err = UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new([0u8; 32]))
+            .expect_err("all-zero bytes key");
+        assert_eq!(file_err.kind, BackendErrorKind::Internal);
+        assert_eq!(
+            bytes_err.kind, file_err.kind,
+            "both constructors must refuse with the same error variant"
+        );
+        assert!(
+            file_err.message.contains("degenerate (all zeros)"),
+            "got {:?}",
+            file_err.message
+        );
+        assert!(
+            bytes_err.message.contains("degenerate (all zeros)"),
+            "got {:?}",
+            bytes_err.message
+        );
+    }
+
+    #[test]
+    fn from_private_key_bytes_engine_debug_does_not_expose_secret() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let secret: [u8; 32] = std::array::from_fn(|i| 0xA0 ^ (i as u8));
+        let built = UserspaceEngine::from_private_key_bytes(zeroize::Zeroizing::new(secret))
+            .expect("bytes key must load");
+        let rendered = format!("{built:?}");
+        let secret_hex: String = secret.iter().map(|byte| format!("{byte:02x}")).collect();
+        let public_hex: String = built
+            .local_static_public
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let secret_hex_upper = secret_hex.to_uppercase();
+        let secret_b64 = BASE64_STANDARD.encode(secret);
+        let secret_b64_url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret);
+        // Decimal array form: the Debug of a [u8; 32] renders "[160, 161, ...".
+        let decimal_prefix = format!("{}, {}, {}, {}", secret[0], secret[1], secret[2], secret[3]);
+        let hex_prefix = &secret_hex[..8];
+        let hex_suffix = &secret_hex[secret_hex.len() - 8..];
+        let checks: [(&str, &str); 9] = [
+            ("full hex", &secret_hex),
+            ("uppercase hex", &secret_hex_upper),
+            ("hex prefix window", hex_prefix),
+            ("hex suffix window", hex_suffix),
+            ("decimal array prefix", &decimal_prefix),
+            ("base64 padded", &secret_b64),
+            ("base64 url-safe unpadded", &secret_b64_url),
+            ("base64 prefix window", &secret_b64[..8]),
+            ("public key hex", &public_hex),
+        ];
+        for (label, needle) in checks {
+            assert!(
+                !rendered.contains(needle),
+                "Debug must not render the secret or public key ({label}), got {rendered:?}"
+            );
+        }
+        assert!(rendered.contains("[REDACTED]"), "got {rendered:?}");
     }
 
     // --- EngineIoSink dispatch tests (P1 follow-up to commit 049ed1e5) ---
