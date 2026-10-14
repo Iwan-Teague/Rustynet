@@ -54,4 +54,4 @@ boringtun/src/device/tun_linux.rs blocks=11 fns=0 impls=0 externs=0 includes=0 p
 boringtun/src/ffi/mod.rs blocks=1 fns=0 impls=0 externs=12 includes=0 path_attrs=0 cfg_attrs=0
 boringtun/src/jni.rs blocks=0 fns=0 impls=0 externs=7 includes=0 path_attrs=0 cfg_attrs=0
 rustynet-alloc-meter/src/lib.rs blocks=4 fns=4 impls=1 externs=0 includes=0 path_attrs=0 cfg_attrs=0
-rustynet-tun/src/lib.rs blocks=19 fns=0 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
+rustynet-tun/src/lib.rs blocks=21 fns=0 impls=0 externs=0 includes=0 path_attrs=0 cfg_attrs=0
