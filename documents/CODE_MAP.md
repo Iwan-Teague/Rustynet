@@ -32,6 +32,7 @@ Symbol-level reference for AI agents: key types, traits, functions, and where th
 │  rustynet-windows-native (WFP, DPAPI, pipes)     │
 │  rustynet-local-security (ACL verifiers)         │
 │  rustynet-sysinfo (OS detection, interfaces)     │
+│  rustynet-mobile-ffi (mobile C ABI, JNI shim)    │
 └─────────────────────────────────────────────────┘
 ```
 

@@ -21,6 +21,7 @@ members = [
   "crates/rustynet-mcp",
   "crates/rustynet-xtask",
   "crates/rustynet-netns-probe",
+  "crates/rustynet-mobile-ffi",
 ]
 resolver = "2"
 

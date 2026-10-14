@@ -126,6 +126,7 @@ const WORKSPACE_MEMBER_CRATE_DIRS: &[&str] = &[
     "crates/rustynet-mcp",
     "crates/rustynet-xtask",
     "crates/rustynet-netns-probe",
+    "crates/rustynet-mobile-ffi",
 ];
 
 /// Source roots to walk during the audit: every cargo workspace member

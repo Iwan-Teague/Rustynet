@@ -1303,7 +1303,7 @@ fn collect_rust_source_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
 /// `#[allow(unsafe_code)]` regions inventoried here. Anything else
 /// fails this gate — the check stays fail-closed.
 ///
-/// Each entry is (path prefix relative to `--root`, rationale). The
+/// Each entry is (exact file path relative to `--root`, rationale). The
 /// textual scan is file-granular; the compile-level pins are the
 /// exact-scope backstop: each member crate carries its own
 /// `[lints.rust]` pin (forbid where the crate holds zero unsafe, deny
@@ -1341,12 +1341,33 @@ const UNSAFE_SCAN_ALLOWED_SCOPES: &[(&str, &str)] = &[
         "rustynet-windows-native/src/lib.rs",
         "cfg(windows) `mod imp` Win32 FFI (DPAPI, WFP, IpHelper, RPC, registry); scoped #[allow(unsafe_code)] on `mod imp` in this file; crate [lints.rust] pins deny outside the module",
     ),
+    // MC1d C ABI + JNI skeleton (crates/rustynet-mobile-ffi): the only mobile unsafe.
+    // Two exact files, so the two other src files and the crate's build.rs/tests stay
+    // unlisted. Sites: `#[unsafe(no_mangle)]` exports, the `unsafe extern "C"` start
+    // export, the single `OwnedFd::from_raw_fd` adoption (c_abi.rs), and the JNI start
+    // export plus its one forwarding block (jni_shim.rs). Every site carries
+    // `// SAFETY:`. Scoped `#[allow(unsafe_code)]` sits on the functions that hold the
+    // sites. Exact per-key counts are pinned in crates/rustynet-mobile-ffi/UNSAFE_PIN
+    // and enforced by scripts/ci/mobile_unsafe_confinement_gate.sh. The crate pins
+    // `unsafe_code = "deny"` in its own [lints.rust] and does not inherit workspace
+    // lints. Owner-approved slice: C11 / CORE-Q1 / SEC-Q5
+    // (notes/APPROVAL-MC1a-prime-2026-10-14.md, MC1d scope).
+    (
+        "rustynet-mobile-ffi/src/c_abi.rs",
+        "MC1d C ABI (rustynet-mobile-ffi): unsafe extern start export, unsafe(no_mangle) exports, the single from_raw_fd adoption; counts pinned by UNSAFE_PIN and mobile_unsafe_confinement_gate.sh; per-crate deny; owner-approved C11/CORE-Q1/SEC-Q5",
+    ),
+    (
+        "rustynet-mobile-ffi/src/jni_shim.rs",
+        "MC1d JNI shim (rustynet-mobile-ffi): unsafe(no_mangle) JNI exports and one unsafe forwarding block to the C ABI start export; counts pinned by UNSAFE_PIN and mobile_unsafe_confinement_gate.sh; per-crate deny; owner-approved C11/CORE-Q1/SEC-Q5",
+    ),
 ];
 
+/// Exact path match. A prefix match would also admit sibling names such as
+/// `c_abi.rs_x.rs` or a whole directory, so every entry is a single file.
 fn unsafe_scan_path_is_allowlisted(repo_relative: &str) -> bool {
     UNSAFE_SCAN_ALLOWED_SCOPES
         .iter()
-        .any(|(prefix, _)| repo_relative.starts_with(prefix))
+        .any(|(path, _)| repo_relative == *path)
 }
 
 /// OI-20 §B1: every unsafe site needs an adjacent `// SAFETY:` comment —
@@ -1595,7 +1616,7 @@ fn toml_table_section<'a>(manifest: &'a str, header: &str) -> Option<&'a str> {
 /// unsafe_code = "deny"` (checked by [`verify_member_unsafe_lints`]),
 /// because inherited workspace lints cannot be overridden per crate and
 /// forbid admits no `#[allow(unsafe_code)]`. The only members holding
-/// unsafe (rustynetd, rustynet-windows-native) carry exactly that own
+/// unsafe (rustynetd, rustynet-windows-native, rustynet-mobile-ffi) carry exactly that own
 /// deny table and do not inherit the workspace lints, so the root
 /// `forbid` means "forbid wherever a crate holds zero unsafe". Fails
 /// closed on a missing manifest — a scan root outside a rustynet
@@ -1804,7 +1825,7 @@ pub fn execute_ops_check_no_unsafe_rust_sources(
 
     if !findings.is_empty() {
         return Err(format!(
-            "unsafe policy violation (OI-20/T2 security-bar B1): unsafe is permitted only inside explicitly scoped #[allow(unsafe_code)] regions (rustynetd macos_utun_helper_unsafe module, rustynet-windows-native cfg(windows) mod imp) and every site needs an adjacent // SAFETY: comment:\n{}",
+            "unsafe policy violation (OI-20/T2 security-bar B1): unsafe is permitted only inside explicitly scoped #[allow(unsafe_code)] regions (rustynetd macos_utun_helper_unsafe module, rustynet-windows-native cfg(windows) mod imp, rustynet-mobile-ffi c_abi.rs and jni_shim.rs) and every site needs an adjacent // SAFETY: comment:\n{}",
             findings.join("\n")
         ));
     }
@@ -2902,12 +2923,13 @@ mod secret_removal_rule_tests {
 mod tests {
     use super::{
         CheckDependencyExceptionsConfig, CheckNoUnsafeRustSourcesConfig, CheckPerfRegressionConfig,
-        Phase1MetricEntryView, Phase1ValidateReportView, execute_ops_check_dependency_exceptions,
-        execute_ops_check_no_unsafe_rust_sources, execute_ops_check_perf_regression,
-        extract_bearer_excerpt, extract_secret_assignment_excerpt,
-        line_contains_forbidden_inline_passphrase_flag, parse_bool_value,
-        parse_mktemp_secret_variable, parse_utc_to_unix, phase1_collect_measured_input_from_source,
-        phase1_validate_report, phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
+        Phase1MetricEntryView, Phase1ValidateReportView, UNSAFE_SCAN_ALLOWED_SCOPES,
+        execute_ops_check_dependency_exceptions, execute_ops_check_no_unsafe_rust_sources,
+        execute_ops_check_perf_regression, extract_bearer_excerpt,
+        extract_secret_assignment_excerpt, line_contains_forbidden_inline_passphrase_flag,
+        parse_bool_value, parse_mktemp_secret_variable, parse_utc_to_unix,
+        phase1_collect_measured_input_from_source, phase1_validate_report,
+        phase1_validate_secure_directory, scan_rust_source_text_for_unsafe,
         unsafe_scan_path_is_allowlisted, unsafe_site_has_adjacent_safety_comment,
         verify_member_unsafe_lints, verify_workspace_unsafe_pin, workspace_member_paths,
     };
@@ -3369,7 +3391,9 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_allowlist_matches_exactly_the_two_oi20_scopes() {
+    fn unsafe_allowlist_matches_exactly_the_oi20_scopes() {
+        // Four exact file entries: two precedent scopes, two MC1d mobile FFI files.
+        assert_eq!(UNSAFE_SCAN_ALLOWED_SCOPES.len(), 4);
         assert!(unsafe_scan_path_is_allowlisted(
             "rustynetd/src/macos_utun_helper_unsafe.rs"
         ));
@@ -3386,6 +3410,31 @@ mod tests {
         assert!(!unsafe_scan_path_is_allowlisted(
             "third_party/rustynet-tun/src/lib.rs"
         ));
+        // MC1d: exactly the two mobile FFI files are allowed.
+        assert!(unsafe_scan_path_is_allowlisted(
+            "rustynet-mobile-ffi/src/c_abi.rs"
+        ));
+        assert!(unsafe_scan_path_is_allowlisted(
+            "rustynet-mobile-ffi/src/jni_shim.rs"
+        ));
+        // Negatives: sibling src files, subdirectories, directory-name tricks, build
+        // scripts and tests of the same crate must not match.
+        for not_allowed in [
+            "rustynet-mobile-ffi/src/lib.rs",
+            "rustynet-mobile-ffi/src/panic.rs",
+            "rustynet-mobile-ffi/src/c_abi.rs_x.rs",
+            "rustynet-mobile-ffi/src_evil/x.rs",
+            "rustynet-mobile-ffi/src/sub/x.rs",
+            "rustynet-mobile-ffi/build.rs",
+            "rustynet-mobile-ffi/tests/x.rs",
+            "rustynet-mobile-ffi-evil/src/c_abi.rs",
+            "rustynet-mobile-core/src/lib.rs",
+        ] {
+            assert!(
+                !unsafe_scan_path_is_allowlisted(not_allowed),
+                "{not_allowed} must not be allowlisted"
+            );
+        }
     }
 
     #[test]
