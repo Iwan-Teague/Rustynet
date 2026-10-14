@@ -1,14 +1,22 @@
 use std::io;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod imp {
+    #[cfg(target_os = "linux")]
     use std::ffi::CString;
     use std::fs::File;
     use std::io;
+    #[cfg(target_os = "linux")]
     use std::mem;
-    use std::os::fd::AsRawFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
+    #[cfg(target_os = "linux")]
     use std::os::unix::fs::OpenOptionsExt;
 
+    // Linux only: libc types the ioctl request as `c_ulong` on glibc Linux but as
+    // `c_int` on Android (and on musl), and an Android app never opens
+    // /dev/net/tun itself (the VPN service hands it an already-configured fd:
+    // `from_owned_fd`). The constant therefore stays out of the Android build.
+    #[cfg(target_os = "linux")]
     const TUNSETIFF: libc::c_ulong = 0x400454ca;
 
     pub struct SyncDevice {
@@ -16,6 +24,38 @@ mod imp {
     }
 
     impl SyncDevice {
+        /// Adopt an already-configured TUN file descriptor (for example the one an
+        /// Android `VpnService` returns from `establish()`), taking ownership: the
+        /// descriptor is closed when the `SyncDevice` is dropped. No ioctl is issued
+        /// and the interface is not renamed or reconfigured.
+        ///
+        /// The caller guarantees the descriptor is a TUN device that delivers raw IP
+        /// packets without a packet-information header (`IFF_TUN | IFF_NO_PI` on
+        /// Linux; Android VPN descriptors are expected to behave the same, which is
+        /// UNVERIFIED here and must be proven on a device before relying on it).
+        ///
+        /// Ownership rules for callers: pass a descriptor Rust may close. On Android
+        /// that means a duplicate obtained with `ParcelFileDescriptor.dup()` and then
+        /// `detachFd()`; never also `close()` the `ParcelFileDescriptor` that the
+        /// descriptor came from, or it is closed twice. The descriptor keeps the
+        /// blocking mode it arrives in (an `establish()` fd is typically
+        /// non-blocking); call [`SyncDevice::set_nonblocking`] to choose. Unlike
+        /// `open`, this does not set `O_CLOEXEC`: an Android app process never execs.
+        ///
+        /// `recv` returns `Ok(0)` when the descriptor reports end-of-file (closed
+        /// peer); callers looping on a blocking descriptor must treat that as the end
+        /// and not as an empty packet. `recv` buffers must be at least the tunnel MTU
+        /// (`VpnService.Builder.setMtu`, default 1500).
+        ///
+        /// Returns `io::Result` for API parity with the other platforms (where this is
+        /// unsupported); on Linux and Android it cannot fail.
+        pub fn from_owned_fd(fd: OwnedFd) -> io::Result<Self> {
+            Ok(Self {
+                file: File::from(fd),
+            })
+        }
+
+        #[cfg(target_os = "linux")]
         pub fn open(interface_name: &str) -> io::Result<Self> {
             validate_interface_name(interface_name)?;
 
@@ -93,6 +133,7 @@ mod imp {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn validate_interface_name(interface_name: &str) -> io::Result<()> {
         if interface_name.is_empty() {
             return Err(io::Error::new(
@@ -111,14 +152,66 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
+        use super::SyncDevice;
+        #[cfg(target_os = "linux")]
         use super::validate_interface_name;
+        use std::io::{Read, Write};
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
 
+        // A connected stream socket pair stands in for the tun fd: `from_owned_fd`
+        // must not care what kind of descriptor it adopts (the production caller
+        // guarantees a TUN fd); only safe std APIs are used here so the vendored
+        // unsafe census is unchanged.
+        fn adopted_pair() -> (SyncDevice, UnixStream) {
+            let (a, b) = UnixStream::pair().expect("socketpair");
+            let device = SyncDevice::from_owned_fd(OwnedFd::from(a)).expect("adopt fd");
+            (device, b)
+        }
+
+        #[test]
+        fn adopted_fd_sends_and_receives_through_the_device() {
+            let (device, mut peer) = adopted_pair();
+            assert_eq!(device.send(&[0x45, 1, 2, 3]).expect("send"), 4);
+            let mut got = [0u8; 8];
+            let n = peer.read(&mut got).expect("peer read");
+            assert_eq!(&got[..n], &[0x45, 1, 2, 3]);
+            peer.write_all(&[0x60, 9]).expect("peer write");
+            let mut buf = [0u8; 8];
+            let n = device.recv(&mut buf).expect("recv");
+            assert_eq!(&buf[..n], &[0x60, 9]);
+        }
+
+        #[test]
+        fn adopted_fd_honours_nonblocking_mode() {
+            let (device, _peer) = adopted_pair();
+            device.set_nonblocking(true).expect("nonblocking on");
+            let mut buf = [0u8; 8];
+            let err = device
+                .recv(&mut buf)
+                .expect_err("empty queue must not block");
+            assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        }
+
+        #[test]
+        fn dropping_the_device_closes_the_adopted_fd() {
+            let (device, mut peer) = adopted_pair();
+            peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .expect("read timeout");
+            drop(device);
+            let mut buf = [0u8; 1];
+            // The peer sees EOF only if the adopted fd was really closed.
+            assert_eq!(peer.read(&mut buf).expect("eof read"), 0);
+        }
+
+        #[cfg(target_os = "linux")]
         #[test]
         fn rejects_empty_interface_name() {
             let err = validate_interface_name("").expect_err("empty name should fail");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         }
 
+        #[cfg(target_os = "linux")]
         #[test]
         fn rejects_interface_names_that_exceed_ifnamsiz() {
             let oversized = "a".repeat(libc::IFNAMSIZ);
@@ -142,6 +235,16 @@ mod imp {
     }
 
     impl SyncDevice {
+        /// Not supported on macOS: a utun descriptor needs the address-family
+        /// framing handled by `from_raw_fd`/`open`, which is not the raw-IP contract
+        /// of the Linux/Android constructor. Present for cross-platform callers.
+        pub fn from_owned_fd(_fd: std::os::fd::OwnedFd) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "from_owned_fd is supported only on Linux and Android",
+            ))
+        }
+
         pub fn open(interface_name: &str) -> io::Result<Self> {
             let unit = parse_utun_unit(interface_name)?;
             let fd =
@@ -588,13 +691,20 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
 mod imp {
     use std::io;
 
     pub struct SyncDevice;
 
     impl SyncDevice {
+        pub fn from_owned_fd(_fd: std::os::fd::OwnedFd) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "from_owned_fd is supported only on Linux and Android",
+            ))
+        }
+
         pub fn open(_interface_name: &str) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
