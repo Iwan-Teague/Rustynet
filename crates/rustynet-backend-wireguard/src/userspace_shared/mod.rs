@@ -3,6 +3,13 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+// The test-harness seams hand the backend a socket without the transport
+// protect step. They must never reach an Android build.
+#[cfg(all(target_os = "android", feature = "test-harness"))]
+compile_error!(
+    "the test-harness feature must not be enabled on Android: its test seams bypass transport protection"
+);
+
 use rustynet_backend_api::{
     AuthoritativeTransportIdentity, AuthoritativeTransportResponse, BackendCapabilities,
     BackendError, ExitMode, NodeId, PeerConfig, Route, RuntimeContext, SocketEndpoint,
@@ -17,12 +24,16 @@ use crate::linux_command::{
 pub(crate) mod engine;
 pub(crate) mod handshake;
 mod runtime;
-mod socket;
+// `pub(crate)` so the macOS arm shares the transport provider seam below.
+pub(crate) mod socket;
 mod tun;
 
 use engine::UserspaceEngine;
 use runtime::{RunningUserspaceRuntime, RuntimeControl};
-use socket::AuthoritativeSocket;
+use socket::{
+    AuthoritativeSocket, DefaultSocketProtector, DefaultTransportSocketProvider, SocketProtector,
+    TransportSocketProvider,
+};
 #[cfg(any(test, feature = "test-harness"))]
 use tun::TestTunLifecycle;
 use tun::{DirectTunLifecycle, HelperBackedTunLifecycle, SharedTunLifecycle, TunLifecycle};
@@ -39,6 +50,15 @@ pub struct LinuxUserspaceSharedBackend {
     desired_peers: BTreeMap<NodeId, PeerConfig>,
     desired_routes: Vec<Route>,
     desired_exit_mode: ExitMode,
+    /// Creates the authoritative transport socket on every start. Default on
+    /// Linux, macOS and Windows: the plain bind. Default on every other target:
+    /// refuses (`NotConfigured`), so a build without an injected provider cannot
+    /// bind.
+    transport_provider: Box<dyn TransportSocketProvider>,
+    /// Protects every socket the provider returns, before the backend uses it
+    /// (VpnService on Android). Default on Linux, macOS and Windows accepts
+    /// without a syscall; default on every other target refuses.
+    socket_protector: Box<dyn SocketProtector>,
     #[cfg(any(test, feature = "test-harness"))]
     test_tun_state: Option<tun::TunTestState>,
     /// A socket the caller bound and handed over, used for the FIRST bind.
@@ -47,7 +67,10 @@ pub struct LinuxUserspaceSharedBackend {
     /// `-D warnings` gate invocations, and a top-level `use std::net::UdpSocket`
     /// would be an unused import there. Same reason `test_tun_state` above spells
     /// out `tun::TunTestState`.
-    #[cfg(any(test, feature = "test-harness"))]
+    ///
+    /// Bypasses the transport provider and protector, so it is never compiled
+    /// for Android.
+    #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
     prebound_socket: Option<std::net::UdpSocket>,
 }
 
@@ -124,9 +147,11 @@ impl LinuxUserspaceSharedBackend {
             desired_peers: BTreeMap::new(),
             desired_routes: Vec::new(),
             desired_exit_mode: ExitMode::Off,
+            transport_provider: Box::new(DefaultTransportSocketProvider),
+            socket_protector: Box::new(DefaultSocketProtector),
             #[cfg(any(test, feature = "test-harness"))]
             test_tun_state: None,
-            #[cfg(any(test, feature = "test-harness"))]
+            #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
             prebound_socket: None,
         })
     }
@@ -143,10 +168,25 @@ impl LinuxUserspaceSharedBackend {
     /// Only the first bind is served. A restart or a worker recovery re-enters
     /// `start_runtime` and binds `listen_port` normally, which is what keeps the
     /// same-address-across-restart contract intact.
-    #[cfg(any(test, feature = "test-harness"))]
+    ///
+    /// Bypasses the transport provider and protector, so it is never compiled
+    /// for Android.
+    #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
     #[doc(hidden)]
     pub fn adopt_prebound_socket_for_test(&mut self, socket: std::net::UdpSocket) {
         self.prebound_socket = Some(socket);
+    }
+
+    /// Replace the transport provider and protector. Test-only: lets a test
+    /// hand the runtime a socket it opened, or refuse the protect.
+    #[cfg(test)]
+    fn set_transport_seam_for_test(
+        &mut self,
+        provider: Box<dyn TransportSocketProvider>,
+        protector: Box<dyn SocketProtector>,
+    ) {
+        self.transport_provider = provider;
+        self.socket_protector = protector;
     }
 
     fn ensure_runtime_control(&self) -> Result<&RuntimeControl, BackendError> {
@@ -177,12 +217,20 @@ impl LinuxUserspaceSharedBackend {
     /// second start from the same socket is impossible (it was moved into the
     /// worker thread and dropped with it), and silently reusing a stale handle
     /// would be worse than binding afresh.
+    ///
+    /// Every start that does not adopt a prebound socket opens it through the
+    /// injected transport provider, so the socket the runtime uses is the one
+    /// that provider returned.
     fn acquire_authoritative_socket(&mut self) -> Result<AuthoritativeSocket, BackendError> {
-        #[cfg(any(test, feature = "test-harness"))]
+        #[cfg(all(any(test, feature = "test-harness"), not(target_os = "android")))]
         if let Some(socket) = self.prebound_socket.take() {
             return AuthoritativeSocket::from_bound_socket(socket);
         }
-        AuthoritativeSocket::bind(self.listen_port)
+        AuthoritativeSocket::bind_with_provider(
+            self.listen_port,
+            self.transport_provider.as_ref(),
+            self.socket_protector.as_ref(),
+        )
     }
 
     fn start_runtime(
@@ -191,6 +239,10 @@ impl LinuxUserspaceSharedBackend {
     ) -> Result<RunningUserspaceRuntime, BackendError> {
         let engine =
             UserspaceEngine::from_private_key_file(Path::new(self.private_key_path.as_path()))?;
+        // Ordering (MC1c-2 concern, recorded not changed here): the TUN is prepared
+        // BEFORE the authoritative socket is opened and protected. If the socket
+        // open or protect fails, the TUN is cleaned up on the error path below.
+        // The Android VpnService wiring must be checked against this order.
         let tun_device = self
             .tun_lifecycle
             .prepare_and_open(&self.interface_name, &context)?;
@@ -645,7 +697,8 @@ mod tests {
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -660,6 +713,10 @@ mod tests {
 
     use super::LinuxUserspaceSharedBackend;
     use super::engine::UserspaceEngine;
+    use super::socket::{
+        RefuseAllSocketProtector, SocketProtector, TransportError, TransportFd,
+        TransportSocketProvider, port_is_bindable,
+    };
     use super::tun::{
         TestExitModeBehavior, TestRouteBehavior, TestTunBehavior, TestTunLifecycle,
         TunExitModeMutation, TunRouteMutation, TunRouteMutationKind,
@@ -1153,6 +1210,148 @@ mod tests {
         );
 
         drop(reserved);
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    /// A provider that hands the backend a socket the test reserved. The
+    /// reservation is consumed on the first open. The backend, not the
+    /// provider, protects the socket.
+    struct ReservedSocketProvider {
+        reserved: std::sync::Mutex<Option<UdpSocket>>,
+    }
+
+    impl TransportSocketProvider for ReservedSocketProvider {
+        fn open_transport(
+            &self,
+            _generation: u64,
+            _listen_port: u16,
+        ) -> Result<UdpSocket, TransportError> {
+            self.reserved
+                .lock()
+                .expect("reservation lock")
+                .take()
+                .ok_or_else(|| {
+                    TransportError::Io(std::io::Error::other("reservation already consumed"))
+                })
+        }
+    }
+
+    /// Accepts every protect and counts the calls.
+    struct CountingAcceptProtector {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl SocketProtector for CountingAcceptProtector {
+        fn protect(&self, _fd: TransportFd, _generation: u64) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_protect_refusal_fails_start_closed() {
+        let private_key_path = write_private_key([41; 32]);
+        let (reserved, listen_port) = reserve_listen_port();
+        let tun_lifecycle = TestTunLifecycle::new();
+        let tun_state = tun_lifecycle.state();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        backend.set_transport_seam_for_test(
+            Box::new(ReservedSocketProvider {
+                reserved: std::sync::Mutex::new(Some(reserved)),
+            }),
+            Box::new(RefuseAllSocketProtector),
+        );
+
+        let err = backend
+            .start(runtime_context())
+            .expect_err("a refused protect must fail the start");
+        assert_eq!(err.kind, BackendErrorKind::Internal);
+        assert!(
+            err.message.contains("protect refused"),
+            "the refusal must be named in the error, got: {}",
+            err.message
+        );
+        assert!(backend.authoritative_transport_identity().is_none());
+        assert!(backend.worker_exit_count_for_test().is_none());
+        assert_eq!(
+            tun_state.snapshot().cleanup_calls,
+            1,
+            "a failed socket open must clean up the TUN it prepared"
+        );
+        // The backend dropped the refused socket: nothing holds its port now.
+        assert!(
+            port_is_bindable(listen_port),
+            "the refused socket must be closed"
+        );
+
+        let _ = fs::remove_file(private_key_path);
+    }
+
+    #[test]
+    fn linux_userspace_shared_backend_runs_on_the_socket_the_transport_provider_returned() {
+        // Same identity proof as the adopted-socket test: a datagram buffered in
+        // the provider's socket before start must be ingested by the runtime.
+        // That is only possible if the runtime runs on the provider's socket.
+        let private_key_path = write_private_key([43; 32]);
+        let (reserved, listen_port) = reserve_listen_port();
+
+        let sender = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .expect("sender socket should bind");
+        sender
+            .send_to(b"provider-marker", backend_loopback_addr(listen_port))
+            .expect("marker should be sent to the provider's socket");
+
+        let protects = Arc::new(AtomicUsize::new(0));
+        let tun_lifecycle = TestTunLifecycle::new();
+        let mut backend =
+            backend_with_test_tun_lifecycle(private_key_path.as_path(), listen_port, tun_lifecycle);
+        backend.set_transport_seam_for_test(
+            Box::new(ReservedSocketProvider {
+                reserved: std::sync::Mutex::new(Some(reserved)),
+            }),
+            Box::new(CountingAcceptProtector {
+                calls: Arc::clone(&protects),
+            }),
+        );
+
+        backend
+            .start(runtime_context())
+            .expect("a protected start should succeed");
+        assert_eq!(
+            protects.load(Ordering::SeqCst),
+            1,
+            "the provider must protect the socket exactly once before it is used"
+        );
+        let identity = backend
+            .authoritative_transport_identity()
+            .expect("identity should exist after start");
+        assert_eq!(
+            identity.local_addr,
+            SocketAddr::from(([0, 0, 0, 0], listen_port))
+        );
+
+        let ingress = wait_for(Duration::from_secs(2), || {
+            let recorded = backend
+                .recorded_peer_ciphertext_ingress_for_test()
+                .expect("ingress query should succeed");
+            if recorded
+                .iter()
+                .any(|entry| entry.payload == b"provider-marker")
+            {
+                Some(recorded)
+            } else {
+                None
+            }
+        });
+        assert!(
+            ingress
+                .iter()
+                .any(|entry| entry.payload == b"provider-marker"),
+            "the datagram buffered in the provider's socket must be ingested by the runtime"
+        );
+
+        backend.shutdown().expect("shutdown should succeed");
         let _ = fs::remove_file(private_key_path);
     }
 
