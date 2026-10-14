@@ -9,6 +9,9 @@ description = "Boringtun userspace WireGuard backend for Rustynet"
 [dependencies]
 rustynet-backend-api = { path = "../rustynet-backend-api" }
 rustynet-backend-wireguard = { path = "../rustynet-backend-wireguard" }
+# Already in the workspace lockfile (used by rustynet-backend-api and the
+# wireguard backend): carries the Android in-memory key into `new_android`.
+zeroize = "1"
 
 [dev-dependencies]
 base64 = "0.22"

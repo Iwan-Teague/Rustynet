@@ -39,8 +39,12 @@ mod imp {
         /// `detachFd()`; never also `close()` the `ParcelFileDescriptor` that the
         /// descriptor came from, or it is closed twice. The descriptor keeps the
         /// blocking mode it arrives in (an `establish()` fd is typically
-        /// non-blocking); call [`SyncDevice::set_nonblocking`] to choose. Unlike
-        /// `open`, this does not set `O_CLOEXEC`: an Android app process never execs.
+        /// non-blocking); call [`SyncDevice::set_nonblocking`] to choose. This
+        /// function does not change the close-on-exec flag: the descriptor keeps
+        /// the flag it arrives with. `ParcelFileDescriptor.dup()` on Android API 29
+        /// and later returns a close-on-exec descriptor, but this function does not
+        /// rely on that, because an app process can exec. Do not assume an Android
+        /// app never execs (MN3-11).
         ///
         /// `recv` returns `Ok(0)` when the descriptor reports end-of-file (closed
         /// peer); callers looping on a blocking descriptor must treat that as the end
@@ -53,6 +57,18 @@ mod imp {
             Ok(Self {
                 file: File::from(fd),
             })
+        }
+
+        /// Android has no open-by-name path for an app: the VPN service configures
+        /// the interface and hands the core a descriptor, which is adopted with
+        /// [`SyncDevice::from_owned_fd`]. Refused here so a caller that tries to
+        /// open by name fails loudly instead of silently.
+        #[cfg(target_os = "android")]
+        pub fn open(_interface_name: &str) -> io::Result<Self> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "SyncDevice::open is not supported on Android: adopt the VpnService descriptor with from_owned_fd",
+            ))
         }
 
         #[cfg(target_os = "linux")]

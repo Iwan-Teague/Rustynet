@@ -27,7 +27,7 @@ use rustynet_backend_api::{
     SocketEndpoint, TunnelBackend, TunnelStats,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use rustynet_backend_wireguard::LinuxUserspaceSharedBackend;
 
 #[cfg(target_os = "macos")]
@@ -40,11 +40,11 @@ use rustynet_backend_wireguard::MacosUserspaceSharedBackend;
 /// On other platforms every mutating call returns a `BackendError::internal`
 /// with a platform-unavailable message.
 pub struct UserspaceBackend {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     inner: LinuxUserspaceSharedBackend,
     #[cfg(target_os = "macos")]
     inner: MacosUserspaceSharedBackend,
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
     _marker: (),
 }
 
@@ -75,7 +75,14 @@ impl UserspaceBackend {
                 MacosUserspaceSharedBackend::new(interface_name, private_key_path, listen_port)?;
             Ok(Self { inner })
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(target_os = "android")]
+        {
+            let _ = (interface_name, private_key_path, listen_port);
+            Err(BackendError::internal(
+                "UserspaceBackend::new is not available on Android: the WireGuard key and the tunnel descriptor arrive in memory through UserspaceBackend::new_android",
+            ))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = (interface_name, private_key_path, listen_port);
             Err(BackendError::internal(
@@ -83,9 +90,29 @@ impl UserspaceBackend {
             ))
         }
     }
+
+    /// Android constructor. The static key is handed in memory and the tunnel
+    /// descriptor is adopted from the VPN service, taken once. No key path is
+    /// read (N4/N27). Start fails closed until the VPN protect seam is injected
+    /// (MC1e), because the default transport socket provider refuses on Android.
+    #[cfg(target_os = "android")]
+    pub fn new_android(
+        interface_name: impl Into<String>,
+        private_key: Box<zeroize::Zeroizing<[u8; 32]>>,
+        listen_port: u16,
+        tun_fd: rustynet_backend_api::TunFdHandoff,
+    ) -> Result<Self, BackendError> {
+        let inner = LinuxUserspaceSharedBackend::new_adopted(
+            interface_name,
+            private_key,
+            listen_port,
+            tun_fd,
+        )?;
+        Ok(Self { inner })
+    }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
 fn platform_unavailable() -> BackendError {
     BackendError::internal("UserspaceBackend is only available on Linux and macOS")
 }
@@ -96,11 +123,11 @@ impl TunnelBackend for UserspaceBackend {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.capabilities()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         BackendCapabilities {
             supports_roaming: false,
             supports_exit_nodes: false,
@@ -112,11 +139,11 @@ impl TunnelBackend for UserspaceBackend {
     }
 
     fn start(&mut self, context: RuntimeContext) -> Result<(), BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.start(context)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = context;
             Err(platform_unavailable())
@@ -124,11 +151,11 @@ impl TunnelBackend for UserspaceBackend {
     }
 
     fn configure_peer(&mut self, peer: PeerConfig) -> Result<(), BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.configure_peer(peer)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = peer;
             Err(platform_unavailable())
@@ -140,11 +167,11 @@ impl TunnelBackend for UserspaceBackend {
         node_id: &NodeId,
         endpoint: SocketEndpoint,
     ) -> Result<(), BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.update_peer_endpoint(node_id, endpoint)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = (node_id, endpoint);
             Err(platform_unavailable())
@@ -155,11 +182,11 @@ impl TunnelBackend for UserspaceBackend {
         &self,
         node_id: &NodeId,
     ) -> Result<Option<SocketEndpoint>, BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.current_peer_endpoint(node_id)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = node_id;
             Err(platform_unavailable())
@@ -170,11 +197,11 @@ impl TunnelBackend for UserspaceBackend {
         &mut self,
         node_id: &NodeId,
     ) -> Result<Option<u64>, BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.peer_latest_handshake_unix(node_id)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = node_id;
             Err(platform_unavailable())
@@ -182,11 +209,11 @@ impl TunnelBackend for UserspaceBackend {
     }
 
     fn remove_peer(&mut self, node_id: &NodeId) -> Result<(), BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.remove_peer(node_id)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = node_id;
             Err(platform_unavailable())
@@ -194,11 +221,11 @@ impl TunnelBackend for UserspaceBackend {
     }
 
     fn apply_routes(&mut self, routes: Vec<Route>) -> Result<(), BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.apply_routes(routes)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = routes;
             Err(platform_unavailable())
@@ -206,11 +233,11 @@ impl TunnelBackend for UserspaceBackend {
     }
 
     fn set_exit_mode(&mut self, mode: ExitMode) -> Result<(), BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.set_exit_mode(mode)
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         {
             let _ = mode;
             Err(platform_unavailable())
@@ -218,20 +245,20 @@ impl TunnelBackend for UserspaceBackend {
     }
 
     fn stats(&self) -> Result<TunnelStats, BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.stats()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         Err(platform_unavailable())
     }
 
     fn shutdown(&mut self) -> Result<(), BackendError> {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "android"))]
         {
             self.inner.shutdown()
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "android")))]
         Err(platform_unavailable())
     }
 }

@@ -10,12 +10,16 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+#[cfg(not(target_os = "android"))]
 use std::fs;
+#[cfg(not(target_os = "android"))]
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(not(target_os = "android"))]
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(not(target_os = "android"))]
 use base64::prelude::*;
 use boringtun::noise::{Packet, Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
@@ -337,8 +341,13 @@ impl UserspaceEngine {
     /// On-disk bound for the base64 private-key file. Checked at READ time so
     /// an oversized or special-file path cannot drive unbounded allocation
     /// before the decoder rejects the content.
+    #[cfg(not(target_os = "android"))]
     pub(crate) const MAX_PRIVATE_KEY_FILE_BYTES: u64 = 4096;
 
+    /// Key-file loader. Compiled out of every Android build (N4/N27): on Android
+    /// the WireGuard static key arrives from memory only, through
+    /// [`Self::from_private_key_bytes`], and never from a path.
+    #[cfg(not(target_os = "android"))]
     pub(crate) fn from_private_key_file(path: &Path) -> Result<Self, BackendError> {
         // Secret-material hygiene: the on-disk base64 blob and the decoded 32-byte
         // scalar are WireGuard static private key material. Wrap intermediates in
@@ -419,11 +428,20 @@ impl UserspaceEngine {
         Self::from_validated_private_key(&private_key, "in-memory key bytes")
     }
 
+    /// Borrowing form of [`Self::from_private_key_bytes`], for a key the Android
+    /// backend keeps for its whole life. The key is read in place, so a start does
+    /// not move or duplicate it in the backend. The caller's buffer is wiped when
+    /// the backend drops.
+    #[cfg(all(unix, any(target_os = "android", test)))]
+    pub(crate) fn from_private_key_borrowed(private_key: &[u8; 32]) -> Result<Self, BackendError> {
+        Self::from_validated_private_key(private_key, "in-memory key bytes")
+    }
+
     /// Shared tail of both constructors. `source` is a plain label naming
     /// where the key came from; it appears only in the refusal message, and
     /// the key bytes are never formatted.
     fn from_validated_private_key(
-        private_key: &Zeroizing<[u8; 32]>,
+        private_key: &[u8; 32],
         source: &str,
     ) -> Result<Self, BackendError> {
         // CRY-06 convention (mirrors rustynet-crypto's WeakMaterial rejects):
@@ -435,7 +453,7 @@ impl UserspaceEngine {
                 "userspace-shared private key is degenerate (all zeros) for {source}; refusing to load weak key material"
             )));
         }
-        let mut private_key_bytes: [u8; 32] = **private_key;
+        let mut private_key_bytes: [u8; 32] = *private_key;
 
         let local_static_private = StaticSecret::from(private_key_bytes);
         private_key_bytes.zeroize();
@@ -1585,6 +1603,7 @@ mod tests {
         assert_eq!(tracker.rttvar_ms, Some(35)); // 0.75*20 + 0.25*80
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn inbound_dispatch_uses_receiver_index_independent_of_source_address() {
         use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
@@ -1668,6 +1687,7 @@ mod tests {
         assert!(engine.find_node_id_by_receiver_index(&init).is_none());
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn outbound_peer_selection_prefers_longest_prefix_over_exit_default_route() {
         use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
@@ -1730,6 +1750,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn peer_path_quality_accessor_dedupes_by_handshake_advance() {
         use rustynet_backend_api::{NodeId, PathHealth, PeerConfig, SocketEndpoint};
@@ -1806,6 +1827,7 @@ mod tests {
     /// an existing peer reported `Replaced`, each pass built a fresh `Tunn` and
     /// the runtime cleared that peer's handshake telemetry, so liveness read
     /// permanently dead on nodes that were passing traffic.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn reconfiguring_an_identical_peer_is_unchanged_and_keeps_the_session() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1860,6 +1882,7 @@ mod tests {
     /// value at the boundary the defect lived at: the config the engine is given
     /// is the config it must not drop. Mutating the argument back to `None`
     /// fails `keepalive_is_not_dropped_when_configuring_a_peer` below.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn peer_config_carries_its_keepalive_into_the_engine() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1894,6 +1917,7 @@ mod tests {
     /// the flap block lifted, the re-race supplied fresh endpoints; while each
     /// one rebuilt the tunnel, the handshake record was wiped as fast as a
     /// handshake could write it, so recovery could never be observed.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn endpoint_only_change_moves_the_peer_and_keeps_its_session() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1939,6 +1963,7 @@ mod tests {
 
     /// The other half: material that ACTUALLY changed must still rebuild, so a
     /// stale handshake timestamp can never be carried onto a new session.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn changed_peer_material_still_reports_replaced() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1999,6 +2024,7 @@ mod tests {
     /// ANY change must classify the configure as a full `Replaced` rebuild —
     /// never `Unchanged` and never `EndpointMoved` — while an identical PSK
     /// (with everything else identical) stays `Unchanged`.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn preshared_key_change_classifies_as_replaced_not_unchanged_or_moved() {
         use rustynet_backend_api::PresharedKey;
@@ -2068,6 +2094,7 @@ mod tests {
     /// (`None` everywhere) the engine's decisions are exactly the pre-S5
     /// dispositions, and an all-`None` workload never records a PSK re-key
     /// classification — S5 must be inert unless a PSK actually changes.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn psk_none_workload_keeps_pre_s5_dispositions_and_classifies_nothing() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2128,6 +2155,7 @@ mod tests {
     /// classification naming the peer; an ordinary (public-key-only) rebuild
     /// records NONE, so the hardened-rollout signal stays distinct from
     /// generic re-configure noise.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn preshared_key_rebuild_records_loud_classification() {
         use super::PresharedKeyRekeyChange;
@@ -2336,6 +2364,7 @@ mod tests {
 
     /// Engine peer-state Debug carries PRESENCE only (`has_preshared_key`),
     /// never the bytes, and the default configure path is None.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn engine_peer_state_debug_reports_psk_presence_only() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2396,6 +2425,7 @@ mod tests {
     /// full three-message handshake and a data frame round-trip; a
     /// counterpart WITHOUT it (profile mismatch) fails at msg2, exactly the
     /// pair-scoped condition F9 classifies.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn preshared_key_reaches_tunnel_construction_and_gates_handshake() {
         use boringtun::noise::{Tunn, TunnResult};
@@ -2557,6 +2587,7 @@ mod tests {
         node_id
     }
 
+    #[cfg(not(target_os = "android"))]
     fn fresh_engine(seed: u8) -> UserspaceEngine {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("wg.key");
@@ -2567,6 +2598,7 @@ mod tests {
         UserspaceEngine::from_private_key_file(&path).expect("engine")
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_high_then_low() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2600,6 +2632,7 @@ mod tests {
         let _ = peer_b;
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_endpoint_resolves_to_lowest_node_id_insertion_order_low_then_high() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2632,6 +2665,7 @@ mod tests {
         assert!(engine.has_endpoint(shared_endpoint));
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_endpoint_removal_of_winner_promotes_next_lowest_node_id() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2705,6 +2739,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn update_peer_endpoint_moves_peer_between_reverse_index_entries() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2744,6 +2779,7 @@ mod tests {
         assert_eq!(engine.find_node_id_by_endpoint(endpoint_2), Some(peer));
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn reconfiguring_existing_peer_at_new_endpoint_unlinks_the_old_endpoint() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2777,6 +2813,7 @@ mod tests {
     // answer for `has_endpoint`, same absence after the last sharer is
     // removed. This is the invariant the fail-closed
     // `reject_round_trip_target` check and inbound dispatch both stand on.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn endpoint_index_agrees_with_linear_scan_reference_under_random_mutations() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -2895,6 +2932,7 @@ mod tests {
     // nothing, and dispatch must degrade (never panic) if the map ever
     // named a peer with no live state.
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn stale_receiver_index_after_rebuild_is_not_attributed() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -2984,6 +3022,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn removed_peer_receiver_index_entry_is_gone() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3029,6 +3068,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn duplicate_tunnel_index_collision_refusal_is_a_clean_no_op() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3102,6 +3142,7 @@ mod tests {
     // is internal corruption; the packet path must fail closed on it in
     // EVERY build — drop and count, no endpoint re-attribution, no panic or
     // assertion — because a panic kills the engine's worker thread.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn receiver_index_dispatch_never_panics_on_divergence() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3173,6 +3214,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn receiver_index_agrees_with_peer_states_under_random_mutations() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3346,6 +3388,7 @@ mod tests {
 
     // ---- from_private_key_file: key-material loading ----
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_loads_valid_32_byte_key() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3355,6 +3398,7 @@ mod tests {
         UserspaceEngine::from_private_key_file(&path).expect("valid key must load");
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_tolerates_trailing_whitespace() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3366,6 +3410,7 @@ mod tests {
         UserspaceEngine::from_private_key_file(&path).expect("key with newline must load");
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_rejects_missing_file() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3376,6 +3421,7 @@ mod tests {
         assert!(err.message.contains("open failed"), "got {:?}", err.message);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_rejects_invalid_base64() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3391,6 +3437,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_file_rejects_wrong_key_length() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3425,6 +3472,7 @@ mod tests {
     const RFC7748_ALICE_PUBLIC_HEX: &str =
         "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a";
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_bytes_matches_rfc7748_known_answer_for_both_constructors() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3446,6 +3494,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_bytes_derives_same_public_key_as_file_loader() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3465,6 +3514,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn from_private_key_bytes_rejects_all_zero_secret_like_file_loader() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3698,6 +3748,7 @@ mod tests {
         assert!(sink.events.is_empty());
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn drive_inbound_result_flushes_deferred_plaintext_after_the_follow_up_drain() {
         use boringtun::noise::TunnResult;
@@ -3747,6 +3798,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn drive_inbound_result_with_initial_err_emits_nothing_and_stays_ok() {
         use boringtun::noise::TunnResult;
@@ -3785,6 +3837,7 @@ mod tests {
     /// turns writing into ONE long-lived engine buffer, so each initiation
     /// must emit a complete, valid, fixed-size handshake message with no
     /// stale bytes from the previous writer's message.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn initiate_handshake_reuses_engine_scratch_with_byte_identical_output() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -3933,6 +3986,7 @@ mod tests {
     /// keepalive (32 bytes, shorter than everything before it) is driven
     /// through `update_peer_timers` over a scratch still holding the 65 KiB
     /// max frame, and the counterpart must accept it.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn shared_scratch_roundtrips_handshake_then_variable_length_frames() {
         use boringtun::noise::{Tunn, TunnResult};
@@ -4105,6 +4159,7 @@ mod tests {
     /// 65 535 + 32 lands exactly on `MAX_ENCRYPTED_PACKET_BYTES` — the fix has
     /// zero slack, so a future regression that shrinks the drain buffer fails
     /// here rather than in the field.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn follow_up_drain_encapsulates_a_max_size_queued_frame_without_panicking() {
         use boringtun::noise::{Tunn, TunnResult};
@@ -4209,6 +4264,7 @@ mod tests {
     /// once the session comes up. `decrypt_scratch` stays at the decrypted
     /// bound and must not be "helpfully" raised or the reverse — both are
     /// asserted here so neither can drift on its own.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn follow_up_drain_scratch_holds_the_encrypt_ceiling_not_the_decrypt_one() {
         let engine = fresh_engine(12);
@@ -4290,6 +4346,7 @@ mod tests {
     }
 
     impl RekeyFixture {
+        #[cfg(not(target_os = "android"))]
         fn new() -> Self {
             use boringtun::x25519::{PublicKey, StaticSecret};
 
@@ -4653,6 +4710,7 @@ mod tests {
     /// Deterministic: boringtun runs on the mock clock under the workspace
     /// gate (`boringtun-mock-instant`), moved by `advance_engine_clock`; no
     /// sleeps.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn rekey_after_time_emits_new_initiation_and_counterpart_completes_it() {
         let _mock_clock_guard = mock_clock_test_lease();
@@ -4691,6 +4749,7 @@ mod tests {
     /// engine's subsequent frames must name the NEW session's index (never
     /// the old one) and the counterpart must still decrypt them
     /// byte-identically — traffic keeps flowing across the rekey.
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn rekeyed_session_replaces_keypair_and_traffic_still_flows() {
         let _mock_clock_guard = mock_clock_test_lease();

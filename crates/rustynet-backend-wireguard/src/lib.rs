@@ -7,6 +7,7 @@ mod linux_command;
 mod macos_command;
 mod udp_offload_probe;
 mod userspace_shared;
+#[cfg(not(target_os = "android"))]
 mod userspace_shared_macos;
 mod windows_command;
 
@@ -27,6 +28,7 @@ pub use udp_offload_probe::{
     OffloadSupport, UdpOffloadCapabilities, probe_udp_offload_capabilities,
 };
 pub use userspace_shared::LinuxUserspaceSharedBackend;
+#[cfg(not(target_os = "android"))]
 pub use userspace_shared_macos::MacosUserspaceSharedBackend;
 /// Closure type for opening a macOS utun device via the privileged helper.
 #[cfg(target_os = "macos")]

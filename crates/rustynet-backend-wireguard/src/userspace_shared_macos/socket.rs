@@ -56,6 +56,9 @@ fn macos_transport_error(err: TransportError, bind_addr: SocketAddr) -> BackendE
         TransportError::ProtectDenied { generation } => BackendError::internal(format!(
             "macos userspace-shared authoritative UDP socket protect refused on {bind_addr} for transport generation {generation}"
         )),
+        TransportError::ConnectednessUnknown(err) => BackendError::internal(format!(
+            "macos userspace-shared authoritative UDP socket connectedness could not be verified on {bind_addr}: {err}"
+        )),
     }
 }
 
@@ -100,7 +103,7 @@ impl AuthoritativeSocket {
     ) -> Result<Self, BackendError> {
         // NOTE: `transport_generation` is the generation the socket was protected
         // under. Trusting a bare fd needs the live (fd, generation) registry that
-        // MC1c-2 must add; none exists yet.
+        // MC1e must add; none exists in MC1c-2.
         socket.set_nonblocking(true).map_err(|err| {
             BackendError::internal(format!(
                 "macos userspace-shared authoritative UDP socket nonblocking setup failed on {bind_addr}: {err}"

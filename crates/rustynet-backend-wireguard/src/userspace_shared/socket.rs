@@ -52,14 +52,15 @@ pub(crate) fn transport_fd(socket: &UdpSocket) -> TransportFd {
 /// honours; a stale or foreign generation must be refused. `false` means the
 /// protect was refused or timed out.
 ///
-/// Requirements on the MC1c-2 (Android) protector. Not implemented in this slice:
+/// Requirements on the MC1e (Android) protector. Not implemented in MC1c-2, which has no
+/// injection seam, so nothing can be protected yet:
 /// - It must protect a DUPLICATE of `fd` that native code closes after the call
 ///   returns, including after a timeout. The backend drops its own socket on
 ///   `false`, so the backend cannot keep `fd` alive for the native call.
 /// - It must not retain `fd` after returning.
 /// - fd numbers are reused after close (ABA). A live (fd, generation) registry
-///   is REQUIRED before a protector may trust a bare fd. No such registry exists
-///   in this slice.
+///   is REQUIRED before a protector may trust a bare fd. MC1e owns it; no such
+///   registry exists in MC1c-2.
 pub(crate) trait SocketProtector: Send + Sync {
     fn protect(&self, fd: TransportFd, generation: u64) -> bool;
 }
@@ -70,8 +71,8 @@ pub(crate) trait SocketProtector: Send + Sync {
 /// protected by [`open_protected_transport`] before the socket can be used. The
 /// socket must be bound to the unspecified address (`0.0.0.0` / `::`).
 ///
-/// Not done in this slice, and required for MC1c-2: a public injection seam and
-/// a re-export through `rustynet-backend-userspace`.
+/// Not done in MC1c-2. MC1e owns the public injection seam and its re-export
+/// through `rustynet-backend-userspace`.
 pub(crate) trait TransportSocketProvider: Send + Sync {
     fn open_transport(
         &self,
@@ -105,6 +106,10 @@ pub(crate) enum TransportError {
     ProtectDenied { generation: u64 },
     /// The OS refused to create the socket.
     Io(std::io::Error),
+    /// The connectedness check itself failed with an OS error other than
+    /// `NotConnected`. The socket cannot be shown to be unconnected, so it is
+    /// refused. This is not a bind failure (N5).
+    ConnectednessUnknown(std::io::Error),
 }
 
 /// Default provider.
@@ -181,7 +186,7 @@ pub(crate) fn open_protected_transport(
     match socket.peer_addr() {
         Ok(_) => return Err(TransportError::Connected),
         Err(err) if err.kind() == ErrorKind::NotConnected => {}
-        Err(err) => return Err(TransportError::Io(err)),
+        Err(err) => return Err(TransportError::ConnectednessUnknown(err)),
     }
     let local = socket.local_addr().map_err(TransportError::Io)?;
     if !local.ip().is_unspecified() {
@@ -203,6 +208,9 @@ fn linux_transport_error(err: TransportError, bind_addr: SocketAddr) -> BackendE
     match err {
         TransportError::Io(err) => BackendError::internal(format!(
             "linux userspace-shared authoritative UDP socket bind failed on {bind_addr}: {err}"
+        )),
+        TransportError::ConnectednessUnknown(err) => BackendError::internal(format!(
+            "linux userspace-shared authoritative UDP socket connectedness could not be verified on {bind_addr}: {err}"
         )),
         TransportError::NotConfigured => BackendError::internal(format!(
             "linux userspace-shared authoritative UDP socket transport provider is not configured; refusing to bind {bind_addr}"
@@ -227,9 +235,9 @@ pub(crate) struct AuthoritativeSocket {
     socket: UdpSocket,
     /// The generation the socket was protected under.
     ///
-    /// A live (fd, generation) registry is REQUIRED in MC1c-2 before a protector
-    /// may trust a bare fd, because fd numbers are reused after close (ABA). No
-    /// such registry exists in this slice.
+    /// A live (fd, generation) registry is REQUIRED before a protector may trust
+    /// a bare fd, because fd numbers are reused after close (ABA). MC1e owns it;
+    /// no such registry exists in MC1c-2.
     transport_generation: u64,
     // Resolved once at bind: the bound address is immutable for the socket's
     // lifetime, and `local_addr` sits on the per-datagram hot path — caching
@@ -493,8 +501,20 @@ impl SocketProtector for RefuseAllSocketProtector {
 /// like. `false` means something still holds it. The probe's own socket is
 /// dropped at once. Test-only.
 #[cfg(test)]
-pub(crate) fn port_is_bindable(port: u16) -> bool {
-    UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).is_ok()
+pub(crate) fn port_released_within_budget(port: u16) -> bool {
+    // A single probe races the parallel tests that bind ephemeral ports (N3): a
+    // port freed here can be taken by another test in the gap. Polling bounds
+    // that race; a port held for the whole budget still reads as held.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], port))).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 #[cfg(test)]
@@ -658,6 +678,29 @@ mod tests {
     }
 
     #[test]
+    fn connectedness_check_failure_is_not_reported_as_a_bind_failure() {
+        // N5: an OS error from the connectedness probe is a different fault from a
+        // failed bind, and the message must not say the bind failed.
+        let addr = SocketAddr::from(([0, 0, 0, 0], 4000));
+        let err = linux_transport_error(
+            TransportError::ConnectednessUnknown(Error::other("probe refused")),
+            addr,
+        );
+        assert_eq!(err.kind, rustynet_backend_api::BackendErrorKind::Internal);
+        assert!(
+            err.message
+                .contains("connectedness could not be verified on 0.0.0.0:4000"),
+            "the probe failure must be named as such, got: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("bind failed"),
+            "a probe failure must not be labelled a bind failure, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn protect_refusal_closes_the_socket_and_fails_the_bind_closed() {
         let provider = LoopbackProvider::new(FakeMode::Plain);
         let err = AuthoritativeSocket::bind_with_provider(0, &provider, &RefuseAllSocketProtector)
@@ -671,7 +714,7 @@ mod tests {
         assert_eq!(provider.opens(), 1);
         // The backend dropped the socket before returning: nothing holds the port.
         assert!(
-            port_is_bindable(provider.port()),
+            port_released_within_budget(provider.port()),
             "the refused socket must be closed"
         );
     }
@@ -689,9 +732,12 @@ mod tests {
             "protect must run once, on this socket's fd, under the generation it reports"
         );
         // Control: while the socket is open, its port cannot be bound again.
-        assert!(
-            !port_is_bindable(provider.port()),
-            "an open socket must hold its port"
+        assert_eq!(
+            UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0], provider.port())))
+                .err()
+                .map(|err| err.kind()),
+            Some(ErrorKind::AddrInUse),
+            "an open socket must hold its port (AddrInUse while open)"
         );
 
         let receiver = UdpSocket::bind("127.0.0.1:0").expect("receiver bind");
@@ -747,7 +793,7 @@ mod tests {
             "the protector panic must propagate, not turn into a usable socket"
         );
         assert!(
-            port_is_bindable(provider.port()),
+            port_released_within_budget(provider.port()),
             "the socket must be dropped during the unwind"
         );
     }
@@ -764,7 +810,7 @@ mod tests {
             "the port mismatch must be named, got: {}",
             err.message
         );
-        assert!(port_is_bindable(provider.port()));
+        assert!(port_released_within_budget(provider.port()));
     }
 
     #[test]
@@ -778,7 +824,7 @@ mod tests {
             "the connected socket must be named, got: {}",
             err.message
         );
-        assert!(port_is_bindable(provider.port()));
+        assert!(port_released_within_budget(provider.port()));
     }
 
     #[test]
@@ -792,7 +838,7 @@ mod tests {
             "the non-wildcard address must be named, got: {}",
             err.message
         );
-        assert!(port_is_bindable(provider.port()));
+        assert!(port_released_within_budget(provider.port()));
     }
 
     #[test]

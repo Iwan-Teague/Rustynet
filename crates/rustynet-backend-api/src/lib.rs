@@ -156,6 +156,37 @@ impl fmt::Debug for PresharedKey {
     }
 }
 
+/// A tunnel descriptor handed to the core by the platform (on Android, the
+/// descriptor the VPN service established, duplicated and detached). The
+/// handoff owns the descriptor: an adopting backend takes it once, and dropping
+/// an unadopted handoff closes it. Only std types appear here, so no third-party
+/// type crosses the backend boundary through this seam.
+#[cfg(unix)]
+pub struct TunFdHandoff(std::os::fd::OwnedFd);
+
+#[cfg(unix)]
+impl TunFdHandoff {
+    /// Take ownership of a tunnel descriptor. The caller must pass a descriptor
+    /// the core may close; see the platform notes for each target.
+    pub fn new(fd: std::os::fd::OwnedFd) -> Self {
+        Self(fd)
+    }
+
+    /// Give up the descriptor to the adopting backend.
+    pub fn into_owned_fd(self) -> std::os::fd::OwnedFd {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Debug for TunFdHandoff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The descriptor number is not printed: it is not secret, but a log line
+        // must not suggest the handoff can be reused by number.
+        f.debug_struct("TunFdHandoff").finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
     pub node_id: NodeId,

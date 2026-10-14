@@ -10,12 +10,12 @@
 //!   is closed. The caller still owns the integer and must close it if it is its own.
 //! - `fd >= 3`: ownership transfers to this call on every outcome. The descriptor is
 //!   closed exactly once when the call returns, including after a caught panic. The
-//!   caller must not close it. While the engine is unwired (MC1c-2) the outcome is
+//!   caller must not close it. While the engine is unwired (until MC1e) the outcome is
 //!   `Unsupported`.
 //!
-//! Requirement for MC1c-2 (not implemented here): a second adoption of the same integer
-//! must be refused by started-state, because the second call would close a descriptor
-//! number that may have been reused.
+//! Requirement for MC1e (not implemented in MC1c-2 or MC1d): a second adoption of the same
+//! integer must be refused by started-state, because the second call would close a
+//! descriptor number that may have been reused.
 //!
 //! The native shell never closes a descriptor it has passed here. The JNI shim follows
 //! that rule (see `jni_shim`).
@@ -39,7 +39,7 @@ pub enum MobileStatus {
     Ok = 0,
     /// A negative descriptor was passed. Nothing was owned and nothing was closed.
     InvalidArgument = 1,
-    /// The operation is not available in this build. The engine arrives in MC1c-2.
+    /// The operation is not available in this build. The engine arrives in MC1e.
     Unsupported = 2,
     /// A panic was caught at the boundary. It never crossed the C ABI.
     PanicCaught = 3,
@@ -84,13 +84,13 @@ pub extern "C" fn rn_mobile_abi_version() -> u32 {
 ///
 /// What the caller must do after each status:
 /// - `Unsupported`, `PanicCaught`: Rust has closed the descriptor. The caller must not
-///   close or use it. (This export never returns `Ok`: the engine is unwired until MC1c-2.)
+///   close or use it. (This export never returns `Ok`: the engine is unwired until MC1e.)
 /// - `InvalidArgument` (negative `fd`) and `StdioNotAdopted` (`fd` 0..=2): nothing was
 ///   transferred. The caller still owns the integer and must close it if it is its own.
 ///
 /// Passing a descriptor still owned elsewhere can close a descriptor that is in use.
-/// Double adoption of one fd stays possible until MC1c-2 (started-state refusal is an
-/// MC1c-2 requirement, not implemented in this build). Kotlin must never call start twice.
+/// Double adoption of one fd stays possible until MC1e (started-state refusal is an
+/// MC1e requirement, not implemented in this build). Kotlin must never call start twice.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
 // SAFETY: this export has the `# Safety` contract above. The body only forwards `fd`
@@ -135,7 +135,7 @@ unsafe fn start_raw_fd(fd: i32) -> MobileStatus {
     // this function, including a panic raised below and caught by the guard.
     let _adopted = adopted;
     injection_point("start");
-    // The engine is unwired (MC1c-2), so every path releases the descriptor by drop.
+    // The engine is unwired (until MC1e), so every path releases the descriptor by drop.
     MobileStatus::Unsupported
 }
 

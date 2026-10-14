@@ -1524,6 +1524,7 @@ dependencies = [
  "rustynet-backend-api",
  "rustynet-backend-wireguard",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]

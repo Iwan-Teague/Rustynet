@@ -5,7 +5,7 @@
 //! (`jni_shim`). The shim forwards to the C ABI and holds no logic.
 //!
 //! `rn_mobile_start_raw_fd` is `unsafe extern "C"`. It adopts the integer descriptor into
-//! an `OwnedFd` and returns `Unsupported`, because the engine is not wired until MC1c-2.
+//! an `OwnedFd` and returns `Unsupported`, because the engine is not wired until MC1e.
 //! Panics never cross the C ABI. The crate needs `panic = "unwind"`, which the check
 //! below enforces.
 //!
@@ -23,9 +23,9 @@
 //!   leaves the integer with the caller, which must close it if it is the caller's own.
 //!   After any other status, the descriptor has been closed by Rust, and the caller must
 //!   not close it.
-//! - MC1c-2 requirement (not implemented here). A second adoption of the same integer must
-//!   be refused by started-state. The MC1d skeleton returns `Unsupported` before any
-//!   state exists.
+//! - MC1e requirement (not implemented in MC1c-2 or MC1d). A second adoption of the same
+//!   integer must be refused by started-state. The MC1d skeleton returns `Unsupported`
+//!   before any state exists.
 //! - Every export runs its body under `catch_unwind`. A panic becomes `PanicCaught` (or 0
 //!   for the ABI version), and the payload is neither printed nor dropped inside the guard.
 

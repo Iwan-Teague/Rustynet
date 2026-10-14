@@ -1541,6 +1541,7 @@ mod tests {
         SharedTunLifecycle, TestTunLifecycle, TunDevice, TunTestState,
     };
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_authoritative_socket_poll_is_budgeted_per_tick() {
         let (mut state, _tun_state, _private_key) = test_runtime_state("rn-test0");
@@ -1603,6 +1604,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_tun_poll_is_budgeted_per_tick() {
         let (mut state, tun_state, _private_key) = test_runtime_state("rn-test1");
@@ -1638,6 +1640,7 @@ mod tests {
     // when the peer's material genuinely changed, so a stale timestamp can
     // never be carried onto a new session and make `handshake_fresh` lie.
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_peer_timer_tick_survives_firewalled_egress() {
         // Live incident 2026-08-26 (live_network_flap_validation): an nft
@@ -1710,6 +1713,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_worker_exit_cause_surfaces_in_control_errors() {
         // 2026-08-26: the worker died on a firewalled send and the CAUSE was
@@ -1772,6 +1776,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_identical_reconfigure_keeps_recorded_handshake() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1807,6 +1812,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_endpoint_only_reconfigure_keeps_recorded_handshake_and_moves_the_peer() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1851,6 +1857,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_replaced_peer_material_clears_recorded_handshake() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -1895,6 +1902,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "android"))]
     fn test_runtime_state(
         interface_name: &str,
     ) -> (RuntimeState, TunTestState, tempfile::NamedTempFile) {
@@ -1954,6 +1962,7 @@ mod tests {
     // the old linear `peer_states` scan. This test pins that the fail-closed
     // behavior survived the index swap, and that removing the peer retires
     // the indexed answer in lockstep (the check must stop firing).
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn authoritative_round_trip_rejects_a_configured_peer_endpoint_fail_closed() {
         use rustynet_backend_api::{PeerConfig, SocketEndpoint};
@@ -2166,6 +2175,7 @@ mod tests {
              straight out of spawn"
         );
     }
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn linux_runtime_worker_panic_is_contained_and_reported_as_the_exit_cause() {
         // WG-07 end to end. A panic raised on the SINGLE worker thread (here

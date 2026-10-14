@@ -131,6 +131,7 @@ impl DataplaneEnginePair {
     /// Construct two engines, configure them as each other's peer,
     /// and drive the Noise handshake to completion so transport data
     /// can flow. Panics on any setup error (bench-only).
+    #[cfg(not(target_os = "android"))]
     pub fn handshaken() -> Self {
         Self::handshaken_with_extra_peers(0)
     }
@@ -150,6 +151,7 @@ impl DataplaneEnginePair {
     // built directly instead of parsed. Any `expect` firing means
     // the harness itself is broken, and the documented contract
     // (see [`Self::handshaken`]) is to abort the bench.
+    #[cfg(not(target_os = "android"))]
     #[allow(clippy::expect_used)]
     pub fn handshaken_with_extra_peers(extra_peers: usize) -> Self {
         let sender_secret = [7u8; 32];
