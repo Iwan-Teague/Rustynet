@@ -389,6 +389,28 @@ jobs:
         run: |
           sudo env "PATH=$PATH" "HOME=$HOME" ./scripts/e2e/real_wireguard_exitnode_e2e.sh
 
+
+  mobile_ffi:
+    name: Mobile FFI confinement and dependency gates (MC1d)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Bootstrap CI tools
+        run: |
+          ./scripts/ci/bootstrap_ci_tools.sh
+      - name: Mobile unsafe-confinement gate (workspace members named rustynet-mobile*, from cargo metadata)
+        # A text tripwire, not a boundary: the OI-20 scanner and its exact-file allowlist
+        # plus review are the real controls (see the gate header). The default run includes
+        # the gate's own negative self-test, so a gate that stops catching evasions fails here.
+        run: |
+          bash scripts/ci/mobile_unsafe_confinement_gate.sh
+      - name: Mobile dependency boundary (std-only, aarch64-linux-android graph)
+        run: |
+          bash scripts/mobile/check-mobile-deps.sh
+      - name: OI-20 unsafe-source scan (full tree)
+        run: |
+          cargo run -q --locked -p rustynet-cli --bin rustynet-cli -- ops check-no-unsafe-rust-sources
+
   windows:
     name: Windows build+security (rustynetd + windows-native)
     runs-on: windows-2022
