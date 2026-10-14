@@ -22,6 +22,7 @@ pub mod key_rotation;
 pub mod managed_dns_handoff;
 pub mod membership;
 pub mod operations;
+#[cfg(feature = "persistence")]
 pub mod persistence;
 pub mod role_audit;
 pub mod role_presets;
@@ -2228,11 +2229,13 @@ pub struct SignedDnsZoneBundleRequest {
     pub records: Vec<DnsRecordRequest>,
 }
 
+#[cfg(feature = "persistence")]
 #[derive(Debug)]
 pub struct ControlPlanePersistence {
     store: Mutex<persistence::SqliteStore>,
 }
 
+#[cfg(feature = "persistence")]
 impl ControlPlanePersistence {
     pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self, persistence::PersistenceError> {
         let store = persistence::SqliteStore::open(path)?;
@@ -2491,6 +2494,7 @@ impl ControlPlaneCore {
         })
     }
 
+    #[cfg(feature = "persistence")]
     pub fn enroll_with_throwaway_and_persist(
         &self,
         request: EnrollmentRequest,
@@ -3609,6 +3613,7 @@ pub enum ControlPlaneError {
     Credential(CredentialError),
     Auth(AuthError),
     Trust(TrustStateError),
+    #[cfg(feature = "persistence")]
     Persistence(persistence::PersistenceError),
     Assignment(String),
     Dns(String),
@@ -3622,6 +3627,7 @@ impl fmt::Display for ControlPlaneError {
             ControlPlaneError::Credential(err) => write!(f, "credential error: {err}"),
             ControlPlaneError::Auth(err) => write!(f, "auth error: {err}"),
             ControlPlaneError::Trust(err) => write!(f, "trust error: {err}"),
+            #[cfg(feature = "persistence")]
             ControlPlaneError::Persistence(err) => write!(f, "persistence error: {err}"),
             ControlPlaneError::Assignment(err) => write!(f, "assignment error: {err}"),
             ControlPlaneError::Dns(err) => write!(f, "dns error: {err}"),
@@ -3682,6 +3688,7 @@ fn derive_signing_seed(domain: &[u8], secret: &[u8]) -> [u8; 32] {
     seed
 }
 
+#[cfg(feature = "persistence")]
 fn map_persisted_credential_state_to_error(state: Option<&str>) -> CredentialError {
     match state {
         Some("revoked") => CredentialError::Revoked,
@@ -4585,22 +4592,24 @@ mod tests {
             .expect("a hostname-slug node id must still be storable");
         assert!(registry.get("client-1").expect("registry read").is_some());
     }
+    #[cfg(feature = "persistence")]
+    use super::ControlPlanePersistence;
     use super::{
         ACCESS_TOKEN_SIGNING_SEED_INFO_V1, ASSIGNMENT_SIGNING_SEED_INFO_V1, AbuseAlertPolicy,
         ApiAbuseMonitor, AuthError, AuthRateLimitConfig, AuthSurfaceGuard, AutoTunnelBundleRequest,
-        ControlPlaneCore, ControlPlaneError, ControlPlanePersistence, ControlPlaneTlsVersion,
-        CredentialError, DnsRecordRequest, DnsRecordType, DnsTargetAddrKind,
-        ENDPOINT_HINT_SIGNING_SEED_INFO_V1, EndpointHintBundleRequest, EndpointHintCandidate,
-        EndpointHintCandidateType, EnrollmentRequest, LockoutConfig,
-        MAX_RELAY_SESSION_TOKEN_TTL_SECS, MAX_TRUST_STATE_FILE_BYTES, PolicyCheckRequest,
-        PolicyDecision, PolicyGuard, RELAY_TOKEN_SCOPE, RelayFleetBundleRequest,
-        RelayFleetNodeDescriptor, RelaySessionToken, RelaySessionTokenRequest, ReplayPolicy,
-        ReusableCredentialPolicy, ReusableCredentialRequest, RoleCapability,
-        SignedAutoTunnelBundle, SignedDnsZoneBundleRequest, SignedTokenClaims,
-        ThrowawayCredentialState, ThrowawayCredentialStore, TokenClaims, TransportPolicyError,
-        TraversalCoordinationRecord, TrustState, auto_tunnel_payload_field_matches,
-        canonical_relay_id_from_label, derive_endpoint_hint_signing_key, derive_gossip_signing_key,
-        derive_signing_seed, hex_bytes, load_trust_state, parse_relay_session_token_wire,
+        ControlPlaneCore, ControlPlaneError, ControlPlaneTlsVersion, CredentialError,
+        DnsRecordRequest, DnsRecordType, DnsTargetAddrKind, ENDPOINT_HINT_SIGNING_SEED_INFO_V1,
+        EndpointHintBundleRequest, EndpointHintCandidate, EndpointHintCandidateType,
+        EnrollmentRequest, LockoutConfig, MAX_RELAY_SESSION_TOKEN_TTL_SECS,
+        MAX_TRUST_STATE_FILE_BYTES, PolicyCheckRequest, PolicyDecision, PolicyGuard,
+        RELAY_TOKEN_SCOPE, RelayFleetBundleRequest, RelayFleetNodeDescriptor, RelaySessionToken,
+        RelaySessionTokenRequest, ReplayPolicy, ReusableCredentialPolicy,
+        ReusableCredentialRequest, RoleCapability, SignedAutoTunnelBundle,
+        SignedDnsZoneBundleRequest, SignedTokenClaims, ThrowawayCredentialState,
+        ThrowawayCredentialStore, TokenClaims, TransportPolicyError, TraversalCoordinationRecord,
+        TrustState, auto_tunnel_payload_field_matches, canonical_relay_id_from_label,
+        derive_endpoint_hint_signing_key, derive_gossip_signing_key, derive_signing_seed,
+        hex_bytes, load_trust_state, parse_relay_session_token_wire,
         parse_signed_relay_fleet_bundle_wire, persist_trust_state, relay_session_token_to_wire,
     };
     use ed25519_dalek::SigningKey;
@@ -7480,6 +7489,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "persistence")]
     #[test]
     fn enrollment_persists_user_node_and_audit_event() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
@@ -7557,6 +7567,7 @@ mod tests {
         assert_eq!(audit_count, 2);
     }
 
+    #[cfg(feature = "persistence")]
     #[test]
     fn persisted_enrollment_rejects_missing_persisted_credential() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
@@ -7596,6 +7607,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "persistence")]
     #[test]
     fn persisted_enrollment_enforces_single_use_in_persistence() {
         let core = ControlPlaneCore::new(b"control-secret".to_vec(), PolicySet::default());
