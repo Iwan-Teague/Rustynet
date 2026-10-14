@@ -698,6 +698,9 @@ mod imp {
     pub struct SyncDevice;
 
     impl SyncDevice {
+        // Unix only: `std::os::fd::OwnedFd` does not exist on Windows. Windows has
+        // no fd-adopting constructor (a cross-platform caller must cfg(unix) its use).
+        #[cfg(unix)]
         pub fn from_owned_fd(_fd: std::os::fd::OwnedFd) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
