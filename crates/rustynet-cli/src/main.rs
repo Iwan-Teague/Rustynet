@@ -15103,11 +15103,25 @@ fn ensure_parent_directory_for_membership_path(
             Some(Uid::from_raw(0)),
             None,
         ),
-        SigningPassphraseHostProfile::Macos => {
-            ensure_directory_with_mode_owner(parent, 0o700, None, None)
-        }
+        SigningPassphraseHostProfile::Macos => ensure_directory_with_mode_owner(
+            parent,
+            // The membership owner key is decrypted under
+            // encrypted_secret_permission_policy, which requires a 0o750
+            // directory on macOS exactly as on Linux. Forcing 0o700 here made
+            // the very next sign-update fail its custody check
+            // (macos-m2-a6 membership_init). The owner stays as it is and the
+            // group is untouched (None), so rustynetd's group is preserved and
+            // nothing is widened beyond the policy.
+            MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE,
+            None,
+            None,
+        ),
     }
 }
+
+/// Parent-directory mode `init-membership` leaves on macOS. It must equal the
+/// custody policy's required directory mode (pinned by a unit test).
+const MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE: u32 = 0o750;
 
 fn maybe_remove_blind_exit_owner_signing_key(
     node_role: &str,
@@ -24070,6 +24084,45 @@ mod tests {
     use rustynetd::ipc::IpcCommand;
     use serde_json::Value;
     use std::fs;
+
+    #[test]
+    fn macos_membership_parent_directory_mode_matches_the_custody_policy() {
+        let policy = encrypted_secret_permission_policy(Path::new(
+            "/usr/local/etc/rustynet/membership.owner.key",
+        ));
+        assert_eq!(
+            policy.required_directory_mode,
+            crate::MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE,
+            "init-membership must leave the macOS key directory in the mode the \
+             key-custody check requires"
+        );
+        assert_eq!(crate::MACOS_MEMBERSHIP_PARENT_DIRECTORY_MODE, 0o750);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_init_membership_repairs_a_0700_parent_to_the_policy_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "rn-macos-membership-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let dir = root.join("rustynet");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        crate::ensure_parent_directory_for_membership_path(
+            &dir.join("membership.owner.key"),
+            crate::SigningPassphraseHostProfile::Macos,
+        )
+        .expect("ensure parent");
+        let mode = std::fs::metadata(&dir).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
