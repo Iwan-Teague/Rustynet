@@ -8008,34 +8008,84 @@ mod trusted_binary_resolution_tests {
     fn resolve_trusted_system_binary_never_consults_path() {
         // A 0o755 shim named like a helper that exists NOWHERE in the fixed
         // directories is put on PATH; the resolver must ignore PATH entirely
-        // (KM-1) and refuse with OsStoreUnavailable. This kills a PATH-first
-        // resolver and a fallback-to-PATH-after-miss alike, on every host,
-        // regardless of what is installed: either mutant returns the shim's
-        // path instead of the error.
+        // (KM-1) and refuse with OsStoreUnavailable. This kills a resolver
+        // that falls back to a NON-validating PATH lookup (returns any
+        // executable it finds on PATH). It does NOT kill a PATH-first resolver
+        // that still runs validate_trusted_binary(candidate, 0): that check
+        // rejects this shim because the shim is owned by the test euid, not
+        // root. Rejecting such a candidate is the validator's job, covered by
+        // the validate_trusted_binary tests.
+        // The crate forbids `unsafe`, so PATH is never mutated in this
+        // process (`std::env::set_var` is unsafe on this edition). Instead the
+        // outer invocation writes the shim and re-runs THIS test binary as a
+        // child with `PATH` set to the shim directory (`Command::env` is
+        // safe). The child sees the inner marker and performs the assertion
+        // directly; the outer checks that the child passed AND that the inner
+        // test really ran, so a filtered-out child cannot pass vacuously.
+        const SHIM_NAME: &str = "rustynet-km1-path-shadow-helper";
+        const INNER_MARKER: &str = "RUSTYNET_KM1_PATH_SHADOW_INNER";
+        const SHIM_DIR_VAR: &str = "RUSTYNET_KM1_PATH_SHADOW_DIR";
+
+        // Inner branch only when BOTH markers are present, so a stray inherited
+        // INNER_MARKER cannot send a top-level run into the inner branch.
+        if std::env::var_os(INNER_MARKER).is_some() && std::env::var_os(SHIM_DIR_VAR).is_some() {
+            let directory = std::env::var_os(SHIM_DIR_VAR)
+                .map(PathBuf::from)
+                .expect("inner run must receive the shim directory");
+            assert_eq!(
+                std::env::var_os("PATH").map(PathBuf::from),
+                Some(directory.clone()),
+                "inner run must have PATH set to the shim directory"
+            );
+            assert!(
+                directory.join(SHIM_NAME).is_file(),
+                "shim must be present on the PATH of the inner run"
+            );
+            assert_eq!(
+                resolve_trusted_system_binary(SHIM_NAME),
+                Err(CryptoError::OsStoreUnavailable),
+                "resolver must never fall back to a PATH-resolved candidate"
+            );
+            return;
+        }
+
+        // Fallible setup first, so a failure here cannot leak the shim or dir.
+        // `module_path!()` is `<crate>::<module>`; libtest names omit the crate.
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let inner_test = format!("{module}::resolve_trusted_system_binary_never_consults_path");
+        let test_binary = std::env::current_exe().expect("test binary path should resolve");
         let directory = unique_test_dir("path-shadow");
-        let shim = directory.join("rustynet-km1-path-shadow-helper");
+        let shim = directory.join(SHIM_NAME);
         std::fs::write(&shim, b"#!/bin/sh\n").expect("shim should be written");
         std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
             .expect("mode should be set");
         assert!(shim.is_file() && shim.canonicalize().is_ok());
-        let previous = std::env::var_os("PATH");
-        // SAFETY: test-only, minimal window; PATH is restored before any
-        // assertion, so a failure never leaks the mutated environment.
-        unsafe {
-            std::env::set_var("PATH", &directory);
-        }
-        let resolved = resolve_trusted_system_binary("rustynet-km1-path-shadow-helper");
-        match previous {
-            Some(value) => unsafe { std::env::set_var("PATH", value) },
-            None => unsafe { std::env::remove_var("PATH") },
-        }
-        assert_eq!(
-            resolved,
-            Err(CryptoError::OsStoreUnavailable),
-            "resolver must never fall back to a PATH-resolved candidate"
-        );
+        let output = std::process::Command::new(test_binary)
+            .args([
+                "--exact",
+                inner_test.as_str(),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PATH", &directory)
+            .env(INNER_MARKER, "1")
+            .env(SHIM_DIR_VAR, &directory)
+            .output();
         let _ = std::fs::remove_file(&shim);
         let _ = std::fs::remove_dir(&directory);
+        let output = output.expect("child test process should spawn");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "inner PATH-shadow test failed ({:?}):\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("test result: ok. 1 passed"),
+            "inner PATH-shadow test did not run (filtered out?):\n{stdout}"
+        );
     }
 }
 
