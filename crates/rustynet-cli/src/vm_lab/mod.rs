@@ -23853,13 +23853,117 @@ fn require_dns_block_rule(rules: &[Value], expected_name: &str) -> Result<(), St
 /// together form the proof. A future Windows caller MUST stay Skipped until its
 /// producer emits the same probe artifact.
 fn require_empty_dns_pcap(label: &str, content: &str) -> Result<(), String> {
-    let trimmed = content.trim();
-    if trimmed.is_empty() || trimmed.contains("0 packets captured") {
-        return Ok(());
+    // Line-exact: a substring test for `0 packets captured` also accepts
+    // `10 packets captured` / `100 packets captured` and any capture that merely
+    // mentions the zero tally, which would pass a leaking exit as fail-closed.
+    // Only blank lines, the tcpdump/tshark read banners and zero tally lines are
+    // benign; every other line is treated as DNS egress evidence.
+    let mut saw_zero_tally = false;
+    let mut saw_other_benign = false;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line == "0 packets captured" {
+            saw_zero_tally = true;
+        } else if !line.is_empty() {
+            saw_other_benign = true;
+        }
+        let benign = line.is_empty()
+            || line.starts_with("reading from file ")
+            || line.starts_with("dropped privs to ")
+            || line.starts_with("listening on ")
+            || line.starts_with("tcpdump: listening on ")
+            || line == "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode"
+            || matches!(
+                line,
+                "0 packets captured"
+                    | "0 packets received by filter"
+                    | "0 packets dropped by kernel"
+            );
+        if !benign {
+            return Err(format!(
+                "{label} contains DNS egress evidence; expected an empty blocked-path capture"
+            ));
+        }
     }
-    Err(format!(
-        "{label} contains DNS egress evidence; expected an empty blocked-path capture"
-    ))
+    // Banner/summary lines alone are not a capture result: with any non-blank
+    // content the exact zero tally must be present (empty content stays Ok).
+    if saw_other_benign && !saw_zero_tally {
+        return Err(format!(
+            "{label} has no zero-packet tally; expected an empty blocked-path capture"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod require_empty_dns_pcap_tests {
+    use super::require_empty_dns_pcap;
+
+    #[test]
+    fn accepts_empty_and_zero_tally_captures() {
+        for content in [
+            "",
+            "\n",
+            "0 packets captured",
+            "0 packets captured\n",
+            "reading from file /tmp/x.pcap\n0 packets captured\n",
+            "reading from file /tmp/x.pcap, link-type EN10MB (Ethernet), snapshot length 262144\n0 packets captured\n",
+            "tcpdump: verbose output suppressed, use -v[v]... for full protocol decode\nlistening on eth0, link-type EN10MB (Ethernet), snapshot length 262144 bytes\n0 packets captured\n0 packets received by filter\n0 packets dropped by kernel\n",
+        ] {
+            assert!(
+                require_empty_dns_pcap("t", content).is_ok(),
+                "must accept {content:?}"
+            );
+        }
+    }
+
+    // Regression: `contains("0 packets captured")` accepted every count that
+    // ends in 0 (10, 20, 100, ...), i.e. a leaking exit passed as fail-closed.
+    #[test]
+    fn rejects_counts_that_merely_end_in_zero() {
+        for content in [
+            "10 packets captured\n",
+            "20 packets captured",
+            "100 packets captured\n",
+            "reading from file /tmp/x.pcap\n30 packets captured\n",
+        ] {
+            assert!(
+                require_empty_dns_pcap("t", content).is_err(),
+                "must reject {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_crlf_line_endings_on_the_zero_tally() {
+        assert!(require_empty_dns_pcap("t", "0 packets captured\r\n").is_ok());
+        assert!(require_empty_dns_pcap("t", "0 packets captured\r").is_ok());
+    }
+
+    #[test]
+    fn rejects_banner_or_summary_only_content_without_a_zero_tally() {
+        for content in [
+            "listening on eth0\n",
+            "reading from file /tmp/x.pcap\n",
+            "0 packets received by filter\n",
+            "0 packets dropped by kernel\n",
+        ] {
+            assert!(
+                require_empty_dns_pcap("t", content).is_err(),
+                "must reject {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_packet_lines_next_to_a_zero_tally() {
+        let content =
+            "12:00:01.000000 IP 10.0.0.2.5353 > 1.1.1.1.53: UDP, length 32\n0 packets captured\n";
+        assert!(require_empty_dns_pcap("t", content).is_err());
+        assert!(require_empty_dns_pcap("t", "0 packets captured extra\n").is_err());
+        assert!(require_empty_dns_pcap("t", "x0 packets captured\n").is_err());
+        assert!(require_empty_dns_pcap("t", "1 packet captured\n").is_err());
+    }
 }
 
 fn run_validate_windows_mesh_join_stage(

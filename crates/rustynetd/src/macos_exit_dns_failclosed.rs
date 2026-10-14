@@ -519,6 +519,16 @@ fn derive_macos_default_gateway() -> Result<String, String> {
     Err("default-gateway derivation is only supported on macOS".to_owned())
 }
 
+/// tcpdump argv for the blocked-path DNS capture. `-l` (line-buffered stdout)
+/// is load-bearing: the capture is read from a pipe and the child is stopped
+/// with SIGKILL, which cannot flush stdio buffers, so without `-l` any packet
+/// lines still buffered at kill time would vanish and a LEAKING exit would
+/// produce an empty capture (a vacuous pass).
+#[cfg(any(target_os = "macos", test))]
+fn dns_capture_args<'a>(iface: &'a str, protocol: &'a str) -> [&'a str; 8] {
+    ["-n", "-l", "-i", iface, protocol, "and", "port", "53"]
+}
+
 /// Capture DNS/53 egress on `iface` while ACTIVELY sending one off-tunnel DNS
 /// probe (to `server`) mid-window. Returns the tcpdump text plus the `dig`
 /// output. The probe makes an empty pcap meaningful: a real port-53 datagram
@@ -533,7 +543,7 @@ fn capture_dns_block_path(
     duration: Duration,
 ) -> Result<(String, String), String> {
     let mut child = Command::new("/usr/sbin/tcpdump")
-        .args(["-n", "-i", iface, protocol, "and", "port", "53"])
+        .args(dns_capture_args(iface, protocol))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -661,6 +671,13 @@ fn capture_tunnel_dns_resolution(_hostname: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dns_capture_is_line_buffered_so_a_sigkill_cannot_lose_leak_evidence() {
+        let args = dns_capture_args("eth0", "udp");
+        assert!(args.contains(&"-l"), "{args:?}");
+        assert_eq!(&args[3..], ["eth0", "udp", "and", "port", "53"]);
+    }
 
     #[test]
     fn pf_report_accepts_reviewed_udp_and_tcp_rules() {
