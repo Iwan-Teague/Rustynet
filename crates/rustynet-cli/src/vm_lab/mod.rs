@@ -41766,11 +41766,13 @@ fn kept_after() {}\n\
         // Re-measured 2026-10-03 (AQ-254 b+c): 95 stage sources
         // (underlay_attestation.rs, the dataplane underlay attestation
         // helpers shared by collect_pubkeys, mesh_status_validation and
-        // traffic_test_matrix).
+        // traffic_test_matrix). Re-measured 2026-10-16: 96 stage sources
+        // (peer_direct_not_via_exit_validation.rs, the peer-direct
+        // live-lab stage).
         // Bump this number deliberately when a stage source is added or removed.
         assert_eq!(
-            files_scanned, 95,
-            "expected exactly 95 stage sources under the scan root; found \
+            files_scanned, 96,
+            "expected exactly 96 stage sources under the scan root; found \
              {files_scanned} — the tree moved, or the walk went blind. Re-measure \
              and pin the new count on purpose."
         );
@@ -42073,7 +42075,8 @@ fn execute(&self, ctx: &mut OrchestrationContext) -> StageOutcome {
         // MAC-D3 (2026-08-29): 61 + the 3 macOS anchor validator stages.
         // C6 (2026-09-02): + validate_macos_role_transition.
         // C7 (2026-09-02): + validate_macos_reboot_recovery.
-        assert_eq!(cli_ids.len(), 67);
+        // Peer-direct (2026-10-16): + peer_direct_not_via_exit_validation.
+        assert_eq!(cli_ids.len(), 68);
         assert_eq!(
             cli_ids.last(),
             Some(&super::orchestrator::stage::StageId::Cleanup)

@@ -2561,6 +2561,57 @@ fn enforce_overlay_exception_for_exit_routes(routes: &[Route]) -> Result<(), Str
     }
 }
 
+/// Peer-direct invariant guard (live proof:
+/// `peer_direct_not_via_exit_validation`; manual evidence
+/// `notes/PROOF-peer-direct-routing-2026-10-16.md`). When an
+/// `ExitNodeDefault` (0.0.0.0/0) is present, every `Mesh`-kind route
+/// must be strictly more specific than the default (prefix length
+/// greater than zero). WireGuard's longest-prefix cryptokey routing
+/// and the kernel's longest-prefix match then keep mesh
+/// peer-to-peer traffic (nas/llm/API/entry/relay/aux) out of the
+/// exit tunnel. A mesh route collapsed to /0 — or an unparseable
+/// destination — would let the exit default capture overlay
+/// traffic; refuse the apply instead (fail closed).
+fn enforce_exit_default_cannot_shadow_mesh_peers(routes: &[Route]) -> Result<(), String> {
+    let has_exit_default = routes
+        .iter()
+        .any(|route| matches!(route.kind, RouteKind::ExitNodeDefault));
+    if !has_exit_default {
+        return Ok(());
+    }
+    for route in routes
+        .iter()
+        .filter(|route| matches!(route.kind, RouteKind::Mesh))
+    {
+        let prefix_len = parse_route_prefix_len(&route.destination_cidr).ok_or_else(|| {
+            format!(
+                "route set carries an exit default route alongside mesh route with \
+                 unparseable destination `{}`; peer-direct specificity cannot be \
+                 proven — refusing apply",
+                route.destination_cidr
+            )
+        })?;
+        if prefix_len == 0 {
+            return Err(format!(
+                "route set carries an exit default route alongside mesh route `{}` \
+                 with no specificity over the default; peer-to-peer mesh traffic \
+                 would be captured by the exit — refusing apply",
+                route.destination_cidr
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_route_prefix_len(destination_cidr: &str) -> Option<u8> {
+    let (addr, prefix) = destination_cidr.split_once('/')?;
+    let prefix_len: u8 = prefix.parse().ok()?;
+    if addr.parse::<std::net::Ipv4Addr>().is_err() && addr.parse::<std::net::Ipv6Addr>().is_err() {
+        return None;
+    }
+    Some(prefix_len)
+}
+
 fn validate_node_role_membership_alignment(
     membership_state: &MembershipState,
     local_node_id: &str,
@@ -9601,6 +9652,13 @@ impl DaemonRuntime {
             self.force_fail_closed_or_restrict("bootstrap_exit_overlay_exception_violated");
             return;
         }
+        // Peer-direct invariant: mesh peers stay peer-to-peer under an
+        // active exit (live proof: peer_direct_not_via_exit_validation).
+        if let Err(err) = enforce_exit_default_cannot_shadow_mesh_peers(&routes) {
+            self.restrict_recoverable(format!("peer-direct guard rejected bootstrap apply: {err}"));
+            self.force_fail_closed_or_restrict("bootstrap_peer_direct_invariant_violated");
+            return;
+        }
         // M2 amendment (MacosClientResolverNotServingDiagnosisReview §3.3):
         // BOTH macOS postures now apply in-bootstrap. The original M2 split
         // deferred a plain client's `ScopedResolverOnly` sub-apply to the
@@ -11370,6 +11428,18 @@ impl DaemonRuntime {
                 self.last_reconcile_error = Some(message.clone());
                 self.restrict_recoverable(message);
                 self.force_fail_closed_or_restrict("reconcile_exit_overlay_exception_violated");
+                self.promote_to_permanent_if_over_limit();
+                self.pending_generation_apply = false;
+                return;
+            }
+            // Peer-direct invariant: mesh peers stay peer-to-peer under an
+            // active exit (live proof: peer_direct_not_via_exit_validation).
+            if let Err(err) = enforce_exit_default_cannot_shadow_mesh_peers(&routes) {
+                self.reconcile_failures = self.reconcile_failures.saturating_add(1);
+                let message = format!("peer-direct guard rejected reconcile apply: {err}");
+                self.last_reconcile_error = Some(message.clone());
+                self.restrict_recoverable(message);
+                self.force_fail_closed_or_restrict("reconcile_peer_direct_invariant_violated");
                 self.promote_to_permanent_if_over_limit();
                 self.pending_generation_apply = false;
                 return;
@@ -19759,23 +19829,23 @@ mod tests {
         TrustWatermark, bind_anchor_bundle_pull_listener, bind_anchor_enrollment_listener,
         build_dns_response, build_gossip_node,
         collect_traversal_host_candidate_snapshot_with_retry, complete_anchor_tls_handshake,
-        enforce_overlay_exception_for_exit_routes, is_root_managed_shared_runtime_parent,
-        load_anchor_bundle_pull_bundle, load_anchor_bundle_pull_token, load_auto_tunnel_bundle,
-        load_auto_tunnel_watermark, load_dns_zone_bundle, load_dns_zone_watermark,
-        load_relay_client, load_relay_fleet_bundle, load_traversal_bundle,
-        load_traversal_bundle_set, load_traversal_watermark, load_trust_evidence,
-        load_trust_watermark, membership_watermark_is_replay, overlay_addresses_from_bundle_peers,
-        parse_route_interface_token, parse_windows_default_egress_interface_output,
-        passphrase_disallowed_mode_mask, persist_auto_tunnel_watermark,
-        persist_traversal_watermark, persist_trust_watermark, poll_anchor_bundle_pull_once,
-        poll_anchor_enrollment_once, port_mapping_bring_up_skip_reason,
-        prepare_runtime_wireguard_key_material, read_line_bounded, require_local_signed_capability,
-        resolve_egress_interface_value, resolve_gossip_overlay_bind_addr, run_daemon,
-        run_preflight_checks, sanitize_dataplane_routes_for_node_role,
-        scrub_runtime_wireguard_key_material, select_runtime_relay_candidate,
-        select_runtime_relay_candidate_with_verified_fleet, sha256_digest,
-        snapshot_has_usable_traversal_host_candidates, trust_evidence_payload, unix_now,
-        validate_anchor_bundle_pull_addr, validate_anchor_enrollment_addr,
+        enforce_exit_default_cannot_shadow_mesh_peers, enforce_overlay_exception_for_exit_routes,
+        is_root_managed_shared_runtime_parent, load_anchor_bundle_pull_bundle,
+        load_anchor_bundle_pull_token, load_auto_tunnel_bundle, load_auto_tunnel_watermark,
+        load_dns_zone_bundle, load_dns_zone_watermark, load_relay_client, load_relay_fleet_bundle,
+        load_traversal_bundle, load_traversal_bundle_set, load_traversal_watermark,
+        load_trust_evidence, load_trust_watermark, membership_watermark_is_replay,
+        overlay_addresses_from_bundle_peers, parse_route_interface_token, parse_route_prefix_len,
+        parse_windows_default_egress_interface_output, passphrase_disallowed_mode_mask,
+        persist_auto_tunnel_watermark, persist_traversal_watermark, persist_trust_watermark,
+        poll_anchor_bundle_pull_once, poll_anchor_enrollment_once,
+        port_mapping_bring_up_skip_reason, prepare_runtime_wireguard_key_material,
+        read_line_bounded, require_local_signed_capability, resolve_egress_interface_value,
+        resolve_gossip_overlay_bind_addr, run_daemon, run_preflight_checks,
+        sanitize_dataplane_routes_for_node_role, scrub_runtime_wireguard_key_material,
+        select_runtime_relay_candidate, select_runtime_relay_candidate_with_verified_fleet,
+        sha256_digest, snapshot_has_usable_traversal_host_candidates, trust_evidence_payload,
+        unix_now, validate_anchor_bundle_pull_addr, validate_anchor_enrollment_addr,
         validate_auto_tunnel_role_membership_alignment, validate_daemon_config,
         validate_file_security, validate_node_role_membership_alignment,
         write_anchor_bundle_pull_response, write_anchor_bundle_pull_response_with_have,
@@ -40035,6 +40105,84 @@ mod tests {
 
         enforce_overlay_exception_for_exit_routes(&[])
             .expect("empty route set carries no exit default and must be accepted");
+    }
+
+    fn peer_direct_mesh_route(cidr: &str, node: &str) -> Route {
+        Route {
+            destination_cidr: cidr.to_owned(),
+            via_node: NodeId::new(node.to_owned()).expect("mesh peer node id"),
+            kind: RouteKind::Mesh,
+        }
+    }
+
+    fn peer_direct_exit_default_route() -> Route {
+        Route {
+            destination_cidr: "0.0.0.0/0".to_owned(),
+            via_node: NodeId::new("exit-peer".to_owned()).expect("exit peer node id"),
+            kind: RouteKind::ExitNodeDefault,
+        }
+    }
+
+    #[test]
+    fn peer_direct_guard_accepts_specific_mesh_routes_beside_exit_default() {
+        let routes = vec![
+            peer_direct_mesh_route("100.64.0.0/10", "mesh-peer-a"),
+            peer_direct_mesh_route("100.95.199.56/32", "mesh-peer-b"),
+            peer_direct_mesh_route("100.66.184.214/32", "mesh-peer-c"),
+            peer_direct_exit_default_route(),
+        ];
+
+        enforce_exit_default_cannot_shadow_mesh_peers(&routes)
+            .expect("peer /32 and mesh /10 routes are strictly more specific than /0");
+    }
+
+    #[test]
+    fn peer_direct_guard_refuses_mesh_route_collapsed_to_default_prefix() {
+        let routes = vec![
+            peer_direct_mesh_route("0.0.0.0/0", "mesh-peer-a"),
+            peer_direct_exit_default_route(),
+        ];
+
+        let err = enforce_exit_default_cannot_shadow_mesh_peers(&routes).expect_err(
+            "a mesh route with /0 gives the exit default equal specificity (fail closed)",
+        );
+        assert!(err.contains("no specificity over the default"));
+    }
+
+    #[test]
+    fn peer_direct_guard_refuses_unparseable_mesh_destination_beside_exit_default() {
+        let routes = vec![
+            peer_direct_mesh_route("not-a-cidr", "mesh-peer-a"),
+            peer_direct_exit_default_route(),
+        ];
+
+        let err = enforce_exit_default_cannot_shadow_mesh_peers(&routes)
+            .expect_err("an unparseable mesh destination cannot prove peer-direct specificity");
+        assert!(err.contains("unparseable destination"));
+    }
+
+    #[test]
+    fn peer_direct_guard_accepts_route_sets_without_exit_default() {
+        let routes = vec![
+            peer_direct_mesh_route("100.64.0.0/10", "mesh-peer-a"),
+            peer_direct_mesh_route("0.0.0.0/0", "not-really-mesh-but-unchecked"),
+        ];
+        enforce_exit_default_cannot_shadow_mesh_peers(&routes)
+            .expect("without an exit default the guard has nothing to shadow");
+
+        enforce_exit_default_cannot_shadow_mesh_peers(&[])
+            .expect("empty route set carries no exit default");
+    }
+
+    #[test]
+    fn parse_route_prefix_len_handles_v4_v6_and_rejects_garbage() {
+        assert_eq!(parse_route_prefix_len("0.0.0.0/0"), Some(0));
+        assert_eq!(parse_route_prefix_len("100.64.0.0/10"), Some(10));
+        assert_eq!(parse_route_prefix_len("100.95.199.56/32"), Some(32));
+        assert_eq!(parse_route_prefix_len("fd00::/8"), Some(8));
+        assert_eq!(parse_route_prefix_len("100.95.199.56"), None);
+        assert_eq!(parse_route_prefix_len("300.1.2.3/24"), None);
+        assert_eq!(parse_route_prefix_len("100.64.0.0/ten"), None);
     }
 
     #[test]

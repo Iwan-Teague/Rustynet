@@ -25,6 +25,7 @@ pub mod identity_challenge;
 pub mod ipv6_leak;
 pub mod key_custody;
 pub mod mesh_status;
+pub mod peer_direct_not_via_exit;
 pub mod relay;
 pub mod runtime_acls;
 pub mod secrets_not_in_logs_eval;

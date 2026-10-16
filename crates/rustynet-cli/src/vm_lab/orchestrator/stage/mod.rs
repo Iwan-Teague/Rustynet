@@ -140,6 +140,7 @@ pub mod negative_control;
 pub mod negative_control_enrollment_replay;
 pub mod negative_control_killswitch_bypass;
 pub mod node_diagnostics;
+pub mod peer_direct_not_via_exit_validation;
 pub mod preflight;
 pub mod refresh_signed_bundles;
 pub mod relay_forwards_frame_validation;
@@ -463,6 +464,12 @@ define_stage_catalog! {
     // T1 list ("exit→NAT+handoff+dns-failclosed+demotion-residue"); the
     // standalone dns_failclosed_validation above is the T4 family member.
     ExitDnsFailclosedValidation => "exit_dns_failclosed_validation" @ Live / T1Role / StageEvidence::StageLog,
+    // Peer-direct invariant: traffic from an exit-using client to another
+    // mesh node (entry/relay/aux/...) must flow peer-to-peer and NEVER
+    // traverse the exit. QH-83: the ONLY pass path writes the StageLog
+    // witness naming client/exit/peer and the observed counts; the verdict
+    // JSON + raw captures are always written alongside it.
+    PeerDirectNotViaExitValidation => "peer_direct_not_via_exit_validation" @ Live / T1Role / StageEvidence::StageLog,
     ExitEgressLeakWitness => "exit_egress_leak_witness" @ Live / T1Role / StageEvidence::StageLog,
     ExitNatLifecycleValidation => "exit_nat_lifecycle_validation" @ Live / T1Role / StageEvidence::StageLog,
     ExitDemotionResidueValidation => "exit_demotion_residue_validation" @ Live / T1Role / StageEvidence::StageLog,

@@ -894,6 +894,17 @@ pub const STAGES: &[StageSpec] = &[
         platform_rule: PlatformRule::AllPlatforms,
         ..DEFAULT_SPEC
     },
+    // Peer-direct invariant (2026-10-16): with an exit in use, traffic from
+    // the client to ANOTHER mesh node must never reach the exit. Only the
+    // Rust `--node` plan dispatches it (state_machine_only); per-stage rows
+    // land in the node stage-results ledger (no aggregate CSV column).
+    StageSpec {
+        name: "peer_direct_not_via_exit_validation",
+        state_machine_only: true,
+        group: StageGroup::Live,
+        platform_rule: PlatformRule::AllPlatforms,
+        ..DEFAULT_SPEC
+    },
     StageSpec {
         name: "exit_egress_leak_witness",
         state_machine_only: true,
@@ -3210,7 +3221,11 @@ mod tests {
             // +1 on 2026-09-07 (bundle freshness): refresh_signed_bundles,
             // the HP-3 prerequisite re-mint stage
             // (TraversalBundleFreshnessPlan_2026-09-07.md).
-            ("t1_role", 25),
+            // +1 on 2026-10-16: peer_direct_not_via_exit_validation — the
+            // exit role's peer-direct invariant (mesh peers stay
+            // peer-to-peer under an active exit; live proof:
+            // notes/PROOF-peer-direct-routing-2026-10-16.md).
+            ("t1_role", 26),
             // +1 on 2026-09-02 (C7): validate_macos_reboot_recovery joins
             // T2Resilience as the macOS reboot-with-protection live stage
             // (MacosDnsBackupRebootSurvivalPlan_2026-09-02.md).

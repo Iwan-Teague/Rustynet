@@ -1743,7 +1743,87 @@ mod tests {
             engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 80, 169, 183))),
             Some(exit.clone())
         );
-        // ...and still catches off-mesh traffic via the default route.
+        // ...and still catch off-mesh traffic via the default route.
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+            Some(exit)
+        );
+    }
+
+    /// Peer-direct invariant (live proof:
+    /// `peer_direct_not_via_exit_validation`): with an active exit
+    /// carrying 0.0.0.0/0, EVERY mesh peer's /32 must select that peer —
+    /// not the exit — so client→nas/llm/API/entry/relay/aux traffic never
+    /// traverses the exit tunnel. The exit only wins off-mesh destinations.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn outbound_peer_selection_routes_every_mesh_peer_over_the_exit_default() {
+        use rustynet_backend_api::{NodeId, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wg.key");
+        std::fs::write(&path, BASE64_STANDARD.encode([6u8; 32])).expect("write key");
+        let mut engine = UserspaceEngine::from_private_key_file(&path).expect("engine");
+
+        // The exit sorts FIRST alphabetically (the order that made a
+        // first-match scan hand it every destination) and carries the
+        // control-plane shape: its own /32 plus the exit default.
+        let exit = NodeId::new("aaa-exit").expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: exit.clone(),
+                endpoint: SocketEndpoint {
+                    addr: IpAddr::V4(Ipv4Addr::new(192, 168, 64, 4)),
+                    port: 51820,
+                },
+                public_key: [0x11; 32],
+                allowed_ips: vec!["100.80.169.183/32".to_owned(), "0.0.0.0/0".to_owned()],
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            })
+            .expect("exit configures");
+
+        // Three mesh peers with distinct service roles (nas / llm / entry),
+        // configured AFTER the exit.
+        let peers = [
+            ("zzz-nas", "100.95.199.56"),
+            ("zzz-llm", "100.123.229.22"),
+            ("zzz-entry", "100.66.184.214"),
+        ]
+        .map(|(name, mesh_ip)| {
+            let node_id = NodeId::new(name).expect("node id");
+            let octets: [u8; 4] = mesh_ip
+                .split('.')
+                .map(|o| o.parse().expect("mesh octet"))
+                .collect::<Vec<_>>()
+                .try_into()
+                .expect("four octets");
+            engine
+                .configure_peer(&PeerConfig {
+                    node_id: node_id.clone(),
+                    endpoint: SocketEndpoint {
+                        addr: IpAddr::V4(Ipv4Addr::from([192, 168, 64, octets[3]])),
+                        port: 51820,
+                    },
+                    public_key: [octets[3]; 32],
+                    allowed_ips: vec![format!("{mesh_ip}/32")],
+                    persistent_keepalive_secs: None,
+                    preshared_key: None,
+                })
+                .expect("peer configures");
+            (node_id, mesh_ip)
+        });
+
+        for (node_id, mesh_ip) in peers {
+            let dst: IpAddr = mesh_ip.parse().expect("mesh ip");
+            assert_eq!(
+                engine.select_peer_for_destination(dst),
+                Some(node_id),
+                "mesh peer {mesh_ip} must route peer-to-peer, never via the exit"
+            );
+        }
+        // Off-mesh traffic still rides the exit default.
         assert_eq!(
             engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
             Some(exit)

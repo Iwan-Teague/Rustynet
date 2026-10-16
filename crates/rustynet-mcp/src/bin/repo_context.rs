@@ -2120,49 +2120,51 @@ The orchestrator runs these stages in order. Each stage is an `OrchestrationStag
 | 31 | `exit_handoff` | Validate exit-node handoff | `stage/exit_handoff.rs` |
 | 32 | `active_exit` | Windows active-exit promotion (route advertise) | `stage/active_exit.rs` |
 | 33 | `exit_dns_failclosed_validation` | Per-node exit DNS fail-closed leak proof (six-artifact directory: firewall rules, block pcaps, active off-tunnel probe, tunnel positive control) | `stage/exit_dns_failclosed_validation.rs` |
-| 34 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
-| 35 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
-| 36 | `blind_exit_dataplane_validation` | Per-node blind-exit dataplane proof (live nft ruleset capture, five hardened subchecks: ruleset captured, mesh-scoped forward, no NAT, no unrestricted forward, no own-egress) | `stage/blind_exit_dataplane_validation.rs` |
-| 37 | `live_anchor` | Live anchor role validation delegated to the proven `live_linux_anchor_test` binary | `stage/live_anchor.rs` |
-| 38 | `live_two_hop_validation` | Live two-hop dataplane proof (client→entry→exit chain: end-to-end reachability + per-hop TTL decrement) delegates to the proven cross-OS `live_linux_two_hop_test` binary | `stage/live_two_hop_validation.rs` |
-| 39 | `live_managed_dns_validation` | Live managed-DNS issuance/refresh/fail-closed proof (signer=exit, client=client, managed peers=others) delegates to the proven cross-OS `live_linux_managed_dns_test` binary | `stage/live_managed_dns_validation.rs` |
-| 40 | `live_network_flap_validation` | Live WG tunnel recovery after network flap (exit + client: baseline handshake, induce disruption, prove recovery with membership + gossip intact) delegates to the proven cross-OS `live_linux_network_flap_test` binary | `stage/live_network_flap_validation.rs` |
-| 41 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
-| 42 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
-| 43 | `live_key_custody_validation` | Live key-custody enforcement proof (client-only: manipulate key file permissions on running daemon, validate rejection + recovery) delegates to the proven `live_linux_key_custody_test` binary | `stage/live_key_custody_validation.rs` |
-| 44 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
-| 45 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
-| 46 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
-| 47 | `live_hello_limiter_flood_validation` | Live hello-limiter flood proof (relay hello-limiter audit: validates flood detection and rate-limit enforcement on relay-hosting nodes) delegates to the `hello-limiter-audit` subcommand of `rustynet-relay` | `stage/live_hello_limiter_flood_validation.rs` |
-| 48 | `refresh_signed_bundles` | HP-3 freshness prerequisite (opt-in, same `--enable-relay-forwarding-validation` gate): re-mints and redistributes the signed traversal and dns_zone bundles through the exit adapter (`issue_bundles_to_dir`) and the verifier-key barrier immediately before `relay_forwards_frame_validation`, so the disruptive proof never runs against bundles that expired mid-run; skipped (fail-closed) when the proof is not elected | `stage/refresh_signed_bundles.rs` |
-| 49 | `relay_forwards_frame_validation` | HP-3/RPT-01 disruptive proof (opt-in): forces two spare Linux peers onto a relay-only path, restarts both daemons mid-run, and asserts each peer independently reports relay-routed traffic before cleanup | `stage/relay_forwards_frame_validation.rs` |
-| 50 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
-| 51 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
-| 52 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 53 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 54 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 55 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 56 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 57 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 58 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 59 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
-| 60 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
-| 61 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
-| 62 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
-| 63 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
-| 64 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
-| 65 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
-| 66 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
-| 67 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
-| 68 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
-| 69 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
-| 70 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
-| 71 | `negative_control_signed_bundle_rejection` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` against a forged assignment-bundle corpus; PASSES iff every forgery is rejected fail-closed for its named reason AND a genuine bundle is accepted (runs locally) | `stage/negative_control.rs` |
-| 72 | `negative_control_planted_residue` | Opt-in T5 negative control: adjudicates that planted `rustynet*` residue drives the pure `parse_node_clean_probe` clean-assert to `Err` (live guest planting deferred to live-verify) | `stage/negative_control.rs` |
-| 73 | `negative_control_wrong_node_substitution` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` with a mismatched `expected_node_id`; PASSES iff the substitution is rejected AND the matching id accepted (verify-path level) | `stage/negative_control.rs` |
-| 74 | `negative_control_daemon_kill_mid_stage` | Opt-in T5 negative control: adjudicates that a targeted stage's recorded outcome is NOT a pass under a mid-stage daemon kill (live kill reuses `live_chaos_daemon_fault_test`, deferred to live-verify) | `stage/negative_control.rs` |
-| 75 | `cross_network_substrate_teardown` | Always-run overlay teardown: remove every vxlan link the substrate created, even after a partial setup or an earlier failure | `stage/cross_network/substrate.rs` |
-| 76 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
+| 34 | `peer_direct_not_via_exit_validation` | Peer-direct invariant under an active exit: client→other-mesh-node traffic (ICMP/TCP/UDP) must reach the peer directly and NEVER appear on the exit, with an internet-bound positive control and an unused-mesh-CIDR negative-space probe | `stage/peer_direct_not_via_exit_validation.rs` |
+| 35 | `exit_egress_leak_witness` | Forwarded-egress leak witness on the live exit (attributed forwarded DNS/ICMP, masqueraded positive control) | `stage/exit_egress_leak_witness.rs` |
+| 36 | `exit_nat_lifecycle_validation` | Two-phase exit NAT lifecycle check (snapshot during active exit → stop daemon → snapshot again → prove NAT gone) | `stage/exit_nat_lifecycle_validation.rs` |
+| 37 | `exit_demotion_residue_validation` | Two-phase exit→client demotion capture (NAT torn down, forwarding restored, daemon still running) | `stage/exit_demotion_residue_validation.rs` |
+| 38 | `blind_exit_dataplane_validation` | Per-node blind-exit dataplane proof (live nft ruleset capture, five hardened subchecks: ruleset captured, mesh-scoped forward, no NAT, no unrestricted forward, no own-egress) | `stage/blind_exit_dataplane_validation.rs` |
+| 39 | `live_anchor` | Live anchor role validation delegated to the proven `live_linux_anchor_test` binary | `stage/live_anchor.rs` |
+| 40 | `live_two_hop_validation` | Live two-hop dataplane proof (client→entry→exit chain: end-to-end reachability + per-hop TTL decrement) delegates to the proven cross-OS `live_linux_two_hop_test` binary | `stage/live_two_hop_validation.rs` |
+| 41 | `live_managed_dns_validation` | Live managed-DNS issuance/refresh/fail-closed proof (signer=exit, client=client, managed peers=others) delegates to the proven cross-OS `live_linux_managed_dns_test` binary | `stage/live_managed_dns_validation.rs` |
+| 42 | `live_network_flap_validation` | Live WG tunnel recovery after network flap (exit + client: baseline handshake, induce disruption, prove recovery with membership + gossip intact) delegates to the proven cross-OS `live_linux_network_flap_test` binary | `stage/live_network_flap_validation.rs` |
+| 43 | `live_reboot_recovery_validation` | Live reboot recovery on 2-node mesh (exit + client: reboot individually, verify boot-id changed, rustynetd recovered, WireGuard re-established, gossip epoch advanced) delegates to the proven `live_linux_reboot_recovery_test` binary | `stage/live_reboot_recovery_validation.rs` |
+| 44 | `live_secrets_not_in_logs_validation` | Live secrets-not-in-logs audit (client-only: scan daemon journal + state dir for plaintext keys/key material) delegates to the proven `live_linux_secrets_not_in_logs_test` binary | `stage/live_secrets_not_in_logs_validation.rs` |
+| 45 | `live_key_custody_validation` | Live key-custody enforcement proof (client-only: manipulate key file permissions on running daemon, validate rejection + recovery) delegates to the proven `live_linux_key_custody_test` binary | `stage/live_key_custody_validation.rs` |
+| 46 | `live_enrollment_restart_validation` | Live enrollment-restart proof (admin killed mid-enrollment, must recover + membership integrity intact) delegates to the proven `live_linux_enrollment_restart_test` binary | `stage/live_enrollment_restart_validation.rs` |
+| 47 | `live_lan_toggle_validation` | Live LAN-toggle three-cycle proof (off→on→off with enforcement evidence on each side + blind-exit rejection) delegates to the proven cross-OS `live_linux_lan_toggle_test` binary | `stage/live_lan_toggle_validation.rs` |
+| 48 | `live_mixed_topology_validation` | Live cross-OS mutual-visibility proof (one Linux + one macOS + one Windows node: all mutually visible in membership + datapath freshness) delegates to the proven `live_linux_mixed_topology_test` binary | `stage/live_mixed_topology_validation.rs` |
+| 49 | `live_hello_limiter_flood_validation` | Live hello-limiter flood proof (relay hello-limiter audit: validates flood detection and rate-limit enforcement on relay-hosting nodes) delegates to the `hello-limiter-audit` subcommand of `rustynet-relay` | `stage/live_hello_limiter_flood_validation.rs` |
+| 50 | `refresh_signed_bundles` | HP-3 freshness prerequisite (opt-in, same `--enable-relay-forwarding-validation` gate): re-mints and redistributes the signed traversal and dns_zone bundles through the exit adapter (`issue_bundles_to_dir`) and the verifier-key barrier immediately before `relay_forwards_frame_validation`, so the disruptive proof never runs against bundles that expired mid-run; skipped (fail-closed) when the proof is not elected | `stage/refresh_signed_bundles.rs` |
+| 51 | `relay_forwards_frame_validation` | HP-3/RPT-01 disruptive proof (opt-in): forces two spare Linux peers onto a relay-only path, restarts both daemons mid-run, and asserts each peer independently reports relay-routed traffic before cleanup | `stage/relay_forwards_frame_validation.rs` |
+| 52 | `extended_soak` | Extended soak composite over two-hop, exit-handoff, LAN-toggle, and reboot-recovery live validators | `stage/live_extended_soak_validation.rs` |
+| 53 | `cross_network_preflight` | Cross-network preflight report from the Rust run context | `stage/cross_network.rs` |
+| 54 | `cross_network_direct_remote_exit` | Cross-network direct remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 55 | `cross_network_node_network_switch` | Cross-network node-network switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 56 | `cross_network_relay_remote_exit` | Cross-network relay remote-exit validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 57 | `cross_network_failback_roaming` | Cross-network failback/roaming validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 58 | `cross_network_controller_switch` | Cross-network controller-switch validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 59 | `cross_network_traversal_adversarial` | Cross-network traversal adversarial validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 60 | `cross_network_remote_exit_dns` | Cross-network remote-exit DNS validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 61 | `cross_network_remote_exit_soak` | Cross-network remote-exit soak validator delegated to the existing SSH e2e wrapper | `stage/cross_network.rs` |
+| 62 | `cross_network_nat_classification` | Rust-native registered netns classification stage; skips until substrate staging is ported | `stage/cross_network.rs` |
+| 63 | `cross_network_nat_matrix` | Cross-network NAT matrix validation via `ops validate-cross-network-nat-matrix` | `stage/cross_network.rs` |
+| 64 | `chaos_clock_attack` | Opt-in chaos clock-attack stage, delegated to `live_chaos_clock_attack_test` | `stage/chaos.rs` |
+| 65 | `chaos_crash_recovery` | Opt-in chaos crash-recovery stage, delegated to `live_chaos_crash_recovery_test` | `stage/chaos.rs` |
+| 66 | `chaos_daemon_fault` | Opt-in daemon-fault chaos stage, delegated to `live_chaos_daemon_fault_test` | `stage/chaos.rs` |
+| 67 | `chaos_daemon_sigstop_sigcont` | Opt-in daemon SIGSTOP/SIGCONT chaos stage, delegated to `live_chaos_daemon_fault_test --fault-mode sigstop-cont` | `stage/chaos.rs` |
+| 68 | `chaos_membership_adversarial` | Opt-in membership-adversarial chaos stage, delegated to `live_chaos_membership_adversarial_test` | `stage/chaos.rs` |
+| 69 | `chaos_network_impairment` | Opt-in network-impairment chaos stage, delegated to `live_chaos_network_impairment_test` | `stage/chaos.rs` |
+| 70 | `chaos_privileged_boundary` | Opt-in privileged-boundary chaos stage, delegated to `live_chaos_privileged_boundary_test` | `stage/chaos.rs` |
+| 71 | `chaos_resource_exhaustion` | Opt-in resource-exhaustion chaos stage, delegated to `live_chaos_resource_exhaustion_test` | `stage/chaos.rs` |
+| 72 | `chaos_signed_state_adversarial` | Opt-in signed-state adversarial chaos stage, delegated to `live_chaos_signed_state_adversarial_test` | `stage/chaos.rs` |
+| 73 | `negative_control_signed_bundle_rejection` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` against a forged assignment-bundle corpus; PASSES iff every forgery is rejected fail-closed for its named reason AND a genuine bundle is accepted (runs locally) | `stage/negative_control.rs` |
+| 74 | `negative_control_planted_residue` | Opt-in T5 negative control: adjudicates that planted `rustynet*` residue drives the pure `parse_node_clean_probe` clean-assert to `Err` (live guest planting deferred to live-verify) | `stage/negative_control.rs` |
+| 75 | `negative_control_wrong_node_substitution` | Opt-in T5 negative control: drives `verify_signed_assignment_state_artifact` with a mismatched `expected_node_id`; PASSES iff the substitution is rejected AND the matching id accepted (verify-path level) | `stage/negative_control.rs` |
+| 76 | `negative_control_daemon_kill_mid_stage` | Opt-in T5 negative control: adjudicates that a targeted stage's recorded outcome is NOT a pass under a mid-stage daemon kill (live kill reuses `live_chaos_daemon_fault_test`, deferred to live-verify) | `stage/negative_control.rs` |
+| 77 | `cross_network_substrate_teardown` | Always-run overlay teardown: remove every vxlan link the substrate created, even after a partial setup or an earlier failure | `stage/cross_network/substrate.rs` |
+| 78 | `cleanup` | Teardown + artifact collection | `stage/final_cleanup.rs` |
 
 ## Daemon Security-Validator Stages (Linux)
 
@@ -2321,6 +2323,8 @@ mod tests {
             "exit_handoff",
             "active_exit",
             "exit_dns_failclosed_validation",
+            "peer_direct_not_via_exit_validation",
+            "exit_egress_leak_witness",
             "exit_nat_lifecycle_validation",
             "exit_demotion_residue_validation",
             "blind_exit_dataplane_validation",
