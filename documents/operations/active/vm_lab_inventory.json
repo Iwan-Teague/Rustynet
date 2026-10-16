@@ -125,6 +125,25 @@
       "ssh_user": "debian"
     },
     {
+      "alias": "pi-aarch64-1",
+      "include_in_all": false,
+      "last_known_ip": "100.73.193.83",
+      "last_known_network": "tailnet-100.64.0.0/10",
+      "live_ips": [
+        "100.73.193.83",
+        "192.168.0.37"
+      ],
+      "network_group": "lan-192.168.0.0/24",
+      "node_id": "pi-aarch64-1",
+      "notes": "PHYSICAL Raspberry Pi 4 Model B Rev 1.2 (4 cores, 3.8 GB RAM, 29 GB SD, wired eth0 192.168.0.37 on the home LAN), hostname ieredlabs-pi, joined the tailnet 2026-10-16 as 100.73.193.83 so it is reachable away from the home LAN. Live-lab node CANDIDATE: no lab_role and include_in_all=false until the owner approves a lab shape. No out-of-band console: a killswitch lockout needs physical access, so first runs happen with the owner at the device and with a dead-man switch. First real aarch64 Linux evidence for the platform matrix. Kernel WireGuard module present (interface create verified); nft/iproute2 installed; systemd-resolved NOT installed (bootstrap installs it); NetworkManager owns DNS. Use the prebuilt (host-cross) bootstrap path, never a native build on the SD card.",
+      "os": "Debian GNU/Linux 13 (trixie) (aarch64)",
+      "parent_device": "Raspberry Pi 4 Model B (physical, wired, home LAN 192.168.0.0/24)",
+      "platform": "linux",
+      "rustynet_src_dir": "/home/iwan/Rustynet",
+      "ssh_target": "100.73.193.83",
+      "ssh_user": "iwan"
+    },
+    {
       "alias": "macos-utm-1",
       "controller": {
         "bundle_path": "/Users/iwan/Desktop/OS_images/UTM images/macOS.utm",
