@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+const CHECKLIST_DOC_PATH: &str =
+    "documents/operations/done/Phase5ReleaseReadinessChecklist_2026-04-12.md";
 const REQUIRED_DOCS: &[&str] = &[
     "documents/operations/ReleaseReadinessGuardrails.md",
-    "documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md",
+    CHECKLIST_DOC_PATH,
     "documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md",
 ];
 const DEFAULT_BUNDLE_PATH: &str = "artifacts/release/phase5_readiness_bundle.json";
@@ -397,8 +399,7 @@ impl ReleaseReadinessBundle {
             generated_at_unix: 0,
             summary_doc:
                 "documents/operations/active/Phase5ReleaseReadinessSummary_2026-04-12.md".to_owned(),
-            checklist_doc:
-                "documents/operations/active/Phase5ReleaseReadinessChecklist_2026-04-12.md".to_owned(),
+            checklist_doc: CHECKLIST_DOC_PATH.to_owned(),
             phase5_gate_report_path: phase5_gate_report_path.display().to_string(),
             required_phase5_step_ids: REQUIRED_PHASE5_STEP_IDS
                 .iter()
@@ -459,9 +460,11 @@ struct StepExecutionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        GateRunStatus, GateStepStatus, REQUIRED_PHASE5_STEP_IDS, ReleaseReadinessBundle,
-        read_phase5_gate_report, validate_phase5_gate_report,
+        CHECKLIST_DOC_PATH, GateRunStatus, GateStepStatus, REQUIRED_DOCS, REQUIRED_PHASE5_STEP_IDS,
+        ReleaseReadinessBundle, read_phase5_gate_report, repo_root, require_files,
+        validate_phase5_gate_report,
     };
+    use rustynetd::exit_codes::ExitCode;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -571,6 +574,44 @@ mod tests {
                 .steps
                 .iter()
                 .all(|step| step.status == GateStepStatus::NotExecuted)
+        );
+    }
+
+    #[test]
+    fn required_readiness_docs_all_exist_in_repo() {
+        let root_dir = repo_root().expect("resolve repository root");
+        let missing: Vec<String> = REQUIRED_DOCS
+            .iter()
+            .filter(|doc| !root_dir.join(doc).is_file())
+            .map(|doc| (*doc).to_owned())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "required readiness docs missing on disk: {missing:?}"
+        );
+        assert!(
+            REQUIRED_DOCS.contains(&CHECKLIST_DOC_PATH),
+            "REQUIRED_DOCS must gate on the canonical checklist path constant"
+        );
+        let bundle =
+            ReleaseReadinessBundle::new(Path::new("artifacts/release/phase5_gate_report.json"));
+        assert_eq!(bundle.checklist_doc, CHECKLIST_DOC_PATH);
+    }
+
+    #[test]
+    fn require_readiness_docs_fail_closed_when_checklist_missing() {
+        let temp_dir = TempDirGuard::create().expect("temp dir");
+        let err = require_files(
+            temp_dir.path(),
+            REQUIRED_DOCS,
+            "required readiness document",
+        )
+        .expect_err("missing readiness docs must fail closed");
+        assert_eq!(err.exit_code, ExitCode::PolicyReject.as_i32());
+        assert!(
+            err.detail.contains(CHECKLIST_DOC_PATH),
+            "failure detail should name the checklist path, got: {}",
+            err.detail
         );
     }
 }
