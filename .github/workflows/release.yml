@@ -50,8 +50,12 @@ jobs:
           # Native ARM Linux runner (free for public repos). If unavailable in
           # your plan, swap for a cross-compile leg on ubuntu-latest.
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, ext: "", family: linux }
-          - { os: macos-14, target: aarch64-apple-darwin, ext: "", family: macos }
-          - { os: macos-13, target: x86_64-apple-darwin, ext: "", family: macos }
+          # macos-14 is retired by GitHub (brownout failures since 2026-07,
+          # fully unsupported 2026-11-02); macos-15 is the free arm64 label.
+          - { os: macos-15, target: aarch64-apple-darwin, ext: "", family: macos }
+          # macos-13 was retired by GitHub (2025); macos-15-intel is the free
+          # x86_64 (Intel) runner label, so the x86_64-apple-darwin leg runs.
+          - { os: macos-15-intel, target: x86_64-apple-darwin, ext: "", family: macos }
           - { os: windows-2022, target: x86_64-pc-windows-msvc, ext: ".exe", family: windows }
     defaults:
       run:
@@ -69,9 +73,23 @@ jobs:
         run: |
           set -euxo pipefail
           T="${{ matrix.target }}"
+          # rustynetd and rustynet-relay are the portable shipping binaries
+          # (PlatformSupportMatrix.md: rustynetd exposes the reviewed Windows
+          # service/config host surface and rustynet-relay carries its SCM host;
+          # both are built by cross-platform-ci.yml's Windows leg).
           cargo build --release --locked --target "$T" -p rustynetd
-          cargo build --release --locked --target "$T" -p rustynet-cli --bin rustynet-cli
           cargo build --release --locked --target "$T" -p rustynet-relay --features daemon
+          # rustynet-cli is Unix-only by design: unconditional `nix` and
+          # `std::os::unix` imports (crates/rustynet-cli/Cargo.toml:117,
+          # crates/rustynet-cli/src/main.rs:102-104,117). Building it on the
+          # Windows leg failed the build job, which skipped `manifest`
+          # (`needs: build`) and so produced no release at all for a v*.*.*
+          # tag. It ships only where it compiles.
+          if [ "${{ matrix.family }}" != "windows" ]; then
+            cargo build --release --locked --target "$T" -p rustynet-cli --bin rustynet-cli
+          else
+            echo "windows leg: skipping rustynet-cli (Unix-only crate; not a Windows artifact)"
+          fi
 
       - name: Stage binaries as <name>-<target>[.exe]
         run: |
@@ -81,9 +99,14 @@ jobs:
           BIN="target/$T/release"
           mkdir -p dist
           cp "$BIN/rustynetd$X"      "dist/rustynetd-$T$X"
-          # rustynet-cli ships as `rustynet`.
-          cp "$BIN/rustynet-cli$X"   "dist/rustynet-$T$X"
           cp "$BIN/rustynet-relay$X" "dist/rustynet-relay-$T$X"
+          # rustynet-cli ships as `rustynet` on the platforms where it builds;
+          # the Windows leg has no such artifact (see the build step above).
+          if [ "${{ matrix.family }}" != "windows" ]; then
+            cp "$BIN/rustynet-cli$X" "dist/rustynet-$T$X"
+          else
+            echo "windows leg: no rustynet-cli artifact to stage"
+          fi
           ls -la dist
 
       # --- Optional per-OS code signing (layered on top of the manifest) ---

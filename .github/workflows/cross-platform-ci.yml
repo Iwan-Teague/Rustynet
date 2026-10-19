@@ -11,7 +11,9 @@ permissions:
 jobs:
   macos:
     name: macOS build+security
-    runs-on: macos-14
+    # macos-14 is retired by GitHub (unsupported 2026-11-02); macos-15 is the
+    # free arm64 label.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Bootstrap CI tools
@@ -342,6 +344,14 @@ jobs:
           # Text-only checks + self-test battery (must reject the pre-fix
           # script shape); uses only grep/awk, no pwsh required on this leg.
           ./scripts/ci/windows_provisioner_download_integrity_gates.sh
+          # Q1: static gate for the release workflow's Windows leg — the
+          # Unix-only orchestrator crate (rustynet-cli) must not be built or
+          # staged on the Windows matrix row, or the release build fails and
+          # the signed `manifest` job (needs: build) is skipped so no
+          # v*.*.* tag can ever publish. Text-only checks + self-test
+          # battery (must reject the pre-fix unguarded shape); uses only
+          # grep/awk, no pwsh required on this leg.
+          ./scripts/ci/release_workflow_windows_leg_gate.sh
 
   supply_chain:
     name: cargo-vet supply-chain audit
