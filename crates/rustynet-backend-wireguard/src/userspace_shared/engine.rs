@@ -17,6 +17,7 @@ use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 #[cfg(not(target_os = "android"))]
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(not(target_os = "android"))]
@@ -213,6 +214,32 @@ pub(crate) struct UserspaceEngine {
     /// the endpoint match and never panicked over (a panic here would tear
     /// down the engine's single worker thread and every live session).
     receiver_index_divergence_drops: u64,
+    /// Count of decrypted inbound data frames DROPPED because the sending peer
+    /// was not the longest-prefix owner of the frame's inner source address
+    /// (M26). boringtun hands the parsed inner source to the engine and the
+    /// engine used to discard it, so any enrolled peer could write packets with
+    /// a spoofed inner source straight to the TUN. The packet path fails closed
+    /// on a mismatch — the frame is dropped and counted, never written to the
+    /// TUN, never panicked over and never errored into the worker thread (a
+    /// panic/error here would tear down the engine's single worker thread and
+    /// every live session). A source no configured network contains is unowned
+    /// and therefore dropped too (default deny). The counter currently has no
+    /// operator-facing surface (the engine's `stats()` reports bytes only); the
+    /// M26 follow-up is to export it through an existing stats/health path.
+    allowed_ips_source_drops: u64,
+    /// M26 cryptokey routing: every configured peer's allowed network, flattened
+    /// into one engine-wide table and sorted by DESCENDING prefix length (ties
+    /// broken by descending `NodeId`), so the FIRST entry whose network contains
+    /// an inner source is that source's longest-prefix owner across ALL peers —
+    /// exactly the peer `select_peer_for_destination` would choose for the same
+    /// address. Inbound and outbound therefore agree by construction.
+    ///
+    /// Rebuilt in lockstep with `peer_states` by `configure_peer` /
+    /// `remove_peer`, the only two mutators that change the allowed-ips set
+    /// (`update_peer_endpoint` moves an address only). It is a separate field
+    /// rather than a derived scan because the inbound path already holds
+    /// `peer_states` mutably when it needs the owner.
+    source_owner_table: Vec<(AllowedIpNetwork, NodeId)>,
     path_quality: BTreeMap<NodeId, PeerPathQuality>,
     /// F9: latest PSK re-key classification per peer (latest wins; the
     /// condition is per-peer and current, not a history). Empty unless a
@@ -467,6 +494,8 @@ impl UserspaceEngine {
             endpoint_index: BTreeMap::new(),
             receiver_index: HashMap::new(),
             receiver_index_divergence_drops: 0,
+            allowed_ips_source_drops: 0,
+            source_owner_table: Vec::new(),
             path_quality: BTreeMap::new(),
             preshared_key_rekey_classifications: BTreeMap::new(),
             recorded_peer_ciphertext_ingress: Vec::new(),
@@ -505,6 +534,18 @@ impl UserspaceEngine {
             .iter()
             .map(|cidr| AllowedIpNetwork::parse(cidr))
             .collect::<Result<Vec<_>, _>>()?;
+        // Reject an empty allowed-ips set for parity with the kernel backend
+        // (`linux_command.rs`, which refuses the same input) and with the
+        // daemon, which never emits one. An empty set is not a valid peer:
+        // WireGuard has no notion of a peer that may route nothing, and the
+        // inbound owner check treats every inner source as unowned, so
+        // accepting it would configure a peer that can never carry traffic
+        // while silently looking healthy. Refuse loudly instead.
+        if allowed_ips.is_empty() {
+            return Err(BackendError::invalid_input(
+                "peer allowed_ips must not be empty",
+            ));
+        }
 
         // Re-applying identical material must NOT disturb the live session.
         //
@@ -644,6 +685,7 @@ impl UserspaceEngine {
             self.unlink_endpoint(previous_endpoint, &peer.node_id);
         }
         self.link_endpoint(endpoint, peer.node_id.clone());
+        self.rebuild_source_owner_table();
         #[cfg(any(test, debug_assertions))]
         self.verify_receiver_index_consistent();
         Ok(disposition)
@@ -692,6 +734,8 @@ impl UserspaceEngine {
             peer_state,
             transport_generation,
             initial_result,
+            &mut self.allowed_ips_source_drops,
+            &self.source_owner_table,
             &mut self.recorded_tunnel_plaintext_packets,
             sink,
         )
@@ -747,6 +791,8 @@ impl UserspaceEngine {
                 peer_state,
                 transport_generation,
                 result,
+                &mut self.allowed_ips_source_drops,
+                &self.source_owner_table,
                 &mut self.recorded_tunnel_plaintext_packets,
                 sink,
             )? {
@@ -798,9 +844,36 @@ impl UserspaceEngine {
             }
             None => false,
         };
+        if removed {
+            self.rebuild_source_owner_table();
+        }
         #[cfg(any(test, debug_assertions))]
         self.verify_receiver_index_consistent();
         removed
+    }
+
+    /// M26: rebuild the flattened `(allowed network, owner)` table from
+    /// `peer_states`. Called from the only two mutators that change the
+    /// allowed-ips set. The sort key is descending prefix length, ties broken
+    /// by descending `NodeId`: `select_peer_for_destination` scans the
+    /// ascending-`NodeId` `peer_states` map and keeps the last equally-longest
+    /// match (`Iterator::max_by_key` returns the LAST maximum), i.e. the
+    /// HIGHEST `NodeId` on a tie — so the first entry here that contains an
+    /// address is exactly that function's answer.
+    fn rebuild_source_owner_table(&mut self) {
+        self.source_owner_table.clear();
+        for (node_id, peer_state) in &self.peer_states {
+            for network in &peer_state.allowed_ips {
+                self.source_owner_table.push((*network, node_id.clone()));
+            }
+        }
+        self.source_owner_table
+            .sort_by(|(network_a, node_a), (network_b, node_b)| {
+                network_b
+                    .prefix_len
+                    .cmp(&network_a.prefix_len)
+                    .then_with(|| node_b.cmp(node_a))
+            });
     }
 
     /// Add `node_id` to the reverse-index entry for `endpoint`.
@@ -866,6 +939,8 @@ impl UserspaceEngine {
             endpoint_index,
             receiver_index,
             receiver_index_divergence_drops,
+            allowed_ips_source_drops,
+            source_owner_table,
             #[cfg(test)]
             recorded_peer_ciphertext_ingress,
             recorded_tunnel_plaintext_packets,
@@ -930,6 +1005,8 @@ impl UserspaceEngine {
             remote_addr,
             transport_generation,
             initial_result,
+            allowed_ips_source_drops,
+            source_owner_table,
             recorded_tunnel_plaintext_packets,
             decrypt_follow_up_scratch,
             sink,
@@ -956,6 +1033,8 @@ impl UserspaceEngine {
 
         let Self {
             peer_states,
+            allowed_ips_source_drops,
+            source_owner_table,
             recorded_tunnel_plaintext_packets,
             encrypt_scratch,
             ..
@@ -985,6 +1064,8 @@ impl UserspaceEngine {
             peer_state,
             transport_generation,
             initial_result,
+            allowed_ips_source_drops,
+            source_owner_table,
             recorded_tunnel_plaintext_packets,
             sink,
         )
@@ -1217,6 +1298,12 @@ impl UserspaceEngine {
         self.receiver_index_divergence_drops
     }
 
+    /// Test-only read of the M26 inbound allowed-ips source-drop counter.
+    #[cfg(test)]
+    pub(crate) fn allowed_ips_source_drops(&self) -> u64 {
+        self.allowed_ips_source_drops
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     /// Pick the outbound peer by LONGEST-PREFIX match over `allowed_ips`, the
     /// rule WireGuard itself uses for its allowed-ips routing table.
@@ -1230,20 +1317,93 @@ impl UserspaceEngine {
     /// *is* the right peer for its own address) while every client-to-client
     /// flow is silently blackholed through the exit.
     fn select_peer_for_destination(&self, dst_addr: IpAddr) -> Option<NodeId> {
-        self.peer_states
-            .iter()
-            .filter_map(|(node_id, peer_state)| {
-                peer_state
-                    .allowed_ips
-                    .iter()
-                    .filter(|allowed_ip| allowed_ip.contains(dst_addr))
-                    .map(|allowed_ip| allowed_ip.prefix_len)
-                    .max()
-                    .map(|prefix_len| (prefix_len, node_id))
-            })
-            .max_by_key(|(prefix_len, _node_id)| *prefix_len)
-            .map(|(_prefix_len, node_id)| node_id.clone())
+        // DELEGATES to the same table the inbound owner check uses, so the two
+        // directions cannot drift apart. The table is sorted (prefix length
+        // descending, then NodeId descending), which is exactly this function's
+        // former rule: highest prefix wins, and an equal-prefix tie resolves to
+        // the highest NodeId (`Iterator::max_by_key` over the ascending-NodeId
+        // map returned the LAST maximum). See `rebuild_source_owner_table`.
+        source_owner(&self.source_owner_table, dst_addr).cloned()
     }
+}
+
+/// Total malformed inner packets dropped before a TUN write since start-up.
+static TUN_WRITE_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+/// Log the first drop, then one line every this many drops (rate limiting).
+const TUN_DROP_LOG_INTERVAL: u64 = 1024;
+
+/// Defense-in-depth validator for an inbound inner IP packet just before it
+/// reaches the TUN device (`M27`). Returns the drop reason for any packet a
+/// TUN stack must never see: empty, truncated, internally inconsistent
+/// (`total length` vs header/actual length), or of an unsupported IP version.
+/// Boringtun already rejects most of these at decapsulation time, but its v4
+/// fast path returns `&packet[..tot_len]` trusting the header field — a
+/// malformed frame that slips through would tear down the worker on write
+/// (`tot_len = 0` slice) and reset the whole dataplane. Fail closed: when in
+/// doubt, drop.
+fn inner_packet_tun_drop_reason(plaintext: &[u8]) -> Option<&'static str> {
+    if plaintext.is_empty() {
+        return Some("empty inner packet (tot_len = 0)");
+    }
+    let (version_nibble, _rest) = plaintext.split_first()?;
+    match version_nibble >> 4 {
+        4 => {
+            if plaintext.len() < 20 {
+                return Some("truncated IPv4 inner packet (len < 20)");
+            }
+            let ihl_bytes = usize::from(version_nibble & 0x0f) * 4;
+            if ihl_bytes < 20 {
+                return Some("IPv4 IHL below minimum header size (IHL < 5)");
+            }
+            if ihl_bytes > plaintext.len() {
+                return Some("IPv4 IHL exceeds inner packet length");
+            }
+            let mut tot_len_bytes = [0u8; 2];
+            if let Some(field) = plaintext.get(2..4) {
+                tot_len_bytes.copy_from_slice(field);
+            }
+            let tot_len = usize::from(u16::from_be_bytes(tot_len_bytes));
+            if tot_len < ihl_bytes {
+                return Some("IPv4 total length shorter than its own header");
+            }
+            if tot_len > plaintext.len() {
+                return Some("IPv4 total length exceeds inner packet length");
+            }
+            None
+        }
+        6 => {
+            if plaintext.len() < 40 {
+                return Some("truncated IPv6 inner packet (len < 40)");
+            }
+            None
+        }
+        _ => Some("unsupported inner IP version"),
+    }
+}
+
+/// Rate-limited, metadata-only drop notice: no payload bytes, no addresses.
+fn note_tun_write_drop(reason: &'static str, len: usize) {
+    let drops = TUN_WRITE_DROP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if drops == 1 || drops % TUN_DROP_LOG_INTERVAL == 0 {
+        eprintln!(
+            "rustynet: dropped malformed inner packet before TUN write (reason={reason}, len={len}, total_drops={drops})"
+        );
+    }
+}
+
+/// The ONLY path through which engine plaintext reaches the TUN device.
+/// Malformed inner packets are counted, logged (rate limited) and swallowed
+/// with `Ok(())`: one bad frame must never fail the drive call and tear down
+/// the worker (the M27 dataplane reset).
+fn write_plaintext_checked<S: EngineIoSink>(
+    sink: &mut S,
+    plaintext: &[u8],
+) -> Result<(), BackendError> {
+    if let Some(reason) = inner_packet_tun_drop_reason(plaintext) {
+        note_tun_write_drop(reason, plaintext.len());
+        return Ok(());
+    }
+    sink.write_plaintext(plaintext)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1253,6 +1413,8 @@ fn drive_inbound_result<S: EngineIoSink>(
     remote_addr: SocketAddr,
     transport_generation: u64,
     initial_result: TunnResult<'_>,
+    allowed_ips_source_drops: &mut u64,
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
     follow_up_scratch: &mut [u8],
     sink: &mut S,
@@ -1275,6 +1437,8 @@ fn drive_inbound_result<S: EngineIoSink>(
         remote_addr,
         transport_generation,
         initial_result,
+        source_owner_table,
+        allowed_ips_source_drops,
         recorded_tunnel_plaintext_packets,
         sink,
     )?;
@@ -1292,6 +1456,8 @@ fn drive_inbound_result<S: EngineIoSink>(
                 remote_addr,
                 transport_generation,
                 follow_up,
+                source_owner_table,
+                allowed_ips_source_drops,
                 recorded_tunnel_plaintext_packets,
                 sink,
             )?;
@@ -1314,7 +1480,7 @@ fn drive_inbound_result<S: EngineIoSink>(
     }
 
     if let Some(plaintext) = deferred_plaintext.take() {
-        sink.write_plaintext(plaintext)?;
+        write_plaintext_checked(sink, plaintext)?;
     }
 
     Ok(
@@ -1324,11 +1490,14 @@ fn drive_inbound_result<S: EngineIoSink>(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
 fn drive_outbound_result<S: EngineIoSink>(
     node_id: &NodeId,
     peer_state: &mut PeerEngineState,
     transport_generation: u64,
     initial_result: TunnResult<'_>,
+    allowed_ips_source_drops: &mut u64,
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
     sink: &mut S,
 ) -> Result<Option<(NodeId, u64)>, BackendError> {
@@ -1343,10 +1512,12 @@ fn drive_outbound_result<S: EngineIoSink>(
         peer_state.endpoint,
         transport_generation,
         initial_result,
+        source_owner_table,
+        allowed_ips_source_drops,
         recorded_tunnel_plaintext_packets,
         sink,
     )? {
-        sink.write_plaintext(plaintext)?;
+        write_plaintext_checked(sink, plaintext)?;
     }
     Ok(
         authenticated_handshake_unix(&peer_state.tunnel)
@@ -1361,26 +1532,54 @@ fn drive_outbound_result<S: EngineIoSink>(
 /// (still borrowed) so the caller can sequence it relative to any ciphertext
 /// that a subsequent drain iteration produces, matching the
 /// ciphertext-then-plaintext application order the runtime has always used.
+#[allow(clippy::too_many_arguments)]
 fn handle_single_tunn_result<'result, S: EngineIoSink>(
     node_id: &NodeId,
     remote_addr: SocketAddr,
     transport_generation: u64,
     result: TunnResult<'result>,
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
+    allowed_ips_source_drops: &mut u64,
     recorded_tunnel_plaintext_packets: &mut Vec<RecordedTunnelPlaintextPacket>,
     sink: &mut S,
 ) -> Result<Option<&'result [u8]>, BackendError> {
-    // `node_id` is consumed only by the `cfg(test)` plaintext-recording fixtures
-    // below; in production builds it is otherwise unused now that the redundant
-    // per-result handshake observation has moved to the drive functions.
-    #[cfg(not(test))]
-    let _ = node_id;
     match result {
         TunnResult::Done | TunnResult::Err(_) => Ok(None),
         TunnResult::WriteToNetwork(packet) => {
             sink.send_ciphertext(remote_addr, packet)?;
             Ok(None)
         }
-        TunnResult::WriteToTunnelV4(packet, _src_addr) => {
+        TunnResult::WriteToTunnelV4(packet, src_addr) => {
+            // M26 cryptokey routing: reproduce WireGuard's rule — the sending
+            // peer must be the LONGEST-PREFIX OWNER of the decrypted inner
+            // source across ALL configured peers. The kernel accepts a frame
+            // iff the source lookup names this peer; the first pass checked
+            // only that one of the sender's own networks covered the source,
+            // which is weaker: an exit peer carrying `0.0.0.0/0` could also
+            // write another peer's more specific mesh `/32`. That escape is
+            // what this check closes.
+            //
+            // Residual, stated precisely: an address that NO peer owns more
+            // specifically (the local node's tunnel address, or `127.0.0.1`,
+            // under an exit's `0.0.0.0/0`) remains owned by that exit, exactly
+            // as kernel WireGuard's lookup would treat it. Since
+            // `service_access_state` treats the inner source as identity for
+            // NAS/LLM access, carving local/loopback addresses out of this
+            // table is a separate policy follow-up; this change does not claim
+            // to provide one.
+            //
+            // `source_owner` returns the same peer `select_peer_for_destination`
+            // would route the address to, so inbound and outbound agree. Fail
+            // closed: drop the frame and count it. This never panics and never
+            // returns an error, because the engine runs on a single worker
+            // thread that a panic/error would tear down for every live session
+            // (the same discipline as the receiver-index divergence drop above).
+            // With no configured network containing the source, `source_owner`
+            // is `None`, so the frame is dropped — default deny.
+            if source_owner(source_owner_table, IpAddr::V4(src_addr)) != Some(node_id) {
+                *allowed_ips_source_drops = allowed_ips_source_drops.saturating_add(1);
+                return Ok(None);
+            }
             // Unbounded-growth guard: production code never reads
             // `recorded_tunnel_plaintext_packets`; appending every plaintext frame
             // would retain the cleartext of every tunneled packet and grow without
@@ -1400,7 +1599,12 @@ fn handle_single_tunn_result<'result, S: EngineIoSink>(
             }
             Ok(Some(packet))
         }
-        TunnResult::WriteToTunnelV6(packet, _src_addr) => {
+        TunnResult::WriteToTunnelV6(packet, src_addr) => {
+            // M26 cryptokey routing, IPv6 arm — see the V4 arm above.
+            if source_owner(source_owner_table, IpAddr::V6(src_addr)) != Some(node_id) {
+                *allowed_ips_source_drops = allowed_ips_source_drops.saturating_add(1);
+                return Ok(None);
+            }
             #[cfg(test)]
             {
                 let recorded_packet = RecordedTunnelPlaintextPacket {
@@ -1417,6 +1621,32 @@ fn handle_single_tunn_result<'result, S: EngineIoSink>(
             Ok(Some(packet))
         }
     }
+}
+
+/// M26: the longest-prefix OWNER of `source` across ALL configured peers, or
+/// `None` when no configured network contains it.
+///
+/// `source_owner_table` is pre-sorted by descending prefix length, ties broken
+/// by descending `NodeId`, so the first entry that contains `source` is its
+/// longest-prefix owner — the same peer `select_peer_for_destination` would
+/// route the address to. (With no table entry, the source is unowned:
+/// default deny.) `AllowedIpNetwork::contains` is discriminant-safe, so an
+/// IPv4 source can never match an IPv6 network and vice versa — a v4-mapped
+/// `::ffff:a.b.c.d` is an IPv6 address and does not match a `10.0.0.0/8`
+/// entry.
+///
+/// This reproduces WireGuard's cryptokey-routing lookup. The first pass only
+/// asked whether one of the SENDER's own networks covered the source, which is
+/// weaker: being covered by the sender's network is not enough when another
+/// peer owns a longer prefix over the same address.
+fn source_owner(
+    source_owner_table: &[(AllowedIpNetwork, NodeId)],
+    source: IpAddr,
+) -> Option<&NodeId> {
+    source_owner_table
+        .iter()
+        .find(|(network, _node_id)| network.contains(source))
+        .map(|(_network, node_id)| node_id)
 }
 
 fn authenticated_handshake_unix(tunnel: &Tunn) -> Option<u64> {
@@ -1467,7 +1697,6 @@ impl AllowedIpNetwork {
         }
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn contains(&self, addr: IpAddr) -> bool {
         std::mem::discriminant(&self.network) == std::mem::discriminant(&addr)
             && mask_ip(addr, self.prefix_len) == self.network
@@ -3733,6 +3962,8 @@ mod tests {
             remote_addr(),
             42,
             TunnResult::WriteToNetwork(&mut packet),
+            &[],
+            &mut 0,
             &mut recorded,
             &mut sink,
         )
@@ -3763,6 +3994,8 @@ mod tests {
                 remote_addr(),
                 42,
                 result,
+                &[],
+                &mut 0,
                 &mut recorded,
                 &mut sink,
             )
@@ -3780,6 +4013,17 @@ mod tests {
         let node_id = NodeId::new("sender").expect("node id");
         let mut recorded = Vec::new();
         let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let source_owner_table = vec![
+            (
+                super::AllowedIpNetwork::parse("10.0.0.0/8").expect("parse"),
+                node_id.clone(),
+            ),
+            (
+                super::AllowedIpNetwork::parse("::/0").expect("parse"),
+                node_id.clone(),
+            ),
+        ];
         let mut v4_frame = vec![0xAB; 100];
         let v4_expected = v4_frame.clone();
 
@@ -3788,6 +4032,8 @@ mod tests {
             remote_addr(),
             7,
             TunnResult::WriteToTunnelV4(&mut v4_frame, Ipv4Addr::from([10, 0, 0, 1])),
+            &source_owner_table,
+            &mut drops,
             &mut recorded,
             &mut sink,
         )
@@ -3819,6 +4065,8 @@ mod tests {
             remote_addr(),
             8,
             TunnResult::WriteToTunnelV6(&mut v6_frame, std::net::Ipv6Addr::LOCALHOST),
+            &source_owner_table,
+            &mut drops,
             &mut recorded,
             &mut sink,
         )
@@ -3826,6 +4074,7 @@ mod tests {
         assert_eq!(dispatched, Some(&v6_expected[..]));
         assert_eq!(recorded.len(), 2, "V6 frame recorded too");
         assert!(sink.events.is_empty());
+        assert_eq!(drops, 0, "both in-allowed sources must be delivered");
     }
 
     #[cfg(not(target_os = "android"))]
@@ -3840,21 +4089,35 @@ mod tests {
 
         let mut recorded = Vec::new();
         let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
         let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
-        let mut plaintext_frame = vec![0x42; 96];
+        // A well-formed 96-byte IPv4 frame (IHL=5, total length = 96): since
+        // the M27 TUN-write validator every flushed frame must parse as a
+        // sane inner packet, otherwise it is silently dropped.
+        let mut plaintext_frame = {
+            let mut frame = vec![0x42u8; 96];
+            frame[0] = 0x45;
+            frame[2] = 0x00;
+            frame[3] = 0x60;
+            frame
+        };
         let plaintext_expected = plaintext_frame.clone();
 
         // A freshly configured tunnel has no established session, so the
         // follow-up drain's `decapsulate(None, &[], _)` deterministically
         // yields Done — the loop below must emit nothing and then flush the
-        // deferred inbound plaintext exactly once, at the END.
+        // deferred inbound plaintext exactly once, at the END. The inner
+        // source (100.64.0.5) is covered by the peer's 100.64.0.5/32
+        // allowed-ips, so the M26 cryptokey-routing check delivers it.
         let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
         let outcome = super::drive_inbound_result(
             &node_id,
             peer_state,
             endpoint,
             42,
-            TunnResult::WriteToTunnelV4(&mut plaintext_frame, Ipv4Addr::from([10, 0, 0, 2])),
+            TunnResult::WriteToTunnelV4(&mut plaintext_frame, Ipv4Addr::from([100, 64, 0, 5])),
+            &mut drops,
+            &engine.source_owner_table,
             &mut recorded,
             follow_up_scratch.as_mut_slice(),
             &mut sink,
@@ -3868,6 +4131,10 @@ mod tests {
             "deferred inbound plaintext must be flushed exactly once, AFTER the (inert) drain loop"
         );
         assert_eq!(
+            drops, 0,
+            "an in-allowed inner source must never increment the drop counter"
+        );
+        assert_eq!(
             recorded,
             vec![super::RecordedTunnelPlaintextPacket {
                 node_id: node_id.clone(),
@@ -3875,6 +4142,395 @@ mod tests {
                 transport_generation: 42,
             }],
             "recorder must see the same frame with the same generation"
+        );
+    }
+
+    // ---- M27: TUN-write inner-packet validator (defense in depth) ----
+
+    fn v4_frame(total_len: u16, ihl_words: u8, len: usize) -> Vec<u8> {
+        let mut frame = vec![0x11u8; len];
+        frame[0] = 0x40 | ihl_words;
+        frame[2..4].copy_from_slice(&total_len.to_be_bytes());
+        frame
+    }
+
+    fn v6_frame(len: usize) -> Vec<u8> {
+        let mut frame = vec![0x22u8; len];
+        frame[0] = 0x60;
+        frame
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_empty_inner_packet() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&[]),
+            Some("empty inner packet (tot_len = 0)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_zero_total_length_field() {
+        // The exact M27 shape: a syntactically present 20-byte IPv4 header
+        // whose total-length field is 0 (boringtun would slice [..0]).
+        // Check order is deterministic, so pin the exact reason: this frame
+        // is ONLY caught by the total-length-vs-header consistency check.
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(0, 5, 20)),
+            Some("IPv4 total length shorter than its own header")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_truncated_ipv4_header() {
+        // Check order is deterministic, so pin the exact reason: both frames
+        // are ONLY caught by the len < 20 minimum (the 19-byte IHL=5 frame
+        // would also trip the IHL check if that ran first — it does not).
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(19, 5, 19)),
+            Some("truncated IPv4 inner packet (len < 20)")
+        );
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(15, 2, 15)),
+            Some("truncated IPv4 inner packet (len < 20)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_total_length_beyond_buffer() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(u16::MAX, 5, 20)),
+            Some("IPv4 total length exceeds inner packet length")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_ihl_beyond_buffer() {
+        // IHL = 0xF (60 bytes) but only 20 bytes present. Check order is
+        // deterministic, so pin the exact reason: this frame is ONLY caught
+        // by the IHL-vs-length check (the later total-length checks would
+        // report a different reason).
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(20, 0x0f, 20)),
+            Some("IPv4 IHL exceeds inner packet length")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_ihl_below_minimum() {
+        // Review F1: an RFC-invalid IHL < 5 (header claim shorter than the
+        // 20-byte IPv4 minimum) must be dropped, not written to the TUN.
+        // IHL = 3 claims 12 header bytes while 24 bytes are present, so the
+        // len >= 20 and IHL-vs-length checks pass and ONLY the IHL < 5
+        // minimum can produce this exact reason.
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(24, 3, 24)),
+            Some("IPv4 IHL below minimum header size (IHL < 5)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_truncated_ipv6_packet() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v6_frame(39)),
+            Some("truncated IPv6 inner packet (len < 40)")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_flags_unsupported_ip_version() {
+        let mut frame = vec![0u8; 20];
+        frame[0] = 0x50;
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&frame),
+            Some("unsupported inner IP version")
+        );
+    }
+
+    #[test]
+    fn tun_write_drop_validator_accepts_well_formed_frames() {
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(20, 5, 20)),
+            None
+        );
+        assert_eq!(
+            super::inner_packet_tun_drop_reason(&v4_frame(96, 5, 96)),
+            None
+        );
+        assert_eq!(super::inner_packet_tun_drop_reason(&v6_frame(40)), None);
+        assert_eq!(super::inner_packet_tun_drop_reason(&v6_frame(80)), None);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_inbound_drive_swallows_malformed_frames() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(31);
+        // The inner sources below are IN the peer's allowed-ips, so the M26
+        // ownership gate delivers them and ONLY the M27 length validator can
+        // drop these frames (the two counters must stay independent).
+        let node_id = configure_peer_at(&mut engine, "peer-m27", endpoint, 0x55, "100.64.0.7/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        // The M27 kill: a zero-length "plaintext" (tot_len = 0 slice)...
+        let outcome = super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut [], Ipv4Addr::from([100, 64, 0, 7])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("a malformed inner packet must NOT fail the drive");
+        assert_eq!(outcome, None);
+        // ...and a truncated 19-byte v4 header.
+        let mut short_frame = v4_frame(19, 5, 19);
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut short_frame, Ipv4Addr::from([100, 64, 0, 7])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("a malformed inner packet must NOT fail the drive");
+
+        assert!(
+            sink.events.is_empty(),
+            "no malformed frame may reach the TUN sink"
+        );
+        assert_eq!(
+            recorded.len(),
+            2,
+            "the cfg(test) recorder still observes both frames pre-drop"
+        );
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            2,
+            "each malformed frame must bump the drop counter exactly once"
+        );
+        assert_eq!(
+            drops, 0,
+            "an in-allowed source must NOT move the M26 source-drop counter"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_outbound_drive_swallows_empty_frame() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(32);
+        let node_id = configure_peer_at(&mut engine, "peer-m27b", endpoint, 0x66, "100.64.0.8/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        super::drive_outbound_result(
+            &node_id,
+            peer_state,
+            42,
+            TunnResult::WriteToTunnelV4(&mut [], Ipv4Addr::from([100, 64, 0, 8])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("a malformed inner packet must NOT fail the drive");
+
+        assert!(sink.events.is_empty());
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            1
+        );
+        assert_eq!(
+            drops, 0,
+            "an in-allowed source must NOT move the M26 source-drop counter"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_valid_frames_still_reach_tun() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(33);
+        // Two peers, one per family, so BOTH frames carry in-allowed inner
+        // sources under the M26 ownership gate (a v6 source is never covered
+        // by a v4 allowed-ip).
+        let node_v4 = configure_peer_at(&mut engine, "peer-m27c", endpoint, 0x77, "100.64.0.9/32");
+        let node_v6 = configure_peer_at(&mut engine, "peer-m27e", endpoint, 0x88, "fd00::9/128");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let mut v4_frame = v4_frame(20, 5, 20);
+        let v4_expected = v4_frame.clone();
+        let peer_state = engine.peer_states.get_mut(&node_v4).expect("peer");
+        super::drive_inbound_result(
+            &node_v4,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut v4_frame, Ipv4Addr::from([100, 64, 0, 9])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("valid v4 frame must drive cleanly");
+
+        let mut v6_frame = v6_frame(40);
+        let v6_expected = v6_frame.clone();
+        let peer_state = engine.peer_states.get_mut(&node_v6).expect("peer");
+        super::drive_inbound_result(
+            &node_v6,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV6(
+                &mut v6_frame,
+                std::net::Ipv6Addr::from([0xfd00, 0, 0, 0, 0, 0, 0, 9]),
+            ),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("valid v6 frame must drive cleanly");
+
+        assert_eq!(
+            sink.events,
+            vec![
+                SinkEvent::Plaintext(v4_expected),
+                SinkEvent::Plaintext(v6_expected)
+            ],
+            "well-formed inner packets must still be written, in order"
+        );
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            0,
+            "valid frames must never bump the drop counter"
+        );
+        assert_eq!(
+            drops, 0,
+            "in-allowed sources must never bump the M26 source-drop counter"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn tun_write_drop_counters_stay_independent_for_spoofed_malformed_frame() {
+        use boringtun::noise::TunnResult;
+        use std::sync::atomic::Ordering;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(34);
+        let node_id = configure_peer_at(&mut engine, "peer-m27f", endpoint, 0x99, "100.64.0.10/32");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
+        let tun_drops_before = super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed);
+
+        let peer_state = engine.peer_states.get_mut(&node_id).expect("peer");
+        // Source 10.99.99.99 is owned by NO peer: the M26 ownership gate must
+        // drop this frame BEFORE the M27 TUN-write validator is ever reached,
+        // and exactly one of the two counters must move.
+        let outcome = super::drive_inbound_result(
+            &node_id,
+            peer_state,
+            endpoint,
+            42,
+            TunnResult::WriteToTunnelV4(&mut [], Ipv4Addr::from([10, 99, 99, 99])),
+            &mut drops,
+            &engine.source_owner_table,
+            &mut recorded,
+            follow_up_scratch.as_mut_slice(),
+            &mut sink,
+        )
+        .expect("a spoofed inner source must NOT fail the drive");
+        assert_eq!(outcome, None);
+
+        assert!(
+            sink.events.is_empty(),
+            "a spoofed frame must never reach the TUN"
+        );
+        assert!(
+            recorded.is_empty(),
+            "a spoofed frame must be dropped before the recorder too"
+        );
+        assert_eq!(drops, 1, "the M26 source-drop counter must count the spoof");
+        assert_eq!(
+            super::TUN_WRITE_DROP_COUNT.load(Ordering::Relaxed) - tun_drops_before,
+            0,
+            "the M27 TUN-write drop counter must NOT count a frame the M26 gate already dropped"
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn remove_peer_rebuilds_the_source_owner_table() {
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let endpoint = remote_addr();
+        let mut engine = fresh_engine(35);
+        let source_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+
+        let owner = configure_peer_at(&mut engine, "owner-a", endpoint, 0x91, "10.0.0.9/32");
+        assert_eq!(
+            super::source_owner(&engine.source_owner_table, source_ip),
+            Some(&owner),
+            "the configured peer must own its network before removal"
+        );
+
+        assert!(engine.remove_peer(&owner), "the owner peer must be removed");
+        assert_eq!(
+            super::source_owner(&engine.source_owner_table, source_ip),
+            None,
+            "a removed owner must not keep stale-owning its network: \
+             remove_peer must rebuild the source owner table"
+        );
+
+        let taker = configure_peer_at(&mut engine, "taker-b", endpoint, 0x92, "10.0.0.9/32");
+        assert_eq!(
+            super::source_owner(&engine.source_owner_table, source_ip),
+            Some(&taker),
+            "after the removal rebuild, the newly configured peer must be the sole owner"
         );
     }
 
@@ -3891,6 +4547,7 @@ mod tests {
 
         let mut recorded = Vec::new();
         let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
         let mut follow_up_scratch = vec![0u8; super::MAX_ENCRYPTED_PACKET_BYTES];
 
         // An initial Err skips the drain entirely (fail closed on that call's
@@ -3902,6 +4559,8 @@ mod tests {
             endpoint,
             42,
             TunnResult::Err(WireGuardError::ConnectionExpired),
+            &mut drops,
+            &engine.source_owner_table,
             &mut recorded,
             follow_up_scratch.as_mut_slice(),
             &mut sink,
@@ -3911,6 +4570,7 @@ mod tests {
         assert_eq!(outcome, None);
         assert!(sink.events.is_empty(), "an initial Err must emit nothing");
         assert!(recorded.is_empty());
+        assert_eq!(drops, 0);
     }
 
     /// Regression test for the handshake-initiation scratch reuse: peers take
@@ -4024,17 +4684,25 @@ mod tests {
 
     /// Builds a minimal IPv4 packet (no checksum — boringtun neither verifies
     /// nor recomputes it on the encapsulate/decapsulate path) of
-    /// `payload_len` zero bytes destined for `100.64.8.1`, which falls inside
-    /// the test peer's allowed_ips.
-    fn ipv4_packet_for_peer(payload_len: usize) -> Vec<u8> {
+    /// `payload_len` zero bytes from `source` destined for `100.64.8.1`
+    /// (inside the test peer's allowed_ips).
+    fn ipv4_packet_with_source(source: [u8; 4], payload_len: usize) -> Vec<u8> {
         let total_len = 20 + payload_len;
         let mut packet = vec![0u8; total_len];
         packet[0] = 0x45; // version 4, IHL 5
         packet[8] = 64; // TTL
         packet[9] = 6; // proto TCP (arbitrary; datapath does not inspect)
         packet[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        packet[12..16].copy_from_slice(&source); // source
         packet[16..20].copy_from_slice(&[100, 64, 8, 1]); // destination
         packet
+    }
+
+    /// Builds a minimal IPv4 packet from a source (`100.64.8.2`) that is
+    /// inside the test peer's allowed-ips, so the inbound M26 cryptokey-routing
+    /// check accepts it.
+    fn ipv4_packet_for_peer(payload_len: usize) -> Vec<u8> {
+        ipv4_packet_with_source([100, 64, 8, 2], payload_len)
     }
 
     /// Advance the clock boringtun's timers read. Every build of this
@@ -4611,14 +5279,37 @@ mod tests {
         /// the KEEPALIVE+REKEY_TIMEOUT initiation branch for every later
         /// tick of this helper (`data_packet_sent > aut_packet_received` is
         /// false — both carry the same +1s stamp — and the flag is clear).
+        ///
+        /// Uses the in-allowed source `100.64.8.2`; see
+        /// `counterpart_sends_frame_with_source_to_engine` for the raw hook.
         fn counterpart_sends_frame_to_engine(
             &mut self,
             payload_len: usize,
             transport_generation: u64,
         ) -> Vec<u8> {
+            self.counterpart_sends_frame_with_source_to_engine(
+                [100, 64, 8, 2],
+                payload_len,
+                transport_generation,
+            )
+            .expect("an in-allowed inner source must be delivered")
+        }
+
+        /// Sends one data frame with an explicit inner IPv4 `source` FROM the
+        /// counterpart TO the engine. Returns `Some(plaintext)` when the
+        /// engine surfaced the decrypted frame, and `None` when the engine
+        /// dropped it (M26: the inner source was not covered by the peer's
+        /// allowed-ips). Proves the cryptokey-routing drop happens AFTER a
+        /// genuine decrypt, on a real session, and emits nothing else.
+        fn counterpart_sends_frame_with_source_to_engine(
+            &mut self,
+            source: [u8; 4],
+            payload_len: usize,
+            transport_generation: u64,
+        ) -> Option<Vec<u8>> {
             use boringtun::noise::TunnResult;
 
-            let plaintext = ipv4_packet_for_peer(payload_len);
+            let plaintext = ipv4_packet_with_source(source, payload_len);
             let outbound = match self
                 .counterpart
                 .encapsulate(&plaintext, &mut self.counterpart_buf)
@@ -4638,19 +5329,23 @@ mod tests {
                 .expect("return frame never errors")
                 .expect("the return frame names the live peer-x session");
             assert_eq!(observed_peer, self.node_id, "the return frame is peer-x's");
-            match self.sink.events.pop() {
-                Some(SinkEvent::Plaintext(decrypted)) => assert_eq!(
-                    decrypted, plaintext,
-                    "the engine must surface the counterpart's frame byte-identically"
-                ),
-                other => panic!("engine must surface the decrypted return frame, got {other:?}"),
-            }
+            let delivered = match self.sink.events.pop() {
+                Some(SinkEvent::Plaintext(decrypted)) => {
+                    assert_eq!(
+                        decrypted, plaintext,
+                        "the engine must surface an accepted frame byte-identically"
+                    );
+                    Some(decrypted)
+                }
+                None => None,
+                other => panic!("unexpected engine event for the return frame, got {other:?}"),
+            };
             assert!(
                 self.sink.events.is_empty(),
-                "receiving the return frame must emit nothing else, got {:?}",
+                "receiving one return frame must emit at most one event, got {:?}",
                 self.sink.events
             );
-            plaintext
+            delivered
         }
 
         /// Ages the session past `REKEY_AFTER_TIME` (boringtun timers.rs:19,
@@ -4895,6 +5590,737 @@ mod tests {
             fixture.sink.events.is_empty(),
             "post-rekey frame send must leave no events, got {:?}",
             fixture.sink.events
+        );
+    }
+
+    /// M26 cryptokey routing: an inbound frame whose decrypted inner source is
+    /// NOT OWNED (longest-prefix, across all peers) by the sending peer must be
+    /// DROPPED before it can reach the TUN, counted, and never recorded or
+    /// surfaced. Without the enforcement in `handle_single_tunn_result` the
+    /// frame would be returned and recorded, so this test fails on the pre-fix
+    /// engine (the PRINCIPLES #8 "test that fails without the enforcement
+    /// point" witness for M26).
+    #[test]
+    fn inbound_plaintext_source_outside_allowed_ips_is_dropped_and_counted() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let source_owner_table = vec![(
+            AllowedIpNetwork::parse("10.0.0.0/8").expect("parse"),
+            node_id.clone(),
+        )];
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        // IPv4 source 192.0.2.5 is outside 10.0.0.0/8.
+        let mut spoofed = vec![0x11; 64];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            3,
+            TunnResult::WriteToTunnelV4(&mut spoofed, Ipv4Addr::from([192, 0, 2, 5])),
+            &source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("a dropped source is not a dispatch error");
+
+        assert_eq!(dispatched, None, "the spoofed frame must not be surfaced");
+        assert_eq!(drops, 1, "the spoofed frame must be counted");
+        assert!(
+            recorded.is_empty(),
+            "the spoofed frame must not be recorded"
+        );
+        assert!(
+            sink.events.is_empty(),
+            "the spoofed frame must not be written to the sink"
+        );
+
+        // A second spoof (different source, same family) increments once more.
+        let mut spoofed_again = vec![0x22; 48];
+        let _ = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            3,
+            TunnResult::WriteToTunnelV4(&mut spoofed_again, Ipv4Addr::from([172, 16, 0, 1])),
+            &source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(drops, 2);
+        assert!(sink.events.is_empty());
+
+        // Positive control: a source OWNED by the sender is delivered,
+        // recorded, and does not move the counter.
+        let mut allowed_frame = vec![0x33; 40];
+        let allowed_expected = allowed_frame.clone();
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            3,
+            TunnResult::WriteToTunnelV4(&mut allowed_frame, Ipv4Addr::from([10, 1, 2, 3])),
+            &source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("in-allowed dispatch never errors");
+        assert_eq!(dispatched, Some(&allowed_expected[..]));
+        assert_eq!(drops, 2, "an owned source must not increment the counter");
+        assert_eq!(
+            recorded,
+            vec![super::RecordedTunnelPlaintextPacket {
+                node_id: node_id.clone(),
+                packet: allowed_expected,
+                transport_generation: 3,
+            }]
+        );
+        assert!(
+            sink.events.is_empty(),
+            "handle_single_tunn_result never writes plaintext itself"
+        );
+    }
+
+    /// M26 default-deny and family isolation: an EMPTY owner table drops every
+    /// inbound frame regardless of family, and an IPv4 source can never match
+    /// an IPv6 network (nor the converse) — the discriminant-safe membership
+    /// `AllowedIpNetwork::contains` relies on.
+    #[test]
+    fn inbound_plaintext_default_deny_and_family_mismatch_drop() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let mut sink = RecordingSink::default();
+        let mut recorded = Vec::new();
+
+        // Empty owner table: every family is dropped and counted.
+        let mut drops = 0u64;
+        for (label, source) in [
+            ("v4", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))),
+            ("v6", IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+        ] {
+            let mut frame = vec![0u8; 32];
+            let result = match source {
+                IpAddr::V4(v4) => TunnResult::WriteToTunnelV4(&mut frame, v4),
+                IpAddr::V6(v6) => TunnResult::WriteToTunnelV6(&mut frame, v6),
+            };
+            let dispatched = super::handle_single_tunn_result(
+                &node_id,
+                remote_addr(),
+                1,
+                result,
+                &[],
+                &mut drops,
+                &mut recorded,
+                &mut sink,
+            )
+            .expect("drop is not an error");
+            assert_eq!(dispatched, None, "{label}: empty owner table must drop");
+        }
+        assert_eq!(drops, 2, "both families counted under default deny");
+        assert!(sink.events.is_empty());
+
+        // Family mismatch drops both ways.
+        let v6_only = vec![(
+            AllowedIpNetwork::parse("::/0").expect("parse"),
+            node_id.clone(),
+        )];
+        let v4_only = vec![(
+            AllowedIpNetwork::parse("0.0.0.0/0").expect("parse"),
+            node_id.clone(),
+        )];
+        let mut drops2 = 0u64;
+        let mut v4_frame = vec![0u8; 32];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut v4_frame, Ipv4Addr::new(10, 0, 0, 1)),
+            &v6_only,
+            &mut drops2,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(
+            dispatched, None,
+            "a v4 source cannot match a v6-only allowed-ips"
+        );
+        let mut v6_frame = vec![0u8; 32];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV6(&mut v6_frame, std::net::Ipv6Addr::LOCALHOST),
+            &v4_only,
+            &mut drops2,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(
+            dispatched, None,
+            "a v6 source cannot match a v4-only allowed-ips"
+        );
+        assert_eq!(drops2, 2);
+        assert!(sink.events.is_empty());
+    }
+
+    /// M26 end-to-end on a REAL established session: a frame the counterpart
+    /// encrypts with an inner source outside the peer's allowed-ips is
+    /// decrypted (valid MAC — proven by the in-allowed frame on the same
+    /// session) and then DROPPED by cryptokey routing: no plaintext is
+    /// surfaced and the engine's drop counter increments. This is the witness
+    /// that the enforcement sits on the real decrypt path
+    /// (`process_inbound_ciphertext` → `drive_inbound_result` →
+    /// `handle_single_tunn_result`), not merely on a synthetic dispatch.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn live_session_drops_inbound_frame_from_source_outside_allowed_ips() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        fixture.establish_session(1);
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            0,
+            "a fresh session has no source drops"
+        );
+
+        // Source 100.64.9.9 is outside the peer's 100.64.8.0/24.
+        assert_eq!(
+            fixture.counterpart_sends_frame_with_source_to_engine([100, 64, 9, 9], 32, 1),
+            None,
+            "an out-of-allowed inner source must be dropped, not surfaced"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "the drop must be counted on the engine"
+        );
+
+        // An in-allowed source on the SAME session still flows and does not
+        // move the counter.
+        let delivered = fixture
+            .counterpart_sends_frame_with_source_to_engine([100, 64, 8, 42], 32, 1)
+            .expect("an in-allowed source must be delivered");
+        assert_eq!(
+            delivered,
+            ipv4_packet_with_source([100, 64, 8, 42], 32),
+            "the delivered frame is the byte-identical in-allowed packet"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "an in-allowed frame must not move the counter"
+        );
+    }
+
+    /// M26 finding 1 witness (cross-peer ownership): being inside the SENDER's
+    /// own network is not enough. `peer-a` carries the enclosing
+    /// `100.64.8.0/24`, `peer-b` the more specific `100.64.8.5/32`; a frame
+    /// from peer-a with inner source `100.64.8.5` is covered by peer-a's own
+    /// allowed-ips (so the first-pass membership check accepted it) but the
+    /// longest-prefix owner is peer-b, so it must be dropped.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn inbound_cross_peer_source_owned_by_another_peer_is_dropped() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(21);
+        let peer_a = configure_peer_at(
+            &mut engine,
+            "peer-a",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 61)), 51820),
+            0x61,
+            "100.64.8.0/24",
+        );
+        let peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 62)), 51820),
+            0x62,
+            "100.64.8.5/32",
+        );
+        assert_ne!(peer_a, peer_b);
+
+        // Inbound and outbound agree: the /32 owner wins the destination.
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 64, 8, 5))),
+            Some(peer_b.clone()),
+            "the /32 owner must be selected for the address it owns"
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        // peer-a sends the address peer-b owns: dropped despite being inside
+        // peer-a's 100.64.8.0/24.
+        let mut spoofed = vec![0x44; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &peer_a,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut spoofed, Ipv4Addr::new(100, 64, 8, 5)),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("a source owned by another peer is a drop, not an error");
+        assert_eq!(
+            dispatched, None,
+            "peer-a must not spoof the /32 peer-b owns"
+        );
+        assert_eq!(drops, 1, "the cross-peer spoof must be counted");
+        assert!(
+            recorded.is_empty(),
+            "the dropped frame must not be recorded"
+        );
+        assert!(
+            sink.events.is_empty(),
+            "the dropped frame must not be surfaced"
+        );
+
+        // A source in peer-a's /24 that nobody owns more specifically is still
+        // peer-a's and is delivered.
+        let mut allowed = vec![0x55; 40];
+        let allowed_expected = allowed.clone();
+        let dispatched = super::handle_single_tunn_result(
+            &peer_a,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut allowed, Ipv4Addr::new(100, 64, 8, 7)),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("in-allowed dispatch never errors");
+        assert_eq!(dispatched, Some(&allowed_expected[..]));
+        assert_eq!(drops, 1, "an owned source must not move the counter");
+    }
+
+    /// M26 finding 2(b): the selected exit peer carries `0.0.0.0/0` plus its
+    /// own `/32`. It may originate traffic to the public internet (`8.8.8.8`)
+    /// and to its own address, but NOT to another mesh peer's `/32`
+    /// (`100.64.0.3`): that `/32` is a longer prefix owned by peer-b.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn inbound_exit_peer_cannot_spoof_mesh_or_own_address() {
+        use boringtun::noise::TunnResult;
+        use rustynet_backend_api::{PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(22);
+        let exit_id = NodeId::new("aaa-exit").expect("node id");
+        engine
+            .configure_peer(&PeerConfig {
+                node_id: exit_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.71".parse().expect("ip"),
+                    port: 51820,
+                },
+                public_key: [0x71; 32],
+                // The selected exit's emitted set: its own /32 plus the
+                // default route (control plane adds lan_routes separately).
+                allowed_ips: vec!["100.64.0.9/32".to_owned(), "0.0.0.0/0".to_owned()],
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            })
+            .expect("exit peer configures");
+        let peer_b = configure_peer_at(
+            &mut engine,
+            "peer-b",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 72)), 51820),
+            0x72,
+            "100.64.0.3/32",
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+        let delivers = |engine: &UserspaceEngine,
+                        recorded: &mut Vec<super::RecordedTunnelPlaintextPacket>,
+                        sink: &mut RecordingSink,
+                        drops: &mut u64,
+                        source: [u8; 4]| {
+            let mut frame = vec![0x66; 40];
+            super::handle_single_tunn_result(
+                &exit_id,
+                remote_addr(),
+                1,
+                TunnResult::WriteToTunnelV4(&mut frame, Ipv4Addr::from(source)),
+                &engine.source_owner_table,
+                drops,
+                recorded,
+                sink,
+            )
+            .expect("exit dispatch never errors")
+            .is_some()
+        };
+
+        // Public internet: the exit owns it via 0.0.0.0/0 -> delivered.
+        assert!(
+            delivers(&engine, &mut recorded, &mut sink, &mut drops, [8, 8, 8, 8]),
+            "the exit may originate 8.8.8.8 traffic"
+        );
+        assert_eq!(drops, 0);
+
+        // Another mesh peer's /32: a longer prefix owned by peer-b -> dropped.
+        assert!(
+            !delivers(
+                &engine,
+                &mut recorded,
+                &mut sink,
+                &mut drops,
+                [100, 64, 0, 3]
+            ),
+            "the exit must not spoof peer-b's mesh address"
+        );
+        assert_eq!(drops, 1);
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 3))),
+            Some(peer_b),
+            "peer-b, not the exit, owns its mesh address"
+        );
+
+        // The exit's own /32 -> delivered.
+        assert!(
+            delivers(
+                &engine,
+                &mut recorded,
+                &mut sink,
+                &mut drops,
+                [100, 64, 0, 9]
+            ),
+            "the exit may originate traffic from its own address"
+        );
+        assert_eq!(drops, 1, "only the mesh spoof is counted");
+    }
+
+    /// M26 finding 2(c): an IPv4-mapped IPv6 source (`::ffff:10.0.0.1`) is an
+    /// IPv6 address and must NOT match the IPv4 network `10.0.0.0/8`; it is
+    /// delivered only when an IPv6 network (`::/0`) owns it.
+    #[test]
+    fn inbound_v4_mapped_source_never_matches_a_v4_network() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let node_id = NodeId::new("sender").expect("node id");
+        let v4_table = vec![(
+            AllowedIpNetwork::parse("10.0.0.0/8").expect("parse"),
+            node_id.clone(),
+        )];
+        let v6_default_table = vec![(
+            AllowedIpNetwork::parse("::/0").expect("parse"),
+            node_id.clone(),
+        )];
+        let mapped: std::net::Ipv6Addr = "::ffff:10.0.0.1".parse().expect("mapped address");
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV6(&mut frame, mapped),
+            &v4_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("drop is not an error");
+        assert_eq!(
+            dispatched, None,
+            "a v4-mapped v6 source must not match 10.0.0.0/8"
+        );
+        assert_eq!(drops, 1);
+
+        let mut frame = vec![0u8; 40];
+        let expected = frame.clone();
+        let dispatched = super::handle_single_tunn_result(
+            &node_id,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV6(&mut frame, mapped),
+            &v6_default_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert_eq!(
+            dispatched,
+            Some(&expected[..]),
+            "::/0 owns the v4-mapped address"
+        );
+        assert_eq!(drops, 1, "the delivered frame must not move the counter");
+    }
+
+    /// M26 finding 2(d): prefix boundaries. A `/32` owns only its exact
+    /// address, the enclosing `/24` owns the rest of the block, `0.0.0.0/0`
+    /// owns every other IPv4 address, and an IPv4 default route owns no IPv6
+    /// address. The enforcement point agrees with the table: the `/32` owner
+    /// may send its address, the `/0` owner may not.
+    #[test]
+    fn inbound_owner_table_prefix_boundaries() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let owner = NodeId::new("owner").expect("node id");
+        let other = NodeId::new("zz-other").expect("node id");
+        // Exactly as the engine sorts it: descending prefix length.
+        let table = vec![
+            (
+                AllowedIpNetwork::parse("100.64.0.2/32").expect("parse"),
+                owner.clone(),
+            ),
+            (
+                AllowedIpNetwork::parse("100.64.0.0/24").expect("parse"),
+                other.clone(),
+            ),
+            (
+                AllowedIpNetwork::parse("0.0.0.0/0").expect("parse"),
+                other.clone(),
+            ),
+        ];
+        let v4 = |octets: [u8; 4]| IpAddr::V4(Ipv4Addr::from(octets));
+
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 0, 2])),
+            Some(&owner),
+            "the /32 owns its exact address"
+        );
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 0, 3])),
+            Some(&other),
+            "the neighbour of the /32 is owned by the enclosing /24"
+        );
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 0, 255])),
+            Some(&other),
+            "the last address of the /24 is owned by it"
+        );
+        assert_eq!(
+            super::source_owner(&table, v4([100, 64, 1, 0])),
+            Some(&other),
+            "the first address outside the /24 falls to the default route"
+        );
+        assert_eq!(
+            super::source_owner(&table, IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+            None,
+            "an IPv4 default route owns no IPv6 address"
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &owner,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, Ipv4Addr::new(100, 64, 0, 2)),
+            &table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert!(dispatched.is_some(), "the /32 owner may send its address");
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &other,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, Ipv4Addr::new(100, 64, 0, 2)),
+            &table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert_eq!(
+            dispatched, None,
+            "the /0 owner may not send the /32's address"
+        );
+        assert_eq!(drops, 1);
+    }
+
+    /// M26 tie-break parity: two peers own the same prefix. The outbound rule
+    /// (`select_peer_for_destination`) resolves an equal-length tie to the
+    /// HIGHEST `NodeId`; inbound must agree — that owner is accepted and the
+    /// lower `NodeId` is dropped (fail closed), never both.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn inbound_equal_prefix_tie_resolves_to_highest_node_id_like_outbound() {
+        use boringtun::noise::TunnResult;
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(23);
+        let peer_low = configure_peer_at(
+            &mut engine,
+            "aaa-low",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 81)), 51820),
+            0x81,
+            "100.64.8.0/24",
+        );
+        let peer_high = configure_peer_at(
+            &mut engine,
+            "zzz-high",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 82)), 51820),
+            0x82,
+            "100.64.8.0/24",
+        );
+        let source = Ipv4Addr::new(100, 64, 8, 7);
+        assert_eq!(
+            engine.select_peer_for_destination(IpAddr::V4(source)),
+            Some(peer_high.clone()),
+            "equal-prefix outbound ties resolve to the highest NodeId"
+        );
+
+        let mut recorded = Vec::new();
+        let mut sink = RecordingSink::default();
+        let mut drops = 0u64;
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &peer_high,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, source),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert!(
+            dispatched.is_some(),
+            "the highest-NodeId owner is the inbound owner"
+        );
+
+        let mut frame = vec![0u8; 40];
+        let dispatched = super::handle_single_tunn_result(
+            &peer_low,
+            remote_addr(),
+            1,
+            TunnResult::WriteToTunnelV4(&mut frame, source),
+            &engine.source_owner_table,
+            &mut drops,
+            &mut recorded,
+            &mut sink,
+        )
+        .expect("dispatch never errors");
+        assert_eq!(
+            dispatched, None,
+            "on an equal-prefix tie the non-winning peer fails closed"
+        );
+        assert_eq!(drops, 1);
+    }
+
+    /// M26 finding 5: `configure_peer` must refuse an empty allowed-ips set for
+    /// parity with the kernel backend (`linux_command.rs`) and the daemon. The
+    /// refusal happens before any mutation, so no peer is installed.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn configure_peer_rejects_empty_allowed_ips() {
+        use rustynet_backend_api::{BackendErrorKind, PeerConfig, SocketEndpoint};
+        let _mock_clock_guard = mock_clock_test_lease();
+
+        let mut engine = fresh_engine(24);
+        let node_id = NodeId::new("empty-peer").expect("node id");
+        let err = engine
+            .configure_peer(&PeerConfig {
+                node_id: node_id.clone(),
+                endpoint: SocketEndpoint {
+                    addr: "203.0.113.90".parse().expect("ip"),
+                    port: 51820,
+                },
+                public_key: [0x90; 32],
+                allowed_ips: Vec::new(),
+                persistent_keepalive_secs: None,
+                preshared_key: None,
+            })
+            .expect_err("an empty allowed-ips set must be refused");
+        assert_eq!(err.kind, BackendErrorKind::InvalidInput);
+        assert!(
+            err.message.contains("must not be empty"),
+            "the refusal must name the empty set, got {err:?}"
+        );
+        assert!(
+            !engine.has_peer(&node_id),
+            "a refused peer must not be installed"
+        );
+        assert!(
+            engine.source_owner_table.is_empty(),
+            "a refused peer must not enter the owner table"
+        );
+    }
+
+    /// M26 end-to-end witness for finding 1 on a REAL established session:
+    /// peer-x owns `100.64.8.0/24`, a second peer-y owns the more specific
+    /// `100.64.8.5/32`. The counterpart (peer-x) encrypts a frame whose inner
+    /// source is `100.64.8.5` — inside peer-x's own /24, so the first-pass
+    /// membership check accepted it — but peer-y is the longest-prefix owner,
+    /// so the engine must drop it and count it.
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn live_session_drops_cross_peer_spoof_covered_by_sender_network() {
+        let _mock_clock_guard = mock_clock_test_lease();
+        let mut fixture = RekeyFixture::new();
+        fixture.establish_session(1);
+        configure_peer_at(
+            &mut fixture.engine,
+            "peer-y",
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 99)), 51821),
+            0x99,
+            // Longer prefix than peer-x's 100.64.8.0/24, inside it.
+            "100.64.8.5/32",
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            0,
+            "a fresh session has no source drops"
+        );
+
+        assert_eq!(
+            fixture.counterpart_sends_frame_with_source_to_engine([100, 64, 8, 5], 32, 1),
+            None,
+            "peer-x must not spoof the address peer-y owns, although its own /24 covers it"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "the cross-peer spoof must be counted"
+        );
+
+        // A source in peer-x's /24 that peer-y does not own still flows.
+        let delivered = fixture
+            .counterpart_sends_frame_with_source_to_engine([100, 64, 8, 42], 32, 1)
+            .expect("a source owned by peer-x must still be delivered");
+        assert_eq!(
+            delivered,
+            ipv4_packet_with_source([100, 64, 8, 42], 32),
+            "the delivered frame is byte-identical"
+        );
+        assert_eq!(
+            fixture.engine.allowed_ips_source_drops(),
+            1,
+            "an owned frame must not move the counter"
         );
     }
 }
