@@ -236,7 +236,15 @@ pub fn validate_blind_exit_runtime(
                 ));
             }
         }
-        _ => {}
+        VmGuestPlatform::Ios | VmGuestPlatform::Android => {
+            // No blind_exit NAT/forwarding probe exists for this platform. Never
+            // pass on the role line alone: a role claim without a ruleset proof
+            // is exactly the fail-open this validator must not have.
+            return Err(format!(
+                "{alias}: blind_exit runtime validation is not implemented for \
+                 {platform:?}; refusing to pass without a NAT/forwarding probe"
+            ));
+        }
     }
 
     Ok(())
@@ -504,6 +512,18 @@ mod tests {
                     stderr: Vec::new(),
                 },
             );
+        }
+    }
+
+    #[test]
+    fn mobile_platforms_fail_closed_even_when_the_role_line_matches() {
+        for platform in [VmGuestPlatform::Ios, VmGuestPlatform::Android] {
+            let shell = MockShellHost::new();
+            program_status(&shell, "node_role=blind_exit state=Ready\n", 0);
+            let err = validate_blind_exit_runtime(&shell, platform, "phone-1")
+                .expect_err("a role line alone must never pass on a platform with no probe");
+            assert!(err.contains("not implemented"), "{err}");
+            assert!(err.contains("phone-1"), "{err}");
         }
     }
 

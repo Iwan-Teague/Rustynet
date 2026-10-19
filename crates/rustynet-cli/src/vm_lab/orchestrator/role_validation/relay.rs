@@ -158,7 +158,7 @@ pub fn validate_relay_lifecycle(
     shell: &dyn RemoteShellHost,
     platform: VmGuestPlatform,
 ) -> Result<(), String> {
-    let (datapath_port, health_port) = relay_ports(platform);
+    let (datapath_port, health_port) = relay_ports(platform)?;
 
     // Bounded readiness wait before the formal during-run capture: the start
     // verbs (launchd kickstart, systemctl start, SCM start) return as soon as
@@ -257,13 +257,18 @@ pub fn validate_relay_lifecycle(
 /// Per-OS (datapath, health) listener ports. Linux + macOS bind the
 /// health endpoint on 4501; Windows binds it on
 /// [`REVIEWED_WINDOWS_RELAY_HEALTH_PORT`].
-fn relay_ports(platform: VmGuestPlatform) -> (u16, u16) {
+fn relay_ports(platform: VmGuestPlatform) -> Result<(u16, u16), String> {
+    // EXHAUSTIVE deliberately: a `_` arm would assert a port the OS never used.
     match platform {
-        VmGuestPlatform::Windows => (
+        VmGuestPlatform::Linux | VmGuestPlatform::Macos => Ok((RELAY_BIND_PORT, RELAY_HEALTH_PORT)),
+        VmGuestPlatform::Windows => Ok((
             REVIEWED_WINDOWS_RELAY_BIND_PORT,
             REVIEWED_WINDOWS_RELAY_HEALTH_PORT,
-        ),
-        _ => (RELAY_BIND_PORT, RELAY_HEALTH_PORT),
+        )),
+        VmGuestPlatform::Ios | VmGuestPlatform::Android => Err(format!(
+            "relay listener ports are not defined for {platform:?}; relay lifecycle \
+             validation is only implemented for Linux, macOS, and Windows"
+        )),
     }
 }
 
@@ -1164,15 +1169,19 @@ mod tests {
     fn relay_ports_are_per_os_reviewed_constants() {
         // Linux + macOS bind health on 4501; Windows on the reviewed
         // 9100. A drift in the rustynetd constants surfaces here.
-        assert_eq!(relay_ports(VmGuestPlatform::Linux), (4500, 4501));
-        assert_eq!(relay_ports(VmGuestPlatform::Macos), (4500, 4501));
+        assert_eq!(relay_ports(VmGuestPlatform::Linux), Ok((4500, 4501)));
+        assert_eq!(relay_ports(VmGuestPlatform::Macos), Ok((4500, 4501)));
         assert_eq!(
             relay_ports(VmGuestPlatform::Windows),
-            (
+            Ok((
                 REVIEWED_WINDOWS_RELAY_BIND_PORT,
                 REVIEWED_WINDOWS_RELAY_HEALTH_PORT
-            )
+            ))
         );
+        for platform in [VmGuestPlatform::Ios, VmGuestPlatform::Android] {
+            let err = relay_ports(platform).expect_err("mobile has no relay ports");
+            assert!(err.contains("not defined"), "{err}");
+        }
         assert_eq!(REVIEWED_WINDOWS_RELAY_BIND_PORT, 4600);
         assert_eq!(REVIEWED_WINDOWS_RELAY_HEALTH_PORT, 9100);
     }
