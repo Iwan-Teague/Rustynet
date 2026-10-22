@@ -1610,21 +1610,31 @@ fn prepare_security_cargo_context(
 }
 
 fn run_security_audit_and_deny(
-    _root_dir: &Path,
-    _security: &SecurityCargoContext,
+    root_dir: &Path,
+    security: &SecurityCargoContext,
 ) -> Result<(), String> {
-    println!("Skipping run_security_audit_and_deny on remote host (verified locally).");
-    return Ok(());
-    #[allow(unreachable_code)]
-    let mut env_pairs_owned = Vec::new();
-    env_pairs_owned.push((
+    run_security_audit_and_deny_with(root_dir, security, &mut run_command_inherit)
+}
+
+type SecurityCommandRunner<'a> =
+    dyn FnMut(&str, &[&str], Option<&Path>, &[(&str, &str)]) -> Result<(), String> + 'a;
+
+/// Runs `cargo audit` then `cargo deny check`. Fail closed: any command
+/// failure is returned and the gate must not pass. The runner is injected so
+/// tests can witness that both commands are really invoked.
+fn run_security_audit_and_deny_with(
+    root_dir: &Path,
+    security: &SecurityCargoContext,
+    runner: &mut SecurityCommandRunner<'_>,
+) -> Result<(), String> {
+    let mut env_pairs_owned = vec![(
         "CARGO_HOME".to_owned(),
-        _security.effective_cargo_home.to_string_lossy().to_string(),
-    ));
-    if let Some(home) = &_security.effective_home {
+        security.effective_cargo_home.to_string_lossy().to_string(),
+    )];
+    if let Some(home) = &security.effective_home {
         env_pairs_owned.push(("HOME".to_owned(), home.to_string_lossy().to_string()));
     }
-    if let Some(rustup_home) = &_security.effective_rustup_home {
+    if let Some(rustup_home) = &security.effective_rustup_home {
         env_pairs_owned.push((
             "RUSTUP_HOME".to_owned(),
             rustup_home.to_string_lossy().to_string(),
@@ -1634,11 +1644,11 @@ fn run_security_audit_and_deny(
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
-    let audit_db_value = _security.audit_db.to_string_lossy().to_string();
+    let audit_db_value = security.audit_db.to_string_lossy().to_string();
 
     let audit_args = vec![
         "run",
-        _security.security_toolchain.as_str(),
+        security.security_toolchain.as_str(),
         "cargo",
         "audit",
         "--deny",
@@ -1648,20 +1658,22 @@ fn run_security_audit_and_deny(
         "--db",
         audit_db_value.as_str(),
     ];
-    run_command_inherit("rustup", &audit_args, Some(_root_dir), &env_pairs)?;
+    runner("rustup", &audit_args, Some(root_dir), &env_pairs)
+        .map_err(|err| format!("cargo audit failed (supply-chain gate): {err}"))?;
 
     let mut deny_args = vec![
         "run",
-        _security.security_toolchain.as_str(),
+        security.security_toolchain.as_str(),
         "cargo",
         "deny",
         "check",
     ];
-    if _security.deny_disable_fetch {
+    if security.deny_disable_fetch {
         deny_args.push("--disable-fetch");
     }
     deny_args.extend(["bans", "licenses", "sources", "advisories"]);
-    run_command_inherit("rustup", &deny_args, Some(_root_dir), &env_pairs)?;
+    runner("rustup", &deny_args, Some(root_dir), &env_pairs)
+        .map_err(|err| format!("cargo deny failed (supply-chain gate): {err}"))?;
     Ok(())
 }
 
@@ -1853,24 +1865,30 @@ fn require_commands(commands: &[&str]) -> Result<(), String> {
 }
 
 fn require_cargo_subcommands(subcommands: &[&str]) -> Result<(), String> {
-    for subcommand in subcommands {
-        if *subcommand == "audit" || *subcommand == "deny" {
-            println!("Skipping check for optional cargo subcommand: {subcommand}");
-            continue;
-        }
-        let status = Command::new("cargo")
+    require_cargo_subcommands_with(subcommands, &mut |subcommand| {
+        Command::new("cargo")
             .arg(subcommand)
             .arg("--version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        match status {
-            Ok(status) if status.success() => {}
-            _ => {
-                return Err(format!(
-                    "missing required cargo subcommand: cargo {subcommand}\ninstall toolchain components/tools and retry."
-                ));
-            }
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Every listed subcommand (including `audit` and `deny`) must be present:
+/// the supply-chain gate has no optional tools. `probe` returns true when
+/// `cargo <subcommand> --version` succeeds.
+fn require_cargo_subcommands_with(
+    subcommands: &[&str],
+    probe: &mut dyn FnMut(&str) -> bool,
+) -> Result<(), String> {
+    for subcommand in subcommands {
+        if !probe(subcommand) {
+            return Err(format!(
+                "missing required cargo subcommand: cargo {subcommand}\ninstall toolchain components/tools and retry."
+            ));
         }
     }
     Ok(())
@@ -2568,6 +2586,126 @@ struct CapturedStatusOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_security_context() -> SecurityCargoContext {
+        SecurityCargoContext {
+            audit_db: PathBuf::from("/db"),
+            security_toolchain: "1.88.0-test".to_owned(),
+            effective_home: None,
+            effective_cargo_home: PathBuf::from("/cargo"),
+            effective_rustup_home: None,
+            deny_disable_fetch: true,
+        }
+    }
+
+    #[test]
+    fn security_gate_really_runs_audit_then_deny() {
+        let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut runner = |program: &str,
+                          args: &[&str],
+                          _cwd: Option<&Path>,
+                          _env: &[(&str, &str)]|
+         -> Result<(), String> {
+            let mut c = vec![program.to_owned()];
+            c.extend(args.iter().map(|a| (*a).to_owned()));
+            calls.push(c);
+            Ok(())
+        };
+        run_security_audit_and_deny_with(Path::new("/r"), &test_security_context(), &mut runner)
+            .unwrap();
+        assert_eq!(calls.len(), 2, "audit and deny must both run");
+        assert_eq!(calls[0][0], "rustup");
+        assert!(calls[0].contains(&"audit".to_owned()));
+        assert!(calls[0].contains(&"1.88.0-test".to_owned()));
+        let deny_pos = calls[0].iter().position(|a| a == "--deny").unwrap();
+        assert_eq!(calls[0][deny_pos + 1], "warnings");
+        assert!(calls[0].contains(&"--no-fetch".to_owned()));
+        let db_pos = calls[0].iter().position(|a| a == "--db").unwrap();
+        assert_eq!(calls[0][db_pos + 1], "/db");
+        assert_eq!(calls[1][0], "rustup");
+        assert!(calls[1].contains(&"deny".to_owned()));
+        assert!(calls[1].contains(&"check".to_owned()));
+        assert!(calls[1].contains(&"--disable-fetch".to_owned()));
+        for kind in ["bans", "licenses", "sources", "advisories"] {
+            assert!(
+                calls[1].contains(&kind.to_owned()),
+                "missing deny kind {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_gate_omits_disable_fetch_when_fetch_allowed() {
+        let mut ctx = test_security_context();
+        ctx.deny_disable_fetch = false;
+        let mut deny_args: Vec<String> = Vec::new();
+        let mut runner = |_: &str, args: &[&str], _: Option<&Path>, _: &[(&str, &str)]| {
+            if args.contains(&"deny") {
+                deny_args = args.iter().map(|a| (*a).to_owned()).collect();
+            }
+            Ok(())
+        };
+        run_security_audit_and_deny_with(Path::new("/r"), &ctx, &mut runner).unwrap();
+        assert!(!deny_args.is_empty());
+        assert!(!deny_args.contains(&"--disable-fetch".to_owned()));
+    }
+
+    #[test]
+    fn security_gate_fails_closed_when_audit_or_deny_fails() {
+        let mut seen = 0usize;
+        let mut fail_audit = |_: &str, args: &[&str], _: Option<&Path>, _: &[(&str, &str)]| {
+            seen += 1;
+            if args.contains(&"audit") {
+                Err("vulnerability found".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let err = run_security_audit_and_deny_with(
+            Path::new("/r"),
+            &test_security_context(),
+            &mut fail_audit,
+        )
+        .unwrap_err();
+        assert!(err.contains("cargo audit failed"));
+        assert_eq!(seen, 1, "deny must not mask an audit failure");
+
+        let mut fail_deny = |_: &str, args: &[&str], _: Option<&Path>, _: &[(&str, &str)]| {
+            if args.contains(&"deny") {
+                Err("banned crate".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let err = run_security_audit_and_deny_with(
+            Path::new("/r"),
+            &test_security_context(),
+            &mut fail_deny,
+        )
+        .unwrap_err();
+        assert!(err.contains("cargo deny failed"));
+    }
+
+    #[test]
+    fn require_cargo_subcommands_has_no_audit_or_deny_exemption() {
+        let mut probed = Vec::new();
+        let mut missing_audit = |name: &str| {
+            probed.push(name.to_owned());
+            name != "audit"
+        };
+        let err =
+            require_cargo_subcommands_with(&["deny", "audit"], &mut missing_audit).unwrap_err();
+        assert!(err.contains("cargo audit"), "{err}");
+        assert_eq!(probed, vec!["deny", "audit"], "deny must be probed too");
+
+        let mut missing_deny = |name: &str| name != "deny";
+        let err =
+            require_cargo_subcommands_with(&["audit", "deny"], &mut missing_deny).unwrap_err();
+        assert!(err.contains("cargo deny"), "{err}");
+
+        let mut all_present = |_: &str| true;
+        assert!(require_cargo_subcommands_with(&["audit", "deny"], &mut all_present).is_ok());
+    }
 
     #[test]
     fn parse_truthy_accepts_expected_values() {
