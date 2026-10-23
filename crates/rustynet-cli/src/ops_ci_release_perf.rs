@@ -91,6 +91,7 @@ pub fn execute_ops_run_phase1_ci_gates() -> Result<String, String> {
     require_cargo_subcommands(&["fmt", "clippy", "audit", "deny"])?;
 
     let security = prepare_security_cargo_context(&root_dir, default_security_toolchain()?)?;
+    require_security_gate_preflight(&root_dir, &security)?;
 
     run_command_inherit(
         "cargo",
@@ -286,6 +287,7 @@ pub fn execute_ops_run_phase10_ci_gates() -> Result<String, String> {
     )?;
 
     let security = prepare_security_cargo_context(&root_dir, default_security_toolchain()?)?;
+    require_security_gate_preflight(&root_dir, &security)?;
 
     run_command_inherit(
         "cargo",
@@ -419,6 +421,7 @@ pub fn execute_ops_run_membership_ci_gates() -> Result<String, String> {
     require_cargo_subcommands(&["fmt", "clippy", "audit", "deny"])?;
 
     let security = prepare_security_cargo_context(&root_dir, default_security_toolchain()?)?;
+    require_security_gate_preflight(&root_dir, &security)?;
 
     run_command_inherit(
         "cargo",
@@ -786,6 +789,7 @@ pub fn execute_ops_run_supply_chain_integrity_gates() -> Result<String, String> 
     let security_toolchain = env_optional_string("RUSTYNET_SECURITY_TOOLCHAIN")?
         .unwrap_or_else(|| format!("{DEFAULT_SECURITY_TOOLCHAIN}-{host_triple}"));
     let security = prepare_security_cargo_context(&root_dir, security_toolchain)?;
+    require_security_gate_preflight(&root_dir, &security)?;
     run_security_audit_and_deny(&root_dir, &security)?;
 
     run_command_inherit(
@@ -1619,14 +1623,10 @@ fn run_security_audit_and_deny(
 type SecurityCommandRunner<'a> =
     dyn FnMut(&str, &[&str], Option<&Path>, &[(&str, &str)]) -> Result<(), String> + 'a;
 
-/// Runs `cargo audit` then `cargo deny check`. Fail closed: any command
-/// failure is returned and the gate must not pass. The runner is injected so
-/// tests can witness that both commands are really invoked.
-fn run_security_audit_and_deny_with(
-    root_dir: &Path,
-    security: &SecurityCargoContext,
-    runner: &mut SecurityCommandRunner<'_>,
-) -> Result<(), String> {
+/// The isolated env every supply-chain gate command runs under: `CARGO_HOME`
+/// always, plus `HOME` and `RUSTUP_HOME` when the security context pinned
+/// them. Shared by the gate and its preflight so they can never drift.
+fn security_env_pairs(security: &SecurityCargoContext) -> Vec<(String, String)> {
     let mut env_pairs_owned = vec![(
         "CARGO_HOME".to_owned(),
         security.effective_cargo_home.to_string_lossy().to_string(),
@@ -1640,6 +1640,18 @@ fn run_security_audit_and_deny_with(
             rustup_home.to_string_lossy().to_string(),
         ));
     }
+    env_pairs_owned
+}
+
+/// Runs `cargo audit` then `cargo deny check`. Fail closed: any command
+/// failure is returned and the gate must not pass. The runner is injected so
+/// tests can witness that both commands are really invoked.
+fn run_security_audit_and_deny_with(
+    root_dir: &Path,
+    security: &SecurityCargoContext,
+    runner: &mut SecurityCommandRunner<'_>,
+) -> Result<(), String> {
+    let env_pairs_owned = security_env_pairs(security);
     let env_pairs = env_pairs_owned
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -1892,6 +1904,53 @@ fn require_cargo_subcommands_with(
         }
     }
     Ok(())
+}
+
+type SecurityPreflightProbe<'a> =
+    dyn FnMut(&str, &[&str], Option<&Path>, &[(&str, &str)]) -> bool + 'a;
+
+/// Preflight for the supply-chain gate: probes the EXACT command (`rustup run
+/// <security_toolchain> cargo <subcommand> --version`), working directory and
+/// isolated env (`CARGO_HOME`/`HOME`/`RUSTUP_HOME` from the security context)
+/// that `run_security_audit_and_deny_with` will use, so a `cargo-audit` or
+/// `cargo-deny` binary that is missing under the pinned security toolchain —
+/// or broken by the isolated cargo/rustup home — fails the gate before any
+/// long work starts. The probe is injected so unit tests stay hermetic.
+fn require_security_gate_preflight_with(
+    root_dir: &Path,
+    security: &SecurityCargoContext,
+    probe: &mut SecurityPreflightProbe<'_>,
+) -> Result<(), String> {
+    let env_pairs_owned = security_env_pairs(security);
+    let env_pairs = env_pairs_owned
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect::<Vec<_>>();
+    let toolchain = security.security_toolchain.as_str();
+    for (subcommand, install) in [("audit", "cargo-audit"), ("deny", "cargo-deny --locked")] {
+        let args = ["run", toolchain, "cargo", subcommand, "--version"];
+        if !probe("rustup", &args, Some(root_dir), &env_pairs) {
+            return Err(format!(
+                "supply-chain gate preflight failed: `rustup run {toolchain} cargo {subcommand} --version` did not succeed under the gate's isolated env\ninstall the missing tool with the pinned security toolchain: rustup run {toolchain} cargo install {install}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn require_security_gate_preflight(
+    root_dir: &Path,
+    security: &SecurityCargoContext,
+) -> Result<(), String> {
+    require_security_gate_preflight_with(
+        root_dir,
+        security,
+        &mut |program, args, cwd, env_pairs| {
+            run_command_allow_failure(program, args, cwd, env_pairs)
+                .map(|status| status.success())
+                .unwrap_or(false)
+        },
+    )
 }
 
 fn run_script(root_dir: &Path, script: &str, args: &[&str]) -> Result<(), String> {
@@ -2591,9 +2650,9 @@ mod tests {
         SecurityCargoContext {
             audit_db: PathBuf::from("/db"),
             security_toolchain: "1.88.0-test".to_owned(),
-            effective_home: None,
+            effective_home: Some(PathBuf::from("/home-iso")),
             effective_cargo_home: PathBuf::from("/cargo"),
-            effective_rustup_home: None,
+            effective_rustup_home: Some(PathBuf::from("/rustup-iso")),
             deny_disable_fetch: true,
         }
     }
@@ -2601,19 +2660,49 @@ mod tests {
     #[test]
     fn security_gate_really_runs_audit_then_deny() {
         let mut calls: Vec<Vec<String>> = Vec::new();
+        let mut cwds: Vec<Option<PathBuf>> = Vec::new();
+        let mut envs: Vec<Vec<(String, String)>> = Vec::new();
         let mut runner = |program: &str,
                           args: &[&str],
-                          _cwd: Option<&Path>,
-                          _env: &[(&str, &str)]|
+                          cwd: Option<&Path>,
+                          env: &[(&str, &str)]|
          -> Result<(), String> {
             let mut c = vec![program.to_owned()];
             c.extend(args.iter().map(|a| (*a).to_owned()));
             calls.push(c);
+            cwds.push(cwd.map(|p| p.to_path_buf()));
+            envs.push(
+                env.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            );
             Ok(())
         };
         run_security_audit_and_deny_with(Path::new("/r"), &test_security_context(), &mut runner)
             .unwrap();
         assert_eq!(calls.len(), 2, "audit and deny must both run");
+        for idx in 0..calls.len() {
+            assert_eq!(
+                cwds[idx].as_deref(),
+                Some(Path::new("/r")),
+                "gate call {idx} must run in root_dir"
+            );
+            for (key, value) in [
+                ("CARGO_HOME", "/cargo"),
+                ("HOME", "/home-iso"),
+                ("RUSTUP_HOME", "/rustup-iso"),
+            ] {
+                let got = envs[idx]
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str());
+                assert_eq!(
+                    got,
+                    Some(value),
+                    "gate call {idx} must carry the isolated {key}"
+                );
+            }
+        }
         assert_eq!(calls[0][0], "rustup");
         assert!(calls[0].contains(&"audit".to_owned()));
         assert!(calls[0].contains(&"1.88.0-test".to_owned()));
@@ -2670,10 +2759,13 @@ mod tests {
         assert!(err.contains("cargo audit failed"));
         assert_eq!(seen, 1, "deny must not mask an audit failure");
 
+        let mut audit_calls = 0usize;
         let mut fail_deny = |_: &str, args: &[&str], _: Option<&Path>, _: &[(&str, &str)]| {
             if args.contains(&"deny") {
+                assert_eq!(audit_calls, 1, "deny must run after exactly one audit call");
                 Err("banned crate".to_owned())
             } else {
+                audit_calls += 1;
                 Ok(())
             }
         };
@@ -2705,6 +2797,139 @@ mod tests {
 
         let mut all_present = |_: &str| true;
         assert!(require_cargo_subcommands_with(&["audit", "deny"], &mut all_present).is_ok());
+    }
+
+    #[test]
+    fn security_gate_preflight_probes_exact_command_cwd_and_env() {
+        type CapturedProbe = (String, Vec<String>, Option<PathBuf>, Vec<(String, String)>);
+        let mut probes: Vec<CapturedProbe> = Vec::new();
+        let mut probe = |program: &str, args: &[&str], cwd: Option<&Path>, env: &[(&str, &str)]| {
+            probes.push((
+                program.to_owned(),
+                args.iter().map(|a| (*a).to_owned()).collect(),
+                cwd.map(|p| p.to_path_buf()),
+                env.iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            ));
+            true
+        };
+        require_security_gate_preflight_with(Path::new("/r"), &test_security_context(), &mut probe)
+            .unwrap();
+        assert_eq!(probes.len(), 2, "audit and deny must both be probed");
+        for (idx, (program, args, cwd, env)) in probes.iter().enumerate() {
+            let subcommand = if idx == 0 { "audit" } else { "deny" };
+            assert_eq!(program, "rustup", "probe {idx} must go through rustup");
+            assert_eq!(
+                args,
+                &[
+                    "run".to_owned(),
+                    "1.88.0-test".to_owned(),
+                    "cargo".to_owned(),
+                    subcommand.to_owned(),
+                    "--version".to_owned(),
+                ],
+                "probe {idx} must match the gate's exact command",
+            );
+            assert_eq!(
+                cwd.as_deref(),
+                Some(Path::new("/r")),
+                "probe {idx} must use the gate's cwd"
+            );
+            for (key, value) in [
+                ("CARGO_HOME", "/cargo"),
+                ("HOME", "/home-iso"),
+                ("RUSTUP_HOME", "/rustup-iso"),
+            ] {
+                assert!(
+                    env.iter().any(|(k, v)| k == key && v == value),
+                    "probe {idx} must carry the isolated {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn security_gate_preflight_names_install_command_and_toolchain() {
+        for (missing, install) in [
+            ("audit", "cargo install cargo-audit"),
+            ("deny", "cargo install cargo-deny --locked"),
+        ] {
+            let mut probe = |_: &str, args: &[&str], _: Option<&Path>, _: &[(&str, &str)]| {
+                !args.contains(&missing)
+            };
+            let err = require_security_gate_preflight_with(
+                Path::new("/r"),
+                &test_security_context(),
+                &mut probe,
+            )
+            .unwrap_err();
+            assert!(
+                err.contains("1.88.0-test"),
+                "error must name the toolchain: {err}"
+            );
+            assert!(
+                err.contains(install),
+                "error must name the install command for {missing}: {err}"
+            );
+            assert!(
+                err.contains(&format!("cargo {missing}")),
+                "error must name the failing subcommand: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_gate_preflight_prod_wrapper_fails_closed_on_spawn_error() {
+        let missing_root = Path::new("/nonexistent-rustynet-preflight-probe-root-7f3a");
+        assert!(
+            !missing_root.exists(),
+            "this test needs a cwd that does not exist: {}",
+            missing_root.display()
+        );
+        let err = require_security_gate_preflight(missing_root, &test_security_context())
+            .expect_err("production probe wrapper must fail closed when the probe cannot spawn");
+        assert!(
+            err.contains("supply-chain gate preflight failed"),
+            "error must be the preflight failure, got: {err}"
+        );
+        assert!(
+            err.contains("cargo audit"),
+            "error must name the first probed subcommand, got: {err}"
+        );
+    }
+
+    #[test]
+    fn security_gate_preflight_is_wired_into_every_supply_chain_flow() {
+        const SOURCE: &str = include_str!("ops_ci_release_perf.rs");
+        for flow in [
+            "execute_ops_run_phase1_ci_gates",
+            "execute_ops_run_phase10_ci_gates",
+            "execute_ops_run_membership_ci_gates",
+            "execute_ops_run_supply_chain_integrity_gates",
+        ] {
+            let needle = format!("fn {flow}(");
+            let start = SOURCE
+                .find(&needle)
+                .unwrap_or_else(|| panic!("flow fn {flow} must exist in the source"));
+            let rest = &SOURCE[start..];
+            let body_end = rest["fn ".len()..]
+                .find("\nfn ")
+                .map(|idx| idx + "fn ".len())
+                .unwrap_or(rest.len());
+            let body = &rest[..body_end];
+            let call = "require_security_gate_preflight(&root_dir, &security)?;";
+            let call_at = body
+                .find(call)
+                .unwrap_or_else(|| panic!("flow {flow} must wire the preflight with ?"));
+            let gate_at = body
+                .find("run_security_audit_and_deny(")
+                .unwrap_or_else(|| panic!("flow {flow} must run the supply-chain gate"));
+            assert!(
+                call_at < gate_at,
+                "flow {flow}: preflight must run before the gate"
+            );
+        }
     }
 
     #[test]
