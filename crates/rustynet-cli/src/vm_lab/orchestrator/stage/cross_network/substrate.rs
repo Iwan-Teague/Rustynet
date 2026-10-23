@@ -62,6 +62,13 @@ pub const OVERLAY_PREFIX_LEN: u8 = 16;
 /// The whole overlay pool, as the destination prefix a NAT'd site routes
 /// through its router namespace.
 pub const OVERLAY_POOL_CIDR: &str = "172.20.0.0/16";
+/// The substrate id [`VxlanSubstrateProvider`] records into
+/// `SubstrateRecord::substrate_id`, which the orchestrator context persists
+/// as `substrate_record` across a resume. Stages that must behave
+/// differently on a provisioned overlay (e.g. the exit egress leak witness,
+/// whose WireGuard control rides `rustynet-vx0` instead of the underlay)
+/// compare against this constant instead of re-deriving the provider name.
+pub const VXLAN_SUBSTRATE_ID: &str = "vxlan";
 
 /// The router namespace a NAT-shaping profile builds on a participating guest
 /// (CN-4). `rustynet*`-prefixed so the final-cleanup residue assert flags it.
@@ -1725,7 +1732,7 @@ impl SiteAddressing {
 
 impl CrossNetworkSubstrateProvider for VxlanSubstrateProvider {
     fn id(&self) -> &'static str {
-        "vxlan"
+        VXLAN_SUBSTRATE_ID
     }
 
     /// WIDENED IN CN-4, in the same change that wired

@@ -47,6 +47,9 @@ use crate::vm_lab::VmGuestPlatform;
 use crate::vm_lab::orchestrator::remote_shell::RemoteShellHost;
 use crate::vm_lab::orchestrator::role_validation::discover_single_generated_nft_table;
 use crate::vm_lab::orchestrator::stage::cross_network::scenario::TUNNEL_INTERFACE;
+use crate::vm_lab::orchestrator::stage::cross_network::substrate::{
+    OVERLAY_POOL_CIDR, VXLAN_LINK_NAME, VXLAN_SUBSTRATE_ID,
+};
 use std::sync::Arc;
 
 /// Test-net documentation target the host-origin DNS probes are fired at.
@@ -1080,6 +1083,11 @@ pub struct LeakWitnessReport {
     pub killswitch_table: String,
     pub wg_listen_port: u16,
     pub capture_filter: String,
+    /// Every interface this run captured, in capture order: the default-route
+    /// egress NIC first, then (on a vxlan substrate) the overlay link that
+    /// carries the WireGuard control. Recorded so the verdict artifact always
+    /// names the plane the tunnel-control count came from.
+    pub capture_ifaces: Vec<String>,
     /// W1 evidence, recorded verbatim-but-bounded at capture start:
     /// generation-table `-a` listing, boot-table listing (`absent` tolerated),
     /// and the conntrack/ss DNS connection snapshot.
@@ -1146,6 +1154,171 @@ fn detect_linux_egress_interface(shell: &dyn RemoteShellHost) -> Result<String, 
         }
     }
     Err("default egress interface not found in `ip route show default` output".to_owned())
+}
+
+/// What the orchestrator recorded about the run's cross-network substrate,
+/// handed down by the stage from `OrchestrationContext::substrate` (the live
+/// `SubstrateHandle`, including `record.provisioned`) or, after a resume,
+/// from the persisted `substrate_record`. It tells the witness WHICH plane
+/// carries the WireGuard control before it ever looks at the guest: on a
+/// provisioned vxlan overlay every mesh WG endpoint is an overlay address
+/// (`substrate::plan_overlay` → `172.20.0.0/16` on `rustynet-vx0`), so the
+/// tunnel control is EXPECTED there. It is not guaranteed absent from the
+/// underlay: katana-xnet-841 (vxlan) passed with three exit-origin
+/// udp/51820→:3478 packets on the underlay NIC — the overlay plane is
+/// mandatory, not exclusive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubstrateOverlayHint {
+    /// The run's substrate is a provisioned vxlan overlay: the exit MUST
+    /// carry the overlay link. A missing link is an `Err` (fail closed) —
+    /// an underlay-only capture would be vacuous on the tunnel control.
+    Required,
+    /// The recorded substrate carries no overlay (netns/slirp, or a vxlan
+    /// substrate that decided no overlay was needed for a single network
+    /// group): no overlay plane exists, none is probed for, and the capture
+    /// is byte-identical to the pre-overlay behaviour.
+    NotRequired,
+    /// No substrate record available (plain run, or the guest is probed
+    /// without orchestrator context): the guest itself decides — if it
+    /// carries the overlay link, that plane is captured too.
+    Unknown,
+}
+
+/// One capture plane of the witness: the interface to sniff, the MAC that
+/// scopes the IPv6 clause of its filter, and the exit's own IPv4 address ON
+/// THAT PLANE — a captured packet sourced from it is exit-origin traffic on
+/// this plane (the underlay egress address, or the overlay address when the
+/// plane is the vxlan link).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WitnessCapturePlane {
+    pub iface: String,
+    pub mac: String,
+    pub addr: String,
+    /// True for the vxlan overlay plane (WireGuard control rides it on a
+    /// cross-LAN vxlan substrate); false for the default-route underlay NIC.
+    pub overlay: bool,
+}
+
+/// True when `addr` falls inside the substrate's overlay pool
+/// ([`OVERLAY_POOL_CIDR`]) — the address range `plan_overlay` assigns, so a
+/// link only qualifies as the witness overlay plane when it carries one.
+fn addr_in_overlay_pool(addr: &str) -> bool {
+    let Some((net, prefix)) = OVERLAY_POOL_CIDR.split_once('/') else {
+        return false;
+    };
+    let Ok(prefix_len): Result<u32, _> = prefix.parse() else {
+        return false;
+    };
+    fn octets(value: &str) -> Option<u32> {
+        let parts: Vec<&str> = value.split('.').collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        let mut acc = 0u32;
+        for part in parts {
+            acc = (acc << 8) | u32::from(part.parse::<u8>().ok()?);
+        }
+        Some(acc)
+    }
+    let (Some(network), Some(candidate)) = (octets(net), octets(addr)) else {
+        return false;
+    };
+    let mask = if prefix_len >= 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix_len)
+    };
+    network & mask == candidate & mask
+}
+
+/// The vxlan overlay capture plane on this guest, when it exists: the
+/// [`VXLAN_LINK_NAME`] link must hold an address inside [`OVERLAY_POOL_CIDR`]
+/// (both are what `substrate::plan_overlay`/`VxlanSubstrateProvider` create),
+/// and its MAC must be readable (the IPv6 clause of the capture filter is
+/// MAC-scoped, so an unreadable MAC fails closed through
+/// [`detect_egress_mac`]). A non-zero `ip` exit means the guest carries no
+/// such link — a legitimate netns/slirp/no-overlay shape, not an error.
+fn detect_overlay_capture_plane(
+    shell: &dyn RemoteShellHost,
+) -> Result<Option<(String, String)>, String> {
+    let argv = ["ip", "-4", "addr", "show", "dev", VXLAN_LINK_NAME];
+    let out = shell.run_argv(&argv, &[], &[]).map_err(|err| {
+        format!("failed to query the vxlan overlay link {VXLAN_LINK_NAME}: {err}")
+    })?;
+    if out.code != 0 {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let overlay_addr = stdout.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let pos = parts.iter().position(|p| *p == "inet")?;
+        let addr_cidr = parts.get(pos + 1)?;
+        let addr = addr_cidr.split('/').next()?;
+        if addr.is_empty() {
+            return None;
+        }
+        addr_in_overlay_pool(addr).then(|| addr.to_owned())
+    });
+    let Some(addr) = overlay_addr else {
+        return Ok(None);
+    };
+    let mac = detect_egress_mac(shell, VXLAN_LINK_NAME)?;
+    Ok(Some((addr, mac)))
+}
+
+/// The planes this run captures: always the default-route egress NIC
+/// (unchanged filter, unchanged leak counting), plus the vxlan overlay link
+/// when the exit guest carries one and the orchestrator's substrate record
+/// does not rule it out. [`SubstrateOverlayHint::Required`] makes a missing
+/// overlay link a hard `Err`: recording a provisioned vxlan overlay while
+/// silently capturing only the underlay is exactly the vacuity this witness
+/// exists to refuse.
+fn capture_planes(
+    shell: &dyn RemoteShellHost,
+    hint: SubstrateOverlayHint,
+    egress_iface: &str,
+    egress_addr: &str,
+    egress_mac: &str,
+) -> Result<Vec<WitnessCapturePlane>, String> {
+    let overlay = match hint {
+        SubstrateOverlayHint::NotRequired => None,
+        SubstrateOverlayHint::Required | SubstrateOverlayHint::Unknown => {
+            detect_overlay_capture_plane(shell)?
+        }
+    };
+    let Some((overlay_addr, overlay_mac)) = overlay else {
+        if hint == SubstrateOverlayHint::Required {
+            return Err(format!(
+                "the run's cross-network substrate is a provisioned {VXLAN_SUBSTRATE_ID} \
+                 overlay, but the exit guest carries no {VXLAN_LINK_NAME} link with an \
+                 {OVERLAY_POOL_CIDR} address — the WireGuard control rides that overlay, so an \
+                 underlay-only capture would be vacuous; failing closed"
+            ));
+        }
+        return Ok(vec![WitnessCapturePlane {
+            iface: egress_iface.to_owned(),
+            mac: egress_mac.to_owned(),
+            addr: egress_addr.to_owned(),
+            overlay: false,
+        }]);
+    };
+    let mut planes = vec![WitnessCapturePlane {
+        iface: egress_iface.to_owned(),
+        mac: egress_mac.to_owned(),
+        addr: egress_addr.to_owned(),
+        overlay: false,
+    }];
+    // Pathological shape: the default route already exits via the overlay
+    // link — the underlay plane above IS that link, never capture it twice.
+    if !planes.iter().any(|plane| plane.iface == VXLAN_LINK_NAME) {
+        planes.push(WitnessCapturePlane {
+            iface: VXLAN_LINK_NAME.to_owned(),
+            mac: overlay_mac,
+            addr: overlay_addr,
+            overlay: true,
+        });
+    }
+    Ok(planes)
 }
 
 /// Fail-closed posture precondition: the active generated killswitch table
@@ -1712,7 +1885,14 @@ fn line_transport(line: &str) -> LineTransport {
 /// Banner lines are skipped (never counted); anything unparseable is ignored
 /// by classification but the capture-level checks (banner present, stderr
 /// clean) fail the stage independently.
-fn classify_capture(stdout: &str, egress_addr: &str, wg_port: u16) -> LeakWitnessCounts {
+///
+/// `host_src_addrs` is the exit's own address on EVERY captured plane (the
+/// underlay egress address, plus the overlay address when the vxlan plane is
+/// captured): a packet sourced from any of them is exit-origin traffic and
+/// keeps the strict count-and-fail treatment, wherever on the guest it was
+/// witnessed. Leak counts never weaken when a plane is added — they can only
+/// grow.
+fn classify_capture(stdout: &str, host_src_addrs: &[&str], wg_port: u16) -> LeakWitnessCounts {
     let mut counts = LeakWitnessCounts::default();
     for line in stdout.lines() {
         if is_capture_banner_line(line) {
@@ -1726,7 +1906,7 @@ fn classify_capture(stdout: &str, egress_addr: &str, wg_port: u16) -> LeakWitnes
         let Some((src_ip, src_port, dst_ip, dst_port)) = parse_v4_packet_endpoints(line) else {
             continue;
         };
-        if src_ip == egress_addr {
+        if host_src_addrs.contains(&src_ip.as_str()) {
             if dst_port == Some(WITNESS_DOT_PORT) {
                 counts.host_dot += 1;
                 continue;
@@ -2593,6 +2773,12 @@ fn run_host_origin_probes(shell: &dyn RemoteShellHost) -> Vec<(String, i32)> {
 /// mesh-peer space falls back to the tunnel subnets visible in the
 /// capture-start interface listing, then to the documented RFC1918+CGNAT
 /// fallback.
+/// Substrate-unaware entry point (the historical behaviour): the guest alone
+/// decides whether an overlay plane exists ([`SubstrateOverlayHint::Unknown`]).
+/// A stage that knows the run's substrate calls
+/// [`run_linux_exit_egress_leak_witness_with_substrate`] instead, so a
+/// recorded provisioned vxlan overlay can never be silently witnessed on the
+/// underlay only.
 pub fn run_linux_exit_egress_leak_witness(
     shell: Arc<dyn RemoteShellHost>,
     alias: &str,
@@ -2600,6 +2786,49 @@ pub fn run_linux_exit_egress_leak_witness(
     mesh_peers: &[(String, String)],
     window_secs: u64,
     settle_secs: u64,
+) -> Result<LeakWitnessReport, String> {
+    run_linux_exit_egress_leak_witness_with_substrate(
+        shell,
+        alias,
+        client,
+        mesh_peers,
+        window_secs,
+        settle_secs,
+        SubstrateOverlayHint::Unknown,
+    )
+}
+
+/// Run the full Linux exit egress leak witness: posture precondition, egress
+/// context, bounded tcpdump capture window with concurrent probes, packet
+/// classification, and the fail-closed verdict. Setup/transport failures are
+/// `Err`; verdict failures are carried in `LeakWitnessReport::failures`.
+///
+/// `substrate_overlay` selects the CAPTURE PLANE(S): the default-route
+/// underlay NIC always, plus the vxlan overlay link (`rustynet-vx0`, where
+/// every mesh WG endpoint lives on a cross-LAN vxlan substrate) when the
+/// guest carries one — or exactly when the orchestrator's substrate record
+/// demands it. Only WHERE the witness looks changes: the vacuous WireGuard
+/// and ICMP controls, every leak count, the posture precondition, and the
+/// conntrack attribution all stay exactly as strict as on the underlay-only
+/// capture.
+///
+/// `mesh_peers` carries the orchestrator-known mesh addresses of EVERY
+/// non-exit node as `(alias, address)` pairs (MED-5 of the independent
+/// review; W3T scope correction — u46-r48's flagged tcp/53 flow ORIGINALed
+/// at a RELAY's mesh address, so admission is no longer client-only): when
+/// non-empty, conntrack attribution admits only ORIGINAL sources from this
+/// exact set and names the owning peer in the verdict; when empty, the
+/// mesh-peer space falls back to the tunnel subnets visible in the
+/// capture-start interface listing, then to the documented RFC1918+CGNAT
+/// fallback.
+pub fn run_linux_exit_egress_leak_witness_with_substrate(
+    shell: Arc<dyn RemoteShellHost>,
+    alias: &str,
+    client: Option<(Arc<dyn RemoteShellHost>, Vec<String>)>,
+    mesh_peers: &[(String, String)],
+    window_secs: u64,
+    settle_secs: u64,
+    substrate_overlay: SubstrateOverlayHint,
 ) -> Result<LeakWitnessReport, String> {
     let egress_iface = detect_linux_egress_interface(&*shell)?;
     let killswitch_table =
@@ -2612,27 +2841,66 @@ pub fn run_linux_exit_egress_leak_witness(
     let wg_listen_port =
         wg_listen_port_from_killswitch_listing(&killswitch_listing, &egress_iface)?;
 
-    let filter_tokens = capture_filter_tokens(wg_listen_port, &egress_mac);
-    let timeout_secs = window_secs + CAPTURE_KILL_AFTER_SECS;
-    let mut capture_argv: Vec<String> = vec![
-        "sudo".to_owned(),
-        "-n".to_owned(),
-        "timeout".to_owned(),
-        format!("--kill-after={CAPTURE_KILL_AFTER_SECS}"),
-        timeout_secs.to_string(),
-        "tcpdump".to_owned(),
-        "-i".to_owned(),
-        egress_iface.clone(),
-        "-nn".to_owned(),
-        "-l".to_owned(),
-    ];
-    capture_argv.extend(filter_tokens.iter().cloned());
+    // Capture plane(s) for the ACTIVE substrate: underlay always, overlay
+    // (rustynet-vx0) when the guest carries it / the record demands it.
+    let planes = capture_planes(
+        &*shell,
+        substrate_overlay,
+        &egress_iface,
+        &egress_addr,
+        &egress_mac,
+    )?;
+    let multi_plane = planes.len() > 1;
 
-    let capture_shell = Arc::clone(&shell);
-    let capture_handle = std::thread::spawn(move || {
-        let argv_refs: Vec<&str> = capture_argv.iter().map(String::as_str).collect();
-        capture_shell.run_argv(&argv_refs, &[], &[])
-    });
+    let timeout_secs = window_secs + CAPTURE_KILL_AFTER_SECS;
+    let mut capture_jobs: Vec<(String, Vec<String>)> = Vec::with_capacity(planes.len());
+    let mut plane_filters: Vec<Vec<String>> = Vec::with_capacity(planes.len());
+    for plane in &planes {
+        // The SAME strict filter on every plane: IPv4 host-origin DNS/DoT,
+        // the ICMP positive control, the WireGuard listen port, and IPv6
+        // sent by THIS plane's MAC. Nothing is ever filtered out.
+        let filter_tokens = capture_filter_tokens(wg_listen_port, &plane.mac);
+        let mut capture_argv: Vec<String> = vec![
+            "sudo".to_owned(),
+            "-n".to_owned(),
+            "timeout".to_owned(),
+            format!("--kill-after={CAPTURE_KILL_AFTER_SECS}"),
+            timeout_secs.to_string(),
+            "tcpdump".to_owned(),
+            "-i".to_owned(),
+            plane.iface.clone(),
+            "-nn".to_owned(),
+            "-l".to_owned(),
+        ];
+        capture_argv.extend(filter_tokens.iter().cloned());
+        plane_filters.push(filter_tokens);
+        capture_jobs.push((plane.iface.clone(), capture_argv));
+    }
+    // Single-plane evidence stays byte-identical to the historical shape
+    // (bare filter tokens); only a multi-plane run records the per-plane form.
+    let capture_filter = if multi_plane {
+        planes
+            .iter()
+            .zip(plane_filters.iter())
+            .map(|(plane, tokens)| format!("{}: {}", plane.iface, tokens.join(" ")))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    } else {
+        plane_filters
+            .first()
+            .map(|tokens| tokens.join(" "))
+            .unwrap_or_default()
+    };
+
+    let mut capture_handles = Vec::with_capacity(capture_jobs.len());
+    for (iface, capture_argv) in capture_jobs {
+        let capture_shell = Arc::clone(&shell);
+        let handle = std::thread::spawn(move || {
+            let argv_refs: Vec<&str> = capture_argv.iter().map(String::as_str).collect();
+            capture_shell.run_argv(&argv_refs, &[], &[])
+        });
+        capture_handles.push((iface, handle));
+    }
 
     std::thread::sleep(std::time::Duration::from_secs(settle_secs));
 
@@ -2664,29 +2932,56 @@ pub fn run_linux_exit_egress_leak_witness(
     probe_exit_codes.extend(run_host_origin_probes(&*shell));
 
     let mut failures = Vec::new();
-    let (capture_stdout, capture_stderr, capture_code) = match capture_handle.join() {
-        Ok(Ok(status)) => (
-            String::from_utf8_lossy(&status.stdout).to_string(),
-            String::from_utf8_lossy(&status.stderr).to_string(),
-            status.code,
-        ),
-        Ok(Err(err)) => {
+    let mut capture_stdout = String::new();
+    let mut capture_stderr = String::new();
+    for (iface, handle) in capture_handles {
+        let (plane_stdout, plane_stderr, plane_code) = match handle.join() {
+            Ok(Ok(status)) => (
+                String::from_utf8_lossy(&status.stdout).to_string(),
+                String::from_utf8_lossy(&status.stderr).to_string(),
+                status.code,
+            ),
+            Ok(Err(err)) => {
+                failures.push(format!(
+                    "{alias}: tcpdump capture run failed on {iface} ({err}) — capture unusable, \
+                     failing closed"
+                ));
+                (String::new(), String::new(), -1)
+            }
+            Err(_) => {
+                return Err(format!(
+                    "{alias}: tcpdump capture thread panicked — capture unusable, failing closed"
+                ));
+            }
+        };
+        // Every plane must have started its own capture: with more than one
+        // plane the banner must also NAME the plane's interface, so one
+        // plane's tcpdump can never stand in for another's.
+        let banner_ok = plane_stderr.contains("listening on ")
+            && (!multi_plane
+                || plane_stderr.contains(&format!("listening on '{iface}'"))
+                || plane_stderr.contains(&format!("listening on {iface}")));
+        if !banner_ok {
             failures.push(format!(
-                "{alias}: tcpdump capture run failed ({err}) — capture unusable, failing closed"
-            ));
-            (String::new(), String::new(), -1)
-        }
-        Err(_) => {
-            return Err(format!(
-                "{alias}: tcpdump capture thread panicked — capture unusable, failing closed"
+                "{alias}: tcpdump did not start on {iface} (exit code {plane_code}; no \
+                 `listening on` banner in stderr) — capture unusable, failing closed"
             ));
         }
-    };
-    if !capture_stderr.contains("listening on ") {
-        failures.push(format!(
-            "{alias}: tcpdump did not start on {egress_iface} (exit code {capture_code}; no \
-             `listening on` banner in stderr) — capture unusable, failing closed"
-        ));
+        if multi_plane {
+            // Provenance marker per plane (banner-whitelisted, never counted):
+            // the merged capture text always says which plane each line came
+            // from. Only added when there IS a second plane, so single-plane
+            // (netns etc.) evidence stays byte-identical to the old shape.
+            if !capture_stdout.is_empty() && !capture_stdout.ends_with('\n') {
+                capture_stdout.push('\n');
+            }
+            capture_stdout.push_str(&format!("capture_provenance=interface={iface}\n"));
+        }
+        capture_stdout.push_str(&plane_stdout);
+        if !capture_stderr.is_empty() && !capture_stderr.ends_with('\n') {
+            capture_stderr.push('\n');
+        }
+        capture_stderr.push_str(&plane_stderr);
     }
     let non_benign: Vec<&str> = capture_stderr
         .lines()
@@ -2711,7 +3006,12 @@ pub fn run_linux_exit_egress_leak_witness(
     // Informational: the same socket snapshot at window close.
     let capture_end_dns_sockets = gather_dns_sockets(&*shell);
 
-    let mut counts = classify_capture(&capture_stdout, &egress_addr, wg_listen_port);
+    // The exit's source addresses on EVERY captured plane: a host-origin
+    // packet is counted wherever it was witnessed (underlay egress address,
+    // overlay address on the vxlan plane) — leak counts only ever grow when
+    // a plane is added, never shrink.
+    let host_src_addrs: Vec<&str> = planes.iter().map(|plane| plane.addr.as_str()).collect();
+    let mut counts = classify_capture(&capture_stdout, &host_src_addrs, wg_listen_port);
 
     // W3b/W3c: conservative conntrack attribution. Armed only when EVERY
     // query in BOTH snapshots answered AND the exit's local addresses are
@@ -2822,7 +3122,8 @@ pub fn run_linux_exit_egress_leak_witness(
         egress_addr,
         killswitch_table,
         wg_listen_port,
-        capture_filter: filter_tokens.join(" "),
+        capture_filter,
+        capture_ifaces: planes.iter().map(|plane| plane.iface.clone()).collect(),
         capture_start_nft: capture_start.nft,
         capture_start_boot_nft: capture_start.boot_nft,
         capture_start_conntrack: capture_start.conntrack,
@@ -3036,6 +3337,40 @@ mod tests {
     const TEST_EGRESS_ADDR: &str = "192.0.2.240";
     const TEST_WG_PORT: u16 = 51820;
     const TEST_EGRESS_MAC: &str = "52:54:00:0a:00:31";
+    const TEST_OVERLAY_IFACE: &str = "rustynet-vx0";
+    const TEST_OVERLAY_ADDR: &str = "172.20.10.4";
+    const TEST_OVERLAY_MAC: &str = "02:52:ac:14:0a:04";
+    const TEST_PEER_OVERLAY: &str = "172.20.10.3";
+
+    /// The guest carries NO vxlan overlay link (`ip ... dev rustynet-vx0`
+    /// exits non-zero, exactly like a real guest without the link): the
+    /// witness must capture the underlay only, byte-identical to the
+    /// pre-overlay behaviour.
+    fn program_overlay_absent(mock: &MockShellHost) {
+        mock.program_run_response(
+            &["ip", "-4", "addr", "show", "dev", TEST_OVERLAY_IFACE],
+            exit_code(1, ""),
+        );
+    }
+
+    /// The guest carries the substrate's vxlan overlay link with its
+    /// `plan_overlay` address and deterministic MAC: both argvs the overlay
+    /// plane detection issues, in call order (address query, then MAC query).
+    fn program_overlay_present(mock: &MockShellHost) {
+        mock.program_run_response(
+            &["ip", "-4", "addr", "show", "dev", TEST_OVERLAY_IFACE],
+            exit_ok(&format!(
+                "7: {TEST_OVERLAY_IFACE}: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    \
+                 inet {TEST_OVERLAY_ADDR}/16 brd 172.20.255.255 scope global {TEST_OVERLAY_IFACE}\n"
+            )),
+        );
+        mock.program_run_response(
+            &["ip", "-brief", "link", "show", "dev", TEST_OVERLAY_IFACE],
+            exit_ok(&format!(
+                "{TEST_OVERLAY_IFACE}           UP             {TEST_OVERLAY_MAC} <BROADCAST,MULTICAST,UP,LOWER_UP>\n"
+            )),
+        );
+    }
 
     fn program_egress_mac(mock: &MockShellHost) {
         mock.program_run_response(
@@ -3130,6 +3465,19 @@ mod tests {
     /// client positive control. The tcpdump capture and `dig` responses are
     /// left to each test (FIFO programming).
     fn program_setup(mock: &MockShellHost, with_dig_success_path: bool) {
+        program_setup_base(mock, with_dig_success_path);
+        // No overlay link on this guest: underlay-only capture, no vxlan query.
+        program_overlay_absent(mock);
+    }
+
+    /// Same, but the guest carries the vxlan overlay link — the witness must
+    /// then capture BOTH planes (the vxlan topology shape).
+    fn program_setup_with_overlay(mock: &MockShellHost, with_dig_success_path: bool) {
+        program_setup_base(mock, with_dig_success_path);
+        program_overlay_present(mock);
+    }
+
+    fn program_setup_base(mock: &MockShellHost, with_dig_success_path: bool) {
         mock.program_run_response(
             &["ip", "route", "show", "default"],
             exit_ok(&format!("default via 192.0.2.1 dev {TEST_EGRESS_IFACE}\n")),
@@ -6706,7 +7054,7 @@ mod tests {
         let _ = parse_ip_o_addr_show_v4(&big_blob);
         let _ = parse_ip_o_addr_show_v4_entries(&big_blob);
         let _ = bound_evidence_text(&big_blob);
-        let _ = classify_capture(&big_blob, TEST_EGRESS_ADDR, TEST_WG_PORT);
+        let _ = classify_capture(&big_blob, &[TEST_EGRESS_ADDR], TEST_WG_PORT);
         let client_space = ClientSpace::derive(&[], "", TEST_EGRESS_ADDR, TUNNEL_INTERFACE);
         let _ = attribute_forwarded_packets(
             &big_blob,
@@ -8808,5 +9156,228 @@ mod tests {
             .expect("non-established shape must not be fatal");
         assert_eq!(posture.order_findings.len(), 1);
         assert!(posture.order_findings[0].contains("non-fatal DNS rule order finding"));
+    }
+
+    // ── vxlan substrate capture plane (AQ-256 family: katana-xnet-839/840,
+    //    lenovo-lab-633/634/635 — "no WireGuard udp/51820 traffic was
+    //    captured" because the WG control rides rustynet-vx0, not the
+    //    default-route underlay NIC) ────────────────────────────────────────
+
+    fn overlay_capture_argv_for_test(window_secs: u64) -> Vec<String> {
+        let mut argv: Vec<String> = vec![
+            "sudo".to_owned(),
+            "-n".to_owned(),
+            "timeout".to_owned(),
+            format!("--kill-after={CAPTURE_KILL_AFTER_SECS}"),
+            (window_secs + CAPTURE_KILL_AFTER_SECS).to_string(),
+            "tcpdump".to_owned(),
+            "-i".to_owned(),
+            TEST_OVERLAY_IFACE.to_owned(),
+            "-nn".to_owned(),
+            "-l".to_owned(),
+        ];
+        argv.extend(capture_filter_tokens(TEST_WG_PORT, TEST_OVERLAY_MAC));
+        argv
+    }
+
+    fn overlay_tcpdump_stderr_ok() -> String {
+        format!(
+            "tcpdump: listening on '{TEST_OVERLAY_IFACE}', link-type EN10MB (Ethernet), snapshot \
+             length 262144 bytes\n2 packets captured\n2 packets received by filter\n0 packets \
+             dropped by kernel\n"
+        )
+    }
+
+    /// THE vxlan regression: on the cross-LAN vxlan substrate the
+    /// client<->exit WireGuard control is VXLAN-encapsulated (outer
+    /// udp/4789), so the underlay NIC never carries bare udp/51820. The
+    /// witness must capture `rustynet-vx0` too and witness the tunnel
+    /// control THERE, while every assertion (zero leak classes, the
+    /// masqueraded-ICMP positive control, the vacuous checks) stays exactly
+    /// as strict as on the underlay-only shape.
+    #[test]
+    fn vxlan_substrate_witnesses_wireguard_control_on_the_overlay_plane() {
+        let mock = Arc::new(MockShellHost::new());
+        program_setup_with_overlay(&mock, true);
+        program_capture_start_evidence_clean(&mock);
+        program_w3_clean(&mock);
+        // Underlay: the positive control transits here (masqueraded NAT out),
+        // but NO bare udp/51820 — that is the whole defect on this shape.
+        let underlay = format!(
+            "12:00:01.000000 IP {TEST_EGRESS_ADDR} > 192.0.2.1: ICMP echo request, id 1, seq 1, length 64\n\
+             12:00:01.100000 IP 192.0.2.1 > {TEST_EGRESS_ADDR}: ICMP echo reply, id 1, seq 1, length 64\n"
+        );
+        program_capture(&mock, &underlay, &tcpdump_stderr_ok());
+        // Overlay: the WG control as it rides rustynet-vx0 (inner udp/51820
+        // between the plan_overlay overlay addresses).
+        let overlay = format!(
+            "12:00:02.000000 IP {TEST_OVERLAY_ADDR}.{TEST_WG_PORT} > {TEST_PEER_OVERLAY}.{TEST_WG_PORT}: UDP, length 32\n\
+             12:00:03.000000 IP {TEST_PEER_OVERLAY}.{TEST_WG_PORT} > {TEST_OVERLAY_ADDR}.{TEST_WG_PORT}: UDP, length 32\n"
+        );
+        mock.program_run_response(
+            &argv_refs(&overlay_capture_argv_for_test(0)),
+            capture_status(&overlay, &overlay_tcpdump_stderr_ok()),
+        );
+        let report = run_witness(&mock).expect("vxlan witness must not err on setup");
+        // Every assertion kept: zero leak classes, BOTH controls present.
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert_eq!(
+            report.counts.wireguard, 2,
+            "the WG control must come from the overlay plane"
+        );
+        assert_eq!(report.counts.forwarded_icmp, 1);
+        assert_eq!(report.counts.host_dns_udp, 0);
+        assert_eq!(report.counts.host_dns_tcp, 0);
+        assert_eq!(report.counts.host_dot, 0);
+        assert_eq!(report.counts.ipv6, 0);
+        assert_eq!(report.wg_listen_port, TEST_WG_PORT);
+        // Capture-interface selection: BOTH planes, underlay first.
+        assert_eq!(
+            report.capture_ifaces,
+            vec![TEST_EGRESS_IFACE.to_owned(), TEST_OVERLAY_IFACE.to_owned()]
+        );
+        // Filter tokens name both planes, and the merged capture text records
+        // which plane each line came from.
+        assert!(
+            report.capture_filter.contains(TEST_OVERLAY_IFACE),
+            "{}",
+            report.capture_filter
+        );
+        assert!(
+            report.capture_filter.contains(TEST_EGRESS_IFACE),
+            "{}",
+            report.capture_filter
+        );
+        assert!(
+            report.capture_filter.contains("udp port 51820"),
+            "{}",
+            report.capture_filter
+        );
+        assert!(
+            report
+                .capture_stdout
+                .contains("capture_provenance=interface=rustynet-vx0"),
+            "{}",
+            report.capture_stdout
+        );
+    }
+
+    /// Capture-interface selection for a vxlan topology, unit-level: the
+    /// underlay plane stays first and untouched, the overlay plane carries
+    /// the plan_overlay address and the link's MAC (which scopes its filter).
+    #[test]
+    fn capture_planes_select_underlay_and_overlay_for_a_vxlan_guest() {
+        let mock = MockShellHost::new();
+        program_overlay_present(&mock);
+        let planes = capture_planes(
+            &mock,
+            SubstrateOverlayHint::Unknown,
+            TEST_EGRESS_IFACE,
+            TEST_EGRESS_ADDR,
+            TEST_EGRESS_MAC,
+        )
+        .expect("the overlay plane must be selected for a vxlan guest");
+        assert_eq!(planes.len(), 2);
+        assert_eq!(planes[0].iface, TEST_EGRESS_IFACE);
+        assert!(!planes[0].overlay);
+        assert_eq!(planes[0].addr, TEST_EGRESS_ADDR);
+        assert_eq!(planes[1].iface, TEST_OVERLAY_IFACE);
+        assert!(planes[1].overlay);
+        assert_eq!(planes[1].addr, TEST_OVERLAY_ADDR);
+        assert_eq!(planes[1].mac, TEST_OVERLAY_MAC);
+    }
+
+    /// A recorded NON-overlay substrate (netns/slirp/no-plan vxlan) keeps the
+    /// historical shape: one plane, and the vxlan query is never even issued.
+    #[test]
+    fn capture_planes_keep_the_underlay_only_shape_without_an_overlay_substrate() {
+        let mock = MockShellHost::new(); // any vxlan query would transport-error this mock
+        let planes = capture_planes(
+            &mock,
+            SubstrateOverlayHint::NotRequired,
+            TEST_EGRESS_IFACE,
+            TEST_EGRESS_ADDR,
+            TEST_EGRESS_MAC,
+        )
+        .expect("no overlay probe is due for a recorded non-overlay substrate");
+        assert_eq!(planes.len(), 1);
+        assert_eq!(planes[0].iface, TEST_EGRESS_IFACE);
+        assert_eq!(planes[0].addr, TEST_EGRESS_ADDR);
+        assert!(
+            mock.run_log()
+                .iter()
+                .all(|call| call.argv.join(" ") != "ip -4 addr show dev rustynet-vx0"),
+            "a recorded netns/slirp substrate must not probe for the overlay link"
+        );
+    }
+
+    /// Fail closed: a provisioned vxlan overlay recorded by the orchestrator
+    /// with no overlay link on the exit guest can NEVER silently degrade to
+    /// the vacuous underlay-only capture — it errors, naming the link.
+    #[test]
+    fn capture_planes_fail_closed_when_a_provisioned_vxlan_overlay_is_missing() {
+        let mock = MockShellHost::new();
+        program_overlay_absent(&mock);
+        let err = capture_planes(
+            &mock,
+            SubstrateOverlayHint::Required,
+            TEST_EGRESS_IFACE,
+            TEST_EGRESS_ADDR,
+            TEST_EGRESS_MAC,
+        )
+        .expect_err("a recorded provisioned overlay with no link must fail closed");
+        assert!(err.contains("vxlan"), "{err}");
+        assert!(err.contains(TEST_OVERLAY_IFACE), "{err}");
+        assert!(err.contains("failing closed"), "{err}");
+    }
+
+    /// Filter tokens for the vxlan topology's overlay plane: the full strict
+    /// set (host-origin DNS/DoT, ICMP control, WireGuard, MAC-scoped IPv6) —
+    /// adding a plane never filters a class out.
+    #[test]
+    fn capture_filter_tokens_keep_every_clause_on_the_overlay_plane() {
+        let mac_clause = format!("ether src {TEST_OVERLAY_MAC}");
+        let joined = capture_filter_tokens(TEST_WG_PORT, TEST_OVERLAY_MAC).join(" ");
+        let needles = [
+            "udp port 53",
+            "tcp port 53",
+            "tcp port 853",
+            "icmp",
+            "udp port 51820",
+            mac_clause.as_str(),
+        ];
+        for needle in needles {
+            assert!(joined.contains(needle), "missing {needle:?} in {joined}");
+        }
+    }
+
+    /// Leak counting spans EVERY captured plane: an exit-origin packet seen
+    /// on the overlay counts exactly like one seen on the underlay, and a
+    /// foreign source never does.
+    #[test]
+    fn classify_counts_host_origin_packets_on_any_captured_plane() {
+        let both_planes = format!(
+            "12:00:01.000000 IP {TEST_OVERLAY_ADDR}.41000 > 8.8.8.8.53: UDP, length 40\n\
+             12:00:02.000000 IP {TEST_EGRESS_ADDR}.42000 > 8.8.8.8.53: UDP, length 40\n"
+        );
+        let counts = classify_capture(
+            &both_planes,
+            &[TEST_EGRESS_ADDR, TEST_OVERLAY_ADDR],
+            TEST_WG_PORT,
+        );
+        assert_eq!(
+            counts.host_dns_udp, 2,
+            "a leak witnessed on either plane must count"
+        );
+        let foreign = "12:00:01.000000 IP 172.20.10.9.41000 > 8.8.8.8.53: UDP, length 40\n";
+        let counts = classify_capture(
+            foreign,
+            &[TEST_EGRESS_ADDR, TEST_OVERLAY_ADDR],
+            TEST_WG_PORT,
+        );
+        assert_eq!(
+            counts.host_dns_udp, 0,
+            "a non-local source is never host-origin"
+        );
     }
 }

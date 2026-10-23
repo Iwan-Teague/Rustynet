@@ -5,8 +5,11 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::exit_egress_leak_witness::{
-    LeakWitnessReport, exit_egress_leak_witness_runtime_implemented,
-    run_linux_exit_egress_leak_witness,
+    LeakWitnessReport, SubstrateOverlayHint, exit_egress_leak_witness_runtime_implemented,
+    run_linux_exit_egress_leak_witness_with_substrate,
+};
+use crate::vm_lab::orchestrator::stage::cross_network::substrate::{
+    SubstrateRecord, VXLAN_SUBSTRATE_ID,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -123,13 +126,29 @@ impl OrchestrationStage for ExitEgressLeakWitnessStage {
         // each carried with its alias so the verdict names the peer.
         let mesh_peers = mesh_peer_set(&ctx.mesh_ips, &alias);
 
-        let mut report = match run_linux_exit_egress_leak_witness(
+        // The run's cross-network substrate decides WHERE the witness must
+        // look for the WireGuard control: on a provisioned vxlan overlay the
+        // client↔exit WG endpoints are overlay addresses, so the control
+        // is expected on `rustynet-vx0` (katana-xnet-840 and lenovo-lab-655
+        // saw none on the underlay; 841 still caught exit-origin :3478 chatter
+        // there — the overlay capture is mandatory, not exclusive). The
+        // live handle (this run) or the persisted record (a resume) carries
+        // the same information; with neither, the guest itself decides.
+        let substrate_record = ctx
+            .substrate
+            .as_ref()
+            .map(|handle| &handle.record)
+            .or(ctx.substrate_record.as_ref());
+        let substrate_overlay = substrate_overlay_hint(substrate_record);
+
+        let mut report = match run_linux_exit_egress_leak_witness_with_substrate(
             shell,
             &alias,
             Some((client_shell, client_ping_argv)),
             &mesh_peers,
             crate::vm_lab::orchestrator::role_validation::exit_egress_leak_witness::CAPTURE_WINDOW_SECS,
             crate::vm_lab::orchestrator::role_validation::exit_egress_leak_witness::CAPTURE_SETTLE_SECS,
+            substrate_overlay,
         ) {
             Ok(report) => report,
             Err(e) => return StageOutcome::Failed(format!("{alias}: {e}")),
@@ -210,6 +229,22 @@ fn mesh_peer_set(
     peers
 }
 
+/// What the recorded substrate says about the vxlan overlay plane: a
+/// provisioned vxlan substrate REQUIRES the overlay capture plane (the WG
+/// control rides it — an underlay-only capture would be vacuous); any other
+/// recorded substrate (netns/slirp, or a vxlan substrate that provisioned no
+/// overlay for a single network group) does not; with no record at all the
+/// guest itself decides ([`SubstrateOverlayHint::Unknown`]).
+fn substrate_overlay_hint(record: Option<&SubstrateRecord>) -> SubstrateOverlayHint {
+    match record {
+        None => SubstrateOverlayHint::Unknown,
+        Some(record) if record.substrate_id == VXLAN_SUBSTRATE_ID && record.provisioned => {
+            SubstrateOverlayHint::Required
+        }
+        Some(_) => SubstrateOverlayHint::NotRequired,
+    }
+}
+
 /// The per-run verdict artifact: posture context, per-class counts, probe
 /// exit codes, verdict reasons, and the raw capture text. A serialization
 /// failure is an error, never an empty file (LOW finding of the independent
@@ -240,6 +275,7 @@ fn verdict_json_bytes(report: &LeakWitnessReport, client_alias: &str) -> Result<
         "client_alias": client_alias,
         "egress_iface": report.egress_iface,
         "egress_addr": report.egress_addr,
+        "capture_ifaces": report.capture_ifaces,
         "killswitch_table": report.killswitch_table,
         "wg_listen_port": report.wg_listen_port,
         "capture_filter": report.capture_filter,
@@ -407,6 +443,7 @@ mod tests {
             exit_alias: "exit-1".to_owned(),
             egress_iface: "enp0s9".to_owned(),
             egress_addr: "192.0.2.240".to_owned(),
+            capture_ifaces: vec!["enp0s9".to_owned()],
             killswitch_table: "rustynet_g7".to_owned(),
             wg_listen_port: 51820,
             capture_filter: "udp port 53 or icmp".to_owned(),
@@ -554,6 +591,38 @@ mod tests {
         // the filter to exact alias equality, not role guesses).
         let all = mesh_peer_set(&mesh_ips, "not-in-table");
         assert_eq!(all.len(), 3, "{all:?}");
+    }
+
+    // The substrate record decides the capture plane(s): a provisioned
+    // vxlan record REQUIRES the overlay plane (a recorded provisioned vxlan
+    // overlay can never be silently witnessed on the underlay only); any
+    // other recorded substrate does not; no record lets the guest decide.
+    #[test]
+    fn substrate_overlay_hint_follows_the_recorded_substrate() {
+        use crate::vm_lab::orchestrator::stage::cross_network::substrate::SubstrateRecord;
+        let record = |substrate_id: &str, provisioned: bool| SubstrateRecord {
+            substrate_id: substrate_id.to_owned(),
+            topology_digest: "digest".to_owned(),
+            provisioned,
+            participants: vec!["exit-1".to_owned(), "client-1".to_owned()],
+        };
+        assert_eq!(
+            substrate_overlay_hint(Some(&record(VXLAN_SUBSTRATE_ID, true))),
+            SubstrateOverlayHint::Required
+        );
+        assert_eq!(
+            substrate_overlay_hint(Some(&record(VXLAN_SUBSTRATE_ID, false))),
+            SubstrateOverlayHint::NotRequired
+        );
+        assert_eq!(
+            substrate_overlay_hint(Some(&record("netns", true))),
+            SubstrateOverlayHint::NotRequired
+        );
+        assert_eq!(
+            substrate_overlay_hint(Some(&record("slirp", false))),
+            SubstrateOverlayHint::NotRequired
+        );
+        assert_eq!(substrate_overlay_hint(None), SubstrateOverlayHint::Unknown);
     }
 
     #[test]
