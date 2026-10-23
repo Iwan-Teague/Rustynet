@@ -46735,12 +46735,16 @@ directory = "vendor"
     /// L2 topology, because `--require-same-network` gates on them and returns
     /// `Err` before any stage runs.
     ///
-    /// Measured on the live lab 2026-08-13: `debian-headless-2` (192.168.64.4)
-    /// and `debian-headless-4` (192.168.64.10) share the QEMU-backend vmnet and
-    /// reach each other. `macos-utm-1` (192.168.65.101) is on the
-    /// Apple-Virtualization vmnet, served by a different host bridge; from the
-    /// Linux side it cannot reach even the host's own 192.168.65.1, and
-    /// traceroute dies at hop 1 with no reply.
+    /// Measured against the inventory as of suite commit 4c0fd2a33, which
+    /// dropped the five deleted UTM guests: `linux-x86-client-1`
+    /// (192.168.121.137) and `linux-x86-exit-1` (192.168.121.26) are both
+    /// libvirt guests on ubuntu-kvm-1's single default network
+    /// (`libvirt-192.168.121.0/24`, same `controller.host_id`), so they share
+    /// one L2 by construction. `katana-client-1` (192.168.122.45) is NAT'd on
+    /// katana's own virbr0 (`libvirt-nat-192.168.122.0/24`): a different
+    /// physical host, subnet and L2 with no path to the ubuntu-kvm-1 guests.
+    /// The negative pair below is therefore a REAL topology split, not merely
+    /// two different `network_group` labels.
     ///
     /// Both halves are asserted because a wrong label inverts this gate in BOTH
     /// directions, and each direction fails in a way the other would hide.
@@ -46763,14 +46767,13 @@ directory = "vendor"
                 .clone()
         };
 
-        let same_plane = [pick("debian-headless-2"), pick("debian-headless-4")];
-        ensure_inventory_entries_share_network(&same_plane).expect(
-            "two guests measured on the same QEMU vmnet must satisfy --require-same-network",
-        );
+        let same_plane = [pick("linux-x86-client-1"), pick("linux-x86-exit-1")];
+        ensure_inventory_entries_share_network(&same_plane)
+            .expect("guests on ubuntu-kvm-1's default network must satisfy --require-same-network");
 
-        let split_plane = [pick("debian-headless-4"), pick("macos-utm-1")];
+        let split_plane = [pick("linux-x86-exit-1"), pick("katana-client-1")];
         let err = ensure_inventory_entries_share_network(&split_plane).expect_err(
-            "a QEMU-vmnet guest and the Apple-vmnet guest have no L3 path and must be rejected",
+            "ubuntu-kvm-1 and katana virbr0 guests have no shared L2 and must be rejected",
         );
         assert!(
             err.contains("multiple network groups"),
