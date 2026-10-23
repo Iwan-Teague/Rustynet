@@ -568,20 +568,33 @@ install_faketime() {{
   # a daemon that refuses the injected clock exits a moment later (live
   # 2026-09-11: "trust preflight failed: trust evidence is stale", exit 65).
   # Judge the unit's state after a settle, not the restart's exit code.
-  systemctl restart "$service" >/dev/null 2>&1 || true
+  restart_rc=0
+  systemctl restart "$service" 2>"$status_diag_file" || restart_rc=$?
+  printf 'started_restart_diag=rc=%s stderr=%s\n' "$restart_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)"
   sleep 5
-  if systemctl is-active --quiet "$service" && [ -S "$socket_path" ]; then
+  # Started means "answers ONE bounded status IPC under the fault" — the same
+  # oracle as recovery (fingerprint 9044e3ed661a; katana-xnet-843: is-active +
+  # the lingering socket FILE read started=true at 5 s while every IPC call in
+  # the same run hit rc=70, forcing the started-form of the verdict onto
+  # evidence that could never be sampled). The attempt's rc+stderr land in the
+  # diagnostics channel so the WHY survives the later status_field overwrites.
+  started_probe_rc=0
+  timeout {probe_timeout} env RUSTYNET_DAEMON_SOCKET="$socket_path" {remote_rustynet_bin} status 2>"$status_diag_file" >/dev/null || started_probe_rc=$?
+  if [ "$started_probe_rc" -eq 0 ]; then
     printf 'daemon_started_under_fault=true\n'
   else
     printf 'daemon_started_under_fault=false\n'
   fi
+  printf 'started_diag=rc=%s stderr=%s\n' "$started_probe_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)"
 }}
 remove_faketime() {{
   rm -f "$drop_in_file" >/dev/null 2>&1 || true
   rmdir "$drop_in_dir" >/dev/null 2>&1 || true
   systemctl daemon-reload
   systemctl reset-failed "$service" >/dev/null 2>&1 || true
-  systemctl restart "$service"
+  remove_restart_rc=0
+  systemctl restart "$service" 2>"$status_diag_file" || remove_restart_rc=$?
+  printf 'remove_restart_diag=rc=%s stderr=%s\n' "$remove_restart_rc" "$(tr '\n' '|' <"$status_diag_file" | cut -c1-300)"
 }}
 # Recovery readiness is ONE completed IPC round trip against the daemon
 # socket — the same criterion as the host-side shared readiness probe
@@ -621,6 +634,11 @@ wait_recovered() {{
   printf 'recovered_diag_probe=%s\n' "$probe_diag"
   printf 'recovered_diag_unit=%s\n' "$(systemctl is-active "$service" 2>/dev/null || true)/$(systemctl show "$service" -p SubState --value 2>/dev/null || true)"
   printf 'recovered_diag_socket_file=%s\n' "$([ -S "$socket_path" ] && echo present || echo absent)"
+  # Report-only WHY for a recovery failure (katana-xnet-849/-853: 181 s of
+  # rc=70 stderr= with the refusal text left unread in the unit journal).
+  if [ "$recovered" != true ]; then
+    printf 'recovery_journal_tail=%s\n' "$(journalctl -u "$service" -n 40 --no-pager 2>/dev/null | tr '\n' '|' | cut -c1-2000)"
+  fi
 }}
 "#
     );
@@ -1281,6 +1299,73 @@ mod tests {
         );
     }
 
+    // katana-xnet-843: install_faketime declared daemon_started_under_fault=true from
+    // `systemctl is-active` + the lingering socket FILE at 5 s while every
+    // bounded status IPC in the same run hit rc=70 (fingerprint 9044e3ed661a),
+    // forcing the started-form of the verdict onto unsampleable evidence. The
+    // started oracle must be the same bounded IPC round trip as recovery, and
+    // its rc+stderr must reach the diagnostics channel.
+    #[test]
+    fn remote_script_started_oracle_is_ipc_backed_not_unit_and_socket_file() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        let start = script
+            .find("install_faketime() {")
+            .expect("install_faketime fn");
+        let end = script
+            .find("remove_faketime() {")
+            .expect("remove_faketime fn");
+        let install = &script[start..end];
+        assert!(
+            !install
+                .lines()
+                .any(|l| !l.trim_start().starts_with('#') && l.contains("is-active")),
+            "started oracle must not rest on the unit-state + lingering socket FILE check (katana-xnet-843): {install}"
+        );
+        let started_true = install
+            .find("daemon_started_under_fault=true")
+            .expect("started=true verdict line must remain");
+        let probe = install
+            .find("status 2>\"$status_diag_file\"")
+            .expect("bounded status IPC probe inside install_faketime");
+        assert!(
+            probe < started_true,
+            "started=true must be decided by a completed bounded IPC round trip"
+        );
+        assert!(
+            install.contains("started_diag=rc="),
+            "the started attempt's rc+stderr must reach the diagnostics channel: {install}"
+        );
+    }
+
+    // katana-xnet-843..853: the only artifact that names the bootstrap error is
+    // the failed start's own stderr (the daemon never binds, so no status IPC
+    // can sample it) and the old `>/dev/null 2>&1` discarded it —
+    // bootstrap_error_names_staleness was structurally unsatisfiable. Restart
+    // stderr must be captured in both fault windows, and a recovery failure
+    // must fold the unit journal into the stage log.
+    #[test]
+    fn remote_script_captures_restart_and_journal_failure_text() {
+        let config = parse(&["--dry-run"]).expect("dry-run config should parse");
+        let script = render_remote_clock_script(&config);
+        for function in ["install_faketime() {", "remove_faketime() {"] {
+            let start = script.find(function).expect(function);
+            let body = &script[start..start + 1600];
+            assert!(
+                !body.contains("restart \"$service\" >/dev/null 2>&1"),
+                "restart stderr must be captured, not discarded, in {function}: {body}"
+            );
+        }
+        assert!(
+            script.contains("recovery_journal_tail="),
+            "a recovery failure must fold the unit journal into the stage log"
+        );
+        assert!(
+            script.contains("journalctl -u \"$service\""),
+            "the unit journal is the only source of the bootstrap error text"
+        );
+    }
+
     #[test]
     fn dry_run_allows_no_live_targets() {
         let config = parse(&["--dry-run"]).expect("dry-run config should parse");
@@ -1420,8 +1505,13 @@ mod tests {
     // Live 2026-09-11: `systemctl restart` returned 0 while the daemon exited
     // a second later refusing the clock; and the post-recovery epoch was
     // sampled before bootstrap finished. Both are observation bugs.
+    // katana-xnet-843 (fingerprint 9044e3ed661a) showed the t+5 s unit-state +
+    // socket-FILE start oracle itself lies: the old socket FILE lingers after
+    // a restart, so the started decision must be the same bounded IPC round
+    // trip as recovery. This test was updated from the unit-state oracle to
+    // the IPC oracle with the fix; the verdict functions are untouched.
     #[test]
-    fn remote_script_judges_fault_start_by_unit_state_and_polls_post_recovery() {
+    fn remote_script_judges_fault_start_by_ipc_and_polls_post_recovery() {
         let config = parse(&["--dry-run"]).expect("dry-run config should parse");
         let script = render_remote_clock_script(&config);
         let install = script.find("install_faketime() {").expect("install fn");
@@ -1431,9 +1521,18 @@ mod tests {
             + install;
         let body = &script[install..end];
         assert!(body.contains("sleep 5"), "{body}");
+        let probe = body
+            .lines()
+            .find(|l| l.contains("timeout 15 env RUSTYNET_DAEMON_SOCKET=\"$socket_path\""))
+            .expect("the start decision must be a timeout-bounded status IPC round trip");
         assert!(
-            body.contains("systemctl is-active --quiet \"$service\" && [ -S \"$socket_path\" ]"),
-            "{body}"
+            probe.contains("status 2>\"$status_diag_file\""),
+            "the start probe's stderr must be captured, not discarded:\n{probe}"
+        );
+        assert!(
+            body.find("timeout 15 env RUSTYNET_DAEMON_SOCKET=\"$socket_path\"")
+                < body.find("daemon_started_under_fault="),
+            "started must be decided by the completed bounded IPC round trip, not unit state + socket FILE:\n{body}"
         );
         assert!(
             script.contains("sample_end_unix=\"$((start_unix + deadline))\""),
