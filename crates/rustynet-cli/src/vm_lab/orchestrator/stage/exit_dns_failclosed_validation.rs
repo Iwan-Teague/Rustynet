@@ -5,7 +5,7 @@ use crate::vm_lab::orchestrator::error::StageOutcome;
 use crate::vm_lab::orchestrator::evidence::append_stage_evidence_line;
 use crate::vm_lab::orchestrator::role::NodeRole;
 use crate::vm_lab::orchestrator::role_validation::exit_dns_failclosed::{
-    exit_dns_failclosed_runtime_implemented, validate_linux_exit_dns_failclosed,
+    EVIDENCE_SUBDIR, exit_dns_failclosed_runtime_implemented, validate_linux_exit_dns_failclosed,
 };
 use crate::vm_lab::orchestrator::stage::{OrchestrationStage, StageFanout, StageId};
 
@@ -112,6 +112,7 @@ impl OrchestrationStage for ExitDnsFailclosedValidationStage {
                     daemon_path,
                     &alias,
                     &mesh_hostname,
+                    &ctx.report_dir.join(EVIDENCE_SUBDIR),
                 ) {
                     Ok(()) => Vec::new(),
                     Err(e) => vec![format!("{alias}: {e}")],
