@@ -15461,6 +15461,15 @@ pub(crate) fn build_relay_forward_test_status_script() -> String {
     )
 }
 
+/// Unprivileged guest view of every interface address, in the exact
+/// `ip -o -4 addr show` form the cross_network provisioning stages read via
+/// [`crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::unique_ipv4_in_benchmark_prefix`],
+/// so a stage-side pre-check and the cross_network stages can never
+/// disagree about what the relay guest actually holds.
+fn build_relay_forward_test_relay_addresses_script() -> String {
+    "ip -o -4 addr show".to_owned()
+}
+
 /// Starts a bounded background capture on the relay's own dataplane port
 /// range. `timeout` self-terminates the capture after
 /// `RELAY_FORWARD_TEST_CAPTURE_SECS` regardless of what else happens, so a
@@ -15729,6 +15738,79 @@ fn relay_forward_test_status_reports_relay_peer(status_line: &str) -> bool {
         }
     }
     false
+}
+
+/// Reads the relay guest's interface addresses over the same SSH control
+/// plane the relay-forward proof itself uses, so a stage-side pre-check can
+/// apply the identical fail-fast verdict the cross_network stages apply
+/// before any wait begins. Fails closed on SSH transport errors.
+pub(crate) fn relay_transport_guest_addresses(
+    inventory_path: &Path,
+    relay_alias: &str,
+    ssh_identity_file: &Path,
+    known_hosts_path: Option<&Path>,
+) -> Result<String, String> {
+    let targets = resolve_remote_targets(inventory_path, &[relay_alias.to_owned()], false, &[])?;
+    let target = targets
+        .iter()
+        .find(|t| t.label == relay_alias)
+        .ok_or_else(|| {
+            format!("relay {relay_alias} not found in the resolved inventory targets")
+        })?;
+    run_relay_forward_test_script(
+        target,
+        ssh_identity_file,
+        known_hosts_path,
+        build_relay_forward_test_relay_addresses_script().as_str(),
+        "relay transport address pre-check",
+    )
+}
+
+/// Stage-side fail-fast verdict for the relay-forwards-frame proof. Mirrors
+/// the cross_network provisioning stages: the relay must hold exactly one
+/// 198.18.0.0/15 address, phase-prefixed with the same
+/// `resolving the relay transport endpoint: ` text so operators see one
+/// root cause for both stage families.
+///
+/// Two deviations are deliberate, both proving-only:
+/// - a `None` candidate endpoint means the orchestrator never minted a
+///   RELAY_SPEC, so no relay candidate can ever be armed and the 90s
+///   traversal wait would be provably futile — fail fast with that root
+///   cause regardless of the guest's addresses;
+/// - a public (non-198.18/15) candidate endpoint is a legitimate elected
+///   address the daemon validator accepts, so the 198.18.0.0/15 requirement
+///   does not apply and the check passes without consulting the guest.
+///
+/// The legacy per-node validation chain (which passes `None` on purpose)
+/// never calls this verdict: it is wired into the orchestrator stage only.
+pub(crate) fn relay_transport_preflight_verdict(
+    candidate_endpoint: Option<&str>,
+    guest_addresses: &str,
+) -> Result<(), String> {
+    if let Some(candidate) = candidate_endpoint {
+        let in_benchmark_prefix = candidate
+            .parse::<Ipv4Addr>()
+            .is_ok_and(|addr| addr.octets()[0] == 198 && matches!(addr.octets()[1], 18 | 19));
+        if !in_benchmark_prefix {
+            return Ok(());
+        }
+    }
+    let unique = crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::unique_ipv4_in_benchmark_prefix(guest_addresses)
+        .map_err(|err| format!("resolving the relay transport endpoint: {err}"))?;
+    match candidate_endpoint {
+        Some(candidate) => {
+            if candidate != unique {
+                return Err(format!(
+                    "the elected --relay-forward-candidate-endpoint {candidate} is not the unique 198.18.0.0/15 address on the relay guest ({unique}): the relay cannot bind the advertised address"
+                ));
+            }
+            Ok(())
+        }
+        None => Err(
+            "no --relay-forward-candidate-endpoint was elected for this run: no RELAY_SPEC can be minted and no relay candidate can ever be armed, so the relay-routed session this proof waits for could never form"
+                .to_owned(),
+        ),
+    }
 }
 
 /// Drives the full live two-peer-through-relay proof: provisions a
@@ -51979,6 +52061,109 @@ EF63D4C9-0E3D-4155-95C2-E758316CC8BA stopping debian-headless-3
         // One port constant: the bind port matches the legacy literal the
         // relay unit ships.
         assert_eq!(super::RELAY_FORWARD_TEST_RELAY_BIND_PORT, 4500);
+    }
+
+    // Realistic `ip -o -4 addr show` output from a lab relay guest WITHOUT
+    // any 198.18.0.0/15 address (the katana-xnet-856 shape: loopback, the
+    // hypervisor bridge, the vxlan underlay and the tailscale interface —
+    // no benchmark-prefix address anywhere).
+    const GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX: &str = r#"1: lo    inet 127.0.0.1/8 scope host lo\       valid_lft forever preferred_lft forever
+2: ens3    inet 192.168.122.57/24 brd 192.168.122.255 scope global dynamic ens3\       valid_lft 3378sec preferred_lft 3378sec
+5: rustynet-vx0    inet 172.20.10.4/24 brd 172.20.10.255 scope global rustynet-vx0\       valid_lft forever preferred_lft forever
+6: rustynet0    inet 100.95.194.56/24 scope global rustynet0\       valid_lft forever preferred_lft forever"#;
+
+    #[test]
+    fn relay_addresses_script_matches_the_cross_network_unprivileged_view() {
+        assert_eq!(
+            super::build_relay_forward_test_relay_addresses_script(),
+            "ip -o -4 addr show"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_without_benchmark_prefix_fails_with_the_cross_network_root_cause() {
+        let verdict = super::relay_transport_preflight_verdict(
+            Some("198.18.0.10"),
+            GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX,
+        );
+        let err = verdict.expect_err("missing 198.18.0.0/15 address must fail the pre-check");
+        assert_eq!(
+            err,
+            format!(
+                "resolving the relay transport endpoint: {}",
+                crate::vm_lab::orchestrator::stage::cross_network::scenario::provisioning::unique_ipv4_in_benchmark_prefix("").unwrap_err()
+            ),
+            "root-cause text must stay byte-identical to the cross_network stages: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_without_elected_candidate_names_the_missing_relay_spec() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever"
+        );
+        let err = super::relay_transport_preflight_verdict(None, &addresses)
+            .expect_err("no elected candidate means no RELAY_SPEC can ever exist");
+        assert!(
+            err.contains("no --relay-forward-candidate-endpoint was elected")
+                && err.contains("no RELAY_SPEC can be minted"),
+            "election root cause expected: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_passes_when_the_guest_holds_the_elected_benchmark_address() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever"
+        );
+        assert_eq!(
+            super::relay_transport_preflight_verdict(Some("198.18.0.10"), &addresses),
+            Ok(())
+        );
+        // A None candidate still fails the election even on a perfect guest.
+        assert!(super::relay_transport_preflight_verdict(None, &addresses).is_err());
+    }
+
+    #[test]
+    fn preflight_verdict_allows_a_publicly_elected_candidate_without_the_benchmark_prefix() {
+        // The daemon validator accepts public candidate endpoints; such a
+        // lab never needs a 198.18.0.0/15 address, so the pre-check must
+        // not false-fail it.
+        assert_eq!(
+            super::relay_transport_preflight_verdict(
+                Some("203.0.113.10"),
+                GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_rejects_a_candidate_that_disagrees_with_the_guest() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever"
+        );
+        let err = super::relay_transport_preflight_verdict(Some("198.18.64.5"), &addresses)
+            .expect_err("a candidate the guest does not hold cannot be bound");
+        assert!(
+            err.contains(
+                "is not the unique 198.18.0.0/15 address on the relay guest (198.18.0.10)"
+            ),
+            "mismatch root cause expected: {err}"
+        );
+    }
+
+    #[test]
+    fn preflight_verdict_rejects_multiple_benchmark_prefix_addresses() {
+        let addresses = format!(
+            "{GUEST_ADDRESSES_WITHOUT_BENCHMARK_PREFIX}\n7: ens4    inet 198.18.0.10/15 scope global ens4\\       valid_lft forever preferred_lft forever\n8: ens5    inet 198.19.4.7/15 scope global ens5\\       valid_lft forever preferred_lft forever"
+        );
+        let err = super::relay_transport_preflight_verdict(Some("198.18.0.10"), &addresses)
+            .expect_err("two distinct 198.18.0.0/15 addresses is a hard error");
+        assert!(
+            err.contains("multiple 198.18.0.0/15 addresses on the relay guest"),
+            "multiple-address root cause expected: {err}"
+        );
     }
 
     #[test]

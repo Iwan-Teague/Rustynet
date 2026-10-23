@@ -188,6 +188,32 @@ impl OrchestrationStage for RelayForwardsFrameValidationStage {
             }
         };
 
+        // Fail-fast relay transport pre-check, BEFORE any wait begins. The
+        // traversal proof polls for 90s for a relay-routed session that can
+        // only exist when the relay holds its elected 198.18.0.0/15 address
+        // (or a legitimately elected public candidate); when that cannot be
+        // true the wait is provably futile, so this stage fails now with the
+        // SAME root-cause text the cross_network stages report.
+        let guest_addresses = match crate::vm_lab::relay_transport_guest_addresses(
+            Path::new(&inventory_path),
+            &relay_alias,
+            &params.identity_file,
+            Some(params.known_hosts.as_path()),
+        ) {
+            Ok(addresses) => addresses,
+            Err(e) => {
+                return StageOutcome::Failed(format!(
+                    "{relay_alias}: relay transport pre-check: {e}"
+                ));
+            }
+        };
+        if let Err(e) = crate::vm_lab::relay_transport_preflight_verdict(
+            ctx.relay_forward_candidate_endpoint.as_deref(),
+            &guest_addresses,
+        ) {
+            return StageOutcome::Failed(format!("{relay_alias}: pre-flight: {e}"));
+        }
+
         // Delegate the whole probe: script build → SSH run → counter-delta +
         // ciphertext-only assertions → cleanup (inside the helper, all
         // paths). Its Ok summary is already the rich evidence string; the
@@ -1272,5 +1298,26 @@ mod tests {
         assert!(!err.is_empty());
         assert!(err.contains(EVIDENCE_FILENAME));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn relay_transport_preflight_runs_before_the_traversal_proof_delegates() {
+        let source = crate::vm_lab::implementation_source_slice(include_str!(
+            "relay_forwards_frame_validation.rs"
+        ))
+        .expect("stage implementation slice must parse");
+        let execute_start = source
+            .find("fn execute(")
+            .expect("execute fn present in this stage file");
+        let preflight = source[execute_start..]
+            .find("relay_transport_preflight_verdict(")
+            .expect("stage must wire the relay transport pre-flight");
+        let delegation = source[execute_start..]
+            .find("exercise_linux_relay_forwards_frame(")
+            .expect("stage must delegate the traversal proof");
+        assert!(
+            preflight < delegation,
+            "the fail-fast pre-check must run before any traversal wait begins"
+        );
     }
 }
