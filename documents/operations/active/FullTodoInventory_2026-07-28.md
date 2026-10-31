@@ -170,6 +170,22 @@ doc-comment claimed it "only ever fills a `null`". That defect was not in this
 inventory or any source doc — it surfaced only from reading the code the stale
 entries pointed at, which is the argument for verifying rather than scheduling.
 
+## 2b. Addendum 2026-10-31 — verification sweep of §2 items
+
+Checked against `origin/development` (`c3ef96f`) before any edit. Fixed only what
+the code or a sibling doc settled; everything else is recorded as not verified.
+
+| § 2 item | Verdict | Evidence / action |
+| --- | --- | --- |
+| 4. `LiveLabMonitorTUIAccuracyImprovements` heading "OPEN TODO" over a "Done" body | **FIXED** | Heading changed to `DONE`. Body claims checked: `run_matrix_csv_path` returns `Option<PathBuf>` and has no legacy fallback (`crates/rustynet-lab-monitor/src/data/run_matrix.rs:142`). |
+| 13. RN-02 `MembershipDirectory::is_populated()` comment describes dead code | **ALREADY DONE** | The doc comment now states the bypass does not exist and that remaining callers use the method only as an advisory signal (`crates/rustynet-policy/src/lib.rs:130-150`). Callers match: `rustynet-control/src/lib.rs:2439, 3546`. |
+| 16. `SecurityAuditCatalogStalePathsTodo` — catalog cites deleted `dataplane.rs` | **ALREADY DONE** | `dataplane.rs` now appears only in comments in `security_audit_catalog.rs:414` and `phase4_gates.rs:128`. No `rustynetd/src/dataplane` path remains in `crates/`. |
+| 1. `AnchorBundlePullAttestationSecurityReview` header says "Not merged, 1 finding open" while §8 says merged and §6 closed | **NOT VERIFIED — header left as is** | §8 cites `e1d2a8b`, `e0cc8e5` and `3c1ae84`. None of those commits exists in the GitHub repository, so neither the merge nor the closure can be checked from `origin/development` or `origin/main`. The contradiction stands until those commits are located, most likely on the owner's local checkout. |
+| CI §4 "Debian 13 and Linux E2E fail at Bootstrap CI tools (`cargo: not found`)" | **NOT VERIFIED** | GitHub reports no workflow runs at all for `cross-platform-ci.yml` on any branch, so the current state of that failure cannot be read from CI. The bootstrap path (`scripts/ci/bootstrap_ci_tools.sh`, invoked from the `debian13`, `supply_chain` and `linux_e2e` jobs) was not changed. |
+
+Not yet worked: the other §2 items (2, 3, 5–12, 14, 15, 17) need owner decisions or
+larger code changes and were not started in this pass.
+
 ---
 
 ## Part 1 — `documents/operations/active/` (117 files, A→Z)
